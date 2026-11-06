@@ -10,7 +10,9 @@ pub use schema::{
 
 use std::borrow::Cow;
 use std::ops::Range;
-use toml_edit::{ArrayOfTables, Decor, DocumentMut, InlineTable, Item, Table, TableLike, Value};
+use toml_edit::{
+    Array, ArrayOfTables, Decor, DocumentMut, InlineTable, Item, Table, TableLike, Value,
+};
 
 /// Schema version this build writes. Equals `MIGRATIONS.len() + 1` (checked by a test).
 pub const CURRENT_VERSION: i64 = 1;
@@ -44,16 +46,24 @@ pub struct ConfigFile {
     /// True when the file's `version` is newer than this build: never write it back.
     pub read_only: bool,
     raw: DocumentMut,
+    /// The file started with a UTF-8 byte order mark; written back with it.
+    bom: bool,
+    /// Every line of the file ended in CRLF; written back, new lines included, with CRLF.
+    crlf: bool,
 }
 
 impl Default for ConfigFile {
+    /// Every key with its default, for a new file.
     fn default() -> Self {
-        let mut raw = DocumentMut::new();
+        // Serialising our own `Config` does not fail; an empty document is still a valid file.
+        let mut raw = typed_doc(&Config::default()).unwrap_or_default();
         raw.insert("version", toml_edit::value(CURRENT_VERSION));
         Self {
             config: Config::default(),
             read_only: false,
             raw,
+            bom: false,
+            crlf: false,
         }
     }
 }
@@ -65,6 +75,17 @@ impl ConfigFile {
 
     /// `parse` with an explicit migration list (tests ship their own).
     pub fn parse_with(text: &str, migrations: &[Migration]) -> Result<Self, ConfigError> {
+        let bom = text.starts_with('\u{feff}');
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        let crlf =
+            text.contains("\r\n") && text.matches('\n').count() == text.matches("\r\n").count();
+        // The document is kept with LF; `to_toml_string` puts the CRLF back.
+        let text = if crlf {
+            Cow::Owned(text.replace("\r\n", "\n"))
+        } else {
+            Cow::Borrowed(text)
+        };
+        let text = &*text;
         let mut raw: DocumentMut = text
             .parse()
             .map_err(|e: toml_edit::TomlError| located(text, e.span(), e.message()))?;
@@ -107,43 +128,96 @@ impl ConfigFile {
             config,
             read_only,
             raw,
+            bom,
+            crlf,
         })
     }
 
     /// The raw document with the typed settings written into its existing items, so an
-    /// unchanged file comes back byte-identical and a changed value changes only its text.
+    /// unchanged file comes back byte-identical (BOM and CRLF included) and a changed value
+    /// changes only its text. A key the file lacks is added only when it is not the default.
     /// Errors with `ReadOnly` for a file from a newer version.
     pub fn to_toml_string(&self) -> Result<String, ConfigError> {
         if self.read_only {
             return Err(ConfigError::ReadOnly);
         }
-        let typed =
-            toml::to_string(&self.config).map_err(|e| ConfigError::Invalid(e.to_string()))?;
-        let mut typed: DocumentMut = typed
-            .parse()
-            .map_err(|e: toml_edit::TomlError| ConfigError::Invalid(e.to_string()))?;
+        let mut typed = typed_doc(&self.config)?;
         unplace(typed.as_table_mut());
+        let default = typed_doc(&Config::default())?;
         let mut out = self.raw.clone();
-        merge(out.as_table_mut(), typed.as_table());
-        Ok(out.to_string())
+        merge(
+            out.as_table_mut(),
+            typed.as_table(),
+            Some(default.as_table()),
+        );
+        let mut text = out.to_string();
+        if self.crlf {
+            text = text.replace('\n', "\r\n");
+        }
+        if self.bom {
+            text.insert(0, '\u{feff}');
+        }
+        Ok(text)
     }
+}
+
+fn typed_doc(config: &Config) -> Result<DocumentMut, ConfigError> {
+    toml::to_string(config)
+        .map_err(|e| ConfigError::Invalid(e.to_string()))?
+        .parse()
+        .map_err(|e: toml_edit::TomlError| ConfigError::Invalid(e.to_string()))
 }
 
 /// Writes every key of `src` into `dst`: tables merge key by key, arrays of tables merge
 /// element by element on `app`, values replace only when they differ and keep their decor.
-fn merge(dst: &mut dyn TableLike, src: &dyn TableLike) {
+/// `default` is the same place in the default config (`None` inside a rule).
+fn merge(dst: &mut dyn TableLike, src: &dyn TableLike, default: Option<&dyn TableLike>) {
     for (key, new) in src.iter() {
+        let fallback = default.and_then(|d| d.get(key));
         let Some(old) = dst.get_mut(key) else {
-            dst.insert(key, new.clone());
+            insert_changed(dst, key, new, fallback);
             continue;
         };
         if is_table_array(new) && is_table_array(old) {
-            merge_rules(old, new);
+            if old.is_array_of_tables() && new.as_array().is_some_and(Array::is_empty) {
+                // An empty `[[x]]` prints nothing, and a missing key loads the default rules;
+                // a fresh key gets plain `x = []` spacing.
+                dst.remove(key);
+                dst.insert(key, new.clone());
+            } else {
+                merge_rules(old, new);
+            }
         } else if let (Some(o), Some(n)) = (old.as_table_like_mut(), new.as_table_like()) {
-            merge(o, n);
+            merge(o, n, fallback.and_then(Item::as_table_like));
         } else {
             put(dst, key, new);
         }
+    }
+}
+
+/// A key the file does not have is written only where it differs from the default, so a
+/// minimal file stays minimal and keeps following future defaults.
+fn insert_changed(dst: &mut dyn TableLike, key: &str, new: &Item, default: Option<&Item>) {
+    match (new, default) {
+        (Item::Table(n), Some(Item::Table(d))) => {
+            let mut t = Table::new();
+            merge(&mut t, n, Some(d));
+            if !t.is_empty() {
+                dst.insert(key, Item::Table(t));
+            }
+        }
+        (_, Some(d)) if same_item(new, d) => {}
+        _ => {
+            dst.insert(key, new.clone());
+        }
+    }
+}
+
+/// `same` for items, with `[table]` and `[[array]]` compared as their inline forms.
+fn same_item(a: &Item, b: &Item) -> bool {
+    match (a.clone().into_value(), b.clone().into_value()) {
+        (Ok(a), Ok(b)) => same(&a, &b),
+        _ => false,
     }
 }
 
@@ -262,7 +336,7 @@ fn take<T: TableLike>(pool: &mut [Option<T>], app_name: Option<&str>) -> Option<
 }
 
 fn merge_rule(dst: &mut dyn TableLike, src: &dyn TableLike) {
-    merge(dst, src);
+    merge(dst, src, None);
     for key in PasteRule::KEYS {
         if !src.contains_key(key) {
             dst.remove(key);

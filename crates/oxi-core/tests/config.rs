@@ -320,3 +320,70 @@ fn error_column_counts_characters() {
         other => panic!("expected Syntax, got {other:?}"),
     }
 }
+
+#[test]
+fn deleting_every_rule_survives_a_reload() {
+    for text in [RULES.to_owned(), architecture_sample()] {
+        let mut file = ConfigFile::parse(&text).unwrap();
+        file.config.paste.rules.clear();
+        let out = file.to_toml_string().unwrap();
+        assert!(out.contains("rules = []"), "{out}");
+        assert_eq!(ConfigFile::parse(&out).unwrap().config.paste.rules, []);
+    }
+    let empty = ConfigFile::parse("[paste]\nrules = []\n").unwrap();
+    assert_eq!(empty.config.paste.rules, []);
+}
+
+#[test]
+fn minimal_file_stays_minimal() {
+    let text = "version = 1\n[audio]\ngain_db = 1.0\n";
+    assert_eq!(
+        ConfigFile::parse(text).unwrap().to_toml_string().unwrap(),
+        text
+    );
+    // A changed key the file lacks is added alone, not with its neighbours.
+    let mut file = ConfigFile::parse(text).unwrap();
+    file.config.model.id = "base".into();
+    let out = file.to_toml_string().unwrap();
+    assert!(out.starts_with(text), "{out}");
+    assert!(out.contains("[model]\nid = \"base\"\n"), "{out}");
+    assert!(!out.contains("gpu") && !out.contains("tail_ms"), "{out}");
+    assert_eq!(ConfigFile::parse(&out).unwrap().config, file.config);
+}
+
+#[test]
+fn new_file_has_every_default() {
+    let out = ConfigFile::default().to_toml_string().unwrap();
+    assert!(out.contains("max_seconds = 600"), "{out}");
+    assert!(out.contains("app = \"mstsc.exe\""), "{out}");
+}
+
+fn lf_count_is_crlf_count(s: &str) -> bool {
+    s.matches('\n').count() == s.matches("\r\n").count()
+}
+
+#[test]
+fn crlf_and_bom_survive_a_save() {
+    let crlf = architecture_sample().replace('\n', "\r\n");
+    for text in [
+        crlf.clone(),
+        format!("\u{feff}{}", architecture_sample()),
+        format!("\u{feff}{crlf}"),
+    ] {
+        let mut file = ConfigFile::parse(&text).unwrap();
+        assert_eq!(file.config, Config::default());
+        assert_eq!(file.to_toml_string().unwrap(), text);
+        file.config.audio.gain_db = 1.5;
+        assert_eq!(
+            file.to_toml_string().unwrap(),
+            text.replacen("gain_db = 0.0", "gain_db = 1.5", 1)
+        );
+    }
+    // Lines this build adds to a CRLF file use CRLF too.
+    let mut file = ConfigFile::parse("version = 1\r\n[audio]\r\ngain_db = 1.0\r\n").unwrap();
+    file.config.model.id = "base".into();
+    file.config.audio.tail_ms = 5;
+    let out = file.to_toml_string().unwrap();
+    assert!(lf_count_is_crlf_count(&out), "{out:?}");
+    assert_eq!(ConfigFile::parse(&out).unwrap().config, file.config);
+}
