@@ -181,11 +181,21 @@ fn shot_text_notes() {
     // Over the token budget (red count and note), a line without `=>`, and the broken-config banner.
     shot_with("text-notes", Page::Text, Some(BROKEN), |l| {
         let words: Vec<String> = (0..400).map(|i| format!("word{i}")).collect();
-        fs::write(l.dictionary_file(), words.join("
-")).unwrap();
-        fs::write(l.replace_file(), "heard => wanted
+        fs::write(
+            l.dictionary_file(),
+            words.join(
+                "
+",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            l.replace_file(),
+            "heard => wanted
 no arrow here
-").unwrap();
+",
+        )
+        .unwrap();
     });
 }
 
