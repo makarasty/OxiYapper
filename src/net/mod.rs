@@ -3,9 +3,12 @@
 //! Model download: `<file>.part` with `Range` resume, SHA256 while streaming, rename on
 //! match, `.part` removed on mismatch. Every URL, redirects included, passes the host
 //! allowlist before a request is made.
-#![allow(
-    dead_code,
-    reason = "wired into the daemon in M3; only tests call it for now"
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "wired into the daemon in M3; only tests call it for now"
+    )
 )]
 
 use std::fmt;
@@ -13,9 +16,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
-use oxi_core::models::ModelEntry;
+use oxi_core::models::{ModelEntry, Stamp, stamp_file_name};
 use sha2::{Digest, Sha256};
 use ureq::Agent;
 use ureq::http::Uri;
@@ -47,12 +50,15 @@ fn host_allowed(host: &str) -> bool {
 struct Policy {
     host_ok: fn(&str) -> bool,
     https_only: bool,
+    /// Longest silence allowed between two reads; a stalled server fails instead of hanging.
+    read_timeout: Duration,
 }
 
 impl Policy {
     const PRODUCTION: Self = Self {
         host_ok: host_allowed,
         https_only: true,
+        read_timeout: Duration::from_secs(30),
     };
 
     fn check(&self, uri: &Uri) -> Result<(), DownloadError> {
@@ -70,48 +76,32 @@ impl Policy {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum DownloadError {
     /// URL (or redirect target) outside the allowlist; nothing was requested.
+    #[error("host not allowed: {0}")]
     Refused(String),
     /// Finished file does not match the registry; `.part` was removed.
-    Hash {
-        expected: String,
-        actual: String,
-    },
+    #[error("hash mismatch: expected {expected}, got {actual}")]
+    Hash { expected: String, actual: String },
     /// More bytes than the registry size; `.part` was removed.
+    #[error("server sent more bytes than the model size")]
     TooLarge,
+    #[error("download cancelled")]
     Cancelled,
     /// Status that is neither success nor a resumable condition.
+    #[error("server answered HTTP {0}")]
     Http(u16),
-    /// Connection failed or dropped; `.part` is kept for resume.
-    Network(String),
+    /// Connection failed, stalled or dropped; `.part` is kept for resume.
+    #[error("network error")]
+    Network(#[source] io::Error),
     /// Local file error (disk full included); `.part` was removed on a write failure.
-    Io(io::Error),
+    #[error("file error")]
+    Io(#[from] io::Error),
 }
 
-impl fmt::Display for DownloadError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Refused(u) => write!(f, "host not allowed: {u}"),
-            Self::Hash { expected, actual } => {
-                write!(f, "hash mismatch: expected {expected}, got {actual}")
-            }
-            Self::TooLarge => write!(f, "server sent more bytes than the model size"),
-            Self::Cancelled => write!(f, "download cancelled"),
-            Self::Http(s) => write!(f, "server answered HTTP {s}"),
-            Self::Network(e) => write!(f, "network error: {e}"),
-            Self::Io(e) => write!(f, "file error: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for DownloadError {}
-
-impl From<io::Error> for DownloadError {
-    fn from(e: io::Error) -> Self {
-        Self::Io(e)
-    }
+fn network(msg: &str) -> DownloadError {
+    DownloadError::Network(io::Error::other(msg))
 }
 
 /// What to do with a response to a request that asked to resume at `have` bytes.
@@ -177,6 +167,7 @@ fn download_with(
             .https_only(policy.https_only)
             .timeout_connect(Some(Duration::from_secs(30)))
             .timeout_recv_response(Some(Duration::from_secs(60)))
+            .timeout_per_read(Some(policy.read_timeout))
             .build(),
     );
 
@@ -212,15 +203,19 @@ fn download_with(
 
         let mut reader = resp.body_mut().as_reader();
         let mut buf = vec![0u8; CHUNK];
-        while done < entry.size {
+        // Read to the end of the body: a read can overshoot the registry size by a whole chunk.
+        loop {
             if cancel.load(Ordering::Relaxed) {
                 return Err(DownloadError::Cancelled);
             }
-            let n = reader
-                .read(&mut buf)
-                .map_err(|e| DownloadError::Network(e.to_string()))?;
+            let n = reader.read(&mut buf).map_err(DownloadError::Network)?;
             if n == 0 {
                 break;
+            }
+            if done + n as u64 > entry.size {
+                drop(file);
+                let _ = fs::remove_file(&part);
+                return Err(DownloadError::TooLarge);
             }
             if let Err(e) = file.write_all(&buf[..n]) {
                 drop(file);
@@ -231,22 +226,18 @@ fn download_with(
             done += n as u64;
             progress(done, entry.size);
         }
-        // One more byte means the server sends more than the registry says.
-        if done == entry.size && reader.read(&mut buf[..1]).unwrap_or(0) > 0 {
-            drop(file);
-            let _ = fs::remove_file(&part);
-            return Err(DownloadError::TooLarge);
-        }
         if done < entry.size {
-            return Err(DownloadError::Network("connection closed early".into()));
+            return Err(network("connection closed early"));
         }
-        file.flush()?;
+        // On disk before the rename, so a crash cannot leave a verified name on lost data.
+        file.sync_all()?;
         drop(file);
         return finish(hasher, &part, &dest, entry);
     }
 }
 
-/// Compare the digest with the registry: rename on match, delete `.part` on mismatch.
+/// Compare the digest with the registry: rename and stamp on match, delete `.part` on
+/// mismatch.
 fn finish(
     hasher: Sha256,
     part: &Path,
@@ -256,6 +247,7 @@ fn finish(
     let actual = hex(&hasher.finalize());
     if actual == entry.sha256 {
         fs::rename(part, dest)?;
+        write_stamp(dest)?;
         Ok(dest.to_path_buf())
     } else {
         let _ = fs::remove_file(part);
@@ -264,6 +256,24 @@ fn finish(
             actual,
         })
     }
+}
+
+/// `<file>.ok` next to the verified file (ARCHITECTURE 8), as `<size> <mtime_ms>`.
+fn write_stamp(file: &Path) -> io::Result<()> {
+    let meta = fs::metadata(file)?;
+    let since_epoch = meta
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?;
+    let stamp = Stamp {
+        size: meta.len(),
+        mtime_ms: u64::try_from(since_epoch.as_millis()).map_err(io::Error::other)?,
+    };
+    let name = file.file_name().unwrap_or_default().to_string_lossy();
+    fs::write(
+        file.with_file_name(stamp_file_name(&name)),
+        format!("{} {}\n", stamp.size, stamp.mtime_ms),
+    )
 }
 
 /// Lower-case hex, the form the registry stores.
@@ -307,7 +317,7 @@ fn fetch(
         }
         let resp = req
             .call()
-            .map_err(|e| DownloadError::Network(e.to_string()))?;
+            .map_err(|e| DownloadError::Network(e.into_io()))?;
         if !matches!(resp.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
             return Ok(resp);
         }
@@ -315,23 +325,24 @@ fn fetch(
             .headers()
             .get("location")
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| DownloadError::Network("redirect without Location".into()))?;
+            .ok_or_else(|| network("redirect without Location"))?;
         uri = resolve(&uri, location)?;
     }
-    Err(DownloadError::Network("too many redirects".into()))
+    Err(network("too many redirects"))
 }
 
-/// Absolute or root-relative `Location` against the current URL.
+/// Absolute, protocol-relative (`//host/x`) or root-relative `Location` against the
+/// current URL.
 fn resolve(base: &Uri, location: &str) -> Result<Uri, DownloadError> {
-    let full = if location.starts_with('/') {
+    let scheme = base.scheme_str().unwrap_or("https");
+    let full = if location.starts_with("//") {
+        format!("{scheme}:{location}")
+    } else if location.starts_with('/') {
         let authority = base
             .authority()
             .map(ToString::to_string)
             .unwrap_or_default();
-        format!(
-            "{}://{authority}{location}",
-            base.scheme_str().unwrap_or("https")
-        )
+        format!("{scheme}://{authority}{location}")
     } else {
         location.to_string()
     };
@@ -403,6 +414,7 @@ mod tests {
     const LOCAL: Policy = Policy {
         host_ok: |h| h == "127.0.0.1",
         https_only: false,
+        read_timeout: Duration::from_secs(5),
     };
 
     type Handler = Box<dyn Fn(Option<u64>) -> Vec<u8> + Send>;
@@ -505,6 +517,10 @@ mod tests {
         assert_eq!(fs::read(path).unwrap(), data);
         assert_eq!(last, (data.len() as u64, data.len() as u64));
         assert!(!dir.join("model.bin.part").exists());
+        let stamp = fs::read_to_string(dir.join("model.bin.ok")).unwrap();
+        let (size, mtime) = stamp.trim().split_once(' ').unwrap();
+        assert_eq!(size, data.len().to_string());
+        assert!(mtime.parse::<u64>().unwrap() > 0);
     }
 
     #[test]
@@ -518,6 +534,7 @@ mod tests {
         assert!(matches!(err, DownloadError::Hash { .. }), "{err}");
         assert!(!dir.join("model.bin.part").exists());
         assert!(!dir.join("model.bin").exists());
+        assert!(!dir.join("model.bin.ok").exists());
     }
 
     #[test]
@@ -632,6 +649,78 @@ mod tests {
         assert!(matches!(err, DownloadError::Cancelled), "{err}");
         let kept = fs::metadata(dir.join("model.bin.part")).unwrap().len();
         assert!(kept > 0 && kept < data.len() as u64);
+    }
+
+    #[test]
+    fn resolve_table() {
+        let base: Uri = "https://huggingface.co/a/b.bin".parse().unwrap();
+        let cases = [
+            ("https://cdn-lfs.hf.co/x", "cdn-lfs.hf.co", "/x"),
+            ("//cdn-lfs.hf.co/x", "cdn-lfs.hf.co", "/x"),
+            ("//example.com/x", "example.com", "/x"),
+            ("/real.bin", "huggingface.co", "/real.bin"),
+        ];
+        for (location, host, path) in cases {
+            let uri = resolve(&base, location).unwrap();
+            assert_eq!(uri.scheme_str(), Some("https"), "{location}");
+            assert_eq!(uri.host(), Some(host), "{location}");
+            assert_eq!(uri.path(), path, "{location}");
+        }
+    }
+
+    #[test]
+    fn oversized_body_is_refused_without_part() {
+        let data = payload();
+        let mut big = data.clone();
+        big.push(0);
+        let (port, _) = serve(vec![ok_handler(big)]);
+        let dir = tempdir("big");
+        let err = run(&entry(port, &data), &dir).unwrap_err();
+        assert!(matches!(err, DownloadError::TooLarge), "{err}");
+        assert!(!dir.join("model.bin.part").exists());
+        assert!(!dir.join("model.bin").exists());
+    }
+
+    #[test]
+    fn stalled_body_times_out_and_keeps_the_part() {
+        let data = payload();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let half = data[..100_000].to_vec();
+        let total = data.len();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n");
+            let _ = sock.write_all(head.as_bytes());
+            let _ = sock.write_all(&half);
+            // Stall: hold the socket open until the client gives up and closes it.
+            let mut sink = [0u8; 1024];
+            while sock.read(&mut sink).is_ok_and(|n| n > 0) {}
+        });
+        let dir = tempdir("stall");
+        let policy = Policy {
+            read_timeout: Duration::from_millis(300),
+            ..LOCAL
+        };
+        let entry = entry(port, &data);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread_dir = dir.clone();
+        std::thread::spawn(move || {
+            let r = download_with(
+                &policy,
+                &entry,
+                &thread_dir,
+                &mut |_, _| {},
+                &AtomicBool::new(false),
+            );
+            let _ = tx.send(r);
+        });
+        let err = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("download hung on a stalled server")
+            .unwrap_err();
+        assert!(matches!(err, DownloadError::Network(_)), "{err}");
+        assert!(dir.join("model.bin.part").exists());
     }
 
     #[test]
