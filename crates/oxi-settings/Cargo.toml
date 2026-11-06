@@ -29,6 +29,6 @@ tiny-skia.workspace = true
 [lints]
 workspace = true
 
-# Added ahead of the task that uses them (M9 settings UI); remove the entry when it does.
+# Added ahead of the task that uses it (M9 settings UI); remove the entry when it does.
 [package.metadata.cargo-machete]
-ignored = ["oxi-core", "oxi-platform", "thiserror", "rfd", "tiny-skia"]
+ignored = ["rfd"]
