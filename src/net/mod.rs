@@ -258,7 +258,7 @@ fn finish(
     }
 }
 
-/// `<file>.ok` next to the verified file (ARCHITECTURE 8), as `<size> <mtime_ms>`.
+/// `<file>.ok` next to the verified file (ARCHITECTURE 8).
 fn write_stamp(file: &Path) -> io::Result<()> {
     let meta = fs::metadata(file)?;
     let since_epoch = meta
@@ -270,10 +270,7 @@ fn write_stamp(file: &Path) -> io::Result<()> {
         mtime_ms: u64::try_from(since_epoch.as_millis()).map_err(io::Error::other)?,
     };
     let name = file.file_name().unwrap_or_default().to_string_lossy();
-    fs::write(
-        file.with_file_name(stamp_file_name(&name)),
-        format!("{} {}\n", stamp.size, stamp.mtime_ms),
-    )
+    fs::write(file.with_file_name(stamp_file_name(&name)), stamp.to_line())
 }
 
 /// Lower-case hex, the form the registry stores.
@@ -517,10 +514,9 @@ mod tests {
         assert_eq!(fs::read(path).unwrap(), data);
         assert_eq!(last, (data.len() as u64, data.len() as u64));
         assert!(!dir.join("model.bin.part").exists());
-        let stamp = fs::read_to_string(dir.join("model.bin.ok")).unwrap();
-        let (size, mtime) = stamp.trim().split_once(' ').unwrap();
-        assert_eq!(size, data.len().to_string());
-        assert!(mtime.parse::<u64>().unwrap() > 0);
+        let stamp = Stamp::parse(&fs::read_to_string(dir.join("model.bin.ok")).unwrap()).unwrap();
+        assert_eq!(stamp.size, data.len() as u64);
+        assert!(stamp.mtime_ms > 0);
     }
 
     #[test]
