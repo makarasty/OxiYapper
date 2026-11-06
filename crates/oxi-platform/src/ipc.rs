@@ -41,9 +41,10 @@ pub enum Error {
     /// squatter). Refuse to start or to talk to it; never treat it as a running daemon.
     #[error("the IPC pipe is held by another account")]
     ForeignServer,
-    /// The server is ours but below medium integrity (a sandboxed or low-integrity process).
-    #[error("OxiYapper is running with different privileges")]
-    OtherPrivileges,
+    /// The server runs as us but below medium integrity: a sandboxed or low-integrity
+    /// program squatting the name (the daemon always labels its pipe medium).
+    #[error("the OxiYapper pipe is held by an untrusted program")]
+    Untrusted,
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -77,7 +78,7 @@ pub struct Server {
 impl Server {
     /// Binds `name` (a pipe path on Windows, a socket path on Unix). A live server of this
     /// user on the name gives [`Error::AlreadyRunning`] (or [`Error::Busy`] when it frees
-    /// no instance), a squatter [`Error::ForeignServer`] or [`Error::OtherPrivileges`]; a
+    /// no instance), a squatter [`Error::ForeignServer`] or [`Error::Untrusted`]; a
     /// stale Unix socket (connect refused) is removed and bound again.
     pub fn bind(name: &str) -> Result<Self, Error> {
         let mut retried = false;
@@ -136,6 +137,7 @@ fn listen(name: &str) -> io::Result<Listener> {
 pub struct Conn {
     stream: Stream,
     dec: Decoder,
+    broken: bool,
     #[cfg(windows)]
     read_timeout: Option<Duration>,
     #[cfg(windows)]
@@ -150,6 +152,7 @@ impl Conn {
         Self {
             stream,
             dec: Decoder::new(),
+            broken: false,
             #[cfg(windows)]
             read_timeout: None,
             #[cfg(windows)]
@@ -176,7 +179,7 @@ impl Conn {
         match check_server(handle.as_handle())? {
             Verdict::Trusted => {}
             Verdict::OtherAccount => return Err(Error::ForeignServer),
-            Verdict::LowIntegrity => return Err(Error::OtherPrivileges),
+            Verdict::LowIntegrity => return Err(Error::Untrusted),
         }
         let stream = PipeStream::try_from(handle).map_err(|e| {
             e.cause
@@ -217,36 +220,56 @@ impl Conn {
         self.stream.set_send_timeout(limit)
     }
 
-    /// Writes one framed message. An `Err` may leave part of it written: drop this
-    /// connection. No flush: the local socket `flush` is a no-op and interprocess flushes
-    /// on drop.
+    /// Writes one framed message. After an `Err` part of it may be on the wire, so the
+    /// connection is poisoned: every later `send` and `recv` fails with `BrokenPipe`. No
+    /// flush: the local socket `flush` is a no-op and interprocess flushes on drop.
     pub fn send<T: Message>(&mut self, msg: &T) -> io::Result<()> {
+        self.check_broken()?;
         let line = msg.encode();
         #[cfg(windows)]
         let limit = self.write_timeout;
         #[cfg(not(windows))]
         let limit = None;
         let stream = &self.stream;
-        timed(stream, limit, || {
+        let result = timed(stream, limit, || {
             let mut stream = stream;
             stream.write_all(line.as_bytes())
-        })
+        });
+        if result.is_err() {
+            self.broken = true;
+            // Unsent bytes would make interprocess's drop wait on a FlushFileBuffers that a
+            // peer which never reads never ends, holding its linger thread.
+            #[cfg(windows)]
+            {
+                let Stream::NamedPipe(pipe) = &self.stream;
+                pipe.inner().assume_flushed();
+            }
+        }
+        result
     }
 
-    /// The next message, `None` once the peer has closed. Any `Err` (a line over
-    /// `MAX_LINE`, bad JSON: `InvalidData`; `TimedOut`) means drop this connection.
+    /// The next message, `None` once the peer has closed. The read timeout covers the whole
+    /// call, however the peer splits the line. Any `Err` (a line over `MAX_LINE`, bad JSON:
+    /// `InvalidData`; `TimedOut`) means drop this connection.
     pub fn recv<T: Message>(&mut self) -> io::Result<Option<T>> {
+        self.check_broken()?;
         let mut buf = [0u8; 16 * 1024];
+        // shortcut: on Unix the socket timeout applies per read; make it per call when the
+        // Unix module lands.
         #[cfg(windows)]
-        let limit = self.read_timeout;
+        let deadline = self.read_timeout.map(|limit| Instant::now() + limit);
         #[cfg(not(windows))]
-        let limit = None;
+        let deadline: Option<Instant> = None;
         loop {
             if let Some(msg) = T::decode(&mut self.dec) {
                 return Ok(Some(msg?));
             }
+            let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+            if left == Some(Duration::ZERO) {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "IPC I/O timed out"));
+            }
             let stream = &self.stream;
-            match timed(stream, limit, || {
+            match timed(stream, left, || {
                 let mut stream = stream;
                 stream.read(&mut buf)
             })? {
@@ -254,6 +277,16 @@ impl Conn {
                 n => self.dec.push(&buf[..n]),
             }
         }
+    }
+
+    fn check_broken(&self) -> io::Result<()> {
+        if self.broken {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "IPC connection dropped after a failed send",
+            ));
+        }
+        Ok(())
     }
 }
 

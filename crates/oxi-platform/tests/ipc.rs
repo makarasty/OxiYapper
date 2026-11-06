@@ -356,11 +356,21 @@ mod windows {
     }
 
     #[test]
-    fn low_integrity_pipe_of_ours_is_other_privileges() {
-        let n = name("lowil");
+    fn low_integrity_pipe_of_ours_untrusted() {
+        type Call = fn(&str) -> Result<(), Error>;
         let sid = user_sid().unwrap();
-        let _squatter = pipe_with(&n, &format!("O:{sid}D:P(A;;GA;;;{sid})S:(ML;;NW;;;LW)"));
-        assert!(matches!(Client::connect(&n), Err(Error::OtherPrivileges)));
+        let low = format!("O:{sid}D:P(A;;GA;;;{sid})S:(ML;;NW;;;LW)");
+        // A fresh squatter per call: each probe takes and drops its only instance.
+        let cases: [(&str, Call); 3] = [
+            ("lowc", |n| Client::connect(n).map(drop)),
+            ("lowb", |n| Server::bind(n).map(drop)),
+            ("lowf", forward_open_settings),
+        ];
+        for (tag, call) in cases {
+            let n = name(tag);
+            let _squatter = pipe_with(&n, &low);
+            assert!(matches!(call(&n), Err(Error::Untrusted)), "{tag}");
+        }
     }
 
     #[test]
@@ -390,5 +400,96 @@ mod windows {
         let _conn = server.accept().unwrap();
         let got = rx.recv_timeout(Duration::from_secs(10));
         assert_eq!(got, Ok(Err(io::ErrorKind::TimedOut)));
+    }
+
+    /// A client whose big send timed out against a peer that never reads.
+    fn timed_out_sender(server: &Server, n: &str) -> (Client, Client) {
+        let n2 = n.to_owned();
+        let client = thread::spawn(move || {
+            let mut c = Client::connect(&n2).unwrap();
+            c.set_write_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            let big = Request::DownloadModel {
+                id: "a".repeat(4 * MAX_LINE),
+            };
+            assert_eq!(c.send(&big).unwrap_err().kind(), io::ErrorKind::TimedOut);
+            c
+        });
+        let conn = server.accept().unwrap();
+        (client.join().unwrap(), conn)
+    }
+
+    #[test]
+    fn send_after_timed_out_send_is_refused() {
+        let n = name("poison");
+        let server = Server::bind(&n).unwrap();
+        let (mut client, _conn) = timed_out_sender(&server, &n);
+        let err = client.send(&Request::Status).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            client.recv::<Push>().unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn dropping_a_timed_out_sender_does_not_stall_later_closes() {
+        let n = name("linger");
+        let server = Server::bind(&n).unwrap();
+        // The stalled peer stays alive and unread for the whole test.
+        let (client, _stalled) = timed_out_sender(&server, &n);
+        drop(client);
+        // Later connections in this process must still close.
+        let got = within(10, move || {
+            let mut conns = Vec::new();
+            for _ in 0..4 {
+                let n2 = n.clone();
+                let t = thread::spawn(move || {
+                    let mut c = Client::connect(&n2).unwrap();
+                    c.send(&Request::Status).unwrap();
+                });
+                let mut conn = server.accept().unwrap();
+                t.join().unwrap();
+                assert_eq!(conn.recv::<Request>().unwrap(), Some(Request::Status));
+                assert_eq!(conn.recv::<Request>().unwrap(), None);
+                conns.push(conn);
+            }
+            conns.len()
+        });
+        assert_eq!(got, 4);
+    }
+
+    #[test]
+    fn forward_deadline_covers_a_trickled_line() {
+        use std::io::Write;
+        let n = name("trickle");
+        let listener = pipe_with(&n, &owner_only_sddl(&user_sid().unwrap()));
+        let n2 = n.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let t = Instant::now();
+            tx.send((forward_open_settings(&n2), t.elapsed()))
+        });
+        let mut stream = listener.accept().unwrap();
+        // Read the request first, as a real daemon does: an unread dirty handle pins
+        // interprocess's linger thread (see forward_deadline_is_total_not_per_read).
+        let mut b = [0u8; 1];
+        while b[0] != b'\n' {
+            stream.read_exact(&mut b).unwrap();
+        }
+        // One byte of a never-ending line every 100 ms: each read returns, no line completes.
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(10) {
+            if let Ok((got, took)) = rx.try_recv() {
+                assert!(matches!(got, Err(Error::Io(e)) if e.kind() == io::ErrorKind::TimedOut));
+                assert!(took < Duration::from_millis(3500), "{took:?}");
+                return;
+            }
+            if stream.write_all(b" ").is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        panic!("forward_open_settings outlived its deadline");
     }
 }
