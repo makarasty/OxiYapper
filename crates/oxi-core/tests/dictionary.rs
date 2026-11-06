@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use oxi_core::dictionary::{BUDGET, build_prompt, token_count};
 use proptest::prelude::*;
 
@@ -24,8 +26,38 @@ fn counts_follow_the_whisper_cpp_split() {
 
 #[test]
 fn cyrillic_is_counted_by_bytes_like_whisper_cpp() {
-    assert!(token_count("синхрофазотрон") > 1);
-    assert!(token_count("привет, мир") >= 3);
+    // Counts from whisper_tokenize on ggml-tiny.bin (both texts are in tokenizer_regression).
+    assert_eq!(token_count("синхрофазотрон"), 8);
+    assert_eq!(token_count("привет, мир"), 4);
+}
+
+#[test]
+fn budget_is_223_tokens() {
+    // "a, a, ..., a": n lines take 2n - 1 tokens ("a", then "," and " a" per line).
+    let fits = vec!["a"; 112];
+    assert_eq!(token_count(&fits.join(", ")), 223);
+    let p = build_prompt(fits.iter().copied());
+    assert_eq!((p.tokens, p.dropped.len()), (223, 0));
+
+    // "hello" takes 2, so the same shape with 111 more lines is 224: the last one goes.
+    let over: Vec<&str> = std::iter::once("hello").chain(vec!["a"; 111]).collect();
+    assert_eq!(token_count(&over.join(", ")), 224);
+    let p = build_prompt(over.iter().copied());
+    assert_eq!((p.tokens, p.dropped.as_slice()), (222, [111].as_slice()));
+}
+
+#[test]
+fn a_long_word_is_counted_in_linear_time() {
+    let word = "x".repeat(32 * 1024);
+    let start = Instant::now();
+    let n = token_count(&word);
+    // Generous for a debug build; the quadratic search took 8-17 s here.
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(n > 0);
 }
 
 #[test]

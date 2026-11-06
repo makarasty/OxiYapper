@@ -1,12 +1,13 @@
-//! Dictionary: whisper.cpp's prompt tokenizer and the 224-token prompt budget
+//! Dictionary: whisper.cpp's prompt tokenizer and the 223-token prompt budget
 //! (ARCHITECTURE sections 7, 11 item 29 and 13).
 //!
-//! The vocab in `data/vocab/multilingual.vocab` is the multilingual token set of
-//! openai/whisper (`multilingual.tiktoken`, MIT licence, Copyright (c) 2022 `OpenAI`),
-//! read from the `ggml-tiny.bin` that whisper.cpp ships for it (same tokens). Format:
-//! the tokens as raw byte strings, deduplicated, empty one dropped, sorted
-//! byte-wise; each is one length byte followed by that many bytes (50256 tokens,
-//! about 357 KB).
+//! `data/vocab/multilingual.vocab` is openai/whisper's `multilingual.tiktoken`
+//! (MIT licence, Copyright (c) 2022 `OpenAI`, full text in `data/vocab/LICENSE`)
+//! in a compact form: each line's token base64-decoded, the empty token dropped,
+//! the byte strings sorted byte-wise, each written as one length byte followed by
+//! its bytes (50256 tokens, longest 33 bytes, 357313 bytes). whisper.cpp loads the
+//! same tokens from the model file; `oxi-whisper/tests/tokenizer_regression.rs`
+//! checks the file against `ggml-tiny.bin`.
 //!
 //! The algorithm is `tokenize` in whisper.cpp's `src/whisper.cpp`: split the bytes
 //! with a regex, then take the longest vocab entry at each position. Its regex uses
@@ -16,15 +17,26 @@
 
 use std::sync::OnceLock;
 
-/// Prompt tokens whisper.cpp keeps: half of the 448-token text context.
-pub const BUDGET: usize = 224;
+/// Prompt tokens whisper.cpp keeps: half of the 448-token text context, less one
+/// for the PREV marker it puts first. Vendored whisper.cpp (whisper-rs-sys 0.15,
+/// `src/whisper.cpp`) keeps `max_prompt_ctx - n_take0 - 1` tokens of the prompt
+/// (line 7106; `max_prompt_ctx - 1` in carry mode, line 6927) and drops the rest
+/// from the front.
+pub const BUDGET: usize = 223;
 
 const VOCAB_FILE: &[u8] = include_bytes!("../../data/vocab/multilingual.vocab");
 const CONTRACTIONS: [&[u8]; 7] = [b"'s", b"'t", b"'re", b"'ve", b"'m", b"'ll", b"'d"];
 
-/// Sorted token byte strings, parsed once from [`VOCAB_FILE`].
-fn vocab() -> &'static [&'static [u8]] {
-    static VOCAB: OnceLock<Vec<&'static [u8]>> = OnceLock::new();
+struct Vocab {
+    /// Sorted token byte strings.
+    tokens: Vec<&'static [u8]>,
+    /// Length of the longest token: no match can end further than this from its start.
+    max_len: usize,
+}
+
+/// The vocab, parsed once from [`VOCAB_FILE`].
+fn vocab() -> &'static Vocab {
+    static VOCAB: OnceLock<Vocab> = OnceLock::new();
     VOCAB.get_or_init(|| {
         let mut tokens = Vec::with_capacity(51_000);
         let mut rest = VOCAB_FILE;
@@ -35,7 +47,8 @@ fn vocab() -> &'static [&'static [u8]] {
             tokens.push(token);
             rest = tail;
         }
-        tokens
+        let max_len = tokens.iter().map(|t| t.len()).max().unwrap_or(0);
+        Vocab { tokens, max_len }
     })
 }
 
@@ -87,9 +100,10 @@ pub fn token_count(text: &str) -> usize {
         let mut at = 0;
         while at < word.len() {
             // Longest vocab entry starting at `at`; a byte nothing covers is skipped, as in whisper.cpp.
-            let end = (at + 1..=word.len())
+            // Capping the end at `max_len` keeps a long word linear, not quadratic.
+            let end = (at + 1..=word.len().min(at + vocab.max_len))
                 .rev()
-                .find(|&end| vocab.binary_search(&&word[at..end]).is_ok());
+                .find(|&end| vocab.tokens.binary_search(&&word[at..end]).is_ok());
             if let Some(end) = end {
                 count += 1;
                 at = end;

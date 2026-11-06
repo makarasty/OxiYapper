@@ -263,7 +263,7 @@ Model and GPU
 28. Disk full: download removes its `.part`; a history write is skipped; the dictation is still pasted.
 
 Text
-29. Dictionary over 224 tokens: settings shows the count with the exact whisper tokenizer and marks the lines past the limit; the daemon sends only the lines that fit, first lines win (whisper.cpp would silently drop from the front).
+29. Dictionary over 223 tokens (whisper.cpp keeps half of the 448-token text context less one slot for its PREV marker; SPEC rounds this to ~224): settings shows the count with the exact whisper tokenizer and marks the lines past the limit; the daemon sends only the lines that fit, first lines win (whisper.cpp would silently drop from the front).
 30. Empty transcript: nothing pasted, overlay "nothing heard".
 31. Hallucinated segments ("Субтитры сделал DimaTorzok", "Продолжение следует...", "Редактор субтитров ..."): segments matching the shipped list or user lines in it are dropped; empty after that = case 30.
 32. Whisper wraps mid-word with `\n`: removed without a space.
@@ -315,7 +315,7 @@ System
 Pure core (`oxi-core`, every OS, seconds):
 - State machine: table tests per transition, including every hotkey edge case above, driven with fake time. Property test: any event sequence never pastes after Esc, never runs two whisper jobs at once, always returns to Idle when events stop.
 - Text: newline strip, replace engine, hallucination filter. Property tests (proptest): replace with no rules is identity; output never contains `\n`; whole-word rules never fire inside a word. Snapshot tests (insta) over a fixture corpus of synthetic sentences (never owner text).
-- Dictionary token budget: the tokenizer in core implements whisper.cpp's greedy longest-match over the multilingual vocab; a regression test in the whisper job compares its counts with `whisper_tokenize` on the tiny model.
+- Dictionary token budget: the tokenizer in core implements whisper.cpp's greedy longest-match over the multilingual vocab; a regression test in the whisper job compares its counts with `whisper_tokenize` on the tiny model, and checks the embedded vocab and the 223-token budget (`n_text_ctx/2 - 1`) against the same model.
 - Config: a fixture per schema version migrates to current; defaults round-trip; unknown keys survive; a newer version loads read-only.
 - History retention: deletes oldest first, never deletes a non-history file (temp dir fixture).
 - Audio DSP: synthetic sine plus silence for trim, known gains for normalise, resample length and energy checks.
