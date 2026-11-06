@@ -10,6 +10,7 @@ use std::path::Path;
 use oxi_core::types::{Language, Millis};
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperError,
+    WhisperState,
 };
 
 pub use device::{Device, DeviceChoice, Picked, list_devices, pick};
@@ -32,7 +33,9 @@ pub enum Error {
 /// What a load ended up with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadInfo {
-    /// ggml device name, `None` = CPU.
+    /// ggml device name whisper runs on, `None` = CPU. `None` after a GPU choice is
+    /// the CPU fallback: per ARCHITECTURE 8 the caller then loads with
+    /// [`DeviceChoice::Cpu`] until the config or the model changes.
     pub device: Option<String>,
     /// Tray text: the named GPU was gone, or GPU init failed and CPU runs instead.
     pub warning: Option<String>,
@@ -53,49 +56,56 @@ pub struct Transcript {
 
 pub struct Engine {
     ctx: WhisperContext,
+    /// Made once per load and reused by every job.
+    state: WhisperState,
     info: LoadInfo,
 }
 
-fn open(path: &Path, gpu: Option<usize>) -> Result<WhisperContext, WhisperError> {
+fn open(path: &Path, gpu: Option<usize>) -> Result<(WhisperContext, WhisperState), WhisperError> {
     let mut params = WhisperContextParameters::new();
     params.use_gpu(gpu.is_some());
     if let Some(i) = gpu {
         params.gpu_device(i32::try_from(i).unwrap_or(0));
     }
-    WhisperContext::new_with_params(path, params)
+    let ctx = WhisperContext::new_with_params(path, params)?;
+    // The GPU backend, KV cache and compute buffers come up here, not in new_with_params.
+    let state = ctx.create_state()?;
+    Ok((ctx, state))
 }
 
 impl Engine {
-    /// Load a model on the chosen device. A GPU failure retries once on CPU.
+    /// Load a model on the chosen device. A GPU failure (backend start, weights,
+    /// KV cache or compute buffers) retries once on CPU; see [`LoadInfo::device`].
     pub fn load(path: &Path, choice: &DeviceChoice) -> Result<Self, Error> {
         let devices = list_devices();
         let picked = pick(&devices, choice);
-        let Some(index) = picked.index else {
-            let ctx = open(path, None).map_err(Error::Load)?;
-            let info = LoadInfo {
-                device: None,
-                warning: picked.warning,
-            };
-            return Ok(Self { ctx, info });
-        };
-        let name = devices[index].name.clone();
-        match open(path, Some(index)) {
-            Ok(ctx) => Ok(Self {
-                ctx,
-                info: LoadInfo {
-                    device: Some(name),
-                    warning: picked.warning,
-                },
-            }),
-            Err(gpu_err) => {
-                let ctx = open(path, None).map_err(Error::Load)?;
+        let gpu_err = match picked.index {
+            None => {
+                let (ctx, state) = open(path, None).map_err(Error::Load)?;
                 let info = LoadInfo {
                     device: None,
-                    warning: Some(format!("running on CPU: {gpu_err}")),
+                    warning: picked.warning,
                 };
-                Ok(Self { ctx, info })
+                return Ok(Self { ctx, state, info });
             }
-        }
+            Some(i) if !device::gpu_starts(i) => format!("cannot start {}", devices[i].name),
+            Some(i) => match open(path, Some(i)) {
+                Ok((ctx, state)) => {
+                    let info = LoadInfo {
+                        device: Some(devices[i].name.clone()),
+                        warning: picked.warning,
+                    };
+                    return Ok(Self { ctx, state, info });
+                }
+                Err(e) => e.to_string(),
+            },
+        };
+        let (ctx, state) = open(path, None).map_err(Error::Load)?;
+        let info = LoadInfo {
+            device: None,
+            warning: Some(format!("running on CPU: {gpu_err}")),
+        };
+        Ok(Self { ctx, state, info })
     }
 
     pub fn info(&self) -> &LoadInfo {
@@ -104,7 +114,7 @@ impl Engine {
 
     /// Transcribe 16 kHz mono f32 samples. `prompt` may be empty.
     pub fn transcribe(
-        &self,
+        &mut self,
         audio: &[f32],
         language: Language,
         prompt: &str,
@@ -125,9 +135,9 @@ impl Engine {
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
 
-        let mut state = self.ctx.create_state().map_err(Error::Run)?;
-        state.full(params, audio).map_err(Error::Run)?;
-        let segments = state
+        self.state.full(params, audio).map_err(Error::Run)?;
+        let segments = self
+            .state
             .as_iter()
             .map(|s| {
                 Ok(Segment {

@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use oxi_core::types::Language;
-use oxi_whisper::{DeviceChoice, Engine};
+use oxi_whisper::{DeviceChoice, Engine, list_devices, pick};
 
 const JFK: &str = "And so my fellow Americans, ask not what your country can do for you, \
                    ask what you can do for your country.";
@@ -87,7 +87,7 @@ fn jfk_wer_under_0_2() {
     let (Some(model), Some(audio)) = (model(), jfk()) else {
         return;
     };
-    let engine = Engine::load(&model, &DeviceChoice::Cpu).unwrap();
+    let mut engine = Engine::load(&model, &DeviceChoice::Cpu).unwrap();
     assert_eq!(engine.info().device, None);
     let t = engine.transcribe(&audio, Language::En, "").unwrap();
     let text: String = t.segments.iter().map(|s| s.text.as_str()).collect();
@@ -103,15 +103,25 @@ fn auto_device_loads_and_prompt_is_accepted() {
     let (Some(model), Some(audio)) = (model(), jfk()) else {
         return;
     };
-    let engine = Engine::load(&model, &DeviceChoice::Auto).unwrap();
-    let t = engine
-        .transcribe(&audio, Language::Auto, "Kennedy, Americans")
-        .unwrap();
-    assert!(
-        t.segments
-            .iter()
-            .any(|s| s.text.to_lowercase().contains("country"))
-    );
+    let mut engine = Engine::load(&model, &DeviceChoice::Auto).unwrap();
+    let devices = list_devices();
+    let want = pick(&devices, &DeviceChoice::Auto)
+        .index
+        .map(|i| devices[i].name.clone());
+    let info = engine.info();
+    eprintln!("device {:?}, warning {:?}", info.device, info.warning);
+    assert_eq!(info.device, want);
+    // Twice: the state made in load serves every job.
+    for _ in 0..2 {
+        let t = engine
+            .transcribe(&audio, Language::Auto, "Kennedy, Americans")
+            .unwrap();
+        assert!(
+            t.segments
+                .iter()
+                .any(|s| s.text.to_lowercase().contains("country"))
+        );
+    }
 }
 
 #[test]
