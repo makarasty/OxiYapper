@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -62,10 +62,7 @@ impl CpalCapture {
         };
         drain.thread().unpark();
         let joined = drain.join();
-        self.meter.store(Level {
-            peak: 0.0,
-            rms: 0.0,
-        });
+        self.meter.clear();
         match joined {
             Ok(result) => Ok(result?),
             Err(_) => Err(CaptureError::Thread(std::io::Error::other(
@@ -87,7 +84,7 @@ impl Capture for CpalCapture {
         device: &str,
         opts: &Audio,
         meter: LevelMeter,
-        mut on_event: impl FnMut(CaptureEvent) + Send + 'static,
+        on_event: impl FnMut(CaptureEvent) + Send + 'static,
     ) -> Result<Self, CaptureError> {
         let host = cpal::default_host();
         let named = if device.is_empty() {
@@ -110,6 +107,14 @@ impl Capture for CpalCapture {
         let pipeline = Pipeline::new(rate, opts)?;
         let (tx, rx) = RingBuffer::new(rate as usize * channels * RING_SECONDS);
         let shared = Arc::new(Shared::default());
+        // Two senders (cpal error thread, drain thread), both off the data callback.
+        let on_event = Arc::new(Mutex::new(on_event));
+        let drain_event = Arc::clone(&on_event);
+        let notify = move |event| {
+            if let Ok(mut f) = drain_event.lock() {
+                f(event);
+            }
+        };
 
         let err_shared = Arc::clone(&shared);
         let on_error = move |e: cpal::Error| {
@@ -118,8 +123,9 @@ impl Capture for CpalCapture {
                 e.kind(),
                 cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::StreamInvalidated
             ) && !err_shared.lost.swap(true, Ordering::AcqRel)
+                && let Ok(mut f) = on_event.lock()
             {
-                on_event(CaptureEvent::DeviceLost);
+                f(CaptureEvent::DeviceLost);
             }
         };
 
@@ -146,7 +152,15 @@ impl Capture for CpalCapture {
         let window = samples_for(WINDOW, rate);
         let drain = thread::Builder::new()
             .name("oxi-capture-drain".into())
-            .spawn(move || drain_loop(rx, channels, window, pipeline, &drain_shared, &drain_meter))
+            .spawn(move || {
+                let drain = Drain {
+                    channels,
+                    window,
+                    shared: &drain_shared,
+                    meter: &drain_meter,
+                };
+                drain.run(rx, pipeline, notify)
+            })
             .map_err(CaptureError::Thread)?;
         Ok(Self {
             stream: Some(stream),
@@ -213,38 +227,82 @@ where
     }
 }
 
-/// Moves the ring into `pipeline` until stopped, then drains once more so nothing captured is lost.
-fn drain_loop(
-    mut rx: Consumer<f32>,
+/// What the drain feeds; a trait only so tests can inject a failing pipeline.
+trait Sink {
+    fn push(&mut self, mono: &[f32]) -> Result<Level, AudioError>;
+    fn finish(self) -> Result<Vec<f32>, AudioError>;
+}
+
+impl Sink for Pipeline {
+    fn push(&mut self, mono: &[f32]) -> Result<Level, AudioError> {
+        Pipeline::push(self, mono)
+    }
+
+    fn finish(self) -> Result<Vec<f32>, AudioError> {
+        Pipeline::finish(self)
+    }
+}
+
+/// The drain thread's fixed inputs.
+struct Drain<'a> {
     channels: usize,
     window: usize,
-    mut pipeline: Pipeline,
-    shared: &Shared,
-    meter: &LevelMeter,
-) -> Result<Vec<f32>, AudioError> {
-    loop {
-        // Read before draining: everything pushed before `stop` is seen by the last pass.
-        let stopping = shared.stop.load(Ordering::Acquire);
-        if stopping && shared.cancel.load(Ordering::Relaxed) {
-            return Ok(Vec::new());
+    shared: &'a Shared,
+    meter: &'a LevelMeter,
+}
+
+impl Drain<'_> {
+    /// Moves the ring into `sink` until stopped, then drains once more so nothing captured is
+    /// lost. After a failed push the ring is still emptied (no overrun) but not processed.
+    fn run(
+        &self,
+        mut rx: Consumer<f32>,
+        mut sink: impl Sink,
+        mut notify: impl FnMut(CaptureEvent),
+    ) -> Result<Vec<f32>, AudioError> {
+        let mut failed = None;
+        loop {
+            // Read before draining: everything pushed before `stop` is seen by the last pass.
+            let stopping = self.shared.stop.load(Ordering::Acquire);
+            if stopping && self.shared.cancel.load(Ordering::Relaxed) {
+                return Ok(Vec::new());
+            }
+            if failed.is_some() {
+                if let Ok(chunk) = rx.read_chunk(rx.slots()) {
+                    chunk.commit_all();
+                }
+            } else if let Err(e) = drain_once(
+                &mut rx,
+                self.channels,
+                self.window,
+                &mut sink,
+                self.meter,
+                stopping,
+            ) {
+                failed = Some(e);
+                self.meter.clear();
+                notify(CaptureEvent::Failed);
+            }
+            if stopping {
+                break;
+            }
+            thread::park_timeout(DRAIN_POLL);
         }
-        drain_once(&mut rx, channels, window, &mut pipeline, meter, stopping)?;
-        if stopping {
-            break;
+        match failed {
+            Some(e) => Err(e),
+            None => sink.finish(),
         }
-        thread::park_timeout(DRAIN_POLL);
     }
-    pipeline.finish()
 }
 
 /// One pass: whole blocks of `window` frames (everything when `all`) go from the ring into
-/// `pipeline`, one window per push, and the meter gets each window's post-gain level. A part
+/// `sink`, one window per push, and the meter gets each window's post-gain level. A part
 /// window waits in the ring for the next pass.
 fn drain_once(
     rx: &mut Consumer<f32>,
     channels: usize,
     window: usize,
-    pipeline: &mut Pipeline,
+    sink: &mut impl Sink,
     meter: &LevelMeter,
     all: bool,
 ) -> Result<(), AudioError> {
@@ -264,7 +322,7 @@ fn drain_once(
     let interleaved = [a, b].concat();
     chunk.commit_all();
     for piece in downmix(&interleaved, channels).chunks(window) {
-        meter.store(pipeline.push(piece)?);
+        meter.store(sink.push(piece)?);
     }
     Ok(())
 }
@@ -378,8 +436,13 @@ mod tests {
         let shared = Shared::default();
         shared.cancel.store(cancel, Ordering::Relaxed);
         shared.stop.store(true, Ordering::Release);
-        let window = samples_for(WINDOW, RATE);
-        drain_loop(rx, 1, window, pipeline, &shared, &LevelMeter::default())
+        let drain = Drain {
+            channels: 1,
+            window: samples_for(WINDOW, RATE),
+            shared: &shared,
+            meter: &LevelMeter::default(),
+        };
+        drain.run(rx, pipeline, |_| {})
     }
 
     #[test]
@@ -390,5 +453,84 @@ mod tests {
     #[test]
     fn cancel_discards_without_processing() {
         assert_eq!(stopped_drain(true).unwrap(), Vec::<f32>::new());
+    }
+
+    /// Fails from the second push on; counts pushes.
+    struct FailingSink(Arc<AtomicU64>);
+
+    impl Sink for FailingSink {
+        fn push(&mut self, _: &[f32]) -> Result<Level, AudioError> {
+            if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                Ok(Level {
+                    peak: 0.5,
+                    rms: 0.25,
+                })
+            } else {
+                Err(AudioError::Resample("injected".into()))
+            }
+        }
+
+        fn finish(self) -> Result<Vec<f32>, AudioError> {
+            Ok(vec![1.0])
+        }
+    }
+
+    #[test]
+    fn failed_push_zeroes_meter_notifies_once_keeps_emptying_ring() {
+        const WINDOW_LEN: usize = 4;
+        const CAPACITY: usize = WINDOW_LEN * 8;
+        let pushes = Arc::new(AtomicU64::new(0));
+        let shared = Arc::new(Shared::default());
+        let meter = LevelMeter::default();
+        let (mut tx, rx) = RingBuffer::new(CAPACITY);
+        let (event_tx, events) = std::sync::mpsc::channel();
+        let wait_empty = |tx: &Producer<f32>| {
+            let start = std::time::Instant::now();
+            while tx.slots() < CAPACITY && start.elapsed() < Duration::from_secs(5) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(tx.slots(), CAPACITY, "ring emptied");
+        };
+        let worker = {
+            let (shared, meter, sink) = (
+                Arc::clone(&shared),
+                meter.clone(),
+                FailingSink(Arc::clone(&pushes)),
+            );
+            thread::spawn(move || {
+                let drain = Drain {
+                    channels: 1,
+                    window: WINDOW_LEN,
+                    shared: &shared,
+                    meter: &meter,
+                };
+                drain.run(rx, sink, |e| event_tx.send(e).unwrap())
+            })
+        };
+        // Two windows: the first push sets the meter, the second fails and clears it.
+        for _ in 0..2 * WINDOW_LEN {
+            tx.push(0.1).unwrap();
+        }
+        let event = events.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(event, CaptureEvent::Failed);
+        wait_empty(&tx);
+        assert_eq!(
+            meter.read(),
+            Level {
+                peak: 0.0,
+                rms: 0.0
+            }
+        );
+        // A full ring later is still emptied, without more pushes or events.
+        for _ in 0..CAPACITY {
+            tx.push(0.1).unwrap();
+        }
+        wait_empty(&tx);
+        shared.stop.store(true, Ordering::Release);
+        worker.thread().unpark();
+        let result = worker.join().unwrap();
+        assert!(matches!(result, Err(AudioError::Resample(_))), "{result:?}");
+        assert_eq!(pushes.load(Ordering::Relaxed), 2);
+        assert!(events.try_recv().is_err(), "one event only");
     }
 }

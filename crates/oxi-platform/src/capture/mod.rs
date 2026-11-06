@@ -41,6 +41,10 @@ impl LevelMeter {
         let bits = u64::from(level.peak.to_bits()) << 32 | u64::from(level.rms.to_bits());
         self.0.store(bits, Ordering::Relaxed);
     }
+
+    fn clear(&self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Something the daemon must react to while capture runs.
@@ -48,6 +52,9 @@ impl LevelMeter {
 pub enum CaptureEvent {
     /// The device went away mid-stream (USB unplug). What was captured is kept; `finish` still works.
     DeviceLost,
+    /// Processing failed mid-recording (sent once). The meter reads zero, the ring keeps being
+    /// emptied without processing, and `finish` returns the error.
+    Failed,
 }
 
 #[derive(Debug, Error)]
