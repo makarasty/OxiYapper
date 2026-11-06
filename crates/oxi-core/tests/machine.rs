@@ -837,3 +837,39 @@ fn machine_config_maps_the_file_settings() {
         }
     );
 }
+
+#[test]
+fn tail_does_not_hold_back_a_short_toggle_or_locked_stop() {
+    // (mode, events before the stop press, stop press ms): under 300 ms of audio either way.
+    let table = [
+        (
+            Mode::Toggle,
+            vec![(0, Event::ChordDown), (50, Event::ChordUp)],
+            250,
+        ),
+        (
+            Mode::Push,
+            vec![
+                (0, Event::ChordDown),
+                (100, Event::ChordUp),
+                (200, Event::ChordDown),
+                (300, Event::ChordUp), // double tap: locked from 200
+            ],
+            400,
+        ),
+    ];
+    for (mode, before, stop_ms) in table {
+        let mut s = tailed(mode, 100);
+        for (ms, event) in before {
+            s.at(ms, event);
+        }
+        assert_eq!(s.phase(), Phase::Recording, "{mode:?}");
+        assert_eq!(
+            s.core(stop_ms, Event::ChordDown),
+            [Effect::DiscardCapture],
+            "{mode:?}"
+        );
+        assert_eq!(s.phase(), Phase::Idle, "{mode:?}");
+        assert_eq!(s.core(stop_ms + 100, Event::Tick), [], "{mode:?}");
+    }
+}
