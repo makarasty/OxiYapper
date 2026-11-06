@@ -105,6 +105,13 @@ fn replace_rules_table() {
         ("well um um fine", "well fine"),
         // A dropped duplicate keeps the left mark, even before a closer.
         ("\"fine, um,\" he said", "\"fine,\" he said"),
+        // Only a closing quote keeps it; a bracket does not.
+        ("(fine, um,) ok", "(fine) ok"),
+        // A quote right after a closing quote closes too.
+        (
+            "he said \"she said 'no'\" um ok",
+            "he said \"she said 'no'\" ok",
+        ),
         ("\u{AB}да, ну,\u{BB} сказал", "\u{AB}да,\u{BB} сказал"),
         // A straight quote after a space opens, whatever follows it.
         ("say 'um yes'", "say 'yes'"),

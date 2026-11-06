@@ -69,11 +69,16 @@ fn is_closer(chars: &[char], i: usize) -> bool {
         || (matches!(c, '"' | '\'') && i > 0 && !chars[i - 1].is_whitespace())
 }
 
-/// `c` opens what follows it, so no space goes after it. A straight quote opens only after a
-/// space, the start, or another opener.
-fn is_opener(c: char, prev: Option<char>) -> bool {
+/// A bracket or curly quote that opens.
+fn is_open_mark(c: char) -> bool {
     matches!(c, '(' | '[' | '{' | '\u{201C}' | '\u{AB}')
-        || (matches!(c, '"' | '\'') && prev.is_none_or(|p| p.is_whitespace() || is_opener(p, None)))
+}
+
+/// `c` opens what follows it, so no space goes after it. A straight quote opens only after a
+/// space, the start, or an opening mark; after anything else, another quote included, it closes.
+fn is_opener(c: char, prev: Option<char>) -> bool {
+    is_open_mark(c)
+        || (matches!(c, '"' | '\'') && prev.is_none_or(|p| p.is_whitespace() || is_open_mark(p)))
 }
 
 /// The closer that pairs with opener `c`.
@@ -99,26 +104,29 @@ fn join_after_deletion(out: &mut String, chars: &[char], mut i: usize) -> usize 
         }
         i
     };
-    out.truncate(out.trim_end().len());
-    i = skip_space(i);
-    let mut rev = out.chars().rev();
-    let (last, prev) = (rev.next(), rev.next());
-    // At the start or after an opener the deleted word takes its separators with it.
-    if last.is_none_or(|c| is_opener(c, prev)) {
+    let left = loop {
+        out.truncate(out.trim_end().len());
+        i = skip_space(i);
+        let mut rev = out.chars().rev();
+        let (last, prev) = (rev.next(), rev.next());
+        if !last.is_none_or(|c| is_opener(c, prev)) {
+            break last.map_or(0, separator_rank);
+        }
+        // At the start or after an opener the deleted word takes its separators with it.
         while chars.get(i).is_some_and(|&c| separator_rank(c) > 0) {
             i = skip_space(i + 1);
         }
-        // A pair left empty goes too, with the space it leaves.
+        // A pair left empty goes too, with the space it leaves; then join again.
         if let (Some(open), Some(&close)) = (last, chars.get(i))
             && pair_of(open) == Some(close)
             && is_closer(chars, i)
         {
             out.pop();
-            return join_after_deletion(out, chars, i + 1);
+            i += 1;
+            continue;
         }
         return i;
-    }
-    let left = last.map_or(0, separator_rank);
+    };
     let mut dropped = false;
     while let Some(&next) = chars.get(i) {
         if !is_closer(chars, i) {
@@ -132,8 +140,9 @@ fn join_after_deletion(out: &mut String, chars: &[char], mut i: usize) -> usize 
             dropped = true;
             continue;
         }
-        if left == 1 && !dropped {
-            // A comma-like mark before a stronger mark or a closer goes.
+        // A comma-like mark before a stronger mark or a closer goes; after a dropped
+        // duplicate it stays only before a closing quote (`"fine, um," he said`).
+        if left == 1 && !(dropped && matches!(next, '"' | '\'' | '\u{201D}' | '\u{BB}')) {
             out.pop();
         }
         break;
