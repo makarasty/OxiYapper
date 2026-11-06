@@ -14,6 +14,36 @@ cpal.workspace = true
 rtrb.workspace = true
 hound.workspace = true
 thiserror.workspace = true
+tiny-skia.workspace = true
+ab_glyph.workspace = true
+interprocess.workspace = true
+directories.workspace = true
+tracing.workspace = true
+
+# Each feature is the module of the listed API in windows-sys 0.61.2 (src/Windows/Win32/...).
+[target.'cfg(windows)'.dependencies.windows-sys]
+workspace = true
+features = [
+    "Win32_Foundation",                # HWND, LPARAM, HANDLE, CloseHandle, GetLastError
+    "Win32_Security",                  # GetTokenInformation, GetSidSubAuthority, SECURITY_ATTRIBUTES
+    "Win32_Security_Authorization",    # ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW
+    "Win32_Graphics_Gdi",              # CreateDIBSection, MonitorFromWindow, GetMonitorInfoW
+    "Win32_Storage_FileSystem",        # FILE_FLAGS_AND_ATTRIBUTES for CreateNamedPipeW
+    "Win32_System_DataExchange",       # OpenClipboard, EnumClipboardFormats, GetClipboardData, SetClipboardData, EmptyClipboard, GetClipboardSequenceNumber, RegisterClipboardFormatW
+    "Win32_System_LibraryLoader",      # GetModuleHandleW
+    "Win32_System_Memory",             # GlobalAlloc, GlobalLock, GlobalSize
+    "Win32_System_Pipes",              # CreateNamedPipeW
+    "Win32_System_RemoteDesktop",      # WTSRegisterSessionNotification
+    "Win32_System_Threading",          # OpenProcess, QueryFullProcessImageNameW, OpenProcessToken
+    "Win32_UI_HiDpi",                  # GetDpiForMonitor, SetProcessDpiAwarenessContext
+    "Win32_UI_Input_KeyboardAndMouse", # SendInput, GetAsyncKeyState
+    "Win32_UI_Shell",                  # SHQueryUserNotificationState, Shell_NotifyIconW, ShellExecuteW
+    "Win32_UI_WindowsAndMessaging",    # SetWindowsHookExW, CallNextHookEx, UnhookWindowsHookEx, GetMessageW, PostThreadMessageW, KBDLLHOOKSTRUCT, GetForegroundWindow, GetWindowThreadProcessId, CreateWindowExW, UpdateLayeredWindow, CreateIconIndirect, CreatePopupMenu, TrackPopupMenu, SetTimer
+]
 
 [lints]
 workspace = true
+
+# Added ahead of the task that uses them (wave 2 platform modules); remove the entry when it does.
+[package.metadata.cargo-machete]
+ignored = ["tiny-skia", "ab_glyph", "interprocess", "directories", "tracing", "windows-sys"]

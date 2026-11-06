@@ -21,9 +21,24 @@ allow = [
     "Unlicense", # whisper-rs, whisper-rs-sys
     "CC0-1.0",
     "BSL-1.0",
+    "0BSD", # doctest-file, recvmsg (interprocess)
 ]
 # Slint (settings UI, ROADMAP M9) is "GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR ...".
-# Add an exception for the slint crates with the royalty-free licence when it lands.
+# The royalty-free licence is taken for the slint crates only; no other crate gets it.
+exceptions = [
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "slint" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "slint-build" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "slint-macros" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "i-slint-backend-selector" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "i-slint-backend-testing" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "i-slint-backend-winit" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "i-slint-common" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "i-slint-compiler" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "i-slint-core" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "i-slint-core-macros" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "i-slint-renderer-software" },
+    { allow = ["MPL-2.0"], crate = "option-ext" }, # directories -> dirs-sys; file-level copyleft, unmodified
+]
 
 [bans]
 multiple-versions = "warn"

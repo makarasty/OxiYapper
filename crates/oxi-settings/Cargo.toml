@@ -1,0 +1,34 @@
+[package]
+name = "oxi-settings"
+description = "Slint settings window and first-run wizard (software renderer, no Qt, no Skia)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[dependencies]
+oxi-core.workspace = true
+oxi-platform.workspace = true
+slint = { workspace = true, features = ["std", "compat-1-18", "backend-winit", "renderer-software", "software-renderer-systemfonts"] }
+thiserror.workspace = true
+
+# Native file dialog for "use my own .bin"; Windows only, so Linux CI pulls no GTK or portal.
+[target.'cfg(windows)'.dependencies]
+rfd.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true
+
+[dev-dependencies]
+i-slint-backend-testing.workspace = true
+tiny-skia.workspace = true
+
+[lints]
+workspace = true
+
+# Added ahead of the task that uses them (M9 settings UI); remove the entry when it does.
+[package.metadata.cargo-machete]
+ignored = ["oxi-core", "oxi-platform", "thiserror", "rfd", "tiny-skia"]
