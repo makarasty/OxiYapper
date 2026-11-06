@@ -138,14 +138,23 @@ fn content_range_start(header: Option<&str>) -> Option<u64> {
         .ok()
 }
 
-/// Download `entry` into `dest_dir` and return the verified file path. `progress` gets
+/// A verified model in place.
+#[derive(Debug)]
+pub struct Downloaded {
+    pub path: PathBuf,
+    /// Why `<file>.ok` could not be written (any stale one was removed if possible). The
+    /// model is fine; the next load only re-hashes it.
+    pub stamp_error: Option<io::Error>,
+}
+
+/// Download `entry` into `dest_dir` and return the verified file. `progress` gets
 /// `(done, total)` bytes; `cancel` stops the transfer and keeps `.part` for a later resume.
 pub fn download(
     entry: &ModelEntry,
     dest_dir: &Path,
     progress: &mut dyn FnMut(u64, u64),
     cancel: &AtomicBool,
-) -> Result<PathBuf, DownloadError> {
+) -> Result<Downloaded, DownloadError> {
     download_with(&Policy::PRODUCTION, entry, dest_dir, progress, cancel)
 }
 
@@ -155,7 +164,7 @@ fn download_with(
     dest_dir: &Path,
     progress: &mut dyn FnMut(u64, u64),
     cancel: &AtomicBool,
-) -> Result<PathBuf, DownloadError> {
+) -> Result<Downloaded, DownloadError> {
     fs::create_dir_all(dest_dir)?;
     let dest = dest_dir.join(entry.file_name);
     let part = dest_dir.join(format!("{}.part", entry.file_name));
@@ -243,12 +252,21 @@ fn finish(
     part: &Path,
     dest: &Path,
     entry: &ModelEntry,
-) -> Result<PathBuf, DownloadError> {
+) -> Result<Downloaded, DownloadError> {
     let actual = hex(&hasher.finalize());
     if actual == entry.sha256 {
         fs::rename(part, dest)?;
-        write_stamp(dest)?;
-        Ok(dest.to_path_buf())
+        let name = dest.file_name().unwrap_or_default().to_string_lossy();
+        let stamp = dest.with_file_name(stamp_file_name(&name));
+        // Best effort: failing here after the rename would make a retry download it again.
+        let stamp_error = write_stamp(dest, &stamp).err();
+        if stamp_error.is_some() {
+            let _ = fs::remove_file(&stamp);
+        }
+        Ok(Downloaded {
+            path: dest.to_path_buf(),
+            stamp_error,
+        })
     } else {
         let _ = fs::remove_file(part);
         Err(DownloadError::Hash {
@@ -259,7 +277,7 @@ fn finish(
 }
 
 /// `<file>.ok` next to the verified file (ARCHITECTURE 8).
-fn write_stamp(file: &Path) -> io::Result<()> {
+fn write_stamp(file: &Path, stamp_path: &Path) -> io::Result<()> {
     let meta = fs::metadata(file)?;
     let since_epoch = meta
         .modified()?
@@ -269,8 +287,7 @@ fn write_stamp(file: &Path) -> io::Result<()> {
         size: meta.len(),
         mtime_ms: u64::try_from(since_epoch.as_millis()).map_err(io::Error::other)?,
     };
-    let name = file.file_name().unwrap_or_default().to_string_lossy();
-    fs::write(file.with_file_name(stamp_file_name(&name)), stamp.to_line())
+    fs::write(stamp_path, stamp.to_line())
 }
 
 /// Lower-case hex, the form the registry stores.
@@ -473,7 +490,7 @@ mod tests {
         }
     }
 
-    fn run(entry: &ModelEntry, dir: &Path) -> Result<PathBuf, DownloadError> {
+    fn run(entry: &ModelEntry, dir: &Path) -> Result<Downloaded, DownloadError> {
         download_with(&LOCAL, entry, dir, &mut |_, _| {}, &AtomicBool::new(false))
     }
 
@@ -511,12 +528,24 @@ mod tests {
             &AtomicBool::new(false),
         )
         .unwrap();
-        assert_eq!(fs::read(path).unwrap(), data);
+        assert_eq!(fs::read(path.path).unwrap(), data);
         assert_eq!(last, (data.len() as u64, data.len() as u64));
         assert!(!dir.join("model.bin.part").exists());
         let stamp = Stamp::parse(&fs::read_to_string(dir.join("model.bin.ok")).unwrap()).unwrap();
         assert_eq!(stamp.size, data.len() as u64);
         assert!(stamp.mtime_ms > 0);
+    }
+
+    #[test]
+    fn unwritable_stamp_still_returns_the_model() {
+        let data = payload();
+        let (port, _) = serve(vec![ok_handler(data.clone())]);
+        let dir = tempdir("nostamp");
+        fs::create_dir(dir.join("model.bin.ok")).unwrap();
+        let got = run(&entry(port, &data), &dir).unwrap();
+        assert!(got.stamp_error.is_some());
+        assert_eq!(fs::read(got.path).unwrap(), data);
+        assert!(!dir.join("model.bin.part").exists());
     }
 
     #[test]
@@ -547,7 +576,7 @@ mod tests {
         let dir = tempdir("resume");
         fs::write(dir.join("model.bin.part"), &data[..cut]).unwrap();
         let path = run(&entry(port, &data), &dir).unwrap();
-        assert_eq!(fs::read(path).unwrap(), data);
+        assert_eq!(fs::read(path.path).unwrap(), data);
         assert!(!dir.join("model.bin.part").exists());
     }
 
@@ -558,7 +587,7 @@ mod tests {
         let dir = tempdir("norange");
         fs::write(dir.join("model.bin.part"), &data[..70_000]).unwrap();
         let path = run(&entry(port, &data), &dir).unwrap();
-        assert_eq!(fs::read(path).unwrap(), data);
+        assert_eq!(fs::read(path.path).unwrap(), data);
     }
 
     #[test]
@@ -568,7 +597,7 @@ mod tests {
         let dir = tempdir("offset");
         fs::write(dir.join("model.bin.part"), &data[..70_000]).unwrap();
         let path = run(&entry(port, &data), &dir).unwrap();
-        assert_eq!(fs::read(path).unwrap(), data);
+        assert_eq!(fs::read(path.path).unwrap(), data);
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
