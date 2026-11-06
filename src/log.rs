@@ -2,6 +2,7 @@
 // Nothing calls this until the daemon wiring lands.
 #![allow(dead_code, reason = "used by the daemon wiring")]
 
+use std::any::Any;
 use std::borrow::Cow;
 use std::panic;
 use std::path::Path;
@@ -65,10 +66,27 @@ fn install_panic_hook(guard: &Guard) {
     let shared = Guard(Arc::clone(&guard.0));
     let previous = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
-        tracing::error!("panic: {info}");
-        shared.flush();
+        tracing::error!("{}", panic_line(info.location(), info.payload()));
+        // Unwind builds keep running: dropping the worker guard would silence later logs.
+        if cfg!(panic = "abort") {
+            shared.flush();
+        }
         previous(info);
     }));
+}
+
+/// Where a panic happened and how long its message was. Never the message: a std panic such
+/// as a bad `&text[..n]` slice quotes the dictated text in it (ARCHITECTURE section 12).
+fn panic_line(location: Option<&panic::Location<'_>>, payload: &(dyn Any + Send)) -> String {
+    let len = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.len())
+        .or_else(|| payload.downcast_ref::<String>().map(String::len));
+    let at = location.map_or_else(|| "unknown location".into(), ToString::to_string);
+    match len {
+        Some(n) => format!("panic at {at}, message {n} bytes"),
+        None => format!("panic at {at}"),
+    }
 }
 
 /// Dictated text for a log line: the text itself only when `debug.log_text` is on, else its
@@ -92,6 +110,19 @@ mod tests {
         assert_eq!(hidden, "[6 chars]");
         assert!(!hidden.contains("секрет"));
         assert_eq!(text_for_log("", false), "[0 chars]");
+    }
+
+    #[test]
+    fn panic_line_has_location_and_length_but_not_the_message() {
+        let payload = String::from("byte index 3 is not a char boundary in секрет");
+        let line = panic_line(Some(panic::Location::caller()), &payload);
+        assert!(line.contains("log.rs"), "{line}");
+        assert!(
+            line.contains(&format!("message {} bytes", payload.len())),
+            "{line}"
+        );
+        assert!(!line.contains("секрет"), "{line}");
+        assert_eq!(panic_line(None, &42_u8), "panic at unknown location");
     }
 
     #[test]

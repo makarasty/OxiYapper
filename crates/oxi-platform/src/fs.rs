@@ -11,7 +11,7 @@ fn tmp_path(path: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
-/// Create `tmp`, let `write` fill it, `sync_all`, rename it over `path`. On any error `tmp` is
+/// Create `tmp`, let `write` fill it, `sync_all`, rename it over `path`, sync the directory (Unix). On any error `tmp` is
 /// removed and an existing `path` is untouched. Shared by `write_atomic` and the wav writer
 /// (which uses the `.part` name).
 pub fn write_via<E: From<io::Error>>(
@@ -22,12 +22,30 @@ pub fn write_via<E: From<io::Error>>(
     let mut file = File::create(tmp)?;
     let result = write(&mut file)
         .and_then(|()| Ok(file.sync_all()?))
-        .and_then(|()| Ok(fs::rename(tmp, path)?));
+        .and_then(|()| Ok(fs::rename(tmp, path)?))
+        .and_then(|()| Ok(sync_parent(path)?));
     if result.is_err() {
         drop(file);
         let _ = fs::remove_file(tmp);
     }
     result
+}
+
+/// Make the rename itself durable.
+#[cfg(unix)]
+fn sync_parent(path: &Path) -> io::Result<()> {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    File::open(dir.unwrap_or_else(|| Path::new(".")))?.sync_all()
+}
+
+/// Windows has no directory handle to sync.
+#[cfg(not(unix))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "same signature as the Unix version"
+)]
+fn sync_parent(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// Replace `path` with `bytes` through `<path>.tmp`: a crash leaves the old or the new file, never half.
