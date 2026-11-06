@@ -111,7 +111,7 @@ fn wire_shape_snapshots() {
 
 #[test]
 fn names_come_from_app_name() {
-    assert_eq!(pipe_name("S-1-5-21-1"), r"\.\pipe\OxiYapper-S-1-5-21-1");
+    assert_eq!(pipe_name("S-1-5-21-1"), r"\\.\pipe\OxiYapper-S-1-5-21-1");
     assert_eq!(socket_file(), "OxiYapper.sock");
 }
 
@@ -180,6 +180,18 @@ fn line_of_max_len_passes_one_byte_more_is_refused() {
         d.decode::<Request>(),
         Some(Err(DecodeError::TooLong))
     ));
+    assert!(d.decode::<Request>().is_none());
+}
+
+#[test]
+fn line_of_max_len_with_crlf_split_between_pushes_passes() {
+    let mut d = Decoder::new();
+    let mut first = padded(MAX_LINE);
+    first.push(b'\r');
+    d.push(&first);
+    assert!(d.decode::<Request>().is_none());
+    d.push(b"\n");
+    assert_eq!(d.decode::<Request>().unwrap().unwrap(), Request::Status);
     assert!(d.decode::<Request>().is_none());
 }
 

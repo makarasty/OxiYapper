@@ -105,9 +105,9 @@ pub enum Push {
     },
 }
 
-/// Windows named pipe for one user: `\.\pipe\OxiYapper-<SID>`.
+/// Windows named pipe for one user: `\\.\pipe\OxiYapper-<SID>`.
 pub fn pipe_name(user_sid: &str) -> String {
-    format!(r"\.\pipe\{APP_NAME}-{user_sid}")
+    format!(r"\\.\pipe\{APP_NAME}-{user_sid}")
 }
 
 /// File name of the Unix socket (`OxiYapper.sock`); the platform picks its 0700 directory.
@@ -163,7 +163,10 @@ impl Decoder {
     pub fn decode<T: DeserializeOwned>(&mut self) -> Option<Result<T, DecodeError>> {
         loop {
             let Some(end) = self.buf.iter().position(|&b| b == b'\n') else {
-                if self.buf.len() <= MAX_LINE {
+                // A full-length line may end in the `\r` of a CRLF whose `\n` is still to come.
+                if self.buf.len() <= MAX_LINE
+                    || (self.buf.len() == MAX_LINE + 1 && self.buf.last() == Some(&b'\r'))
+                {
                     return None;
                 }
                 // No newline and already too long: refuse now, never buffer unbounded.
