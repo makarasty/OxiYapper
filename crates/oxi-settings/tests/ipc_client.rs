@@ -29,6 +29,7 @@ fn options(name: &str, grace: Duration, spawn: impl Fn() + Send + 'static) -> Op
             Ok(())
         }),
         grace,
+        exit_wait: Duration::from_secs(2),
     }
 }
 
@@ -99,21 +100,26 @@ fn hello_then_pushes_and_requests() {
     assert_eq!(daemon.join().unwrap(), Some(Request::Status));
 }
 
-#[test]
-fn mismatch_shows_the_update_banner_and_restart_shuts_the_daemon_down() {
-    let n = name("mismatch");
-    let server = Server::bind(&n).unwrap();
-    let daemon = thread::spawn(move || {
+/// A daemon of another version: answers `Hello` with `PROTO + 1`, then reads until `Shutdown`.
+/// Returns the first request after `Hello`; the server is handed back so the caller decides
+/// when the name goes away.
+fn old_daemon(server: Server) -> thread::JoinHandle<(Server, Option<Request>)> {
+    thread::spawn(move || {
         let mut conn = server.accept().unwrap();
         ack(&mut conn, PROTO + 1);
         // The window must not send anything else to a daemon of another version.
         let first = conn.recv::<Request>().unwrap();
         (server, first)
-    });
-    let spawned = Arc::new(AtomicUsize::new(0));
-    let count = spawned.clone();
+    })
+}
+
+#[test]
+fn mismatch_shows_the_update_banner_and_restart_waits_for_the_old_daemon_to_unbind() {
+    let n = name("mismatch");
+    let daemon = old_daemon(Server::bind(&n).unwrap());
+    let (spawned, spawned_at) = mpsc::channel();
     let (tx, events) = start(options(&n, Duration::from_millis(200), move || {
-        count.fetch_add(1, Ordering::SeqCst);
+        spawned.send(Instant::now()).unwrap();
     }));
     let shown = until(&events, |e| matches!(e, Event::Link(Link::Mismatch { .. })));
     assert_eq!(
@@ -125,10 +131,37 @@ fn mismatch_shows_the_update_banner_and_restart_shuts_the_daemon_down() {
     );
     tx.send(Cmd::Send(Request::Status)).unwrap();
     tx.send(Cmd::Restart).unwrap();
+    let (server, first) = daemon.join().unwrap();
+    assert_eq!(first, Some(Request::Shutdown));
+    // The old daemon closed the connection but keeps the name a little longer.
+    thread::sleep(Duration::from_millis(600));
+    assert!(
+        spawned_at.try_recv().is_err(),
+        "spawned while the name was held"
+    );
+    let freed = Instant::now();
+    drop(server);
+    let at = spawned_at.recv_timeout(Duration::from_secs(4)).unwrap();
+    assert!(at >= freed);
+}
+
+#[test]
+fn restart_that_never_frees_the_name_says_so_and_spawns_nothing() {
+    let n = name("stuck");
+    let daemon = old_daemon(Server::bind(&n).unwrap());
+    let (spawned, spawned_at) = mpsc::channel();
+    let mut o = options(&n, Duration::from_millis(200), move || {
+        spawned.send(Instant::now()).unwrap();
+    });
+    o.exit_wait = Duration::from_millis(300);
+    let (tx, events) = start(o);
+    until(&events, |e| matches!(e, Event::Link(Link::Mismatch { .. })));
+    tx.send(Cmd::Restart).unwrap();
+    let stuck = until(&events, link(Link::Stuck));
+    assert_eq!(notice(&stuck).unwrap().action, Some(Action::Start));
+    assert!(spawned_at.try_recv().is_err());
     let (_server, first) = daemon.join().unwrap();
     assert_eq!(first, Some(Request::Shutdown));
-    until(&events, link(Link::Connecting));
-    assert_eq!(spawned.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -178,6 +211,32 @@ fn dropped_connection_shows_not_running_and_reconnects() {
     until(&events, link(Link::Online));
     drop(tx);
     daemon.join().unwrap();
+}
+
+#[test]
+fn a_daemon_quit_while_connected_is_not_relaunched() {
+    let n = name("quit");
+    let server = Server::bind(&n).unwrap();
+    let daemon = thread::spawn(move || {
+        let mut conn = server.accept().unwrap();
+        ack(&mut conn, PROTO);
+        // Quit from the tray: the connection closes and the name goes away.
+        drop(conn);
+        drop(server);
+    });
+    let (spawned, spawned_at) = mpsc::channel();
+    let (tx, events) = start(options(&n, Duration::from_millis(200), move || {
+        spawned.send(()).unwrap();
+    }));
+    until(&events, link(Link::Online));
+    let off = until(&events, link(Link::Offline));
+    assert_eq!(notice(&off).unwrap().action, Some(Action::Start));
+    daemon.join().unwrap();
+    // Several reconnect attempts later: still offline, nothing started.
+    assert!(events.recv_timeout(Duration::from_millis(1200)).is_err());
+    assert!(spawned_at.try_recv().is_err());
+    tx.send(Cmd::Start).unwrap();
+    spawned_at.recv_timeout(Duration::from_secs(4)).unwrap();
 }
 
 #[test]

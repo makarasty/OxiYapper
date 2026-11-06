@@ -15,10 +15,12 @@ use std::time::{Duration, Instant};
 use oxi_core::ipc::{PROTO, Push, Request};
 use oxi_platform::ipc::{Client, Error, default_name};
 
-/// How long the worker waits on the pipe before it looks at the commands again.
+/// How long the worker waits on the pipe before it looks at the commands again. Pushes wake
+/// it at once; only a request from a page can wait this long (the first one after idle), and
+/// each wait costs a watchdog thread in `Conn::recv` on Windows.
 // shortcut: `Conn` cannot be split into a reader and a writer, so a timed-out `recv` is
 // retried instead of dropping the connection; split it in oxi-platform if the latency matters.
-const POLL: Duration = Duration::from_millis(100);
+const POLL: Duration = Duration::from_millis(250);
 /// `Hello` write and reply, and the wait for the old daemon to close on a restart.
 const REPLY_WAIT: Duration = Duration::from_secs(2);
 const MIN_BACKOFF: Duration = Duration::from_millis(250);
@@ -40,6 +42,8 @@ pub enum Link {
     },
     /// The pipe exists but nothing answers in time.
     Busy,
+    /// A restart closed the old daemon's connection but its pipe never freed up.
+    Stuck,
     /// A low-integrity program holds the pipe. Nothing is sent to it.
     Untrusted,
     /// Another account holds the pipe. Nothing is sent to it.
@@ -90,6 +94,10 @@ pub fn notice(event: &Event) -> Option<Notice> {
             Some(Action::Restart),
         ),
         Event::Link(Link::Busy) => ("OxiYapper is running but not answering".to_owned(), None),
+        Event::Link(Link::Stuck) => (
+            "The old OxiYapper did not exit. Quit it from the tray, then press Start.".to_owned(),
+            Some(Action::Start),
+        ),
         Event::Link(Link::Untrusted) => (
             "The OxiYapper pipe is held by an untrusted program. Not connecting.".to_owned(),
             None,
@@ -115,6 +123,8 @@ pub struct Options {
     pub spawn: Box<dyn Fn() -> io::Result<()> + Send>,
     /// How long to keep retrying after `spawn` before reporting [`Link::Offline`].
     pub grace: Duration,
+    /// How long a restart waits for the old daemon's pipe to go away before it gives up.
+    pub exit_wait: Duration,
 }
 
 impl Options {
@@ -124,6 +134,7 @@ impl Options {
             name: default_name()?,
             spawn: Box::new(spawn_daemon),
             grace: Duration::from_secs(2),
+            exit_wait: Duration::from_secs(3),
         })
     }
 }
@@ -185,6 +196,8 @@ fn run(o: &Options, rx: &Receiver<Cmd>, out: &Out<impl Fn(Event)>) {
         match open(&o.name) {
             Ok((mut conn, daemon_proto)) => {
                 backoff = MIN_BACKOFF;
+                // From now on a missing daemon was quit on purpose: show Start, never relaunch.
+                launched = true;
                 let mismatch = daemon_proto != PROTO;
                 out.set(if mismatch {
                     Link::Mismatch { daemon_proto }
@@ -194,8 +207,14 @@ fn run(o: &Options, rx: &Receiver<Cmd>, out: &Out<impl Fn(Event)>) {
                 match serve(&mut conn, rx, &out.post, mismatch) {
                     Served::Stopped => return,
                     Served::Restart => {
-                        launch(o, &mut grace);
                         out.set(Link::Connecting);
+                        // A new daemon started while the old one still holds the name would
+                        // find it, forward OpenSettings to it and exit.
+                        if pipe_freed(&o.name, o.exit_wait) {
+                            launch(o, &mut grace);
+                        } else {
+                            out.set(Link::Stuck);
+                        }
                     }
                     Served::Dropped => out.set(Link::Offline),
                 }
@@ -213,18 +232,16 @@ fn run(o: &Options, rx: &Receiver<Cmd>, out: &Out<impl Fn(Event)>) {
                 out.set(link);
             }
         }
-        let pause = if in_grace(grace) {
-            STARTUP_RETRY
-        } else {
-            backoff
-        };
+        let graced = in_grace(grace);
+        let pause = if graced { STARTUP_RETRY } else { backoff };
         match wait(rx, pause) {
             Waited::Stopped => return,
             Waited::Start => {
                 launch(o, &mut grace);
                 out.set(Link::Connecting);
             }
-            Waited::Elapsed => backoff = (backoff * 2).min(MAX_BACKOFF),
+            Waited::Elapsed if !graced => backoff = (backoff * 2).min(MAX_BACKOFF),
+            Waited::Elapsed => {}
         }
     }
 }
@@ -238,6 +255,25 @@ fn launch(o: &Options, grace: &mut Option<Instant>) {
     // channel for the reason yet.
     let _ = (o.spawn)();
     *grace = Some(Instant::now() + o.grace);
+}
+
+/// Polls until no server answers on `name`, at most `limit`.
+fn pipe_freed(name: &str, limit: Duration) -> bool {
+    let end = Instant::now() + limit;
+    loop {
+        match Client::connect(name) {
+            Err(Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                return true;
+            }
+            _ if Instant::now() >= end => return false,
+            _ => thread::sleep(Duration::from_millis(50)),
+        }
+    }
 }
 
 enum Waited {
@@ -299,7 +335,8 @@ enum Served {
 fn is_transient(e: &io::Error) -> bool {
     matches!(
         e.kind(),
-        io::ErrorKind::TimedOut | io::ErrorKind::InvalidData
+        // WouldBlock is how a Unix socket timeout reads.
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock | io::ErrorKind::InvalidData
     )
 }
 
@@ -483,5 +520,17 @@ mod tests {
         let n = notice(&Event::Link(Link::Untrusted)).unwrap();
         assert!(n.text.contains("untrusted") && n.action.is_none());
         assert!(notice(&Event::Link(Link::Online)).is_none());
+    }
+
+    #[test]
+    fn unix_and_windows_read_timeouts_are_transient() {
+        for (kind, transient) in [
+            (io::ErrorKind::TimedOut, true),
+            (io::ErrorKind::WouldBlock, true),
+            (io::ErrorKind::InvalidData, true),
+            (io::ErrorKind::BrokenPipe, false),
+        ] {
+            assert_eq!(is_transient(&io::Error::from(kind)), transient, "{kind:?}");
+        }
     }
 }
