@@ -19,7 +19,7 @@ env:
 # Branch protection requires one check: `ci-ok`. Gates: docs/ARCHITECTURE.md "Quality gates".
 jobs:
   hygiene:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,16 +41,19 @@ jobs:
       - run: cargo deny --locked check
 
   clippy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install build deps
+        timeout-minutes: 10
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev libasound2-dev
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends cmake clang libclang-dev libasound2-dev
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
@@ -61,7 +64,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        os: [windows-latest, ubuntu-24.04, macos-latest]
     env:
       CARGO_TARGET_DIR: ${{ matrix.os == 'windows-latest' && 'C:/t' || 'target' }}
     steps:
@@ -78,16 +81,19 @@ jobs:
       - run: cargo nextest run --locked --profile ci -p oxi-core
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install build deps
+        timeout-minutes: 10
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev libasound2-dev
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends cmake clang libclang-dev libasound2-dev
       - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-nextest
@@ -106,8 +112,7 @@ jobs:
         include:
           # timeout ~2x the cold (no cache) run measured on 2026-11-06.
           - { os: windows-latest, feature: vulkan, timeout: 25 } # 10 min cold
-          - { os: ubuntu-latest, feature: vulkan, timeout: 15 }  # 4 min cold build, apt aside
-          - { os: macos-latest, feature: metal, timeout: 25 }    # not measured yet (no runner on the first run)
+          - { os: ubuntu-24.04, feature: vulkan, timeout: 15 }  # 4 min cold build, apt aside
     env:
       # Windows: a long target path breaks the nested vulkan-shaders-gen build (MAX_PATH).
       CARGO_TARGET_DIR: ${{ matrix.os == 'windows-latest' && 'C:/t' || 'target' }}
@@ -139,6 +144,21 @@ jobs:
         shell: bash
         run: "\"$CARGO_TARGET_DIR/release/oxi-yapper\" --version"
 
+  # Informational until ROADMAP M12 (macOS): on 2026-11-06 two runs in a row never got a
+  # macos-latest runner for this job ("not acquired"), which would make ci-ok fail at random.
+  build-macos:
+    runs-on: macos-latest
+    timeout-minutes: 25 # not measured yet
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: metal
+      - run: cargo build --locked --release --features metal
+      - run: target/release/oxi-yapper --version
+
   # Informational until the Vulkan-vs-CUDA measurement (ROADMAP M5) keeps or drops CUDA.
   # Kept out of ci-ok: a job-level continue-on-error inside the build matrix hid a cancelled macOS leg.
   build-cuda:
@@ -166,7 +186,7 @@ jobs:
   ci-ok:
     if: always()
     needs: [hygiene, clippy, core, test, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: All gates passed

@@ -25,7 +25,7 @@ jobs:
         include:
           - { os: windows-latest, feature: vulkan, target: windows-x86_64-vulkan }
           - { os: windows-latest, feature: cuda, target: windows-x86_64-cuda }
-          - { os: ubuntu-latest, feature: vulkan, target: linux-x86_64-vulkan }
+          - { os: ubuntu-24.04, feature: vulkan, target: linux-x86_64-vulkan }
           - { os: macos-latest, feature: metal, target: macos-aarch64-metal }
     env:
       CARGO_TARGET_DIR: ${{ startsWith(matrix.os, 'windows') && 'C:/t' || 'target' }}
@@ -82,7 +82,7 @@ jobs:
 
   publish:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: write
