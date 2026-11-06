@@ -1,15 +1,17 @@
-//! Real Windows clipboard. Runs only with `OXI_CLIPBOARD_TEST=1`. Each test puts back the
-//! clipboard it found, and its own data carries the history-exclusion formats (no Win+V entries).
+//! Real Windows clipboard. Runs only with `OXI_CLIPBOARD_TEST=1`. Each test first saves the
+//! clipboard it found and puts it back on drop; its own data carries
+//! `ExcludeClipboardContentFromMonitorProcessing`, so it never reaches Win+V history.
 #![cfg(windows)]
 
-use std::ptr::null_mut;
+use std::ptr::{null, null_mut};
 use std::sync::mpsc;
 use std::thread::{self, sleep};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use oxi_core::paste::{ClipError, Clipboard, Snap};
 use oxi_platform::os::clipboard::{Saved, WinClipboard};
 use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Graphics::Gdi::{CloseEnhMetaFile, CreateEnhMetaFileW};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
     SetClipboardData,
@@ -17,12 +19,15 @@ use windows_sys::Win32::System::DataExchange::{
 use windows_sys::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
-use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
-use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, HWND_MESSAGE};
+use windows_sys::Win32::System::Ole::{CF_ENHMETAFILE, CF_UNICODETEXT};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DestroyWindow, DispatchMessageW, HWND_MESSAGE, MSG, PM_REMOVE, PeekMessageW,
+};
 use windows_sys::w;
 
+const EXCLUDE_MONITOR: &str = "ExcludeClipboardContentFromMonitorProcessing";
 const EXCLUDE: [&str; 3] = [
-    "ExcludeClipboardContentFromMonitorProcessing",
+    EXCLUDE_MONITOR,
     "CanIncludeInClipboardHistory",
     "CanUploadToCloudClipboard",
 ];
@@ -52,7 +57,10 @@ impl UserClipboard {
 impl Drop for UserClipboard {
     fn drop(&mut self) {
         if let Some(saved) = self.0.take() {
-            WinClipboard::new().unwrap().restore(saved).unwrap();
+            let put_back = WinClipboard::new().and_then(|mut c| c.restore(saved));
+            if let Err(err) = put_back {
+                eprintln!("could not put the user's clipboard back: {err}");
+            }
         }
     }
 }
@@ -65,13 +73,35 @@ fn register(name: &str) -> u32 {
     id
 }
 
+fn message_window() -> HWND {
+    // SAFETY: a message-only window of the predefined STATIC class; callers destroy it.
+    let window = unsafe {
+        CreateWindowExW(
+            0,
+            w!("STATIC"),
+            null(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            null_mut(),
+            null_mut(),
+            null(),
+        )
+    };
+    assert!(!window.is_null());
+    window
+}
+
 /// Opens the clipboard on this thread; other apps may hold it for a moment.
 fn open() {
     open_as(null_mut());
 }
 
 fn open_as(owner: HWND) {
-    for _ in 0..50 {
+    for _ in 0..100 {
         // SAFETY: `owner` is null or a live window of this thread; every caller closes it.
         if unsafe { OpenClipboard(owner) } != 0 {
             return;
@@ -92,7 +122,7 @@ fn put_raw(formats: &[(u32, &[u8])]) {
     // SAFETY: the clipboard is open on this thread.
     assert_ne!(unsafe { EmptyClipboard() }, 0);
     for &(format, bytes) in formats {
-        // SAFETY: a fresh block of `len` bytes, filled while locked, then given to the clipboard.
+        // SAFETY: a fresh non-empty block, filled while locked, then given to the clipboard.
         unsafe {
             let mem = GlobalAlloc(GMEM_MOVEABLE, bytes.len());
             assert!(!mem.is_null());
@@ -152,24 +182,29 @@ fn set_marks_exclusion_and_restore_brings_back_every_format_byte_for_byte() {
     let _user = UserClipboard::save();
     let text = u32::from(CF_UNICODETEXT);
     let custom = register("OxiYapper.ClipboardLiveTest");
+    let history = register("CanIncludeInClipboardHistory");
     let original_text = utf16z("oxi clipboard test: before");
     let original_custom: Vec<u8> = (0..=255).collect();
-    let zero = 0u32.to_ne_bytes();
-    let mut setup = vec![
-        (text, original_text.as_slice()),
-        (custom, original_custom.as_slice()),
-    ];
-    setup.extend(EXCLUDE.map(|n| (register(n), zero.as_slice())));
-    put_raw(&setup);
+    // The original allows history; ours must not (item 40). Cloud upload is not set at all.
+    put_raw(&[
+        (register(EXCLUDE_MONITOR), &0u32.to_ne_bytes()),
+        (history, &1u32.to_ne_bytes()),
+        (text, &original_text),
+        (custom, &original_custom),
+    ]);
 
     let mut clip = WinClipboard::new().unwrap();
     let Snap::Complete(saved) = clip.snapshot() else {
-        panic!("snapshot of text plus a custom format is not complete");
+        panic!("snapshot of text plus custom formats is not complete");
     };
     let before = clip.sequence();
     let seq = clip.set_text("oxi clipboard test: after").unwrap();
     assert_ne!(seq, before, "set_text did not change the sequence number");
-    assert_eq!(seq, clip.sequence());
+    assert_eq!(
+        seq,
+        clip.sequence(),
+        "the close changed the sequence number"
+    );
     assert_eq!(read_raw(text), Some(utf16z("oxi clipboard test: after")));
     assert_eq!(read_raw(custom), None);
     assert_excluded();
@@ -180,42 +215,26 @@ fn set_marks_exclusion_and_restore_brings_back_every_format_byte_for_byte() {
     assert_excluded();
 }
 
-#[test]
-fn clipboard_held_open_by_another_thread_is_locked() {
-    if !clipboard_test() {
-        return;
-    }
-    // Put back if the clipboard is not locked after all and `set_text` overwrites it.
+/// Holds the clipboard open on another thread (with `owner_window` or a null owner) while
+/// snapshot and `set_text` run; both must see it locked.
+fn locked_while_held(owner_window: bool) {
     let _user = UserClipboard::save();
     let (opened_tx, opened_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel::<()>();
-    // Another app holds the clipboard through its window: a null-owner open from a second
-    // thread of the same process does not lock it.
     let holder = thread::spawn(move || {
-        // SAFETY: a message-only window of the predefined STATIC class, destroyed below.
-        let window = unsafe {
-            CreateWindowExW(
-                0,
-                w!("STATIC"),
-                null_mut(),
-                0,
-                0,
-                0,
-                0,
-                0,
-                HWND_MESSAGE,
-                null_mut(),
-                null_mut(),
-                null_mut(),
-            )
+        let window = if owner_window {
+            message_window()
+        } else {
+            null_mut()
         };
-        assert!(!window.is_null());
         open_as(window);
         opened_tx.send(()).unwrap();
         let _ = release_rx.recv();
         close();
-        // SAFETY: created on this thread above.
-        unsafe { DestroyWindow(window) };
+        if owner_window {
+            // SAFETY: created on this thread above.
+            unsafe { DestroyWindow(window) };
+        }
     });
     opened_rx.recv().unwrap();
     let mut clip = WinClipboard::new().unwrap();
@@ -225,4 +244,98 @@ fn clipboard_held_open_by_another_thread_is_locked() {
     holder.join().unwrap();
     assert!(matches!(snap, Snap::Locked), "snapshot gave {snap:?}");
     assert_eq!(set, Err(ClipError::Locked));
+}
+
+#[test]
+fn clipboard_held_through_a_window_is_locked() {
+    if clipboard_test() {
+        locked_while_held(true);
+    }
+}
+
+#[test]
+fn clipboard_held_with_a_null_owner_is_locked() {
+    if clipboard_test() {
+        locked_while_held(false);
+    }
+}
+
+#[test]
+fn a_lone_metafile_is_incomplete() {
+    if !clipboard_test() {
+        return;
+    }
+    let _user = UserClipboard::save();
+    // SAFETY: an empty in-memory metafile; the clipboard owns the handle once it is set.
+    unsafe {
+        let hdc = CreateEnhMetaFileW(null_mut(), null(), null(), null());
+        assert!(!hdc.is_null());
+        let emf = CloseEnhMetaFile(hdc);
+        assert!(!emf.is_null());
+        open();
+        assert_ne!(EmptyClipboard(), 0);
+        assert!(!SetClipboardData(u32::from(CF_ENHMETAFILE), emf).is_null());
+        close();
+    }
+    let snap = WinClipboard::new().unwrap().snapshot();
+    assert!(matches!(snap, Snap::Incomplete), "snapshot gave {snap:?}");
+}
+
+/// Answers the messages sent to this thread's windows (here the pending `WM_RENDERFORMAT`).
+fn pump() {
+    // SAFETY: MSG is plain data; PeekMessageW fills it before DispatchMessageW reads it.
+    unsafe {
+        let mut msg: MSG = std::mem::zeroed();
+        while PeekMessageW(&raw mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+            DispatchMessageW(&raw const msg);
+        }
+    }
+}
+
+#[test]
+fn a_delayed_render_its_owner_does_not_answer_gives_up_as_incomplete() {
+    if !clipboard_test() {
+        return;
+    }
+    let _user = UserClipboard::save();
+    let delayed = register("OxiYapper.ClipboardLiveTest.Delayed");
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    // The owner promises a format, then does not pump messages until released.
+    let owner = thread::spawn(move || {
+        let window = message_window();
+        open_as(window);
+        // SAFETY: the clipboard is open by `window`; a null handle means delayed render.
+        unsafe {
+            assert_ne!(EmptyClipboard(), 0);
+            SetClipboardData(delayed, null_mut());
+        }
+        close();
+        ready_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+        while done_rx.try_recv().is_err() {
+            pump();
+            sleep(Duration::from_millis(5));
+        }
+        // SAFETY: created on this thread above.
+        unsafe { DestroyWindow(window) };
+    });
+    ready_rx.recv().unwrap();
+    let (snap_tx, snap_rx) = mpsc::channel();
+    let start = Instant::now();
+    thread::spawn(move || {
+        let snap = WinClipboard::new().unwrap().snapshot();
+        let _ = snap_tx.send(matches!(snap, Snap::Incomplete));
+    });
+    let incomplete = snap_rx.recv_timeout(Duration::from_secs(3));
+    let took = start.elapsed();
+    release_tx.send(()).unwrap();
+    // The reader that gave up closes the clipboard once the owner answers.
+    open();
+    close();
+    done_tx.send(()).unwrap();
+    owner.join().unwrap();
+    assert_eq!(incomplete, Ok(true), "snapshot did not give up");
+    assert!(took < Duration::from_secs(2), "gave up after {took:?}");
 }

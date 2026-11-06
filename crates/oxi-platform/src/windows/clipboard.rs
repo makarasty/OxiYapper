@@ -1,25 +1,32 @@
 //! Clipboard snapshot and restore (ARCHITECTURE section 10, steps 4, 5 and 7; items 37-40).
 
-use std::ptr::{copy_nonoverlapping, null_mut};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::marker::PhantomData;
+use std::ptr::{copy_nonoverlapping, null, null_mut};
+use std::sync::mpsc::{self, Sender};
+use std::thread::{self, sleep};
+use std::time::Duration;
 
 use oxi_core::paste::{
     ClipError, Clipboard, DELAYED_RENDER_TIMEOUT, OPEN_RETRIES, OPEN_RETRY_GAP, SNAPSHOT_CAP, Snap,
 };
-use windows_sys::Win32::Foundation::{GetLastError, GlobalFree, HANDLE};
+use oxi_core::types::Millis;
+use windows_sys::Win32::Foundation::{GetLastError, GlobalFree, HANDLE, HWND, SetLastError};
 use windows_sys::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
+    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardOwner,
     GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{
-    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+    GMEM_FIXED, GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
 use windows_sys::Win32::System::Ole::{
     CF_BITMAP, CF_DIB, CF_DIBV5, CF_DSPBITMAP, CF_DSPENHMETAFILE, CF_DSPMETAFILEPICT,
     CF_ENHMETAFILE, CF_GDIOBJLAST, CF_METAFILEPICT, CF_OEMTEXT, CF_OWNERDISPLAY, CF_PALETTE,
     CF_PRIVATEFIRST, CF_TEXT, CF_UNICODETEXT,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DestroyWindow, HWND_MESSAGE, IsHungAppWindow,
+};
+use windows_sys::w;
 
 /// Registered formats that keep data out of clipboard managers, Win+V history and cloud sync.
 const EXCLUDE: [&str; 3] = [
@@ -33,7 +40,8 @@ const EXCLUDE: [&str; 3] = [
 /// `CF_BITMAP` is a GDI handle and never copied, so its group is the two DIB formats.
 const SYNTH_GROUPS: [&[u16]; 2] = [&[CF_UNICODETEXT, CF_TEXT, CF_OEMTEXT], &[CF_DIB, CF_DIBV5]];
 
-/// The Windows clipboard, opened with no owner window for each call.
+/// The Windows clipboard. Each call opens it through its own message-only window, which
+/// is destroyed right after the close, so no window of ours is left to answer clipboard messages.
 #[derive(Debug)]
 pub struct WinClipboard {
     exclude: [u32; 3],
@@ -65,66 +73,76 @@ impl WinClipboard {
         Ok(Self { exclude })
     }
 
-    /// Empties the clipboard and writes `formats`, then the exclusion formats (last, so a
-    /// saved `CanIncludeInClipboardHistory` = 1 cannot override ours).
+    /// Empties the clipboard, writes the exclusion formats first (a later failure never
+    /// leaves data on it unexcluded), then `formats` minus any saved exclusion values.
+    /// Returns the sequence number after the close: the close itself bumps it (by 2 to 3 in
+    /// the live test, likely the formats synthesised then), so a number read inside never
+    /// matches a later `sequence()`. Another app writing between the close and that read
+    /// must empty the clipboard, which takes ownership from our window: then the number read
+    /// inside the open is returned, which never matches again, so no restore overwrites
+    /// their data (item 39).
     fn replace<'a>(
         &self,
         formats: impl IntoIterator<Item = (u32, &'a [u8])>,
-    ) -> Result<(), ClipError> {
-        let _open = Open::new()?;
-        // SAFETY: the clipboard is open on this thread (`_open`).
+    ) -> Result<u32, ClipError> {
+        let window = Window::new()?;
+        let open = Open::new(&window)?;
+        // SAFETY: the clipboard is open on this thread (`open`).
         if unsafe { EmptyClipboard() } == 0 {
             return Err(os_error("EmptyClipboard"));
-        }
-        for (format, bytes) in formats {
-            put(format, bytes)?;
         }
         for id in self.exclude {
             put(id, &0u32.to_ne_bytes())?;
         }
-        Ok(())
+        for (format, bytes) in formats {
+            if !self.exclude.contains(&format) {
+                put(format, bytes)?;
+            }
+        }
+        let inside = self.sequence();
+        drop(open);
+        let after = self.sequence();
+        // SAFETY: no arguments; compared as a value only.
+        let ours = unsafe { GetClipboardOwner() } == window.0;
+        Ok(if ours { after } else { inside })
     }
 }
 
 impl Clipboard for WinClipboard {
     type Snapshot = Saved;
 
+    /// Reads on a helper thread: `GetClipboardData` on a delayed-render format waits for its
+    /// owner without a time limit, so the wait here gives up after `DELAYED_RENDER_TIMEOUT`.
+    /// A helper that gave up keeps the clipboard open until the owner answers or exits (the
+    /// thread cannot be cut short); an owner Windows already marks hung is never asked.
     fn snapshot(&mut self) -> Snap<Saved> {
-        let Ok(_open) = Open::new() else {
-            return Snap::Locked;
-        };
-        let mut saved: Vec<(u32, Vec<u8>)> = Vec::new();
-        let mut room = SNAPSHOT_CAP;
-        let mut format = 0;
+        // SAFETY: no arguments; a null owner is passed on as null.
+        if unsafe { IsHungAppWindow(GetClipboardOwner()) } != 0 {
+            return Snap::Incomplete;
+        }
+        let (tx, rx) = mpsc::channel();
+        let spawned = thread::Builder::new()
+            .name("clipboard-snapshot".into())
+            .spawn(move || {
+                let snap = read_all(&tx);
+                let _ = tx.send(Step::Done(snap));
+            });
+        if spawned.is_err() {
+            return Snap::Incomplete;
+        }
+        // The open retries are bounded by OPEN_RETRIES; only the reads after it are timed.
+        let mut opened = false;
         loop {
-            // SAFETY: the clipboard is open on this thread (`_open`).
-            format = unsafe { EnumClipboardFormats(format) };
-            if format == 0 {
-                // Zero is the end with ERROR_SUCCESS, or a failure with its code.
-                // SAFETY: reads this thread's last-error value, no arguments.
-                return if unsafe { GetLastError() } == 0 {
-                    Snap::Complete(Saved(saved))
-                } else {
-                    Snap::Incomplete
-                };
-            }
-            let kept: Vec<u32> = saved.iter().map(|(f, _)| *f).collect();
-            if !copyable(format, &kept) {
-                continue;
-            }
-            let start = Instant::now();
-            // SAFETY: the clipboard is open on this thread; a delayed render runs in the owner.
-            let handle = unsafe { GetClipboardData(format) };
-            // shortcut: a slow delayed render is detected after it returns, not cut off; the
-            // wait is bounded by the system's own render timeout. Upgrade if users report hangs.
-            if handle.is_null() || start.elapsed() > duration(DELAYED_RENDER_TIMEOUT) {
-                return Snap::Incomplete;
-            }
-            let Some(bytes) = read_global(handle, room) else {
-                return Snap::Incomplete;
+            let step = if opened {
+                rx.recv_timeout(duration(DELAYED_RENDER_TIMEOUT)).ok()
+            } else {
+                rx.recv().ok()
             };
-            room -= bytes.len();
-            saved.push((format, bytes));
+            match step {
+                Some(Step::Reading) => opened = true,
+                Some(Step::Done(snap)) => return snap,
+                None => return Snap::Incomplete,
+            }
         }
     }
 
@@ -134,8 +152,7 @@ impl Clipboard for WinClipboard {
             .chain([0])
             .flat_map(u16::to_ne_bytes)
             .collect();
-        self.replace([(u32::from(CF_UNICODETEXT), bytes.as_slice())])?;
-        Ok(self.sequence())
+        self.replace([(u32::from(CF_UNICODETEXT), bytes.as_slice())])
     }
 
     fn sequence(&self) -> u32 {
@@ -145,39 +162,144 @@ impl Clipboard for WinClipboard {
 
     fn restore(&mut self, snapshot: Saved) -> Result<(), ClipError> {
         self.replace(snapshot.0.iter().map(|(f, b)| (*f, b.as_slice())))
+            .map(drop)
     }
 }
 
-/// The clipboard, open on this thread until dropped.
-struct Open;
+/// What the snapshot thread reports: about to block on the clipboard, or finished (closed).
+enum Step {
+    Reading,
+    Done(Snap<Saved>),
+}
 
-impl Open {
+/// Copies every copyable format, sending `Reading` before each call that can block on an owner.
+/// The clipboard is closed when this returns.
+fn read_all(tx: &Sender<Step>) -> Snap<Saved> {
+    let Ok(window) = Window::new() else {
+        return Snap::Incomplete;
+    };
+    let Ok(_open) = Open::new(&window) else {
+        return Snap::Locked;
+    };
+    let mut saved: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut skipped_handle = false;
+    let mut room = SNAPSHOT_CAP;
+    let mut format = 0;
+    loop {
+        if tx.send(Step::Reading).is_err() {
+            return Snap::Incomplete; // the caller gave up already
+        }
+        // SAFETY: the clipboard is open on this thread (`_open`).
+        format = unsafe { EnumClipboardFormats(format) };
+        if format == 0 {
+            // Zero is the end with ERROR_SUCCESS, or a failure with its code. A clipboard
+            // of handle formats only (a lone metafile) would restore as nothing.
+            // SAFETY: reads this thread's last-error value, no arguments.
+            let failed = unsafe { GetLastError() } != 0;
+            return if failed || (saved.is_empty() && skipped_handle) {
+                Snap::Incomplete
+            } else {
+                Snap::Complete(Saved(saved))
+            };
+        }
+        let kept: Vec<u32> = saved.iter().map(|(f, _)| *f).collect();
+        match kind(format, &kept) {
+            Kind::Handle => skipped_handle = true,
+            Kind::Synthesised => {}
+            Kind::Copy => {
+                // SAFETY: the clipboard is open on this thread; a delayed render runs in the owner.
+                let handle = unsafe { GetClipboardData(format) };
+                let Some(bytes) = (!handle.is_null())
+                    .then(|| read_global(handle, room))
+                    .flatten()
+                else {
+                    return Snap::Incomplete;
+                };
+                room -= bytes.len();
+                saved.push((format, bytes));
+            }
+        }
+    }
+}
+
+/// A message-only window, destroyed on drop. It owns the clipboard while one call has it open.
+struct Window(HWND);
+
+impl Window {
     fn new() -> Result<Self, ClipError> {
+        // SAFETY: the predefined STATIC class needs no registration; HWND_MESSAGE makes the
+        // window invisible and message-only; `Drop` destroys it on this same thread.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                w!("STATIC"),
+                null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                null_mut(),
+                null_mut(),
+                null(),
+            )
+        };
+        if hwnd.is_null() {
+            return Err(os_error("CreateWindowExW"));
+        }
+        Ok(Self(hwnd))
+    }
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        // SAFETY: created by `Window::new` on this thread and not destroyed yet.
+        unsafe { DestroyWindow(self.0) };
+    }
+}
+
+/// The clipboard, open on this thread until dropped. A null-owner open does not exclude
+/// other null-owner opens, so the open goes through a window: then another app holding the
+/// clipboard (with or without a window) makes this fail as Locked (item 37).
+/// Borrows the window so the window cannot be destroyed while the clipboard is open.
+struct Open<'w>(PhantomData<&'w Window>);
+
+impl<'w> Open<'w> {
+    fn new(window: &'w Window) -> Result<Self, ClipError> {
         for attempt in 0..OPEN_RETRIES {
             if attempt > 0 {
                 sleep(duration(OPEN_RETRY_GAP));
             }
-            // SAFETY: a null owner is allowed; `Drop` closes what this opens.
-            if unsafe { OpenClipboard(null_mut()) } != 0 {
-                return Ok(Self);
+            // SAFETY: `window` is a live window of this thread; `Drop` closes what this opens.
+            if unsafe { OpenClipboard(window.0) } != 0 {
+                return Ok(Self(PhantomData));
             }
         }
         Err(ClipError::Locked)
     }
 }
 
-impl Drop for Open {
+impl Drop for Open<'_> {
     fn drop(&mut self) {
         // SAFETY: this thread opened the clipboard in `Open::new`.
         unsafe { CloseClipboard() };
     }
 }
 
-/// Whether `format` is an HGLOBAL the owner placed itself (not a GDI handle, not owner-drawn,
-/// not synthesised from a format already in `kept`).
-fn copyable(format: u32, kept: &[u32]) -> bool {
+#[derive(Debug, PartialEq, Eq)]
+enum Kind {
+    /// An HGLOBAL the owner placed: copied.
+    Copy,
+    /// Made by the system from a format already copied: made again on restore.
+    Synthesised,
+    /// A GDI handle, owner-drawn or private format: bytes cannot be copied.
+    Handle,
+}
+
+fn kind(format: u32, kept: &[u32]) -> Kind {
     let Ok(id) = u16::try_from(format) else {
-        return false;
+        return Kind::Copy;
     };
     let handle = matches!(
         id,
@@ -190,21 +312,32 @@ fn copyable(format: u32, kept: &[u32]) -> bool {
             | CF_DSPMETAFILEPICT
             | CF_DSPENHMETAFILE
     ) || (CF_PRIVATEFIRST..=CF_GDIOBJLAST).contains(&id);
-    let synthesised = SYNTH_GROUPS
+    if handle {
+        Kind::Handle
+    } else if SYNTH_GROUPS
         .iter()
-        .any(|g| g.contains(&id) && g.iter().any(|f| kept.contains(&u32::from(*f))));
-    !handle && !synthesised
+        .any(|g| g.contains(&id) && g.iter().any(|f| kept.contains(&u32::from(*f))))
+    {
+        Kind::Synthesised
+    } else {
+        Kind::Copy
+    }
 }
 
-/// Copies an HGLOBAL's bytes, or `None` when it is bigger than `room` or cannot be locked.
+/// Copies an HGLOBAL's bytes, or `None` when it is bigger than `room` or cannot be read.
 fn read_global(handle: HANDLE, room: usize) -> Option<Vec<u8>> {
+    // GlobalSize gives 0 both for an empty block and on failure; the last error tells them apart.
     // SAFETY: `handle` came from `GetClipboardData` for an HGLOBAL format, clipboard still open.
-    let size = unsafe { GlobalSize(handle) };
+    let size = unsafe {
+        SetLastError(0);
+        GlobalSize(handle)
+    };
+    if size == 0 {
+        // SAFETY: reads this thread's last-error value, no arguments.
+        return (unsafe { GetLastError() } == 0).then(Vec::new);
+    }
     if size > room {
         return None;
-    }
-    if size == 0 {
-        return Some(Vec::new());
     }
     // SAFETY: as above; unlocked below.
     let ptr = unsafe { GlobalLock(handle) };
@@ -220,25 +353,33 @@ fn read_global(handle: HANDLE, room: usize) -> Option<Vec<u8>> {
 
 /// Puts one format on the open clipboard; the system owns the block once it is set.
 fn put(format: u32, bytes: &[u8]) -> Result<(), ClipError> {
-    // A zero-byte movable block is allocated discarded and cannot be locked: use one byte.
+    // A zero-byte movable block is allocated discarded and SetClipboardData refuses it; a
+    // zero-byte fixed one is accepted (Windows hands it back to readers as one byte).
+    let flags = if bytes.is_empty() {
+        GMEM_FIXED
+    } else {
+        GMEM_MOVEABLE
+    };
     // SAFETY: plain allocation, freed below on every failure path.
-    let mem = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1)) };
+    let mem = unsafe { GlobalAlloc(flags, bytes.len()) };
     if mem.is_null() {
         return Err(os_error("GlobalAlloc"));
     }
-    // SAFETY: `mem` is a live movable block from `GlobalAlloc`.
-    let ptr = unsafe { GlobalLock(mem) };
-    if ptr.is_null() {
-        let err = os_error("GlobalLock");
-        // SAFETY: not handed to the clipboard, so it is still ours to free.
-        unsafe { GlobalFree(mem) };
-        return Err(err);
-    }
-    // SAFETY: the block holds at least `bytes.len()` bytes and does not overlap `bytes`;
-    // the unlock balances the lock above.
-    unsafe {
-        copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
-        GlobalUnlock(mem);
+    if !bytes.is_empty() {
+        // SAFETY: `mem` is a live movable block from `GlobalAlloc`.
+        let ptr = unsafe { GlobalLock(mem) };
+        if ptr.is_null() {
+            let err = os_error("GlobalLock");
+            // SAFETY: not handed to the clipboard, so it is still ours to free.
+            unsafe { GlobalFree(mem) };
+            return Err(err);
+        }
+        // SAFETY: the block holds `bytes.len()` bytes and does not overlap `bytes`; the
+        // unlock balances the lock above.
+        unsafe {
+            copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
+            GlobalUnlock(mem);
+        }
     }
     // SAFETY: the clipboard is open on this thread (the caller holds `Open`), `mem` is unlocked.
     if unsafe { SetClipboardData(format, mem) }.is_null() {
@@ -256,7 +397,7 @@ fn os_error(call: &'static str) -> ClipError {
     ClipError::Os { call, code }
 }
 
-fn duration(ms: oxi_core::types::Millis) -> Duration {
+fn duration(ms: Millis) -> Duration {
     Duration::from_millis(ms.0)
 }
 
@@ -269,24 +410,21 @@ mod tests {
         let text = u32::from(CF_UNICODETEXT);
         let dib = u32::from(CF_DIB);
         let custom = 0xC123;
-        let cases: [(u32, &[u32], bool); 10] = [
-            (text, &[], true),
-            (u32::from(CF_TEXT), &[text], false),
-            (u32::from(CF_TEXT), &[], true),
-            (text, &[u32::from(CF_TEXT)], false),
-            (u32::from(CF_DIBV5), &[dib], false),
-            (dib, &[text], true),
-            (u32::from(CF_BITMAP), &[], false),
-            (u32::from(CF_ENHMETAFILE), &[], false),
-            (0x0300, &[], false),
-            (custom, &[text, dib], true),
+        let cases: [(u32, &[u32], Kind); 11] = [
+            (text, &[], Kind::Copy),
+            (u32::from(CF_TEXT), &[text], Kind::Synthesised),
+            (u32::from(CF_TEXT), &[], Kind::Copy),
+            (text, &[u32::from(CF_TEXT)], Kind::Synthesised),
+            (u32::from(CF_DIBV5), &[dib], Kind::Synthesised),
+            (dib, &[text], Kind::Copy),
+            (u32::from(CF_BITMAP), &[], Kind::Handle),
+            (u32::from(CF_ENHMETAFILE), &[], Kind::Handle),
+            (u32::from(CF_METAFILEPICT), &[text], Kind::Handle),
+            (0x0300, &[], Kind::Handle),
+            (custom, &[text, dib], Kind::Copy),
         ];
         for (format, kept, want) in cases {
-            assert_eq!(
-                copyable(format, kept),
-                want,
-                "format {format:#x} kept {kept:?}"
-            );
+            assert_eq!(kind(format, kept), want, "format {format:#x} kept {kept:?}");
         }
     }
 }
