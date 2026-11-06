@@ -51,9 +51,9 @@ jobs:
         if: matrix.feature == 'cuda'
         uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
         with:
-          cuda: 12.6.3
+          # Same as ci.yml build-cuda: VS 2026 runner needs CUDA 13.x.
+          cuda: 13.3.1
           method: network
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "visual_studio_integration"]'
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.feature }}
