@@ -1,0 +1,219 @@
+// Shared widgets of the settings window. This file is their only home: a page that needs a
+// new kind of row adds it here, never a local copy (SPEC Settings UI, compact XClicker-like panel).
+import { Palette, Switch, Slider } from "std-widgets.slint";
+
+// Window-wide state every control reads.
+export global Shell {
+    // The config cannot be written (newer version, or a parse error until Reset): controls go grey.
+    in-out property <bool> locked;
+}
+
+// A titled box of rows.
+export component Group inherits VerticalLayout {
+    in property <string> title;
+    spacing: 4px;
+    Text {
+        text: root.title;
+        font-size: 11px;
+        font-weight: 600;
+        color: Palette.foreground;
+        opacity: 0.7;
+    }
+    Rectangle {
+        background: Palette.alternate-background;
+        border-color: Palette.border;
+        border-width: 1px;
+        border-radius: 6px;
+        VerticalLayout {
+            padding-left: 10px;
+            padding-right: 10px;
+            padding-top: 2px;
+            padding-bottom: 2px;
+            @children
+        }
+    }
+}
+
+// A label on the left, its control (the children) on the right.
+export component Row inherits HorizontalLayout {
+    in property <string> label;
+    min-height: 32px;
+    spacing: 8px;
+    Text {
+        text: root.label;
+        vertical-alignment: center;
+        horizontal-stretch: 1;
+        color: Palette.foreground;
+    }
+    @children
+}
+
+export component ToggleRow inherits Row {
+    in-out property <bool> checked;
+    callback toggled(bool);
+    Switch {
+        checked <=> root.checked;
+        enabled: !Shell.locked;
+        accessible-label: root.label;
+        toggled => {
+            root.toggled(self.checked);
+        }
+    }
+}
+
+// `value-text` is the formatted value shown right of the slider ("-6 dB", "300 ms").
+export component SliderRow inherits Row {
+    in-out property <float> value;
+    in property <float> minimum: 0;
+    in property <float> maximum: 1;
+    in property <float> step: 1;
+    in property <string> value-text;
+    callback changed(float);
+    Slider {
+        horizontal-stretch: 2;
+        minimum: root.minimum;
+        maximum: root.maximum;
+        step: root.step;
+        value <=> root.value;
+        enabled: !Shell.locked;
+        accessible-label: root.label;
+        changed(v) => {
+            root.changed(v);
+        }
+    }
+    Text {
+        text: root.value-text;
+        min-width: 56px;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+        color: Palette.foreground;
+    }
+}
+
+export struct Thumb {
+    image: image,
+    caption: string,
+}
+
+// Selectable SVG cards. One-way: `selected` comes from the owner, a pick only fires `picked`,
+// and the owner updates the value `selected` is bound to. Left and Right move the pick.
+export component ThumbPicker inherits FocusScope {
+    in property <[Thumb]> thumbs;
+    in property <int> selected;
+    callback picked(int);
+    accessible-role: radio-group;
+    function pick(i: int) {
+        if (!Shell.locked && i >= 0 && i < root.thumbs.length) {
+            root.picked(i);
+        }
+    }
+    key-pressed(event) => {
+        if (event.text == Key.LeftArrow) {
+            root.pick(root.selected - 1);
+            return accept;
+        }
+        if (event.text == Key.RightArrow) {
+            root.pick(root.selected + 1);
+            return accept;
+        }
+        reject
+    }
+    Rectangle {
+        border-radius: 8px;
+        border-width: root.has-focus ? 1px : 0;
+        border-color: Palette.accent-background;
+        HorizontalLayout {
+            padding: 2px;
+            spacing: 8px;
+            alignment: start;
+            for thumb[i] in root.thumbs: Rectangle {
+                width: 84px;
+                border-radius: 6px;
+                border-width: i == root.selected ? 2px : 1px;
+                border-color: i == root.selected ? Palette.accent-background : Palette.border;
+                background: touch.has-hover && !Shell.locked ? Palette.alternate-background : transparent;
+                opacity: Shell.locked ? 0.5 : 1;
+                accessible-role: radio-button;
+                accessible-label: thumb.caption;
+                accessible-checkable: true;
+                accessible-checked: i == root.selected;
+                accessible-enabled: !Shell.locked;
+                accessible-action-default => {
+                    root.pick(i);
+                }
+                VerticalLayout {
+                    padding: 6px;
+                    spacing: 4px;
+                    Image {
+                        source: thumb.image;
+                        height: 44px;
+                        image-fit: contain;
+                    }
+                    Text {
+                        text: thumb.caption;
+                        font-size: 11px;
+                        horizontal-alignment: center;
+                        color: Palette.foreground;
+                    }
+                }
+                touch := TouchArea {
+                    clicked => {
+                        root.focus();
+                        root.pick(i);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A message across the top of the page; its actions are the children (buttons).
+export component Banner inherits Rectangle {
+    in property <string> text;
+    // Error tint for a broken file; warning tint otherwise.
+    in property <bool> error;
+    background: root.error ? #c42b1c33 : #f7b50033;
+    border-color: root.error ? #c42b1c : #f7b500;
+    border-width: 1px;
+    border-radius: 6px;
+    accessible-role: banner;
+    accessible-label: root.text;
+    HorizontalLayout {
+        padding: 8px;
+        spacing: 8px;
+        Text {
+            text: root.text;
+            wrap: word-wrap;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            color: Palette.foreground;
+        }
+        @children
+    }
+}
+
+// A short note under a control that asks to confirm an important change (SPEC: confirmations
+// only for important actions). The children are the buttons, confirm first.
+export component InlineNote inherits Rectangle {
+    in property <string> text;
+    background: Palette.alternate-background;
+    border-color: Palette.accent-background;
+    border-width: 1px;
+    border-radius: 6px;
+    accessible-role: AccessibleRole.text;
+    accessible-label: root.text;
+    VerticalLayout {
+        padding: 8px;
+        spacing: 6px;
+        Text {
+            text: root.text;
+            wrap: word-wrap;
+            color: Palette.foreground;
+        }
+        HorizontalLayout {
+            alignment: end;
+            spacing: 6px;
+            @children
+        }
+    }
+}

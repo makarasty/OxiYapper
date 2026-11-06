@@ -1,0 +1,27 @@
+// About page: name, version, licence and the "Made with Slint" badge (SPEC Settings UI).
+import { AboutSlint, Palette } from "std-widgets.slint";
+import { Group, Row } from "../widgets.slint";
+
+export component AboutPage inherits VerticalLayout {
+    in property <string> app-name;
+    in property <string> version;
+    in property <string> licence;
+    alignment: start;
+    spacing: 10px;
+    Group {
+        title: @tr("About");
+        Row {
+            label: @tr("Name");
+            Text { text: root.app-name; vertical-alignment: center; color: Palette.foreground; }
+        }
+        Row {
+            label: @tr("Version");
+            Text { text: root.version; vertical-alignment: center; color: Palette.foreground; }
+        }
+        Row {
+            label: @tr("Licence");
+            Text { text: root.licence; vertical-alignment: center; color: Palette.foreground; }
+        }
+    }
+    AboutSlint { }
+}
