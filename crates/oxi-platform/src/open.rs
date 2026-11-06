@@ -32,11 +32,39 @@ fn open_existing(path: &Path) -> io::Result<()> {
             SW_SHOWNORMAL,
         )
     };
-    // Success is a value above 32 (documented contract of ShellExecuteW).
-    if code as isize > 32 {
+    // Success is a value above 32; at or below 32 the value itself is the error, and
+    // GetLastError is not set (documented contract of ShellExecuteW).
+    let code = code as isize;
+    if code > 32 {
         Ok(())
     } else {
-        Err(io::Error::last_os_error())
+        Err(shell_error(code))
+    }
+}
+
+/// A failed `ShellExecuteW` return value (0..=32) as an error.
+#[cfg(windows)]
+fn shell_error(code: isize) -> io::Error {
+    use io::ErrorKind;
+    match code {
+        // Plain Win32 codes: file or path not found, access denied, out of memory, bad exe.
+        2 | 3 | 5 | 8 | 11 => io::Error::from_raw_os_error(i32::try_from(code).unwrap_or(0)),
+        0 => ErrorKind::OutOfMemory.into(),
+        26 => io::Error::new(ErrorKind::ResourceBusy, "the file is in use by another app"),
+        27 | 31 => io::Error::new(
+            ErrorKind::Unsupported,
+            "no app is set to open this file type",
+        ),
+        28 => io::Error::new(
+            ErrorKind::TimedOut,
+            "the app did not answer the open request",
+        ),
+        29 | 30 => io::Error::other("the app failed to take the open request"),
+        32 => io::Error::new(
+            ErrorKind::NotFound,
+            "a library needed to open the file is missing",
+        ),
+        _ => io::Error::other(format!("ShellExecuteW failed with code {code}")),
     }
 }
 
@@ -62,5 +90,32 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let err = super::open(&path).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_error_maps_every_failure_code() {
+        use std::io::ErrorKind;
+        let table = [
+            (0, ErrorKind::OutOfMemory),
+            (2, ErrorKind::NotFound),
+            (3, ErrorKind::NotFound),
+            (5, ErrorKind::PermissionDenied),
+            (26, ErrorKind::ResourceBusy),
+            (27, ErrorKind::Unsupported),
+            (28, ErrorKind::TimedOut),
+            (29, ErrorKind::Other),
+            (31, ErrorKind::Unsupported),
+            (32, ErrorKind::NotFound),
+        ];
+        for (code, kind) in table {
+            let err = super::shell_error(code);
+            assert_eq!(err.kind(), kind, "code {code}");
+            assert!(
+                !err.to_string().contains("successfully"),
+                "code {code}: {err}"
+            );
+        }
+        assert_eq!(super::shell_error(8).raw_os_error(), Some(8));
     }
 }
