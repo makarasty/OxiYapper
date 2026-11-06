@@ -5,9 +5,8 @@ use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, I24, InputCallbackInfo, Sample, SampleFormat, SizedSample, Stream};
-use oxi_core::audio::{AudioError, Level, Pipeline, downmix, samples_for};
+use oxi_core::audio::{AudioError, CHUNK, Level, Pipeline, downmix, samples_for};
 use oxi_core::config::Audio;
-use oxi_core::types::Millis;
 use rtrb::{Consumer, Producer, RingBuffer};
 
 use super::{Capture, CaptureError, CaptureEvent, LevelMeter};
@@ -15,8 +14,6 @@ use super::{Capture, CaptureError, CaptureEvent, LevelMeter};
 /// Ring length: the drain thread polls every [`DRAIN_POLL`], this covers a long stall.
 const RING_SECONDS: usize = 2;
 const DRAIN_POLL: Duration = Duration::from_millis(10);
-/// The drain feeds the pipeline and the meter in windows of this length (ARCHITECTURE section 2).
-const WINDOW: Millis = Millis(20);
 
 /// State shared by the cpal callbacks and the drain thread. Only atomics: no lock on the audio thread.
 #[derive(Default)]
@@ -81,11 +78,11 @@ impl Drop for CpalCapture {
 
 impl Capture for CpalCapture {
     fn open(
-        device: &str,
         opts: &Audio,
         meter: LevelMeter,
         on_event: impl FnMut(CaptureEvent) + Send + 'static,
     ) -> Result<Self, CaptureError> {
+        let device = opts.device.as_str();
         let host = cpal::default_host();
         let named = if device.is_empty() {
             None
@@ -149,7 +146,8 @@ impl Capture for CpalCapture {
         stream.play()?;
         let drain_shared = Arc::clone(&shared);
         let drain_meter = meter.clone();
-        let window = samples_for(WINDOW, rate);
+        // The pipeline and the meter get one chunk per window (ARCHITECTURE section 2).
+        let window = samples_for(CHUNK, rate);
         let drain = thread::Builder::new()
             .name("oxi-capture-drain".into())
             .spawn(move || {

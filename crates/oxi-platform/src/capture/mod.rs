@@ -86,11 +86,10 @@ impl From<cpal::Error> for CaptureError {
 
 /// One microphone recording: open on key-down, [`Capture::finish`] on key-up.
 pub trait Capture: Sized {
-    /// Open `device` by name; an empty name, or a name that is not found, opens the system default
-    /// (see [`Capture::fell_back_to_default`]). `meter` gets the level while capture runs and is
-    /// zeroed when it stops. `on_event` runs on a cpal thread.
+    /// Open the device named `opts.device`; an empty name, or a name that is not found, opens the
+    /// system default (see [`Capture::fell_back_to_default`]). `meter` gets the level while capture
+    /// runs and is zeroed when it stops. `on_event` runs on a cpal thread.
     fn open(
-        device: &str,
         opts: &Audio,
         meter: LevelMeter,
         on_event: impl FnMut(CaptureEvent) + Send + 'static,

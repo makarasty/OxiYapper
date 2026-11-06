@@ -149,7 +149,7 @@ fn record(args: &[String]) -> Result<()> {
         ..Audio::default()
     };
     let (tx, rx) = std::sync::mpsc::channel();
-    let capture = CpalCapture::open("", &opts, LevelMeter::default(), move |e| {
+    let capture = CpalCapture::open(&opts, LevelMeter::default(), move |e| {
         let _ = tx.send(e);
     })?;
     println!(
