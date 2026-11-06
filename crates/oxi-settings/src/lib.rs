@@ -157,9 +157,12 @@ fn open_inner(
 /// The daemon banner follows the link; a push that is not a notice leaves it alone.
 fn on_daemon_event(window: &AppWindow, event: &Event) {
     if matches!(event, Event::Push(Push::Raise)) {
-        // Un-minimise and show again: the shell puts a shown window in front.
         window.window().set_minimized(false);
         let _ = window.show();
+        // `show` leaves a window that is already visible behind other apps; the daemon has
+        // allowed this process to take the foreground.
+        #[cfg(windows)]
+        oxi_platform::os::foreground::raise_current_thread_window();
     }
     let notice = ipc::notice(event);
     if notice.is_none() && !matches!(event, Event::Link(_)) {
