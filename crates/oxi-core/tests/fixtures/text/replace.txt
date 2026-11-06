@@ -1,0 +1,7 @@
+джава скрипт => JavaScript
+git hub => GitHub
+гит хаб => GitHub
+pull request => PR
+pull => fetch
+this line has no arrow
+=> nothing on the left
