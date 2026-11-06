@@ -15,6 +15,15 @@ pub const REPLACE_FILE: &str = "replace.txt";
 pub const STATE_FILE: &str = "state.toml";
 pub const MODELS_DIR: &str = "models";
 pub const HISTORY_DIR: &str = "history";
+/// Suffix of a file still being written; the rename that drops it makes the file whole.
+pub const PART_SUFFIX: &str = ".part";
+
+/// `<path>.part`, where a download or recording is written before its rename.
+pub fn part_path(path: &Path) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(PART_SUFFIX);
+    PathBuf::from(p)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {

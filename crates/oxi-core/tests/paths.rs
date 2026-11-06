@@ -1,4 +1,4 @@
-use oxi_core::paths::{BaseDirs, Layout, Os, layout, portable_layout};
+use oxi_core::paths::{BaseDirs, Layout, Os, PORTABLE_MARKER, layout, part_path, portable_layout};
 use std::path::PathBuf;
 
 fn p(s: &str) -> PathBuf {
@@ -76,4 +76,37 @@ fn macos_config_and_data_share_a_dir_when_bases_match() {
     };
     let l = layout(Os::MacOs, &b, "id");
     assert_eq!(l.config_file().parent(), l.state_file().parent());
+}
+
+#[test]
+fn part_path_appends_the_suffix_to_the_whole_name() {
+    assert_eq!(part_path(&p("dir/a.wav")), p("dir/a.wav.part"));
+    assert_eq!(
+        part_path(&p("dir/ggml-tiny.bin")),
+        p("dir/ggml-tiny.bin.part")
+    );
+    assert_eq!(part_path(&p("noext")), p("noext.part"));
+}
+
+#[test]
+fn current_os_is_the_build_target() {
+    let want = if cfg!(windows) {
+        Os::Windows
+    } else if cfg!(target_os = "macos") {
+        Os::MacOs
+    } else {
+        Os::Linux
+    };
+    assert_eq!(Os::current(), want);
+}
+
+#[test]
+fn portable_marker_is_the_name_architecture_documents() {
+    let doc = include_str!("../../../docs/ARCHITECTURE.md");
+    assert!(
+        doc.contains(&format!(
+            "a file named `{PORTABLE_MARKER}` sits next to the exe"
+        )),
+        "ARCHITECTURE section 7 names another marker"
+    );
 }

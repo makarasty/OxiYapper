@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 
 use oxi_core::models::{ModelEntry, Stamp, hash_file, hex, sha256_file, stamp_file_name};
+use oxi_core::paths::part_path;
 use sha2::{Digest, Sha256};
 use ureq::Agent;
 use ureq::http::Uri;
@@ -166,7 +167,7 @@ fn download_with(
 ) -> Result<Downloaded, DownloadError> {
     fs::create_dir_all(dest_dir)?;
     let dest = dest_dir.join(entry.file_name);
-    let part = dest_dir.join(format!("{}.part", entry.file_name));
+    let part = part_path(&dest);
     let agent = Agent::new_with_config(
         Agent::config_builder()
             .max_redirects(0)

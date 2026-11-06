@@ -6,13 +6,12 @@
 
 use std::fs::{self, File};
 use std::io::BufWriter;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use oxi_core::audio::{SAMPLE_RATE, downmix};
+use oxi_core::paths::{PART_SUFFIX, part_path};
 use thiserror::Error;
-
-const PART_SUFFIX: &str = ".wav.part";
 
 #[derive(Debug, Error)]
 pub enum WavError {
@@ -22,12 +21,6 @@ pub enum WavError {
     Hound(#[from] hound::Error),
     #[error("unsupported wav: {0}")]
     Unsupported(String),
-}
-
-fn part_path(path: &Path) -> PathBuf {
-    let mut p = path.as_os_str().to_owned();
-    p.push(".part");
-    PathBuf::from(p)
 }
 
 /// Write 16 kHz mono `samples` (f32 in `[-1, 1]`, clamped) to `path`, which must end in `.wav`.
@@ -81,7 +74,13 @@ pub fn remove_leftover_parts(dir: &Path) -> Result<usize, WavError> {
         let kind = entry.file_type()?;
         if kind.is_dir() {
             removed += remove_leftover_parts(&path)?;
-        } else if kind.is_file() && entry.file_name().to_string_lossy().ends_with(PART_SUFFIX) {
+        } else if kind.is_file()
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .strip_suffix(PART_SUFFIX)
+                .is_some_and(|name| name.ends_with(".wav"))
+        {
             fs::remove_file(&path)?;
             removed += 1;
         }
