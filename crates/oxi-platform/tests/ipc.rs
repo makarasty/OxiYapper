@@ -4,7 +4,7 @@ use std::io;
 use std::thread;
 
 use oxi_core::ipc::{MAX_LINE, PROTO, Push, Request};
-use oxi_platform::ipc::{BindError, Client, Server, forward_open_settings};
+use oxi_platform::ipc::{Client, Error, Server, forward_open_settings};
 
 /// A name no other test or running daemon uses.
 fn name(tag: &str) -> String {
@@ -43,7 +43,7 @@ fn hello_round_trip(server: &Server, name: &str) -> Option<Push> {
 fn second_bind_is_already_running() {
     let n = name("twice");
     let _first = Server::bind(&n).unwrap();
-    assert!(matches!(Server::bind(&n), Err(BindError::AlreadyRunning)));
+    assert!(matches!(Server::bind(&n), Err(Error::AlreadyRunning)));
 }
 
 #[test]
@@ -107,12 +107,41 @@ fn stale_socket_is_replaced() {
 
 #[cfg(windows)]
 mod windows {
+    use std::io::Read;
+    use std::os::windows::io::{AsHandle, AsRawHandle};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, prelude::*};
     use oxi_platform::os::pipe::{owner_only_sddl, user_sid};
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, RevertToSelf, SecurityIdentification, TOKEN_QUERY,
+        TokenImpersonationLevel,
+    };
+    use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+
+    use super::*;
+
+    /// A pipe every Windows box has, owned by Administrators: stands in for a squatter.
+    const FOREIGN: &str = r"\\.\pipe\lsass";
+
+    /// Runs `f` on a thread and fails the test if it has not returned within `secs`.
+    fn within<R: Send + 'static>(secs: u64, f: impl FnOnce() -> R + Send + 'static) -> R {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || tx.send(f()));
+        rx.recv_timeout(Duration::from_secs(secs))
+            .expect("call did not return in time")
+    }
 
     #[test]
     fn sddl_admits_only_the_given_sid() {
         let sddl = owner_only_sddl("S-1-5-21-1-2-3-1001");
-        assert_eq!(sddl, "D:P(A;;GA;;;S-1-5-21-1-2-3-1001)");
+        assert_eq!(
+            sddl,
+            "O:S-1-5-21-1-2-3-1001D:P(A;;GA;;;S-1-5-21-1-2-3-1001)"
+        );
         assert!(!sddl.contains("WD") && !sddl.contains("Everyone"));
     }
 
@@ -124,5 +153,111 @@ mod windows {
             oxi_platform::ipc::default_name().unwrap(),
             oxi_core::ipc::pipe_name(&sid)
         );
+    }
+
+    #[test]
+    fn pipe_of_another_account_is_foreign_not_running() {
+        assert!(matches!(Server::bind(FOREIGN), Err(Error::ForeignServer)));
+        assert!(matches!(
+            Client::connect(FOREIGN),
+            Err(Error::ForeignServer)
+        ));
+        assert!(matches!(
+            forward_open_settings(FOREIGN),
+            Err(Error::ForeignServer)
+        ));
+    }
+
+    #[test]
+    fn busy_pipe_connect_times_out() {
+        let n = name("busy");
+        let _server = Server::bind(&n).unwrap();
+        // Takes the only waiting instance; nobody accepts it.
+        let _hog = Client::connect(&n).unwrap();
+        let err = within(10, move || Client::connect(&n).map(drop).unwrap_err());
+        assert!(matches!(err, Error::Io(e) if e.kind() == io::ErrorKind::TimedOut));
+    }
+
+    #[test]
+    fn forward_gives_up_when_daemon_keeps_conn() {
+        let n = name("fwdhang");
+        let server = Server::bind(&n).unwrap();
+        let n2 = n.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || tx.send(forward_open_settings(&n2)));
+        // Accepts and neither reads nor closes.
+        let _conn = server.accept().unwrap();
+        let got = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(matches!(got, Err(Error::Io(e)) if e.kind() == io::ErrorKind::TimedOut));
+    }
+
+    #[test]
+    fn read_timeout_ends_a_silent_recv() {
+        let n = name("silent");
+        let server = Server::bind(&n).unwrap();
+        thread::scope(|s| {
+            s.spawn(|| {
+                let mut c = server.accept().unwrap();
+                // Hold the connection until the client side is done.
+                let _ = c.recv::<Request>();
+            });
+            let mut client = Client::connect(&n).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            let t = Instant::now();
+            let err = client.recv::<Push>().unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+            assert!(t.elapsed() < Duration::from_secs(5));
+            drop(client);
+        });
+    }
+
+    #[test]
+    fn client_allows_only_identification() {
+        let n = name("sqos");
+        let listener = ListenerOptions::new()
+            .name(n.as_str().to_fs_name::<GenericFilePath>().unwrap())
+            .create_sync()
+            .unwrap();
+        let level = thread::scope(|s| {
+            s.spawn(|| {
+                let mut c = Client::connect(&n).unwrap();
+                c.send(&hello()).unwrap();
+                let _ = c.recv::<Push>();
+            });
+            let mut stream = listener.accept().unwrap();
+            // A pipe server can impersonate only after reading from the client.
+            let mut b = [0u8; 1];
+            stream.read_exact(&mut b).unwrap();
+            let Stream::NamedPipe(pipe) = &stream;
+            let h = pipe.inner().as_handle().as_raw_handle();
+            // SAFETY: `h` is a connected server pipe handle that has been read from.
+            assert_ne!(unsafe { ImpersonateNamedPipeClient(h) }, 0);
+            let mut token = std::ptr::null_mut();
+            // SAFETY: valid out pointer; this thread impersonates the client now.
+            let opened =
+                unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &raw mut token) };
+            let mut level = -1i32;
+            let mut len = 0u32;
+            if opened != 0 {
+                // SAFETY: `level` has room for a SECURITY_IMPERSONATION_LEVEL (i32).
+                unsafe {
+                    GetTokenInformation(
+                        token,
+                        TokenImpersonationLevel,
+                        (&raw mut level).cast(),
+                        4,
+                        &raw mut len,
+                    )
+                };
+                // SAFETY: opened above, closed once.
+                unsafe { CloseHandle(token) };
+            }
+            // SAFETY: ends the impersonation started above.
+            unsafe { RevertToSelf() };
+            level
+        });
+        assert_eq!(level, SecurityIdentification);
     }
 }

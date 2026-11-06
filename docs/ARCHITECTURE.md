@@ -98,6 +98,10 @@ Platform code: each concern is a trait in `oxi-platform` (`Hotkey`, `Paster`, `C
 
 Transport: `interprocess` local socket. Windows: named pipe `\\.\pipe\OxiYapper-<user SID>` created with a DACL for the current user only and `PIPE_REJECT_REMOTE_CLIENTS` (the default pipe DACL lets Everyone read). macOS/Linux: Unix socket `OxiYapper.sock` in `$XDG_RUNTIME_DIR` (Linux) or the per-user `$TMPDIR` (macOS), directory mode 0700. A stale socket file (connect refused) is removed before bind.
 
+Windows clients open the pipe at `SECURITY_IDENTIFICATION` (the server can never act as the user) and, before sending anything, check that the pipe's owner is the current user's SID (the daemon sets it explicitly in the SDDL). A pipe of another account under our name is a squatter: the daemon refuses to start with a clear message and never treats it as a running instance. A connect waits at most 2 s while every pipe instance is busy.
+
+Connection close rule: the daemon closes a connection whose first message is `OpenSettings` after acting on it; the settings window starts with `Hello` and keeps its connection. A second launch sends `OpenSettings`, waits up to 3 s for that close and exits (a pipe closed before the daemon accepts it is discarded unread, so it must not close first).
+
 Framing: one JSON object per line (`serde_json`), max 1 MiB per line, tagged enum `{"t": "...", ...}`. Types live in `oxi-core::ipc` and are snapshot-tested so a field rename shows up in review.
 
 | From settings | Reply / pushed by daemon |
