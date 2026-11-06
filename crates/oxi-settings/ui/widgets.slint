@@ -101,13 +101,17 @@ export struct Thumb {
     caption: string,
 }
 
-// Selectable SVG cards. One-way: `selected` comes from the owner, a pick only fires `picked`,
-// and the owner updates the value `selected` is bound to. Left and Right move the pick.
-// Give each picker an `accessible-label` (its group title) so screen readers name the group.
+// Selectable SVG cards, `columns` to a row (all in one row by default). One-way: `selected`
+// comes from the owner, a pick only fires `picked`, and the owner updates the value `selected`
+// is bound to. Left and Right move the pick in reading order, Up and Down by a row; each stops
+// at the edge. Give each picker an `accessible-label` (its group title) so screen readers name
+// the group.
 export component ThumbPicker inherits FocusScope {
     in property <[Thumb]> thumbs;
     in property <int> selected;
+    in property <int> columns: root.thumbs.length;
     callback picked(int);
+    property <int> cols: max(1, min(root.columns, root.thumbs.length));
     accessible-role: radio-group;
     function pick(i: int) {
         if (!Shell.locked && i >= 0 && i < root.thumbs.length) {
@@ -123,50 +127,63 @@ export component ThumbPicker inherits FocusScope {
             root.pick(root.selected + 1);
             return accept;
         }
+        if (event.text == Key.UpArrow && root.cols < root.thumbs.length) {
+            root.pick(root.selected - root.cols);
+            return accept;
+        }
+        if (event.text == Key.DownArrow && root.cols < root.thumbs.length) {
+            root.pick(root.selected + root.cols);
+            return accept;
+        }
         reject
     }
     Rectangle {
         border-radius: 8px;
         border-width: root.has-focus ? 1px : 0;
         border-color: Palette.accent-background;
-        HorizontalLayout {
+        VerticalLayout {
             padding: 2px;
             spacing: 8px;
-            alignment: start;
-            for thumb[i] in root.thumbs: Rectangle {
-                width: 84px;
-                border-radius: 6px;
-                border-width: i == root.selected ? 2px : 1px;
-                border-color: i == root.selected ? Palette.accent-background : Palette.border;
-                background: touch.has-hover && !Shell.locked ? Palette.alternate-background : transparent;
-                opacity: Shell.locked ? 0.5 : 1;
-                accessible-role: radio-button;
-                accessible-label: thumb.caption;
-                accessible-checkable: true;
-                accessible-checked: i == root.selected;
-                accessible-enabled: !Shell.locked;
-                accessible-action-default => {
-                    root.pick(i);
-                }
-                VerticalLayout {
-                    padding: 6px;
-                    spacing: 4px;
-                    Image {
-                        source: thumb.image;
-                        height: 44px;
-                        image-fit: contain;
-                    }
-                    Text {
-                        text: thumb.caption;
-                        font-size: 11px;
-                        horizontal-alignment: center;
-                        color: Palette.foreground;
-                    }
-                }
-                touch := TouchArea {
-                    clicked => {
-                        root.focus();
+            for row in ceil(root.thumbs.length / root.cols): HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+                for col in min(root.cols, root.thumbs.length - row * root.cols): Rectangle {
+                    property <int> i: row * root.cols + col;
+                    property <Thumb> thumb: root.thumbs[self.i];
+                    width: 84px;
+                    border-radius: 6px;
+                    border-width: i == root.selected ? 2px : 1px;
+                    border-color: i == root.selected ? Palette.accent-background : Palette.border;
+                    background: touch.has-hover && !Shell.locked ? Palette.alternate-background : transparent;
+                    opacity: Shell.locked ? 0.5 : 1;
+                    accessible-role: radio-button;
+                    accessible-label: thumb.caption;
+                    accessible-checkable: true;
+                    accessible-checked: i == root.selected;
+                    accessible-enabled: !Shell.locked;
+                    accessible-action-default => {
                         root.pick(i);
+                    }
+                    VerticalLayout {
+                        padding: 6px;
+                        spacing: 4px;
+                        Image {
+                            source: thumb.image;
+                            height: 44px;
+                            image-fit: contain;
+                        }
+                        Text {
+                            text: thumb.caption;
+                            font-size: 11px;
+                            horizontal-alignment: center;
+                            color: Palette.foreground;
+                        }
+                    }
+                    touch := TouchArea {
+                        clicked => {
+                            root.focus();
+                            root.pick(i);
+                        }
                     }
                 }
             }

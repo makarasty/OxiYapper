@@ -6,6 +6,7 @@ use oxi_core::ipc::Request;
 use slint::{ComponentHandle, Weak};
 
 use crate::generated::OverlayState;
+use crate::ipc::{Event, Link};
 use crate::{AppWindow, Ctx, report};
 
 /// Picker order: the top row left to right, then the bottom row.
@@ -26,6 +27,17 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     s.set_position(index(overlay.position));
     s.set_hide_over_fullscreen(overlay.hide_over_fullscreen);
     drop(file);
+    s.set_online(ctx.ipc.link() == Link::Online);
+    let w = window.as_weak();
+    // shortcut: Reset rebinds and adds one more subscriber, each setting the same value; fine
+    // for a handful of resets, subscribe once in the shell if pages ever do more here.
+    ctx.ipc.subscribe(move |event| {
+        if let (Event::Link(link), Some(window)) = (event, w.upgrade()) {
+            window
+                .global::<OverlayState>()
+                .set_online(*link == Link::Online);
+        }
+    });
 
     let (w, c) = (window.as_weak(), ctx.clone());
     s.on_enabled_toggled(move |on| apply(&w, &c, |o| o.enabled = on));
@@ -76,7 +88,7 @@ mod tests {
     use slint::ComponentHandle;
 
     use super::{POSITIONS, index};
-    use crate::ipc::{Cmd, Ipc};
+    use crate::ipc::{Cmd, Event, Ipc, Link};
     use crate::{AppWindow, Ctx, Page};
 
     #[test]
@@ -121,6 +133,20 @@ mod tests {
             Some(Cmd::Send(Request::PreviewOverlay {
                 position: OverlayPosition::TopCentre
             }))
+        );
+
+        // The daemon goes away: Preview turns off and says why.
+        ctx.ipc.deliver(&Event::Link(Link::Offline));
+        let preview = find("Preview", AccessibleRole::Button);
+        assert_eq!(preview.accessible_enabled(), Some(false));
+        assert_eq!(
+            preview.accessible_description().as_deref(),
+            Some("OxiYapper is not running")
+        );
+        ctx.ipc.deliver(&Event::Link(Link::Online));
+        assert_eq!(
+            find("Preview", AccessibleRole::Button).accessible_enabled(),
+            Some(true)
         );
     }
 }

@@ -46,6 +46,10 @@ export component SystemPage inherits VerticalLayout {
                 SystemState.autostart-toggled(on);
             }
         }
+        // Until the OS registration lands (ROADMAP M10) the switch only saves the setting.
+        InlineNote {
+            text: @tr("Takes effect in a later version: OxiYapper does not add itself to sign-in yet.");
+        }
         ToggleRow {
             label: @tr("Check for updates");
             checked <=> SystemState.update-check;

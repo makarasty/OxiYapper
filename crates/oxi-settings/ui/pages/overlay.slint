@@ -1,6 +1,6 @@
 // Overlay page (SPEC Feedback): the pill on or off, its spot on screen, hiding it over
 // fullscreen apps, and a preview the daemon shows at the picked spot.
-import { Button } from "std-widgets.slint";
+import { Button, Palette } from "std-widgets.slint";
 import { Group, ToggleRow, ThumbPicker } from "../widgets.slint";
 
 // Filled and read by `pages::overlay`.
@@ -9,6 +9,8 @@ export global OverlayState {
     // Picker order: top left, top centre, top right, then the bottom row the same way.
     in property <int> position;
     in-out property <bool> hide-over-fullscreen;
+    // The daemon link is up: Preview needs it to show the pill.
+    in property <bool> online;
     callback enabled-toggled(bool);
     callback position-picked(int);
     callback hide-over-fullscreen-toggled(bool);
@@ -37,42 +39,43 @@ export component OverlayPage inherits VerticalLayout {
     }
     Group {
         title: @tr("Position");
-        // Two rows laid out like the screen; one picker per row, so six cards fit the panel.
         VerticalLayout {
             padding-top: 4px;
             padding-bottom: 4px;
             spacing: 4px;
+            // Two rows of three, laid out like the screen.
             ThumbPicker {
-                accessible-label: @tr("Position, top row");
+                accessible-label: @tr("Position");
+                columns: 3;
                 thumbs: [
                     { image: @image-url("../img/overlay-top-left.svg"), caption: @tr("Top left") },
                     { image: @image-url("../img/overlay-top-centre.svg"), caption: @tr("Top centre") },
                     { image: @image-url("../img/overlay-top-right.svg"), caption: @tr("Top right") },
-                ];
-                selected: OverlayState.position < 3 ? OverlayState.position : -1;
-                picked(i) => {
-                    OverlayState.position-picked(i);
-                }
-            }
-            ThumbPicker {
-                accessible-label: @tr("Position, bottom row");
-                thumbs: [
                     { image: @image-url("../img/overlay-bottom-left.svg"), caption: @tr("Bottom left") },
                     { image: @image-url("../img/overlay-bottom-centre.svg"), caption: @tr("Bottom centre") },
                     { image: @image-url("../img/overlay-bottom-right.svg"), caption: @tr("Bottom right") },
                 ];
-                selected: OverlayState.position >= 3 ? OverlayState.position - 3 : -1;
+                selected: OverlayState.position;
                 picked(i) => {
-                    OverlayState.position-picked(i + 3);
+                    OverlayState.position-picked(i);
                 }
             }
             HorizontalLayout {
                 alignment: start;
+                spacing: 8px;
                 Button {
                     text: @tr("Preview");
+                    enabled: OverlayState.online;
+                    accessible-description: OverlayState.online ? "" : @tr("OxiYapper is not running");
                     clicked => {
                         OverlayState.preview();
                     }
+                }
+                if !OverlayState.online: Text {
+                    text: @tr("OxiYapper is not running");
+                    vertical-alignment: center;
+                    color: Palette.foreground;
+                    opacity: 0.7;
                 }
             }
         }
