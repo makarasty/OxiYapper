@@ -47,6 +47,12 @@ fn hallucinated_segments_dropped() {
         ),
         // The prefix entry needs a word boundary.
         (&["Корректорский совет"], text("Корректорский совет")),
+        // Real speech starting with a credit word is kept.
+        (
+            &["Корректор проверил договор."],
+            text("Корректор проверил договор."),
+        ),
+        (&["Корректор субтитров Иван"], Outcome::NothingHeard),
     ];
     for (segments, want) in cases {
         assert_eq!(&run(segments, "", false), want, "{segments:?}");
@@ -63,7 +69,7 @@ fn user_lines_extend_the_default_list() {
 
 #[test]
 fn replace_rules_table() {
-    let rules = "git hub => GitHub\npull => fetch\npull request => PR\nджава скрипт => JavaScript\nc++ => C++\num =>\n";
+    let rules = "git hub => GitHub\npull => fetch\npull request => PR\nджава скрипт => JavaScript\nc++ => C++\num =>\nm => meters\nll => will\n";
     let cases = [
         ("Open Git Hub now", "Open GitHub now"),
         // Longest match first.
@@ -79,7 +85,13 @@ fn replace_rules_table() {
         // A non-word edge needs no boundary.
         ("c++x", "C++x"),
         // Empty wanted deletes.
-        ("well um fine", "well  fine"),
+        ("well um fine", "well fine"),
+        // Apostrophes inside a word do not make a boundary.
+        ("I'm here", "I'm here"),
+        ("I'll go", "I'll go"),
+        ("I\u{2019}m here", "I\u{2019}m here"),
+        // A quote around a word does.
+        ("'pull' it", "'fetch' it"),
     ];
     for (input, want) in cases {
         assert_eq!(

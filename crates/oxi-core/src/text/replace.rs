@@ -23,6 +23,28 @@ fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+fn is_apostrophe(c: char) -> bool {
+    c == '\'' || c == '\u{2019}'
+}
+
+/// The char before `i` continues a word: a word char, or an apostrophe between word chars.
+fn word_before(chars: &[char], i: usize) -> bool {
+    match i.checked_sub(1).map(|j| chars[j]) {
+        Some(c) if is_word(c) => true,
+        Some(c) if is_apostrophe(c) => i >= 2 && is_word(chars[i - 2]),
+        _ => false,
+    }
+}
+
+/// The char at `i` continues a word: a word char, or an apostrophe before a word char.
+fn word_after(chars: &[char], i: usize) -> bool {
+    match chars.get(i) {
+        Some(&c) if is_word(c) => true,
+        Some(&c) if is_apostrophe(c) => chars.get(i + 1).is_some_and(|&n| is_word(n)),
+        _ => false,
+    }
+}
+
 impl ReplaceRules {
     /// Parse a `replace.txt`. Blank lines are skipped; a line without `=>` or with an empty
     /// left side is ignored and its number reported. When two lines share `heard`, the first wins.
@@ -61,12 +83,19 @@ impl ReplaceRules {
                 end <= chars.len()
                     && chars[i..end].iter().zip(heard).all(|(&c, &h)| fold(c) == h)
                     // A word edge needs a boundary; an edge like the `+` of `c++` does not.
-                    && !(is_word(heard[0]) && i > 0 && is_word(chars[i - 1]))
-                    && !(is_word(heard[heard.len() - 1]) && chars.get(end).is_some_and(|&c| is_word(c)))
+                    && !(is_word(heard[0]) && word_before(&chars, i))
+                    && !(is_word(heard[heard.len() - 1]) && word_after(&chars, end))
             });
             if let Some((heard, wanted)) = hit {
                 out.push_str(wanted);
                 i += heard.len();
+                // A deleted word must not leave two spaces behind.
+                if wanted.is_empty()
+                    && out.ends_with(char::is_whitespace)
+                    && chars.get(i).is_some_and(|c| c.is_whitespace())
+                {
+                    i += 1;
+                }
             } else {
                 out.push(chars[i]);
                 i += 1;
