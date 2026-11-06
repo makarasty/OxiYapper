@@ -1,0 +1,88 @@
+use std::fs;
+use std::path::PathBuf;
+
+use oxi_platform::wav::{read_wav_mono_f32, remove_leftover_parts, write_wav};
+
+fn scratch(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("oxi-wav-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn written_file_reads_back_at_16k_mono_and_leaves_no_part() {
+    let dir = scratch("roundtrip");
+    let samples: Vec<f32> = (0..1600).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+    let path = dir.join("a.wav");
+    write_wav(&path, &samples).unwrap();
+
+    let (back, rate) = read_wav_mono_f32(&path).unwrap();
+    assert_eq!(rate, 16_000);
+    assert_eq!(back.len(), samples.len());
+    assert!(
+        back.iter()
+            .zip(&samples)
+            .all(|(b, s)| (b - s).abs() < 1.0 / 16_000.0)
+    );
+    let names: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["a.wav"]);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn out_of_range_samples_are_clamped() {
+    let dir = scratch("clamp");
+    let path = dir.join("c.wav");
+    write_wav(&path, &[2.0, -2.0]).unwrap();
+    let (back, _) = read_wav_mono_f32(&path).unwrap();
+    assert!((back[0] - 1.0).abs() < 1e-3 && (back[1] + 1.0).abs() < 1e-3);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn rejects_a_path_without_wav_extension() {
+    let dir = scratch("ext");
+    assert!(write_wav(&dir.join("a.txt"), &[0.0]).is_err());
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn cleanup_removes_only_wav_part_files_including_subdirs() {
+    let dir = scratch("cleanup");
+    let sub = dir.join("2026-11-06");
+    fs::create_dir_all(&sub).unwrap();
+    for p in [
+        dir.join("a.wav.part"),
+        sub.join("b.wav.part"),
+        dir.join("keep.wav"),
+        dir.join("keep.txt"),
+        dir.join("keep.part"),
+        sub.join("keep.txt.part"),
+    ] {
+        fs::write(p, b"x").unwrap();
+    }
+    assert_eq!(remove_leftover_parts(&dir).unwrap(), 2);
+    let mut left: Vec<_> = [&dir, &sub]
+        .iter()
+        .flat_map(|d| fs::read_dir(d).unwrap())
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        [
+            "2026-11-06",
+            "keep.part",
+            "keep.txt",
+            "keep.txt.part",
+            "keep.wav"
+        ]
+    );
+    assert_eq!(remove_leftover_parts(&dir.join("missing")).unwrap(), 0);
+    fs::remove_dir_all(&dir).unwrap();
+}
