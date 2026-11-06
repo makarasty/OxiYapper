@@ -175,13 +175,13 @@ export component TextPage inherits ScrollView {
                 text <=> TextState.dictionary;
                 Text {
                     text: @tr("{} / {} tokens", TextState.tokens, TextState.budget);
-                    color: TextState.dropped-from > 0 ? #c42b1c : Palette.foreground;
+                    color: TextState.dropped-from > 0 ? Shell.error-text : Palette.foreground;
                 }
                 if TextState.dropped-from > 0: Text {
                     text: @tr("Over the limit: line {} and after are not sent.", TextState.dropped-from);
                     wrap: word-wrap;
                     font-size: 11px;
-                    color: #c42b1c;
+                    color: Shell.error-text;
                 }
             }
         }
@@ -197,7 +197,7 @@ export component TextPage inherits ScrollView {
                 Text {
                     text: TextState.bad-lines == "" ? @tr("Every line has =>.") : @tr("Ignored, no =>: line {}", TextState.bad-lines);
                     wrap: word-wrap;
-                    color: TextState.bad-lines == "" ? Palette.foreground : #c42b1c;
+                    color: TextState.bad-lines == "" ? Palette.foreground : Shell.error-text;
                 }
             }
         }

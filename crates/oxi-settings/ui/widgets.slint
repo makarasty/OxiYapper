@@ -6,6 +6,8 @@ import { Palette, Switch, Slider } from "std-widgets.slint";
 export global Shell {
     // The config cannot be written (newer version, or a parse error until Reset): controls go grey.
     in-out property <bool> locked;
+    // Error text: 4.5:1 or better on the page and group backgrounds in both themes.
+    out property <color> error-text: Palette.color-scheme == ColorScheme.dark ? #ff8a80 : #b3261e;
 }
 
 // A titled box of rows.

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+use oxi_core::paths::Layout;
 use oxi_settings::{AppWindow, Page, ThemeChoice};
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
@@ -36,9 +37,15 @@ impl Platform for Shots {
 }
 
 fn open(screen: &str, config: Option<&str>) -> AppWindow {
+    open_with(screen, config, |_| {})
+}
+
+/// `prepare` runs on the fresh layout before the window reads it.
+fn open_with(screen: &str, config: Option<&str>, prepare: fn(&Layout)) -> AppWindow {
     // Once per thread; a second call on the same thread is the same platform.
     let _ = slint::platform::set_platform(Box::new(Shots));
     let layout = common::layout(screen, config);
+    prepare(&layout);
     oxi_settings::open(layout).unwrap()
 }
 
@@ -82,8 +89,12 @@ fn save(pixmap: &Pixmap, screen: &str, theme: &str) {
 
 /// `screen` in light and in dark.
 fn shot(screen: &str, page: Page, config: Option<&str>) {
+    shot_with(screen, page, config, |_| {});
+}
+
+fn shot_with(screen: &str, page: Page, config: Option<&str>, prepare: fn(&Layout)) {
     for (theme, choice) in [("light", ThemeChoice::Light), ("dark", ThemeChoice::Dark)] {
-        let window = open(screen, config);
+        let window = open_with(screen, config, prepare);
         window.set_page(page);
         window.set_theme(choice);
         save(&render(&window, 1.0), screen, theme);
@@ -163,6 +174,27 @@ fn shot_model() {
 #[test]
 fn shot_text() {
     shot("text", Page::Text, None);
+}
+
+#[test]
+fn shot_text_notes() {
+    // Over the token budget (red count and note), a line without `=>`, and the broken-config banner.
+    shot_with("text-notes", Page::Text, Some(BROKEN), |l| {
+        let words: Vec<String> = (0..400).map(|i| format!("word{i}")).collect();
+        fs::write(l.dictionary_file(), words.join("
+")).unwrap();
+        fs::write(l.replace_file(), "heard => wanted
+no arrow here
+").unwrap();
+    });
+}
+
+#[test]
+fn shot_text_unreadable() {
+    // A directory where replace.txt belongs: reading it fails.
+    shot_with("text-unreadable", Page::Text, None, |l| {
+        fs::create_dir(l.replace_file()).unwrap();
+    });
 }
 
 #[test]
