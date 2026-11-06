@@ -7,9 +7,9 @@ use super::types::{
 };
 use crate::types::Millis;
 
-/// Jobs allowed in the pipeline (waiting for audio, whisper or paste) before a key-down is
-/// refused: one in flight plus one waiting. The recording itself is not counted.
-const MAX_PENDING_JOBS: usize = 2;
+/// Jobs allowed to wait (for audio, whisper or paste) before a key-down is refused. The job in
+/// whisper, the one pasting and the recording itself are not waiting (ARCHITECTURE 3).
+const MAX_WAITING_JOBS: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -69,6 +69,8 @@ pub struct State {
     /// Release time of a lone short press. The double-tap window is checked against it at
     /// the next press, so it needs no timer of its own.
     last_tap: Option<Millis>,
+    /// Between the hook's `ChordDown` and its `ChordUp`, in both modes.
+    chord_held: bool,
     notice: Option<(Notice, Millis)>,
     idle_unload_at: Option<Millis>,
     /// Sleep asked for an unload; done as soon as nothing is in flight.
@@ -92,6 +94,7 @@ impl State {
             next_job: 0,
             model: ModelStatus::Unloaded,
             last_tap: None,
+            chord_held: false,
             notice: None,
             idle_unload_at: None,
             unload_when_idle: false,
@@ -145,9 +148,15 @@ impl State {
     pub(super) fn handle(&mut self, event: Event, now: Millis) -> Effects {
         let mut fx = Effects::new();
         match event {
-            Event::ChordDown => self.chord_down(now, &mut fx),
+            Event::ChordDown => {
+                self.chord_held = true;
+                self.chord_down(now, &mut fx);
+            }
             // A poll that finds the chord released is a key-up the hook never delivered.
-            Event::ChordUp | Event::ChordPolled { held: false } => self.chord_up(now, &mut fx),
+            Event::ChordUp | Event::ChordPolled { held: false } => {
+                self.chord_held = false;
+                self.chord_up(now, &mut fx);
+            }
             Event::ChordPolled { held: true } => {}
             Event::Esc => {
                 if self.rec.take().is_some() {
@@ -157,8 +166,10 @@ impl State {
                 }
             }
             Event::OtherKey => {
-                // The user meant a shortcut: cancel silently. Only while the chord is held.
-                if self.rec.as_ref().is_some_and(|r| r.kind == Kind::Held) {
+                // The user meant a shortcut: cancel silently, in both modes. A recording that
+                // exists while the chord is held was started by this press: a press that stops
+                // one leaves none.
+                if self.chord_held {
                     self.discard_recording(&mut fx);
                 }
             }
@@ -256,7 +267,13 @@ impl State {
             self.fail(model_notice(why), now, fx);
             return;
         }
-        if self.jobs.len() >= MAX_PENDING_JOBS {
+        let waiting = self.jobs.iter().filter(|j| {
+            matches!(
+                j.stage,
+                Stage::AwaitingAudio | Stage::Queued | Stage::Transcribed
+            )
+        });
+        if waiting.count() >= MAX_WAITING_JOBS {
             fx.push(Effect::Play(Sound::Error));
             return;
         }
@@ -264,7 +281,7 @@ impl State {
         let lock_candidate = push
             && self
                 .last_tap
-                .is_some_and(|t| now - t <= self.cfg.double_tap_gap);
+                .is_some_and(|t| now - t < self.cfg.double_tap_gap);
         self.last_tap = None;
         self.notice = None;
         self.idle_unload_at = None;

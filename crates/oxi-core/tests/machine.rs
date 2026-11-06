@@ -73,6 +73,7 @@ fn overlay_of(fx: &[Effect]) -> Option<Overlay> {
 const START: [Effect; 2] = [Effect::StartCapture, Effect::Play(Sound::Start)];
 const J0: JobId = JobId(0);
 const J1: JobId = JobId(1);
+const J2: JobId = JobId(2);
 
 fn stop(job: JobId) -> [Effect; 2] {
     [Effect::StopCapture(job), Effect::Play(Sound::Stop)]
@@ -113,30 +114,54 @@ fn edge_01_key_during_paste_starts_a_new_recording() {
 }
 
 #[test]
-fn edge_01_jobs_run_and_paste_in_order_and_a_third_is_refused() {
+fn edge_01_jobs_run_and_paste_in_order_and_a_third_waiting_job_is_refused() {
     let mut s = Sim::loaded();
-    s.press(0, 400); // job 0
+    s.press(0, 400); // job 0 goes to whisper
     s.at(450, Event::JobAudioReady(J0));
     s.press(500, 1000); // job 1 waits for whisper
     assert_eq!(s.core(1050, Event::JobAudioReady(J1)), []);
 
-    // Two jobs wait: the third key-down is refused with the error sound, nothing else.
-    assert_eq!(s.at(1100, Event::ChordDown), [Effect::Play(Sound::Error)]);
+    // One job waits, the one in whisper does not count: a new recording starts.
+    assert_eq!(s.core(1100, Event::ChordDown), START);
+    assert_eq!(s.core(1500, Event::ChordUp), stop(J2));
+    assert_eq!(s.core(1550, Event::JobAudioReady(J2)), []);
+
+    // Two jobs wait: the next key-down is refused with the error sound, nothing else.
+    assert_eq!(s.at(1600, Event::ChordDown), [Effect::Play(Sound::Error)]);
+    assert_eq!(s.core(1700, Event::ChordUp), []);
     assert_eq!(s.phase(), Phase::Transcribing);
 
     // Job 0 finishes: job 1 goes to whisper, job 0 to paste.
     assert_eq!(
-        s.core(1200, done(J0)),
+        s.core(1800, done(J0)),
         [Effect::Transcribe(J1), Effect::Paste(J0)]
     );
     // Job 1 is transcribed while job 0 still pastes: it waits for its turn.
-    assert_eq!(s.core(1300, done(J1)), []);
-    assert_eq!(s.core(1400, Event::PasteDone(J0)), [Effect::Paste(J1)]);
-    s.at(1500, Event::PasteDone(J1));
+    assert_eq!(s.core(1900, done(J1)), [Effect::Transcribe(J2)]);
+    assert_eq!(s.core(2000, Event::PasteDone(J0)), [Effect::Paste(J1)]);
+    assert_eq!(s.core(2100, done(J2)), []);
+    assert_eq!(s.core(2200, Event::PasteDone(J1)), [Effect::Paste(J2)]);
+    s.at(2300, Event::PasteDone(J2));
     assert_eq!(s.phase(), Phase::Idle);
 
     // The queue has room again.
-    assert_eq!(s.core(1600, Event::ChordDown), START);
+    assert_eq!(s.core(2400, Event::ChordDown), START);
+}
+
+#[test]
+fn edge_01_jobs_in_whisper_and_paste_are_not_waiting() {
+    let mut s = Sim::loaded();
+    s.press(0, 400);
+    s.at(450, Event::JobAudioReady(J0));
+    s.press(500, 1000);
+    s.at(1050, Event::JobAudioReady(J1));
+    assert_eq!(
+        s.core(1200, done(J0)),
+        [Effect::Transcribe(J1), Effect::Paste(J0)]
+    );
+    // Job 0 pastes, job 1 is in whisper: nothing waits, the press records.
+    assert_eq!(s.core(1250, Event::ChordDown), START);
+    assert_eq!(s.phase(), Phase::Recording);
 }
 
 // ---- 2. double tap -------------------------------------------------------------------------
@@ -148,6 +173,7 @@ fn edge_02_double_tap_locks_recording_on() {
         (100, 200, 100, true),
         (249, 299, 249, true),
         (250, 100, 100, false), // first press too long to count
+        (100, 300, 100, false), // gap must be under 300 ms
         (100, 301, 100, false), // gap too long
         (100, 200, 250, false), // second press too long
         (100, 200, 400, false), // second press is a normal push recording
@@ -324,29 +350,38 @@ fn edge_06_esc_when_not_recording_is_not_ours() {
 // ---- 7. another key while the chord is held --------------------------------------------------
 
 #[test]
-fn edge_07_other_key_cancels_silently() {
-    let mut s = Sim::loaded();
-    s.at(0, Event::ChordDown);
-    let fx = s.at(80, Event::OtherKey);
-    // No sound, no notification, no overlay text: just gone.
-    assert_eq!(
-        fx,
-        [Effect::DiscardCapture, Effect::Overlay(Overlay::Hidden)]
-    );
-    assert_eq!(s.core(900, Event::ChordUp), []);
-    assert_eq!(s.phase(), Phase::Idle);
-    assert_eq!(s.0.next_deadline(), Some(Millis(80 + 300_000))); // only the idle unload
+fn edge_07_other_key_cancels_silently_in_both_modes() {
+    for mode in [Mode::Push, Mode::Toggle] {
+        let mut s = Sim::with(MachineConfig {
+            mode,
+            ..MachineConfig::default()
+        });
+        s.at(0, Event::ChordDown);
+        let fx = s.at(50, Event::OtherKey);
+        // No sound, no notification, no overlay text: just gone.
+        assert_eq!(
+            fx,
+            [Effect::DiscardCapture, Effect::Overlay(Overlay::Hidden)],
+            "{mode:?}"
+        );
+        assert_eq!(s.core(900, Event::ChordUp), [], "{mode:?}");
+        assert_eq!(s.phase(), Phase::Idle, "{mode:?}");
+        // Only the idle unload is armed.
+        assert_eq!(s.0.next_deadline(), Some(Millis(50 + 300_000)), "{mode:?}");
+    }
 }
 
 #[test]
-fn edge_07_other_key_is_ignored_when_the_chord_is_not_held() {
+fn edge_07_other_key_during_the_stopping_press_keeps_the_job() {
     let mut s = Sim::loaded();
     assert_eq!(s.at(0, Event::OtherKey), []); // idle
     let mut t = Sim::toggle();
     t.at(0, Event::ChordDown);
     t.at(50, Event::ChordUp);
-    assert_eq!(t.core(500, Event::OtherKey), []); // toggle recording: typing is fine
-    assert_eq!(t.phase(), Phase::Recording);
+    // The press that stops a toggle recording, then a shortcut key: the job stays.
+    assert_eq!(t.core(500, Event::ChordDown), stop(J0));
+    assert_eq!(t.core(550, Event::OtherKey), []);
+    assert_eq!(t.phase(), Phase::Transcribing);
 }
 
 // ---- 8. lost key-up and the watchdog ---------------------------------------------------------
