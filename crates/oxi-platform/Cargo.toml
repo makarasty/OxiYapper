@@ -1,0 +1,18 @@
+[package]
+name = "oxi-platform"
+description = "OS code behind traits: audio capture, WAV, and per-OS hotkey/paste/tray modules."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+oxi-core.workspace = true
+cpal.workspace = true
+rtrb.workspace = true
+hound.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

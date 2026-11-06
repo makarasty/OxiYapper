@@ -13,6 +13,7 @@ cuda = ["whisper-rs/cuda"]
 metal = ["whisper-rs/metal"]
 
 [dependencies]
+oxi-core.workspace = true
 whisper-rs.workspace = true
 
 [lints]
