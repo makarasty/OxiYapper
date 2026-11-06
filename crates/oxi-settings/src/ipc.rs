@@ -25,6 +25,8 @@ const POLL: Duration = Duration::from_millis(250);
 const REPLY_WAIT: Duration = Duration::from_secs(2);
 const MIN_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
+/// Pause between probes of a pipe that should be going away.
+const PROBE_PAUSE: Duration = Duration::from_millis(50);
 /// Retry interval while a daemon we just started comes up.
 const STARTUP_RETRY: Duration = Duration::from_millis(100);
 
@@ -123,7 +125,8 @@ pub struct Options {
     pub spawn: Box<dyn Fn() -> io::Result<()> + Send>,
     /// How long to keep retrying after `spawn` before reporting [`Link::Offline`].
     pub grace: Duration,
-    /// How long a restart waits for the old daemon's pipe to go away before it gives up.
+    /// How long a restart (or Start while [`Link::Stuck`]) waits for the old daemon's pipe to
+    /// go away before it gives up; also how often a stuck link looks again.
     pub exit_wait: Duration,
 }
 
@@ -191,8 +194,32 @@ fn run(o: &Options, rx: &Receiver<Cmd>, out: &Out<impl Fn(Event)>) {
     let mut backoff = MIN_BACKOFF;
     let mut grace: Option<Instant> = None;
     let mut launched = false;
+    let mut stuck = false;
     out.set(Link::Connecting);
     loop {
+        if stuck {
+            // Keep the note until the name frees or the user acts; no probing of the old
+            // daemon, which would replace it with Busy or Mismatch.
+            let start = match wait(rx, o.exit_wait) {
+                Waited::Stopped => return,
+                Waited::Start => true,
+                Waited::Elapsed => false,
+            };
+            match pipe_freed(&o.name, rx, o.exit_wait) {
+                Probe::Stopped => return,
+                Probe::Held => {}
+                Probe::Free => {
+                    stuck = false;
+                    if start {
+                        launch(o, &mut grace);
+                        out.set(Link::Connecting);
+                    } else {
+                        out.set(Link::Offline);
+                    }
+                }
+            }
+            continue;
+        }
         match open(&o.name) {
             Ok((mut conn, daemon_proto)) => {
                 backoff = MIN_BACKOFF;
@@ -210,10 +237,14 @@ fn run(o: &Options, rx: &Receiver<Cmd>, out: &Out<impl Fn(Event)>) {
                         out.set(Link::Connecting);
                         // A new daemon started while the old one still holds the name would
                         // find it, forward OpenSettings to it and exit.
-                        if pipe_freed(&o.name, o.exit_wait) {
-                            launch(o, &mut grace);
-                        } else {
-                            out.set(Link::Stuck);
+                        match pipe_freed(&o.name, rx, o.exit_wait) {
+                            Probe::Stopped => return,
+                            Probe::Free => launch(o, &mut grace),
+                            Probe::Held => {
+                                stuck = true;
+                                out.set(Link::Stuck);
+                                continue;
+                            }
                         }
                     }
                     Served::Dropped => out.set(Link::Offline),
@@ -257,21 +288,44 @@ fn launch(o: &Options, grace: &mut Option<Instant>) {
     *grace = Some(Instant::now() + o.grace);
 }
 
-/// Polls until no server answers on `name`, at most `limit`.
-fn pipe_freed(name: &str, limit: Duration) -> bool {
+enum Probe {
+    Free,
+    Held,
+    Stopped,
+}
+
+/// Polls until no server answers on `name`, at most `limit` in all (a probe that blocks on a
+/// busy pipe is abandoned on its own thread). Dropped commands do not end the wait; a closed
+/// command channel does.
+fn pipe_freed(name: &str, rx: &Receiver<Cmd>, limit: Duration) -> Probe {
     let end = Instant::now() + limit;
     loop {
-        match Client::connect(name) {
-            Err(Error::Io(e))
-                if matches!(
+        let (done, result) = mpsc::channel();
+        let name = name.to_owned();
+        thread::spawn(move || {
+            let gone = matches!(
+                Client::connect(&name),
+                Err(Error::Io(e)) if matches!(
                     e.kind(),
                     io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                return true;
-            }
-            _ if Instant::now() >= end => return false,
-            _ => thread::sleep(Duration::from_millis(50)),
+                )
+            );
+            let _ = done.send(gone);
+        });
+        match result.recv_timeout(end.saturating_duration_since(Instant::now())) {
+            Ok(true) => return Probe::Free,
+            Ok(false) => {}
+            Err(_) => return Probe::Held,
+        }
+        match wait(
+            rx,
+            PROBE_PAUSE.min(end.saturating_duration_since(Instant::now())),
+        ) {
+            Waited::Stopped => return Probe::Stopped,
+            Waited::Start | Waited::Elapsed => {}
+        }
+        if Instant::now() >= end {
+            return Probe::Held;
         }
     }
 }

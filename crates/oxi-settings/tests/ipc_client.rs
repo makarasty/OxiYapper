@@ -145,9 +145,9 @@ fn mismatch_shows_the_update_banner_and_restart_waits_for_the_old_daemon_to_unbi
     assert!(at >= freed);
 }
 
-#[test]
-fn restart_that_never_frees_the_name_says_so_and_spawns_nothing() {
-    let n = name("stuck");
+/// A restart whose old daemon keeps the name: the link is `Stuck`, nothing is spawned.
+fn stuck_after_restart(tag: &str) -> (Sender<Cmd>, Receiver<Event>, Receiver<Instant>, Server) {
+    let n = name(tag);
     let daemon = old_daemon(Server::bind(&n).unwrap());
     let (spawned, spawned_at) = mpsc::channel();
     let mut o = options(&n, Duration::from_millis(200), move || {
@@ -159,9 +159,29 @@ fn restart_that_never_frees_the_name_says_so_and_spawns_nothing() {
     tx.send(Cmd::Restart).unwrap();
     let stuck = until(&events, link(Link::Stuck));
     assert_eq!(notice(&stuck).unwrap().action, Some(Action::Start));
-    assert!(spawned_at.try_recv().is_err());
-    let (_server, first) = daemon.join().unwrap();
+    let (server, first) = daemon.join().unwrap();
     assert_eq!(first, Some(Request::Shutdown));
+    (tx, events, spawned_at, server)
+}
+
+#[test]
+fn stuck_stays_until_the_name_frees() {
+    let (_tx, events, spawned_at, _server) = stuck_after_restart("stuck");
+    // Longer than a probe of the old daemon takes to come back as Busy (2 s Hello wait).
+    assert!(events.recv_timeout(Duration::from_millis(2600)).is_err());
+    assert!(spawned_at.try_recv().is_err());
+}
+
+#[test]
+fn start_while_the_name_is_held_spawns_nothing() {
+    let (tx, events, spawned_at, server) = stuck_after_restart("stuck-start");
+    tx.send(Cmd::Start).unwrap();
+    assert!(events.recv_timeout(Duration::from_millis(1000)).is_err());
+    assert!(spawned_at.try_recv().is_err());
+    drop(server);
+    until(&events, link(Link::Offline));
+    tx.send(Cmd::Start).unwrap();
+    spawned_at.recv_timeout(Duration::from_secs(4)).unwrap();
 }
 
 #[test]
