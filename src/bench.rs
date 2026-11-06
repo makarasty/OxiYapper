@@ -18,12 +18,13 @@ use oxi_core::audio;
 use oxi_core::config::Audio;
 use oxi_core::device::DeviceChoice;
 use oxi_core::dictionary::build_prompt;
-use oxi_core::models::{find_by_file_name, sha256_file};
-use oxi_core::text::{self, HallucinationFilter, Outcome, ReplaceRules, decode_text_file};
+use oxi_core::text::{Outcome, decode_text_file};
 use oxi_core::types::{Language, Millis};
 use oxi_platform::capture::{Capture, CaptureEvent, CpalCapture, LevelMeter};
 use oxi_platform::wav::{read_wav_mono_f32, write_wav};
 use oxi_whisper::Engine;
+
+use crate::pipeline::{self, TextAssets};
 
 /// Usage text; a `Display` constant so `{USAGE}` still works while the name comes from `APP_NAME`.
 struct Usage;
@@ -122,26 +123,6 @@ fn percentile(sorted: &[u128], pct: usize) -> u128 {
     }
 }
 
-/// Refuse a file that carries a registry file name but not the registry hash. Any other
-/// name is a custom model and loads as is (ARCHITECTURE 8).
-fn verify_model(path: &Path) -> Result<()> {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
-    let Some(entry) = find_by_file_name(name) else {
-        return Ok(());
-    };
-    let actual = sha256_file(path).with_context(|| format!("hash {}", path.display()))?;
-    if actual != entry.sha256 {
-        bail!(
-            "{name}: hash mismatch (expected {}, got {actual}); delete the file and download it again",
-            entry.sha256
-        );
-    }
-    Ok(())
-}
-
 fn wav_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files: Vec<PathBuf> = fs::read_dir(dir)
         .with_context(|| format!("read {}", dir.display()))?
@@ -216,15 +197,15 @@ pub fn run(args: &[String]) -> Result<()> {
     if files.is_empty() {
         bail!("no .wav files in {}", args.dir.display());
     }
-    let prompt = match &args.prompt_file {
+    let assets = TextAssets::with_prompt(match &args.prompt_file {
         Some(p) => {
             let bytes = fs::read(p).with_context(|| format!("read {}", p.display()))?;
             build_prompt(decode_text_file(&bytes)?.lines()).text
         }
         None => String::new(),
-    };
+    });
 
-    verify_model(&args.model)?;
+    pipeline::verify_hash(&args.model)?;
     print_vram(&args, "before load");
     let started = Instant::now();
     let mut engine = Engine::load(&args.model, &args.gpu)?;
@@ -236,7 +217,6 @@ pub fn run(args: &[String]) -> Result<()> {
         println!("warning: {w}");
     }
 
-    let (filter, rules) = (HallucinationFilter::default(), ReplaceRules::default());
     let (mut times, mut heard) = (Vec::new(), 0_usize);
     for path in &files {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -259,15 +239,10 @@ pub fn run(args: &[String]) -> Result<()> {
             }
         };
         let started = Instant::now();
-        let transcript = engine.transcribe(&clip, args.lang, &prompt)?;
+        let transcript = engine.transcribe(&clip, args.lang, &assets.prompt)?;
         let ms = started.elapsed().as_millis();
         times.push(ms);
-        let segments: Vec<&str> = transcript
-            .segments
-            .iter()
-            .map(|s| s.text.as_str())
-            .collect();
-        let text = match text::process(&segments, &filter, &rules, false) {
+        let text = match pipeline::finish(&transcript, &assets, false) {
             Outcome::Text(t) => {
                 heard += 1;
                 t
@@ -301,12 +276,6 @@ mod tests {
 
     fn strs(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| (*s).to_owned()).collect()
-    }
-
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("oxi-bench-{}-{name}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
     }
 
     #[test]
@@ -415,17 +384,5 @@ mod tests {
         assert_eq!(percentile(&[7], 95), 7);
         let v: Vec<u128> = (1..=10).collect();
         assert_eq!((percentile(&v, 50), percentile(&v, 95)), (5, 10));
-    }
-
-    #[test]
-    fn registry_named_file_with_wrong_bytes_is_refused_custom_loads() {
-        let dir = scratch("model");
-        let tiny = dir.join("ggml-tiny.bin");
-        fs::write(&tiny, b"not the real model").unwrap();
-        let err = verify_model(&tiny).unwrap_err().to_string();
-        assert!(err.contains("hash mismatch"), "{err}");
-        let custom = dir.join("my-model.bin");
-        fs::write(&custom, b"anything").unwrap();
-        verify_model(&custom).unwrap();
     }
 }
