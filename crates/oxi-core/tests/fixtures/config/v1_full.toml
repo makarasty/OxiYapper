@@ -1,0 +1,55 @@
+version = 1
+
+[audio]
+denoise = true
+device = "Test Mic"
+gain_db = 3.5
+max_seconds = 300
+normalize = false
+tail_ms = 150
+trim = true
+
+[debug]
+log_text = true
+
+[history]
+enabled = true
+max_bytes = 1048576
+
+[hotkey]
+chord = ["Ctrl", "Alt", "Space"]
+mode = "toggle"
+
+[model]
+custom_path = ""
+gpu = "cpu"
+id = "base"
+idle_unload_minutes = 0
+language = "auto"
+
+[overlay]
+enabled = false
+hide_over_fullscreen = true
+position = "top-left"
+
+[paste]
+mode = "type"
+restore_delay_ms = 500
+trailing_space = false
+
+[[paste.rules]]
+app = "a.exe"
+mode = "clipboard"
+restore_delay_ms = 50
+
+[[paste.rules]]
+app = "b.exe"
+chord = ["Ctrl", "Shift", "V"]
+
+[sounds]
+enabled = false
+volume = 0.25
+
+[system]
+autostart = false
+update_check = false

@@ -1,0 +1,12 @@
+version = 1
+zeta = "top"
+
+[audio]
+future_field = 42
+gain_db = 1.5
+
+[future]
+flag = true
+
+[hotkey]
+chord = ["Ctrl", "Win"]
