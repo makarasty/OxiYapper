@@ -36,9 +36,19 @@ fn word_before(chars: &[char], i: usize) -> bool {
     }
 }
 
-/// The char at `i` continues a word. An apostrophe does not: the stem of `GitHub's` matches.
+/// The char at `i` continues a word: a word char, or an apostrophe before a word char,
+/// except the possessive `'s` ending a word, so the stem of `GitHub's` matches but not `don't`.
 fn word_after(chars: &[char], i: usize) -> bool {
-    chars.get(i).is_some_and(|&c| is_word(c))
+    match chars.get(i) {
+        Some(&c) if is_word(c) => true,
+        Some(&c) if is_apostrophe(c) => {
+            let next_is_word = |j: usize| chars.get(j).is_some_and(|&n| is_word(n));
+            let possessive =
+                chars.get(i + 1).is_some_and(|&n| fold(n) == 's') && !next_is_word(i + 2);
+            next_is_word(i + 1) && !possessive
+        }
+        _ => false,
+    }
 }
 
 impl ReplaceRules {

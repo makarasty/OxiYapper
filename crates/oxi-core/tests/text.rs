@@ -69,7 +69,7 @@ fn user_lines_extend_the_default_list() {
 
 #[test]
 fn replace_rules_table() {
-    let rules = "git hub => GitHub\ngithub => GitHub\npull => fetch\npull request => PR\nджава скрипт => JavaScript\nc++ => C++\num =>\nm => meters\nll => will\n";
+    let rules = "git hub => GitHub\ngithub => GitHub\npull => fetch\npull request => PR\nджава скрипт => JavaScript\nc++ => C++\num =>\nm => meters\nll => will\ndon => do\ni => me\nwe => us\n";
     let cases = [
         ("Open Git Hub now", "Open GitHub now"),
         // Longest match first.
@@ -97,6 +97,10 @@ fn replace_rules_table() {
         ("github's repo", "GitHub's repo"),
         ("git hub's API", "GitHub's API"),
         ("git hub\u{2019}s API", "GitHub\u{2019}s API"),
+        // Any other apostrophe continuation blocks the match.
+        ("don't", "don't"),
+        ("we're here", "we're here"),
+        ("we've, we'd", "we've, we'd"),
         // A quote around a word does.
         ("'pull' it", "'fetch' it"),
     ];
