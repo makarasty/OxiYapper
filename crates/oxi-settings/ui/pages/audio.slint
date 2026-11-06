@@ -1,10 +1,164 @@
-// Audio page. A stub of the shell: the Audio page task fills it.
-import { Group } from "../widgets.slint";
+// Audio page (SPEC Recording, Audio before whisper): microphone, live meter, the DSP switches,
+// tail, recording cap and dictation language.
+import { Palette, ComboBox, Button } from "std-widgets.slint";
+import { Shell, Group, Row, ToggleRow, SliderRow, InlineNote } from "../widgets.slint";
+
+// Which control changed; `value` of `AudioState.edited` carries its new value.
+export enum AudioKey { device, gain, sensitivity, normalize, trim, denoise, tail, max-minutes, language }
+
+// Filled and read by `pages::audio`.
+export global AudioState {
+    // "System default" first, then the input devices.
+    in property <[string]> devices;
+    in-out property <int> device;
+    in-out property <float> gain-db;
+    in-out property <float> sensitivity-db;
+    in-out property <bool> normalize;
+    in-out property <bool> trim;
+    in-out property <bool> denoise;
+    in-out property <float> tail-ms;
+    in-out property <float> max-minutes;
+    // 0 ru, 1 en, 2 auto.
+    in property <int> language;
+    // Live meter: bar heights 0..1, oldest first.
+    in property <[float]> bars;
+    in property <bool> clipping;
+    // True while the page holds the microphone open.
+    in property <bool> live;
+    // Why there is no meter ("No microphone"), shown while `live` is off.
+    in property <string> note;
+    callback shown();
+    callback edited(AudioKey, float);
+}
 
 export component AudioPage inherits VerticalLayout {
     alignment: start;
     spacing: 10px;
+    init => {
+        AudioState.shown();
+    }
     Group {
-        title: @tr("Audio");
+        title: @tr("Microphone");
+        Row {
+            label: @tr("Device");
+            ComboBox {
+                horizontal-stretch: 2;
+                model: AudioState.devices;
+                current-index <=> AudioState.device;
+                enabled: !Shell.locked;
+                accessible-label: @tr("Device");
+                selected => {
+                    AudioState.edited(AudioKey.device, self.current-index);
+                }
+            }
+        }
+        Row {
+            label: @tr("Level");
+            if !AudioState.live: Text {
+                text: AudioState.note;
+                horizontal-stretch: 2;
+                vertical-alignment: center;
+                color: Palette.foreground;
+            }
+            if AudioState.live: Rectangle {
+                horizontal-stretch: 2;
+                height: 22px;
+                accessible-role: progress-indicator;
+                accessible-label: AudioState.clipping ? @tr("Level, clipping") : @tr("Level");
+                HorizontalLayout {
+                    spacing: 2px;
+                    for bar in AudioState.bars: Rectangle {
+                        Rectangle {
+                            y: parent.height - self.height;
+                            height: max(1px, parent.height * bar);
+                            border-radius: 1px;
+                            background: AudioState.clipping ? #c42b1c : Palette.accent-background;
+                        }
+                    }
+                }
+            }
+        }
+        SliderRow {
+            label: @tr("Gain");
+            minimum: -20;
+            maximum: 20;
+            value <=> AudioState.gain-db;
+            value-text: "\{round(self.value)} dB";
+            changed(v) => {
+                AudioState.edited(AudioKey.gain, v);
+            }
+        }
+        SliderRow {
+            label: @tr("Meter sensitivity");
+            minimum: -20;
+            maximum: 20;
+            value <=> AudioState.sensitivity-db;
+            value-text: "\{round(self.value)} dB";
+            changed(v) => {
+                AudioState.edited(AudioKey.sensitivity, v);
+            }
+        }
+    }
+    Group {
+        title: @tr("Processing");
+        ToggleRow {
+            label: @tr("Normalise level");
+            checked <=> AudioState.normalize;
+            toggled(on) => {
+                AudioState.edited(AudioKey.normalize, on ? 1 : 0);
+            }
+        }
+        ToggleRow {
+            label: @tr("Trim silence");
+            checked <=> AudioState.trim;
+            toggled(on) => {
+                AudioState.edited(AudioKey.trim, on ? 1 : 0);
+            }
+        }
+        ToggleRow {
+            label: @tr("Noise suppression");
+            checked <=> AudioState.denoise;
+            toggled(on) => {
+                AudioState.edited(AudioKey.denoise, on ? 1 : 0);
+            }
+        }
+        if AudioState.denoise: InlineNote {
+            text: @tr("Noise suppression can make Whisper worse.");
+        }
+    }
+    Group {
+        title: @tr("Recording");
+        SliderRow {
+            label: @tr("Tail after release");
+            minimum: 0;
+            maximum: 1000;
+            step: 50;
+            value <=> AudioState.tail-ms;
+            value-text: "\{round(self.value)} ms";
+            changed(v) => {
+                AudioState.edited(AudioKey.tail, v);
+            }
+        }
+        SliderRow {
+            label: @tr("Max length");
+            minimum: 1;
+            maximum: 30;
+            value <=> AudioState.max-minutes;
+            value-text: "\{round(self.value)} min";
+            changed(v) => {
+                AudioState.edited(AudioKey.max-minutes, v);
+            }
+        }
+        Row {
+            label: @tr("Language");
+            for code[i] in [@tr("RU"), @tr("EN"), @tr("Auto")]: Button {
+                text: code;
+                primary: AudioState.language == i;
+                enabled: !Shell.locked;
+                clicked => {
+                    AudioState.edited(AudioKey.language, i);
+                }
+            }
+        }
     }
 }
