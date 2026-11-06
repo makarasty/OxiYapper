@@ -1,20 +1,85 @@
-[package]
-name = "oxi-yapper"
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Push-to-talk dictation: hold a hotkey, speak, local whisper.cpp transcribes and pastes."
 license = "MIT OR Apache-2.0"
 publish = false
 
+# One place for versions; a crate takes what it needs with `name.workspace = true`.
+# Entries no crate uses yet are not resolved and cost nothing. They are the picks from
+# docs/research/stack-2026-11.md that milestones M1-M6 (docs/ROADMAP.md) need.
+[workspace.dependencies]
+oxi-core = { path = "crates/oxi-core" }
+oxi-whisper = { path = "crates/oxi-whisper" }
+whisper-rs = "0.16"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.2"
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1.44"
+tracing-subscriber = "0.3"
+tracing-appender = "0.2"
+directories = "6"
+interprocess = "2.4"
+cpal = "0.18"
+rtrb = "0.4"
+rubato = "5"
+hound = "3.5"
+earshot = "1.2"
+nnnoiseless = "0.5"
+windows-sys = "0.61"
+clipboard-win = "5.4"
+tray-icon = "0.26"
+notify = "8.2"
+notify-debouncer-full = "0.7"
+sha2 = "0.11"
+ureq = "3.5"
+proptest = "1.12"
+insta = "1.49"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Pedantic lints that cost more than they catch here.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_precision_loss = "allow" # audio math: sample counts to f32
+# Restriction lints worth having: platform code is mostly FFI.
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+
+# The app binary. `cargo build --release --features vulkan` at the root builds it.
+[package]
+name = "oxi-yapper"
+description = "Push-to-talk dictation: hold a hotkey, speak, local whisper.cpp transcribes and pastes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
 [features]
 default = []
-vulkan = ["whisper-rs/vulkan"]
-cuda = ["whisper-rs/cuda"]
-metal = ["whisper-rs/metal"]
+vulkan = ["oxi-whisper/vulkan"]
+cuda = ["oxi-whisper/cuda"]
+metal = ["oxi-whisper/metal"]
 
 [dependencies]
-whisper-rs = "0.16"
+oxi-core.workspace = true
+oxi-whisper.workspace = true
+
+[lints]
+workspace = true
 
 [profile.release]
 lto = "fat"
@@ -22,3 +87,16 @@ codegen-units = 1
 strip = true
 panic = "abort"
 opt-level = 3
+
+# Debug builds of dependencies are too slow for audio DSP and whisper.cpp in tests.
+# cmake maps a non-zero opt-level to an optimised build of whisper.cpp.
+[profile.dev.package."*"]
+opt-level = 2
+
+# Release speed without the fat-LTO link: benches and the Vulkan/CUDA measurement.
+[profile.profiling]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+strip = false
+debug = "line-tables-only"

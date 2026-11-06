@@ -14,11 +14,35 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
+# Branch protection requires one check: `ci-ok`. Gates: docs/ARCHITECTURE.md "Quality gates".
 jobs:
-  lint:
+  hygiene:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: PR title is a Conventional Commit
+        if: github.event_name == 'pull_request'
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          printf '%s\n' "$TITLE" | grep -Eq '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9-]+\))?!?: .+' \
+            || { echo "PR title must look like 'fix(paste): restore clipboard after RDP paste'"; exit 1; }
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cargo-deny,cargo-machete,typos
+      - run: cargo fmt --all --check
+      - run: typos
+      - run: cargo machete
+      - run: cargo deny --locked check
+
+  clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -28,13 +52,56 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake clang libclang-dev libasound2-dev
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo fmt --check
-      - run: cargo clippy --release -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  core:
+    name: core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    env:
+      CARGO_TARGET_DIR: ${{ matrix.os == 'windows-latest' && 'C:/t' || 'target' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: oxi-core has no -sys dependency
+        if: runner.os == 'Linux'
+        run: "! cargo tree --locked -p oxi-core -e normal --prefix none | grep -E -- '-sys v'"
+      - run: cargo nextest run --locked --profile ci -p oxi-core
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev libasound2-dev
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # M3 adds here: cache ggml-tiny.bin, check its pinned SHA256, set OXI_TINY_MODEL
+      # so the whisper regression (WER threshold on jfk.wav) runs instead of skipping.
+      - run: cargo nextest run --locked --profile ci --workspace
 
   build:
     name: build (${{ matrix.os }}, ${{ matrix.feature }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    # CUDA stays informational until the Vulkan-vs-CUDA measurement (ROADMAP M5) keeps it.
+    continue-on-error: ${{ matrix.feature == 'cuda' }}
     strategy:
       fail-fast: false
       matrix:
@@ -45,7 +112,7 @@ jobs:
           - { os: macos-latest, feature: metal }
     env:
       # Windows: a long target path breaks the nested vulkan-shaders-gen build (MAX_PATH).
-      CARGO_TARGET_DIR: ${{ runner.os == 'Windows' && 'C:/t' || 'target' }}
+      CARGO_TARGET_DIR: ${{ matrix.os == 'windows-latest' && 'C:/t' || 'target' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -72,7 +139,18 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.feature }}
-      - run: cargo build --release --features ${{ matrix.feature }}
+      - run: cargo build --locked --release --features ${{ matrix.feature }}
       - name: Run binary
         shell: bash
         run: "\"$CARGO_TARGET_DIR/release/oxi-yapper\" --version"
+
+  ci-ok:
+    if: always()
+    needs: [hygiene, clippy, core, test, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: All gates passed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: exit 1
+      - run: echo ok

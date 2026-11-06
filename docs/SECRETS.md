@@ -14,5 +14,5 @@ Repo owner: enable in Settings
 - Secret scanning and push protection.
 - Dependabot alerts.
 - Private vulnerability reporting.
-- Branch protection on `main` (require the `ci` checks, no force push).
+- Branch protection on `main` (require the `ci-ok` check, no force push).
 - Actions > General > "Require approval for all outside collaborators" for fork PR workflows.

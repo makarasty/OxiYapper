@@ -1,0 +1,40 @@
+# cargo-deny: licences, advisories, bans, sources. Run: cargo deny check
+[graph]
+all-features = false
+
+[advisories]
+# RustSec advisories fail the check; an ignore needs an id and a reason here.
+ignore = []
+
+[licenses]
+confidence-threshold = 0.9
+unused-allowed-license = "allow"
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense", # whisper-rs, whisper-rs-sys
+    "CC0-1.0",
+    "BSL-1.0",
+]
+# Slint (settings UI, ROADMAP M9) is "GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR ...".
+# Add an exception for the slint crates with the royalty-free licence when it lands.
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    # TLS goes through rustls (ureq default); no system OpenSSL in the bundle.
+    { name = "openssl-sys" },
+    { name = "openssl" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

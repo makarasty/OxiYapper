@@ -1,0 +1,17 @@
+# cargo-nextest. Every test gets a hard limit: a hung test fails, it never runs for hours.
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[profile.ci]
+fail-fast = false
+retries = 0
+slow-timeout = { period = "60s", terminate-after = 5 }
+failure-output = "immediate-final"
+
+# whisper tests load a model: one at a time, so CI runners do not run out of RAM.
+[test-groups]
+whisper = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = "package(oxi-whisper)"
+test-group = "whisper"

@@ -28,7 +28,7 @@ jobs:
           - { os: ubuntu-latest, feature: vulkan, target: linux-x86_64-vulkan }
           - { os: macos-latest, feature: metal, target: macos-aarch64-metal }
     env:
-      CARGO_TARGET_DIR: ${{ runner.os == 'Windows' && 'C:/t' || 'target' }}
+      CARGO_TARGET_DIR: ${{ startsWith(matrix.os, 'windows') && 'C:/t' || 'target' }}
       TAG: ${{ github.ref_name }}
       NAME: oxi-yapper-${{ github.ref_name }}-${{ matrix.target }}
     steps:

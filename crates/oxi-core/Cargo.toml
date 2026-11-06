@@ -1,0 +1,13 @@
+[package]
+name = "oxi-core"
+description = "Pure logic of oxi-yapper: state machine, config, text pipeline. No OS calls, no C/C++ build."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

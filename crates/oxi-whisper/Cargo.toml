@@ -1,0 +1,19 @@
+[package]
+name = "oxi-whisper"
+description = "whisper.cpp wrapper: model load/unload, GPU device choice, transcription worker."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+vulkan = ["whisper-rs/vulkan"]
+cuda = ["whisper-rs/cuda"]
+metal = ["whisper-rs/metal"]
+
+[dependencies]
+whisper-rs.workspace = true
+
+[lints]
+workspace = true
