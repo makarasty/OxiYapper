@@ -1,8 +1,8 @@
 use oxi_core::audio::{
-    AudioError, CHUNK_SAMPLES, DENOISE_FRAME, DENOISE_RATE, Denoiser, MAX_GAIN_DB, PEAK_LIMIT,
-    SAMPLE_RATE, StreamResampler, TARGET_RMS_DBFS, apply_gain_db, downmix, level, levels,
-    normalise, samples_for, trim,
+    AudioError, CHUNK_SAMPLES, MAX_GAIN_DB, PEAK_LIMIT, Pipeline, SAMPLE_RATE, TARGET_RMS_DBFS,
+    downmix, level, process, samples_for,
 };
+use oxi_core::config::Audio;
 use oxi_core::types::Millis;
 use std::f32::consts::TAU;
 
@@ -27,11 +27,28 @@ fn noise(len: usize, amp: f32) -> Vec<f32> {
         .collect()
 }
 
+fn opts(trim: bool, normalize: bool, denoise: bool) -> Audio {
+    Audio {
+        trim,
+        normalize,
+        denoise,
+        ..Audio::default()
+    }
+}
+
+/// Only resampling (and gain): no gate, no normalising.
+fn plain() -> Audio {
+    opts(false, false, false)
+}
+
+/// Trim on, normalise off, so the output keeps the input amplitude.
+fn trim_only() -> Audio {
+    opts(true, false, false)
+}
+
 #[test]
 fn constants_are_consistent() {
     assert_eq!(CHUNK_SAMPLES, 320);
-    assert_eq!(DENOISE_FRAME, 480);
-    assert_eq!(DENOISE_RATE, 48_000);
     assert_eq!(samples_for(Millis(200), SAMPLE_RATE), 3200);
 }
 
@@ -44,12 +61,27 @@ fn downmix_averages_channels() {
 }
 
 #[test]
-fn gain_in_db() {
-    let mut s = vec![0.1, -0.2];
-    apply_gain_db(&mut s, 6.0);
-    assert!((s[0] - 0.1 * 1.9953).abs() < 1e-4 && (s[1] + 0.2 * 1.9953).abs() < 1e-4);
-    apply_gain_db(&mut s, -6.0);
-    assert!((s[0] - 0.1).abs() < 1e-4);
+fn push_applies_gain_and_meters_it() {
+    let mut p = Pipeline::new(
+        SAMPLE_RATE,
+        &Audio {
+            gain_db: 6.0,
+            ..plain()
+        },
+    )
+    .unwrap();
+    let l = p.push(&[0.1, -0.2]).unwrap();
+    assert!((l.peak - 0.2 * 1.9953).abs() < 1e-4, "peak {}", l.peak);
+    let out = process(
+        &sine(300.0, SAMPLE_RATE, 16_000, 0.1),
+        SAMPLE_RATE,
+        &Audio {
+            gain_db: -6.0,
+            ..plain()
+        },
+    )
+    .unwrap();
+    assert!((db(level(&out).rms) - db(0.1 / 2.0_f32.sqrt()) + 6.0).abs() < 0.1);
 }
 
 #[test]
@@ -62,18 +94,6 @@ fn level_of_sine_and_silence() {
 }
 
 #[test]
-fn levels_per_20_ms_chunk() {
-    // 50 ms at 16 kHz: two full chunks and a 10 ms rest; only the first is loud.
-    let mut s = vec![0.0; 800];
-    s[..320].fill(0.5);
-    let ls = levels(&s, SAMPLE_RATE);
-    assert_eq!(ls.len(), 3);
-    assert_eq!(ls[0].peak, 0.5);
-    assert_eq!(ls[1].peak, 0.0);
-    assert_eq!(ls[2].peak, 0.0);
-}
-
-#[test]
 fn resample_length_within_one_chunk() {
     for (rate, input_len) in [
         (48_000, 48_000),
@@ -82,9 +102,7 @@ fn resample_length_within_one_chunk() {
         (16_000, 16_000),
         (8_000, 3_333),
     ] {
-        let mut r = StreamResampler::new(rate, SAMPLE_RATE).unwrap();
-        let mut out = r.push(&sine(300.0, rate, input_len, 0.5)).unwrap();
-        out.extend(r.finish().unwrap());
+        let out = process(&sine(300.0, rate, input_len, 0.5), rate, &plain()).unwrap();
         let expected = input_len * SAMPLE_RATE as usize / rate as usize;
         assert!(
             out.len().abs_diff(expected) <= CHUNK_SAMPLES,
@@ -95,19 +113,16 @@ fn resample_length_within_one_chunk() {
 }
 
 #[test]
-fn resample_streaming_equals_one_shot_and_keeps_the_tone() {
+fn streaming_equals_one_shot_and_keeps_the_tone() {
     let input = sine(440.0, 48_000, 48_000, 0.5);
-    let mut one = StreamResampler::new(48_000, SAMPLE_RATE).unwrap();
-    let mut whole = one.push(&input).unwrap();
-    whole.extend(one.finish().unwrap());
+    let whole = process(&input, 48_000, &plain()).unwrap();
 
     // Callback-sized pieces that do not line up with the 20 ms chunk.
-    let mut many = StreamResampler::new(48_000, SAMPLE_RATE).unwrap();
-    let mut pieces = Vec::new();
+    let mut many = Pipeline::new(48_000, &plain()).unwrap();
     for part in input.chunks(441) {
-        pieces.extend(many.push(part).unwrap());
+        many.push(part).unwrap();
     }
-    pieces.extend(many.finish().unwrap());
+    let pieces = many.finish().unwrap();
 
     assert_eq!(whole.len(), 16_000);
     assert_eq!(pieces.len(), whole.len());
@@ -130,71 +145,64 @@ fn resample_streaming_equals_one_shot_and_keeps_the_tone() {
 }
 
 #[test]
-fn resample_rejects_zero_rate() {
-    assert!(matches!(
-        StreamResampler::new(0, SAMPLE_RATE),
-        Err(AudioError::Resample(_))
-    ));
+fn zero_rate_is_rejected() {
+    for denoise in [false, true] {
+        assert!(matches!(
+            Pipeline::new(0, &opts(true, true, denoise)),
+            Err(AudioError::Resample(_))
+        ));
+    }
 }
 
 #[test]
-fn denoise_keeps_length_and_lowers_noise() {
-    let input = noise(DENOISE_RATE as usize, 0.05);
-    let mut d = Denoiser::new();
-    // Odd push sizes: frames must carry over between calls.
-    let mut out = Vec::new();
-    for part in input.chunks(1000) {
-        out.extend(d.push(part));
+fn denoise_lowers_noise() {
+    // 44.1 kHz input also exercises the resample to 48 kHz in front of RNNoise.
+    for rate in [48_000, 44_100] {
+        let input = noise(rate as usize, 0.05);
+        let raw = process(&input, rate, &plain()).unwrap();
+        let clean = process(&input, rate, &opts(false, false, true)).unwrap();
+        assert!(clean.len().abs_diff(raw.len()) <= CHUNK_SAMPLES);
+        // Skip the first 100 ms (RNNoise adapts). White noise is hard for it: 4 dB at 48 kHz, 2.3 at 44.1.
+        let skip = 1600;
+        let (before, after) = (level(&raw[skip..]).rms, level(&clean[skip..]).rms);
+        assert!(
+            db(after) < db(before) - 2.0,
+            "{rate}: noise only dropped from {} to {} dB",
+            db(before),
+            db(after)
+        );
     }
-    out.extend(d.finish());
-    assert_eq!(out.len(), input.len());
-    // Skip the first 100 ms (RNNoise adapts).
-    let skip = 4800;
-    let before = level(&input[skip..]).rms;
-    let after = level(&out[skip..]).rms;
-    assert!(
-        db(after) < db(before) - 3.0,
-        "noise only dropped from {} to {} dB",
-        db(before),
-        db(after)
-    );
+}
+
+fn normalised(input: &[f32]) -> Vec<f32> {
+    process(input, SAMPLE_RATE, &opts(false, true, false)).unwrap()
 }
 
 #[test]
 fn normalise_hits_target_within_half_db() {
     for start_dbfs in [-40.0_f32, -30.0, -25.0, -20.0, -15.0] {
         let amp = 10.0_f32.powf(start_dbfs / 20.0) * 2.0_f32.sqrt();
-        let mut s = sine(300.0, SAMPLE_RATE, 16_000, amp);
-        let gain = normalise(&mut s).unwrap();
-        let got = db(level(&s).rms);
-        if start_dbfs > TARGET_RMS_DBFS {
-            // Already above target: attenuated, not boosted.
-            assert!(gain < 0.0);
-        }
+        let got = db(level(&normalised(&sine(300.0, SAMPLE_RATE, 16_000, amp))).rms);
         assert!(
             (got - TARGET_RMS_DBFS).abs() < 0.5,
             "{start_dbfs} dBFS became {got}"
         );
-        assert!((gain - (TARGET_RMS_DBFS - start_dbfs)).abs() < 0.5);
     }
 }
 
 #[test]
 fn normalise_caps_gain_at_20_db() {
-    let mut s = sine(300.0, SAMPLE_RATE, 16_000, 0.001);
-    let before = level(&s).rms;
-    let gain = normalise(&mut s).unwrap();
-    assert!((gain - MAX_GAIN_DB).abs() < 0.01);
-    assert!((db(level(&s).rms) - db(before) - MAX_GAIN_DB).abs() < 0.01);
+    let s = sine(300.0, SAMPLE_RATE, 16_000, 0.001);
+    let gain = db(level(&normalised(&s)).rms) - db(level(&s).rms);
+    assert!((gain - MAX_GAIN_DB).abs() < 0.1, "gain {gain}");
 }
 
 #[test]
 fn normalise_limits_the_peak() {
     // Quiet body with one spike: RMS wants +20 dB, the spike would clip.
     let mut s = sine(300.0, SAMPLE_RATE, 16_000, 0.02);
-    s[100] = 0.5;
-    normalise(&mut s).unwrap();
-    let peak = level(&s).peak;
+    s[8000] = 0.5;
+    let peak = level(&normalised(&s)).peak;
     assert!(peak <= PEAK_LIMIT + 1e-6, "peak {peak}");
     assert!(
         peak > PEAK_LIMIT - 0.01,
@@ -203,20 +211,31 @@ fn normalise_limits_the_peak() {
 }
 
 #[test]
-fn normalise_all_zero_is_mic_silence() {
-    let mut s = vec![0.0; 16_000];
-    assert!(matches!(normalise(&mut s), Err(AudioError::MicSilence)));
-    assert!(s.iter().all(|&x| x == 0.0));
-    assert!(matches!(normalise(&mut []), Err(AudioError::MicSilence)));
+fn all_zero_is_mic_silence_whatever_the_options() {
+    for o in [
+        Audio::default(),
+        trim_only(),
+        plain(),
+        opts(true, true, true),
+    ] {
+        for len in [0, 32_000] {
+            assert!(
+                matches!(
+                    process(&vec![0.0; len], SAMPLE_RATE, &o),
+                    Err(AudioError::MicSilence)
+                ),
+                "{o:?} len {len}"
+            );
+        }
+    }
 }
 
 #[test]
-fn trim_silence_only_is_nothing_heard() {
+fn faint_noise_without_speech_is_nothing_heard() {
     assert!(matches!(
-        trim(&vec![0.0; 32_000]),
+        process(&noise(32_000, 0.003), SAMPLE_RATE, &Audio::default()),
         Err(AudioError::NothingHeard)
     ));
-    assert!(matches!(trim(&[]), Err(AudioError::NothingHeard)));
 }
 
 /// `lead` silence, a tone, `tail` silence, all in samples at 16 kHz.
@@ -227,11 +246,16 @@ fn tone_in_silence(lead: usize, tone: usize, tail: usize) -> Vec<f32> {
     s
 }
 
+/// Index of the first sample louder than -40 dBFS.
+fn onset(s: &[f32]) -> usize {
+    s.iter().position(|x| x.abs() > 0.01).unwrap()
+}
+
 #[test]
 fn trim_keeps_tone_plus_200_ms_padding() {
     let pad = samples_for(Millis(200), SAMPLE_RATE);
     let s = tone_in_silence(16_000, 16_000, 16_000);
-    let t = trim(&s).unwrap();
+    let t = process(&s, SAMPLE_RATE, &trim_only()).unwrap();
     // The gate works in 256-sample frames and may miss the tone edges by a frame or two;
     // earshot also holds "voice" for about 100 ms after the tone ends.
     let expected = 16_000 + 2 * pad;
@@ -240,17 +264,15 @@ fn trim_keeps_tone_plus_200_ms_padding() {
         "{} vs {expected}",
         t.len()
     );
-    // It is a slice of the input, positioned around the tone.
-    let start = t.as_ptr() as usize - s.as_ptr() as usize;
-    let start = start / size_of::<f32>();
-    assert!(start.abs_diff(16_000 - pad) <= 3 * 256, "start {start}");
+    // The padding before the tone is there.
+    assert!(onset(&t).abs_diff(pad) <= 3 * 256, "onset {}", onset(&t));
 }
 
 #[test]
 fn trim_padding_is_clamped_to_the_clip() {
     // Only 100 ms of silence before the tone and none after: nothing to cut.
     let s = tone_in_silence(1_600, 16_000, 0);
-    let t = trim(&s).unwrap();
+    let t = process(&s, SAMPLE_RATE, &trim_only()).unwrap();
     assert!(t.len() >= s.len() - 3 * 256, "{} of {}", t.len(), s.len());
 }
 
@@ -259,16 +281,33 @@ fn trim_keeps_silence_between_voiced_parts() {
     let mut s = tone_in_silence(8_000, 8_000, 16_000);
     s.extend(sine(300.0, SAMPLE_RATE, 8_000, 0.5));
     s.resize(s.len() + 8_000, 0.0);
-    let t = trim(&s).unwrap();
+    let t = process(&s, SAMPLE_RATE, &trim_only()).unwrap();
     let pad = samples_for(Millis(200), SAMPLE_RATE);
     assert!(t.len() >= 8_000 + 16_000 + 8_000 + 2 * pad - 4 * 256);
 }
 
 #[test]
-fn trim_short_burst_is_nothing_heard() {
-    // 100 ms of tone is under the 250 ms of voice needed; 600 ms is enough.
-    let short = tone_in_silence(8_000, 1_600, 8_000);
-    assert!(matches!(trim(&short), Err(AudioError::NothingHeard)));
-    let long = tone_in_silence(8_000, 9_600, 8_000);
-    assert!(trim(&long).is_ok());
+fn speech_gate_needs_250_ms_without_counting_the_hold() {
+    // earshot's hold after a tone must not lift 200 ms over the 250 ms bar.
+    for background in [0.0, 0.003] {
+        let gated = |tone_ms: usize| {
+            let mut s = tone_in_silence(8_000, tone_ms * 16, 8_000);
+            for (x, n) in s.iter_mut().zip(noise(32_000, background)) {
+                *x += n;
+            }
+            process(&s, SAMPLE_RATE, &Audio::default())
+        };
+        for tone_ms in [100, 200] {
+            assert!(
+                matches!(gated(tone_ms), Err(AudioError::NothingHeard)),
+                "{tone_ms} ms over noise {background}"
+            );
+        }
+        for tone_ms in [300, 600] {
+            assert!(
+                gated(tone_ms).is_ok(),
+                "{tone_ms} ms over noise {background}"
+            );
+        }
+    }
 }

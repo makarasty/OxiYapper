@@ -1,35 +1,35 @@
 //! Audio DSP: mono, gain, level, denoise, resample, trim, normalise (ARCHITECTURE section 9, steps 3-7).
-//! Pure functions on `f32` samples in `[-1, 1]`; the capture side (t07) imports the constants below.
+//! Pure code on `f32` samples in `[-1, 1]`. Callers use [`downmix`], then only [`Pipeline`] (capture)
+//! or [`process`] (bench), so the steps cannot run in the wrong order.
 
 mod denoise;
+mod pipeline;
 mod resample;
 mod trim;
 
-pub use denoise::Denoiser;
-pub use resample::StreamResampler;
-pub use trim::trim;
+pub use pipeline::{Pipeline, process};
 
 use crate::types::Millis;
 
 /// Sample rate whisper and the speech gate work at.
 pub const SAMPLE_RATE: u32 = 16_000;
-/// Streaming chunk length for resampling and level metering.
+/// Streaming chunk length for resampling; capture drains the ring in chunks of this length.
 pub const CHUNK: Millis = Millis(20);
 /// One chunk at [`SAMPLE_RATE`].
 pub const CHUNK_SAMPLES: usize = samples_for(CHUNK, SAMPLE_RATE);
 /// `RNNoise` only works at this rate.
-pub const DENOISE_RATE: u32 = 48_000;
+const DENOISE_RATE: u32 = 48_000;
 /// `RNNoise` frame length in samples at [`DENOISE_RATE`].
-pub const DENOISE_FRAME: usize = 480;
-/// Silence kept on both sides of the voiced part by [`trim`].
+const DENOISE_FRAME: usize = 480;
+/// Silence kept on both sides of the voiced part by the speech gate.
 pub const TRIM_PADDING: Millis = Millis(200);
 /// Less voiced audio than this is "nothing heard".
 pub const MIN_VOICED: Millis = Millis(250);
-/// [`normalise`] aims at this RMS level (dBFS).
+/// Normalising aims at this RMS level (dBFS).
 pub const TARGET_RMS_DBFS: f32 = -20.0;
-/// [`normalise`] never amplifies more than this.
+/// Normalising never amplifies more than this.
 pub const MAX_GAIN_DB: f32 = 20.0;
-/// [`normalise`] keeps the peak at or below this (linear, about -0.9 dBFS).
+/// Normalising keeps the peak at or below this (linear, about -0.9 dBFS).
 pub const PEAK_LIMIT: f32 = 0.9;
 
 /// Number of samples in `ms` at `rate` Hz.
@@ -69,14 +69,6 @@ pub fn downmix(interleaved: &[f32], channels: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Multiply by `db` decibels (manual gain, applied before the meter).
-pub fn apply_gain_db(samples: &mut [f32], db: f32) {
-    let gain = db_to_linear(db);
-    for s in samples {
-        *s *= gain;
-    }
-}
-
 /// Peak and RMS of `samples`; zero for an empty slice.
 #[must_use]
 pub fn level(samples: &[f32]) -> Level {
@@ -94,32 +86,16 @@ pub fn level(samples: &[f32]) -> Level {
     }
 }
 
-/// [`level`] per [`CHUNK`] at `rate`; the last block may be shorter.
-#[must_use]
-pub fn levels(samples: &[f32], rate: u32) -> Vec<Level> {
-    samples
-        .chunks(samples_for(CHUNK, rate).max(1))
-        .map(level)
-        .collect()
-}
-
 /// Scale `samples` toward [`TARGET_RMS_DBFS`]: at most [`MAX_GAIN_DB`], never past [`PEAK_LIMIT`].
-/// Returns the gain applied in dB.
-///
-/// # Errors
-/// All zeros (or empty) is [`AudioError::MicSilence`]; the samples are left alone.
-pub fn normalise(samples: &mut [f32]) -> Result<f32, AudioError> {
+/// All zeros stay zeros (the gain falls to the cap); [`Pipeline`] reports that case as `MicSilence` first.
+fn normalise(samples: &mut [f32]) {
     let Level { peak, rms } = level(samples);
-    if peak == 0.0 {
-        return Err(AudioError::MicSilence);
-    }
     let gain = (db_to_linear(TARGET_RMS_DBFS) / rms)
         .min(db_to_linear(MAX_GAIN_DB))
         .min(PEAK_LIMIT / peak);
     for s in samples {
         *s *= gain;
     }
-    Ok(20.0 * gain.log10())
 }
 
 fn db_to_linear(db: f32) -> f32 {

@@ -59,7 +59,7 @@ impl StreamResampler {
     ///
     /// # Errors
     /// [`AudioError::Resample`] if rubato rejects a buffer.
-    pub fn finish(mut self) -> Result<Vec<f32>, AudioError> {
+    pub fn finish(&mut self) -> Result<Vec<f32>, AudioError> {
         let expected = self.total_in * u64::from(self.out_rate) / u64::from(self.in_rate);
         let mut out = Vec::new();
         let mut chunk = std::mem::take(&mut self.pending);

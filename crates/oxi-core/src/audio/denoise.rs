@@ -44,7 +44,7 @@ impl Denoiser {
 
     /// Process the last partial frame (zero padded), keeping only its real length.
     #[must_use]
-    pub fn finish(mut self) -> Vec<f32> {
+    pub fn finish(&mut self) -> Vec<f32> {
         let tail = self.pending.len();
         if tail == 0 {
             return Vec::new();
