@@ -14,14 +14,12 @@ use oxi_core::audio;
 use oxi_core::config::Audio;
 use oxi_core::device::DeviceChoice;
 use oxi_core::dictionary::build_prompt;
-use oxi_core::models::MODELS;
+use oxi_core::models::{find_by_file_name, sha256_file};
 use oxi_core::text::{self, HallucinationFilter, Outcome, ReplaceRules, decode_text_file};
 use oxi_core::types::Language;
 use oxi_platform::capture::{Capture, CaptureEvent, CpalCapture, LevelMeter};
 use oxi_platform::wav::{read_wav_mono_f32, write_wav};
 use oxi_whisper::Engine;
-
-use crate::net::sha256_file;
 
 /// Usage text; a `Display` constant so `{USAGE}` still works while the name comes from `APP_NAME`.
 struct Usage;
@@ -95,7 +93,7 @@ fn verify_model(path: &Path) -> Result<()> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    let Some(entry) = MODELS.iter().find(|m| m.file_name == name) else {
+    let Some(entry) = find_by_file_name(name) else {
         return Ok(());
     };
     let actual = sha256_file(path).with_context(|| format!("hash {}", path.display()))?;

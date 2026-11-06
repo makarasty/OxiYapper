@@ -3,6 +3,12 @@
 //! Every URL is pinned to a Hugging Face commit, never `main`. Sizes and SHA256 come from
 //! the HF tree API (`/api/models/<repo>/tree/<commit>`, field `lfs.oid`).
 
+use std::fs::File;
+use std::io::{self, Read};
+use std::path::Path;
+
+use sha2::{Digest, Sha256};
+
 /// One curated model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelEntry {
@@ -57,6 +63,39 @@ pub const MODELS: &[ModelEntry] = &[
 /// Registry entry for `id`; `None` for unknown ids and for `"custom"` (loaded as is, no hash).
 pub fn find(id: &str) -> Option<&'static ModelEntry> {
     MODELS.iter().find(|m| m.id == id)
+}
+
+/// Registry entry stored under `file_name`; `None` means a custom model (loaded as is).
+pub fn find_by_file_name(file_name: &str) -> Option<&'static ModelEntry> {
+    MODELS.iter().find(|m| m.file_name == file_name)
+}
+
+/// Lower-case hex, the form the registry stores.
+pub fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// SHA256 state after the whole file; a resumed download goes on hashing from it.
+pub fn hash_file(path: &Path) -> io::Result<Sha256> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            return Ok(hasher);
+        }
+        hasher.update(&buf[..n]);
+    }
+}
+
+/// SHA256 of a whole file as lower-case hex.
+pub fn sha256_file(path: &Path) -> io::Result<String> {
+    Ok(hex(&hash_file(path)?.finalize()))
 }
 
 /// What a `<file>.ok` stamp records about a verified file: size and modification time.

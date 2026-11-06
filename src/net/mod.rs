@@ -11,14 +11,13 @@
     )
 )]
 
-use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 
-use oxi_core::models::{ModelEntry, Stamp, stamp_file_name};
+use oxi_core::models::{ModelEntry, Stamp, hash_file, hex, sha256_file, stamp_file_name};
 use sha2::{Digest, Sha256};
 use ureq::Agent;
 use ureq::http::Uri;
@@ -287,33 +286,6 @@ fn write_stamp(file: &Path, stamp_path: &Path) -> io::Result<()> {
         mtime_ms: u64::try_from(since_epoch.as_millis()).map_err(io::Error::other)?,
     };
     fs::write(stamp_path, stamp.to_line())
-}
-
-/// Lower-case hex, the form the registry stores.
-fn hex(bytes: &[u8]) -> String {
-    use fmt::Write as _;
-    bytes.iter().fold(String::new(), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
-}
-
-/// SHA256 of a whole file as lower-case hex.
-pub(crate) fn sha256_file(path: &Path) -> io::Result<String> {
-    Ok(hex(&hash_file(path)?.finalize()))
-}
-
-fn hash_file(path: &Path) -> io::Result<Sha256> {
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; CHUNK];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            return Ok(hasher);
-        }
-        hasher.update(&buf[..n]);
-    }
 }
 
 /// GET with `Range: bytes=<have>-` (when `have > 0`), following redirects by hand so each

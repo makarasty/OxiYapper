@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 
-use oxi_core::models::{MODELS, Stamp, find, stamp_file_name, stamp_trusted};
+use oxi_core::models::{
+    MODELS, Stamp, find, find_by_file_name, sha256_file, stamp_file_name, stamp_trusted,
+};
 
 fn is_hex(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
@@ -52,6 +54,30 @@ fn curated_ids_resolve_and_custom_does_not() {
     }
     assert!(find("custom").is_none());
     assert!(find("").is_none());
+}
+
+#[test]
+fn file_names_resolve_to_their_entry_and_others_are_custom() {
+    for m in MODELS {
+        assert_eq!(find_by_file_name(m.file_name).map(|e| e.id), Some(m.id));
+    }
+    for other in ["", "turbo", "my-model.bin", "GGML-TINY.BIN"] {
+        assert!(find_by_file_name(other).is_none(), "{other}");
+    }
+}
+
+#[test]
+fn sha256_file_is_lower_hex_of_the_bytes() {
+    let path = std::env::temp_dir().join(format!("oxi-sha-{}", std::process::id()));
+    std::fs::write(&path, b"abc").unwrap();
+    let got = sha256_file(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    // FIPS 180-2 test vector for "abc".
+    assert_eq!(
+        got,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert!(sha256_file(&path).is_err());
 }
 
 #[test]
