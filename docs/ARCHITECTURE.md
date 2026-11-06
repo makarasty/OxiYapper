@@ -133,7 +133,7 @@ normalize = true
 denoise = false
 trim = true
 tail_ms = 100
-max_seconds = 300
+max_seconds = 600              # SPEC round 4: 10 min cap
 [model]
 id = "turbo"                   # registry id, or "custom"
 custom_path = ""
@@ -233,7 +233,7 @@ Recording and hotkey
 2. Double tap (push-to-talk): two presses shorter than 250 ms with a gap under 300 ms lock recording on; audio counts from the second press; the next full press stops it.
 3. Single press under 300 ms: a tap, discarded without transcription (taps produce "Thank you." hallucinations).
 4. Toggle mode: key-up ignored, no double tap; under 300 ms of audio between presses is discarded.
-5. Recording reaches `max_seconds` (default 300): overlay counts down the last 10 s, then stop and transcribe, never discard.
+5. Recording reaches `max_seconds` (default 600, SPEC round 4): the overlay warns 30 s before, then stop and transcribe, never discard. Long audio goes to whisper in chunks so one job never holds minutes of state (chunk length set in M5).
 6. Esc while recording: cancel, swallow Esc. Esc while transcribing: not ours, passes through.
 7. Another key pressed while the chord is held (Ctrl+Win+D and friends): the user meant a shortcut; cancel silently and pass the key through.
 8. Key-up lost (UAC prompt, Ctrl+Alt+Del, secure desktop): a 100 ms watchdog reads the physical key state while recording; chord not held means key-up.
@@ -343,7 +343,8 @@ All in `.github/workflows/ci.yml`. Branch protection requires one check, `ci-ok`
 | clippy | `cargo clippy --workspace --all-targets -D warnings` (pedantic, CPU build) | yes |
 | core | `cargo nextest run -p oxi-core` on Windows, Linux, macOS; no `-sys` crate in its tree | yes |
 | test | `cargo nextest run --workspace` on Linux CPU; whisper tiny regression once M3 lands | yes |
-| build | release build + `--version` for Windows Vulkan, Linux Vulkan, macOS Metal | yes |
-| build (cuda) | Windows CUDA | no, until M5 decides to keep CUDA |
+| build | release build + `--version` for Windows Vulkan, Linux Vulkan | yes |
+| build-macos | macOS Metal | no, until M12 (macOS runners were sometimes never acquired) |
+| build-cuda | Windows CUDA | no, until M5 decides to keep CUDA |
 
 Release (`release.yml`, on a `v*` tag): builds, packages, SHA256SUMS, provenance attestation, GitHub release. Packaging with cargo-packager arrives in ROADMAP M11.
