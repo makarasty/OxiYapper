@@ -312,6 +312,54 @@ fn duplicate_rule_shows_a_note() {
     one(&window, "New rule app").set_accessible_value("other.exe");
     one(&window, "Add rule").invoke_accessible_default_action();
     assert!(!has(&window, note));
+
+    // Removing the original rule takes the note about it away too.
+    one(&window, "New rule app").set_accessible_value("SYNTH.EXE");
+    one(&window, "Add rule").invoke_accessible_default_action();
+    assert!(has(&window, note));
+    // The list shows two rows: the second rule is the one in view.
+    one(&window, "Remove synth.exe").invoke_accessible_default_action();
+    assert!(!has(&window, note));
+}
+
+#[test]
+fn closing_within_the_debounce_still_saves_the_delay() {
+    let l = layout("delay-close", None);
+    let window = open(&l);
+    with_role(&window, "Restore clipboard after", AccessibleRole::Slider)
+        .set_accessible_value("700");
+    assert!(!l.config_file().exists(), "saved during the drag");
+    window.hide().unwrap();
+    drop(window);
+    assert_eq!(config(&l).config.paste.restore_delay_ms, 700);
+}
+
+#[test]
+fn dirty_editor_names_the_read_error_of_its_file() {
+    let l = layout("dirty-unreadable", None);
+    fs::write(l.dictionary_file(), "synthalpha").unwrap();
+    let window = open(&l);
+    one(&window, "Dictionary").set_accessible_value("synthbeta");
+    fs::remove_file(l.dictionary_file()).unwrap();
+    fs::create_dir(l.dictionary_file()).unwrap();
+
+    one(&window, "Save dictionary.txt").invoke_accessible_default_action();
+    assert_eq!(
+        labels(&window, "Could not read dictionary.txt on disk: ").len(),
+        1,
+        "{:?}",
+        labels(&window, "dictionary.txt")
+    );
+    assert!(!has(
+        &window,
+        "dictionary.txt changed on disk since it was loaded."
+    ));
+    assert!(has(&window, "Overwrite dictionary.txt"));
+    assert!(l.dictionary_file().is_dir());
+    assert_eq!(
+        one(&window, "Dictionary").accessible_value().unwrap(),
+        "synthbeta"
+    );
 }
 
 #[test]

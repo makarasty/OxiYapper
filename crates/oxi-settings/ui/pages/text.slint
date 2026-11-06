@@ -18,7 +18,8 @@ export struct FileInfo {
     base: string,
     // Edited since the last load or save.
     dirty: bool,
-    // Save found the file changed on disk while the editor was dirty.
+    // Save or a re-check found the file changed on disk while the editor was dirty; `error`
+    // then names the read error if the file cannot be read now.
     conflict: bool,
 }
 
@@ -114,7 +115,7 @@ component FileEditor inherits VerticalLayout {
         }
     }
     if root.info.conflict: InlineNote {
-        text: @tr("{} changed on disk since it was loaded.", root.name);
+        text: root.info.error != "" ? @tr("Could not read {} on disk: {}.", root.name, root.info.error) : @tr("{} changed on disk since it was loaded.", root.name);
         Button {
             text: @tr("Reload");
             accessible-label: @tr("Reload {}", root.name);
@@ -160,6 +161,8 @@ export component TextPage inherits ScrollView {
     content-height: content.preferred-height;
     content := VerticalLayout {
         width: root.visible-width;
+        // Room for the scrollbar, so it does not sit on the boxes' border.
+        padding-right: 10px;
         spacing: 8px;
         Group {
             title: @tr("Dictionary: words that help whisper, one per line");

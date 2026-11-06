@@ -1,6 +1,7 @@
 //! Text page: `dictionary.txt` against the prompt budget, `replace.txt` with its ignored lines,
 //! and the `[paste]` config (mode, trailing space, restore delay, per-app rules).
 
+use std::cell::RefCell;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -92,6 +93,7 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
     s.on_trailing_space_toggled(move |on| apply(&w, &c, |p| p.trailing_space = on));
     let (w, c) = (window.as_weak(), ctx.clone());
     let timer = Rc::new(Timer::default());
+    let pending: Rc<RefCell<Option<PendingSave>>> = Rc::default();
     s.on_restore_delay_changed(move |ms| {
         #[allow(
             clippy::cast_possible_truncation,
@@ -100,12 +102,16 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
         )]
         let ms = ms.round().clamp(0.0, 1000.0) as u32;
         c.config.borrow_mut().config.paste.restore_delay_ms = ms;
-        // A drag fires on every step: save once it rests, not one fsync per step.
-        // shortcut: closing the window within SAVE_DELAY drops the last value; flush on close
-        // when the shell gets a close hook.
-        let (w, c) = (w.clone(), c.clone());
+        // A drag fires on every step: save once it rests, not one fsync per step. The pending
+        // save also runs when the window closes first: dropping the page drops it.
+        pending.borrow_mut().get_or_insert_with(|| PendingSave {
+            weak: w.clone(),
+            ctx: c.clone(),
+        });
+        let pending = pending.clone();
         timer.start(TimerMode::SingleShot, SAVE_DELAY, move || {
-            report(&w, c.save());
+            let job = pending.borrow_mut().take();
+            drop(job);
         });
     });
     let (w, c) = (window.as_weak(), ctx.clone());
@@ -123,6 +129,7 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
     });
     let (w, c) = (window.as_weak(), ctx.clone());
     s.on_rule_removed(move |i| {
+        with(&w, |s| s.set_duplicate_app(SharedString::new()));
         apply(&w, &c, |p| {
             if let Ok(i) = usize::try_from(i)
                 && i < p.rules.len()
@@ -139,6 +146,19 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
         let duplicate = if added { "" } else { app };
         with(&w, |s| s.set_duplicate_app(duplicate.into()));
     });
+}
+
+/// A config save not run yet. Dropping it runs it, so a window closed before the debounce
+/// fires still saves.
+struct PendingSave {
+    weak: Weak<AppWindow>,
+    ctx: Ctx,
+}
+
+impl Drop for PendingSave {
+    fn drop(&mut self) {
+        report(&self.weak, self.ctx.save());
+    }
 }
 
 /// A new rule types into `app`. The daemon takes the first rule whose app matches
@@ -211,11 +231,21 @@ fn show_replacements(s: &TextState<'_>, text: &str) {
 fn refresh(s: &TextState<'_>, layout: &Layout, file: TextFile) {
     let mut info = info(s, file);
     if info.dirty {
-        info.conflict = stamp(&fs::read(path(layout, file))) != info.base;
+        flag_disk(&mut info, &fs::read(path(layout, file)));
         set_info(s, file, info);
     } else {
         reload(s, layout, file);
     }
+}
+
+/// A dirty editor against the disk: `conflict` when the file is no longer what the editor was
+/// loaded from, and `error` naming the read error when the file cannot be read now.
+fn flag_disk(info: &mut FileInfo, read: &io::Result<Vec<u8>>) {
+    info.conflict = stamp(read) != info.base;
+    info.error = match read {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => e.kind().to_string().into(),
+        _ => SharedString::new(),
+    };
 }
 
 /// Read the file into the editor, dropping any edits.
@@ -241,9 +271,10 @@ fn save(weak: &Weak<AppWindow>, layout: &Layout, file: TextFile, force: bool) {
         if matches!(info.state, FileState::NotText | FileState::Unreadable) {
             return;
         }
-        if stamp(&fs::read(&path)) != info.base {
+        let read = fs::read(&path);
+        if stamp(&read) != info.base {
             if info.dirty {
-                info.conflict = true;
+                flag_disk(&mut info, &read);
                 set_info(&s, file, info);
             } else {
                 reload(&s, layout, file);
