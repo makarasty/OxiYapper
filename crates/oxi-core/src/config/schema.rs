@@ -1,6 +1,7 @@
 //! Config schema v1 (ARCHITECTURE section 6). Every field has a default, so a partial
 //! or empty file loads. Unknown keys are not rejected here; `ConfigFile` keeps them.
 
+use crate::machine::Mode;
 use crate::types::Language;
 use serde::{Deserialize, Serialize};
 
@@ -18,26 +19,19 @@ pub struct Config {
     pub debug: Debug,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum HotkeyMode {
-    Push,
-    Toggle,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Hotkey {
     /// Key names; "Win" is Cmd on macOS.
     pub chord: Vec<String>,
-    pub mode: HotkeyMode,
+    pub mode: Mode,
 }
 
 impl Default for Hotkey {
     fn default() -> Self {
         Self {
             chord: vec!["Ctrl".into(), "Win".into()],
-            mode: HotkeyMode::Push,
+            mode: Mode::Push,
         }
     }
 }

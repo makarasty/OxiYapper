@@ -1,7 +1,7 @@
 //! Table tests for ARCHITECTURE section 11 items 1-12 (and the few neighbours they touch),
 //! with time driven by hand.
 
-use oxi_core::config::{Config, HotkeyMode, machine_config};
+use oxi_core::config::Config;
 use oxi_core::machine::{
     Effect, Effects, Event, JobId, MachineConfig, Mode, ModelFailure, Notice, Overlay, Phase,
     Sound, State, step,
@@ -820,14 +820,24 @@ fn max_recording_stops_at_once_without_a_tail() {
 
 #[test]
 fn machine_config_maps_the_file_settings() {
+    let d = MachineConfig::default();
+    // SPEC defaults, read from `Config::default` through the same mapping.
+    assert_eq!(
+        (d.mode, d.max_recording, d.idle_unload, d.release_tail),
+        (
+            Mode::Push,
+            Millis::from_secs(600),
+            Millis::from_secs(300),
+            Millis(100)
+        )
+    );
     let mut file = Config::default();
-    assert_eq!(machine_config(&file), MachineConfig::default());
-    file.hotkey.mode = HotkeyMode::Toggle;
+    file.hotkey.mode = Mode::Toggle;
     file.audio.tail_ms = 150;
     file.audio.max_seconds = 300;
     file.model.idle_unload_minutes = 0;
     assert_eq!(
-        machine_config(&file),
+        MachineConfig::from(&file),
         MachineConfig {
             mode: Mode::Toggle,
             release_tail: Millis(150),

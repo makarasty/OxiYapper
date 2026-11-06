@@ -1,7 +1,8 @@
 use oxi_core::config::{
-    CURRENT_VERSION, Config, ConfigError, ConfigFile, HotkeyMode, MIGRATIONS, Migration,
-    OverlayPosition, PasteMode, PasteRule,
+    CURRENT_VERSION, Config, ConfigError, ConfigFile, MIGRATIONS, Migration, OverlayPosition,
+    PasteMode, PasteRule,
 };
+use oxi_core::machine::Mode;
 use oxi_core::types::Language;
 use toml::{Table, Value};
 use toml_edit::{DocumentMut, Item};
@@ -23,7 +24,7 @@ fn v1_fixture_round_trips_byte_identical() {
     assert!(!file.read_only);
     // The fixture differs from the defaults everywhere, so the typed values were really read.
     assert_ne!(file.config, Config::default());
-    assert_eq!(file.config.hotkey.mode, HotkeyMode::Toggle);
+    assert_eq!(file.config.hotkey.mode, Mode::Toggle);
     assert_eq!(file.config.model.language, Language::Auto);
     assert_eq!(file.config.paste.rules.len(), 2);
     assert_eq!(file.to_toml_string().unwrap(), FULL);

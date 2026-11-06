@@ -1,9 +1,13 @@
 //! Public vocabulary of the state machine.
 
+use serde::{Deserialize, Serialize};
+
+use crate::config::Config;
 use crate::types::Millis;
 
-/// Recording mode (SPEC "Recording").
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Recording mode (SPEC "Recording"); also the config's `[hotkey] mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Mode {
     /// Hold to record, release to stop; a double tap locks recording on.
     Push,
@@ -35,20 +39,29 @@ pub struct MachineConfig {
     pub release_tail: Millis,
 }
 
-impl Default for MachineConfig {
-    fn default() -> Self {
+impl From<&Config> for MachineConfig {
+    /// The state machine's view of the settings; the fields the file does not carry are the
+    /// SPEC values.
+    fn from(cfg: &Config) -> Self {
         Self {
-            mode: Mode::Push,
+            mode: cfg.hotkey.mode,
             double_tap_max_press: Millis(250),
             double_tap_gap: Millis(300),
             tap_max: Millis(300),
-            max_recording: Millis::from_secs(600),
+            max_recording: Millis::from_secs(cfg.audio.max_seconds.into()),
             warn_before: Millis::from_secs(30),
             watchdog_period: Millis(100),
-            idle_unload: Millis::from_secs(300),
+            idle_unload: Millis::from_secs(u64::from(cfg.model.idle_unload_minutes) * 60),
             overlay_hide: Millis(1500),
-            release_tail: Millis(100),
+            release_tail: Millis(cfg.audio.tail_ms.into()),
         }
+    }
+}
+
+impl Default for MachineConfig {
+    /// The file-backed fields come from `Config::default`, so each SPEC default is written once.
+    fn default() -> Self {
+        Self::from(&Config::default())
     }
 }
 
