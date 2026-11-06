@@ -1,0 +1,11 @@
+ Привет, это тестовое предложение для проверки текста.
+ Hello, this is a synthetic test sentence.
+ Мы встречаемся в офисе завтра в десять часов утра.
+ The meeting is in the con\nference room at ten.
+ Thanks for watching!
+ Субтитры сделал DimaTorzok
+ Редактор субтитров Иван Иванов
+ Запусти джава скрипт и покажи ошибки.
+ Open the Git Hub page and check the pull request.
+
+ Продолжение следует...

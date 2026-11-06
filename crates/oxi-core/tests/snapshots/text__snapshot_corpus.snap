@@ -1,0 +1,16 @@
+---
+source: crates/oxi-core/tests/text.rs
+expression: out
+---
+bad lines: [6, 7]
+Text("Привет, это тестовое предложение для проверки текста. ")
+Text("Hello, this is a synthetic test sentence. ")
+Text("Мы встречаемся в офисе завтра в десять часов утра. ")
+Text("The meeting is in the conference room at ten. ")
+NothingHeard
+NothingHeard
+NothingHeard
+Text("Запусти JavaScript и покажи ошибки. ")
+Text("Open the GitHub page and check the PR. ")
+NothingHeard
+NothingHeard

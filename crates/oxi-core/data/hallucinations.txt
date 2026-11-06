@@ -1,0 +1,14 @@
+# Publicly known whisper hallucinations, one per line. Matching ignores case,
+# punctuation and extra spaces. A trailing * matches the phrase plus any words after it.
+Субтитры сделал DimaTorzok
+Субтитры создавал DimaTorzok
+Субтитры делал DimaTorzok
+Продолжение следует
+Редактор субтитров *
+Корректор *
+Спасибо за просмотр
+Подписывайтесь на канал
+Thanks for watching
+Thank you for watching
+Please subscribe to my channel
+Subtitles by the Amara.org community
