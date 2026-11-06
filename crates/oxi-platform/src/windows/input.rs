@@ -17,12 +17,8 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput,
-};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-use super::hook::INJECT_TAG;
 use super::keys;
 
 /// Ctrl, Shift, Alt and Win, both sides: the keys step 2 waits on.
@@ -40,7 +36,7 @@ const MODIFIERS: [Key; 8] = [
 /// The longest Win32 path in UTF-16 units.
 const MAX_PATH_UNITS: usize = 32_768;
 
-/// The keyboard of the paste worker: every event it injects carries [`INJECT_TAG`].
+/// The keyboard of the paste worker: every event it injects carries [`super::hook::INJECT_TAG`].
 #[derive(Debug, Default)]
 pub struct Keyboard;
 
@@ -62,7 +58,7 @@ impl Input for Keyboard {
             if i > 0 {
                 self.sleep(gap);
             }
-            send(&unit_events(unit))?;
+            keys::send_unit(unit).map_err(|_| InputBlocked)?;
         }
         Ok(())
     }
@@ -77,35 +73,6 @@ fn chord_events(keys: &[Key]) -> Vec<(Key, bool)> {
     let downs = keys.iter().map(|&k| (k, true));
     let ups = keys.iter().rev().map(|&k| (k, false));
     downs.chain(ups).collect()
-}
-
-/// One UTF-16 unit as a `KEYEVENTF_UNICODE` down and up (Windows reports it as `VK_PACKET`).
-fn unit_events(unit: u16) -> [INPUT; 2] {
-    let event = |flags| INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: 0,
-                wScan: unit,
-                dwFlags: flags,
-                time: 0,
-                dwExtraInfo: INJECT_TAG,
-            },
-        },
-    };
-    [
-        event(KEYEVENTF_UNICODE),
-        event(KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
-    ]
-}
-
-// shortcut: keys::send is private and builds only VK events; move this there if keys.rs grows a
-// Unicode sender.
-fn send(inputs: &[INPUT; 2]) -> Result<(), InputBlocked> {
-    let size = i32::try_from(size_of::<INPUT>()).map_err(|_| InputBlocked)?;
-    // SAFETY: `inputs` is a live array of 2 initialised INPUT values of `size` bytes each.
-    let sent = unsafe { SendInput(2, inputs.as_ptr(), size) };
-    if sent == 2 { Ok(()) } else { Err(InputBlocked) }
 }
 
 fn foreground() -> Foreground {
@@ -223,23 +190,6 @@ mod tests {
                 (Key::LCtrl, false),
             ]
         );
-    }
-
-    #[test]
-    fn a_unit_is_a_tagged_unicode_down_then_up() {
-        let [down, up] = unit_events(0xD83D);
-        for (event, flags) in [
-            (down, KEYEVENTF_UNICODE),
-            (up, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
-        ] {
-            assert_eq!(event.r#type, INPUT_KEYBOARD);
-            // SAFETY: built as a keyboard INPUT above.
-            let ki = unsafe { event.Anonymous.ki };
-            assert_eq!(
-                (ki.wVk, ki.wScan, ki.dwFlags, ki.dwExtraInfo),
-                (0, 0xD83D, flags, INJECT_TAG)
-            );
-        }
     }
 
     #[test]
