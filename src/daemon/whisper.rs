@@ -108,7 +108,11 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
             }
             WhisperCmd::Unload => {
                 self.loaded = None;
-                self.report(None);
+                // A pinned CPU fallback still holds for the next load: keep saying so (no
+                // tray flicker around each idle unload).
+                if self.cpu_reason.is_none() {
+                    self.report(None);
+                }
             }
             WhisperCmd::Transcribe { job, samples } => {
                 let text = self.transcribe(&samples).unwrap_or_else(|failure| {
@@ -122,6 +126,9 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
             WhisperCmd::Config(cfg) => {
                 if MachineConfig::from(&*cfg).model != MachineConfig::from(&self.cfg).model {
                     self.cpu_reason = None;
+                    if self.loaded.is_none() {
+                        self.report(None);
+                    }
                 }
                 self.cfg = *cfg;
                 self.assets = TextAssets::load(&self.layout);
@@ -544,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_fallback_is_reported_and_cleared_by_unload_or_running_as_configured() {
+    fn cpu_fallback_is_reported_across_unloads_until_the_setting_changes() {
         let (r, mut s) = (rig("warn"), Script::new());
         s.gpu_load_fails = true;
         let (mut w, rx) = worker(&s, &r);
@@ -552,15 +559,16 @@ mod tests {
         w.handle(WhisperCmd::Preload);
         w.handle(WhisperCmd::Preload);
         assert_eq!(warnings(&rx), [Some(oom())], "sent once");
+        // Idle unload and reload: still pinned to CPU, the warning stays without a flicker.
         w.handle(WhisperCmd::Unload);
-        assert_eq!(warnings(&rx), [None], "no model, nothing to warn about");
         w.handle(WhisperCmd::Preload);
-        assert_eq!(warnings(&rx), [Some(oom())], "still pinned to CPU");
-        // CPU chosen in the config: no warning.
         w.handle(WhisperCmd::Unload);
+        assert_eq!(warnings(&rx), Vec::<Option<EngineWarning>>::new());
+        // CPU chosen in the config: the warning clears at once, and no load brings it back.
         w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
-        w.handle(WhisperCmd::Preload);
         assert_eq!(warnings(&rx), [None]);
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(warnings(&rx), Vec::<Option<EngineWarning>>::new());
     }
 
     #[test]
