@@ -2,6 +2,10 @@
 //! [--prompt-file <f>]`: every `*.wav` in `<dir>` through the audio pipeline, whisper and the
 //! text pipeline. Prints text and timings; never touches the hotkey or the clipboard.
 //!
+//! Hidden A/B flags (not in the usage text): `--no-trim`, `--no-normalize`, `--denoise`,
+//! `--cut-end-ms <n>` (drop the last n ms of each clip, a shorter release tail) and `--vram`
+//! (print `nvidia-smi` memory before load, after load, after the run and after unload).
+//!
 //! `OxiYapper bench --record <seconds> <out.wav>` records the default microphone instead. The
 //! clip is raw: 16 kHz mono through the capture pipeline with trim and normalise off.
 
@@ -16,7 +20,7 @@ use oxi_core::device::DeviceChoice;
 use oxi_core::dictionary::build_prompt;
 use oxi_core::models::{find_by_file_name, sha256_file};
 use oxi_core::text::{self, HallucinationFilter, Outcome, ReplaceRules, decode_text_file};
-use oxi_core::types::Language;
+use oxi_core::types::{Language, Millis};
 use oxi_platform::capture::{Capture, CaptureEvent, CpalCapture, LevelMeter};
 use oxi_platform::wav::{read_wav_mono_f32, write_wav};
 use oxi_whisper::Engine;
@@ -44,15 +48,23 @@ struct Args {
     gpu: DeviceChoice,
     lang: Language,
     prompt_file: Option<PathBuf>,
+    audio: Audio,
+    cut_end_ms: u32,
+    vram: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Args> {
     let (mut dir, mut model, mut prompt_file) = (None, None, None);
     let (mut gpu, mut lang) = (DeviceChoice::Auto, Language::Auto);
+    let (mut audio, mut cut_end_ms, mut vram) = (Audio::default(), 0, false);
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--model" | "--prompt-file" | "--gpu" | "--lang" => {
+            "--no-trim" => audio.trim = false,
+            "--no-normalize" => audio.normalize = false,
+            "--denoise" => audio.denoise = true,
+            "--vram" => vram = true,
+            "--model" | "--prompt-file" | "--gpu" | "--lang" | "--cut-end-ms" => {
                 let value = it
                     .next()
                     .with_context(|| format!("{arg} needs a value\n{USAGE}"))?;
@@ -60,6 +72,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
                     "--model" => model = Some(PathBuf::from(value)),
                     "--prompt-file" => prompt_file = Some(PathBuf::from(value)),
                     "--gpu" => gpu = DeviceChoice::from(value.clone()),
+                    "--cut-end-ms" => cut_end_ms = value.parse().context("--cut-end-ms")?,
                     _ => lang = value.parse().context("--lang")?,
                 }
             }
@@ -75,7 +88,30 @@ fn parse_args(args: &[String]) -> Result<Args> {
         gpu,
         lang,
         prompt_file,
+        audio,
+        cut_end_ms,
+        vram,
     })
+}
+
+/// MiB of GPU memory in use, from `nvidia-smi`; `None` when the tool is missing.
+fn vram_mib() -> Option<u32> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn print_vram(args: &Args, when: &str) {
+    if args.vram {
+        println!("vram {when}: {} MiB", vram_mib().map_or(-1, i64::from));
+    }
 }
 
 /// Nearest-rank percentile of an ascending slice, `pct` in 1..=100; 0 for an empty slice.
@@ -189,9 +225,11 @@ pub fn run(args: &[String]) -> Result<()> {
     };
 
     verify_model(&args.model)?;
+    print_vram(&args, "before load");
     let started = Instant::now();
     let mut engine = Engine::load(&args.model, &args.gpu)?;
     let load_ms = started.elapsed().as_millis();
+    print_vram(&args, "after load");
     let info = engine.info();
     println!("device: {}", info.device.as_deref().unwrap_or("CPU"));
     if let Some(w) = &info.warning {
@@ -210,7 +248,10 @@ pub fn run(args: &[String]) -> Result<()> {
                 continue;
             }
         };
-        let clip = match audio::process(&mono, rate, &Audio::default()) {
+        let keep = mono
+            .len()
+            .saturating_sub(audio::samples_for(Millis(args.cut_end_ms.into()), rate));
+        let clip = match audio::process(&mono[..keep], rate, &args.audio) {
             Ok(clip) => clip,
             Err(e) => {
                 println!("{name}\tskipped: {e}");
@@ -235,6 +276,9 @@ pub fn run(args: &[String]) -> Result<()> {
         };
         println!("{name}\t{text}\tload {load_ms} ms\ttranscribe {ms} ms");
     }
+    print_vram(&args, "after run");
+    drop(engine);
+    print_vram(&args, "after unload");
     if heard == 0 {
         bail!(
             "no file produced a transcript: {} skipped (unreadable, silent or nothing heard)",
@@ -286,6 +330,30 @@ mod tests {
         assert_eq!(a.prompt_file, Some(PathBuf::from("p.txt")));
         let a = parse_args(&strs(&["d", "--model", "m", "--gpu", "cpu"])).unwrap();
         assert_eq!((a.gpu, a.lang), (DeviceChoice::Cpu, Language::Auto));
+    }
+
+    #[test]
+    fn hidden_ab_flags_change_the_audio_options() {
+        let a = parse_args(&strs(&["d", "--model", "m"])).unwrap();
+        assert_eq!(
+            (a.audio.clone(), a.cut_end_ms, a.vram),
+            (Audio::default(), 0, false)
+        );
+        let a = parse_args(&strs(&[
+            "d",
+            "--model",
+            "m",
+            "--no-trim",
+            "--no-normalize",
+            "--denoise",
+            "--vram",
+            "--cut-end-ms",
+            "300",
+        ]))
+        .unwrap();
+        assert!(!a.audio.trim && !a.audio.normalize && a.audio.denoise && a.vram);
+        assert_eq!(a.cut_end_ms, 300);
+        assert!(parse_args(&strs(&["d", "--model", "m", "--cut-end-ms", "x"])).is_err());
     }
 
     #[test]
