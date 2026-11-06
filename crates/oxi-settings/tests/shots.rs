@@ -162,8 +162,8 @@ fn shot_audio_denoise() {
 }
 
 #[test]
-fn shot_audio_not_connected() {
-    shot("audio-not-connected", Page::Audio, Some(NO_MIC));
+fn shot_audio_config_missing() {
+    shot("audio-config-missing", Page::Audio, Some(NO_MIC));
 }
 
 #[test]
