@@ -14,8 +14,9 @@ use windows_sys::Win32::UI::Shell::{
     NIM_DELETE, NIM_MODIFY, NOTIFY_ICON_MESSAGE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW, RegisterWindowMessageW, SendMessageW,
-    WM_POWERBROADCAST, WM_QUIT, WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    DispatchMessageW, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PM_REMOVE, PeekMessageW,
+    PostMessageW, RegisterWindowMessageW, SendMessageW, WM_POWERBROADCAST, WM_QUIT,
+    WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
 type Events = Arc<Mutex<Vec<Event>>>;
@@ -200,4 +201,145 @@ fn waker_of_a_dropped_loop_posts_nothing() {
             Err(io::ErrorKind::NotConnected)
         );
     }
+}
+
+/// Sends a power or session message to `hwnd`; returns once its window procedure replied.
+fn send(hwnd: HWND, msg: u32, wp: u32) {
+    // SAFETY: a send to a window handle; Windows checks it.
+    unsafe { SendMessageW(hwnd, msg, wparam(wp), 0) };
+}
+
+/// Dispatches every queued message of this thread, as a modal loop (menu, message box) does.
+fn pump() {
+    let mut msg = MSG::default();
+    // SAFETY: `msg` is a valid out-pointer, filled before it is dispatched.
+    while unsafe { PeekMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
+        // SAFETY: as above.
+        unsafe { DispatchMessageW(&raw const msg) };
+    }
+}
+
+/// A Suspend seen before `run` is not overtaken by a Resume sent once `run` pumps.
+#[test]
+fn session_events_seen_before_run_keep_their_order() {
+    if !live() {
+        return;
+    }
+    let mut ml = MainLoop::new().expect("tray window");
+    let hwnd = ml.hwnd();
+    send(hwnd, WM_POWERBROADCAST, PBT_APMSUSPEND);
+    let addr = hwnd.expose_provenance();
+    let waker = ml.waker();
+    let (sending, about_to_send) = mpsc::channel();
+    let poke = std::thread::spawn(move || {
+        sending.send(()).expect("signal");
+        send(
+            std::ptr::with_exposed_provenance_mut(addr),
+            WM_POWERBROADCAST,
+            PBT_APMRESUMEAUTOMATIC,
+        );
+        waker.quit().expect("quit");
+    });
+    about_to_send.recv().expect("signal");
+    // Setup only: lets the Resume be pending when `run` first pumps, the order that broke.
+    std::thread::sleep(Duration::from_millis(50));
+    let events = Events::default();
+    let sink = Arc::clone(&events);
+    ml.run(
+        |_| {},
+        |_, _| {},
+        move |e| sink.lock().expect("events").push(e),
+    );
+    poke.join().expect("poke thread");
+    assert_eq!(
+        *events.lock().expect("events"),
+        [Event::Suspend, Event::Resume]
+    );
+}
+
+/// A session event sent from inside `on_session` comes after the one being handled.
+#[test]
+fn session_event_sent_from_on_session_comes_next() {
+    if !live() {
+        return;
+    }
+    let mut ml = MainLoop::new().expect("tray window");
+    let addr = ml.hwnd().expose_provenance();
+    let waker = ml.waker();
+    let events = Events::default();
+    let sink = Arc::clone(&events);
+    ml.waker().wake().expect("wake");
+    ml.run(
+        |ml| send(ml.hwnd(), WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK),
+        |_, _| {},
+        move |e| {
+            sink.lock().expect("events").push(e);
+            if e == Event::Lock {
+                send(
+                    std::ptr::with_exposed_provenance_mut(addr),
+                    WM_WTSSESSION_CHANGE,
+                    WTS_SESSION_UNLOCK,
+                );
+                waker.quit().expect("quit");
+            }
+        },
+    );
+    assert_eq!(
+        *events.lock().expect("events"),
+        [Event::Lock, Event::Unlock]
+    );
+}
+
+/// A wake left behind by quit is not replayed by a later `run`.
+#[test]
+fn quit_drops_the_wakes_behind_it() {
+    if !live() {
+        return;
+    }
+    let mut ml = MainLoop::new().expect("tray window");
+    let waker = ml.waker();
+    waker.wake().expect("wake");
+    let mut first = 0;
+    ml.run(
+        |ml| {
+            first += 1;
+            let w = ml.waker();
+            w.quit().expect("quit");
+            w.wake().expect("wake");
+            pump();
+        },
+        |_, _| {},
+        |_| {},
+    );
+    assert_eq!(first, 1);
+    let (woken, _, ()) = run_with(&mut ml, |_, waker, _| waker.quit().expect("quit"));
+    assert_eq!(woken, 0, "no wake replayed");
+}
+
+/// A panic in `on_session` leaves `run` as a panic, so Drop still removes the icon.
+#[test]
+fn panic_in_on_session_unwinds_out_of_run() {
+    if !live() {
+        return;
+    }
+    let mut ml = MainLoop::new().expect("tray window");
+    let hwnd = ml.hwnd();
+    let addr = hwnd.expose_provenance();
+    let waker = ml.waker();
+    let poke = std::thread::spawn(move || {
+        send(
+            std::ptr::with_exposed_provenance_mut(addr),
+            WM_WTSSESSION_CHANGE,
+            WTS_SESSION_LOCK,
+        );
+        // Ends the loop if the panic was swallowed.
+        let _ = waker.quit();
+    });
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ml.run(|_| {}, |_, _| {}, |_| panic!("on_session test panic"));
+    }));
+    poke.join().expect("poke thread");
+    assert!(ran.is_err(), "run must rethrow the panic");
+    drop(ml);
+    assert!(!shell(hwnd, NIM_MODIFY), "icon gone after drop");
 }

@@ -5,9 +5,11 @@
 //! restarted), `WM_POWERBROADCAST` and `WM_WTSSESSION_CHANGE`; a message-only window would miss
 //! these broadcasts. The overlay window lives on the same thread and shares the loop.
 
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
+use std::panic;
 use std::ptr;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
@@ -85,7 +87,6 @@ impl Waker {
 enum Incoming {
     Wake,
     Menu { x: i32, y: i32 },
-    Session(Event),
     TaskbarCreated,
     Exit,
 }
@@ -96,6 +97,10 @@ thread_local! {
     static INBOX: RefCell<VecDeque<Incoming>> = const { RefCell::new(VecDeque::new()) };
     /// `on_session` while [`MainLoop::run`] runs: the window procedure calls it directly.
     static SESSION: RefCell<Option<OnSession>> = const { RefCell::new(None) };
+    /// Session events not yet given to `on_session`, in arrival order.
+    static PENDING: RefCell<VecDeque<Event>> = const { RefCell::new(VecDeque::new()) };
+    /// A panic of `on_session` caught in the window procedure; `run` rethrows it.
+    static PANIC: RefCell<Option<Box<dyn Any + Send>>> = const { RefCell::new(None) };
 }
 
 /// Clears [`SESSION`] when `run` ends, also by panic.
@@ -107,14 +112,29 @@ impl Drop for SessionGuard {
     }
 }
 
-/// Runs `on_session` now; false when it is not installed or already running.
-fn deliver(event: Event) -> bool {
+/// Gives the pending session events to `on_session`, oldest first. They stay pending while it
+/// is not installed (before `run`), after a panic, or while it runs: a re-entrant call returns
+/// at once and the outer call delivers them next, so the order holds.
+fn flush() {
     SESSION.with(|f| {
-        f.try_borrow_mut()
-            .ok()
-            .and_then(|mut f| f.as_mut().map(|f| f(event)))
-            .is_some()
-    })
+        let Ok(mut f) = f.try_borrow_mut() else {
+            return;
+        };
+        let Some(f) = f.as_mut() else { return };
+        while PANIC.with_borrow(Option::is_none)
+            && let Some(event) = PENDING.with_borrow_mut(VecDeque::pop_front)
+        {
+            f(event);
+        }
+    });
+}
+
+/// Rethrows a panic caught in the window procedure, then delivers pending session events.
+fn settle() {
+    if let Some(payload) = PANIC.with_borrow_mut(Option::take) {
+        panic::resume_unwind(payload);
+    }
+    flush();
 }
 
 /// Window class atom, 0 when registration failed.
@@ -157,6 +177,8 @@ impl MainLoop {
             unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) }
         });
         INBOX.with_borrow_mut(VecDeque::clear);
+        PENDING.with_borrow_mut(VecDeque::clear);
+        PANIC.with_borrow_mut(|p| *p = None);
         let title = wide(APP_NAME);
         // SAFETY: the class atom stands for the class name (MAKEINTATOM); every pointer is valid
         // for the call. Never shown: no WS_VISIBLE, and a tool window has no taskbar button.
@@ -234,9 +256,16 @@ impl MainLoop {
     /// Runs the thread's message loop until [`Waker::quit`]. `on_wake` runs for each
     /// [`Waker::wake`] and `on_menu` for the chosen menu entry, both from the loop.
     ///
-    /// `on_session` gets Suspend, Resume, Lock and Unlock inside the window procedure, before
-    /// it returns: Windows sends `PBT_APMSUSPEND` and sleeps soon after the reply, so a queued
-    /// Suspend could arrive only after resume (item 46). Keep it short: forward the event.
+    /// `on_session` gets Suspend, Resume, Lock and Unlock in arrival order, inside the window
+    /// procedure before it replies: Windows sends `PBT_APMSUSPEND` and sleeps about 2 s later
+    /// whether or not the reply came, so a queued Suspend could arrive only after resume
+    /// (item 46). Keep it bounded: forward the event. It can run re-entrantly inside a modal
+    /// loop that `on_wake` or `on_menu` starts (menu, message box), so it must never take a
+    /// lock they hold. Its panic leaves `run` as a panic once the window procedure returned.
+    ///
+    /// On [`Waker::quit`], pending session events are delivered and the wakes, menu requests and
+    /// `TaskbarCreated` queued behind it are dropped: they belong to the ended run, and a later
+    /// `run` would replay them out of date.
     pub fn run(
         &mut self,
         mut on_wake: impl FnMut(&mut Self),
@@ -245,6 +274,8 @@ impl MainLoop {
     ) {
         SESSION.with_borrow_mut(|f| *f = Some(Box::new(on_session)));
         let _clear = SessionGuard;
+        // Events seen before `run` come before any sent while it pumps.
+        flush();
         let mut msg = MSG::default();
         // SAFETY: `msg` is a valid out-pointer; a null window takes every message of the thread.
         // GetMessageW returns 0 on WM_QUIT and -1 on error; both end the loop.
@@ -254,14 +285,15 @@ impl MainLoop {
                 TranslateMessage(&raw const msg);
                 DispatchMessageW(&raw const msg);
             }
+            settle();
             while let Some(incoming) = INBOX.with_borrow_mut(VecDeque::pop_front) {
                 match incoming {
                     Incoming::Wake => on_wake(self),
-                    // Seen before `run` or while `on_session` was running.
-                    Incoming::Session(event) => {
-                        deliver(event);
+                    Incoming::Exit => {
+                        INBOX.with_borrow_mut(VecDeque::clear);
+                        settle();
+                        return;
                     }
-                    Incoming::Exit => return,
                     Incoming::Menu { x, y } => match self.menu(x, y) {
                         Ok(Some(item)) => on_menu(self, item),
                         Ok(None) => {}
@@ -273,6 +305,8 @@ impl MainLoop {
                         }
                     }
                 }
+                // A callback's modal loop may have caught a panic or queued session events.
+                settle();
             }
         }
     }
@@ -436,22 +470,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 y: y.into(),
             })
         }
-        WM_POWERBROADCAST | WM_WTSSESSION_CHANGE => session_event(msg, wparam)
-            .filter(|&event| !deliver(event))
-            .map(Incoming::Session),
+        WM_POWERBROADCAST | WM_WTSSESSION_CHANGE => {
+            if let Some(event) = session_event(msg, wparam) {
+                PENDING.with_borrow_mut(|q| q.push_back(event));
+                // Unwinding cannot cross this `extern "system"` frame: keep the panic for `run`.
+                if let Err(payload) = panic::catch_unwind(flush) {
+                    PANIC.with_borrow_mut(|p| *p = Some(payload));
+                }
+                nudge(hwnd);
+            }
+            None
+        }
         m if TASKBAR_CREATED.get() == Some(&m) => Some(Incoming::TaskbarCreated),
         _ => None,
     };
     if let Some(incoming) = incoming {
         INBOX.with_borrow_mut(|q| q.push_back(incoming));
-        // A sent message (TaskbarCreated, the shell's callback) is handled inside GetMessageW,
-        // which then keeps waiting: a posted WM_NULL makes it return so `run` drains the inbox.
-        // SAFETY: `hwnd` is the window this procedure runs for.
-        unsafe { PostMessageW(hwnd, WM_NULL, 0, 0) };
+        nudge(hwnd);
     }
     // Default handling suits every message above (TRUE for WM_POWERBROADCAST, 0 otherwise).
     // SAFETY: the arguments Windows passed to this procedure.
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// A sent message (`PBT_APMSUSPEND`, `TaskbarCreated`, the shell's callback) is handled inside
+/// `GetMessageW`, which then keeps waiting: a posted `WM_NULL` makes it return, so `run` drains
+/// the inbox and rethrows a caught panic.
+fn nudge(hwnd: HWND) {
+    // SAFETY: `hwnd` is the window the procedure runs for.
+    unsafe { PostMessageW(hwnd, WM_NULL, 0, 0) };
 }
 
 fn shell(message: NOTIFY_ICON_MESSAGE, data: &NOTIFYICONDATAW) -> io::Result<()> {
