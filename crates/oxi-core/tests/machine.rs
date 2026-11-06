@@ -4,8 +4,8 @@
 use oxi_core::config::Config;
 use oxi_core::device::DeviceChoice;
 use oxi_core::machine::{
-    Effect, Effects, Event, JobId, MachineConfig, Mode, ModelFailure, Notice, OverlayState, Phase,
-    PhaseCell, Sound, State, step,
+    Effect, Effects, EmptyAudio, Event, JobId, MachineConfig, Mode, ModelFailure, Notice,
+    OverlayState, Phase, PhaseCell, Sound, State, step,
 };
 use oxi_core::paste::{ClipboardOnlyWhy, PasteOutcome};
 use oxi_core::types::Millis;
@@ -833,6 +833,62 @@ fn empty_transcript_pastes_nothing_and_says_so() {
         [Effect::Overlay(OverlayState::Text(Notice::NothingHeard))]
     );
     assert_eq!(s.phase(), Phase::Idle);
+}
+
+#[test]
+fn job_without_audio_ends_with_its_notice_and_no_whisper_call() {
+    let failed = [
+        Effect::Play(Sound::Error),
+        Effect::Notify(Notice::CaptureFailed),
+        Effect::Overlay(OverlayState::Text(Notice::CaptureFailed)),
+    ];
+    let heard = [Effect::Overlay(OverlayState::Text(Notice::NothingHeard))];
+    let cases: [(EmptyAudio, &[Effect]); 3] = [
+        (EmptyAudio::NothingHeard, &heard),
+        (EmptyAudio::MicSilence, &failed),
+        (EmptyAudio::Failed, &failed),
+    ];
+    for (why, want) in cases {
+        let mut s = Sim::loaded();
+        s.press(0, 500);
+        let fx = s.at(550, Event::JobAudioEmpty { job: J0, why });
+        assert_eq!(fx, want, "{why:?}");
+        assert_eq!(s.phase(), Phase::Idle);
+        // A late answer for the ended job changes nothing.
+        assert_eq!(s.core(600, Event::JobAudioReady(J0)), []);
+    }
+}
+
+#[test]
+fn job_without_audio_lets_the_next_job_go_to_whisper() {
+    let mut s = Sim::loaded();
+    s.press(0, 500);
+    s.press(1000, 1500);
+    assert_eq!(s.core(1550, Event::JobAudioReady(J1)), []);
+    let fx = s.core(
+        1600,
+        Event::JobAudioEmpty {
+            job: J0,
+            why: EmptyAudio::NothingHeard,
+        },
+    );
+    assert_eq!(fx, [Effect::Transcribe(J1)]);
+}
+
+#[test]
+fn audio_answer_after_the_job_got_its_audio_is_ignored() {
+    let mut s = Sim::loaded();
+    s.press(0, 500);
+    s.at(550, Event::JobAudioReady(J0));
+    let fx = s.at(
+        600,
+        Event::JobAudioEmpty {
+            job: J0,
+            why: EmptyAudio::Failed,
+        },
+    );
+    assert_eq!(fx, []);
+    assert_eq!(s.phase(), Phase::Transcribing);
 }
 
 #[test]

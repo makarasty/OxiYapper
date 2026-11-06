@@ -9,8 +9,9 @@
 //!   and returns when `rx` closes, which happens when the coordinator ends. Extra arguments are
 //!   the worker's own: audio the shared `LevelMeter`, whisper the `Layout`, io a sender for IPC
 //!   pushes.
-//! - What each worker answers: audio `Inbox::JobAudio` for `Stop(job)` plus `Event::DeviceLost`,
-//!   `CaptureFailed` or `MicFellBack`; whisper `Event::ModelLoaded` or `ModelFailed` for
+//! - What each worker answers: audio `Inbox::JobAudio`, or `Event::JobAudioEmpty`, for
+//!   `Stop(job)`, plus `Inbox::Capture` with `Event::DeviceLost`, `CaptureFailed` or
+//!   `MicFellBack`; whisper `Event::ModelLoaded` or `ModelFailed` for
 //!   `Preload` and `Inbox::Transcribed` for `Transcribe`; paste `Event::PasteDone` for `Paste`
 //!   and nothing for `CopyOnly`.
 //! - The hook thread sends the machine's `Event` on its own `Sender<Event>`; `run.rs` forwards
@@ -34,8 +35,12 @@ use oxi_core::machine::{Event, JobId, Notice, OverlayState, Phase};
 pub enum Inbox {
     /// Hook, worker and session events, fed straight into the state machine.
     Event(Event),
-    /// Audio worker: the trimmed 16 kHz mono samples of a stopped job.
+    /// Audio worker: the trimmed 16 kHz mono samples of a stopped job, never empty.
     JobAudio { job: JobId, samples: Vec<f32> },
+    /// Audio worker: an event of the capture opened by `AudioCmd::Start { session }`. The
+    /// coordinator drops it once a later capture started, so a stale `DeviceLost` cannot stop
+    /// the next recording.
+    Capture { session: u64, event: Event },
     /// Whisper worker: `Some` is the final text (empty when nothing is left to paste), `None`
     /// a failed transcription.
     Transcribed { job: JobId, text: Option<String> },
@@ -80,9 +85,9 @@ pub struct StatusReport {
 /// Commands for the audio worker.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AudioCmd {
-    /// Open the capture with the current `Audio` options.
-    Start,
-    /// Stop, flush the tail, answer `Inbox::JobAudio` for this job.
+    /// Open the capture with the current `Audio` options; its events carry `session`.
+    Start { session: u64 },
+    /// Stop, flush the tail, answer `Inbox::JobAudio` or `Event::JobAudioEmpty` for this job.
     Stop(JobId),
     /// Stop and throw the audio away; no answer.
     Discard,

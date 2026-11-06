@@ -10,9 +10,10 @@
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::{Builder, JoinHandle};
 
+use oxi_core::audio::AudioError;
 use oxi_core::config::Audio;
-use oxi_core::machine::{Event, JobId};
-use oxi_platform::capture::{Capture, CaptureEvent, CpalCapture, LevelMeter};
+use oxi_core::machine::{EmptyAudio, Event, JobId};
+use oxi_platform::capture::{Capture, CaptureError, CaptureEvent, CpalCapture, LevelMeter};
 
 use super::cmd::{AudioCmd, Inbox};
 
@@ -33,73 +34,79 @@ fn run<C: Capture>(rx: &Receiver<AudioCmd>, inbox: &Sender<Inbox>, meter: &Level
     let mut opts = Audio::default();
     let mut capture: Option<C> = None;
     // A send fails only when the coordinator is gone; nothing is left to tell then.
-    let event = |e: Event| {
-        let _ = inbox.send(Inbox::Event(e));
+    let send = |msg: Inbox| {
+        let _ = inbox.send(msg);
     };
 
     for cmd in rx {
         match cmd {
             AudioCmd::Config(audio) => opts = audio,
-            AudioCmd::Start => {
+            AudioCmd::Start { session } => {
                 capture = None; // a second Start must not hold two streams
                 let events = inbox.clone();
                 let opened = C::open(&opts, meter.clone(), move |e| {
-                    let _ = events.send(Inbox::Event(match e {
+                    let event = match e {
                         CaptureEvent::DeviceLost => Event::DeviceLost,
                         CaptureEvent::Failed => Event::CaptureFailed,
-                    }));
+                    };
+                    let _ = events.send(Inbox::Capture { session, event });
                 });
                 match opened {
                     Ok(c) => {
                         if c.fell_back_to_default() {
-                            event(Event::MicFellBack);
+                            let event = Event::MicFellBack;
+                            send(Inbox::Capture { session, event });
                         }
                         capture = Some(c);
                     }
                     Err(e) => {
                         tracing::warn!("microphone not opened: {e}");
-                        event(Event::CaptureFailed);
+                        let event = Event::CaptureFailed;
+                        send(Inbox::Capture { session, event });
                     }
                 }
             }
             AudioCmd::Discard => capture = None,
-            AudioCmd::Stop(job) => {
-                let samples = finish(capture.take(), job);
-                let _ = inbox.send(Inbox::JobAudio { job, samples });
-            }
+            AudioCmd::Stop(job) => send(match finish(capture.take(), job) {
+                Ok(samples) => Inbox::JobAudio { job, samples },
+                Err(why) => Inbox::Event(Event::JobAudioEmpty { job, why }),
+            }),
         }
     }
 }
 
-/// The audio of a stopped capture. A capture that is missing or fails to finish gives no samples:
-/// the job still gets its answer, so it is not stranded in `AwaitingAudio`, and whisper hears
-/// nothing.
-fn finish<C: Capture>(capture: Option<C>, job: JobId) -> Vec<f32> {
+/// The audio of a stopped capture, or why there is none. Either way the job gets its answer, so
+/// it is not stranded in `AwaitingAudio`, and whisper never gets empty audio.
+fn finish<C: Capture>(capture: Option<C>, job: JobId) -> Result<Vec<f32>, EmptyAudio> {
     let Some(capture) = capture else {
         tracing::warn!(?job, "stop without an open capture");
-        return Vec::new();
+        return Err(EmptyAudio::Failed);
     };
     let dropped = capture.dropped_samples();
     if dropped > 0 {
         tracing::warn!(?job, dropped, "capture ring overflowed");
     }
-    capture.finish().unwrap_or_else(|e| {
-        tracing::warn!(?job, "capture failed to finish: {e}");
-        Vec::new()
-    })
+    match capture.finish() {
+        Ok(samples) if !samples.is_empty() => Ok(samples),
+        // A quiet tap is ordinary: no warning.
+        Ok(_) | Err(CaptureError::Audio(AudioError::NothingHeard)) => Err(EmptyAudio::NothingHeard),
+        Err(CaptureError::Audio(AudioError::MicSilence)) => Err(EmptyAudio::MicSilence),
+        Err(e) => {
+            tracing::warn!(?job, "capture failed to finish: {e}");
+            Err(EmptyAudio::Failed)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc::channel;
 
-    use oxi_platform::capture::CaptureError;
-
     use super::*;
 
     /// No microphone: `opts.device` picks the behaviour. "fail" cannot open, "fallback" reports
     /// the default device, "lose" loses the device right after opening, "bad-finish" fails in
-    /// `finish`.
+    /// `finish`, "quiet" hears no speech, "mute" gives all zeros.
     struct Fake {
         device: String,
     }
@@ -136,12 +143,18 @@ mod tests {
             match self.device.as_str() {
                 "lose" => Ok(PARTIAL.to_vec()),
                 "bad-finish" => Err(CaptureError::NoDevice),
+                "quiet" => Err(AudioError::NothingHeard.into()),
+                "mute" => Err(AudioError::MicSilence.into()),
                 _ => Ok(FULL.to_vec()),
             }
         }
     }
 
     const J: JobId = JobId(7);
+
+    fn start(session: u64) -> AudioCmd {
+        AudioCmd::Start { session }
+    }
 
     fn cfg(device: &str) -> AudioCmd {
         AudioCmd::Config(Audio {
@@ -181,58 +194,89 @@ mod tests {
             .collect()
     }
 
+    fn captures(msgs: &[Inbox]) -> Vec<(u64, Event)> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                Inbox::Capture { session, event } => Some((*session, event.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn empty(why: EmptyAudio) -> Event {
+        Event::JobAudioEmpty { job: J, why }
+    }
+
     #[test]
     fn start_then_stop_gives_one_job_audio() {
-        let msgs = drive(vec![AudioCmd::Start, AudioCmd::Stop(J)]);
+        let msgs = drive(vec![start(1), AudioCmd::Stop(J)]);
         assert_eq!(job_audio(&msgs), [(J, FULL.to_vec())]);
         assert_eq!(msgs.len(), 1); // the job audio, no event
     }
 
     #[test]
-    fn discard_gives_no_audio_and_a_later_stop_gets_empty() {
-        let msgs = drive(vec![AudioCmd::Start, AudioCmd::Discard]);
+    fn discard_gives_no_answer_and_a_later_stop_gets_failed() {
+        let msgs = drive(vec![start(1), AudioCmd::Discard]);
         assert!(msgs.is_empty());
-        let msgs = drive(vec![AudioCmd::Start, AudioCmd::Discard, AudioCmd::Stop(J)]);
-        assert_eq!(job_audio(&msgs), [(J, Vec::new())]);
+        let msgs = drive(vec![start(1), AudioCmd::Discard, AudioCmd::Stop(J)]);
+        assert_eq!(events(&msgs), [empty(EmptyAudio::Failed)]);
+        assert_eq!(msgs.len(), 1); // no job audio
     }
 
     #[test]
     fn lost_device_still_gives_partial_audio() {
-        let msgs = drive(vec![cfg("lose"), AudioCmd::Start, AudioCmd::Stop(J)]);
-        assert_eq!(events(&msgs), [Event::DeviceLost]);
+        let msgs = drive(vec![cfg("lose"), start(1), AudioCmd::Stop(J)]);
+        assert_eq!(captures(&msgs), [(1, Event::DeviceLost)]);
         assert_eq!(job_audio(&msgs), [(J, PARTIAL.to_vec())]);
     }
 
     #[test]
+    fn capture_events_carry_the_session_of_their_start() {
+        let msgs = drive(vec![cfg("lose"), start(1), AudioCmd::Stop(J), start(2)]);
+        assert_eq!(
+            captures(&msgs),
+            [(1, Event::DeviceLost), (2, Event::DeviceLost)]
+        );
+    }
+
+    #[test]
     fn failed_open_gives_capture_failed() {
-        let msgs = drive(vec![cfg("fail"), AudioCmd::Start]);
-        assert_eq!(events(&msgs), [Event::CaptureFailed]);
+        let msgs = drive(vec![cfg("fail"), start(3)]);
+        assert_eq!(captures(&msgs), [(3, Event::CaptureFailed)]);
         assert_eq!(msgs.len(), 1); // the event, no job audio
     }
 
     #[test]
     fn fallback_device_reports_mic_fell_back() {
-        let msgs = drive(vec![cfg("fallback"), AudioCmd::Start, AudioCmd::Stop(J)]);
-        assert_eq!(events(&msgs), [Event::MicFellBack]);
+        let msgs = drive(vec![cfg("fallback"), start(1), AudioCmd::Stop(J)]);
+        assert_eq!(captures(&msgs), [(1, Event::MicFellBack)]);
         assert_eq!(job_audio(&msgs).len(), 1);
     }
 
     #[test]
-    fn failed_finish_still_answers_the_job_with_no_samples() {
-        let msgs = drive(vec![cfg("bad-finish"), AudioCmd::Start, AudioCmd::Stop(J)]);
-        assert_eq!(job_audio(&msgs), [(J, Vec::new())]);
+    fn stop_without_audio_answers_why_and_sends_no_samples() {
+        let cases = [
+            ("quiet", EmptyAudio::NothingHeard),
+            ("mute", EmptyAudio::MicSilence),
+            ("bad-finish", EmptyAudio::Failed),
+        ];
+        for (device, why) in cases {
+            let msgs = drive(vec![cfg(device), start(1), AudioCmd::Stop(J)]);
+            assert_eq!(events(&msgs), [empty(why)], "{device}");
+            assert_eq!(msgs.len(), 1, "{device}: no job audio");
+        }
     }
 
     #[test]
     fn config_applies_to_the_next_start_only() {
         let msgs = drive(vec![
-            AudioCmd::Start, // default device opens
+            start(1), // default device opens
             cfg("fail"),
             AudioCmd::Stop(J), // the open capture is untouched
-            AudioCmd::Start,   // now fails
+            start(2),          // now fails
         ]);
         assert_eq!(job_audio(&msgs), [(J, FULL.to_vec())]);
-        assert_eq!(events(&msgs), [Event::CaptureFailed]);
+        assert_eq!(captures(&msgs), [(2, Event::CaptureFailed)]);
     }
 
     #[test]

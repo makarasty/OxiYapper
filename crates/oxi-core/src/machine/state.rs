@@ -3,8 +3,8 @@
 use std::collections::VecDeque;
 
 use super::types::{
-    Effect, Effects, Event, JobId, MachineConfig, Mode, ModelFailure, ModelIdentity, Notice,
-    OverlayState, Phase, Sound,
+    Effect, Effects, EmptyAudio, Event, JobId, MachineConfig, Mode, ModelFailure, ModelIdentity,
+    Notice, OverlayState, Phase, Sound,
 };
 use crate::paste::{ClipboardOnlyWhy, PasteOutcome};
 use crate::types::Millis;
@@ -208,6 +208,7 @@ impl State {
                     job.stage = Stage::Queued;
                 }
             }
+            Event::JobAudioEmpty { job, why } => self.audio_empty(job, why, now, &mut fx),
             Event::TranscriptionDone { job, empty } => {
                 if let Some(j) = self.job_in(job, Stage::Transcribing) {
                     j.stage = Stage::Transcribed;
@@ -272,6 +273,22 @@ impl State {
         self.jobs
             .iter_mut()
             .find(|j| j.id == id && j.stage == stage)
+    }
+
+    /// A stopped job with no audio ends here, without a whisper call (ARCHITECTURE 9 step 6).
+    fn audio_empty(&mut self, job: JobId, why: EmptyAudio, now: Millis, fx: &mut Effects) {
+        if self.job_in(job, Stage::AwaitingAudio).is_none() {
+            return;
+        }
+        self.jobs.retain(|j| j.id != job);
+        match why {
+            EmptyAudio::NothingHeard => self.show(Notice::NothingHeard, now),
+            // shortcut: no "microphone gives silence" notice yet (it needs text in strings.rs
+            // and a look); give MicSilence its own Notice when those get one.
+            EmptyAudio::MicSilence | EmptyAudio::Failed => {
+                self.fail(Notice::CaptureFailed, now, fx);
+            }
+        }
     }
 
     /// What the user must know about how the text arrived (items 35, 36; ARCHITECTURE 10
