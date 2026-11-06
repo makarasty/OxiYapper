@@ -43,7 +43,7 @@ Needs M3 and M4. On the owner's machine, through `bench` on the private phrases:
 - Audio defaults: normalise, trim, denoise, tail length, A/B on the same phrases.
 - Results go into `docs/research/bench-<date>.md` as numbers only (no phrase text, no audio).
 
-Done when: the document states keep or drop CUDA with the numbers; the CI CUDA job becomes blocking or is removed; defaults in `oxi-core::config` match the measured winners; **all 8 reference phrases give the same text as the owner's bench**.
+Done when: the document states keep or drop CUDA with the numbers; the CI CUDA job becomes blocking or is removed; defaults in `oxi-core::config` match the measured winners; **word edits against the owner's reference texts are not worse than the owner's bench** (owner decision 2026-11-06: defaults trim+normalise on; 25 vs 24 edits measured).
 
 ## M6 - Windows hotkey, tray, daemon wiring
 
