@@ -44,7 +44,7 @@ All measured against the 8 owner reference phrases before becoming defaults.
 
 - Short curated list (podlodka for Russian, large-v3, turbo) downloaded from Hugging Face with SHA256 check, plus "use my own .bin".
 - Load in the background on key-down, unload after idle (default 5 min, configurable).
-- GPU: Vulkan build first. CUDA build kept only if a measurement on an RTX 4070 SUPER shows a clear win. Pick the GPU explicitly (machines have an iGPU too).
+- GPU: Vulkan build is the default for everyone; the CUDA build stays and is the default on the owner's machine (owner decision 2026-11-06; M5 flash attention on: p50 -20..-41 % Vulkan, -14..-34 % CUDA; one installer per variant, M11). Pick the GPU explicitly (machines have an iGPU too).
 
 ## History
 

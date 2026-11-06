@@ -76,9 +76,15 @@ fn threads_for(on_gpu: bool) -> i32 {
     thread_count(on_gpu, logical)
 }
 
-fn open(path: &Path, gpu: Option<usize>) -> Result<(WhisperContext, WhisperState), WhisperError> {
+/// `flash_attn` only with a GPU: M5 measured -14..-41 % p50 there; the CPU path stays as it was.
+fn open(
+    path: &Path,
+    gpu: Option<usize>,
+    flash_attn: bool,
+) -> Result<(WhisperContext, WhisperState), WhisperError> {
     let mut params = WhisperContextParameters::new();
     params.use_gpu(gpu.is_some());
+    params.flash_attn(flash_attn && gpu.is_some());
     if let Some(i) = gpu {
         params.gpu_device(i32::try_from(i).unwrap_or(0));
     }
@@ -96,7 +102,7 @@ impl Engine {
         let picked = pick(&devices, choice);
         let gpu_err = match picked.index {
             None => {
-                let (ctx, state) = open(path, None).map_err(Error::Load)?;
+                let (ctx, state) = open(path, None, false).map_err(Error::Load)?;
                 let info = LoadInfo {
                     device: None,
                     warning: picked.warning,
@@ -109,7 +115,8 @@ impl Engine {
                 });
             }
             Some(i) if !device::gpu_starts(i) => format!("cannot start {}", devices[i].name),
-            Some(i) => match open(path, Some(i)) {
+            // Flash attention first; a device that rejects it gets one plain GPU try before the CPU retry.
+            Some(i) => match open(path, Some(i), true).or_else(|_| open(path, Some(i), false)) {
                 Ok((ctx, state)) => {
                     let info = LoadInfo {
                         device: Some(devices[i].name.clone()),
@@ -125,7 +132,7 @@ impl Engine {
                 Err(e) => e.to_string(),
             },
         };
-        let (ctx, state) = open(path, None).map_err(Error::Load)?;
+        let (ctx, state) = open(path, None, false).map_err(Error::Load)?;
         let info = LoadInfo {
             device: None,
             warning: Some(format!("running on CPU: {gpu_err}")),

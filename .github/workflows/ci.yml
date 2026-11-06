@@ -207,7 +207,7 @@ jobs:
       - run: cargo build --locked --release --features metal
       - run: target/release/OxiYapper --version
 
-  # Informational until the Vulkan-vs-CUDA measurement (ROADMAP M5) keeps or drops CUDA.
+  # Informational by owner decision 2026-11-06 (SPEC Models): CUDA stays, default on the owner's machine only; Vulkan is the default for others.
   # Kept out of ci-ok: a job-level continue-on-error inside the build matrix hid a cancelled macOS leg.
   build-cuda:
     runs-on: windows-latest
