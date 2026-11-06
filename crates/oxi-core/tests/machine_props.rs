@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use oxi_core::machine::{
     Effect, Event, JobId, MachineConfig, Mode, ModelFailure, Phase, State, step,
 };
+use oxi_core::paste::{ClipboardOnlyWhy, PasteOutcome};
 use oxi_core::types::Millis;
 use proptest::prelude::*;
 
@@ -12,6 +13,16 @@ const JOB_IDS: u64 = 6;
 
 fn job() -> impl Strategy<Value = JobId> {
     (0..JOB_IDS).prop_map(JobId)
+}
+
+fn outcome() -> impl Strategy<Value = PasteOutcome> {
+    prop_oneof![
+        Just(PasteOutcome::Pasted),
+        Just(PasteOutcome::Typed),
+        Just(PasteOutcome::ClipboardOnly(ClipboardOnlyWhy::ModifiersHeld)),
+        Just(PasteOutcome::ClipboardOnly(ClipboardOnlyWhy::Elevated)),
+        Just(PasteOutcome::PastedNoRestore),
+    ]
 }
 
 fn config() -> impl Strategy<Value = MachineConfig> {
@@ -33,7 +44,8 @@ fn quiet_event() -> impl Strategy<Value = Event> {
         4 => job().prop_map(Event::JobAudioReady),
         4 => (job(), any::<bool>()).prop_map(|(job, empty)| Event::TranscriptionDone { job, empty }),
         1 => job().prop_map(Event::TranscriptionFailed),
-        4 => job().prop_map(Event::PasteDone),
+        4 => (job(), outcome()).prop_map(|(job, outcome)| Event::PasteDone { job, outcome }),
+        1 => Just(Event::MicFellBack),
         2 => Just(Event::ModelLoaded),
         1 => prop_oneof![Just(ModelFailure::Missing), Just(ModelFailure::Bad)].prop_map(Event::ModelFailed),
         1 => config().prop_map(Event::ConfigChanged),
@@ -140,7 +152,7 @@ impl Workers {
             Event::TranscriptionDone { job, .. } | Event::TranscriptionFailed(job) => {
                 self.whisper_busy.remove(&job);
             }
-            Event::PasteDone(job) => {
+            Event::PasteDone { job, .. } => {
                 self.paste_busy.remove(&job);
             }
             _ => {}
@@ -216,7 +228,8 @@ proptest! {
                 let job = JobId(n);
                 step(&mut state, Event::JobAudioReady(job), Millis(now));
                 step(&mut state, Event::TranscriptionDone { job, empty: false }, Millis(now));
-                step(&mut state, Event::PasteDone(job), Millis(now));
+                let outcome = PasteOutcome::Pasted;
+                step(&mut state, Event::PasteDone { job, outcome }, Millis(now));
             }
         }
         let mut ticks = 0;

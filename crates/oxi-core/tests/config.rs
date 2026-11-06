@@ -1,6 +1,6 @@
 use oxi_core::config::{
     CURRENT_VERSION, Config, ConfigError, ConfigFile, MIGRATIONS, Migration, OverlayPosition,
-    PasteMode, PasteRule,
+    PasteMode, PasteRule, Theme,
 };
 use oxi_core::machine::Mode;
 use oxi_core::types::Language;
@@ -415,4 +415,58 @@ fn mixed_line_endings_normalise_to_the_dominant_one() {
         let file = ConfigFile::parse(text).unwrap();
         assert_eq!(file.to_toml_string().unwrap(), want, "{text:?}");
     }
+}
+
+#[test]
+fn theme_round_trips_and_is_written_only_when_set() {
+    assert_eq!(Config::default().ui.theme, Theme::System);
+    for (theme, text) in [
+        (Theme::System, "system"),
+        (Theme::Dark, "dark"),
+        (Theme::Light, "light"),
+    ] {
+        let file = ConfigFile::parse(&format!("[ui]\ntheme = \"{text}\"\n")).unwrap();
+        assert_eq!(file.config.ui.theme, theme);
+        let mut minimal = ConfigFile::parse("version = 1\n").unwrap();
+        minimal.config.ui.theme = theme;
+        let out = minimal.to_toml_string().unwrap();
+        assert_eq!(out.contains("[ui]"), theme != Theme::System, "{out}");
+        assert_eq!(ConfigFile::parse(&out).unwrap().config.ui.theme, theme);
+    }
+}
+
+#[test]
+fn meter_sensitivity_is_clamped_on_load() {
+    // (value in the file, value loaded, warned)
+    let table = [
+        ("0.0", 0.0, false),
+        ("-20.0", -20.0, false),
+        ("1.5", 1.5, false),
+        ("20.5", 20.0, true),
+        ("-100.0", -20.0, true),
+        ("nan", 0.0, true),
+    ];
+    for (text, want, warned) in table {
+        let file = ConfigFile::parse(&format!("[audio]\nmeter_sensitivity_db = {text}\n")).unwrap();
+        let got = file.config.audio.meter_sensitivity_db;
+        assert_eq!(got.to_bits(), f32::to_bits(want), "{text}");
+        assert_eq!(file.warnings.len(), usize::from(warned), "{text}");
+    }
+}
+
+#[test]
+fn meter_sensitivity_survives_a_save() {
+    // 1.1 has no exact f32: the save must not rewrite it as the widened f64.
+    let text = "version = 1\n[audio]\nmeter_sensitivity_db = 1.1\n";
+    assert_eq!(
+        ConfigFile::parse(text).unwrap().to_toml_string().unwrap(),
+        text
+    );
+    let mut minimal = ConfigFile::parse("version = 1\n").unwrap();
+    minimal.config.audio.meter_sensitivity_db = -3.5;
+    let out = minimal.to_toml_string().unwrap();
+    assert!(
+        out.contains("[audio]\nmeter_sensitivity_db = -3.5\n"),
+        "{out}"
+    );
 }

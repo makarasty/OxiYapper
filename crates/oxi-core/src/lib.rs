@@ -10,10 +10,14 @@ pub mod cli;
 pub mod config;
 pub mod device;
 pub mod dictionary;
+pub mod hotkey;
 pub mod ipc;
 pub mod machine;
 pub mod models;
+pub mod overlay;
+pub mod paste;
 pub mod paths;
+pub mod strings;
 pub mod text;
 pub mod types;
 

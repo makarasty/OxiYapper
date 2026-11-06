@@ -5,7 +5,7 @@ mod schema;
 
 pub use schema::{
     Audio, Config, Debug, History, Hotkey, Model, Overlay, OverlayPosition, Paste, PasteMode,
-    PasteRule, Sounds, System,
+    PasteRule, Sounds, System, Theme, Ui,
 };
 
 use crate::paths::CONFIG_FILE;
@@ -46,6 +46,8 @@ pub struct ConfigFile {
     pub config: Config,
     /// True when the file's `version` is newer than this build: never write it back.
     pub read_only: bool,
+    /// Values the load had to correct, for the tray and settings to show.
+    pub warnings: Vec<String>,
     raw: DocumentMut,
     /// The file started with a UTF-8 byte order mark; written back with it.
     bom: bool,
@@ -62,6 +64,7 @@ impl Default for ConfigFile {
         Self {
             config: Config::default(),
             read_only: false,
+            warnings: Vec::new(),
             raw,
             bom: false,
             crlf: false,
@@ -122,14 +125,16 @@ impl ConfigFile {
         } else {
             Cow::Owned(raw.to_string())
         };
-        let config = toml::from_str::<Config>(&migrated)
+        let mut config = toml::from_str::<Config>(&migrated)
             .map_err(|e| located(&migrated, e.span(), e.message()))?;
+        let warnings = config.audio.clamp_meter_sensitivity().into_iter().collect();
         if !read_only {
             put(raw.as_table_mut(), "version", &toml_edit::value(current));
         }
         Ok(Self {
             config,
             read_only,
+            warnings,
             raw,
             bom,
             crlf,
