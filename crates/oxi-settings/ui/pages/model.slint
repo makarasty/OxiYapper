@@ -1,10 +1,229 @@
-// Model page. A stub of the shell: the Model page task fills it.
-import { Group } from "../widgets.slint";
+// Model page (SPEC Models, ARCHITECTURE section 8): the curated models with their state on disk,
+// download and cancel through the daemon, "use my own .bin", the GPU and the idle unload.
+import { Palette, Button, ComboBox, LineEdit, ProgressIndicator } from "std-widgets.slint";
+import { Shell, Group, Row, SliderRow, InlineNote } from "../widgets.slint";
+
+export struct ModelRow {
+    id: string,
+    name: string,
+    // "1.6 GB".
+    size: string,
+    // "Ready", "Not downloaded", "Downloading 0.4 of 1.6 GB", ...
+    status: string,
+    can-download: bool,
+    downloading: bool,
+    // 0..1 while downloading.
+    progress: float,
+    // Why the last download failed; empty otherwise.
+    error: string,
+}
+
+// Filled and read by `pages::model`.
+export global ModelState {
+    in property <[ModelRow]> rows;
+    // Index in `rows`; `rows.length` is "use my own .bin", -1 is none.
+    in property <int> selected;
+    in-out property <string> custom-path;
+    in property <string> custom-error;
+    // The native file dialog exists on this OS.
+    in property <bool> can-browse;
+    // "Auto", "CPU", then the GPUs the daemon lists.
+    in property <[string]> gpus;
+    in-out property <int> gpu;
+    in-out property <float> idle-minutes;
+    // The daemon's Status warnings ("running on CPU: ..."); empty hides the note.
+    in property <string> warning;
+    callback shown();
+    callback picked(int);
+    callback download(int);
+    callback cancel(int);
+    callback custom-edited(string);
+    callback browse();
+    callback gpu-picked(int);
+    callback idle-changed(float);
+}
+
+// One choice of the model list: a radio mark, the name over a detail line, then the children.
+// shortcut: a local radio row; move it to widgets.slint when a second page needs one.
+component Choice inherits Rectangle {
+    in property <string> label;
+    in property <string> detail;
+    in property <bool> checked;
+    callback picked();
+    min-height: 40px;
+    accessible-role: radio-button;
+    accessible-label: root.label;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-enabled: !Shell.locked;
+    accessible-action-default => {
+        if (!Shell.locked) {
+            root.picked();
+        }
+    }
+    TouchArea {
+        enabled: !Shell.locked;
+        clicked => {
+            root.picked();
+        }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        opacity: Shell.locked ? 0.5 : 1;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 14px;
+                height: 14px;
+                border-radius: 7px;
+                border-width: 1.5px;
+                border-color: root.checked ? Palette.accent-background : Palette.foreground.transparentize(50%);
+                Rectangle {
+                    width: 6px;
+                    height: 6px;
+                    border-radius: 3px;
+                    background: Palette.accent-background;
+                    visible: root.checked;
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            Text {
+                text: root.label;
+                overflow: elide;
+                color: Palette.foreground;
+            }
+            Text {
+                text: root.detail;
+                font-size: 11px;
+                overflow: elide;
+                color: Palette.foreground;
+                opacity: 0.7;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            @children
+        }
+    }
+}
 
 export component ModelPage inherits VerticalLayout {
     alignment: start;
     spacing: 10px;
+    init => {
+        ModelState.shown();
+    }
     Group {
         title: @tr("Model");
+        for row[i] in ModelState.rows: VerticalLayout {
+            padding-bottom: 2px;
+            Choice {
+                label: row.name;
+                detail: row.size + " · " + row.status;
+                checked: ModelState.selected == i;
+                picked => {
+                    ModelState.picked(i);
+                }
+                // Downloading writes no config, so it stays on while the config is locked.
+                if row.can-download && !row.downloading: Button {
+                    text: @tr("Download");
+                    accessible-label: @tr("Download {}", row.name);
+                    clicked => {
+                        ModelState.download(i);
+                    }
+                }
+                if row.downloading: Button {
+                    text: @tr("Cancel");
+                    accessible-label: @tr("Cancel {}", row.name);
+                    clicked => {
+                        ModelState.cancel(i);
+                    }
+                }
+            }
+            // Under the name, past the radio mark.
+            VerticalLayout {
+                padding-left: 22px;
+                if row.downloading: ProgressIndicator {
+                    progress: row.progress;
+                    accessible-label: @tr("{} download", row.name);
+                }
+                if row.error != "": Text {
+                    text: row.error;
+                    wrap: word-wrap;
+                    color: Shell.error-text;
+                }
+            }
+        }
+        Choice {
+            label: @tr("Use my own .bin");
+            detail: @tr("Loaded as is, without a hash check");
+            checked: ModelState.selected == ModelState.rows.length;
+            picked => {
+                ModelState.picked(ModelState.rows.length);
+            }
+        }
+        HorizontalLayout {
+            padding-left: 22px;
+            padding-bottom: 6px;
+            spacing: 6px;
+            LineEdit {
+                horizontal-stretch: 1;
+                text <=> ModelState.custom-path;
+                placeholder-text: @tr("Path to a .bin file");
+                enabled: !Shell.locked;
+                accessible-label: @tr("Model file");
+                edited(text) => {
+                    ModelState.custom-edited(text);
+                }
+            }
+            if ModelState.can-browse: Button {
+                text: @tr("Browse…");
+                enabled: !Shell.locked;
+                clicked => {
+                    ModelState.browse();
+                }
+            }
+        }
+        if ModelState.custom-error != "": HorizontalLayout {
+            padding-left: 22px;
+            padding-bottom: 6px;
+            Text {
+                text: ModelState.custom-error;
+                wrap: word-wrap;
+                color: Shell.error-text;
+            }
+        }
+    }
+    Group {
+        title: @tr("Engine");
+        Row {
+            label: @tr("GPU");
+            ComboBox {
+                horizontal-stretch: 2;
+                model: ModelState.gpus;
+                current-index <=> ModelState.gpu;
+                enabled: !Shell.locked;
+                accessible-label: @tr("GPU");
+                selected => {
+                    ModelState.gpu-picked(self.current-index);
+                }
+            }
+        }
+        SliderRow {
+            label: @tr("Unload after idle");
+            minimum: 0;
+            maximum: 60;
+            value <=> ModelState.idle-minutes;
+            value-text: round(self.value) == 0 ? @tr("Never") : "\{round(self.value)} min";
+            changed(v) => {
+                ModelState.idle-changed(v);
+            }
+        }
+        if ModelState.warning != "": InlineNote {
+            text: ModelState.warning;
+        }
     }
 }
