@@ -8,7 +8,7 @@ use std::time::Duration;
 use oxi_core::hotkey::Key;
 use oxi_core::paste::{Foreground, Input, InputBlocked};
 use oxi_core::types::Millis;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM};
 use windows_sys::Win32::Security::{
     GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_MANDATORY_LABEL,
     TOKEN_QUERY, TokenIntegrityLevel,
@@ -17,7 +17,10 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    EnumChildWindows, GetForegroundWindow, GetWindowThreadProcessId,
+};
+use windows_sys::core::BOOL;
 
 use super::keys;
 
@@ -32,6 +35,9 @@ const MODIFIERS: [Key; 8] = [
     Key::LWin,
     Key::RWin,
 ];
+
+/// Hosts the frame window of every UWP app, so the app itself is a child window's process.
+const FRAME_HOST: &str = "ApplicationFrameHost.exe";
 
 /// The longest Win32 path in UTF-16 units.
 const MAX_PATH_UNITS: usize = 32_768;
@@ -54,11 +60,11 @@ impl Input for Keyboard {
     }
 
     fn type_units(&mut self, units: &[u16], gap: Millis) -> Result<(), InputBlocked> {
-        for (i, &unit) in units.iter().enumerate() {
+        for (i, character) in characters(units).enumerate() {
             if i > 0 {
                 self.sleep(gap);
             }
-            keys::send_unit(unit).map_err(|_| InputBlocked)?;
+            keys::send_units(character).map_err(|_| InputBlocked)?;
         }
         Ok(())
     }
@@ -75,27 +81,74 @@ fn chord_events(keys: &[Key]) -> Vec<(Key, bool)> {
     downs.chain(ups).collect()
 }
 
+/// `units` split per character: a valid surrogate pair stays together, any other unit alone.
+fn characters(units: &[u16]) -> impl Iterator<Item = &[u16]> {
+    let mut rest = units;
+    char::decode_utf16(units.iter().copied()).map(move |c| {
+        let (character, tail) = rest.split_at(c.map_or(1, char::len_utf16));
+        rest = tail;
+        character
+    })
+}
+
 fn foreground() -> Foreground {
     // SAFETY: no arguments.
     let window = unsafe { GetForegroundWindow() };
-    let mut pid = 0;
-    // SAFETY: `pid` is a live local; a null or stale window leaves it 0.
-    unsafe { GetWindowThreadProcessId(window, &raw mut pid) };
-    // SAFETY: opening with query rights only; pid 0 or a dead pid gives a null handle.
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    let process = (!process.is_null()).then(|| Owned(process));
-    let app = process
-        .as_ref()
-        .and_then(|p| image_path(p.0))
-        .map(|path| exe_name(&path).to_owned())
-        .unwrap_or_default();
-    let theirs = process.as_ref().and_then(|p| integrity(p.0));
+    let frame = window_pid(window);
+    let (mut app, mut theirs) = process_facts(frame);
+    if app.eq_ignore_ascii_case(FRAME_HOST)
+        && let Some(hosted) = hosted_app(frame, &child_pids(window))
+    {
+        (app, theirs) = process_facts(hosted);
+    }
     // SAFETY: a pseudo handle for our own process; it needs no closing.
     let ours = integrity(unsafe { GetCurrentProcess() });
     Foreground {
         app,
         elevated: elevated(theirs, ours),
     }
+}
+
+/// The app inside a UWP frame: the first child window another process owns. A suspended or
+/// minimised app has none, and the frame host stands for it.
+fn hosted_app(frame: u32, children: &[u32]) -> Option<u32> {
+    children
+        .iter()
+        .copied()
+        .find(|&pid| pid != frame && pid != 0)
+}
+
+/// Exe name (empty when unreadable) and integrity level of process `pid`.
+fn process_facts(pid: u32) -> (String, Option<u32>) {
+    // SAFETY: opening with query rights only; pid 0 or a dead pid gives a null handle.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return (String::new(), None);
+    }
+    let process = Owned(process);
+    let app = image_path(process.0)
+        .map(|path| exe_name(&path).to_owned())
+        .unwrap_or_default();
+    (app, integrity(process.0))
+}
+
+fn window_pid(window: HWND) -> u32 {
+    let mut pid = 0;
+    // SAFETY: `pid` is a live local; a null or stale window leaves it 0.
+    unsafe { GetWindowThreadProcessId(window, &raw mut pid) };
+    pid
+}
+
+fn child_pids(window: HWND) -> Vec<u32> {
+    unsafe extern "system" fn push(child: HWND, pids: LPARAM) -> BOOL {
+        // SAFETY: `pids` is the `&mut Vec<u32>` below, alive for the whole EnumChildWindows call.
+        unsafe { (*(pids as *mut Vec<u32>)).push(window_pid(child)) };
+        1
+    }
+    let mut pids: Vec<u32> = Vec::new();
+    // SAFETY: `push` has the WNDENUMPROC signature and gets `pids` back as its LPARAM.
+    unsafe { EnumChildWindows(window, Some(push), (&raw mut pids) as LPARAM) };
+    pids
 }
 
 /// UIPI drops our input when the target runs above our integrity level. A target whose level
@@ -190,6 +243,31 @@ mod tests {
                 (Key::LCtrl, false),
             ]
         );
+    }
+
+    #[test]
+    fn characters_keep_surrogate_pairs_whole() {
+        let units: Vec<u16> = "a\u{1F600}b".encode_utf16().collect();
+        let got: Vec<&[u16]> = characters(&units).collect();
+        assert_eq!(got, [&[0x61][..], &[0xD83D, 0xDE00], &[0x62]]);
+        // Lone or reversed surrogates go one unit at a time, nothing dropped.
+        let broken = [0xD83D, 0x61, 0xDE00, 0xD83D];
+        let got: Vec<&[u16]> = characters(&broken).collect();
+        assert_eq!(got, [&[0xD83D][..], &[0x61], &[0xDE00], &[0xD83D]]);
+        assert_eq!(characters(&[]).count(), 0);
+    }
+
+    #[test]
+    fn a_uwp_frame_resolves_to_the_child_of_another_process() {
+        let cases: [(&[u32], Option<u32>); 4] = [
+            (&[10, 10, 42, 43], Some(42)),
+            (&[0, 42], Some(42)),
+            (&[10, 10], None),
+            (&[], None),
+        ];
+        for (children, want) in cases {
+            assert_eq!(hosted_app(10, children), want, "{children:?}");
+        }
     }
 
     #[test]

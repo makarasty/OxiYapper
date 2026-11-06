@@ -9,7 +9,7 @@ use std::ptr::null_mut;
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use oxi_core::hotkey::Key;
 use oxi_core::paste::Input;
@@ -30,7 +30,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 /// A tagged event the test hook swallowed: VK code, scan code (the unit for `VK_PACKET`), down.
 type Seen = (u32, u32, bool);
 
-static SEEN: Mutex<Option<Sender<Seen>>> = Mutex::new(None);
+static SEEN: Mutex<Option<Sender<(Seen, Instant)>>> = Mutex::new(None);
 
 fn enabled() -> bool {
     let on = std::env::var_os("OXI_INPUT_TEST").is_some_and(|v| v == "1");
@@ -61,6 +61,32 @@ fn type_units_sends_each_unit_as_a_packet_pair_in_order() {
         })
         .collect();
     assert_eq!(take(&seen, want.len()), want);
+    drop(window);
+    drop(spy);
+}
+
+#[test]
+fn a_surrogate_pair_goes_in_one_batch_and_characters_a_gap_apart() {
+    if !enabled() {
+        return;
+    }
+    let (spy, seen) = Spy::start();
+    let window = OurWindow::foreground();
+    window.assert_foreground();
+    Keyboard
+        .type_units(&"a😀".encode_utf16().collect::<Vec<_>>(), Millis(60))
+        .unwrap();
+    let at: Vec<Instant> = take_timed(&seen, 6).into_iter().map(|(_, t)| t).collect();
+    let (a, high, low) = (at[0], at[2], at[4]);
+    assert!(
+        high - a >= Duration::from_millis(40),
+        "no gap between characters"
+    );
+    assert!(
+        low - high < Duration::from_millis(25),
+        "gap inside a pair: {:?}",
+        low - high
+    );
     drop(window);
     drop(spy);
 }
@@ -100,7 +126,12 @@ fn foreground_is_our_exe_and_not_elevated() {
 }
 
 /// The next `n` swallowed events, or a panic after 2 s.
-fn take(seen: &Receiver<Seen>, n: usize) -> Vec<Seen> {
+fn take(seen: &Receiver<(Seen, Instant)>, n: usize) -> Vec<Seen> {
+    take_timed(seen, n).into_iter().map(|(e, _)| e).collect()
+}
+
+/// [`take`] with the time the hook saw each event.
+fn take_timed(seen: &Receiver<(Seen, Instant)>, n: usize) -> Vec<(Seen, Instant)> {
     (0..n)
         .map(|i| {
             seen.recv_timeout(Duration::from_secs(2))
@@ -116,7 +147,7 @@ struct Spy {
 }
 
 impl Spy {
-    fn start() -> (Self, Receiver<Seen>) {
+    fn start() -> (Self, Receiver<(Seen, Instant)>) {
         let (tx, rx) = mpsc::channel();
         *SEEN.lock().unwrap() = Some(tx);
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -173,7 +204,7 @@ unsafe extern "system" fn spy_proc(code: i32, wparam: WPARAM, lparam: LPARAM) ->
             if let Ok(guard) = SEEN.lock()
                 && let Some(tx) = guard.as_ref()
             {
-                let _ = tx.send(seen);
+                let _ = tx.send((seen, Instant::now()));
             }
             return 1;
         }

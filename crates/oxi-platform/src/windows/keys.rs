@@ -197,14 +197,34 @@ pub(crate) fn send_keys_untagged(keys: &[(Key, bool)]) -> io::Result<()> {
 }
 
 fn send_tagged(keys: &[(Key, bool)], tag: usize) -> io::Result<()> {
-    let inputs: Vec<INPUT> = keys
-        .iter()
-        .map(|&(key, down)| {
-            let (code, extended) = vk(key);
-            input(code, extended, down, tag)
-        })
-        .collect();
-    send(&inputs)
+    let inputs = |keys: &[(Key, bool)]| -> Vec<INPUT> {
+        keys.iter()
+            .map(|&(key, down)| {
+                let (code, extended) = vk(key);
+                input(code, extended, down, tag)
+            })
+            .collect()
+    };
+    let sent = insert(&inputs(keys))?;
+    if sent == keys.len() {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    // A short send leaves the keys it pressed logically down; release them, best effort.
+    let _ = insert(&inputs(&owed_ups(&keys[..sent.min(keys.len())])));
+    Err(error)
+}
+
+/// The key-ups owed after `sent`: keys pressed there and not released, last pressed first.
+fn owed_ups(sent: &[(Key, bool)]) -> Vec<(Key, bool)> {
+    let mut held: Vec<Key> = Vec::new();
+    for &(key, down) in sent {
+        held.retain(|&k| k != key);
+        if down {
+            held.push(key);
+        }
+    }
+    held.into_iter().rev().map(|k| (k, false)).collect()
 }
 
 /// Injects the Start-menu blocker (VK 0xE8 down and up), tagged as ours.
@@ -215,9 +235,11 @@ pub fn send_start_blocker() -> io::Result<()> {
     ])
 }
 
-/// Injects one UTF-16 unit as a tagged `KEYEVENTF_UNICODE` down and up (hooks see `VK_PACKET`).
-pub fn send_unit(unit: u16) -> io::Result<()> {
-    send(&unit_events(unit))
+/// Injects `units` in one batch, each a tagged `KEYEVENTF_UNICODE` down and up (hooks see
+/// `VK_PACKET`), so nothing lands between the halves of a surrogate pair.
+pub fn send_units(units: &[u16]) -> io::Result<()> {
+    let inputs: Vec<INPUT> = units.iter().flat_map(|&u| unit_events(u)).collect();
+    send(&inputs)
 }
 
 fn unit_events(unit: u16) -> [INPUT; 2] {
@@ -254,15 +276,20 @@ fn event(code: u16, scan: u16, flags: KEYBD_EVENT_FLAGS, tag: usize) -> INPUT {
 }
 
 fn send(inputs: &[INPUT]) -> io::Result<()> {
-    let count = u32::try_from(inputs.len()).map_err(|_| io::ErrorKind::InvalidInput)?;
-    let size = i32::try_from(size_of::<INPUT>()).map_err(|_| io::ErrorKind::InvalidInput)?;
-    // SAFETY: `inputs` is a live slice of `count` initialised INPUT values of `size` bytes each.
-    let sent = unsafe { SendInput(count, inputs.as_ptr(), size) };
-    if sent == count {
+    if insert(inputs)? == inputs.len() {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+/// How many of `inputs` Windows inserted.
+fn insert(inputs: &[INPUT]) -> io::Result<usize> {
+    let count = u32::try_from(inputs.len()).map_err(|_| io::ErrorKind::InvalidInput)?;
+    let size = i32::try_from(size_of::<INPUT>()).map_err(|_| io::ErrorKind::InvalidInput)?;
+    // SAFETY: `inputs` is a live slice of `count` initialised INPUT values of `size` bytes each.
+    let sent = unsafe { SendInput(count, inputs.as_ptr(), size) };
+    usize::try_from(sent).map_err(|_| io::ErrorKind::InvalidData.into())
 }
 
 #[cfg(test)]
@@ -295,6 +322,29 @@ mod tests {
         for ((code, extended), want) in cases {
             assert_eq!(key_id(code, extended), want, "{code:#x} ext={extended}");
         }
+    }
+
+    #[test]
+    fn a_short_send_owes_the_ups_of_keys_still_down() {
+        let chord = [
+            (Key::LCtrl, true),
+            (Key::V, true),
+            (Key::V, false),
+            (Key::LCtrl, false),
+        ];
+        let cases: [(usize, &[(Key, bool)]); 5] = [
+            (0, &[]),
+            (1, &[(Key::LCtrl, false)]),
+            (2, &[(Key::V, false), (Key::LCtrl, false)]),
+            (3, &[(Key::LCtrl, false)]),
+            (4, &[]),
+        ];
+        for (sent, want) in cases {
+            assert_eq!(owed_ups(&chord[..sent]), want, "{sent} sent");
+        }
+        // An auto-repeated down is still one key to release.
+        let repeat = [(Key::LCtrl, true), (Key::LCtrl, true), (Key::F13, true)];
+        assert_eq!(owed_ups(&repeat), [(Key::F13, false), (Key::LCtrl, false)]);
     }
 
     #[test]
