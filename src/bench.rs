@@ -17,8 +17,7 @@ use anyhow::{Context, Result, bail};
 use oxi_core::audio;
 use oxi_core::config::Audio;
 use oxi_core::device::DeviceChoice;
-use oxi_core::dictionary::build_prompt;
-use oxi_core::text::{Outcome, decode_text_file};
+use oxi_core::text::Outcome;
 use oxi_core::types::{Language, Millis};
 use oxi_platform::capture::{Capture, CaptureEvent, CpalCapture, LevelMeter};
 use oxi_platform::wav::{read_wav_mono_f32, write_wav};
@@ -197,13 +196,13 @@ pub fn run(args: &[String]) -> Result<()> {
     if files.is_empty() {
         bail!("no .wav files in {}", args.dir.display());
     }
-    let assets = TextAssets::with_prompt(match &args.prompt_file {
-        Some(p) => {
-            let bytes = fs::read(p).with_context(|| format!("read {}", p.display()))?;
-            build_prompt(decode_text_file(&bytes)?.lines()).text
-        }
-        None => String::new(),
-    });
+    let assets = match &args.prompt_file {
+        // Strict, unlike the daemon: a prompt file named on the command line must exist.
+        Some(p) => TextAssets::with_dictionary(
+            &pipeline::read_text(p)?.with_context(|| format!("read {}: not found", p.display()))?,
+        ),
+        None => TextAssets::default(),
+    };
 
     pipeline::verify_hash(&args.model)?;
     print_vram(&args, "before load");

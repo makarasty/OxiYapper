@@ -29,6 +29,8 @@ pub struct Coordinator<H> {
     tray: Phase,
     active: Config,
     warnings: Vec<String>,
+    /// The whisper worker's latest `EngineWarning`.
+    engine_warning: Option<String>,
     config_error: Option<String>,
     /// A config received while busy, with its warnings; becomes active on `ApplyConfig`.
     pending: Option<(Config, Vec<String>)>,
@@ -59,6 +61,7 @@ impl<H: ChordHook> Coordinator<H> {
             tray: Phase::Idle,
             active: config,
             warnings,
+            engine_warning: None,
             config_error: None,
             pending: None,
             audio: HashMap::new(),
@@ -122,6 +125,7 @@ impl<H: ChordHook> Coordinator<H> {
                 tracing::warn!("config not applied: {e}");
                 self.config_error = Some(e.to_string());
             }
+            Inbox::EngineWarning(warning) => self.engine_warning = warning,
             Inbox::AssetsChanged => send(&self.workers.whisper, WhisperCmd::ReloadAssets),
             Inbox::Ipc(IpcAsk::Status(reply)) => {
                 // The asking connection may be gone already; nothing to do then.
@@ -244,6 +248,7 @@ impl<H: ChordHook> Coordinator<H> {
             warnings: self
                 .warnings
                 .iter()
+                .chain(&self.engine_warning)
                 .chain(&self.config_error)
                 .cloned()
                 .collect(),
@@ -278,7 +283,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::mpsc::channel;
 
-    use oxi_core::config::Hotkey;
+    use oxi_core::config::{ConfigError, Hotkey};
     use oxi_core::machine::OverlayState;
 
     use super::*;
@@ -553,6 +558,30 @@ mod tests {
         let status = rx.try_recv().expect("status answered");
         assert_eq!(status.device, "Mic X");
         assert_eq!(status.warnings, ["gain clamped"]);
+    }
+
+    #[test]
+    fn engine_warning_shows_in_status_until_cleared() {
+        let mut rig = Rig::new();
+        let status = |rig: &mut Rig| {
+            let (tx, rx) = channel();
+            rig.c.handle(Inbox::Ipc(IpcAsk::Status(tx)), Millis(0));
+            rx.try_recv().expect("status answered").warnings
+        };
+        rig.c
+            .handle(Inbox::ConfigError(ConfigError::ReadOnly), Millis(0));
+        let error = ConfigError::ReadOnly.to_string();
+        assert_eq!(status(&mut rig), std::slice::from_ref(&error));
+        rig.c.handle(
+            Inbox::EngineWarning(Some("running on CPU: out of memory".into())),
+            Millis(0),
+        );
+        assert_eq!(
+            status(&mut rig),
+            ["running on CPU: out of memory".to_owned(), error.clone()]
+        );
+        rig.c.handle(Inbox::EngineWarning(None), Millis(0));
+        assert_eq!(status(&mut rig), [error]);
     }
 
     #[test]

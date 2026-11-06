@@ -11,7 +11,8 @@
 //!   pushes.
 //! - What each worker answers: audio `Inbox::JobAudio` for `Stop(job)` plus `Event::DeviceLost`,
 //!   `CaptureFailed` or `MicFellBack`; whisper `Event::ModelLoaded` or `ModelFailed` for
-//!   `Preload` and `Inbox::Transcribed` for `Transcribe`; paste `Event::PasteDone` for `Paste`
+//!   `Preload` and `Inbox::Transcribed` for `Transcribe` (then `ModelFailed` when the model
+//!   could not be loaded for it), plus `Inbox::EngineWarning` when its device changes; paste `Event::PasteDone` for `Paste`
 //!   and nothing for `CopyOnly`.
 //! - The hook thread sends the machine's `Event` on its own `Sender<Event>`; `run.rs` forwards
 //!   that channel into the inbox as [`Inbox::Event`]. The coordinator calls the hook only
@@ -39,6 +40,9 @@ pub enum Inbox {
     /// Whisper worker: `Some` is the final text (empty when nothing is left to paste), `None`
     /// a failed transcription.
     Transcribed { job: JobId, text: Option<String> },
+    /// Whisper worker: why the model runs elsewhere than configured ("running on CPU: <reason>",
+    /// a named GPU gone); `None` once it runs as configured again. Never dictated text.
+    EngineWarning(Option<String>),
     /// Watcher: a good `config.toml`, with the values the load corrected (`ConfigFile::warnings`).
     /// Held until the machine is Idle, then sent to the workers.
     Config {
@@ -73,7 +77,7 @@ pub struct StatusReport {
     pub model: String,
     /// Active `[audio] device`; empty is the system default.
     pub device: String,
-    /// Load corrections of the active config, then the last parse error if any.
+    /// Load corrections of the active config, the engine warning, then the last parse error.
     pub warnings: Vec<String>,
 }
 

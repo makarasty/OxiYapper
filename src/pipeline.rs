@@ -15,6 +15,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
+
 use oxi_core::config::Model;
 use oxi_core::dictionary::build_prompt;
 use oxi_core::machine::ModelFailure;
@@ -137,26 +139,44 @@ pub struct TextAssets {
     rules: ReplaceRules,
 }
 
-/// File contents; a missing file is empty, an unreadable one is logged (kind only) and empty.
+/// A text file (UTF-8, or UTF-16 with a BOM) decoded; `None` when it does not exist.
+pub fn read_text(path: &Path) -> anyhow::Result<Option<String>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow::Error::new(e).context(format!("read {}", path.display()))),
+    };
+    let text = decode_text_file(&bytes).with_context(|| format!("decode {}", path.display()))?;
+    Ok(Some(text))
+}
+
+/// A daemon asset: missing is empty, unreadable is logged (path and kind only) and empty.
 fn read_asset(path: &Path) -> String {
-    match fs::read(path) {
-        Ok(bytes) => decode_text_file(&bytes).unwrap_or_else(|e| {
-            tracing::warn!("{}: {e}", path.display());
-            String::new()
-        }),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(e) => {
-            tracing::warn!("{}: {e}", path.display());
-            String::new()
-        }
-    }
+    read_text(path)
+        .unwrap_or_else(|e| {
+            tracing::warn!("{e:#}");
+            None
+        })
+        .unwrap_or_default()
 }
 
 impl TextAssets {
     /// Read `dictionary.txt` and `replace.txt` from the config directory. Lines that do not
     /// fit the prompt or are not rules are logged by number, never by content.
     pub fn load(layout: &Layout) -> Self {
-        let dictionary = read_asset(&layout.dictionary_file());
+        let parsed = ReplaceRules::parse(&read_asset(&layout.replace_file()));
+        if !parsed.bad_lines.is_empty() {
+            tracing::warn!("replace.txt: ignored lines {:?}", parsed.bad_lines);
+        }
+        Self {
+            rules: parsed.rules,
+            ..Self::with_dictionary(&read_asset(&layout.dictionary_file()))
+        }
+    }
+
+    /// Only the prompt built from `dictionary` text, no replace rules: what `bench
+    /// --prompt-file` runs with.
+    pub fn with_dictionary(dictionary: &str) -> Self {
         let prompt = build_prompt(dictionary.lines());
         if !prompt.dropped.is_empty() {
             tracing::warn!(
@@ -164,21 +184,8 @@ impl TextAssets {
                 prompt.dropped.len()
             );
         }
-        let parsed = ReplaceRules::parse(&read_asset(&layout.replace_file()));
-        if !parsed.bad_lines.is_empty() {
-            tracing::warn!("replace.txt: ignored lines {:?}", parsed.bad_lines);
-        }
         Self {
             prompt: prompt.text,
-            filter: HallucinationFilter::default(),
-            rules: parsed.rules,
-        }
-    }
-
-    /// Only a prompt, no replace rules: what `bench --prompt-file` runs with.
-    pub fn with_prompt(prompt: String) -> Self {
-        Self {
-            prompt,
             ..Self::default()
         }
     }
@@ -314,6 +321,30 @@ mod tests {
             entry: None,
         };
         assert_eq!(verify_stamped(&resolved, Path::new(".")), Ok(()));
+    }
+
+    #[test]
+    fn read_text_missing_is_none_bad_bytes_are_an_error() {
+        let dir = scratch("read");
+        assert!(read_text(&dir.join("absent.txt")).unwrap().is_none());
+        let good = dir.join("good.txt");
+        fs::write(
+            &good, "Foo
+",
+        )
+        .unwrap();
+        assert_eq!(
+            read_text(&good).unwrap().as_deref(),
+            Some(
+                "Foo
+"
+            )
+        );
+        let bad = dir.join("bad.txt");
+        fs::write(&bad, [0xff, 0xfe, 0x00]).unwrap();
+        assert!(read_text(&bad).is_err());
+        assert_eq!(read_asset(&bad), "");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

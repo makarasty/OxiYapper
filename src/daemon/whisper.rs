@@ -74,8 +74,11 @@ struct Worker<R, L> {
     cfg: Config,
     assets: TextAssets,
     loaded: Option<R>,
-    /// A GPU load failed or came up on CPU: load on CPU until the model or device setting changes.
-    cpu_only: bool,
+    /// Why the GPU is off ("running on CPU: <reason>"): set once a CPU load after a GPU failure
+    /// succeeded, cleared when the model or device setting changes. Loads go to CPU while set.
+    cpu_reason: Option<String>,
+    /// The last `Inbox::EngineWarning` sent.
+    reported: Option<String>,
 }
 
 impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<R, L> {
@@ -88,14 +91,15 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
             cfg: Config::default(),
             assets,
             loaded: None,
-            cpu_only: false,
+            cpu_reason: None,
+            reported: None,
         }
     }
 
     fn handle(&mut self, cmd: WhisperCmd) {
         match cmd {
             WhisperCmd::Preload => {
-                let event = match self.ensure_loaded() {
+                let event = match self.ensure_loaded(None) {
                     Ok(()) => Event::ModelLoaded,
                     Err(failure) => Event::ModelFailed(failure),
                 };
@@ -103,12 +107,20 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
             }
             WhisperCmd::Unload => self.loaded = None,
             WhisperCmd::Transcribe { job, samples } => {
-                let text = self.transcribe(&samples);
+                let (text, failure) = match self.transcribe(&samples) {
+                    Ok(text) => (text, None),
+                    Err(failure) => (None, Some(failure)),
+                };
                 let _ = self.inbox.send(Inbox::Transcribed { job, text });
+                // After the job's end, so the model notice is the one left showing, and the
+                // machine leaves Loaded instead of retrying a full load on every job.
+                if let Some(failure) = failure {
+                    let _ = self.inbox.send(Inbox::Event(Event::ModelFailed(failure)));
+                }
             }
             WhisperCmd::Config(cfg) => {
                 if MachineConfig::from(&*cfg).model != MachineConfig::from(&self.cfg).model {
-                    self.cpu_only = false;
+                    self.cpu_reason = None;
                 }
                 self.cfg = *cfg;
                 self.assets = TextAssets::load(&self.layout);
@@ -118,14 +130,16 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
     }
 
     /// Loads the configured model unless one is loaded. The state machine unloads a stale one.
-    fn ensure_loaded(&mut self) -> Result<(), ModelFailure> {
+    /// `gpu_failed`: the GPU just failed this reason mid-job, so load on CPU now.
+    fn ensure_loaded(&mut self, gpu_failed: Option<String>) -> Result<(), ModelFailure> {
         if self.loaded.is_some() {
             return Ok(());
         }
         let models_dir = self.layout.models_dir();
         let model = pipeline::resolve_model(&self.cfg.model, &models_dir)?;
         pipeline::verify_stamped(&model, &models_dir)?;
-        let choice = if self.cpu_only {
+        let mut reason = gpu_failed.or_else(|| self.cpu_reason.clone());
+        let choice = if reason.is_some() {
             DeviceChoice::Cpu
         } else {
             self.cfg.model.gpu.clone()
@@ -134,7 +148,7 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
             Ok(engine) => engine,
             Err(e) if choice != DeviceChoice::Cpu => {
                 tracing::warn!("model load on the GPU failed ({e:#}), retrying on CPU");
-                self.cpu_only = true;
+                reason = Some(cpu_reason(&e));
                 (self.load)(&model.path, &DeviceChoice::Cpu).map_err(|e| {
                     tracing::warn!("model load on CPU failed: {e:#}");
                     ModelFailure::Bad
@@ -146,40 +160,59 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
             }
         };
         let info = engine.info();
-        if choice != DeviceChoice::Cpu && info.device.is_none() {
-            self.cpu_only = true;
+        if reason.is_none() && choice != DeviceChoice::Cpu && info.device.is_none() {
+            // The engine fell back to CPU by itself; its warning says why.
+            reason = Some(
+                info.warning
+                    .clone()
+                    .unwrap_or_else(|| "running on CPU".into()),
+            );
         }
-        if let Some(warning) = &info.warning {
-            tracing::warn!("{warning}");
+        let warning = reason.clone().or_else(|| info.warning.clone());
+        if let Some(w) = &warning {
+            tracing::warn!("{w}");
         }
+        self.cpu_reason = reason;
         self.loaded = Some(engine);
+        if warning != self.reported {
+            self.reported.clone_from(&warning);
+            let _ = self.inbox.send(Inbox::EngineWarning(warning));
+        }
         Ok(())
     }
 
-    /// `Some("")` is nothing heard; `None` is a failure (no model, or whisper failed twice).
-    fn transcribe(&mut self, samples: &[f32]) -> Option<String> {
-        self.ensure_loaded().ok()?;
+    /// `Ok(Some(""))` is nothing heard, `Ok(None)` a whisper failure, `Err` no model to run.
+    fn transcribe(&mut self, samples: &[f32]) -> Result<Option<String>, ModelFailure> {
+        self.ensure_loaded(None)?;
         let transcript = match self.run(samples) {
             Ok(t) => t,
             Err(e) => {
-                let engine = self.loaded.take()?;
-                if engine.info().device.is_none() {
+                let on_gpu = self
+                    .loaded
+                    .take()
+                    .is_some_and(|engine| engine.info().device.is_some());
+                if !on_gpu {
                     tracing::warn!("transcription failed: {e:#}");
-                    return None;
+                    return Ok(None);
                 }
                 // ARCHITECTURE 11 item 25: this job again on CPU, then CPU until a config change.
                 tracing::warn!("transcription on the GPU failed ({e:#}), retrying on CPU");
-                self.cpu_only = true;
-                self.ensure_loaded().ok()?;
-                self.run(samples)
-                    .inspect_err(|e| tracing::warn!("transcription failed: {e:#}"))
-                    .ok()?
+                self.ensure_loaded(Some(cpu_reason(&e)))?;
+                match self.run(samples) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!("transcription failed: {e:#}");
+                        return Ok(None);
+                    }
+                }
             }
         };
-        match pipeline::finish(&transcript, &self.assets, self.cfg.paste.trailing_space) {
-            Outcome::Text(text) => Some(text),
-            Outcome::NothingHeard => Some(String::new()),
-        }
+        Ok(
+            match pipeline::finish(&transcript, &self.assets, self.cfg.paste.trailing_space) {
+                Outcome::Text(text) => Some(text),
+                Outcome::NothingHeard => Some(String::new()),
+            },
+        )
     }
 
     fn run(&mut self, samples: &[f32]) -> anyhow::Result<Transcript> {
@@ -191,10 +224,17 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
     }
 }
 
+/// Tray text for a GPU failure (ARCHITECTURE 8), in `oxi_whisper`'s own wording. Errors carry
+/// kinds and paths, never dictated text.
+fn cpu_reason(e: &anyhow::Error) -> String {
+    format!("running on CPU: {e}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::fs;
+    use std::io::Write;
     use std::path::PathBuf;
     use std::rc::Rc;
     use std::sync::mpsc::{Receiver, channel};
@@ -208,10 +248,18 @@ mod tests {
 
     /// What a fake load was asked for, and what its engine does.
     #[derive(Clone)]
+    #[allow(
+        clippy::struct_excessive_bools,
+        reason = "independent failure switches of a test fake"
+    )]
     struct Script {
         calls: Rc<RefCell<Vec<DeviceChoice>>>,
         /// Loads on any device other than CPU fail.
         gpu_load_fails: bool,
+        /// Loads on CPU fail.
+        cpu_load_fails: bool,
+        /// `LoadInfo.warning` of a GPU engine (a named device gone).
+        load_warning: Option<String>,
         /// The first transcription on a GPU engine fails.
         gpu_run_fails: bool,
         /// A GPU request is answered by an engine on CPU (the real `Engine::load` fallback).
@@ -251,6 +299,8 @@ mod tests {
             Self {
                 calls: Rc::default(),
                 gpu_load_fails: false,
+                cpu_load_fails: false,
+                load_warning: None,
                 gpu_run_fails: false,
                 silent_cpu: false,
             }
@@ -261,7 +311,7 @@ mod tests {
             Box::new(move |_, choice| {
                 s.calls.borrow_mut().push(choice.clone());
                 let cpu = *choice == DeviceChoice::Cpu || s.silent_cpu;
-                if !cpu && s.gpu_load_fails {
+                if !cpu && s.gpu_load_fails || cpu && s.cpu_load_fails {
                     anyhow::bail!("out of memory");
                 }
                 Ok(Fake {
@@ -269,7 +319,7 @@ mod tests {
                     fail_run: s.gpu_run_fails,
                     info: LoadInfo {
                         device: (!cpu).then(|| "Vulkan0".into()),
-                        warning: None,
+                        warning: s.load_warning.clone().filter(|_| !cpu),
                     },
                 })
             })
@@ -323,18 +373,34 @@ mod tests {
         (Worker::new(script.loader(), tx, rig.layout()), rx)
     }
 
+    /// The next message that is not an `EngineWarning`.
+    fn next(rx: &Receiver<Inbox>) -> Option<Inbox> {
+        rx.try_iter()
+            .find(|m| !matches!(m, Inbox::EngineWarning(_)))
+    }
+
     fn event(rx: &Receiver<Inbox>) -> Event {
-        match rx.try_recv() {
-            Ok(Inbox::Event(e)) => e,
+        match next(rx) {
+            Some(Inbox::Event(e)) => e,
             _ => panic!("expected an Event"),
         }
     }
 
     fn text(rx: &Receiver<Inbox>) -> Option<String> {
-        match rx.try_recv() {
-            Ok(Inbox::Transcribed { text, .. }) => text,
+        match next(rx) {
+            Some(Inbox::Transcribed { text, .. }) => text,
             _ => panic!("expected Transcribed"),
         }
+    }
+
+    /// Every `EngineWarning` sent so far; drains the other messages too.
+    fn warnings(rx: &Receiver<Inbox>) -> Vec<Option<String>> {
+        rx.try_iter()
+            .filter_map(|m| match m {
+                Inbox::EngineWarning(w) => Some(w),
+                _ => None,
+            })
+            .collect()
     }
 
     fn job(w: &mut TestWorker) {
@@ -385,6 +451,7 @@ mod tests {
         assert_eq!(event(&rx), Event::ModelFailed(ModelFailure::Missing));
         job(&mut w);
         assert_eq!(text(&rx), None);
+        assert_eq!(event(&rx), Event::ModelFailed(ModelFailure::Missing));
         assert_eq!(s.calls(), Vec::<DeviceChoice>::new());
     }
 
@@ -429,17 +496,74 @@ mod tests {
     }
 
     #[test]
-    fn a_load_that_fails_on_cpu_too_is_bad() {
-        let r = rig("bad");
-        let (tx, rx) = channel();
-        let mut w = Worker::new(
-            |_: &Path, _: &DeviceChoice| -> anyhow::Result<Fake> { anyhow::bail!("corrupt") },
-            tx,
-            r.layout(),
-        );
+    fn a_load_that_fails_on_cpu_too_is_bad_and_the_next_load_tries_the_gpu_again() {
+        let (r, mut s) = (rig("bad"), Script::new());
+        (s.gpu_load_fails, s.cpu_load_fails) = (true, true);
+        let (mut w, rx) = worker(&s, &r);
         w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Auto)));
         w.handle(WhisperCmd::Preload);
         assert_eq!(event(&rx), Event::ModelFailed(ModelFailure::Bad));
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(event(&rx), Event::ModelFailed(ModelFailure::Bad));
+        assert_eq!(
+            s.calls(),
+            [
+                DeviceChoice::Auto,
+                DeviceChoice::Cpu,
+                DeviceChoice::Auto,
+                DeviceChoice::Cpu
+            ]
+        );
+        assert_eq!(warnings(&rx), Vec::<Option<String>>::new());
+    }
+
+    #[test]
+    fn cpu_fallback_is_reported_once_and_cleared_when_running_as_configured() {
+        let (r, mut s) = (rig("warn"), Script::new());
+        s.gpu_load_fails = true;
+        let (mut w, rx) = worker(&s, &r);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Auto)));
+        w.handle(WhisperCmd::Preload);
+        w.handle(WhisperCmd::Unload);
+        w.handle(WhisperCmd::Preload);
+        let cpu = Some("running on CPU: out of memory".to_owned());
+        assert_eq!(warnings(&rx), [cpu]);
+        // CPU chosen in the config: no warning.
+        w.handle(WhisperCmd::Unload);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(warnings(&rx), [None]);
+    }
+
+    #[test]
+    fn engine_load_warning_is_reported() {
+        let (r, mut s) = (rig("gone"), Script::new());
+        s.load_warning = Some("Vulkan3 not found, using auto".into());
+        let (mut w, rx) = worker(&s, &r);
+        w.handle(WhisperCmd::Config(
+            r.cfg(DeviceChoice::Named("Vulkan3".into())),
+        ));
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(warnings(&rx), [s.load_warning.clone()]);
+    }
+
+    #[test]
+    fn gpu_lost_mid_job_and_cpu_load_failing_fails_the_model() {
+        let (r, mut s) = (rig("lost"), Script::new());
+        (s.gpu_run_fails, s.cpu_load_fails) = (true, true);
+        let (mut w, rx) = worker(&s, &r);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Auto)));
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(event(&rx), Event::ModelLoaded);
+        job(&mut w);
+        assert_eq!(text(&rx), None);
+        assert_eq!(event(&rx), Event::ModelFailed(ModelFailure::Bad));
+        // CPU never came up, so the next load tries the GPU again.
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(
+            s.calls(),
+            [DeviceChoice::Auto, DeviceChoice::Cpu, DeviceChoice::Auto]
+        );
     }
 
     #[test]
@@ -475,6 +599,13 @@ mod tests {
         job(&mut w);
         assert_eq!(text(&rx).as_deref(), Some("hello "));
         assert_eq!(s.calls().len(), 2, "CPU stays loaded");
+        w.handle(WhisperCmd::Unload);
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(
+            s.calls()[2..],
+            [DeviceChoice::Cpu],
+            "CPU until a config change"
+        );
     }
 
     /// Real tiny model on CPU through the whole worker; skips loudly without the env vars.
@@ -484,7 +615,11 @@ mod tests {
             std::env::var_os("OXI_TINY_MODEL"),
             std::env::var_os("OXI_JFK_WAV"),
         ) else {
-            eprintln!("skipped: set OXI_TINY_MODEL and OXI_JFK_WAV");
+            // Straight to stderr: libtest captures `eprintln!` of a passing test.
+            let _ = writeln!(
+                std::io::stderr(),
+                "SKIPPED tiny_model_transcribes_jfk_through_the_worker: set OXI_TINY_MODEL and OXI_JFK_WAV"
+            );
             return;
         };
         let (samples, rate) = oxi_platform::wav::read_wav_mono_f32(Path::new(&wav)).unwrap();
