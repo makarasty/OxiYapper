@@ -1,5 +1,170 @@
-// Settings window skeleton (ARCHITECTURE section 4); M9 fills it.
+// Settings window (ARCHITECTURE section 4): one compact panel, a slim page rail on the left,
+// the page on the right, no scrolling (SPEC Settings UI).
+import { Palette, Button } from "std-widgets.slint";
+import { Shell, Banner } from "widgets.slint";
+import { HotkeyPage } from "pages/hotkey.slint";
+import { AudioPage } from "pages/audio.slint";
+import { ModelPage } from "pages/model.slint";
+import { TextPage } from "pages/text.slint";
+import { OverlayPage } from "pages/overlay.slint";
+import { SystemPage, ThemeChoice } from "pages/system.slint";
+import { AboutPage } from "pages/about.slint";
+
+export { Shell, ThemeChoice }
+
+export enum Page { hotkey, audio, model, text, overlay, system, about }
+
+// One page tab of the rail; Tab focuses it, Enter or Space opens it.
+component RailItem inherits FocusScope {
+    in property <string> label;
+    in property <bool> selected;
+    callback activated();
+    height: 30px;
+    accessible-role: tab;
+    accessible-label: root.label;
+    accessible-item-selectable: true;
+    accessible-item-selected: root.selected;
+    accessible-action-default => {
+        root.activated();
+    }
+    key-pressed(event) => {
+        if (event.text == Key.Return || event.text == " ") {
+            root.activated();
+            return accept;
+        }
+        reject
+    }
+    Rectangle {
+        border-radius: 4px;
+        border-width: root.has-focus ? 1px : 0;
+        border-color: Palette.accent-background;
+        background: root.selected ? Palette.selection-background.transparentize(0.6) : touch.has-hover ? Palette.border.transparentize(0.6) : transparent;
+        Rectangle {
+            x: 0;
+            width: 3px;
+            height: 16px;
+            border-radius: 1.5px;
+            background: Palette.accent-background;
+            visible: root.selected;
+        }
+        Text {
+            x: 12px;
+            text: root.label;
+            vertical-alignment: center;
+            color: Palette.foreground;
+            font-weight: root.selected ? 600 : 400;
+        }
+        touch := TouchArea {
+            clicked => {
+                root.activated();
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
-    title: "OxiYapper";
-    Text { text: "OxiYapper settings"; }
+    in property <string> app-name;
+    in property <string> version;
+    in property <string> licence;
+    in-out property <Page> page: Page.hotkey;
+    in-out property <ThemeChoice> theme;
+    // Empty hides the banner.
+    in property <string> banner-text;
+    // The banner is for a broken file: offer "Open file" and "Reset to defaults".
+    in property <bool> banner-fixable;
+    // The last failed save or file action; empty hides it. Shown under the config banner.
+    in property <string> action-error;
+    callback theme-changed(ThemeChoice);
+    callback open-file();
+    callback reset-config();
+
+    title: root.app-name;
+    preferred-width: 560px;
+    preferred-height: 600px;
+    min-width: 560px;
+    min-height: 600px;
+    background: Palette.background;
+
+    property <[{page: Page, label: string}]> rail: [
+        { page: Page.hotkey, label: @tr("Hotkey") },
+        { page: Page.audio, label: @tr("Audio") },
+        { page: Page.model, label: @tr("Model") },
+        { page: Page.text, label: @tr("Text") },
+        { page: Page.overlay, label: @tr("Overlay") },
+        { page: Page.system, label: @tr("System") },
+        { page: Page.about, label: @tr("About") },
+    ];
+
+    // System follows the OS: `unknown` makes the style read the OS scheme.
+    function apply-theme() {
+        Palette.color-scheme = root.theme == ThemeChoice.dark ? ColorScheme.dark : root.theme == ThemeChoice.light ? ColorScheme.light : ColorScheme.unknown;
+    }
+    init => {
+        root.apply-theme();
+    }
+    changed theme => {
+        root.apply-theme();
+    }
+
+    HorizontalLayout {
+        Rectangle {
+            width: 112px;
+            background: Palette.alternate-background;
+            VerticalLayout {
+                padding: 8px;
+                spacing: 2px;
+                alignment: start;
+                for item in root.rail: RailItem {
+                    label: item.label;
+                    selected: root.page == item.page;
+                    activated => {
+                        root.page = item.page;
+                    }
+                }
+            }
+        }
+
+        VerticalLayout {
+            padding: 12px;
+            spacing: 10px;
+            if root.banner-text != "": Banner {
+                text: root.banner-text;
+                error: root.banner-fixable;
+                if root.banner-fixable: Button {
+                    text: @tr("Open file");
+                    clicked => {
+                        root.open-file();
+                    }
+                }
+                if root.banner-fixable: Button {
+                    text: @tr("Reset to defaults");
+                    clicked => {
+                        root.reset-config();
+                    }
+                }
+            }
+            if root.action-error != "": Banner {
+                text: root.action-error;
+                error: true;
+            }
+            if root.page == Page.hotkey: HotkeyPage { }
+            if root.page == Page.audio: AudioPage { }
+            if root.page == Page.model: ModelPage { }
+            if root.page == Page.text: TextPage { }
+            if root.page == Page.overlay: OverlayPage { }
+            if root.page == Page.system: SystemPage {
+                theme: root.theme;
+                theme-picked(choice) => {
+                    root.theme = choice;
+                    root.theme-changed(choice);
+                }
+            }
+            if root.page == Page.about: AboutPage {
+                app-name: root.app-name;
+                version: root.version;
+                licence: root.licence;
+            }
+            Rectangle { }
+        }
+    }
 }

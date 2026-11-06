@@ -5,6 +5,7 @@ pub mod dirs;
 pub mod draw;
 pub mod fs;
 pub mod ipc;
+pub mod open;
 pub mod wav;
 
 // Every OS module is reached as `os`, so callers never name the OS.

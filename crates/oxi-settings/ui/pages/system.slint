@@ -1,0 +1,27 @@
+// System page. The shell owns the theme picker (config `ui.theme`); the System page task
+// fills in the rest.
+import { Group, ThumbPicker } from "../widgets.slint";
+
+export enum ThemeChoice { system, dark, light }
+
+export component SystemPage inherits VerticalLayout {
+    in property <ThemeChoice> theme;
+    callback theme-picked(ThemeChoice);
+    alignment: start;
+    spacing: 10px;
+    Group {
+        title: @tr("Theme");
+        ThumbPicker {
+            accessible-label: @tr("Theme");
+            thumbs: [
+                { image: @image-url("../img/theme-system.svg"), caption: @tr("System") },
+                { image: @image-url("../img/theme-dark.svg"), caption: @tr("Dark") },
+                { image: @image-url("../img/theme-light.svg"), caption: @tr("Light") },
+            ];
+            selected: root.theme == ThemeChoice.dark ? 1 : root.theme == ThemeChoice.light ? 2 : 0;
+            picked(i) => {
+                root.theme-picked(i == 1 ? ThemeChoice.dark : i == 2 ? ThemeChoice.light : ThemeChoice.system);
+            }
+        }
+    }
+}
