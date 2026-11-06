@@ -101,7 +101,8 @@ pub trait Input {
     fn foreground(&self) -> Foreground;
     /// Presses `keys` in order and releases them in reverse.
     fn send_chord(&mut self, keys: &[Key]) -> Result<(), InputBlocked>;
-    /// Types each UTF-16 unit as a Unicode key event pair, `gap` apart.
+    /// Types each UTF-16 unit as a Unicode key event pair, characters `gap` apart; the two
+    /// units of a surrogate pair go together with no gap.
     fn type_units(&mut self, units: &[u16], gap: Millis) -> Result<(), InputBlocked>;
     fn sleep(&mut self, time: Millis);
 }
