@@ -224,6 +224,11 @@ pub enum Notice {
     PasteFailed,
     /// The configured microphone is missing; the system default records (item 15).
     MicFallback,
+    /// The config file has an error; the last good config stays in use. Line and message go
+    /// through IPC and the tray tooltip, not here.
+    ConfigInvalid,
+    /// The config file loaded with warnings (a value was clamped or replaced).
+    ConfigAdjusted,
 }
 
 /// What the overlay shows; emitted only when it changes.
