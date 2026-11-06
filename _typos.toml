@@ -1,2 +1,7 @@
 [files]
 extend-exclude = ["Cargo.lock", "LICENSE-*", "*.svg"]
+
+# Tokenizer fragments in dictionary tests are real whisper tokens, not typos.
+[default.extend-words]
+hel = "hel"
+whis = "whis"
