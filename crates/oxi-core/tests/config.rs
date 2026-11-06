@@ -1,0 +1,142 @@
+use oxi_core::config::{
+    CURRENT_VERSION, Config, ConfigError, ConfigFile, HotkeyMode, MIGRATIONS, Migration,
+};
+use oxi_core::types::Language;
+use toml::{Table, Value};
+
+const FULL: &str = include_str!("fixtures/config/v1_full.toml");
+const UNKNOWN: &str = include_str!("fixtures/config/v1_unknown.toml");
+
+#[test]
+fn version_matches_migration_count() {
+    assert_eq!(
+        CURRENT_VERSION,
+        i64::try_from(MIGRATIONS.len() + 1).unwrap()
+    );
+}
+
+#[test]
+fn v1_fixture_round_trips_byte_identical() {
+    let file = ConfigFile::parse(FULL).unwrap();
+    assert!(!file.read_only);
+    // The fixture differs from the defaults everywhere, so the typed values were really read.
+    assert_ne!(file.config, Config::default());
+    assert_eq!(file.config.hotkey.mode, HotkeyMode::Toggle);
+    assert_eq!(file.config.model.language, Language::Auto);
+    assert_eq!(file.config.paste.rules.len(), 2);
+    assert_eq!(file.to_toml_string().unwrap(), FULL);
+}
+
+#[test]
+fn defaults_round_trip() {
+    let text = ConfigFile::default().to_toml_string().unwrap();
+    let again = ConfigFile::parse(&text).unwrap();
+    assert_eq!(again.config, Config::default());
+    assert_eq!(again.to_toml_string().unwrap(), text);
+}
+
+#[test]
+fn default_values_match_the_spec() {
+    let c = Config::default();
+    assert_eq!(c.audio.max_seconds, 600);
+    assert_eq!(c.model.language, Language::Ru);
+    assert_eq!(c.model.id, "turbo");
+    assert_eq!(c.hotkey.chord, ["Ctrl", "Win"]);
+    assert!(!c.history.enabled);
+}
+
+#[test]
+fn empty_file_gives_defaults() {
+    let file = ConfigFile::parse("").unwrap();
+    assert_eq!(file.config, Config::default());
+    assert!(file.to_toml_string().unwrap().starts_with("version = 1\n"));
+}
+
+#[test]
+fn unknown_keys_survive_and_known_edits_apply() {
+    let mut file = ConfigFile::parse(UNKNOWN).unwrap();
+    assert!((file.config.audio.gain_db - 1.5).abs() < f64::EPSILON);
+    file.config.audio.gain_db = 2.0;
+    let out = file.to_toml_string().unwrap();
+    let table: Table = out.parse().unwrap();
+    assert_eq!(table["zeta"], Value::String("top".into()));
+    assert_eq!(table["audio"]["future_field"], Value::Integer(42));
+    assert_eq!(table["audio"]["gain_db"], Value::Float(2.0));
+    assert_eq!(table["future"]["flag"], Value::Boolean(true));
+}
+
+#[test]
+fn newer_version_is_read_only() {
+    let text = "version = 99\n[audio]\ngain_db = 4.0\nnew_thing = 1\n";
+    let file = ConfigFile::parse(text).unwrap();
+    assert!(file.read_only);
+    assert!((file.config.audio.gain_db - 4.0).abs() < f64::EPSILON);
+    assert!(matches!(file.to_toml_string(), Err(ConfigError::ReadOnly)));
+}
+
+#[test]
+fn syntax_error_reports_line_and_column() {
+    let err = ConfigFile::parse("version = 1\n[audio]\ngain_db = = 3\n").unwrap_err();
+    match err {
+        ConfigError::Syntax { line, column, .. } => assert_eq!((line, column), (3, 11)),
+        other => panic!("expected Syntax, got {other:?}"),
+    }
+}
+
+#[test]
+fn wrong_type_reports_line() {
+    let err = ConfigFile::parse("version = 1\n[audio]\n\ngain_db = \"loud\"\n").unwrap_err();
+    match err {
+        ConfigError::Syntax { line, .. } => assert_eq!(line, 4),
+        other => panic!("expected Syntax, got {other:?}"),
+    }
+}
+
+#[test]
+fn bad_version_is_rejected() {
+    for text in ["version = 0\n", "version = \"1\"\n", "version = -3\n"] {
+        assert!(
+            matches!(ConfigFile::parse(text), Err(ConfigError::Invalid(_))),
+            "{text}"
+        );
+    }
+}
+
+fn rename_gain(t: &mut Table) {
+    if let Some(Value::Table(audio)) = t.get_mut("audio")
+        && let Some(v) = audio.remove("gain")
+    {
+        audio.insert("gain_db".into(), v);
+    }
+}
+
+fn gain_plus_one(t: &mut Table) {
+    if let Some(Value::Table(audio)) = t.get_mut("audio")
+        && let Some(Value::Float(g)) = audio.get_mut("gain_db")
+    {
+        *g += 1.0;
+    }
+}
+
+#[test]
+fn migrations_run_in_order_from_the_file_version() {
+    let migrations: [Migration; 2] = [rename_gain, gain_plus_one];
+    // v1: both steps run.
+    let v1 = ConfigFile::parse_with("version = 1\n[audio]\ngain = 1.0\n", &migrations).unwrap();
+    assert!((v1.config.audio.gain_db - 2.0).abs() < f64::EPSILON);
+    // v2: only the second step runs.
+    let v2 = ConfigFile::parse_with("version = 2\n[audio]\ngain_db = 1.0\n", &migrations).unwrap();
+    assert!((v2.config.audio.gain_db - 2.0).abs() < f64::EPSILON);
+    // v3 is current: nothing runs.
+    let v3 = ConfigFile::parse_with("version = 3\n[audio]\ngain_db = 1.0\n", &migrations).unwrap();
+    assert!((v3.config.audio.gain_db - 1.0).abs() < f64::EPSILON);
+    // Migrated output carries the new version.
+    assert!(v1.to_toml_string().unwrap().starts_with("version = 3\n"));
+}
+
+#[test]
+fn version_above_a_custom_migration_list_is_read_only() {
+    let migrations: [Migration; 1] = [gain_plus_one];
+    let file = ConfigFile::parse_with("version = 3\n", &migrations).unwrap();
+    assert!(file.read_only);
+}
