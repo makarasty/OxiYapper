@@ -5,7 +5,7 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.92" # slint 1.18 needs it
 license = "MIT OR Apache-2.0"
 publish = false
 repository = "https://github.com/makarasty/OxiYapper"
@@ -17,6 +17,7 @@ repository = "https://github.com/makarasty/OxiYapper"
 oxi-core = { path = "crates/oxi-core" }
 oxi-whisper = { path = "crates/oxi-whisper" }
 oxi-platform = { path = "crates/oxi-platform" }
+oxi-settings = { path = "crates/oxi-settings" }
 whisper-rs = "0.16"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -36,8 +37,13 @@ hound = "3.5"
 earshot = "1.2"
 nnnoiseless = "0.5"
 windows-sys = "0.61"
-clipboard-win = "5.4"
-tray-icon = "0.26"
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd", "png-format"] }
+ab_glyph = "0.2"
+rfd = { version = "0.17", default-features = false }
+# One exact Slint release for all three; bump them together.
+slint = { version = "=1.18.1", default-features = false }
+slint-build = "=1.18.1"
+i-slint-backend-testing = "=1.18.1"
 notify = "8.2"
 notify-debouncer-full = "0.7"
 sha2 = "0.11"
@@ -86,7 +92,13 @@ metal = ["oxi-whisper/metal"]
 oxi-core.workspace = true
 oxi-whisper.workspace = true
 oxi-platform.workspace = true
+oxi-settings.workspace = true
 anyhow.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+notify-debouncer-full.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 ureq = { workspace = true, features = ["rustls"] }
@@ -113,3 +125,7 @@ lto = "thin"
 codegen-units = 16
 strip = false
 debug = "line-tables-only"
+
+# Added ahead of the task that uses them (wave 2 daemon); remove the entry when it does.
+[package.metadata.cargo-machete]
+ignored = ["serde_json", "tracing", "tracing-subscriber", "tracing-appender", "notify-debouncer-full"]
