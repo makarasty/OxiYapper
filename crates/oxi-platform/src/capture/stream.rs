@@ -24,6 +24,8 @@ struct Shared {
     dropped: AtomicU64,
     lost: AtomicBool,
     stop: AtomicBool,
+    /// Set before `stop` on cancel: the drain exits without processing what it holds.
+    cancel: AtomicBool,
 }
 
 /// Names of the input devices, for the settings list.
@@ -47,9 +49,12 @@ pub struct CpalCapture {
 }
 
 impl CpalCapture {
-    /// Stop the callbacks, then the drain thread, and zero the meter; idempotent.
-    fn stop(&mut self) -> Result<Vec<f32>, CaptureError> {
+    /// Stop the callbacks, then the drain thread, and zero the meter; idempotent. With `cancel`
+    /// the drain skips the pipeline flush and returns nothing.
+    fn stop(&mut self, cancel: bool) -> Result<Vec<f32>, CaptureError> {
         drop(self.stream.take());
+        self.shared.cancel.store(cancel, Ordering::Relaxed);
+        // Release also publishes `cancel` to the drain's Acquire load of `stop`.
         self.shared.stop.store(true, Ordering::Release);
         let Some(drain) = self.drain.take() else {
             // Only `Drop` after `finish` gets here; nothing is left to return.
@@ -63,15 +68,17 @@ impl CpalCapture {
         });
         match joined {
             Ok(result) => Ok(result?),
-            Err(_) => Err(AudioError::Resample("drain thread panicked".into()).into()),
+            Err(_) => Err(CaptureError::Thread(std::io::Error::other(
+                "drain thread panicked",
+            ))),
         }
     }
 }
 
 impl Drop for CpalCapture {
     fn drop(&mut self) {
-        // Cancel path: the audio and any error are discarded.
-        let _ = self.stop();
+        // Cancel path: the audio is discarded unprocessed, so there is no error to report.
+        let _ = self.stop(true);
     }
 }
 
@@ -140,7 +147,7 @@ impl Capture for CpalCapture {
         let drain = thread::Builder::new()
             .name("oxi-capture-drain".into())
             .spawn(move || drain_loop(rx, channels, window, pipeline, &drain_shared, &drain_meter))
-            .map_err(|_| AudioError::Resample("drain thread did not start".into()))?;
+            .map_err(CaptureError::Thread)?;
         Ok(Self {
             stream: Some(stream),
             shared,
@@ -164,7 +171,7 @@ impl Capture for CpalCapture {
     }
 
     fn finish(mut self) -> Result<Vec<f32>, CaptureError> {
-        self.stop()
+        self.stop(false)
     }
 }
 
@@ -218,6 +225,9 @@ fn drain_loop(
     loop {
         // Read before draining: everything pushed before `stop` is seen by the last pass.
         let stopping = shared.stop.load(Ordering::Acquire);
+        if stopping && shared.cancel.load(Ordering::Relaxed) {
+            return Ok(Vec::new());
+        }
         drain_once(&mut rx, channels, window, &mut pipeline, meter, stopping)?;
         if stopping {
             break;
@@ -351,5 +361,34 @@ mod tests {
         drain_once(&mut rx, 2, window, &mut pipeline, &meter, true).unwrap();
         assert!((meter.read().peak - 1.8).abs() < 1e-4);
         assert_eq!(rx.slots(), 0);
+    }
+
+    /// All-zero input: `Pipeline::finish` answers `MicSilence`, so an `Ok` shows it did not run.
+    fn stopped_drain(cancel: bool) -> Result<Vec<f32>, AudioError> {
+        const RATE: u32 = 16_000;
+        let opts = Audio {
+            denoise: false,
+            ..Audio::default()
+        };
+        let pipeline = Pipeline::new(RATE, &opts).unwrap();
+        let (mut tx, rx) = RingBuffer::new(1024);
+        for _ in 0..1024 {
+            tx.push(0.0).unwrap();
+        }
+        let shared = Shared::default();
+        shared.cancel.store(cancel, Ordering::Relaxed);
+        shared.stop.store(true, Ordering::Release);
+        let window = samples_for(WINDOW, RATE);
+        drain_loop(rx, 1, window, pipeline, &shared, &LevelMeter::default())
+    }
+
+    #[test]
+    fn finish_processes_what_was_captured() {
+        assert!(matches!(stopped_drain(false), Err(AudioError::MicSilence)));
+    }
+
+    #[test]
+    fn cancel_discards_without_processing() {
+        assert_eq!(stopped_drain(true).unwrap(), Vec::<f32>::new());
     }
 }
