@@ -13,6 +13,8 @@ use oxi_core::audio::{SAMPLE_RATE, downmix};
 use oxi_core::paths::{PART_SUFFIX, part_path};
 use thiserror::Error;
 
+use crate::fs::write_via;
+
 #[derive(Debug, Error)]
 pub enum WavError {
     #[error("wav io")]
@@ -28,16 +30,7 @@ pub fn write_wav(path: &Path, samples: &[f32]) -> Result<(), WavError> {
     if path.extension().is_none_or(|e| e != "wav") {
         return Err(WavError::Unsupported("path must end in .wav".into()));
     }
-    let part = part_path(path);
-    let mut file = File::create(&part)?;
-    let result = write_into(&mut file, samples)
-        .and_then(|()| Ok(file.sync_all()?))
-        .and_then(|()| Ok(fs::rename(&part, path)?));
-    if result.is_err() {
-        drop(file);
-        let _ = fs::remove_file(&part);
-    }
-    result
+    write_via(&part_path(path), path, |file| write_into(file, samples))
 }
 
 fn write_into(file: &mut File, samples: &[f32]) -> Result<(), WavError> {
