@@ -14,7 +14,8 @@ metal = ["whisper-rs/metal"]
 
 [dependencies]
 oxi-core.workspace = true
-whisper-rs.workspace = true
+whisper-rs = { workspace = true, features = ["raw-api"] } # raw-api re-exports whisper-rs-sys: ggml device list
+thiserror.workspace = true
 
 [lints]
 workspace = true
