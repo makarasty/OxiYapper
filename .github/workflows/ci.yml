@@ -20,7 +20,7 @@ env:
 jobs:
   hygiene:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -42,7 +42,7 @@ jobs:
 
   clippy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -57,7 +57,7 @@ jobs:
   core:
     name: core (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:
@@ -79,7 +79,7 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -99,17 +99,18 @@ jobs:
   build:
     name: build (${{ matrix.os }}, ${{ matrix.feature }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.timeout }}
     # CUDA stays informational until the Vulkan-vs-CUDA measurement (ROADMAP M5) keeps it.
     continue-on-error: ${{ matrix.feature == 'cuda' }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: windows-latest, feature: vulkan }
-          - { os: windows-latest, feature: cuda }
-          - { os: ubuntu-latest, feature: vulkan }
-          - { os: macos-latest, feature: metal }
+          # timeout ~2x the cold (no cache) run measured on 2026-11-06; unmeasured ones are guesses.
+          - { os: windows-latest, feature: vulkan, timeout: 25 } # 10 min cold
+          - { os: windows-latest, feature: cuda, timeout: 40 }   # not measured yet
+          - { os: ubuntu-latest, feature: vulkan, timeout: 25 }  # not measured yet
+          - { os: macos-latest, feature: metal, timeout: 25 }    # not measured yet
     env:
       # Windows: a long target path breaks the nested vulkan-shaders-gen build (MAX_PATH).
       CARGO_TARGET_DIR: ${{ matrix.os == 'windows-latest' && 'C:/t' || 'target' }}
@@ -126,9 +127,13 @@ jobs:
           cache: true
       - name: Install Vulkan build deps (Linux)
         if: matrix.feature == 'vulkan' && runner.os == 'Linux'
+        # A hung apt mirror must fail in minutes, not eat the job timeout (seen on the first run).
+        timeout-minutes: 5
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev libvulkan-dev glslc libasound2-dev
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends cmake clang libclang-dev libvulkan-dev glslc libasound2-dev
       - name: Install CUDA toolkit (Windows)
         if: matrix.feature == 'cuda'
         uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
