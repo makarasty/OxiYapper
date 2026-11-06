@@ -1,8 +1,12 @@
 //! Public vocabulary of the state machine.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::paste::PasteOutcome;
 use crate::types::Millis;
 
 /// Recording mode (SPEC "Recording"); also the config's `[hotkey] mode`.
@@ -105,7 +109,13 @@ pub enum Event {
         empty: bool,
     },
     TranscriptionFailed(JobId),
-    PasteDone(JobId),
+    /// The paste worker finished the job, with how the text got there.
+    PasteDone {
+        job: JobId,
+        outcome: PasteOutcome,
+    },
+    /// The configured microphone is missing; capture opened the system default (item 15).
+    MicFellBack,
     ModelLoaded,
     ModelFailed(ModelFailure),
     /// New settings; applied when the machine is Idle (item 11).
@@ -120,12 +130,50 @@ pub enum Event {
 
 /// The phase shown to the user and mirrored into the `PHASE` atomic.
 /// The most urgent one wins: Recording, then Transcribing, then Pasting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[repr(u8)]
 pub enum Phase {
     Idle,
     Recording,
     Transcribing,
     Pasting,
+}
+
+impl Phase {
+    const ALL: [Self; 4] = [
+        Self::Idle,
+        Self::Recording,
+        Self::Transcribing,
+        Self::Pasting,
+    ];
+
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    #[must_use]
+    pub fn from_u8(n: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(n)).copied()
+    }
+}
+
+/// The `PHASE` atomic (ARCHITECTURE 2): the coordinator stores, the hook and the UI load
+/// lock-free. Clones share one cell; a new cell reads `Idle`.
+#[derive(Debug, Clone, Default)]
+pub struct PhaseCell(Arc<AtomicU8>);
+
+impl PhaseCell {
+    pub fn store(&self, phase: Phase) {
+        self.0.store(phase.as_u8(), Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn load(&self) -> Phase {
+        // Only `store` writes the cell, so every value is a phase.
+        Phase::from_u8(self.0.load(Ordering::Relaxed)).unwrap_or(Phase::Idle)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +194,16 @@ pub enum Notice {
     DeviceLost,
     CaptureFailed,
     TranscriptionFailed,
+    /// Modifiers stayed held: the text is on the clipboard, the user presses Ctrl+V (item 35).
+    PressPaste,
+    /// Elevated target window: the text is on the clipboard (item 36).
+    AdminWindow,
+    /// Pasted, but the old clipboard could not be kept whole, so it was not restored.
+    RestoreSkipped,
+    /// The paste worker could not deliver the text; "Copy last text" still has it (item 42).
+    PasteFailed,
+    /// The configured microphone is missing; the system default records (item 15).
+    MicFallback,
 }
 
 /// What the overlay shows; emitted only when it changes.

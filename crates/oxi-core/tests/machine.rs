@@ -4,8 +4,9 @@
 use oxi_core::config::Config;
 use oxi_core::machine::{
     Effect, Effects, Event, JobId, MachineConfig, Mode, ModelFailure, Notice, OverlayState, Phase,
-    Sound, State, step,
+    PhaseCell, Sound, State, step,
 };
+use oxi_core::paste::{ClipboardOnlyWhy, PasteOutcome};
 use oxi_core::types::Millis;
 
 const REC: OverlayState = OverlayState::Recording {
@@ -64,6 +65,13 @@ impl Sim {
     fn press(&mut self, down: u64, up: u64) -> Effects {
         self.at(down, Event::ChordDown);
         self.at(up, Event::ChordUp)
+    }
+}
+
+fn pasted(job: JobId) -> Event {
+    Event::PasteDone {
+        job,
+        outcome: PasteOutcome::Pasted,
     }
 }
 
@@ -148,10 +156,10 @@ fn edge_01_jobs_run_and_paste_in_order_and_a_third_waiting_job_is_refused() {
     );
     // Job 1 is transcribed while job 0 still pastes: it waits for its turn.
     assert_eq!(s.core(1900, done(J1)), [Effect::Transcribe(J2)]);
-    assert_eq!(s.core(2000, Event::PasteDone(J0)), [Effect::Paste(J1)]);
+    assert_eq!(s.core(2000, pasted(J0)), [Effect::Paste(J1)]);
     assert_eq!(s.core(2100, done(J2)), []);
-    assert_eq!(s.core(2200, Event::PasteDone(J1)), [Effect::Paste(J2)]);
-    s.at(2300, Event::PasteDone(J2));
+    assert_eq!(s.core(2200, pasted(J1)), [Effect::Paste(J2)]);
+    s.at(2300, pasted(J2));
     assert_eq!(s.phase(), Phase::Idle);
 
     // The queue has room again.
@@ -511,7 +519,7 @@ fn edge_10_phase_is_recording_only_while_recording_so_the_hook_swallows_esc_only
     s.at(550, Event::JobAudioReady(J0));
     s.at(600, done(J0));
     seen.push(s.phase());
-    s.at(700, Event::PasteDone(J0));
+    s.at(700, pasted(J0));
     seen.push(s.phase());
     assert_eq!(
         seen,
@@ -541,7 +549,7 @@ fn edge_11_new_config_waits_for_idle() {
     s.at(550, Event::JobAudioReady(J0));
     assert_eq!(s.core(600, done(J0)), [Effect::Paste(J0)]);
     // Back to Idle: the new config goes live.
-    assert_eq!(s.core(700, Event::PasteDone(J0)), [Effect::ApplyConfig]);
+    assert_eq!(s.core(700, pasted(J0)), [Effect::ApplyConfig]);
     // Toggle now: the release does not stop.
     s.at(800, Event::ChordDown);
     assert_eq!(s.core(900, Event::ChordUp), []);
@@ -590,7 +598,7 @@ fn edge_46_sleep_unloads_the_model_once_nothing_is_running() {
     // A job is in flight: unload waits for it.
     assert!(!s.core(600, Event::Suspend).contains(&Effect::Unload));
     s.at(700, done(J0));
-    assert!(s.core(800, Event::PasteDone(J0)).contains(&Effect::Unload));
+    assert!(s.core(800, pasted(J0)).contains(&Effect::Unload));
 
     let mut idle = Sim::loaded();
     assert_eq!(idle.core(0, Event::Suspend), [Effect::Unload]);
@@ -711,7 +719,7 @@ fn model_unloads_after_the_idle_time_and_a_press_cancels_it() {
     s.at(100_500, Event::ChordUp);
     s.at(100_600, Event::JobAudioReady(J0));
     s.at(100_900, done(J0));
-    s.at(101_000, Event::PasteDone(J0));
+    s.at(101_000, pasted(J0));
     assert_eq!(s.0.next_deadline(), Some(Millis(401_000)));
     assert_eq!(s.core(400_999, Event::Tick), []);
     assert_eq!(s.core(401_000, Event::Tick), [Effect::Unload]);
@@ -891,4 +899,140 @@ fn tail_does_not_hold_back_a_short_toggle_or_locked_stop() {
         assert_eq!(s.phase(), Phase::Idle, "{mode:?}");
         assert_eq!(s.core(stop_ms + 100, Event::Tick), [], "{mode:?}");
     }
+}
+
+// ---- paste outcomes and mic fallback (items 15, 35, 36) -----------------------------------
+
+/// A loaded machine with job 0 handed to the paste worker.
+fn pasting() -> Sim {
+    let mut s = Sim::loaded();
+    s.press(0, 500);
+    s.at(550, Event::JobAudioReady(J0));
+    assert_eq!(s.core(900, done(J0)), [Effect::Paste(J0)]);
+    s
+}
+
+/// `pasting`, then job 0 pasted with `first` and job 1 recorded and handed to paste.
+fn second_paste(first: PasteOutcome) -> Sim {
+    let mut s = pasting();
+    s.at(
+        1000,
+        Event::PasteDone {
+            job: J0,
+            outcome: first,
+        },
+    );
+    s.press(2000, 2500);
+    s.at(2550, Event::JobAudioReady(J1));
+    assert_eq!(s.core(2900, done(J1)), [Effect::Paste(J1)]);
+    s
+}
+
+#[test]
+fn paste_outcome_notices() {
+    let table = [
+        (PasteOutcome::Pasted, None),
+        (PasteOutcome::Typed, None),
+        (
+            PasteOutcome::ClipboardOnly(ClipboardOnlyWhy::ModifiersHeld),
+            Some(Notice::PressPaste),
+        ),
+        (
+            PasteOutcome::ClipboardOnly(ClipboardOnlyWhy::Elevated),
+            Some(Notice::AdminWindow),
+        ),
+        (PasteOutcome::PastedNoRestore, Some(Notice::RestoreSkipped)),
+        (PasteOutcome::Failed, Some(Notice::PasteFailed)),
+    ];
+    for (outcome, notice) in table {
+        let mut s = pasting();
+        let fx = s.core(1000, Event::PasteDone { job: J0, outcome });
+        let mut want: Effects = notice.map(Effect::Notify).into_iter().collect();
+        if outcome == PasteOutcome::Failed {
+            want.insert(0, Effect::Play(Sound::Error));
+        }
+        assert_eq!(fx, want, "{outcome:?}");
+        assert_eq!(s.phase(), Phase::Idle, "{outcome:?}");
+    }
+}
+
+#[test]
+fn clipboard_only_notifies_every_time() {
+    let outcome = PasteOutcome::ClipboardOnly(ClipboardOnlyWhy::Elevated);
+    let mut s = second_paste(outcome);
+    assert_eq!(
+        s.core(3000, Event::PasteDone { job: J1, outcome }),
+        [Effect::Notify(Notice::AdminWindow)]
+    );
+}
+
+#[test]
+fn paste_failure_errors_every_time_and_shows_it() {
+    let outcome = PasteOutcome::Failed;
+    let mut s = second_paste(outcome);
+    let fx = s.at(3000, Event::PasteDone { job: J1, outcome });
+    assert_eq!(
+        fx,
+        [
+            Effect::Play(Sound::Error),
+            Effect::Notify(Notice::PasteFailed),
+            Effect::Overlay(OverlayState::Text(Notice::PasteFailed))
+        ]
+    );
+    assert_eq!(s.phase(), Phase::Idle);
+}
+
+#[test]
+fn skipped_restore_is_noted_once() {
+    let outcome = PasteOutcome::PastedNoRestore;
+    let mut s = second_paste(outcome);
+    assert_eq!(s.core(3000, Event::PasteDone { job: J1, outcome }), []);
+    assert_eq!(s.phase(), Phase::Idle);
+}
+
+#[test]
+fn paste_done_for_a_job_not_pasting_says_nothing() {
+    let mut s = pasting();
+    let outcome = PasteOutcome::ClipboardOnly(ClipboardOnlyWhy::ModifiersHeld);
+    assert_eq!(s.core(1000, Event::PasteDone { job: J1, outcome }), []);
+    assert_eq!(s.phase(), Phase::Pasting);
+}
+
+#[test]
+fn mic_fallback_is_noted_once() {
+    let mut s = Sim::loaded();
+    s.at(0, Event::ChordDown);
+    assert_eq!(
+        s.core(10, Event::MicFellBack),
+        [Effect::Notify(Notice::MicFallback)]
+    );
+    s.at(500, Event::ChordUp);
+    s.at(1000, Event::ChordDown);
+    assert_eq!(s.core(1010, Event::MicFellBack), []);
+    assert_eq!(s.phase(), Phase::Recording);
+}
+
+#[test]
+fn phase_cell_round_trips_every_phase() {
+    let cell = PhaseCell::default();
+    let reader = cell.clone();
+    assert_eq!(reader.load(), Phase::Idle);
+    for phase in [
+        Phase::Recording,
+        Phase::Transcribing,
+        Phase::Pasting,
+        Phase::Idle,
+    ] {
+        cell.store(phase);
+        assert_eq!(reader.load(), phase);
+        assert_eq!(Phase::from_u8(phase.as_u8()), Some(phase));
+    }
+    assert_eq!(Phase::from_u8(4), None);
+}
+
+#[test]
+fn phase_serialises_lowercase() {
+    let v = toml::Value::try_from(Phase::Transcribing).unwrap();
+    assert_eq!(v.as_str(), Some("transcribing"));
+    assert_eq!(v.try_into::<Phase>().unwrap(), Phase::Transcribing);
 }

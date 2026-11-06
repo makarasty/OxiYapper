@@ -6,6 +6,7 @@ use super::types::{
     Effect, Effects, Event, JobId, MachineConfig, Mode, ModelFailure, Notice, OverlayState, Phase,
     Sound,
 };
+use crate::paste::{ClipboardOnlyWhy, PasteOutcome};
 use crate::types::Millis;
 
 /// Jobs allowed to wait (for audio, whisper or paste) before a key-down is refused. The job in
@@ -60,6 +61,10 @@ enum ModelStatus {
 
 /// Everything the machine remembers. Build with [`State::new`], drive with [`super::step`].
 #[derive(Debug, Clone)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent flags, one per remembered fact"
+)]
 pub struct State {
     cfg: MachineConfig,
     /// Config received while busy; swapped in when the machine is Idle (item 11).
@@ -79,6 +84,9 @@ pub struct State {
     /// Sleep asked for an unload; done as soon as nothing is in flight.
     unload_when_idle: bool,
     shown: OverlayState,
+    /// One-time notices already given in this daemon run.
+    restore_skip_noted: bool,
+    mic_fallback_noted: bool,
 }
 
 impl Default for State {
@@ -102,6 +110,8 @@ impl State {
             idle_unload_at: None,
             unload_when_idle: false,
             shown: OverlayState::Hidden,
+            restore_skip_noted: false,
+            mic_fallback_noted: false,
         }
     }
 
@@ -209,9 +219,15 @@ impl State {
                     self.fail(Notice::TranscriptionFailed, now, &mut fx);
                 }
             }
-            Event::PasteDone(job) => {
+            Event::PasteDone { job, outcome } => {
                 if self.job_in(job, Stage::Pasting).is_some() {
                     self.jobs.retain(|j| j.id != job);
+                    self.paste_notice(outcome, now, &mut fx);
+                }
+            }
+            Event::MicFellBack => {
+                if !std::mem::replace(&mut self.mic_fallback_noted, true) {
+                    fx.push(Effect::Notify(Notice::MicFallback));
                 }
             }
             Event::ModelLoaded => self.model = ModelStatus::Loaded,
@@ -238,6 +254,25 @@ impl State {
         self.jobs
             .iter_mut()
             .find(|j| j.id == id && j.stage == stage)
+    }
+
+    /// What the user must know about how the text arrived (items 35, 36; ARCHITECTURE 10
+    /// step 4, item 42). Clipboard-only and a failure say so every time, a skipped restore
+    /// once per run.
+    fn paste_notice(&mut self, outcome: PasteOutcome, now: Millis, fx: &mut Effects) {
+        let notice = match outcome {
+            PasteOutcome::Failed => return self.fail(Notice::PasteFailed, now, fx),
+            PasteOutcome::Pasted | PasteOutcome::Typed => None,
+            PasteOutcome::ClipboardOnly(ClipboardOnlyWhy::ModifiersHeld) => {
+                Some(Notice::PressPaste)
+            }
+            PasteOutcome::ClipboardOnly(ClipboardOnlyWhy::Elevated) => Some(Notice::AdminWindow),
+            PasteOutcome::PastedNoRestore => {
+                (!std::mem::replace(&mut self.restore_skip_noted, true))
+                    .then_some(Notice::RestoreSkipped)
+            }
+        };
+        fx.extend(notice.map(Effect::Notify));
     }
 
     /// Overlay text for `overlay_hide`, then back to the phase view.

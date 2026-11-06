@@ -5,6 +5,7 @@ use crate::device::DeviceChoice;
 use crate::machine::Mode;
 use crate::types::Language;
 use serde::{Deserialize, Serialize};
+use std::ops::RangeInclusive;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -18,6 +19,7 @@ pub struct Config {
     pub history: History,
     pub system: System,
     pub debug: Debug,
+    pub ui: Ui,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +51,32 @@ pub struct Audio {
     pub trim: bool,
     pub tail_ms: u32,
     pub max_seconds: u32,
+    /// Scales only the level meter shown (overlay, settings), never the audio whisper gets.
+    pub meter_sensitivity_db: f32,
+}
+
+impl Audio {
+    pub const METER_SENSITIVITY_DB: RangeInclusive<f32> = -20.0..=20.0;
+
+    /// Puts `meter_sensitivity_db` back in range (NaN becomes the default) and says so.
+    pub(crate) fn clamp_meter_sensitivity(&mut self) -> Option<String> {
+        let v = self.meter_sensitivity_db;
+        let range = Self::METER_SENSITIVITY_DB;
+        if range.contains(&v) {
+            return None;
+        }
+        self.meter_sensitivity_db = if v.is_nan() {
+            0.0
+        } else {
+            v.clamp(*range.start(), *range.end())
+        };
+        Some(format!(
+            "audio.meter_sensitivity_db = {v} is outside {}..{}, using {}",
+            range.start(),
+            range.end(),
+            self.meter_sensitivity_db
+        ))
+    }
 }
 
 impl Default for Audio {
@@ -61,6 +89,7 @@ impl Default for Audio {
             trim: true,
             tail_ms: 100,
             max_seconds: 600,
+            meter_sensitivity_db: 0.0,
         }
     }
 }
@@ -223,6 +252,23 @@ impl Default for System {
 pub struct Debug {
     /// Dictated text goes into logs only when true.
     pub log_text: bool,
+}
+
+/// Colour scheme of the settings window and the overlay.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    /// Follow the OS light/dark setting.
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Ui {
+    pub theme: Theme,
 }
 
 #[cfg(test)]
