@@ -128,4 +128,4 @@ debug = "line-tables-only"
 
 # Added ahead of the task that uses them (wave 2 daemon); remove the entry when it does.
 [package.metadata.cargo-machete]
-ignored = ["serde_json", "tracing", "tracing-subscriber", "tracing-appender", "notify-debouncer-full"]
+ignored = ["serde_json", "notify-debouncer-full"]
