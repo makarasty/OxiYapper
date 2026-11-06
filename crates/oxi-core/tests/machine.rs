@@ -566,19 +566,29 @@ fn edge_11_config_at_idle_applies_at_once() {
     );
 }
 
-fn with_model(model: &str) -> MachineConfig {
-    MachineConfig {
-        model: model.into(),
-        ..untailed()
-    }
+fn with_model(file: &str) -> MachineConfig {
+    let mut cfg = untailed();
+    cfg.model.file = file.into();
+    cfg
 }
 
 /// Same model file, loaded onto another device.
 fn on_cpu() -> MachineConfig {
-    MachineConfig {
-        gpu: DeviceChoice::Cpu,
-        ..untailed()
-    }
+    let mut cfg = untailed();
+    cfg.model.gpu = DeviceChoice::Cpu;
+    cfg
+}
+
+/// A load for the default model in flight, then the setting changed to `cfg` at Idle.
+fn loading_then(cfg: MachineConfig) -> Sim {
+    let mut s = Sim(State::new(untailed()));
+    assert!(s.core(0, Event::ChordDown).contains(&Effect::Preload));
+    s.at(100, Event::Esc);
+    assert_eq!(
+        s.core(200, Event::ConfigChanged(cfg)),
+        [Effect::ApplyConfig]
+    );
+    s
 }
 
 #[test]
@@ -633,6 +643,51 @@ fn new_model_setting_during_a_load_unloads_once_the_old_one_lands() {
             "{case}"
         );
     }
+}
+
+#[test]
+fn stale_load_failure_is_silent_and_the_new_model_loads() {
+    let mut s = loading_then(with_model("large-v3"));
+    // The old model is missing: not the user's concern any more.
+    assert_eq!(s.core(300, Event::ModelFailed(ModelFailure::Missing)), []);
+    let fx = s.core(400, Event::ChordDown);
+    assert!(fx.contains(&Effect::Preload), "{fx:?}");
+    assert!(!fx.contains(&Effect::Play(Sound::Error)), "{fx:?}");
+    assert_eq!(s.phase(), Phase::Recording);
+}
+
+#[test]
+fn stale_load_answer_during_a_recording_loads_the_new_model_for_it() {
+    // (answer to the old load, effects)
+    let cases = [
+        (Event::ModelLoaded, vec![Effect::Unload, Effect::Preload]),
+        (
+            Event::ModelFailed(ModelFailure::Missing),
+            vec![Effect::Preload],
+        ),
+    ];
+    for (answer, want) in cases {
+        let case = format!("{answer:?}");
+        let mut s = loading_then(with_model("large-v3"));
+        let fx = s.core(300, Event::ChordDown);
+        assert!(
+            !fx.contains(&Effect::Preload),
+            "{case}: a load is in flight"
+        );
+        assert_eq!(s.core(400, answer), want, "{case}");
+        assert_eq!(s.phase(), Phase::Recording, "{case}: not discarded");
+    }
+}
+
+#[test]
+fn setting_changed_and_changed_back_during_a_load_keeps_the_model() {
+    let mut s = loading_then(with_model("large-v3"));
+    assert_eq!(
+        s.core(300, Event::ConfigChanged(untailed())),
+        [Effect::ApplyConfig]
+    );
+    assert_eq!(s.core(400, Event::ModelLoaded), []);
+    assert!(!s.core(500, Event::ChordDown).contains(&Effect::Preload));
 }
 
 // ---- 12. hook removed after a stall ----------------------------------------------------------
@@ -940,11 +995,11 @@ fn machine_config_maps_the_file_settings() {
     ] {
         file.model.id = id.into();
         file.model.custom_path = path.into();
-        assert_eq!(MachineConfig::from(&file).model, want);
+        assert_eq!(MachineConfig::from(&file).model.file, want);
     }
     file.model.gpu = DeviceChoice::Named("GPU 1".into());
     assert_eq!(
-        MachineConfig::from(&file).gpu,
+        MachineConfig::from(&file).model.gpu,
         DeviceChoice::Named("GPU 1".into())
     );
 }

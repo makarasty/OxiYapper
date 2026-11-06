@@ -31,10 +31,13 @@ fn config() -> impl Strategy<Value = MachineConfig> {
         prop_oneof![Just(Mode::Push), Just(Mode::Toggle)],
         prop_oneof![Just("turbo"), Just("tiny")],
     )
-        .prop_map(|(mode, model)| MachineConfig {
-            mode,
-            model: model.into(),
-            ..MachineConfig::default()
+        .prop_map(|(mode, file)| {
+            let mut cfg = MachineConfig {
+                mode,
+                ..MachineConfig::default()
+            };
+            cfg.model.file = file.into();
+            cfg
         })
 }
 
@@ -149,6 +152,8 @@ struct Workers {
     transcribed: Vec<JobId>,
     whisper_busy: BTreeSet<JobId>,
     paste_busy: BTreeSet<JobId>,
+    /// An `Unload` was sent and no `Preload` or `ModelLoaded` came after it.
+    unloaded: bool,
 }
 
 impl Workers {
@@ -161,10 +166,17 @@ impl Workers {
             Event::PasteDone { job, .. } => {
                 self.paste_busy.remove(&job);
             }
+            Event::ModelLoaded => self.unloaded = false,
             _ => {}
         }
         for effect in effects {
             match *effect {
+                Effect::Preload => self.unloaded = false,
+                Effect::Unload => {
+                    assert!(self.whisper_busy.is_empty(), "unload under a transcription");
+                    assert!(!self.unloaded, "two unloads without a load between");
+                    self.unloaded = true;
+                }
                 Effect::StopCapture(id) => {
                     assert!(self.issued.insert(id), "job {id:?} issued twice");
                 }
@@ -198,7 +210,8 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(10_000))]
 
     /// One whisper job at a time, every job transcribed and pasted at most once and in
-    /// order, whatever the workers and the keyboard do.
+    /// order, no unload under a transcription and no second unload without a load between,
+    /// whatever the workers and the keyboard do.
     #[test]
     fn jobs_are_serial_ordered_and_unique(cfg in config(), steps in script(event())) {
         let mut state = State::new(cfg);

@@ -3,8 +3,8 @@
 use std::collections::VecDeque;
 
 use super::types::{
-    Effect, Effects, Event, JobId, MachineConfig, Mode, ModelFailure, Notice, OverlayState, Phase,
-    Sound,
+    Effect, Effects, Event, JobId, MachineConfig, Mode, ModelFailure, ModelIdentity, Notice,
+    OverlayState, Phase, Sound,
 };
 use crate::paste::{ClipboardOnlyWhy, PasteOutcome};
 use crate::types::Millis;
@@ -83,8 +83,9 @@ pub struct State {
     idle_unload_at: Option<Millis>,
     /// Sleep asked for an unload; done as soon as nothing is in flight.
     unload_when_idle: bool,
-    /// The model setting changed while a load was in flight: that load is the old model.
-    stale_load: bool,
+    /// The settings the loading or loaded model was asked for; `None` when there is none.
+    /// A load answer for other settings than `cfg.model` is stale.
+    model_for: Option<ModelIdentity>,
     shown: OverlayState,
     /// One-time notices already given in this daemon run.
     restore_skip_noted: bool,
@@ -111,7 +112,7 @@ impl State {
             notice: None,
             idle_unload_at: None,
             unload_when_idle: false,
-            stale_load: false,
+            model_for: None,
             shown: OverlayState::Hidden,
             restore_skip_noted: false,
             mic_fallback_noted: false,
@@ -233,15 +234,23 @@ impl State {
                     fx.push(Effect::Notify(Notice::MicFallback));
                 }
             }
+            Event::ModelLoaded if self.stale_load() => {
+                self.unload(&mut fx); // the old settings' model; `dispatch` loads for a job
+                self.preload_for_recording(&mut fx);
+            }
             Event::ModelLoaded => {
                 self.model = ModelStatus::Loaded;
-                if std::mem::take(&mut self.stale_load) {
-                    self.unload(&mut fx); // `dispatch` loads the new one when a job needs it
-                }
+                self.model_for = Some(self.cfg.model.clone());
+            }
+            Event::ModelFailed(_) if self.stale_load() => {
+                // A model no longer selected failed: nothing to tell, the new one may load.
+                self.model = ModelStatus::Unloaded;
+                self.model_for = None;
+                self.preload_for_recording(&mut fx);
             }
             Event::ModelFailed(why) => {
                 self.model = ModelStatus::Failed(why);
-                self.stale_load = false;
+                self.model_for = None;
                 self.discard_recording(&mut fx);
                 self.fail(model_notice(why), now, &mut fx);
             }
@@ -354,10 +363,28 @@ impl State {
         });
         fx.push(Effect::StartCapture);
         if self.model == ModelStatus::Unloaded {
-            self.model = ModelStatus::Loading;
-            fx.push(Effect::Preload);
+            self.preload(fx);
         }
         fx.push(Effect::Play(Sound::Start));
+    }
+
+    fn preload(&mut self, fx: &mut Effects) {
+        self.model = ModelStatus::Loading;
+        self.model_for = Some(self.cfg.model.clone());
+        fx.push(Effect::Preload);
+    }
+
+    /// After a stale load answer: the recording in progress needs the new model.
+    fn preload_for_recording(&mut self, fx: &mut Effects) {
+        if self.rec.is_some() {
+            self.preload(fx);
+        }
+    }
+
+    fn stale_load(&self) -> bool {
+        self.model_for
+            .as_ref()
+            .is_some_and(|m| *m != self.cfg.model)
     }
 
     fn chord_up(&mut self, now: Millis, fx: &mut Effects) {
@@ -440,6 +467,7 @@ impl State {
 
     fn unload(&mut self, fx: &mut Effects) {
         self.model = ModelStatus::Unloaded;
+        self.model_for = None;
         self.idle_unload_at = None;
         self.unload_when_idle = false;
         fx.push(Effect::Unload);
@@ -463,8 +491,7 @@ impl State {
                     break;
                 }
                 ModelStatus::Unloaded => {
-                    self.model = ModelStatus::Loading;
-                    fx.push(Effect::Preload);
+                    self.preload(fx);
                     break;
                 }
                 ModelStatus::Loading => break,
@@ -490,14 +517,13 @@ impl State {
     fn settle(&mut self, now: Millis, fx: &mut Effects) {
         if self.phase() == Phase::Idle {
             if let Some(cfg) = self.pending_cfg.take() {
-                let new_model = (&cfg.model, &cfg.gpu) != (&self.cfg.model, &self.cfg.gpu);
                 self.cfg = cfg;
                 self.idle_unload_at = None;
                 fx.push(Effect::ApplyConfig);
+                // A load in flight is judged when it answers, against the config of that time.
                 match self.model {
                     ModelStatus::Failed(_) => self.model = ModelStatus::Unloaded, // may be fixed now
-                    ModelStatus::Loaded if new_model => self.unload(fx),
-                    ModelStatus::Loading if new_model => self.stale_load = true,
+                    ModelStatus::Loaded if self.stale_load() => self.unload(fx),
                     _ => {}
                 }
             }

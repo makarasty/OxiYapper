@@ -42,10 +42,16 @@ pub struct MachineConfig {
     pub overlay_hide: Millis,
     /// Capture keeps running this long after the stopping key, so the last syllable is kept.
     pub release_tail: Millis,
-    /// `[model] id`, or the file path for a custom model: a change means another model file,
-    /// so a loaded model is unloaded and the next use loads the new one.
-    pub model: String,
-    /// `[model] gpu`: the model is loaded onto this device, so a change reloads it too.
+    /// What a load depends on: a change unloads the loaded model, the next use loads the new one.
+    pub model: ModelIdentity,
+}
+
+/// The settings a model load depends on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelIdentity {
+    /// `[model] id`, or the file path for a custom model.
+    pub file: String,
+    /// `[model] gpu`: the device the model is loaded onto.
     pub gpu: DeviceChoice,
 }
 
@@ -64,12 +70,14 @@ impl From<&Config> for MachineConfig {
             idle_unload: Millis::from_secs(u64::from(cfg.model.idle_unload_minutes) * 60),
             overlay_hide: Millis(1500),
             release_tail: Millis(cfg.audio.tail_ms.into()),
-            model: if cfg.model.id == "custom" {
-                cfg.model.custom_path.clone()
-            } else {
-                cfg.model.id.clone()
+            model: ModelIdentity {
+                file: if cfg.model.id == "custom" {
+                    cfg.model.custom_path.clone()
+                } else {
+                    cfg.model.id.clone()
+                },
+                gpu: cfg.model.gpu.clone(),
             },
-            gpu: cfg.model.gpu.clone(),
         }
     }
 }
