@@ -11,4 +11,4 @@ mod tracker;
 
 pub use chord::{Chord, ChordError};
 pub use key::Key;
-pub use tracker::{Ctx, KeyInput, Tracker, Verdict};
+pub use tracker::{Ctx, KeyId, KeyInput, Tracker, Verdict};

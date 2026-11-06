@@ -2,12 +2,22 @@ use super::chord::Chord;
 use super::key::Key;
 use crate::machine::Event;
 
+/// Which key an event is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyId {
+    Known(Key),
+    /// A key outside [`Key`] (ISO `<>`, media, volume, browser keys), by its OS code (VK on
+    /// Windows). Never a chord key, never swallowed or captured, but another key all the same.
+    Other(u16),
+}
+
+/// Other codes below this are tracked held, so their auto-repeat stays silent.
+const OTHER_CODES: u16 = 1024;
+
 /// One key event as the OS hook saw it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyInput {
-    /// `None`: a key outside [`Key`] (ISO `<>`, media, volume, browser keys). It is never a
-    /// chord key and never swallowed, but it still counts as another key.
-    pub key: Option<Key>,
+    pub key: KeyId,
     pub down: bool,
     /// Injected by `OxiYapper` itself (paste chord, Start blocker): passed, never tracked.
     pub ours: bool,
@@ -50,6 +60,8 @@ pub struct Tracker {
     down: [bool; Key::ALL.len()],
     /// The key's down was swallowed: its repeats and its up are swallowed too, and only then.
     swallowed: [bool; Key::ALL.len()],
+    /// Held [`KeyId::Other`] codes, one bit each.
+    other_down: [u64; OTHER_CODES as usize / 64],
     /// `ChordDown` was sent and its `ChordUp` was not.
     active: bool,
     win: WinPress,
@@ -62,6 +74,7 @@ impl Tracker {
             capture: false,
             down: [false; Key::ALL.len()],
             swallowed: [false; Key::ALL.len()],
+            other_down: [0; OTHER_CODES as usize / 64],
             active: false,
             win: WinPress::default(),
         }
@@ -87,11 +100,16 @@ impl Tracker {
     /// on the secure desktop (Win+L, Ctrl+Alt+Del, UAC). The hook calls it on every watchdog
     /// poll and on session unlock and resume (ARCHITECTURE section 11 items 8 and 12).
     /// Returns `ChordUp` if the chord was down and no longer is; nothing else.
-    pub fn resync(&mut self, held: impl Fn(Key) -> bool) -> Option<Event> {
+    pub fn resync(&mut self, held: impl Fn(KeyId) -> bool) -> Option<Event> {
         for key in Key::ALL {
-            if !held(key) {
+            if !held(KeyId::Known(key)) {
                 self.down[key as usize] = false;
                 self.swallowed[key as usize] = false;
+            }
+        }
+        for code in 0..OTHER_CODES {
+            if self.other_held(code) && !held(KeyId::Other(code)) {
+                self.set_other(code, false);
             }
         }
         if !self.win_held() {
@@ -107,21 +125,42 @@ impl Tracker {
     pub fn on_key(&mut self, input: KeyInput, ctx: Ctx) -> Verdict {
         match input.key {
             _ if input.ours => Verdict::default(),
-            None => self.on_unknown(input.down),
-            Some(key) if input.down => self.on_down(key, ctx),
-            Some(key) => self.on_up(key),
+            KeyId::Other(code) => self.on_other(code, input.down),
+            KeyId::Known(key) if input.down => self.on_down(key, ctx),
+            KeyId::Known(key) => self.on_up(key),
         }
     }
 
-    fn on_unknown(&mut self, down: bool) -> Verdict {
-        if !down || self.capture {
+    fn on_other(&mut self, code: u16, down: bool) -> Verdict {
+        let repeat = down && self.other_held(code);
+        self.set_other(code, down);
+        if !down || repeat || self.capture {
             return Verdict::default();
         }
         self.win.other = true;
         Verdict {
-            // Repeats are not tracked here: the machine ignores a second OtherKey.
             event: self.active.then_some(Event::OtherKey),
             ..Verdict::default()
+        }
+    }
+
+    // shortcut: codes >= OTHER_CODES are not tracked, so their repeats count as fresh downs;
+    // no current OS sends one (VK < 256, evdev KEY_MAX 0x2ff).
+    fn other_held(&self, code: u16) -> bool {
+        code < OTHER_CODES && self.other_down[usize::from(code / 64)] & (1 << (code % 64)) != 0
+    }
+
+    fn set_other(&mut self, code: u16, held: bool) {
+        if code < OTHER_CODES {
+            let (word, bit) = (
+                &mut self.other_down[usize::from(code / 64)],
+                1 << (code % 64),
+            );
+            if held {
+                *word |= bit;
+            } else {
+                *word &= !bit;
+            }
         }
     }
 
