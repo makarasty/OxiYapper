@@ -9,14 +9,15 @@ pub struct Millis(pub u64);
 
 impl Millis {
     pub const fn from_secs(secs: u64) -> Self {
-        Self(secs * 1000)
+        Self(secs.saturating_mul(1000))
     }
 }
 
 impl Add for Millis {
     type Output = Self;
+    /// Saturates at `u64::MAX`: a deadline far in the future never wraps into the past.
     fn add(self, rhs: Self) -> Self {
-        Self(self.0 + rhs.0)
+        Self(self.0.saturating_add(rhs.0))
     }
 }
 
@@ -48,6 +49,12 @@ mod tests {
         assert_eq!(Millis(7) - Millis(5), Millis(2));
         assert_eq!(Millis(5) - Millis(7), Millis(0));
         assert!(Millis(1) < Millis(2));
+    }
+
+    #[test]
+    fn millis_add_and_from_secs_saturate() {
+        assert_eq!(Millis(u64::MAX - 1) + Millis(5), Millis(u64::MAX));
+        assert_eq!(Millis::from_secs(u64::MAX), Millis(u64::MAX));
     }
 
     #[test]

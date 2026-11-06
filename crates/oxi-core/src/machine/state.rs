@@ -1,0 +1,477 @@
+//! The machine itself: `State` and the transitions behind [`super::step`].
+
+use std::collections::VecDeque;
+
+use super::types::{
+    Effect, Effects, Event, JobId, MachineConfig, Mode, ModelFailure, Notice, Overlay, Phase, Sound,
+};
+use crate::types::Millis;
+
+/// Jobs allowed to wait (for audio, whisper or paste) before a key-down is refused. The job in
+/// whisper, the one pasting and the recording itself are not waiting (ARCHITECTURE 3).
+const MAX_WAITING_JOBS: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Push mode, chord held.
+    Held,
+    /// Push mode, locked on by a double tap; the next press stops it.
+    Locked,
+    /// Toggle mode; the next press stops it.
+    Toggled,
+}
+
+#[derive(Debug, Clone)]
+struct Recording {
+    started: Millis,
+    kind: Kind,
+    /// Pressed within the double-tap gap of a short press: a short release locks it.
+    lock_candidate: bool,
+    /// `warn_before` has passed.
+    warned: bool,
+    next_poll: Option<Millis>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    AwaitingAudio,
+    Queued,
+    Transcribing,
+    Transcribed,
+    Pasting,
+}
+
+#[derive(Debug, Clone)]
+struct Job {
+    id: JobId,
+    stage: Stage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelStatus {
+    Unloaded,
+    Loading,
+    Loaded,
+    Failed(ModelFailure),
+}
+
+/// Everything the machine remembers. Build with [`State::new`], drive with [`super::step`].
+#[derive(Debug, Clone)]
+pub struct State {
+    cfg: MachineConfig,
+    /// Config received while busy; swapped in when the machine is Idle (item 11).
+    pending_cfg: Option<MachineConfig>,
+    rec: Option<Recording>,
+    /// Oldest first. Whisper and paste take jobs strictly in this order.
+    jobs: VecDeque<Job>,
+    next_job: u64,
+    model: ModelStatus,
+    /// Release time of a lone short press. The double-tap window is checked against it at
+    /// the next press, so it needs no timer of its own.
+    last_tap: Option<Millis>,
+    /// Between the hook's `ChordDown` and its `ChordUp`, in both modes.
+    chord_held: bool,
+    notice: Option<(Notice, Millis)>,
+    idle_unload_at: Option<Millis>,
+    /// Sleep asked for an unload; done as soon as nothing is in flight.
+    unload_when_idle: bool,
+    shown: Overlay,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self::new(MachineConfig::default())
+    }
+}
+
+impl State {
+    pub fn new(cfg: MachineConfig) -> Self {
+        Self {
+            cfg,
+            pending_cfg: None,
+            rec: None,
+            jobs: VecDeque::new(),
+            next_job: 0,
+            model: ModelStatus::Unloaded,
+            last_tap: None,
+            chord_held: false,
+            notice: None,
+            idle_unload_at: None,
+            unload_when_idle: false,
+            shown: Overlay::Hidden,
+        }
+    }
+
+    pub fn phase(&self) -> Phase {
+        if self.rec.is_some() {
+            Phase::Recording
+        } else if self.jobs.is_empty() {
+            Phase::Idle
+        } else if self
+            .jobs
+            .iter()
+            .any(|j| !matches!(j.stage, Stage::Transcribed | Stage::Pasting))
+        {
+            Phase::Transcribing
+        } else {
+            Phase::Pasting
+        }
+    }
+
+    /// The earliest armed timer: max recording, its warning, the watchdog poll, the
+    /// overlay hide, the idle unload.
+    pub fn next_deadline(&self) -> Option<Millis> {
+        let rec = self
+            .rec
+            .iter()
+            .flat_map(|r| {
+                [
+                    Some(self.max_at(r)),
+                    (!r.warned).then(|| self.warn_at(r)),
+                    r.next_poll,
+                ]
+            })
+            .flatten();
+        rec.chain(self.notice.map(|(_, t)| t))
+            .chain(self.idle_unload_at)
+            .min()
+    }
+
+    fn max_at(&self, r: &Recording) -> Millis {
+        r.started + self.cfg.max_recording
+    }
+
+    fn warn_at(&self, r: &Recording) -> Millis {
+        r.started + (self.cfg.max_recording - self.cfg.warn_before)
+    }
+
+    pub(super) fn handle(&mut self, event: Event, now: Millis) -> Effects {
+        let mut fx = Effects::new();
+        match event {
+            Event::ChordDown => {
+                self.chord_held = true;
+                self.chord_down(now, &mut fx);
+            }
+            // A poll that finds the chord released is a key-up the hook never delivered.
+            Event::ChordUp | Event::ChordPolled { held: false } => {
+                self.chord_held = false;
+                self.chord_up(now, &mut fx);
+            }
+            Event::ChordPolled { held: true } => {}
+            Event::Esc => {
+                if self.rec.take().is_some() {
+                    fx.push(Effect::DiscardCapture);
+                    fx.push(Effect::Play(Sound::Cancel));
+                    self.show(Notice::Cancelled, now);
+                }
+            }
+            Event::OtherKey => {
+                // The user meant a shortcut: cancel silently, in both modes. A recording that
+                // exists while the chord is held was started by this press: a press that stops
+                // one leaves none.
+                if self.chord_held {
+                    self.discard_recording(&mut fx);
+                }
+            }
+            Event::AudioStopped => {
+                if self.rec.is_some() {
+                    self.stop_recording(now, true, &mut fx);
+                    fx.push(Effect::Notify(Notice::MicLost));
+                }
+            }
+            Event::AudioFailed => {
+                if self.rec.is_some() {
+                    self.discard_recording(&mut fx);
+                    self.fail(Notice::MicFailed, now, &mut fx);
+                }
+            }
+            Event::JobAudioReady(id) => {
+                if let Some(job) = self.job_in(id, Stage::AwaitingAudio) {
+                    job.stage = Stage::Queued;
+                }
+            }
+            Event::TranscriptionDone { job, empty } => {
+                if let Some(j) = self.job_in(job, Stage::Transcribing) {
+                    j.stage = Stage::Transcribed;
+                    if empty {
+                        self.jobs.retain(|j| j.id != job);
+                        self.show(Notice::NothingHeard, now);
+                    }
+                }
+            }
+            Event::TranscriptionFailed(job) => {
+                if self.job_in(job, Stage::Transcribing).is_some() {
+                    self.jobs.retain(|j| j.id != job);
+                    self.fail(Notice::TranscriptionFailed, now, &mut fx);
+                }
+            }
+            Event::PasteDone(job) => {
+                if self.job_in(job, Stage::Pasting).is_some() {
+                    self.jobs.retain(|j| j.id != job);
+                }
+            }
+            Event::ModelLoaded => self.model = ModelStatus::Loaded,
+            Event::ModelFailed(why) => {
+                self.model = ModelStatus::Failed(why);
+                self.discard_recording(&mut fx);
+                self.fail(model_notice(why), now, &mut fx);
+            }
+            Event::ConfigChanged(cfg) => self.pending_cfg = Some(cfg),
+            Event::Suspend => {
+                self.discard_recording(&mut fx);
+                self.unload_when_idle = true;
+            }
+            Event::Lock => self.discard_recording(&mut fx),
+            Event::Resume | Event::Unlock => fx.push(Effect::ReinstallHook),
+            Event::Tick => self.tick(now, &mut fx),
+        }
+        self.dispatch(&mut fx);
+        self.settle(now, &mut fx);
+        fx
+    }
+
+    fn job_in(&mut self, id: JobId, stage: Stage) -> Option<&mut Job> {
+        self.jobs
+            .iter_mut()
+            .find(|j| j.id == id && j.stage == stage)
+    }
+
+    /// Overlay text for `overlay_hide`, then back to the phase view.
+    fn show(&mut self, notice: Notice, now: Millis) {
+        self.notice = Some((notice, now + self.cfg.overlay_hide));
+    }
+
+    /// Error outcome: sound, overlay text, notification.
+    fn fail(&mut self, notice: Notice, now: Millis, fx: &mut Effects) {
+        fx.push(Effect::Play(Sound::Error));
+        fx.push(Effect::Notify(notice));
+        self.show(notice, now);
+    }
+
+    fn discard_recording(&mut self, fx: &mut Effects) {
+        if self.rec.take().is_some() {
+            fx.push(Effect::DiscardCapture);
+        }
+    }
+
+    fn chord_down(&mut self, now: Millis, fx: &mut Effects) {
+        match self.rec.as_ref().map(|r| r.kind) {
+            Some(Kind::Locked | Kind::Toggled) => self.stop_recording(now, true, fx),
+            Some(Kind::Held) => {} // down without an up: the hook repeated itself
+            None => self.start_recording(now, fx),
+        }
+    }
+
+    fn start_recording(&mut self, now: Millis, fx: &mut Effects) {
+        if let ModelStatus::Failed(why) = self.model {
+            self.fail(model_notice(why), now, fx);
+            return;
+        }
+        let waiting = self.jobs.iter().filter(|j| {
+            matches!(
+                j.stage,
+                Stage::AwaitingAudio | Stage::Queued | Stage::Transcribed
+            )
+        });
+        if waiting.count() >= MAX_WAITING_JOBS {
+            fx.push(Effect::Play(Sound::Error));
+            return;
+        }
+        let push = self.cfg.mode == Mode::Push;
+        let lock_candidate = push
+            && self
+                .last_tap
+                .is_some_and(|t| now - t < self.cfg.double_tap_gap);
+        self.last_tap = None;
+        self.notice = None;
+        self.idle_unload_at = None;
+        self.unload_when_idle = false;
+        self.rec = Some(Recording {
+            started: now,
+            kind: if push { Kind::Held } else { Kind::Toggled },
+            lock_candidate,
+            warned: false,
+            // Every recording starts with the chord held: watch for a lost key-up in both
+            // modes, so a stale `chord_held` never lets typing cancel a toggle recording.
+            next_poll: Some(now + self.cfg.watchdog_period),
+        });
+        fx.push(Effect::StartCapture);
+        if self.model == ModelStatus::Unloaded {
+            self.model = ModelStatus::Loading;
+            fx.push(Effect::Preload);
+        }
+        fx.push(Effect::Play(Sound::Start));
+    }
+
+    fn chord_up(&mut self, now: Millis, fx: &mut Effects) {
+        let Some(r) = self.rec.as_mut() else { return };
+        r.next_poll = None; // chord released: nothing left to watch
+        if r.kind != Kind::Held {
+            return; // toggle ignores key-up; a poll may repeat a real one
+        }
+        let held = now - r.started;
+        if r.lock_candidate && held < self.cfg.double_tap_max_press {
+            r.kind = Kind::Locked;
+        } else if held < self.cfg.tap_max {
+            // A tap makes "Thank you." hallucinations: throw it away.
+            if !r.lock_candidate && held < self.cfg.double_tap_max_press {
+                self.last_tap = Some(now);
+            }
+            self.discard_recording(fx);
+        } else {
+            self.stop_recording(now, false, fx);
+        }
+    }
+
+    /// End the recording and make it a job. `discard_short`: audio under `tap_max` is dropped.
+    fn stop_recording(&mut self, now: Millis, discard_short: bool, fx: &mut Effects) {
+        let Some(r) = self.rec.take() else { return };
+        if discard_short && now - r.started < self.cfg.tap_max {
+            fx.push(Effect::DiscardCapture);
+            return;
+        }
+        let id = JobId(self.next_job);
+        self.next_job += 1;
+        self.jobs.push_back(Job {
+            id,
+            stage: Stage::AwaitingAudio,
+        });
+        fx.push(Effect::StopCapture(id));
+        fx.push(Effect::Play(Sound::Stop));
+    }
+
+    fn tick(&mut self, now: Millis, fx: &mut Effects) {
+        if let Some(r) = self.rec.as_ref() {
+            if now >= self.max_at(r) {
+                // Never discard a long recording.
+                self.stop_recording(now, false, fx);
+            } else {
+                let warn = !r.warned && now >= self.warn_at(r);
+                let poll = r.next_poll.is_some_and(|t| now >= t);
+                if let Some(r) = self.rec.as_mut() {
+                    r.warned |= warn;
+                    if poll {
+                        r.next_poll = Some(now + self.cfg.watchdog_period);
+                        fx.push(Effect::PollChord);
+                    }
+                }
+            }
+        }
+        if self.notice.is_some_and(|(_, t)| now >= t) {
+            self.notice = None;
+        }
+        if self.idle_unload_at.is_some_and(|t| now >= t) && self.unloadable() {
+            self.unload(fx);
+        }
+    }
+
+    fn unloadable(&self) -> bool {
+        self.phase() == Phase::Idle && self.model == ModelStatus::Loaded
+    }
+
+    fn unload(&mut self, fx: &mut Effects) {
+        self.model = ModelStatus::Unloaded;
+        self.idle_unload_at = None;
+        self.unload_when_idle = false;
+        fx.push(Effect::Unload);
+    }
+
+    /// Hand out work: one job to whisper (oldest first, model permitting), the oldest
+    /// transcribed job to paste. Jobs never overtake each other.
+    fn dispatch(&mut self, fx: &mut Effects) {
+        while !self.jobs.iter().any(|j| j.stage == Stage::Transcribing) {
+            let next = self
+                .jobs
+                .iter()
+                .position(|j| matches!(j.stage, Stage::AwaitingAudio | Stage::Queued));
+            let Some(i) = next.filter(|&i| self.jobs[i].stage == Stage::Queued) else {
+                break;
+            };
+            match self.model {
+                ModelStatus::Loaded => {
+                    self.jobs[i].stage = Stage::Transcribing;
+                    fx.push(Effect::Transcribe(self.jobs[i].id));
+                    break;
+                }
+                ModelStatus::Unloaded => {
+                    self.model = ModelStatus::Loading;
+                    fx.push(Effect::Preload);
+                    break;
+                }
+                ModelStatus::Loading => break,
+                ModelStatus::Failed(_) => {
+                    // The failure was announced once; the audio has nowhere to go.
+                    if let Some(job) = self.jobs.remove(i) {
+                        fx.push(Effect::DropJob(job.id));
+                    }
+                }
+            }
+        }
+        if let Some(front) = self
+            .jobs
+            .front_mut()
+            .filter(|j| j.stage == Stage::Transcribed)
+        {
+            front.stage = Stage::Pasting;
+            fx.push(Effect::Paste(front.id));
+        }
+    }
+
+    /// After every event: apply a waiting config, schedule the idle unload, update the overlay.
+    fn settle(&mut self, now: Millis, fx: &mut Effects) {
+        if self.phase() == Phase::Idle {
+            if let Some(cfg) = self.pending_cfg.take() {
+                self.cfg = cfg;
+                self.idle_unload_at = None;
+                if matches!(self.model, ModelStatus::Failed(_)) {
+                    self.model = ModelStatus::Unloaded; // the model setting may have changed
+                }
+                fx.push(Effect::ApplyConfig);
+            }
+            if self.unload_when_idle && self.model != ModelStatus::Loading {
+                if self.model == ModelStatus::Loaded {
+                    self.unload(fx);
+                }
+                self.unload_when_idle = false;
+            } else if self.unloadable()
+                && self.cfg.idle_unload != Millis(0)
+                && self.idle_unload_at.is_none()
+            {
+                self.idle_unload_at = Some(now + self.cfg.idle_unload);
+            }
+        }
+        if !self.unloadable() {
+            self.idle_unload_at = None;
+        }
+        let overlay = self.overlay();
+        if overlay != self.shown {
+            self.shown = overlay;
+            fx.push(Effect::Overlay(overlay));
+        }
+    }
+
+    fn overlay(&self) -> Overlay {
+        if let Some(r) = &self.rec {
+            return Overlay::Recording {
+                locked: r.kind == Kind::Locked,
+                ending_soon: r.warned,
+            };
+        }
+        if let Some((notice, _)) = self.notice {
+            return Overlay::Text(notice);
+        }
+        match self.phase() {
+            Phase::Idle | Phase::Recording => Overlay::Hidden,
+            Phase::Pasting => Overlay::Pasting,
+            Phase::Transcribing if self.model == ModelStatus::Loading => Overlay::LoadingModel,
+            Phase::Transcribing => Overlay::Transcribing,
+        }
+    }
+}
+
+fn model_notice(why: ModelFailure) -> Notice {
+    match why {
+        ModelFailure::Missing => Notice::NoModel,
+        ModelFailure::Bad => Notice::ModelBad,
+    }
+}
