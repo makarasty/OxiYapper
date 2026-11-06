@@ -1,7 +1,7 @@
 //! Config file watcher (ARCHITECTURE section 6): watches the config directory, not the file, so
 //! an atomic rename-over is seen. A bad `config.toml` never replaces the last good one.
 //!
-//! The debouncer owns its thread; `run.rs` keeps the returned [`Watcher`] alive for the daemon's
+//! The `config-watch` thread owns the debouncer; `run.rs` keeps the returned [`Watcher`] alive for the daemon's
 //! life. `notify` is how a tray notice reaches the UI (`run.rs` wraps `UiCmd::Notify` and the
 //! UI wake-up): once per reload that failed (`ConfigInvalid`) or was corrected (`ConfigAdjusted`).
 
@@ -13,21 +13,55 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::path::Path;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use notify_debouncer_full::notify::{EventKind, RecommendedWatcher, RecursiveMode};
-use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
+use notify_debouncer_full::{
+    DebounceEventResult, DebouncedEvent, Debouncer, RecommendedCache, file_id, new_debouncer,
+};
 use oxi_core::config::{ConfigError, ConfigFile};
 use oxi_core::machine::Notice;
 use oxi_core::paths::{CONFIG_FILE, DICTIONARY_FILE, Layout, REPLACE_FILE};
 
 use super::cmd::Inbox;
 
-/// Keeps the watch running; dropping it stops it.
-pub type Watcher = Debouncer<RecommendedWatcher, RecommendedCache>;
+/// How long a read that failed for another reason than "gone" or "not UTF-8" (an editor holding
+/// the file at its flush) is retried: `READ_RETRIES` more tries, `READ_RETRY_DELAY` apart.
+const READ_RETRIES: u32 = 3;
+const READ_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// Watching again after an error or the directory's removal: tries, first wait (doubling), cap.
+const REWATCH_TRIES: u32 = 8;
+const REWATCH_FIRST: Duration = Duration::from_millis(100);
+const REWATCH_CAP: Duration = Duration::from_secs(2);
 
 const DEBOUNCE: Duration = Duration::from_millis(200);
+/// How often the thread checks that the watched directory is still the one it watches: Windows
+/// reports no event when it is deleted, and the watch is then dead. A delete and re-create inside
+/// one period keeps the NTFS file id and is not noticed (shortcut; upgrade: stat-snapshot).
+const DIR_CHECK: Duration = Duration::from_secs(2);
+
+/// What the debouncer and the owner say to the watcher thread.
+enum Msg {
+    Events(DebounceEventResult),
+    Stop,
+}
+
+/// Keeps the watch running; dropping it stops it.
+pub struct Watcher {
+    tx: Sender<Msg>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Msg::Stop);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 /// Write the default `config.toml` when there is none. `create_new`, so a file that exists (or
 /// appears meanwhile) is never touched.
@@ -53,35 +87,121 @@ pub fn spawn(
     inbox: Sender<Inbox>,
     notify: impl Fn(Notice) + Send + 'static,
 ) -> notify_debouncer_full::notify::Result<Watcher> {
-    start(layout, DEBOUNCE, inbox, notify)
+    start(layout, DEBOUNCE, DIR_CHECK, inbox, notify)
 }
 
 fn start(
     layout: &Layout,
     debounce: Duration,
+    dir_check: Duration,
     inbox: Sender<Inbox>,
     notify: impl Fn(Notice) + Send + 'static,
 ) -> notify_debouncer_full::notify::Result<Watcher> {
+    let (tx, rx) = mpsc::channel();
+    let events_tx = tx.clone();
+    let mut debouncer = new_debouncer(debounce, None, move |result| {
+        let _ = events_tx.send(Msg::Events(result));
+    })?;
+    let dir = layout.config_dir.clone();
+    debouncer.watch(&dir, RecursiveMode::NonRecursive)?;
     let config_file = layout.config_file();
-    let mut debouncer = new_debouncer(debounce, None, move |result: DebounceEventResult| {
-        let Ok(events) = result else { return };
-        let mut changed = Changed::default();
-        for path in events
-            .iter()
-            .filter(|e| !matches!(e.kind, EventKind::Access(_)))
-            .flat_map(|e| &e.paths)
-        {
-            changed.note(path);
+    let thread = thread::Builder::new()
+        .name("config-watch".into())
+        .spawn(move || {
+            run(
+                &rx,
+                &mut debouncer,
+                &dir,
+                dir_check,
+                &config_file,
+                &inbox,
+                &notify,
+            );
+        })
+        .map_err(notify_debouncer_full::notify::Error::io)?;
+    Ok(Watcher {
+        tx,
+        thread: Some(thread),
+    })
+}
+
+/// The watcher thread: reload what changed; after a watch error, an overflow, or the removal
+/// of the directory, watch again and reload everything once.
+fn run(
+    rx: &Receiver<Msg>,
+    debouncer: &mut Debouncer<RecommendedWatcher, RecommendedCache>,
+    dir: &Path,
+    dir_check: Duration,
+    config_file: &Path,
+    inbox: &Sender<Inbox>,
+    notify: &impl Fn(Notice),
+) {
+    let mut dir_id = file_id::get_file_id(dir).ok();
+    loop {
+        let (changed, lost) = match rx.recv_timeout(dir_check) {
+            Ok(Msg::Events(Ok(events))) => {
+                (Changed::from_events(&events), dir_removed(&events, dir))
+            }
+            Ok(Msg::Events(Err(errors))) => {
+                for e in &errors {
+                    tracing::warn!("config watch error: {:?}", e.kind);
+                }
+                (Changed::ALL, true)
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if file_id::get_file_id(dir).ok() == dir_id {
+                    continue;
+                }
+                (Changed::ALL, true)
+            }
+            Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => return,
+        };
+        if lost {
+            if !rewatch(rx, debouncer, dir) {
+                return;
+            }
+            dir_id = file_id::get_file_id(dir).ok();
         }
         if changed.config {
-            reload_config(&config_file, &inbox, &notify);
+            reload_config(config_file, inbox, notify);
         }
         if changed.assets {
             let _ = inbox.send(Inbox::AssetsChanged);
         }
-    })?;
-    debouncer.watch(&layout.config_dir, RecursiveMode::NonRecursive)?;
-    Ok(debouncer)
+    }
+}
+
+/// Watch `dir` again with a bounded backoff. False when the owner stopped us meanwhile; after
+/// the last failed try it logs and returns true (the thread stays up, but blind).
+fn rewatch(
+    rx: &Receiver<Msg>,
+    debouncer: &mut Debouncer<RecommendedWatcher, RecommendedCache>,
+    dir: &Path,
+) -> bool {
+    let _ = debouncer.unwatch(dir);
+    let mut delay = REWATCH_FIRST;
+    for _ in 0..REWATCH_TRIES {
+        // The wait is also where a Stop gets through; events queued meanwhile are covered by
+        // the full reload that follows.
+        match rx.recv_timeout(delay) {
+            Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => return false,
+            Ok(Msg::Events(_)) | Err(RecvTimeoutError::Timeout) => {}
+        }
+        match debouncer.watch(dir, RecursiveMode::NonRecursive) {
+            Ok(()) => return true,
+            Err(e) => tracing::warn!("config watch not re-armed: {:?}", e.kind),
+        }
+        delay = (delay * 2).min(REWATCH_CAP);
+    }
+    tracing::error!("config directory not watched any more; edits need a restart");
+    true
+}
+
+/// The watched directory itself was removed (inotify reports it as an event).
+fn dir_removed(events: &[DebouncedEvent], dir: &Path) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e.kind, EventKind::Remove(_)) && e.paths.iter().any(|p| p == dir))
 }
 
 /// Which watched files a batch of events touched.
@@ -92,6 +212,27 @@ struct Changed {
 }
 
 impl Changed {
+    const ALL: Self = Self {
+        config: true,
+        assets: true,
+    };
+
+    /// An overflow (`need_rescan`) means events were lost: treat everything as changed.
+    fn from_events(events: &[DebouncedEvent]) -> Self {
+        if events.iter().any(|e| e.need_rescan()) {
+            return Self::ALL;
+        }
+        let mut changed = Self::default();
+        for path in events
+            .iter()
+            .filter(|e| !matches!(e.kind, EventKind::Access(_)))
+            .flat_map(|e| &e.paths)
+        {
+            changed.note(path);
+        }
+        changed
+    }
+
     fn note(&mut self, path: &Path) {
         match path.file_name().and_then(|n| n.to_str()) {
             Some(CONFIG_FILE) => self.config = true,
@@ -101,10 +242,27 @@ impl Changed {
     }
 }
 
+/// `read_to_string`, retried when the failure may pass (a sharing violation).
+fn read_with_retry(path: &Path) -> io::Result<String> {
+    let mut retries = 0;
+    loop {
+        match fs::read_to_string(path) {
+            Err(e)
+                if retries < READ_RETRIES
+                    && !matches!(e.kind(), ErrorKind::NotFound | ErrorKind::InvalidData) =>
+            {
+                retries += 1;
+                thread::sleep(READ_RETRY_DELAY);
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Read and parse `config.toml`, send the result to the coordinator. A file that is gone or
 /// unreadable right now (mid-rename) is skipped: the last good config stays.
 fn reload_config(path: &Path, inbox: &Sender<Inbox>, notify: &impl Fn(Notice)) {
-    let text = match fs::read_to_string(path) {
+    let text = match read_with_retry(path) {
         Ok(text) => text,
         Err(e) if e.kind() == ErrorKind::NotFound => return,
         Err(e) if e.kind() == ErrorKind::InvalidData => {
@@ -198,7 +356,14 @@ mod tests {
         let l = layout("good");
         let (tx, rx) = mpsc::channel();
         let (seen, notify) = notices();
-        let _w = start(&l, Duration::from_millis(50), tx, notify).unwrap();
+        let _w = start(
+            &l,
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            tx,
+            notify,
+        )
+        .unwrap();
         for device in ["Mic A", "Mic B"] {
             write_atomic(
                 &l.config_file(),
@@ -213,6 +378,7 @@ mod tests {
                 _ => panic!("no config for {device}"),
             }
         }
+        assert!(next(&rx, 200).is_none(), "exactly one reload per write");
         assert!(seen.lock().unwrap().is_empty());
     }
 
@@ -221,7 +387,14 @@ mod tests {
         let l = layout("broken");
         let (tx, rx) = mpsc::channel();
         let (seen, notify) = notices();
-        let _w = start(&l, Duration::from_millis(50), tx, notify).unwrap();
+        let _w = start(
+            &l,
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            tx,
+            notify,
+        )
+        .unwrap();
         write_atomic(&l.config_file(), b"[audio]\ngain_db = \n").unwrap();
         match next(&rx, 1000) {
             Some(Inbox::ConfigError(ConfigError::Syntax { line, .. })) => assert_eq!(line, 2),
@@ -236,7 +409,14 @@ mod tests {
         let l = layout("warn");
         let (tx, rx) = mpsc::channel();
         let (seen, notify) = notices();
-        let _w = start(&l, Duration::from_millis(50), tx, notify).unwrap();
+        let _w = start(
+            &l,
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            tx,
+            notify,
+        )
+        .unwrap();
         write_atomic(&l.config_file(), b"[audio]\nmeter_sensitivity_db = 99.0\n").unwrap();
         match next(&rx, 1000) {
             Some(Inbox::Config { warnings, .. }) => assert_eq!(warnings.len(), 1),
@@ -250,10 +430,94 @@ mod tests {
         let l = layout("assets");
         let (tx, rx) = mpsc::channel();
         let (_seen, notify) = notices();
-        let _w = start(&l, Duration::from_millis(50), tx, notify).unwrap();
+        let _w = start(
+            &l,
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            tx,
+            notify,
+        )
+        .unwrap();
         write_atomic(&l.dictionary_file(), b"word\n").unwrap();
         assert!(matches!(next(&rx, 1000), Some(Inbox::AssetsChanged)));
         write_atomic(&l.config_dir.join("other.txt"), b"x").unwrap();
         assert!(next(&rx, 200).is_none());
+    }
+
+    #[test]
+    fn watch_survives_the_directory_being_removed() {
+        let l = layout("rearm");
+        let (tx, rx) = mpsc::channel();
+        let (_seen, notify) = notices();
+        let _w = start(
+            &l,
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            tx,
+            notify,
+        )
+        .unwrap();
+        fs::remove_dir_all(&l.config_dir).unwrap();
+        // shortcut: NTFS gives a recreated directory the same file id, so a gap shorter than the
+        // check period goes unnoticed; the test waits two periods.
+        thread::sleep(Duration::from_millis(250));
+        fs::create_dir_all(&l.config_dir).unwrap();
+        write_atomic(
+            &l.config_file(),
+            b"[audio]
+device = \"Mic R\"
+",
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut got = false;
+        while !got && std::time::Instant::now() < deadline {
+            got = matches!(next(&rx, 100), Some(Inbox::Config { config, .. }) if config.audio.device == "Mic R");
+        }
+        assert!(got, "no config after the directory came back");
+        // Edits after the re-arm are still seen.
+        write_atomic(
+            &l.config_file(),
+            b"[audio]
+device = \"Mic S\"
+",
+        )
+        .unwrap();
+        let mut got = false;
+        while !got && std::time::Instant::now() < deadline + Duration::from_secs(2) {
+            got = matches!(next(&rx, 100), Some(Inbox::Config { config, .. }) if config.audio.device == "Mic S");
+        }
+        assert!(got, "edit after re-arm lost");
+    }
+
+    /// An editor holding the file without sharing (Windows) fails the read for a moment.
+    #[cfg(windows)]
+    #[test]
+    fn locked_file_is_retried_not_lost() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let l = layout("locked");
+        fs::write(
+            l.config_file(),
+            "[audio]
+device = \"Mic L\"
+",
+        )
+        .unwrap();
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(l.config_file())
+            .unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(120));
+            drop(held);
+        });
+        let (tx, rx) = mpsc::channel();
+        let (_seen, notify) = notices();
+        reload_config(&l.config_file(), &tx, &notify);
+        release.join().unwrap();
+        assert!(
+            matches!(next(&rx, 10), Some(Inbox::Config { config, .. }) if config.audio.device == "Mic L")
+        );
     }
 }
