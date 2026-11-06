@@ -91,6 +91,14 @@ fn shot(screen: &str, page: Page, config: Option<&str>) {
 }
 
 const NEWER: &str = "version = 99\n";
+const DENOISE: &str = "version = 1
+[audio]
+denoise = true
+";
+const NO_MIC: &str = "version = 1
+[audio]
+device = \"Missing Test Mic\"
+";
 const BROKEN: &str = "version = 1\n[audio]\ngain_db = \n";
 
 #[test]
@@ -135,6 +143,16 @@ fn shot_keyboard() {
 #[test]
 fn shot_audio() {
     shot("audio", Page::Audio, None);
+}
+
+#[test]
+fn shot_audio_denoise() {
+    shot("audio-denoise", Page::Audio, Some(DENOISE));
+}
+
+#[test]
+fn shot_audio_not_connected() {
+    shot("audio-not-connected", Page::Audio, Some(NO_MIC));
 }
 
 #[test]

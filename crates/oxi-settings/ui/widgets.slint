@@ -34,15 +34,19 @@ export component Group inherits VerticalLayout {
     }
 }
 
-// A label on the left, its control (the children) on the right.
+// A label on the left, its control (the children) on the right. Every row has the same label
+// column, so the controls of a group start at one x whatever the label text.
 export component Row inherits HorizontalLayout {
     in property <string> label;
+    in property <length> label-width: 150px;
     min-height: 32px;
     spacing: 8px;
     Text {
         text: root.label;
+        width: root.label-width;
+        overflow: elide;
         vertical-alignment: center;
-        horizontal-stretch: 1;
+        horizontal-stretch: 0;
         color: Palette.foreground;
     }
     @children
