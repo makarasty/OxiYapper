@@ -79,7 +79,7 @@ pub fn remove_leftover_parts(dir: &Path) -> Result<usize, WavError> {
                 .file_name()
                 .to_string_lossy()
                 .strip_suffix(PART_SUFFIX)
-                .is_some_and(|name| name.ends_with(".wav"))
+                .is_some_and(|name| Path::new(name).extension().is_some_and(|e| e == "wav"))
         {
             fs::remove_file(&path)?;
             removed += 1;
