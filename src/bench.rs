@@ -2,9 +2,7 @@
 //! [--prompt-file <f>]`: every `*.wav` in `<dir>` through the audio pipeline, whisper and the
 //! text pipeline. Prints text and timings; never touches the hotkey or the clipboard.
 
-use std::fmt::Write as _;
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -16,7 +14,8 @@ use oxi_core::models::MODELS;
 use oxi_core::text::{self, HallucinationFilter, Outcome, ReplaceRules, decode_text_file};
 use oxi_core::types::Language;
 use oxi_whisper::{DeviceChoice, Engine};
-use sha2::{Digest, Sha256};
+
+use crate::net::sha256_file;
 
 const USAGE: &str = "usage: oxi-yapper bench <dir> --model <path> [--gpu <name|cpu|auto>] \
                      [--lang ru|en|auto] [--prompt-file <file>]";
@@ -113,20 +112,7 @@ fn verify_model(path: &Path) -> Result<()> {
     let Some(entry) = MODELS.iter().find(|m| m.file_name == name) else {
         return Ok(());
     };
-    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let actual = hasher.finalize().iter().fold(String::new(), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    });
+    let actual = sha256_file(path).with_context(|| format!("hash {}", path.display()))?;
     if actual != entry.sha256 {
         bail!(
             "{name}: hash mismatch (expected {}, got {actual}); delete the file and download it again",
@@ -171,7 +157,7 @@ pub fn run(args: &[String]) -> Result<()> {
     }
 
     let (filter, rules) = (HallucinationFilter::new(""), ReplaceRules::default());
-    let mut times = Vec::new();
+    let (mut times, mut heard) = (Vec::new(), 0_usize);
     for path in &files {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         let (mono, rate) = match read_wav(path) {
@@ -198,10 +184,19 @@ pub fn run(args: &[String]) -> Result<()> {
             .map(|s| s.text.as_str())
             .collect();
         let text = match text::process(&segments, &filter, &rules, false) {
-            Outcome::Text(t) => t,
+            Outcome::Text(t) => {
+                heard += 1;
+                t
+            }
             Outcome::NothingHeard => "(nothing heard)".to_owned(),
         };
         println!("{name}\t{text}\tload {load_ms} ms\ttranscribe {ms} ms");
+    }
+    if heard == 0 {
+        bail!(
+            "no file produced a transcript: {} skipped (unreadable, silent or nothing heard)",
+            files.len()
+        );
     }
     times.sort_unstable();
     println!(

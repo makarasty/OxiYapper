@@ -82,7 +82,11 @@ jobs:
 
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15 # not measured cold (whisper.cpp build + 77 MB model)
+    env:
+      # whisper.cpp master at the time of pinning; jfk.wav is public domain.
+      JFK_URL: https://raw.githubusercontent.com/ggml-org/whisper.cpp/727d3e7666485e12450746b523bfb4e7f057cc5e/samples/jfk.wav
+      JFK_SHA: 59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -99,7 +103,8 @@ jobs:
           tool: cargo-nextest
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Whisper regression (WER threshold on jfk.wav) runs instead of skipping: ggml-tiny.bin
-      # is cached and checked against the SHA256 in the model registry (one source of truth).
+      # and jfk.wav are cached and both SHA256-checked on every run; the model hash comes from
+      # the model registry (one source of truth).
       - name: Read the tiny model pin from the registry
         run: |
           entry=$(grep -A6 'id: "tiny"' crates/oxi-core/src/models.rs)
@@ -108,18 +113,14 @@ jobs:
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/models
-          key: ggml-tiny-${{ env.TINY_SHA }}
+          key: fixtures-${{ env.TINY_SHA }}-${{ env.JFK_SHA }}
       - name: Fetch and verify test fixtures
         timeout-minutes: 5
-        env:
-          # whisper.cpp master at the time of pinning; jfk.wav is public domain.
-          JFK_URL: https://raw.githubusercontent.com/ggml-org/whisper.cpp/727d3e7666485e12450746b523bfb4e7f057cc5e/samples/jfk.wav
-          JFK_SHA: 59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e
         run: |
           dir="$RUNNER_TEMP/models"
           mkdir -p "$dir"
           [ -f "$dir/ggml-tiny.bin" ] || curl -fsSL --retry 3 -o "$dir/ggml-tiny.bin" "$TINY_URL"
-          curl -fsSL --retry 3 -o "$dir/jfk.wav" "$JFK_URL"
+          [ -f "$dir/jfk.wav" ] || curl -fsSL --retry 3 -o "$dir/jfk.wav" "$JFK_URL"
           echo "$TINY_SHA  $dir/ggml-tiny.bin" | sha256sum -c -
           echo "$JFK_SHA  $dir/jfk.wav" | sha256sum -c -
           echo "OXI_TINY_MODEL=$dir/ggml-tiny.bin" >> "$GITHUB_ENV"

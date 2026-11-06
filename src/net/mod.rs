@@ -188,7 +188,7 @@ fn download_with(
     loop {
         if have == entry.size {
             // A complete `.part` (interrupted before the rename): verify, no request.
-            return finish(hash_file(&part)?, &part, &dest, entry);
+            return finish(sha256_file(&part)?, &part, &dest, entry);
         }
         let mut resp = fetch(&agent, policy, entry.url, have)?;
         let status = resp.status().as_u16();
@@ -241,19 +241,18 @@ fn download_with(
         // On disk before the rename, so a crash cannot leave a verified name on lost data.
         file.sync_all()?;
         drop(file);
-        return finish(hasher, &part, &dest, entry);
+        return finish(hex(&hasher.finalize()), &part, &dest, entry);
     }
 }
 
-/// Compare the digest with the registry: rename and stamp on match, delete `.part` on
+/// Compare the hex digest with the registry: rename and stamp on match, delete `.part` on
 /// mismatch.
 fn finish(
-    hasher: Sha256,
+    actual: String,
     part: &Path,
     dest: &Path,
     entry: &ModelEntry,
 ) -> Result<Downloaded, DownloadError> {
-    let actual = hex(&hasher.finalize());
     if actual == entry.sha256 {
         fs::rename(part, dest)?;
         let name = dest.file_name().unwrap_or_default().to_string_lossy();
@@ -297,6 +296,11 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
         s
     })
+}
+
+/// SHA256 of a whole file as lower-case hex.
+pub(crate) fn sha256_file(path: &Path) -> io::Result<String> {
+    Ok(hex(&hash_file(path)?.finalize()))
 }
 
 fn hash_file(path: &Path) -> io::Result<Sha256> {
