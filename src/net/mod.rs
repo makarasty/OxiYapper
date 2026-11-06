@@ -134,11 +134,8 @@ fn content_range_start(header: Option<&str>) -> Option<u64> {
 /// A verified model in place.
 #[derive(Debug)]
 #[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into the daemon in M3; only tests read it for now"
-    )
+    not(any(test, windows)),
+    expect(dead_code, reason = "only the Windows daemon downloads for now")
 )]
 pub struct Downloaded {
     pub path: PathBuf,
@@ -150,11 +147,8 @@ pub struct Downloaded {
 /// Download `entry` into `dest_dir` and return the verified file. `progress` gets
 /// `(done, total)` bytes; `cancel` stops the transfer and keeps `.part` for a later resume.
 #[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into the daemon in M3; only tests call it for now"
-    )
+    not(any(test, windows)),
+    expect(dead_code, reason = "only the Windows daemon downloads for now")
 )]
 pub fn download(
     entry: &ModelEntry,

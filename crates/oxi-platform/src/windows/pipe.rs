@@ -29,8 +29,11 @@ use windows_sys::Win32::Storage::FileSystem::{
     SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
 };
 use windows_sys::Win32::System::IO::CancelIoEx;
-use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, WaitNamedPipeW};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    AllowSetForegroundWindow, GetForegroundWindow, GetWindowThreadProcessId,
+};
 
 /// winnt.h values; their windows-sys module (`System_SystemServices`) is not enabled here.
 const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
@@ -40,9 +43,11 @@ const SECURITY_MANDATORY_MEDIUM_RID: u32 = 0x2000;
 /// other user. The explicit owner and the medium integrity label are what clients check;
 /// without them an elevated daemon would default the owner to Administrators, and a label at
 /// its own (high) level would lock a normal second launch out. Medium is the floor clients
-/// accept, so low-integrity squatters stay out at every daemon level.
+/// accept, so low-integrity squatters stay out at every daemon level. The label also bars
+/// lower levels from reading (`NR`), so a low-integrity program cannot open the pipe read-only
+/// and hold one of the few instances.
 pub fn owner_only_sddl(sid: &str) -> String {
-    format!("O:{sid}D:P(A;;GA;;;{sid})S:(ML;;NW;;;ME)")
+    format!("O:{sid}D:P(A;;GA;;;{sid})S:(ML;;NWNR;;;ME)")
 }
 
 /// The current user's SID string, e.g. `S-1-5-21-...`.
@@ -264,6 +269,34 @@ unsafe fn label_rid(sacl: *const ACL) -> Option<u32> {
         }
     }
     None
+}
+
+/// Process id of the client on the server end `h` of a pipe connection.
+pub fn client_pid(h: BorrowedHandle<'_>) -> io::Result<u32> {
+    let mut pid = 0;
+    // SAFETY: `h` is an open pipe handle and `pid` a live local.
+    if unsafe { GetNamedPipeClientProcessId(h.as_raw_handle(), &raw mut pid) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(pid)
+}
+
+/// Process id that owns the foreground window; 0 when there is none.
+pub fn foreground_pid() -> u32 {
+    let mut pid = 0;
+    // SAFETY: no arguments; `pid` is a live local, and a null window leaves it 0.
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &raw mut pid) };
+    pid
+}
+
+/// Lets a window of process `pid` take the foreground (`AllowSetForegroundWindow`), so a
+/// `Raise` push can bring it forward.
+pub fn allow_foreground(pid: u32) -> io::Result<()> {
+    // SAFETY: plain value argument.
+    if unsafe { AllowSetForegroundWindow(pid) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Runs `op`, a blocking I/O call on `h`, and cancels it with `TimedOut` if it is still

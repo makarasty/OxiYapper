@@ -260,6 +260,7 @@ impl<H: ChordHook> Coordinator<H> {
             phase: self.state.phase(),
             model: self.active.model.id.clone(),
             device: self.active.audio.device.clone(),
+            gpu: self.active.model.gpu.clone(),
             warnings: self
                 .warnings
                 .iter()
@@ -598,6 +599,7 @@ mod tests {
         rig.event(Event::ChordDown, 0);
         let mut config = Config::default();
         config.audio.device = "Mic X".into();
+        config.model.gpu = oxi_core::device::DeviceChoice::Named("Vulkan1".into());
         rig.c.handle(
             Inbox::Config {
                 config: Box::new(config.clone()),
@@ -626,6 +628,10 @@ mod tests {
         rig.c.handle(Inbox::Ipc(IpcAsk::Status(tx)), Millis(600));
         let status = rx.try_recv().expect("status answered");
         assert_eq!(status.device, "Mic X");
+        assert_eq!(
+            status.gpu,
+            oxi_core::device::DeviceChoice::Named("Vulkan1".into())
+        );
         assert_eq!(status.warnings, ["gain clamped"]);
     }
 
