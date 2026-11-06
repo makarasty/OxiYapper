@@ -198,14 +198,15 @@ pub fn run(args: &[String]) -> Result<()> {
         println!("warning: {w}");
     }
 
-    let (filter, rules) = (HallucinationFilter::new(""), ReplaceRules::default());
+    let (filter, rules) = (HallucinationFilter::default(), ReplaceRules::default());
     let (mut times, mut heard) = (Vec::new(), 0_usize);
     for path in &files {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         let (mono, rate) = match read_wav_mono_f32(path) {
             Ok(wav) => wav,
             Err(e) => {
-                println!("{name}\terror: {e:#}");
+                // `{:#}` of an anyhow error prints the cause, which `WavError` keeps in `source`.
+                println!("{name}\terror: {:#}", anyhow::Error::from(e));
                 continue;
             }
         };

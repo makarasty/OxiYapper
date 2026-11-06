@@ -24,10 +24,10 @@ pub fn system_info() -> &'static str {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The model file could not be loaded (also after the CPU retry).
-    #[error("cannot load whisper model: {0}")]
+    #[error("cannot load whisper model")]
     Load(#[source] WhisperError),
     /// Decoding or tokenizing failed.
-    #[error("whisper failed: {0}")]
+    #[error("whisper failed")]
     Run(#[source] WhisperError),
 }
 

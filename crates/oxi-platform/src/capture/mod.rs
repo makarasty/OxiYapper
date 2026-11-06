@@ -66,11 +66,11 @@ pub enum CaptureError {
     PermissionDenied,
     #[error("unsupported sample format {0}")]
     UnsupportedFormat(String),
-    #[error("audio device: {0}")]
-    Device(cpal::Error),
+    #[error("audio device")]
+    Device(#[source] cpal::Error),
     /// The drain thread did not start or panicked.
-    #[error("capture thread: {0}")]
-    Thread(std::io::Error),
+    #[error("capture thread")]
+    Thread(#[source] std::io::Error),
     #[error(transparent)]
     Audio(#[from] AudioError),
 }

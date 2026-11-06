@@ -107,3 +107,14 @@ fn cleanup_removes_only_wav_part_files_including_subdirs() {
     assert_eq!(remove_leftover_parts(&dir.join("missing")).unwrap(), 0);
     fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn io_error_message_leaves_the_cause_to_source() {
+    // anyhow's `{:#}` prints message then source: the cause must not be in both.
+    let dir = scratch("nodir");
+    let err = write_wav(&dir.join("missing").join("a.wav"), &[0.0]).unwrap_err();
+    let cause = std::error::Error::source(&err)
+        .expect("io cause kept")
+        .to_string();
+    assert!(!err.to_string().contains(&cause), "{err}");
+}

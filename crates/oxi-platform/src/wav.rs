@@ -15,9 +15,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum WavError {
-    #[error("wav io: {0}")]
+    #[error("wav io")]
     Io(#[from] std::io::Error),
-    #[error("wav format: {0}")]
+    #[error("wav format")]
     Hound(#[from] hound::Error),
     #[error("unsupported wav: {0}")]
     Unsupported(String),
