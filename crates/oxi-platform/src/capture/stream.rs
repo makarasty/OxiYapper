@@ -1,25 +1,26 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, InputCallbackInfo, Sample, SampleFormat, SizedSample, Stream};
-use oxi_core::audio::{AudioError, Pipeline, downmix};
+use cpal::{FromSample, I24, InputCallbackInfo, Sample, SampleFormat, SizedSample, Stream};
+use oxi_core::audio::{AudioError, Level, Pipeline, downmix, samples_for};
 use oxi_core::config::Audio;
+use oxi_core::types::Millis;
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use super::{Capture, CaptureError, CaptureEvent};
+use super::{Capture, CaptureError, CaptureEvent, LevelMeter};
 
 /// Ring length: the drain thread polls every [`DRAIN_POLL`], this covers a long stall.
 const RING_SECONDS: usize = 2;
 const DRAIN_POLL: Duration = Duration::from_millis(10);
+/// The drain feeds the pipeline and the meter in windows of this length (ARCHITECTURE section 2).
+const WINDOW: Millis = Millis(20);
 
 /// State shared by the cpal callbacks and the drain thread. Only atomics: no lock on the audio thread.
 #[derive(Default)]
 struct Shared {
-    /// `f32` bits of the latest block's peak.
-    peak: AtomicU32,
     dropped: AtomicU64,
     lost: AtomicBool,
     stop: AtomicBool,
@@ -35,18 +36,50 @@ pub fn list_input_devices() -> Result<Vec<String>, CaptureError> {
 
 /// cpal implementation of [`Capture`] (one for all OSes).
 pub struct CpalCapture {
-    /// Dropped first in [`Capture::finish`]: no callback runs after that.
-    stream: Stream,
+    /// Dropped first in [`CpalCapture::stop`]: no callback runs after that.
+    stream: Option<Stream>,
     shared: Arc<Shared>,
-    drain: JoinHandle<Result<Vec<f32>, AudioError>>,
+    /// Taken by the first [`CpalCapture::stop`], from `finish` or `Drop`.
+    drain: Option<JoinHandle<Result<Vec<f32>, AudioError>>>,
+    meter: LevelMeter,
     rate: u32,
     fell_back: bool,
+}
+
+impl CpalCapture {
+    /// Stop the callbacks, then the drain thread, and zero the meter; idempotent.
+    fn stop(&mut self) -> Result<Vec<f32>, CaptureError> {
+        drop(self.stream.take());
+        self.shared.stop.store(true, Ordering::Release);
+        let Some(drain) = self.drain.take() else {
+            // Only `Drop` after `finish` gets here; nothing is left to return.
+            return Ok(Vec::new());
+        };
+        drain.thread().unpark();
+        let joined = drain.join();
+        self.meter.store(Level {
+            peak: 0.0,
+            rms: 0.0,
+        });
+        match joined {
+            Ok(result) => Ok(result?),
+            Err(_) => Err(AudioError::Resample("drain thread panicked".into()).into()),
+        }
+    }
+}
+
+impl Drop for CpalCapture {
+    fn drop(&mut self) {
+        // Cancel path: the audio and any error are discarded.
+        let _ = self.stop();
+    }
 }
 
 impl Capture for CpalCapture {
     fn open(
         device: &str,
         opts: &Audio,
+        meter: LevelMeter,
         mut on_event: impl FnMut(CaptureEvent) + Send + 'static,
     ) -> Result<Self, CaptureError> {
         let host = cpal::default_host();
@@ -90,22 +123,29 @@ impl Capture for CpalCapture {
             SampleFormat::F64 => build::<f64>(&dev, config, tx, channels, cb_shared, on_error),
             SampleFormat::I8 => build::<i8>(&dev, config, tx, channels, cb_shared, on_error),
             SampleFormat::I16 => build::<i16>(&dev, config, tx, channels, cb_shared, on_error),
+            SampleFormat::I24 => build::<I24>(&dev, config, tx, channels, cb_shared, on_error),
             SampleFormat::I32 => build::<i32>(&dev, config, tx, channels, cb_shared, on_error),
             SampleFormat::U8 => build::<u8>(&dev, config, tx, channels, cb_shared, on_error),
             SampleFormat::U16 => build::<u16>(&dev, config, tx, channels, cb_shared, on_error),
+            SampleFormat::U32 => build::<u32>(&dev, config, tx, channels, cb_shared, on_error),
             other => return Err(CaptureError::UnsupportedFormat(other.to_string())),
         }?;
 
+        // Play before the spawn: a play error then leaves no thread behind, and the ring holds
+        // what arrives before the drain starts.
+        stream.play()?;
         let drain_shared = Arc::clone(&shared);
+        let drain_meter = meter.clone();
+        let window = samples_for(WINDOW, rate);
         let drain = thread::Builder::new()
             .name("oxi-capture-drain".into())
-            .spawn(move || drain_loop(rx, channels, pipeline, &drain_shared))
+            .spawn(move || drain_loop(rx, channels, window, pipeline, &drain_shared, &drain_meter))
             .map_err(|_| AudioError::Resample("drain thread did not start".into()))?;
-        stream.play()?;
         Ok(Self {
-            stream,
+            stream: Some(stream),
             shared,
-            drain,
+            drain: Some(drain),
+            meter,
             rate,
             fell_back,
         })
@@ -113,10 +153,6 @@ impl Capture for CpalCapture {
 
     fn input_rate(&self) -> u32 {
         self.rate
-    }
-
-    fn peak(&self) -> f32 {
-        f32::from_bits(self.shared.peak.load(Ordering::Relaxed))
     }
 
     fn dropped_samples(&self) -> u64 {
@@ -127,14 +163,8 @@ impl Capture for CpalCapture {
         self.fell_back
     }
 
-    fn finish(self) -> Result<Vec<f32>, CaptureError> {
-        drop(self.stream);
-        self.shared.stop.store(true, Ordering::Release);
-        self.drain.thread().unpark();
-        match self.drain.join() {
-            Ok(result) => Ok(result?),
-            Err(_) => Err(AudioError::Resample("drain thread panicked".into()).into()),
-        }
+    fn finish(mut self) -> Result<Vec<f32>, CaptureError> {
+        self.stop()
     }
 }
 
@@ -158,7 +188,7 @@ where
     )?)
 }
 
-/// The whole cpal callback: convert to f32, push whole frames into the ring, publish the peak.
+/// The whole cpal callback: convert to f32 and push whole frames into the ring.
 /// Counts what does not fit as dropped. No allocation, no lock.
 fn push_converted<T>(tx: &mut Producer<f32>, data: &[T], channels: usize, shared: &Shared)
 where
@@ -166,15 +196,9 @@ where
     f32: FromSample<T>,
 {
     let fits = tx.slots().min(data.len()) / channels * channels;
-    let mut peak = 0.0_f32;
     if let Ok(chunk) = tx.write_chunk_uninit(fits) {
-        chunk.fill_from_iter(data[..fits].iter().map(|s| {
-            let v: f32 = s.to_sample();
-            peak = peak.max(v.abs());
-            v
-        }));
+        chunk.fill_from_iter(data[..fits].iter().map(|s| s.to_sample::<f32>()));
     }
-    shared.peak.store(peak.to_bits(), Ordering::Relaxed);
     if fits < data.len() {
         shared
             .dropped
@@ -186,33 +210,53 @@ where
 fn drain_loop(
     mut rx: Consumer<f32>,
     channels: usize,
+    window: usize,
     mut pipeline: Pipeline,
     shared: &Shared,
+    meter: &LevelMeter,
 ) -> Result<Vec<f32>, AudioError> {
-    let mut failed = None;
     loop {
         // Read before draining: everything pushed before `stop` is seen by the last pass.
         let stopping = shared.stop.load(Ordering::Acquire);
-        let available = rx.slots();
-        if available > 0
-            && let Ok(chunk) = rx.read_chunk(available)
-        {
-            let (a, b) = chunk.as_slices();
-            let interleaved = [a, b].concat();
-            chunk.commit_all();
-            if failed.is_none() {
-                failed = pipeline.push(&downmix(&interleaved, channels)).err();
-            }
-        }
+        drain_once(&mut rx, channels, window, &mut pipeline, meter, stopping)?;
         if stopping {
             break;
         }
         thread::park_timeout(DRAIN_POLL);
     }
-    match failed {
-        Some(e) => Err(e),
-        None => pipeline.finish(),
+    pipeline.finish()
+}
+
+/// One pass: whole blocks of `window` frames (everything when `all`) go from the ring into
+/// `pipeline`, one window per push, and the meter gets each window's post-gain level. A part
+/// window waits in the ring for the next pass.
+fn drain_once(
+    rx: &mut Consumer<f32>,
+    channels: usize,
+    window: usize,
+    pipeline: &mut Pipeline,
+    meter: &LevelMeter,
+    all: bool,
+) -> Result<(), AudioError> {
+    let block = window * channels;
+    let available = if all {
+        rx.slots()
+    } else {
+        rx.slots() / block * block
+    };
+    if available == 0 {
+        return Ok(());
     }
+    let Ok(chunk) = rx.read_chunk(available) else {
+        return Ok(());
+    };
+    let (a, b) = chunk.as_slices();
+    let interleaved = [a, b].concat();
+    chunk.commit_all();
+    for piece in downmix(&interleaved, channels).chunks(window) {
+        meter.store(pipeline.push(piece)?);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -237,15 +281,23 @@ mod tests {
         (out, shared)
     }
 
-    fn peak(shared: &Shared) -> f32 {
-        f32::from_bits(shared.peak.load(Ordering::Relaxed))
+    #[test]
+    fn i16_scales_to_unit_range() {
+        let (out, _) = run(&[0_i16, i16::MIN, 16_384], 1, 8);
+        assert_eq!(out, [0.0, -1.0, 0.5]);
     }
 
     #[test]
-    fn i16_scales_to_unit_range() {
-        let (out, shared) = run(&[0_i16, i16::MIN, 16_384], 1, 8);
+    fn i24_scales_to_unit_range() {
+        let samples = [0, -(1 << 23), 1 << 22].map(|v| I24::new(v).unwrap());
+        let (out, _) = run(&samples, 1, 8);
         assert_eq!(out, [0.0, -1.0, 0.5]);
-        assert_eq!(peak(&shared), 1.0);
+    }
+
+    #[test]
+    fn u32_origin_is_the_middle() {
+        let (out, _) = run(&[1_u32 << 31, 0, 3 << 30], 1, 8);
+        assert_eq!(out, [0.0, -1.0, 0.5]);
     }
 
     #[test]
@@ -256,9 +308,8 @@ mod tests {
 
     #[test]
     fn f32_passes_through() {
-        let (out, shared) = run(&[0.25_f32, -0.75], 2, 8);
+        let (out, _) = run(&[0.25_f32, -0.75], 2, 8);
         assert_eq!(out, [0.25, -0.75]);
-        assert_eq!(peak(&shared), 0.75);
     }
 
     #[test]
@@ -267,5 +318,38 @@ mod tests {
         let (out, shared) = run(&[0.5_f32; 8], 2, 5);
         assert_eq!(out.len(), 4);
         assert_eq!(shared.dropped.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn meter_shows_post_gain_level_of_the_last_whole_window() {
+        const RATE: u32 = 16_000;
+        let window = samples_for(WINDOW, RATE);
+        let opts = Audio {
+            gain_db: 20.0 * 2.0_f64.log10(),
+            denoise: false,
+            trim: false,
+            normalize: false,
+            ..Audio::default()
+        };
+        let mut pipeline = Pipeline::new(RATE, &opts).unwrap();
+        // Stereo: two windows at 0.1, one at 0.25, half a window at 0.9 that must wait in the ring.
+        let (mut tx, mut rx) = RingBuffer::new(window * 2 * 4);
+        let frames = [(0.1_f32, 2 * window), (0.25, window), (0.9, window / 2)];
+        for (value, count) in frames {
+            for _ in 0..count * 2 {
+                tx.push(value).unwrap();
+            }
+        }
+        let meter = LevelMeter::default();
+        drain_once(&mut rx, 2, window, &mut pipeline, &meter, false).unwrap();
+        let level = meter.read();
+        assert!((level.peak - 0.5).abs() < 1e-5, "{level:?}");
+        assert!((level.rms - 0.5).abs() < 1e-5, "{level:?}");
+        assert_eq!(rx.slots(), window);
+
+        // The last pass takes the part window too.
+        drain_once(&mut rx, 2, window, &mut pipeline, &meter, true).unwrap();
+        assert!((meter.read().peak - 1.8).abs() < 1e-4);
+        assert_eq!(rx.slots(), 0);
     }
 }
