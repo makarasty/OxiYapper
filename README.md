@@ -8,7 +8,7 @@ Design: one executable. `oxi-yapper` runs the small resident daemon (tray, hotke
 
 ## Build
 
-Needs Rust 1.85+, CMake and LLVM/clang (bindgen). Pick a GPU backend with a feature flag:
+Needs Rust 1.88+, CMake and LLVM/clang (bindgen). Pick a GPU backend with a feature flag:
 
 | Feature  | Backend | Extra requirements |
 |----------|---------|--------------------|

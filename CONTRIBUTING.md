@@ -4,7 +4,7 @@ Read `docs/SPEC.md` (what the app must do), `docs/ARCHITECTURE.md` (how) and `do
 
 ## Build
 
-Rust 1.85+, CMake, LLVM/clang (for bindgen). GPU backend by feature: `vulkan`, `cuda`, `metal`; none = CPU.
+Rust 1.88+, CMake, LLVM/clang (for bindgen). GPU backend by feature: `vulkan`, `cuda`, `metal`; none = CPU.
 
 Windows (PowerShell), MSVC Build Tools and the Vulkan SDK installed:
 

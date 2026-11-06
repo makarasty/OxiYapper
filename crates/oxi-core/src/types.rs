@@ -29,12 +29,11 @@ impl Sub for Millis {
 }
 
 /// Dictation language.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Language {
     Ru,
     En,
-    #[default]
     Auto,
 }
 
