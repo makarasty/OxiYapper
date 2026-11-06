@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
 use std::ptr;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use oxi_core::APP_NAME;
 use oxi_core::machine::{Event, Notice, Phase};
@@ -28,19 +28,20 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
     DestroyMenu, DestroyWindow, DispatchMessageW, GetMessageW, HICON, MF_GRAYED, MF_STRING, MSG,
-    PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW, PostQuitMessage, RegisterClassExW,
-    RegisterWindowMessageW, SM_CXSMICON, SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CONTEXTMENU, WM_NULL,
-    WM_POWERBROADCAST, WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
-    WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW, RegisterClassExW, RegisterWindowMessageW,
+    SM_CXSMICON, SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    TranslateMessage, WM_APP, WM_CONTEXTMENU, WM_NULL, WM_POWERBROADCAST, WM_WTSSESSION_CHANGE,
+    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
 use crate::draw::tray_icon;
 
-/// The [`Waker`] message.
+/// The [`Waker::wake`] message.
 const WM_WAKE: u32 = WM_APP;
 /// The icon's callback message.
 const WM_TRAY: u32 = WM_APP + 1;
+/// The [`Waker::quit`] message.
+const WM_EXIT: u32 = WM_APP + 2;
 const ICON_ID: u32 = 1;
 
 /// A tray menu entry; the discriminant is its menu command id.
@@ -51,16 +52,28 @@ pub enum MenuItem {
     Quit = 3,
 }
 
-/// Wakes [`MainLoop::run`] from any thread: `on_wake` runs on the UI thread.
+/// Wakes or ends [`MainLoop::run`] from any thread.
 #[derive(Debug, Clone)]
-pub struct Waker(usize);
+pub struct Waker(Arc<Mutex<Option<usize>>>);
 
 impl Waker {
-    /// Fails once the loop's window is gone.
+    /// `on_wake` runs on the UI thread. Fails with `NotConnected` once the loop is dropped.
     pub fn wake(&self) -> io::Result<()> {
-        let hwnd: HWND = ptr::with_exposed_provenance_mut(self.0);
-        // SAFETY: PostMessageW takes any handle value and fails on a dead window.
-        if unsafe { PostMessageW(hwnd, WM_WAKE, 0, 0) } == 0 {
+        self.post(WM_WAKE)
+    }
+
+    /// [`MainLoop::run`] returns once the messages before this one are handled.
+    pub fn quit(&self) -> io::Result<()> {
+        self.post(WM_EXIT)
+    }
+
+    fn post(&self, msg: u32) -> io::Result<()> {
+        // Held while posting: Drop clears the handle under the same lock before destroying the
+        // window, so a recycled handle never gets our message.
+        let slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let addr = slot.ok_or(io::ErrorKind::NotConnected)?;
+        // SAFETY: the window is alive while the slot holds its handle.
+        if unsafe { PostMessageW(ptr::with_exposed_provenance_mut(addr), msg, 0, 0) } == 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
@@ -74,10 +87,34 @@ enum Incoming {
     Menu { x: i32, y: i32 },
     Session(Event),
     TaskbarCreated,
+    Exit,
 }
+
+type OnSession = Box<dyn FnMut(Event)>;
 
 thread_local! {
     static INBOX: RefCell<VecDeque<Incoming>> = const { RefCell::new(VecDeque::new()) };
+    /// `on_session` while [`MainLoop::run`] runs: the window procedure calls it directly.
+    static SESSION: RefCell<Option<OnSession>> = const { RefCell::new(None) };
+}
+
+/// Clears [`SESSION`] when `run` ends, also by panic.
+struct SessionGuard;
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        SESSION.with_borrow_mut(|f| *f = None);
+    }
+}
+
+/// Runs `on_session` now; false when it is not installed or already running.
+fn deliver(event: Event) -> bool {
+    SESSION.with(|f| {
+        f.try_borrow_mut()
+            .ok()
+            .and_then(|mut f| f.as_mut().map(|f| f(event)))
+            .is_some()
+    })
 }
 
 /// Window class atom, 0 when registration failed.
@@ -91,6 +128,8 @@ pub struct MainLoop {
     phase: Phase,
     icon: HICON,
     copy_last: bool,
+    /// The handle every [`Waker`] posts to; `None` once dropped.
+    slot: Arc<Mutex<Option<usize>>>,
 }
 
 impl MainLoop {
@@ -146,6 +185,7 @@ impl MainLoop {
             phase: Phase::Idle,
             icon: ptr::null_mut(),
             copy_last: false,
+            slot: Arc::new(Mutex::new(Some(hwnd.expose_provenance()))),
         };
         // SAFETY: `hwnd` is our live window.
         if unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } == 0 {
@@ -157,7 +197,7 @@ impl MainLoop {
 
     #[must_use]
     pub fn waker(&self) -> Waker {
-        Waker(self.hwnd.expose_provenance())
+        Waker(Arc::clone(&self.slot))
     }
 
     /// The hidden window, for owning other windows and for posting test messages.
@@ -191,21 +231,20 @@ impl MainLoop {
         shell(NIM_MODIFY, &data)
     }
 
-    /// Ends [`run`](Self::run) once the current message is handled.
-    pub fn quit() {
-        // SAFETY: no arguments to check; it posts WM_QUIT to the calling thread.
-        unsafe { PostQuitMessage(0) }
-    }
-
-    /// Runs the thread's message loop until [`quit`](Self::quit). `on_wake` runs for each
-    /// [`Waker::wake`], `on_menu` for the chosen menu entry, `on_session` for Suspend, Resume,
-    /// Lock and Unlock.
+    /// Runs the thread's message loop until [`Waker::quit`]. `on_wake` runs for each
+    /// [`Waker::wake`] and `on_menu` for the chosen menu entry, both from the loop.
+    ///
+    /// `on_session` gets Suspend, Resume, Lock and Unlock inside the window procedure, before
+    /// it returns: Windows sends `PBT_APMSUSPEND` and sleeps soon after the reply, so a queued
+    /// Suspend could arrive only after resume (item 46). Keep it short: forward the event.
     pub fn run(
         &mut self,
         mut on_wake: impl FnMut(&mut Self),
         mut on_menu: impl FnMut(&mut Self, MenuItem),
-        mut on_session: impl FnMut(Event),
+        on_session: impl FnMut(Event) + 'static,
     ) {
+        SESSION.with_borrow_mut(|f| *f = Some(Box::new(on_session)));
+        let _clear = SessionGuard;
         let mut msg = MSG::default();
         // SAFETY: `msg` is a valid out-pointer; a null window takes every message of the thread.
         // GetMessageW returns 0 on WM_QUIT and -1 on error; both end the loop.
@@ -218,7 +257,11 @@ impl MainLoop {
             while let Some(incoming) = INBOX.with_borrow_mut(VecDeque::pop_front) {
                 match incoming {
                     Incoming::Wake => on_wake(self),
-                    Incoming::Session(event) => on_session(event),
+                    // Seen before `run` or while `on_session` was running.
+                    Incoming::Session(event) => {
+                        deliver(event);
+                    }
+                    Incoming::Exit => return,
                     Incoming::Menu { x, y } => match self.menu(x, y) {
                         Ok(Some(item)) => on_menu(self, item),
                         Ok(None) => {}
@@ -348,6 +391,8 @@ impl MainLoop {
 
 impl Drop for MainLoop {
     fn drop(&mut self) {
+        // First, under the lock: no Waker posts to this handle once the window is gone.
+        *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
         let _ = shell(NIM_DELETE, &self.data(0));
         // SAFETY: our window, on its own thread (MainLoop is not Send); a failed unregister
         // (never registered) is harmless.
@@ -382,6 +427,7 @@ fn halves(bytes: &[u8]) -> (i16, i16) {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let incoming = match msg {
         WM_WAKE => Some(Incoming::Wake),
+        WM_EXIT => Some(Incoming::Exit),
         WM_TRAY => {
             let (event, _) = halves(&lparam.to_le_bytes());
             let (x, y) = halves(&wparam.to_le_bytes());
@@ -390,14 +436,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 y: y.into(),
             })
         }
-        WM_POWERBROADCAST | WM_WTSSESSION_CHANGE => {
-            session_event(msg, wparam).map(Incoming::Session)
-        }
+        WM_POWERBROADCAST | WM_WTSSESSION_CHANGE => session_event(msg, wparam)
+            .filter(|&event| !deliver(event))
+            .map(Incoming::Session),
         m if TASKBAR_CREATED.get() == Some(&m) => Some(Incoming::TaskbarCreated),
         _ => None,
     };
     if let Some(incoming) = incoming {
         INBOX.with_borrow_mut(|q| q.push_back(incoming));
+        // A sent message (TaskbarCreated, the shell's callback) is handled inside GetMessageW,
+        // which then keeps waiting: a posted WM_NULL makes it return so `run` drains the inbox.
+        // SAFETY: `hwnd` is the window this procedure runs for.
+        unsafe { PostMessageW(hwnd, WM_NULL, 0, 0) };
     }
     // Default handling suits every message above (TRUE for WM_POWERBROADCAST, 0 otherwise).
     // SAFETY: the arguments Windows passed to this procedure.
