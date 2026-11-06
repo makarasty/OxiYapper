@@ -1,10 +1,80 @@
-// Overlay page. A stub of the shell: the Overlay page task fills it.
-import { Group } from "../widgets.slint";
+// Overlay page (SPEC Feedback): the pill on or off, its spot on screen, hiding it over
+// fullscreen apps, and a preview the daemon shows at the picked spot.
+import { Button } from "std-widgets.slint";
+import { Group, ToggleRow, ThumbPicker } from "../widgets.slint";
+
+// Filled and read by `pages::overlay`.
+export global OverlayState {
+    in-out property <bool> enabled;
+    // Picker order: top left, top centre, top right, then the bottom row the same way.
+    in property <int> position;
+    in-out property <bool> hide-over-fullscreen;
+    callback enabled-toggled(bool);
+    callback position-picked(int);
+    callback hide-over-fullscreen-toggled(bool);
+    callback preview();
+}
 
 export component OverlayPage inherits VerticalLayout {
     alignment: start;
     spacing: 10px;
     Group {
         title: @tr("Overlay");
+        ToggleRow {
+            label: @tr("Show the overlay");
+            checked <=> OverlayState.enabled;
+            toggled(on) => {
+                OverlayState.enabled-toggled(on);
+            }
+        }
+        ToggleRow {
+            label: @tr("Hide over fullscreen apps");
+            checked <=> OverlayState.hide-over-fullscreen;
+            toggled(on) => {
+                OverlayState.hide-over-fullscreen-toggled(on);
+            }
+        }
+    }
+    Group {
+        title: @tr("Position");
+        // Two rows laid out like the screen; one picker per row, so six cards fit the panel.
+        VerticalLayout {
+            padding-top: 4px;
+            padding-bottom: 4px;
+            spacing: 4px;
+            ThumbPicker {
+                accessible-label: @tr("Position, top row");
+                thumbs: [
+                    { image: @image-url("../img/overlay-top-left.svg"), caption: @tr("Top left") },
+                    { image: @image-url("../img/overlay-top-centre.svg"), caption: @tr("Top centre") },
+                    { image: @image-url("../img/overlay-top-right.svg"), caption: @tr("Top right") },
+                ];
+                selected: OverlayState.position < 3 ? OverlayState.position : -1;
+                picked(i) => {
+                    OverlayState.position-picked(i);
+                }
+            }
+            ThumbPicker {
+                accessible-label: @tr("Position, bottom row");
+                thumbs: [
+                    { image: @image-url("../img/overlay-bottom-left.svg"), caption: @tr("Bottom left") },
+                    { image: @image-url("../img/overlay-bottom-centre.svg"), caption: @tr("Bottom centre") },
+                    { image: @image-url("../img/overlay-bottom-right.svg"), caption: @tr("Bottom right") },
+                ];
+                selected: OverlayState.position >= 3 ? OverlayState.position - 3 : -1;
+                picked(i) => {
+                    OverlayState.position-picked(i + 3);
+                }
+            }
+            HorizontalLayout {
+                alignment: start;
+                Button {
+                    text: @tr("Preview");
+                    clicked => {
+                        OverlayState.preview();
+                    }
+                }
+            }
+        }
     }
 }
