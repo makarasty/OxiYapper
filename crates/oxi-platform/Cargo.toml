@@ -45,7 +45,3 @@ features = [
 
 [lints]
 workspace = true
-
-# Added ahead of the task that uses them (wave 2 platform modules); remove the entry when it does.
-[package.metadata.cargo-machete]
-ignored = ["interprocess"]
