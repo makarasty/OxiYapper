@@ -187,7 +187,7 @@ mod tests {
 
     fn rig(download: Arc<DownloadFn>) -> (Worker, Receiver<Push>) {
         let pushes = Pushes::default();
-        let (_, rx) = pushes.claim();
+        let (_, rx) = pushes.claim(0);
         (
             Worker::new(download, pushes, PathBuf::from("models-test")),
             rx,

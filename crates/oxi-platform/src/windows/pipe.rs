@@ -31,7 +31,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::CancelIoEx;
 use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, WaitNamedPipeW};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    AllowSetForegroundWindow, GetForegroundWindow, GetWindowThreadProcessId,
+};
 
 /// winnt.h values; their windows-sys module (`System_SystemServices`) is not enabled here.
 const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
@@ -285,6 +287,16 @@ pub fn foreground_pid() -> u32 {
     // SAFETY: no arguments; `pid` is a live local, and a null window leaves it 0.
     unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &raw mut pid) };
     pid
+}
+
+/// Lets a window of process `pid` take the foreground (`AllowSetForegroundWindow`), so a
+/// `Raise` push can bring it forward.
+pub fn allow_foreground(pid: u32) -> io::Result<()> {
+    // SAFETY: plain value argument.
+    if unsafe { AllowSetForegroundWindow(pid) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Runs `op`, a blocking I/O call on `h`, and cancels it with `TimedOut` if it is still

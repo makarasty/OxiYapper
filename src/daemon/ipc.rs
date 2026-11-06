@@ -56,6 +56,8 @@ pub trait Host: Send + Sync + 'static {
     /// Is the foreground window one of process `client`, the settings window that holds the
     /// connection (never one of this daemon's own windows, such as the tray menu).
     fn settings_foreground(&self, client: u32) -> bool;
+    /// Lets the windows of process `client` take the foreground, before a `Raise`.
+    fn allow_foreground(&self, client: u32) -> io::Result<()>;
     /// The `Devices` push.
     fn devices(&self) -> Push;
     /// Start a settings window.
@@ -71,7 +73,7 @@ pub struct Pushes(Arc<Mutex<Slot>>);
 #[derive(Default)]
 struct Slot {
     next_id: u64,
-    current: Option<(u64, SyncSender<Push>)>,
+    current: Option<(u64, u32, SyncSender<Push>)>,
 }
 
 impl Pushes {
@@ -79,7 +81,7 @@ impl Pushes {
     /// queue is full (it is then disconnected, so a stuck window cannot grow memory).
     pub fn send(&self, push: Push) -> bool {
         let mut slot = lock(&self.0);
-        let Some((_, tx)) = &slot.current else {
+        let Some((_, _, tx)) = &slot.current else {
             return false;
         };
         match tx.try_send(push) {
@@ -97,18 +99,23 @@ impl Pushes {
     }
 
     /// A new settings connection; the old one, if any, ends.
-    pub(super) fn claim(&self) -> (u64, Receiver<Push>) {
+    pub(super) fn claim(&self, client: u32) -> (u64, Receiver<Push>) {
         let (tx, rx) = mpsc::sync_channel(QUEUE);
         let mut slot = lock(&self.0);
         slot.next_id += 1;
         let id = slot.next_id;
-        slot.current = Some((id, tx));
+        slot.current = Some((id, client, tx));
         (id, rx)
+    }
+
+    /// Process id of the settings client, if one is connected.
+    fn client(&self) -> Option<u32> {
+        lock(&self.0).current.as_ref().map(|&(_, client, _)| client)
     }
 
     fn release(&self, id: u64) {
         let mut slot = lock(&self.0);
-        if slot.current.as_ref().is_some_and(|(cur, _)| *cur == id) {
+        if slot.current.as_ref().is_some_and(|(cur, _, _)| *cur == id) {
             slot.current = None;
         }
     }
@@ -342,6 +349,12 @@ impl Ctx {
         let first = session.settings.is_none();
         match req {
             Request::OpenSettings => {
+                // Windows only lets a window take the foreground when the process allows it.
+                if let Some(client) = self.pushes.client()
+                    && let Err(e) = self.host.allow_foreground(client)
+                {
+                    tracing::debug!(kind = ?e.kind(), "foreground not allowed for settings");
+                }
                 if !self.pushes.send(Push::Raise)
                     && let Err(e) = self.host.open_settings()
                 {
@@ -355,8 +368,11 @@ impl Ctx {
                 !first
             }
             Request::Hello { .. } => {
-                session.settings.get_or_insert_with(|| self.pushes.claim());
                 session.client = conn.peer_pid().unwrap_or(0);
+                let client = session.client;
+                session
+                    .settings
+                    .get_or_insert_with(|| self.pushes.claim(client));
                 conn.send(&hello_ack()).is_ok()
             }
             // Only the settings connection may ask for anything else.
@@ -526,6 +542,10 @@ impl Host for SystemHost {
         )
     }
 
+    fn allow_foreground(&self, client: u32) -> io::Result<()> {
+        oxi_platform::os::pipe::allow_foreground(client)
+    }
+
     fn devices(&self) -> Push {
         let mics = oxi_platform::capture::list_input_devices().unwrap_or_else(|e| {
             tracing::warn!("cannot list microphones: {e}");
@@ -574,6 +594,7 @@ mod tests {
     enum Call {
         Capture(bool, bool),
         Open,
+        Allow(u32),
     }
 
     struct Fake {
@@ -595,6 +616,10 @@ mod tests {
         }
         fn settings_foreground(&self, _client: u32) -> bool {
             self.foreground.load(Ordering::Relaxed)
+        }
+        fn allow_foreground(&self, client: u32) -> io::Result<()> {
+            let _ = self.calls.send(Call::Allow(client));
+            Ok(())
         }
         fn devices(&self) -> Push {
             Push::Devices {
@@ -743,6 +768,8 @@ mod tests {
         let mut window = settings(&rig);
         forward_open_settings(&rig.name).unwrap();
         assert_eq!(window.recv::<Push>().unwrap(), Some(Push::Raise));
+        // The window may take the focus: allowed for the client's own pid (here this process).
+        assert_eq!(rig.calls.try_recv(), Ok(Call::Allow(std::process::id())));
         assert!(rig.calls.try_recv().is_err(), "no second window");
     }
 
