@@ -67,6 +67,21 @@ pub struct Stamp {
     pub mtime_ms: u64,
 }
 
+impl Stamp {
+    /// Contents of the `.ok` file: `<size> <mtime_ms>\n`.
+    pub fn to_line(self) -> String {
+        format!("{} {}\n", self.size, self.mtime_ms)
+    }
+
+    /// Reads [`Stamp::to_line`] back; `None` for anything else (a re-hash follows).
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut fields = text.trim_end().split(' ');
+        let size = fields.next()?.parse().ok()?;
+        let mtime_ms = fields.next()?.parse().ok()?;
+        fields.next().is_none().then_some(Self { size, mtime_ms })
+    }
+}
+
 /// Name of the stamp file next to `file_name`.
 pub fn stamp_file_name(file_name: &str) -> String {
     format!("{file_name}.ok")
