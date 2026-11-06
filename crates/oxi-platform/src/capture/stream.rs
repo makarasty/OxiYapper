@@ -389,7 +389,7 @@ mod tests {
     #[test]
     fn meter_shows_post_gain_level_of_the_last_whole_window() {
         const RATE: u32 = 16_000;
-        let window = samples_for(WINDOW, RATE);
+        let window = samples_for(CHUNK, RATE);
         let opts = Audio {
             gain_db: 20.0 * 2.0_f64.log10(),
             denoise: false,
@@ -436,7 +436,7 @@ mod tests {
         shared.stop.store(true, Ordering::Release);
         let drain = Drain {
             channels: 1,
-            window: samples_for(WINDOW, RATE),
+            window: samples_for(CHUNK, RATE),
             shared: &shared,
             meter: &LevelMeter::default(),
         };
