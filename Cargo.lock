@@ -958,7 +958,6 @@ name = "oxi-yapper"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "hound",
  "oxi-core",
  "oxi-platform",
  "oxi-whisper",

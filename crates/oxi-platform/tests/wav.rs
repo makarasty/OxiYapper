@@ -44,6 +44,27 @@ fn out_of_range_samples_are_clamped() {
 }
 
 #[test]
+fn reads_stereo_int_wav_as_mono() {
+    let dir = scratch("stereo");
+    let path = dir.join("a.wav");
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: 8000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut w = hound::WavWriter::create(&path, spec).unwrap();
+    for (l, r) in [(16384_i16, 0_i16), (-16384, -16384)] {
+        w.write_sample(l).unwrap();
+        w.write_sample(r).unwrap();
+    }
+    w.finalize().unwrap();
+    let (mono, rate) = read_wav_mono_f32(&path).unwrap();
+    assert_eq!((rate, mono), (8000, vec![0.25, -0.5]));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn rejects_a_path_without_wav_extension() {
     let dir = scratch("ext");
     assert!(write_wav(&dir.join("a.txt"), &[0.0]).is_err());

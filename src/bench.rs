@@ -16,15 +16,15 @@ use oxi_core::dictionary::build_prompt;
 use oxi_core::models::MODELS;
 use oxi_core::text::{self, HallucinationFilter, Outcome, ReplaceRules, decode_text_file};
 use oxi_core::types::Language;
-use oxi_platform::capture::{Capture, CpalCapture, LevelMeter};
+use oxi_platform::capture::{Capture, CaptureEvent, CpalCapture, LevelMeter};
 use oxi_platform::wav::{read_wav_mono_f32, write_wav};
 use oxi_whisper::{DeviceChoice, Engine};
 
 use crate::net::sha256_file;
 
 const USAGE: &str = "usage: oxi-yapper bench <dir> --model <path> [--gpu <name|cpu|auto>] \
-                     [--lang ru|en|auto] [--prompt-file <file>]
-                            oxi-yapper bench --record <seconds> <out.wav>  (raw 16 kHz mono: no trim,                      no normalise)";
+                     [--lang ru|en|auto] [--prompt-file <file>]\n       \
+                     oxi-yapper bench --record <seconds> <out.wav>  (raw 16 kHz mono: no trim, no normalise)";
 
 #[derive(Debug)]
 struct Args {
@@ -118,20 +118,28 @@ fn wav_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// `--record <seconds> <out.wav>`: the whole argument list, nothing else.
+/// `--record <seconds> <out.wav>`: the whole argument list, nothing else. Seconds are capped
+/// at the config recording limit; the path is checked before the microphone opens.
 fn parse_record(args: &[String]) -> Result<(Duration, PathBuf)> {
     let [_, secs, out] = args else {
-        bail!(
-            "--record takes <seconds> <out.wav>
-{USAGE}"
-        );
+        bail!("--record takes <seconds> <out.wav>\n{USAGE}");
     };
-    let secs: f64 = secs
+    let max = Audio::default().max_seconds;
+    let len = secs
         .parse()
         .ok()
-        .filter(|s: &f64| s.is_finite() && *s > 0.0)
+        .filter(|s: &f64| *s > 0.0)
+        .and_then(|s| Duration::try_from_secs_f64(s).ok())
         .with_context(|| format!("--record: seconds must be a positive number, got {secs:?}"))?;
-    Ok((Duration::from_secs_f64(secs), PathBuf::from(out)))
+    if len > Duration::from_secs(max.into()) {
+        bail!("--record: at most {max} s, got {secs}");
+    }
+    let out = PathBuf::from(out);
+    // write_wav accepts only a lowercase extension.
+    if out.extension().is_none_or(|e| e != "wav") {
+        bail!("--record: {} must end in .wav (lowercase)", out.display());
+    }
+    Ok((len, out))
 }
 
 fn record(args: &[String]) -> Result<()> {
@@ -142,12 +150,18 @@ fn record(args: &[String]) -> Result<()> {
         normalize: false,
         ..Audio::default()
     };
-    let capture = CpalCapture::open("", &opts, LevelMeter::default(), |_| {})?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let capture = CpalCapture::open("", &opts, LevelMeter::default(), move |e| {
+        let _ = tx.send(e);
+    })?;
     println!(
         "recording {:.1} s from the default microphone",
         len.as_secs_f64()
     );
-    std::thread::sleep(len);
+    // Any event ends the wait: a lost device keeps its part, a failure surfaces from `finish`.
+    if let Ok(CaptureEvent::DeviceLost) = rx.recv_timeout(len) {
+        eprintln!("warning: microphone lost, keeping what was captured");
+    }
     let clip = capture.finish()?;
     write_wav(&out, &clip)?;
     println!(
@@ -303,8 +317,28 @@ mod tests {
             &["--record", "-1", "a.wav"],
             &["--record", "x", "a.wav"],
             &["--record", "3", "a.wav", "b.wav"],
+            &["--record", "1e30", "a.wav"],
+            &["--record", "inf", "a.wav"],
+            &["--record", "NaN", "a.wav"],
+            &["--record", "600.5", "a.wav"],
+            &["--record", "3", "a.WAV"],
+            &["--record", "3", "a.txt"],
+            &["--record", "3", "a"],
         ] {
             assert!(parse_record(&strs(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn record_seconds_up_to_the_config_limit() {
+        let (len, _) = parse_record(&strs(&["--record", "600", "a.wav"])).unwrap();
+        assert_eq!(len, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn usage_has_no_space_runs_mid_line() {
+        for line in USAGE.lines() {
+            assert!(!line.trim_start().contains("   "), "{line:?}");
         }
     }
 
@@ -314,25 +348,6 @@ mod tests {
         assert_eq!(percentile(&[7], 95), 7);
         let v: Vec<u128> = (1..=10).collect();
         assert_eq!((percentile(&v, 50), percentile(&v, 95)), (5, 10));
-    }
-
-    #[test]
-    fn reads_stereo_int_wav_as_mono() {
-        let path = scratch("wav").join("a.wav");
-        let spec = hound::WavSpec {
-            channels: 2,
-            sample_rate: 8000,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut w = hound::WavWriter::create(&path, spec).unwrap();
-        for (l, r) in [(16384_i16, 0_i16), (-16384, -16384)] {
-            w.write_sample(l).unwrap();
-            w.write_sample(r).unwrap();
-        }
-        w.finalize().unwrap();
-        let (mono, rate) = read_wav_mono_f32(&path).unwrap();
-        assert_eq!((rate, mono), (8000, vec![0.25, -0.5]));
     }
 
     #[test]
