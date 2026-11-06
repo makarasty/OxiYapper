@@ -41,7 +41,7 @@ use windows_sys::core::PCWSTR;
 use windows_sys::w;
 
 use crate::capture::LevelMeter;
-use crate::draw::{bgra, pill};
+use crate::draw::{PillCanvas, bgra_into};
 
 const CLASS: PCWSTR = w!("OxiYapperOverlay");
 const TIMER: usize = 1;
@@ -53,7 +53,7 @@ const BLEND: BLENDFUNCTION = BLENDFUNCTION {
     SourceConstantAlpha: 255,
     AlphaFormat: AC_SRC_ALPHA as u8,
 };
-/// More bars than ever fit in the pill; `draw::pill` shows the newest that do.
+/// More bars than ever fit in the pill; the canvas shows the newest that do.
 const BARS: usize = PILL_W_DIP.unsigned_abs() as usize;
 
 #[derive(Debug, Error)]
@@ -72,12 +72,15 @@ struct Inner<'f> {
     hwnd: HWND,
     level: LevelMeter,
     meter: Meter,
-    font: Option<FontRef<'f>>,
+    canvas: PillCanvas<'f>,
     state: OverlayState,
     rect: Rect,
     start: Instant,
     dc: HDC,
     dib: Option<Dib>,
+    /// Makes `render` fail, to test the error path of `show`.
+    #[cfg(test)]
+    fail_render: bool,
 }
 
 /// A top-down 32-bit DIB selected into `Inner::dc`.
@@ -142,7 +145,7 @@ impl<'f> Overlay<'f> {
                 hwnd,
                 level,
                 meter: Meter::new(BARS, 0.0),
-                font,
+                canvas: PillCanvas::new(font),
                 state: OverlayState::Hidden,
                 rect: Rect {
                     x: 0,
@@ -153,6 +156,8 @@ impl<'f> Overlay<'f> {
                 start: Instant::now(),
                 dc,
                 dib: None,
+                #[cfg(test)]
+                fail_render: false,
             }));
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, inner as isize);
             Ok(Self { inner })
@@ -195,6 +200,15 @@ impl Drop for Overlay<'_> {
 
 impl Inner<'_> {
     fn show(&mut self, state: OverlayState, cfg: &Config) -> Result<(), OverlayError> {
+        let shown = self.try_show(state, cfg);
+        if shown.is_err() {
+            // No stale pill and no meter timer outside a recording after a failed show.
+            self.hide();
+        }
+        shown
+    }
+
+    fn try_show(&mut self, state: OverlayState, cfg: &Config) -> Result<(), OverlayError> {
         if state == OverlayState::Hidden || !visible(&cfg.overlay, quns()) {
             self.hide();
             return Ok(());
@@ -240,19 +254,18 @@ impl Inner<'_> {
     }
 
     /// Draws the pill into the DIB and hands it to the window, which also moves it to `rect`.
+    /// After the first frame of a state it allocates nothing: the canvas and the DIB are reused.
     fn render(&mut self) -> Result<(), OverlayError> {
-        let Some(pm) = pill(
-            self.state,
-            &self.meter,
-            self.now(),
-            self.rect,
-            self.font.as_ref(),
-        ) else {
+        #[cfg(test)]
+        if self.fail_render {
+            return Err(OverlayError::Win32("render", io::Error::other("injected")));
+        }
+        let now = self.now();
+        let Some(pm) = self.canvas.draw(self.state, &self.meter, now, self.rect) else {
             return Ok(());
         };
         let Rect { x, y, w, h } = self.rect;
-        let bits = self.dib(w, h)?;
-        bits.copy_from_slice(&bgra(&pm));
+        bgra_into(pm, dib(&mut self.dib, self.dc, w, h)?);
         // SAFETY: `dc` holds a `w` x `h` DIB; every pointer is to a live local.
         let ok = unsafe {
             UpdateLayeredWindow(
@@ -272,55 +285,55 @@ impl Inner<'_> {
         }
         Ok(())
     }
+}
 
-    /// The pixels of a `w` x `h` DIB selected into `dc`, made anew only when the size changes.
-    fn dib(&mut self, w: i32, h: i32) -> Result<&mut [u8], OverlayError> {
-        if self.dib.as_ref().is_none_or(|d| (d.w, d.h) != (w, h)) {
-            let info = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: size_of::<BITMAPINFOHEADER>().try_into().unwrap_or(u32::MAX),
-                    biWidth: w,
-                    biHeight: -h, // top-down, the row order of a pixmap
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB,
-                    ..Default::default()
-                },
+/// The pixels of a `w` x `h` DIB selected into `dc`, made anew only when the size changes.
+fn dib(slot: &mut Option<Dib>, dc: HDC, w: i32, h: i32) -> Result<&mut [u8], OverlayError> {
+    if slot.as_ref().is_none_or(|d| (d.w, d.h) != (w, h)) {
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>().try_into().unwrap_or(u32::MAX),
+                biWidth: w,
+                biHeight: -h, // top-down, the row order of a pixmap
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
                 ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = null_mut();
+        // SAFETY: `info` and `bits` are live locals; the old bitmap is deleted only after the
+        // new one replaced it in `dc`.
+        unsafe {
+            let bitmap = CreateDIBSection(
+                dc,
+                &raw const info,
+                DIB_RGB_COLORS,
+                &raw mut bits,
+                null_mut(),
+                0,
+            );
+            if bitmap.is_null() {
+                return Err(last("CreateDIBSection"));
+            }
+            SelectObject(dc, bitmap);
+            let new = Dib {
+                bitmap,
+                bits: bits.cast(),
+                w,
+                h,
             };
-            let mut bits = null_mut();
-            // SAFETY: `info` and `bits` are live locals; the old bitmap is deleted only after the
-            // new one replaced it in `dc`.
-            unsafe {
-                let bitmap = CreateDIBSection(
-                    self.dc,
-                    &raw const info,
-                    DIB_RGB_COLORS,
-                    &raw mut bits,
-                    null_mut(),
-                    0,
-                );
-                if bitmap.is_null() {
-                    return Err(last("CreateDIBSection"));
-                }
-                SelectObject(self.dc, bitmap);
-                let new = Dib {
-                    bitmap,
-                    bits: bits.cast(),
-                    w,
-                    h,
-                };
-                if let Some(old) = self.dib.replace(new) {
-                    DeleteObject(old.bitmap);
-                }
+            if let Some(old) = slot.replace(new) {
+                DeleteObject(old.bitmap);
             }
         }
-        let d = self.dib.as_ref().ok_or_else(|| last("CreateDIBSection"))?;
-        let len = usize::try_from(d.w).unwrap_or(0) * usize::try_from(d.h).unwrap_or(0) * 4;
-        // SAFETY: a w x h 32-bit DIB has exactly `len` bytes at `bits`, alive while it is
-        // selected; `&mut self` keeps every other writer out.
-        Ok(unsafe { std::slice::from_raw_parts_mut(d.bits, len) })
     }
+    let d = slot.as_ref().ok_or_else(|| last("CreateDIBSection"))?;
+    let len = usize::try_from(d.w).unwrap_or(0) * usize::try_from(d.h).unwrap_or(0) * 4;
+    // SAFETY: a w x h 32-bit DIB has exactly `len` bytes at `bits`, alive while it is
+    // selected; the `&mut` slot keeps every other writer out.
+    Ok(unsafe { std::slice::from_raw_parts_mut(d.bits, len) })
 }
 
 impl Drop for Inner<'_> {
@@ -402,4 +415,40 @@ fn quns() -> Quns {
 
 fn last(call: &'static str) -> OverlayError {
     OverlayError::Win32(call, io::Error::last_os_error())
+}
+
+#[cfg(test)]
+mod tests {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+
+    use super::*;
+
+    /// Live: shows a window. Runs only with `OXI_OVERLAY_TEST=1`.
+    #[test]
+    fn a_failed_show_hides_and_stops_the_meter_timer() {
+        if std::env::var_os("OXI_OVERLAY_TEST").is_none_or(|v| v != "1") {
+            eprintln!("skipped: set OXI_OVERLAY_TEST=1");
+            return;
+        }
+        let cfg = Config::default();
+        let mut overlay = Overlay::new(LevelMeter::default(), None).unwrap();
+        let recording = OverlayState::Recording {
+            locked: false,
+            ending_soon: false,
+        };
+        overlay.show(recording, &cfg).unwrap();
+        overlay.inner().fail_render = true;
+        assert!(overlay.show(OverlayState::Transcribing, &cfg).is_err());
+        let inner = overlay.inner();
+        assert_eq!(inner.state, OverlayState::Hidden);
+        // SAFETY: our live window; KillTimer returns 0 when no such timer runs.
+        unsafe {
+            assert_eq!(IsWindowVisible(inner.hwnd), 0, "a stale pill stays up");
+            assert_eq!(
+                KillTimer(inner.hwnd, TIMER),
+                0,
+                "the meter timer still runs"
+            );
+        }
+    }
 }
