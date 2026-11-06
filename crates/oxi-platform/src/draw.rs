@@ -6,32 +6,16 @@
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
 use oxi_core::machine::{OverlayState, Phase};
-use oxi_core::overlay::{Icon, Meter, Rect, Rgba, look, palette};
+use oxi_core::overlay::palette::{EDGE, SURFACE, TEXT};
+use oxi_core::overlay::{
+    Icon, Meter, PILL_BAR_GAP as BAR_GAP, PILL_BAR_MAX as BAR_MAX, PILL_BAR_W as BAR_W,
+    PILL_EM as EM, PILL_EM_MIN as EM_MIN, PILL_GAP as GAP, PILL_ICON as ICON,
+    PILL_METER_MIN as METER_MIN, PILL_PAD as PAD, Rect, Rgba, look, palette,
+};
 use oxi_core::types::Millis;
 use tiny_skia::{
     FillRule, LineCap, LineJoin, Mask, Paint, Path, PathBuilder, Pixmap, Stroke, Transform,
 };
-
-// shortcut: surface, text and edge colours belong in `oxi_core::overlay::palette` (t23 owns
-// it); move them there when that file is next touched.
-/// The pill body: opaque near-black, readable over light and dark desktops alike.
-const SURFACE: Rgba = Rgba(0x1E, 0x1F, 0x24, 0xFF);
-const TEXT: Rgba = Rgba(0xEE, 0xEF, 0xF2, 0xFF);
-/// Hairline rim that keeps the pill's outline visible on a dark desktop.
-const EDGE: Rgba = Rgba(0xFF, 0xFF, 0xFF, 0x24);
-
-// Shares of the pill height.
-const PAD: f32 = 0.34;
-const ICON: f32 = 0.46;
-const GAP: f32 = 0.22;
-const EM: f32 = 0.33;
-/// Narrowest meter next to a label; a longer label shrinks its font instead.
-const METER_MIN: f32 = 0.7;
-const BAR_MAX: f32 = 0.5;
-const BAR_W: f32 = 0.065;
-const BAR_GAP: f32 = 0.05;
-/// Smallest label font, as a share of [`EM`]: below it the label is cut instead.
-const EM_MIN: f32 = 0.85;
 
 /// The overlay pill for `state`, sized `rect.w` x `rect.h` (the [`place`] result).
 /// `now` decides the clipping colour of the meter. Without a font the pill shows its icon and

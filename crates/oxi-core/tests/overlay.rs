@@ -256,7 +256,7 @@ fn every_state_has_a_look_and_every_phase_a_tooltip() {
         ending_soon: true,
     });
     assert_eq!(locked_ending.icon, Icon::Lock);
-    assert_eq!(locked_ending.label, "Locked, ending");
+    assert_eq!(locked_ending.label, "Ending soon");
     // Clipping must be visible against the normal meter colour.
     let (a, b) = (palette::RECORDING, palette::CLIP);
     let dist = [(a.0, b.0), (a.1, b.1), (a.2, b.2)]
