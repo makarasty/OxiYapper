@@ -13,13 +13,13 @@ serde.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
 thiserror.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 rubato.workspace = true
 earshot.workspace = true
 nnnoiseless = { workspace = true, default-features = false }
 
 [dev-dependencies]
-serde_json.workspace = true
 proptest.workspace = true
 insta.workspace = true
 
