@@ -51,6 +51,72 @@ fn word_after(chars: &[char], i: usize) -> bool {
     }
 }
 
+/// Separator strength: sentence-final marks beat `,;:`; 0 for anything else.
+fn separator_rank(c: char) -> u8 {
+    match c {
+        '.' | '!' | '?' | '\u{2026}' => 2,
+        ',' | ';' | ':' => 1,
+        _ => 0,
+    }
+}
+
+/// `c` closes what precedes it, so no space goes before it. A straight quote closes only
+/// when no word follows it.
+fn is_closer(c: char, next: Option<char>) -> bool {
+    separator_rank(c) > 0
+        || matches!(c, ')' | ']' | '}' | '\u{201D}' | '\u{BB}')
+        || (matches!(c, '"' | '\'') && !next.is_some_and(is_word))
+}
+
+/// `c` opens what follows it, so no space goes after it. A straight `"` opens only after a
+/// space, the start, or another opener.
+fn is_opener(c: char, prev: Option<char>) -> bool {
+    matches!(c, '(' | '[' | '{' | '\u{201C}' | '\u{AB}')
+        || (c == '"' && prev.is_none_or(|p| p.is_whitespace() || is_opener(p, None)))
+}
+
+/// Join the text around a deleted word: `out` holds what came before, `chars[i..]` what
+/// follows. Only the spacing and separators touching the deleted word change. Returns the
+/// index to continue from.
+fn join_after_deletion(out: &mut String, chars: &[char], mut i: usize) -> usize {
+    let skip_space = |mut i: usize| {
+        while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+            i += 1;
+        }
+        i
+    };
+    out.truncate(out.trim_end().len());
+    i = skip_space(i);
+    let mut rev = out.chars().rev();
+    let last = rev.next();
+    // At the start or after an opener the deleted word takes its separators with it.
+    if last.is_none_or(|c| is_opener(c, rev.next())) {
+        while chars.get(i).is_some_and(|&c| separator_rank(c) > 0) {
+            i = skip_space(i + 1);
+        }
+        return i;
+    }
+    let left = last.map_or(0, separator_rank);
+    while let Some(&next) = chars.get(i) {
+        if !is_closer(next, chars.get(i + 1).copied()) {
+            out.push(' ');
+            break;
+        }
+        let right = separator_rank(next);
+        if left > 0 && right > 0 && right <= left {
+            // Doubled separator: the left one is as strong, drop the right one.
+            i = skip_space(i + 1);
+            continue;
+        }
+        if left == 1 {
+            // A comma-like mark before a stronger mark or a closer goes.
+            out.pop();
+        }
+        break;
+    }
+    i
+}
+
 impl ReplaceRules {
     /// Parse a `replace.txt`. Blank lines are skipped; a line without `=>` or with an empty
     /// left side is ignored and its number reported. When two lines share `heard`, the first wins.
@@ -95,15 +161,8 @@ impl ReplaceRules {
             if let Some((heard, wanted)) = hit {
                 out.push_str(wanted);
                 i += heard.len();
-                // A deleted word must not leave two spaces or a space before punctuation.
-                if wanted.is_empty() && out.ends_with(char::is_whitespace) {
-                    match chars.get(i) {
-                        Some(c) if c.is_whitespace() => i += 1,
-                        Some(c) if ".,!?;:\u{2026}".contains(*c) => {
-                            out.truncate(out.trim_end().len());
-                        }
-                        _ => {}
-                    }
+                if wanted.is_empty() {
+                    i = join_after_deletion(&mut out, &chars, i);
                 }
             } else {
                 out.push(chars[i]);

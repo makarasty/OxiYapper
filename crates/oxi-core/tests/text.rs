@@ -89,6 +89,23 @@ fn replace_rules_table() {
         // No space is left before punctuation.
         ("well um, fine", "well, fine"),
         ("so um\u{2026} ok", "so\u{2026} ok"),
+        ("(well um) fine", "(well) fine"),
+        ("say \"well um\" ok", "say \"well\" ok"),
+        (
+            "say \u{201C}um well\u{201D} ok",
+            "say \u{201C}well\u{201D} ok",
+        ),
+        // A deleted word at the start takes its separator with it.
+        ("um, fine", "fine"),
+        ("(um, fine)", "(fine)"),
+        // No doubled separators; the stronger mark stays.
+        ("fine, um.", "fine."),
+        ("fine. um, then", "fine. then"),
+        ("(fine, um)", "(fine)"),
+        ("well um um fine", "well fine"),
+        // Spacing away from a deletion is the user's and stays.
+        ("a  b um c", "a  b c"),
+        ("say \"well\" um ok", "say \"well\" ok"),
         // Apostrophes inside a word do not make a boundary.
         ("I'm here", "I'm here"),
         ("I'll go", "I'll go"),
