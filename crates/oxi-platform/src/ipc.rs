@@ -249,8 +249,10 @@ impl Conn {
     }
 
     /// The next message, `None` once the peer has closed. The read timeout covers the whole
-    /// call, however the peer splits the line. Any `Err` (a line over `MAX_LINE`, bad JSON:
-    /// `InvalidData`; `TimedOut`) means drop this connection.
+    /// call, however the peer splits the line. `TimedOut` leaves the connection usable: bytes
+    /// of a half-read line stay buffered and a later `recv` finishes it, so a loop may poll
+    /// with a short timeout. Any other `Err` (a line over `MAX_LINE`, bad JSON: `InvalidData`)
+    /// means drop this connection.
     pub fn recv<T: Message>(&mut self) -> io::Result<Option<T>> {
         self.check_broken()?;
         let mut buf = [0u8; 16 * 1024];
@@ -277,6 +279,23 @@ impl Conn {
                 n => self.dec.push(&buf[..n]),
             }
         }
+    }
+
+    /// Process id of the client, on the server end of a connection from [`Server::accept`].
+    #[cfg(windows)]
+    pub fn peer_pid(&self) -> io::Result<u32> {
+        use std::os::windows::io::AsHandle;
+        let Stream::NamedPipe(pipe) = &self.stream;
+        crate::os::pipe::client_pid(pipe.inner().as_handle())
+    }
+
+    // shortcut: no peer-credential lookup on Unix until its module lands.
+    #[cfg(not(windows))]
+    pub fn peer_pid(&self) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no peer process id on this OS yet",
+        ))
     }
 
     fn check_broken(&self) -> io::Result<()> {
@@ -308,9 +327,11 @@ fn timed<R>(
 }
 
 /// Second launch: ask the daemon serving `name` to open settings, then wait until it closes
-/// the connection; all of it together takes at most a few seconds. The daemon closes a
-/// connection whose first message is `OpenSettings` after acting on it (the settings
-/// window starts with `Hello`).
+/// the connection; all of it together takes at most a few seconds. The daemon answers a
+/// connection whose first message is `OpenSettings` with `HelloAck` and closes it after
+/// acting on it (the settings window starts with `Hello`). A close without that ack (a daemon
+/// that refused the connection for want of a free slot, or an older one) is [`Error::Busy`]:
+/// the request may not have been acted on.
 pub fn forward_open_settings(name: &str) -> Result<(), Error> {
     let deadline = Instant::now() + FORWARD_WAIT;
     let left = || match deadline.saturating_duration_since(Instant::now()) {
@@ -322,12 +343,19 @@ pub fn forward_open_settings(name: &str) -> Result<(), Error> {
     };
     let mut conn = Conn::connect_within(name, BUSY_WAIT.min(left()?))?;
     conn.set_write_timeout(Some(left()?))?;
-    conn.send(&Request::OpenSettings)?;
+    match conn.send(&Request::OpenSettings) {
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Err(Error::Busy),
+        r => r?,
+    }
     // A pipe closed before the daemon accepts it is discarded unread, so hold it open.
+    let mut acked = false;
     loop {
         conn.set_read_timeout(Some(left()?))?;
-        if conn.recv::<Push>()?.is_none() {
-            return Ok(());
+        match conn.recv::<Push>()? {
+            None if acked => return Ok(()),
+            None => return Err(Error::Busy),
+            Some(Push::HelloAck { .. }) => acked = true,
+            Some(_) => {}
         }
     }
 }

@@ -2,9 +2,22 @@
 
 use std::io;
 use std::thread;
+use std::time::Duration;
 
 use oxi_core::ipc::{MAX_LINE, PROTO, Push, Request};
-use oxi_platform::ipc::{Client, Error, Server, forward_open_settings};
+use oxi_platform::ipc::{Client, Error, Message, Server, forward_open_settings};
+
+/// Bytes written as they are, to split a line on the wire.
+struct Raw(String);
+
+impl Message for Raw {
+    fn encode(&self) -> String {
+        self.0.clone()
+    }
+    fn decode(_: &mut oxi_core::ipc::Decoder) -> Option<Result<Self, oxi_core::ipc::DecodeError>> {
+        None
+    }
+}
 
 /// A name no other test or running daemon uses.
 fn name(tag: &str) -> String {
@@ -86,12 +99,69 @@ fn second_launch_forwards_open_settings() {
     let n = name("forward");
     let server = Server::bind(&n).unwrap();
     let got = thread::scope(|s| {
-        let daemon = s.spawn(|| server.accept().unwrap().recv::<Request>().unwrap());
-        // Returns only after the daemon side has read the line and closed.
+        let daemon = s.spawn(|| {
+            let mut conn = server.accept().unwrap();
+            let got = conn.recv::<Request>().unwrap();
+            conn.send(&Push::HelloAck {
+                proto: PROTO,
+                version: "0.0.0-test".into(),
+            })
+            .unwrap();
+            got
+        });
+        // Returns only after the daemon side has read the line, acked and closed.
         forward_open_settings(&n).unwrap();
         daemon.join().unwrap()
     });
     assert_eq!(got, Some(Request::OpenSettings));
+}
+
+#[test]
+fn close_without_ack_is_busy_not_forwarded() {
+    let n = name("noack");
+    let server = Server::bind(&n).unwrap();
+    thread::scope(|s| {
+        s.spawn(|| {
+            // A daemon with no free slot: reads the line like the real one, then drops it.
+            let mut conn = server.accept().unwrap();
+            let _ = conn.recv::<Request>();
+        });
+        let err = forward_open_settings(&n).unwrap_err();
+        assert!(matches!(err, Error::Busy), "{err:?}");
+    });
+}
+
+#[test]
+fn recv_timeout_keeps_the_connection_and_a_half_line() {
+    let n = name("halfline");
+    let server = Server::bind(&n).unwrap();
+    thread::scope(|s| {
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        s.spawn(move || {
+            let mut conn = server.accept().unwrap();
+            let _ = conn.recv::<Request>();
+            // Raw bytes: half of a Push line, a pause, the rest.
+            let line = oxi_core::ipc::encode(&Push::Raise);
+            let (a, b) = line.split_at(line.len() / 2);
+            conn.send(&Raw(a.into())).unwrap();
+            wait.recv().unwrap();
+            conn.send(&Raw(b.into())).unwrap();
+        });
+        let mut client = Client::connect(&n).unwrap();
+        client.send(&hello()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        for _ in 0..2 {
+            let err = client.recv::<Push>().unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        }
+        go.send(()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(client.recv::<Push>().unwrap(), Some(Push::Raise));
+    });
 }
 
 #[cfg(unix)]
@@ -110,7 +180,7 @@ mod windows {
     use std::io::Read;
     use std::os::windows::io::{AsHandle, AsRawHandle};
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, prelude::*};
     use oxi_platform::os::pipe::{owner_only_sddl, user_sid};
@@ -140,7 +210,7 @@ mod windows {
         let sddl = owner_only_sddl("S-1-5-21-1-2-3-1001");
         assert_eq!(
             sddl,
-            "O:S-1-5-21-1-2-3-1001D:P(A;;GA;;;S-1-5-21-1-2-3-1001)S:(ML;;NW;;;ME)"
+            "O:S-1-5-21-1-2-3-1001D:P(A;;GA;;;S-1-5-21-1-2-3-1001)S:(ML;;NWNR;;;ME)"
         );
         assert!(!sddl.contains("WD") && !sddl.contains("Everyone"));
     }

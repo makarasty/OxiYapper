@@ -15,15 +15,15 @@
 
 #![allow(dead_code, reason = "run.rs (t40) calls bind and spawn")]
 
+use std::collections::VecDeque;
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use oxi_core::device::DeviceChoice;
 use oxi_core::hotkey::Key;
 use oxi_core::ipc::{PROTO, Push, Request};
 use oxi_platform::ipc::{Conn, Error, Server, default_name, forward_open_settings};
@@ -41,15 +41,21 @@ const POLL: Duration = Duration::from_millis(50);
 const FIRST_MESSAGE: Duration = Duration::from_secs(5);
 /// A write the client does not read within this long ends the connection.
 const WRITE_LIMIT: Duration = Duration::from_secs(2);
-/// How long `Status` waits for the coordinator.
+/// How long a `Status` waits for the coordinator before it is dropped.
 const ASK_LIMIT: Duration = Duration::from_secs(2);
+/// `Status` asks waiting for the coordinator, per connection; more are ignored.
+const MAX_ASKS: usize = 4;
+/// How often capture checks that the settings window still has the focus, on a thread of its
+/// own: a stalled send or a slow ask on the connection must not delay turning capture off.
+const FOCUS_POLL: Duration = Duration::from_millis(20);
 
 /// What the server needs from the OS and the rest of the daemon; fake in the tests.
 pub trait Host: Send + Sync + 'static {
     /// Hotkey capture on or off; `swallow` while the settings window is foreground.
     fn set_capture(&self, on: bool, swallow: bool);
-    /// Is a settings window the foreground window.
-    fn settings_foreground(&self) -> bool;
+    /// Is the foreground window one of process `client`, the settings window that holds the
+    /// connection (never one of this daemon's own windows, such as the tray menu).
+    fn settings_foreground(&self, client: u32) -> bool;
     /// The `Devices` push.
     fn devices(&self) -> Push;
     /// Start a settings window.
@@ -236,8 +242,50 @@ struct Ctx {
 struct Session {
     /// Set by `Hello`: this is the settings connection.
     settings: Option<(u64, Receiver<Push>)>,
-    /// This connection switched hotkey capture on.
-    capture: bool,
+    /// Process id of the settings client; 0 when unknown (capture is then refused).
+    client: u32,
+    /// Hotkey capture this connection switched on.
+    capture: Option<FocusGuard>,
+    /// `Status` asks the coordinator has not answered yet, oldest first.
+    asks: VecDeque<(Receiver<StatusReport>, Instant)>,
+}
+
+/// Turns capture off the moment the settings window loses the foreground.
+struct FocusGuard {
+    stop: Arc<AtomicBool>,
+    /// The guard turned capture off itself.
+    lost: Arc<AtomicBool>,
+}
+
+impl FocusGuard {
+    fn start(host: &Arc<dyn Host>, client: u32) -> io::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let lost = Arc::new(AtomicBool::new(false));
+        let (host, flags) = (host.clone(), (stop.clone(), lost.clone()));
+        thread::Builder::new()
+            .name("ipc-focus".into())
+            .spawn(move || {
+                let (stop, lost) = flags;
+                loop {
+                    thread::sleep(FOCUS_POLL);
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if !host.settings_foreground(client) {
+                        host.set_capture(false, false);
+                        lost.store(true, Ordering::Release);
+                        return;
+                    }
+                }
+            })?;
+        Ok(Self { stop, lost })
+    }
+
+    /// Ends the guard; `true` when capture was still on (the caller turns it off).
+    fn end(&self) -> bool {
+        self.stop.store(true, Ordering::Release);
+        !self.lost.load(Ordering::Acquire)
+    }
 }
 
 impl Ctx {
@@ -248,9 +296,7 @@ impl Ctx {
         {
             self.serve(&mut conn, &mut session);
         }
-        if session.capture {
-            self.host.set_capture(false, false);
-        }
+        self.end_capture(&mut session);
         if let Some((id, _)) = session.settings {
             self.pushes.release(id);
         }
@@ -262,9 +308,15 @@ impl Ctx {
             if !flush(conn, session) {
                 return;
             }
-            if session.capture && !self.host.settings_foreground() {
-                self.host.set_capture(false, false);
-                session.capture = false;
+            if session
+                .capture
+                .as_ref()
+                .is_some_and(|g| g.lost.load(Ordering::Acquire))
+            {
+                session.capture = None;
+            }
+            if !self.answer_status(conn, session) {
+                return;
             }
             match conn.recv::<Request>() {
                 // A client that connects and closes (the probe of `Server::bind`) reads as `None`.
@@ -297,20 +349,21 @@ impl Ctx {
                 {
                     tracing::warn!(kind = ?e.kind(), "settings window not started");
                 }
-                // The caller of a second launch waits for this close.
+                if first {
+                    // The second launch waits for this ack and the close after it; a close
+                    // without the ack (no free slot) tells it nothing was acted on.
+                    let _ = conn.send(&hello_ack());
+                }
                 !first
             }
             Request::Hello { .. } => {
                 session.settings.get_or_insert_with(|| self.pushes.claim());
-                let ack = Push::HelloAck {
-                    proto: PROTO,
-                    version: crate::VERSION.into(),
-                };
-                conn.send(&ack).is_ok()
+                session.client = conn.peer_pid().unwrap_or(0);
+                conn.send(&hello_ack()).is_ok()
             }
             // Only the settings connection may ask for anything else.
             _ if first => false,
-            Request::Status => self.status(conn),
+            Request::Status => self.status(session),
             Request::ListDevices => conn.send(&self.host.devices()).is_ok(),
             Request::DownloadModel { id } => self.io.send(IoCmd::Download { id }).is_ok(),
             Request::CancelDownload { id } => self.io.send(IoCmd::CancelDownload { id }).is_ok(),
@@ -329,26 +382,63 @@ impl Ctx {
         }
     }
 
-    fn status(&self, conn: &mut Conn) -> bool {
-        let (tx, rx) = mpsc::channel();
-        if self.inbox.send(Inbox::Ipc(IpcAsk::Status(tx))).is_err() {
-            return false;
-        }
-        let Ok(report) = rx.recv_timeout(ASK_LIMIT) else {
-            tracing::warn!("coordinator did not answer Status");
+    /// Asks the coordinator; the answer is sent by [`Ctx::answer_status`], so a busy
+    /// coordinator never holds up this connection's loop.
+    fn status(&self, session: &mut Session) -> bool {
+        if session.asks.len() >= MAX_ASKS {
             return true;
-        };
-        conn.send(&status_push(report, self.host.backend())).is_ok()
+        }
+        let (tx, rx) = mpsc::channel();
+        session.asks.push_back((rx, Instant::now()));
+        self.inbox.send(Inbox::Ipc(IpcAsk::Status(tx))).is_ok()
     }
 
-    /// Capture starts only while the settings window is foreground (it ends when it is not).
+    /// Sends the answers that came in; drops asks the coordinator left unanswered too long.
+    fn answer_status(&self, conn: &mut Conn, session: &mut Session) -> bool {
+        while let Some((rx, asked)) = session.asks.front() {
+            match rx.try_recv() {
+                Ok(report) => {
+                    session.asks.pop_front();
+                    if conn
+                        .send(&status_push(report, self.host.backend()))
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+                Err(TryRecvError::Empty) if asked.elapsed() < ASK_LIMIT => break,
+                Err(_) => {
+                    tracing::warn!("coordinator did not answer Status");
+                    session.asks.pop_front();
+                }
+            }
+        }
+        true
+    }
+
+    /// Capture starts only while the settings window is foreground and ends the moment it is not.
     fn capture(&self, on: bool, session: &mut Session) {
-        if on && !session.capture && self.host.settings_foreground() {
-            self.host.set_capture(true, true);
-            session.capture = true;
-        } else if !on && session.capture {
+        if !on {
+            self.end_capture(session);
+        } else if session.capture.is_none()
+            && session.client != 0
+            && self.host.settings_foreground(session.client)
+        {
+            match FocusGuard::start(&self.host, session.client) {
+                Ok(guard) => {
+                    self.host.set_capture(true, true);
+                    session.capture = Some(guard);
+                }
+                Err(e) => tracing::warn!(kind = ?e.kind(), "capture not started"),
+            }
+        }
+    }
+
+    fn end_capture(&self, session: &mut Session) {
+        if let Some(guard) = session.capture.take()
+            && guard.end()
+        {
             self.host.set_capture(false, false);
-            session.capture = false;
         }
     }
 }
@@ -372,16 +462,27 @@ fn flush(conn: &mut Conn, session: &Session) -> bool {
     }
 }
 
+fn hello_ack() -> Push {
+    Push::HelloAck {
+        proto: PROTO,
+        version: crate::VERSION.into(),
+    }
+}
+
 fn status_push(report: StatusReport, backend: String) -> Push {
     Push::Status {
         phase: report.phase,
         model: report.model,
-        // shortcut: the report's `device` is the `[audio]` microphone, the push wants the GPU choice;
-        // fixed with the settings page that shows it (t30b).
-        device: DeviceChoice::from(report.device),
+        device: report.gpu,
         backend,
         warnings: report.warnings,
     }
+}
+
+/// The foreground window belongs to the settings client, and that client is not this daemon
+/// (its tray menu is a foreground window of ours).
+fn is_settings(foreground: u32, client: u32, own: u32) -> bool {
+    foreground != 0 && foreground == client && foreground != own
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -392,8 +493,6 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct SystemHost {
     hook: Arc<oxi_platform::os::hook::HookHandle>,
     backend: Box<dyn Fn() -> String + Send + Sync>,
-    /// Exe file name; the settings window is a process of our own exe.
-    exe_name: String,
     /// The settings process this daemon started, kept so a window that is still starting is not
     /// started twice.
     child: Mutex<Option<std::process::Child>>,
@@ -403,18 +502,12 @@ impl SystemHost {
     pub fn new(
         hook: Arc<oxi_platform::os::hook::HookHandle>,
         backend: Box<dyn Fn() -> String + Send + Sync>,
-    ) -> io::Result<Self> {
-        let exe = std::env::current_exe()?;
-        let exe_name = exe
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        Ok(Self {
+    ) -> Self {
+        Self {
             hook,
             backend,
-            exe_name,
             child: Mutex::default(),
-        })
+        }
     }
 }
 
@@ -423,11 +516,12 @@ impl Host for SystemHost {
         self.hook.set_capture(on, swallow);
     }
 
-    fn settings_foreground(&self) -> bool {
-        use oxi_core::paste::Input;
-        // The daemon's own windows (pill, tray menu) never take the foreground.
-        let app = oxi_platform::os::input::Keyboard.foreground().app;
-        !self.exe_name.is_empty() && app.eq_ignore_ascii_case(&self.exe_name)
+    fn settings_foreground(&self, client: u32) -> bool {
+        is_settings(
+            oxi_platform::os::pipe::foreground_pid(),
+            client,
+            std::process::id(),
+        )
     }
 
     fn devices(&self) -> Push {
@@ -463,9 +557,8 @@ impl Host for SystemHost {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
-
     use oxi_core::config::OverlayPosition;
+    use oxi_core::device::DeviceChoice;
     use oxi_core::ipc::MAX_LINE;
     use oxi_core::machine::Phase;
 
@@ -488,7 +581,7 @@ mod tests {
         fn set_capture(&self, on: bool, swallow: bool) {
             let _ = self.calls.send(Call::Capture(on, swallow));
         }
-        fn settings_foreground(&self) -> bool {
+        fn settings_foreground(&self, _client: u32) -> bool {
             self.foreground.load(Ordering::Relaxed)
         }
         fn devices(&self) -> Push {
@@ -599,7 +692,8 @@ mod tests {
         let report = StatusReport {
             phase: Phase::Recording,
             model: "tiny".into(),
-            device: "auto".into(),
+            device: "mic".into(),
+            gpu: DeviceChoice::Named("Vulkan0".into()),
             warnings: vec!["w".into()],
         };
         conn.send(&Request::Status).unwrap();
@@ -612,7 +706,7 @@ mod tests {
             Some(Push::Status {
                 phase: Phase::Recording,
                 model: "tiny".into(),
-                device: DeviceChoice::Auto,
+                device: DeviceChoice::Named("Vulkan0".into()),
                 backend: "cpu".into(),
                 warnings: vec!["w".into()],
             })
@@ -771,13 +865,16 @@ mod tests {
         };
         let _ = extra.send(&hello);
         assert!(extra.recv::<Push>().map_or(true, |m| m.is_none()));
+        // The second launch of a full daemon must not read that as "settings opened".
+        assert!(matches!(forward_open_settings(&rig.name), Err(Error::Busy)));
         drop(idle);
         // Slots free up as the threads see the closes.
         let deadline = Instant::now() + WAIT;
         loop {
             let mut conn = connect(&rig);
-            conn.send(&hello).unwrap();
-            if matches!(conn.recv::<Push>(), Ok(Some(Push::HelloAck { .. }))) {
+            if conn.send(&hello).is_ok()
+                && matches!(conn.recv::<Push>(), Ok(Some(Push::HelloAck { .. })))
+            {
                 break;
             }
             assert!(Instant::now() < deadline, "no slot freed");
@@ -812,6 +909,73 @@ mod tests {
         assert!(old.recv::<Push>().map_or(true, |m| m.is_none()));
         assert!(rig.pushes.send(Push::Raise));
         assert_eq!(new.recv::<Push>().unwrap(), Some(Push::Raise));
+    }
+
+    #[test]
+    fn an_unanswered_status_does_not_hold_up_the_focus_check() {
+        let rig = rig("slowask");
+        let mut conn = settings(&rig);
+        conn.send(&Request::CaptureHotkey { on: true }).unwrap();
+        assert_eq!(
+            rig.calls.recv_timeout(WAIT).unwrap(),
+            Call::Capture(true, true)
+        );
+        // The coordinator never answers.
+        conn.send(&Request::Status).unwrap();
+        assert!(matches!(
+            rig.inbox.recv_timeout(WAIT),
+            Ok(Inbox::Ipc(IpcAsk::Status(_)))
+        ));
+        let lost = Instant::now();
+        rig.host.foreground.store(false, Ordering::Relaxed);
+        assert_eq!(
+            rig.calls.recv_timeout(WAIT).unwrap(),
+            Call::Capture(false, false)
+        );
+        assert!(
+            lost.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            lost.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_late_status_answer_still_arrives() {
+        let rig = rig("lateask");
+        let mut conn = settings(&rig);
+        conn.send(&Request::Status).unwrap();
+        let Ok(Inbox::Ipc(IpcAsk::Status(reply))) = rig.inbox.recv_timeout(WAIT) else {
+            panic!("no Status ask");
+        };
+        thread::sleep(Duration::from_millis(300));
+        reply
+            .send(StatusReport {
+                phase: Phase::Idle,
+                model: "tiny".into(),
+                device: String::new(),
+                gpu: DeviceChoice::Auto,
+                warnings: vec![],
+            })
+            .unwrap();
+        assert!(matches!(
+            conn.recv::<Push>().unwrap(),
+            Some(Push::Status { .. })
+        ));
+    }
+
+    #[test]
+    fn only_the_settings_client_counts_as_foreground() {
+        // (foreground, client, own, expected)
+        let cases = [
+            (100, 100, 1, true),
+            (1, 100, 1, false),   // the daemon's own window, such as the tray menu
+            (1, 1, 1, false),     // a client that is the daemon itself
+            (200, 100, 1, false), // another app
+            (0, 0, 1, false),     // no foreground window, no known client
+        ];
+        for (fg, client, own, want) in cases {
+            assert_eq!(is_settings(fg, client, own), want, "{fg} {client} {own}");
+        }
     }
 
     #[test]

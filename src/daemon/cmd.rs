@@ -30,6 +30,7 @@
 use std::sync::mpsc::Sender;
 
 use oxi_core::config::{Audio, Config, ConfigError, Hotkey, Overlay, OverlayPosition, Paste};
+use oxi_core::device::DeviceChoice;
 use oxi_core::machine::{EngineWarning, Event, JobId, Notice, OverlayState, Phase};
 
 /// Everything the coordinator hears, on one channel with many senders.
@@ -82,6 +83,8 @@ pub struct StatusReport {
     pub model: String,
     /// Active `[audio] device`; empty is the system default.
     pub device: String,
+    /// Active `[model] gpu`.
+    pub gpu: DeviceChoice,
     /// Load corrections of the active config, the engine warning, then the last parse error.
     pub warnings: Vec<String>,
 }
