@@ -98,6 +98,10 @@ Platform code: each concern is a trait in `oxi-platform` (`Hotkey`, `Paster`, `C
 
 Transport: `interprocess` local socket. Windows: named pipe `\\.\pipe\OxiYapper-<user SID>` created with a DACL for the current user only and `PIPE_REJECT_REMOTE_CLIENTS` (the default pipe DACL lets Everyone read). macOS/Linux: Unix socket `OxiYapper.sock` in `$XDG_RUNTIME_DIR` (Linux) or the per-user `$TMPDIR` (macOS), directory mode 0700. A stale socket file (connect refused) is removed before bind.
 
+Windows clients open the pipe at `SECURITY_IDENTIFICATION` (the server can never act as the user) and, before sending anything, check the pipe's owner and mandatory integrity label. The daemon always sets owner = the user's SID and label = Medium (`S:(ML;;NW;;;ME)`), whether or not it runs elevated, so a normal second launch reaches an elevated daemon and the other way round. Outcomes, each with its own message: owner is another SID, or the pipe denies us -> `ForeignServer` ("held by another account"); owner is us but label below Medium (a sandboxed or low-integrity program squatting the name) -> `Untrusted` ("held by an untrusted program"); no instance free within 2 s -> `Busy` ("running but not answering"; busy alone is no evidence of a squatter). On `ForeignServer` or `Untrusted` the daemon refuses to start with that message and never treats the pipe as a running instance.
+
+Connection close rule: the daemon closes a connection whose first message is `OpenSettings` after acting on it; the settings window starts with `Hello` and keeps its connection. A second launch connects, sends `OpenSettings` and waits for that close within 3 s in total (connect, a stalled write and pushes in between all count against it), then exits (a pipe closed before the daemon accepts it is discarded unread, so it must not close first).
+
 Framing: one JSON object per line (`serde_json`), max 1 MiB per line, tagged enum `{"t": "...", ...}`. Types live in `oxi-core::ipc` and are snapshot-tested so a field rename shows up in review.
 
 | From settings | Reply / pushed by daemon |
