@@ -5,7 +5,6 @@ pub mod ipc;
 mod pages;
 
 use std::io;
-use std::sync::{Arc, Mutex};
 
 use oxi_core::config::{ConfigError, Theme};
 use oxi_core::ipc::Push;
@@ -37,15 +36,13 @@ pub enum Error {
 pub fn run() -> Result<(), Error> {
     let layout = oxi_platform::dirs::layout()?;
     oxi_platform::dirs::ensure(&layout)?;
-    // The worker reports a failed daemon spawn before the window exists; the window is
-    // looked up when the report reaches the UI thread.
-    let slot = Arc::new(Mutex::new(Weak::default()));
-    let mut options = Options::daemon()?;
-    options.spawn = watch_spawn(options.spawn, &slot);
-    let window = open_with(layout, Ipc::connect(options)?)?;
-    if let Ok(mut weak) = slot.lock() {
-        *weak = window.as_weak();
-    }
+    // The window comes first: it sets up the Slint platform, and the worker's events need that
+    // to reach the UI thread.
+    let window = open_inner(layout, |window| {
+        let mut options = Options::daemon()?;
+        options.spawn = watch_spawn(options.spawn, window.as_weak());
+        Ok(Some(Ipc::connect(options)?))
+    })?;
     window.run()?;
     Ok(())
 }
@@ -53,20 +50,14 @@ pub fn run() -> Result<(), Error> {
 /// `spawn` that also shows why it failed (the error kind only) in the window.
 fn watch_spawn(
     spawn: Box<dyn Fn() -> io::Result<()> + Send>,
-    slot: &Arc<Mutex<Weak<AppWindow>>>,
+    window: Weak<AppWindow>,
 ) -> Box<dyn Fn() -> io::Result<()> + Send> {
-    let slot = Arc::clone(slot);
     Box::new(move || {
         let result = spawn();
         if let Err(e) = &result {
             let note = spawn_note(e);
-            let slot = Arc::clone(&slot);
             // Err means the event loop is gone: the window is closing.
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(window) = slot.lock().ok().and_then(|weak| weak.upgrade()) {
-                    window.set_spawn_error(note.into());
-                }
-            });
+            let _ = window.upgrade_in_event_loop(move |window| window.set_spawn_error(note.into()));
         }
         result
     })
@@ -79,14 +70,25 @@ fn spawn_note(e: &io::Error) -> String {
 /// The settings window on `layout`'s config with no daemon link (it stays offline and shows no
 /// daemon banner); the caller shows it.
 pub fn open(layout: Layout) -> Result<AppWindow, Error> {
-    open_with(layout, Ipc::default())
+    open_inner(layout, |_| Ok(None))
 }
 
 /// [`open`] with the link to the daemon: its state and notices show in the daemon banner.
 pub fn open_with(layout: Layout, ipc: Ipc) -> Result<AppWindow, Error> {
+    open_inner(layout, |_| Ok(Some(ipc)))
+}
+
+/// `link` gets the new window (so the platform is up) and returns the daemon link to follow, if any.
+fn open_inner(
+    layout: Layout,
+    link: impl FnOnce(&AppWindow) -> Result<Option<Ipc>, Error>,
+) -> Result<AppWindow, Error> {
     let window = AppWindow::new()?;
     let (mut ctx, problem) = Ctx::load(layout)?;
-    ctx.ipc = ipc;
+    let followed = link(&window)?;
+    if let Some(ipc) = &followed {
+        ctx.ipc = ipc.clone();
+    }
     if let Some(problem) = &problem {
         window.set_banner_text(problem.to_string().into());
         // A broken file gets "Open file" and "Reset to defaults"; a newer one only the message.
@@ -117,12 +119,16 @@ pub fn open_with(layout: Layout, ipc: Ipc) -> Result<AppWindow, Error> {
         report(&weak, result);
     });
 
-    let weak = window.as_weak();
-    ctx.ipc.subscribe(move |event| {
-        if let Some(window) = weak.upgrade() {
-            on_daemon_event(&window, event);
-        }
-    });
+    if followed.is_some() {
+        let weak = window.as_weak();
+        ctx.ipc.subscribe(move |event| {
+            if let Some(window) = weak.upgrade() {
+                on_daemon_event(&window, event);
+            }
+        });
+        // The worker may have reported before the subscription: show the state as it is now.
+        on_daemon_event(&window, &Event::Link(ctx.ipc.link()));
+    }
     let ipc = ctx.ipc.clone();
     window.on_start_daemon({
         let weak = window.as_weak();
@@ -134,7 +140,15 @@ pub fn open_with(layout: Layout, ipc: Ipc) -> Result<AppWindow, Error> {
         }
     });
     let ipc = ctx.ipc.clone();
-    window.on_restart_daemon(move || ipc.restart_daemon());
+    window.on_restart_daemon({
+        let weak = window.as_weak();
+        move || {
+            if let Some(window) = weak.upgrade() {
+                window.set_spawn_error("".into());
+            }
+            ipc.restart_daemon();
+        }
+    });
 
     bind(&window, &ctx);
     Ok(window)
@@ -155,7 +169,8 @@ fn on_daemon_event(window: &AppWindow, event: &Event) {
     window.set_daemon_text(notice.map(|n| n.text).unwrap_or_default().into());
     window.set_daemon_start(action == Some(Action::Start));
     window.set_daemon_restart(action == Some(Action::Restart));
-    if matches!(event, Event::Link(Link::Online)) {
+    // Connecting and Offline keep it: the failure is reported just before them.
+    if matches!(event, Event::Link(link) if !matches!(link, Link::Connecting | Link::Offline)) {
         window.set_spawn_error("".into());
     }
 }

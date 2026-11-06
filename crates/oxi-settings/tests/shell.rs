@@ -325,3 +325,39 @@ fn a_failed_spawn_reason_shows_under_the_offline_note_until_online() {
     ipc.deliver(&Event::Link(Link::Online));
     assert_eq!(window.get_spawn_error(), "");
 }
+
+#[test]
+fn a_state_reported_before_the_window_followed_the_link_still_shows() {
+    i_slint_backend_testing::init_no_event_loop();
+    let (ipc, _rx) = Ipc::fake();
+    ipc.deliver(&Event::Link(Link::Untrusted));
+    let window = oxi_settings::open_with(layout("daemon-late", None), ipc).unwrap();
+    assert!(window.get_daemon_text().contains("untrusted"));
+    assert_eq!(banners(&window).len(), 1);
+}
+
+#[test]
+fn spawn_reason_clears_on_a_blocked_link_and_on_restart_but_not_on_connecting() {
+    let (window, ipc, _rx) = linked("daemon-spawn-clears");
+    let failed = || window.set_spawn_error("Could not start OxiYapper: entity not found.".into());
+    failed();
+    ipc.deliver(&Event::Link(Link::Connecting));
+    ipc.deliver(&Event::Link(Link::Offline));
+    assert!(window.get_spawn_error().contains("entity not found"));
+    for link in [
+        Link::Mismatch { daemon_proto: 9 },
+        Link::Busy,
+        Link::Stuck,
+        Link::Untrusted,
+        Link::Foreign,
+    ] {
+        failed();
+        ipc.deliver(&Event::Link(link));
+        assert_eq!(window.get_spawn_error(), "", "{link:?}");
+    }
+    failed();
+    ipc.deliver(&Event::Link(Link::Mismatch { daemon_proto: 9 }));
+    failed();
+    one(&window, "Restart").invoke_accessible_default_action();
+    assert_eq!(window.get_spawn_error(), "");
+}
