@@ -23,7 +23,7 @@ const REC: Ctx = Ctx {
 
 fn dn(key: Key) -> KeyInput {
     KeyInput {
-        key,
+        key: Some(key),
         down: true,
         ours: false,
     }
@@ -31,7 +31,7 @@ fn dn(key: Key) -> KeyInput {
 
 fn up(key: Key) -> KeyInput {
     KeyInput {
-        key,
+        key: Some(key),
         down: false,
         ours: false,
     }
@@ -295,7 +295,7 @@ fn esc_while_not_recording_passes() {
 #[test]
 fn ours_events_are_ignored() {
     let ours = |key, down| KeyInput {
-        key,
+        key: Some(key),
         down,
         ours: true,
     };
@@ -335,9 +335,14 @@ fn capture_forwards_keys_and_emits_no_event() {
         }
     );
     assert_eq!(t.on_key(dn(Key::Esc), fg), cap(Key::Esc, true, true));
-    assert_eq!(t.on_key(up(Key::Esc), IDLE), cap(Key::Esc, false, false));
-    assert_eq!(t.on_key(up(Key::LWin), IDLE), cap(Key::LWin, false, false));
+    // An up is swallowed exactly when its own down was, whatever the focus is now.
+    assert_eq!(t.on_key(up(Key::Esc), IDLE), cap(Key::Esc, false, true));
+    assert_eq!(t.on_key(up(Key::LWin), IDLE), cap(Key::LWin, false, true));
+    assert_eq!(t.on_key(dn(Key::LAlt), IDLE), cap(Key::LAlt, true, false));
+    assert_eq!(t.on_key(up(Key::LAlt), fg), cap(Key::LAlt, false, false));
     assert_eq!(t.on_key(up(Key::LCtrl), fg), cap(Key::LCtrl, false, true));
+    // A key outside `Key` is not captured and passes.
+    assert_eq!(t.on_key(UNKNOWN_DN, fg), PASS);
 
     t.set_capture(false);
     assert_eq!(t.on_key(dn(Key::LWin), IDLE), PASS);
@@ -355,6 +360,76 @@ fn set_chord_takes_the_new_keys() {
     assert_eq!(t.on_key(dn(Key::F13), IDLE), ev(Event::ChordDown));
 }
 
+const UNKNOWN_DN: KeyInput = KeyInput {
+    key: None,
+    down: true,
+    ours: false,
+};
+const UNKNOWN_UP: KeyInput = KeyInput {
+    key: None,
+    down: false,
+    ours: false,
+};
+
+#[test]
+fn unknown_key_while_chord_held_is_other_key_and_passes() {
+    run(&[
+        (UNKNOWN_DN, IDLE, PASS),
+        (UNKNOWN_UP, IDLE, PASS),
+        (dn(Key::LCtrl), IDLE, PASS),
+        (dn(Key::LWin), IDLE, ev(Event::ChordDown)),
+        // Ctrl+Win+VolumeUp: a shortcut; Windows saw a key, so Start stays closed by itself.
+        (UNKNOWN_DN, REC, ev(Event::OtherKey)),
+        (UNKNOWN_UP, IDLE, PASS),
+        (up(Key::LCtrl), IDLE, ev(Event::ChordUp)),
+        (up(Key::LWin), IDLE, PASS),
+    ]);
+}
+
+#[test]
+fn resync_forgets_key_ups_lost_on_the_secure_desktop() {
+    let mut t = Tracker::new(chord(&["Ctrl", "Win"]));
+    assert_eq!(t.on_key(dn(Key::LCtrl), IDLE), PASS);
+    assert_eq!(t.on_key(dn(Key::LWin), IDLE), ev(Event::ChordDown));
+    // Win+L: both ups go to the secure desktop. Ctrl is still physically held.
+    assert_eq!(t.resync(|k| k == Key::LCtrl), Some(Event::ChordUp));
+    assert_eq!(t.resync(|k| k == Key::LCtrl), None);
+    assert_eq!(t.resync(|_| false), None);
+    // A stale Ctrl would make a plain Win tap a chord and keep Start closed.
+    assert_eq!(t.on_key(dn(Key::LWin), IDLE), PASS);
+    assert_eq!(t.on_key(up(Key::LWin), IDLE), PASS);
+    // A stale Win would make a plain Ctrl press a chord.
+    assert_eq!(t.on_key(dn(Key::LWin), IDLE), PASS);
+    assert_eq!(t.resync(|_| false), None);
+    assert_eq!(t.on_key(dn(Key::LCtrl), IDLE), PASS);
+}
+
+#[test]
+fn resync_keeps_held_keys_and_a_held_chord() {
+    let mut t = Tracker::new(chord(&["Ctrl", "Win"]));
+    assert_eq!(t.on_key(dn(Key::LCtrl), IDLE), PASS);
+    assert_eq!(t.on_key(dn(Key::LWin), IDLE), ev(Event::ChordDown));
+    assert_eq!(t.resync(|k| matches!(k, Key::LCtrl | Key::LWin)), None);
+    assert_eq!(t.on_key(dn(Key::LWin), REC), PASS, "still a repeat");
+    assert_eq!(
+        t.on_key(up(Key::LWin), REC),
+        Verdict {
+            suppress_start: true,
+            ..ev(Event::ChordUp)
+        }
+    );
+}
+
+#[test]
+fn resync_clears_a_swallowed_esc_whose_up_was_lost() {
+    let mut t = Tracker::new(chord(&["Ctrl", "Win"]));
+    assert!(t.on_key(dn(Key::Esc), REC).swallow);
+    assert_eq!(t.resync(|_| false), None);
+    // Not recording now: this Esc passes, so its up must pass too.
+    assert_eq!(t.on_key(dn(Key::Esc), IDLE), PASS);
+    assert_eq!(t.on_key(up(Key::Esc), IDLE), PASS);
+}
+
 // ---- properties -------------------------------------------------------------------------------
 
 const POOL: [Key; 8] = [
@@ -368,26 +443,50 @@ const POOL: [Key; 8] = [
     Key::F13,
 ];
 
-fn input() -> impl Strategy<Value = (KeyInput, Ctx)> {
-    (
-        0..POOL.len(),
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    Key(KeyInput, Ctx),
+    /// Watchdog: bit `i` set means `POOL[i]` is physically held.
+    Resync(u8),
+    Capture(bool),
+}
+
+fn held_in(mask: u8) -> impl Fn(Key) -> bool {
+    move |k| {
+        POOL.iter()
+            .enumerate()
+            .any(|(i, p)| *p == k && mask & (1 << i) != 0)
+    }
+}
+
+/// `capture`: also turn capture on and off, with random focus.
+fn step(capture: bool) -> impl Strategy<Value = Step> {
+    let key = (
+        // `POOL.len()` stands for a key outside `Key`.
+        0..=POOL.len(),
         any::<bool>(),
         prop::bool::weighted(0.1),
         any::<bool>(),
+        any::<bool>(),
     )
-        .prop_map(|(i, down, ours, recording)| {
-            (
+        .prop_map(move |(i, down, ours, recording, swallow)| {
+            Step::Key(
                 KeyInput {
-                    key: POOL[i],
+                    key: POOL.get(i).copied(),
                     down,
                     ours,
                 },
                 Ctx {
                     recording,
-                    capture_swallow: false,
+                    capture_swallow: capture && swallow,
                 },
             )
-        })
+        });
+    prop_oneof![
+        20 => key,
+        1 => any::<u8>().prop_map(Step::Resync),
+        u32::from(capture) => any::<bool>().prop_map(Step::Capture),
+    ]
 }
 
 proptest! {
@@ -395,14 +494,23 @@ proptest! {
 
     /// Chord keys always reach other apps, and the machine sees Down, Up, Down, Up...
     #[test]
-    fn chord_keys_pass_and_down_up_alternate(steps in prop::collection::vec(input(), 0..200)) {
+    fn chord_keys_pass_and_down_up_alternate(steps in prop::collection::vec(step(false), 0..200)) {
         let mut t = Tracker::new(chord(&["Ctrl", "Win"]));
         let mut held = false;
-        for (input, ctx) in steps {
-            let v = t.on_key(input, ctx);
-            if matches!(input.key, Key::LCtrl | Key::RCtrl | Key::LWin | Key::RWin) {
-                prop_assert!(!v.swallow, "{input:?} swallowed");
-            }
+        for step in steps {
+            let v = match step {
+                Step::Key(input, ctx) => {
+                    let v = t.on_key(input, ctx);
+                    let never_swallowed = matches!(
+                        input.key,
+                        Some(Key::LCtrl | Key::RCtrl | Key::LWin | Key::RWin) | None
+                    );
+                    prop_assert!(!(never_swallowed && v.swallow), "{input:?} swallowed");
+                    v
+                }
+                Step::Resync(mask) => Verdict { event: t.resync(held_in(mask)), ..PASS },
+                Step::Capture(_) => unreachable!("no capture in this property"),
+            };
             match v.event {
                 Some(Event::ChordDown) => { prop_assert!(!held); held = true; }
                 Some(Event::ChordUp) => { prop_assert!(held); held = false; }
@@ -410,6 +518,50 @@ proptest! {
                 _ => {}
             }
             prop_assert!(v.captured.is_none());
+        }
+    }
+
+    /// An up is swallowed only when its own down was: no key is left stuck down in the OS.
+    #[test]
+    fn ups_are_swallowed_only_after_swallowed_downs(
+        steps in prop::collection::vec(step(true), 0..200),
+    ) {
+        let mut t = Tracker::new(chord(&["Ctrl", "Win"]));
+        let mut swallowed = [false; POOL.len()];
+        let mut down = [false; POOL.len()];
+        for step in steps {
+            match step {
+                Step::Key(input, ctx) => {
+                    let v = t.on_key(input, ctx);
+                    let Some(i) = input.key.and_then(|k| POOL.iter().position(|p| *p == k)) else {
+                        prop_assert!(!v.swallow, "{input:?} swallowed");
+                        continue;
+                    };
+                    if input.ours {
+                        prop_assert!(!v.swallow);
+                    } else if input.down {
+                        if down[i] {
+                            prop_assert_eq!(v.swallow, swallowed[i], "repeat of {:?}", input.key);
+                        }
+                        down[i] = true;
+                        swallowed[i] = v.swallow;
+                    } else {
+                        prop_assert!(!v.swallow || swallowed[i], "{:?} up swallowed", input.key);
+                        down[i] = false;
+                        swallowed[i] = false;
+                    }
+                }
+                Step::Resync(mask) => {
+                    t.resync(held_in(mask));
+                    for i in 0..POOL.len() {
+                        if mask & (1 << i) == 0 {
+                            down[i] = false;
+                            swallowed[i] = false;
+                        }
+                    }
+                }
+                Step::Capture(on) => t.set_capture(on),
+            }
         }
     }
 }

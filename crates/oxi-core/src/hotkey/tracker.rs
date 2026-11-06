@@ -5,7 +5,9 @@ use crate::machine::Event;
 /// One key event as the OS hook saw it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyInput {
-    pub key: Key,
+    /// `None`: a key outside [`Key`] (ISO `<>`, media, volume, browser keys). It is never a
+    /// chord key and never swallowed, but it still counts as another key.
+    pub key: Option<Key>,
     pub down: bool,
     /// Injected by `OxiYapper` itself (paste chord, Start blocker): passed, never tracked.
     pub ours: bool,
@@ -46,10 +48,10 @@ pub struct Tracker {
     chord: Chord,
     capture: bool,
     down: [bool; Key::ALL.len()],
+    /// The key's down was swallowed: its repeats and its up are swallowed too, and only then.
+    swallowed: [bool; Key::ALL.len()],
     /// `ChordDown` was sent and its `ChordUp` was not.
     active: bool,
-    /// An Esc down was swallowed: its repeats and its up are swallowed too.
-    esc_swallowed: bool,
     win: WinPress,
 }
 
@@ -59,8 +61,8 @@ impl Tracker {
             chord,
             capture: false,
             down: [false; Key::ALL.len()],
+            swallowed: [false; Key::ALL.len()],
             active: false,
-            esc_swallowed: false,
             win: WinPress::default(),
         }
     }
@@ -81,39 +83,75 @@ impl Tracker {
         self.active = false;
     }
 
+    /// Forgets every key that `held` (the physical key state) says is up: its key-up was lost
+    /// on the secure desktop (Win+L, Ctrl+Alt+Del, UAC). The hook calls it on every watchdog
+    /// poll and on session unlock and resume (ARCHITECTURE section 11 items 8 and 12).
+    /// Returns `ChordUp` if the chord was down and no longer is; nothing else.
+    pub fn resync(&mut self, held: impl Fn(Key) -> bool) -> Option<Event> {
+        for key in Key::ALL {
+            if !held(key) {
+                self.down[key as usize] = false;
+                self.swallowed[key as usize] = false;
+            }
+        }
+        if !self.win_held() {
+            self.win = WinPress::default();
+        }
+        if self.active && !self.chord_held() {
+            self.active = false;
+            return Some(Event::ChordUp);
+        }
+        None
+    }
+
     pub fn on_key(&mut self, input: KeyInput, ctx: Ctx) -> Verdict {
-        if input.ours {
+        match input.key {
+            _ if input.ours => Verdict::default(),
+            None => self.on_unknown(input.down),
+            Some(key) if input.down => self.on_down(key, ctx),
+            Some(key) => self.on_up(key),
+        }
+    }
+
+    fn on_unknown(&mut self, down: bool) -> Verdict {
+        if !down || self.capture {
             return Verdict::default();
         }
-        if input.down {
-            self.on_down(input.key, ctx)
-        } else {
-            self.on_up(input.key, ctx)
+        self.win.other = true;
+        Verdict {
+            // Repeats are not tracked here: the machine ignores a second OtherKey.
+            event: self.active.then_some(Event::OtherKey),
+            ..Verdict::default()
         }
     }
 
     fn on_down(&mut self, key: Key, ctx: Ctx) -> Verdict {
-        if self.down[key as usize] {
-            // Auto-repeat: never an event, but a swallowed key stays swallowed.
-            let swallow = if self.capture {
-                ctx.capture_swallow
-            } else {
-                key == Key::Esc && self.esc_swallowed
-            };
+        let i = key as usize;
+        if self.down[i] {
+            // Auto-repeat: never an event; swallowed exactly when its first down was.
             return Verdict {
-                swallow,
+                swallow: self.swallowed[i],
                 ..Verdict::default()
             };
         }
         if is_win(key) && !self.win_held() {
             self.win = WinPress::default();
         }
-        self.down[key as usize] = true;
+        self.down[i] = true;
+        let verdict = self.decide_down(key, ctx);
+        self.swallowed[i] = verdict.swallow;
+        verdict
+    }
+
+    fn decide_down(&mut self, key: Key, ctx: Ctx) -> Verdict {
         if self.capture {
-            return captured(key, true, ctx);
+            return Verdict {
+                swallow: ctx.capture_swallow,
+                captured: Some((key, true)),
+                ..Verdict::default()
+            };
         }
         if key == Key::Esc && ctx.recording {
-            self.esc_swallowed = true;
             return Verdict {
                 event: Some(Event::Esc),
                 swallow: true,
@@ -122,7 +160,7 @@ impl Tracker {
         }
         let mut event = None;
         if self.chord.contains(key) {
-            if !self.active && self.chord.is_held(|k| self.down[k as usize]) {
+            if !self.active && self.chord_held() {
                 self.active = true;
                 self.win.chord = true;
                 event = Some(Event::ChordDown);
@@ -140,21 +178,22 @@ impl Tracker {
         }
     }
 
-    fn on_up(&mut self, key: Key, ctx: Ctx) -> Verdict {
-        self.down[key as usize] = false;
-        if key == Key::Esc && self.esc_swallowed {
-            self.esc_swallowed = false;
+    fn on_up(&mut self, key: Key) -> Verdict {
+        let i = key as usize;
+        self.down[i] = false;
+        let swallow = std::mem::take(&mut self.swallowed[i]);
+        if self.capture {
             return Verdict {
-                swallow: true,
+                swallow,
+                captured: Some((key, false)),
                 ..Verdict::default()
             };
         }
-        if self.capture {
-            return captured(key, false, ctx);
-        }
-        let mut verdict = Verdict::default();
-        if self.active && self.chord.contains(key) && !self.chord.is_held(|k| self.down[k as usize])
-        {
+        let mut verdict = Verdict {
+            swallow,
+            ..Verdict::default()
+        };
+        if self.active && self.chord.contains(key) && !self.chord_held() {
             self.active = false;
             verdict.event = Some(Event::ChordUp);
         }
@@ -165,16 +204,12 @@ impl Tracker {
         verdict
     }
 
+    fn chord_held(&self) -> bool {
+        self.chord.is_held(|k| self.down[k as usize])
+    }
+
     fn win_held(&self) -> bool {
         self.down[Key::LWin as usize] || self.down[Key::RWin as usize]
-    }
-}
-
-fn captured(key: Key, down: bool, ctx: Ctx) -> Verdict {
-    Verdict {
-        swallow: ctx.capture_swallow,
-        captured: Some((key, down)),
-        ..Verdict::default()
     }
 }
 
