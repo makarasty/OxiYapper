@@ -27,10 +27,15 @@ fn outcome() -> impl Strategy<Value = PasteOutcome> {
 }
 
 fn config() -> impl Strategy<Value = MachineConfig> {
-    prop_oneof![Just(Mode::Push), Just(Mode::Toggle)].prop_map(|mode| MachineConfig {
-        mode,
-        ..MachineConfig::default()
-    })
+    (
+        prop_oneof![Just(Mode::Push), Just(Mode::Toggle)],
+        prop_oneof![Just("turbo"), Just("tiny")],
+    )
+        .prop_map(|(mode, model)| MachineConfig {
+            mode,
+            model: model.into(),
+            ..MachineConfig::default()
+        })
 }
 
 /// Every event except `ChordDown`, which is the only way to start a recording.
@@ -148,8 +153,8 @@ struct Workers {
 
 impl Workers {
     /// Feed the event the way the coordinator would see it, then check the effects.
-    fn observe(&mut self, event: Event, effects: &[Effect]) {
-        match event {
+    fn observe(&mut self, event: &Event, effects: &[Effect]) {
+        match *event {
             Event::TranscriptionDone { job, .. } | Event::TranscriptionFailed(job) => {
                 self.whisper_busy.remove(&job);
             }
@@ -201,8 +206,8 @@ proptest! {
         let mut now = 0;
         for (event, dt) in steps {
             now += dt;
-            let fx = step(&mut state, event, Millis(now));
-            workers.observe(event, &fx);
+            let fx = step(&mut state, event.clone(), Millis(now));
+            workers.observe(&event, &fx);
         }
     }
 

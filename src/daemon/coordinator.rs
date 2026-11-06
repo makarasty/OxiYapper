@@ -9,7 +9,7 @@
     reason = "run.rs (t40) spawns the coordinator; until then only the tests use it"
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
@@ -139,21 +139,27 @@ impl<H: ChordHook> Coordinator<H> {
         }
     }
 
-    /// One machine step: mirror the phase first (the hook reads it for Esc), then execute.
+    /// Machine steps until no effect answers with an event. Mirror the phase first (the hook
+    /// reads it for Esc), then execute. An answer waits until every effect of its step ran, so a
+    /// later effect of that step (an overlay) never overrides what the answer's step decided.
     fn feed(&mut self, event: Event, now: Millis) {
-        let effects = machine::step(&mut self.state, event, now);
-        let phase = self.state.phase();
-        self.phase.store(phase);
-        if phase != self.tray {
-            self.tray = phase;
-            self.ui(UiCmd::Tray(phase));
-        }
-        for effect in effects {
-            self.execute(&effect, now);
+        let mut queue = VecDeque::from([event]);
+        while let Some(event) = queue.pop_front() {
+            let effects = machine::step(&mut self.state, event, now);
+            let phase = self.state.phase();
+            self.phase.store(phase);
+            if phase != self.tray {
+                self.tray = phase;
+                self.ui(UiCmd::Tray(phase));
+            }
+            for effect in effects {
+                queue.extend(self.execute(&effect));
+            }
         }
     }
 
-    fn execute(&mut self, effect: &Effect, now: Millis) {
+    /// Runs one effect; returns the event it answers with, if any.
+    fn execute(&mut self, effect: &Effect) -> Option<Event> {
         match *effect {
             Effect::StartCapture => send(&self.workers.audio, AudioCmd::Start),
             Effect::StopCapture(job) => send(&self.workers.audio, AudioCmd::Stop(job)),
@@ -170,7 +176,7 @@ impl<H: ChordHook> Coordinator<H> {
                     WhisperCmd::Transcribe { job, samples },
                 ),
                 // Cannot happen (the machine waits for JobAudioReady); fail the job, not the machine.
-                None => self.feed(Event::TranscriptionFailed(job), now),
+                None => return Some(Event::TranscriptionFailed(job)),
             },
             Effect::Paste(job) => match self.text.get(&job) {
                 Some(text) => send(
@@ -182,17 +188,17 @@ impl<H: ChordHook> Coordinator<H> {
                     },
                 ),
                 // Cannot happen (empty text is never pasted); fail the job, not the machine.
-                None => self.feed(
-                    Event::PasteDone {
+                None => {
+                    return Some(Event::PasteDone {
                         job,
                         outcome: PasteOutcome::Failed,
-                    },
-                    now,
-                ),
+                    });
+                }
             },
             Effect::PollChord => {
-                let held = self.hook.chord_held();
-                self.feed(Event::ChordPolled { held }, now);
+                return Some(Event::ChordPolled {
+                    held: self.hook.chord_held(),
+                });
             }
             Effect::ReinstallHook => self.hook.reinstall(),
             Effect::ApplyConfig => {
@@ -207,6 +213,7 @@ impl<H: ChordHook> Coordinator<H> {
             Effect::Overlay(state) => self.ui(UiCmd::Overlay(state)),
             Effect::Notify(notice) => self.ui(UiCmd::Notify(notice)),
         }
+        None
     }
 
     /// Every outcome keeps the text, a failed paste too: "Copy last text" still has it (item 42).
@@ -311,6 +318,10 @@ mod tests {
     impl Rig {
         /// A coordinator with the default config; the start-up config commands are drained.
         fn new() -> Self {
+            Self::with(Config::default())
+        }
+
+        fn with(config: Config) -> Self {
             let (audio_tx, audio) = channel();
             let (whisper_tx, whisper) = channel();
             let (paste_tx, paste) = channel();
@@ -327,13 +338,7 @@ mod tests {
                 ..FakeHook::default()
             });
             let phase = PhaseCell::default();
-            let c = Coordinator::new(
-                Config::default(),
-                Vec::new(),
-                workers,
-                Rc::clone(&hook),
-                phase.clone(),
-            );
+            let c = Coordinator::new(config, Vec::new(), workers, Rc::clone(&hook), phase.clone());
             let rig = Self {
                 c,
                 hook,
@@ -562,6 +567,28 @@ mod tests {
             drain(&rig.audio)
                 .iter()
                 .any(|c| matches!(c, AudioCmd::Stop(_)))
+        );
+    }
+
+    #[test]
+    fn poll_answer_overlay_is_not_overridden_by_its_own_step() {
+        let mut config = Config::default();
+        config.audio.tail_ms = 0;
+        config.audio.max_seconds = 31; // `ending_soon` from 1 s, the tick that also polls
+        let mut rig = Rig::with(config);
+        rig.hook.held.set(false);
+        rig.event(Event::ModelLoaded, 0);
+        rig.event(Event::ChordDown, 0);
+        rig.drain_all();
+        rig.event(Event::Tick, 1000);
+        let overlays: Vec<_> = drain(&rig.ui)
+            .into_iter()
+            .filter(|c| matches!(c, UiCmd::Overlay(_)))
+            .collect();
+        assert_eq!(
+            overlays.last(),
+            Some(&UiCmd::Overlay(OverlayState::Transcribing)),
+            "{overlays:?}"
         );
     }
 

@@ -83,6 +83,8 @@ pub struct State {
     idle_unload_at: Option<Millis>,
     /// Sleep asked for an unload; done as soon as nothing is in flight.
     unload_when_idle: bool,
+    /// The model setting changed while a load was in flight: that load is the old model.
+    stale_load: bool,
     shown: OverlayState,
     /// One-time notices already given in this daemon run.
     restore_skip_noted: bool,
@@ -109,6 +111,7 @@ impl State {
             notice: None,
             idle_unload_at: None,
             unload_when_idle: false,
+            stale_load: false,
             shown: OverlayState::Hidden,
             restore_skip_noted: false,
             mic_fallback_noted: false,
@@ -230,9 +233,15 @@ impl State {
                     fx.push(Effect::Notify(Notice::MicFallback));
                 }
             }
-            Event::ModelLoaded => self.model = ModelStatus::Loaded,
+            Event::ModelLoaded => {
+                self.model = ModelStatus::Loaded;
+                if std::mem::take(&mut self.stale_load) {
+                    self.unload(&mut fx); // `dispatch` loads the new one when a job needs it
+                }
+            }
             Event::ModelFailed(why) => {
                 self.model = ModelStatus::Failed(why);
+                self.stale_load = false;
                 self.discard_recording(&mut fx);
                 self.fail(model_notice(why), now, &mut fx);
             }
@@ -481,12 +490,16 @@ impl State {
     fn settle(&mut self, now: Millis, fx: &mut Effects) {
         if self.phase() == Phase::Idle {
             if let Some(cfg) = self.pending_cfg.take() {
+                let new_model = cfg.model != self.cfg.model;
                 self.cfg = cfg;
                 self.idle_unload_at = None;
-                if matches!(self.model, ModelStatus::Failed(_)) {
-                    self.model = ModelStatus::Unloaded; // the model setting may have changed
-                }
                 fx.push(Effect::ApplyConfig);
+                match self.model {
+                    ModelStatus::Failed(_) => self.model = ModelStatus::Unloaded, // may be fixed now
+                    ModelStatus::Loaded if new_model => self.unload(fx),
+                    ModelStatus::Loading if new_model => self.stale_load = true,
+                    _ => {}
+                }
             }
             if self.unload_when_idle && self.model != ModelStatus::Loading {
                 if self.model == ModelStatus::Loaded {

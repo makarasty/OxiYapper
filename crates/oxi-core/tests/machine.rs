@@ -408,7 +408,7 @@ fn edge_07_08_lost_key_up_in_toggle_is_polled_and_typing_keeps_the_recording() {
     ];
     let mut s = Sim::toggle();
     for (event, ms, want) in table {
-        assert_eq!(s.core(ms, event), want, "{event:?} at {ms}");
+        assert_eq!(s.core(ms, event.clone()), want, "{event:?} at {ms}");
     }
     assert_eq!(s.phase(), Phase::Recording);
     assert_eq!(s.core(6000, Event::ChordDown), stop(J0));
@@ -565,13 +565,64 @@ fn edge_11_config_at_idle_applies_at_once() {
     );
 }
 
+fn with_model(model: &str) -> MachineConfig {
+    MachineConfig {
+        model: model.into(),
+        ..untailed()
+    }
+}
+
+#[test]
+fn new_model_setting_unloads_the_loaded_model() {
+    let same = untailed().model;
+    // (model in the new config, model loaded before, effects of the config, next press preloads)
+    let cases = [
+        (same.as_str(), true, vec![Effect::ApplyConfig], false),
+        (
+            "large-v3",
+            true,
+            vec![Effect::ApplyConfig, Effect::Unload],
+            true,
+        ),
+        ("large-v3", false, vec![Effect::ApplyConfig], true),
+    ];
+    for (model, loaded, want, preload) in cases {
+        let mut s = if loaded {
+            Sim::loaded()
+        } else {
+            Sim(State::new(untailed()))
+        };
+        let case = format!("{model}, loaded {loaded}");
+        assert_eq!(
+            s.core(0, Event::ConfigChanged(with_model(model))),
+            want,
+            "{case}"
+        );
+        let fx = s.core(100, Event::ChordDown);
+        assert_eq!(fx.contains(&Effect::Preload), preload, "{case}");
+    }
+}
+
+#[test]
+fn new_model_setting_during_a_load_unloads_once_the_old_one_lands() {
+    let mut s = Sim(State::new(untailed()));
+    assert!(s.core(0, Event::ChordDown).contains(&Effect::Preload));
+    s.at(100, Event::Esc);
+    assert_eq!(
+        s.core(200, Event::ConfigChanged(with_model("large-v3"))),
+        [Effect::ApplyConfig]
+    );
+    assert_eq!(s.core(300, Event::ModelLoaded), [Effect::Unload]);
+    assert!(s.core(400, Event::ChordDown).contains(&Effect::Preload));
+}
+
 // ---- 12. hook removed after a stall ----------------------------------------------------------
 
 #[test]
 fn edge_12_hook_is_reinstalled_on_resume_and_unlock() {
     for event in [Event::Resume, Event::Unlock] {
         let mut s = Sim::loaded();
-        assert_eq!(s.at(0, event), [Effect::ReinstallHook], "{event:?}");
+        assert_eq!(s.at(0, event.clone()), [Effect::ReinstallHook], "{event:?}");
     }
 }
 
@@ -580,7 +631,7 @@ fn edge_46_47_sleep_and_lock_cancel_the_recording() {
     for event in [Event::Suspend, Event::Lock] {
         let mut s = Sim::loaded();
         s.at(0, Event::ChordDown);
-        let fx = s.core(300, event);
+        let fx = s.core(300, event.clone());
         assert!(fx.contains(&Effect::DiscardCapture), "{event:?}");
         assert!(
             !fx.iter().any(|e| matches!(e, Effect::Play(_))),
@@ -863,6 +914,15 @@ fn machine_config_maps_the_file_settings() {
             ..MachineConfig::default()
         }
     );
+    // The model is the file to load: the id, or the path of a custom model.
+    for (id, path, want) in [
+        ("large-v3", "", "large-v3"),
+        ("custom", "D:/m.bin", "D:/m.bin"),
+    ] {
+        file.model.id = id.into();
+        file.model.custom_path = path.into();
+        assert_eq!(MachineConfig::from(&file).model, want);
+    }
 }
 
 #[test]
