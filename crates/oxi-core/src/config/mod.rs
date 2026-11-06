@@ -8,6 +8,8 @@ pub use schema::{
     PasteMode, PasteRule, Sounds, System,
 };
 
+use crate::machine::{MachineConfig, Mode};
+use crate::types::Millis;
 use std::borrow::Cow;
 use std::ops::Range;
 use toml_edit::{
@@ -22,6 +24,21 @@ pub type Migration = fn(&mut DocumentMut);
 
 /// `MIGRATIONS[i]` turns version `i + 1` into `i + 2`. Empty while v1 is the only schema.
 pub const MIGRATIONS: &[Migration] = &[];
+
+/// The state machine's view of the settings; the fields the file does not carry keep the
+/// SPEC defaults.
+pub fn machine_config(cfg: &Config) -> MachineConfig {
+    MachineConfig {
+        mode: match cfg.hotkey.mode {
+            HotkeyMode::Push => Mode::Push,
+            HotkeyMode::Toggle => Mode::Toggle,
+        },
+        max_recording: Millis::from_secs(cfg.audio.max_seconds.into()),
+        idle_unload: Millis::from_secs(u64::from(cfg.model.idle_unload_minutes) * 60),
+        release_tail: Millis(cfg.audio.tail_ms.into()),
+        ..MachineConfig::default()
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {

@@ -1,6 +1,7 @@
 //! Table tests for ARCHITECTURE section 11 items 1-12 (and the few neighbours they touch),
 //! with time driven by hand.
 
+use oxi_core::config::{Config, HotkeyMode, machine_config};
 use oxi_core::machine::{
     Effect, Effects, Event, JobId, MachineConfig, Mode, ModelFailure, Notice, Overlay, Phase,
     Sound, State, step,
@@ -16,18 +17,27 @@ const LOCKED: Overlay = Overlay::Recording {
     ending_soon: false,
 };
 
+/// SPEC defaults without the release tail, so a stop shows in the event that causes it.
+/// The tail has its own tests below.
+fn untailed() -> MachineConfig {
+    MachineConfig {
+        release_tail: Millis(0),
+        ..MachineConfig::default()
+    }
+}
+
 struct Sim(State);
 
 impl Sim {
     /// Push mode, model already loaded.
     fn loaded() -> Self {
-        Self::with(MachineConfig::default())
+        Self::with(untailed())
     }
 
     fn toggle() -> Self {
         Self::with(MachineConfig {
             mode: Mode::Toggle,
-            ..MachineConfig::default()
+            ..untailed()
         })
     }
 
@@ -356,10 +366,7 @@ fn edge_06_esc_when_not_recording_is_not_ours() {
 #[test]
 fn edge_07_other_key_cancels_silently_in_both_modes() {
     for mode in [Mode::Push, Mode::Toggle] {
-        let mut s = Sim::with(MachineConfig {
-            mode,
-            ..MachineConfig::default()
-        });
+        let mut s = Sim::with(MachineConfig { mode, ..untailed() });
         s.at(0, Event::ChordDown);
         let fx = s.at(50, Event::OtherKey);
         // No sound, no notification, no overlay text: just gone.
@@ -518,7 +525,7 @@ fn edge_10_phase_is_recording_only_while_recording_so_the_hook_swallows_esc_only
 fn edge_11_new_config_waits_for_idle() {
     let toggle = MachineConfig {
         mode: Mode::Toggle,
-        ..MachineConfig::default()
+        ..untailed()
     };
     let mut s = Sim::loaded();
     s.at(0, Event::ChordDown);
@@ -539,7 +546,7 @@ fn edge_11_new_config_waits_for_idle() {
 fn edge_11_config_at_idle_applies_at_once() {
     let mut s = Sim::loaded();
     assert_eq!(
-        s.at(0, Event::ConfigChanged(MachineConfig::default())),
+        s.at(0, Event::ConfigChanged(untailed())),
         [Effect::ApplyConfig]
     );
 }
@@ -587,7 +594,7 @@ fn edge_46_sleep_unloads_the_model_once_nothing_is_running() {
 
 #[test]
 fn model_loads_on_key_down_and_a_job_waits_for_it() {
-    let mut s = Sim::with(MachineConfig::default());
+    let mut s = Sim::loaded();
     s.at(100, Event::Suspend); // unloads: model is now cold
     assert_eq!(
         s.core(200, Event::ChordDown),
@@ -631,7 +638,7 @@ fn model_missing_at_key_down_gives_error_and_no_recording() {
         [Effect::Play(Sound::Error), Effect::Notify(Notice::NoModel)]
     );
     assert_eq!(s.phase(), Phase::Idle);
-    s.at(6000, Event::ConfigChanged(MachineConfig::default()));
+    s.at(6000, Event::ConfigChanged(untailed()));
     assert!(
         s.core(7000, Event::ChordDown)
             .contains(&Effect::StartCapture)
@@ -706,9 +713,127 @@ fn model_unloads_after_the_idle_time_and_a_press_cancels_it() {
 fn zero_idle_unload_means_never() {
     let mut s = Sim::with(MachineConfig {
         idle_unload: Millis(0),
-        ..MachineConfig::default()
+        ..untailed()
     });
     assert_eq!(s.0.next_deadline(), None);
     s.press(0, 500);
     assert_eq!(s.0.next_deadline(), None);
+}
+
+// ---- release tail (ARCHITECTURE 3: keeps the last syllable) ---------------------------------
+
+fn tailed(mode: Mode, tail: u64) -> Sim {
+    Sim::with(MachineConfig {
+        mode,
+        release_tail: Millis(tail),
+        ..MachineConfig::default()
+    })
+}
+
+#[test]
+fn tail_delays_the_stop_of_every_kept_recording() {
+    // (mode, tail ms, stopping event at 1000 after a press at 0, when StopCapture comes)
+    let table = [
+        (Mode::Push, 100, Event::ChordUp, 1100),
+        (Mode::Push, 100, Event::ChordPolled { held: false }, 1100),
+        (Mode::Toggle, 100, Event::ChordDown, 1100),
+        (Mode::Push, 250, Event::ChordUp, 1250),
+        (Mode::Push, 0, Event::ChordUp, 1000),
+        (Mode::Toggle, 0, Event::ChordDown, 1000),
+    ];
+    for (mode, tail, event, stop_at) in table {
+        let case = format!("{mode:?}, tail {tail}, {event:?}");
+        let mut s = tailed(mode, tail);
+        s.at(0, Event::ChordDown);
+        if mode == Mode::Toggle {
+            s.at(50, Event::ChordUp);
+        }
+        let mut fx = s.core(1000, event);
+        if stop_at > 1000 {
+            assert_eq!(fx, [], "{case}");
+            assert_eq!(s.phase(), Phase::Recording, "{case}");
+            assert_eq!(s.0.next_deadline(), Some(Millis(stop_at)), "{case}");
+            assert_eq!(s.core(stop_at - 1, Event::Tick), [], "{case}");
+            fx = s.core(stop_at, Event::Tick);
+        }
+        assert_eq!(fx, stop(J0), "{case}");
+        assert_eq!(s.phase(), Phase::Transcribing, "{case}");
+    }
+}
+
+#[test]
+fn tail_does_not_hold_back_a_discarded_tap() {
+    let mut s = tailed(Mode::Push, 100);
+    s.at(0, Event::ChordDown);
+    assert_eq!(s.core(100, Event::ChordUp), [Effect::DiscardCapture]);
+    assert_eq!(s.phase(), Phase::Idle);
+}
+
+#[test]
+fn esc_during_the_tail_cancels() {
+    let mut s = tailed(Mode::Push, 100);
+    s.at(0, Event::ChordDown);
+    s.at(1000, Event::ChordUp);
+    assert_eq!(
+        s.core(1050, Event::Esc),
+        [Effect::DiscardCapture, Effect::Play(Sound::Cancel)]
+    );
+    assert_eq!(s.phase(), Phase::Idle);
+    assert_eq!(s.core(1100, Event::Tick), []);
+}
+
+#[test]
+fn key_down_during_the_tail_stops_the_job_at_once_and_records_again() {
+    let mut s = tailed(Mode::Push, 100);
+    s.at(0, Event::ChordDown);
+    s.at(1000, Event::ChordUp);
+    let fx = s.core(1050, Event::ChordDown);
+    assert_eq!(fx, [stop(J0).as_slice(), START.as_slice()].concat());
+    assert_eq!(s.phase(), Phase::Recording);
+    // The new recording is a plain press: its own release goes through the tail.
+    assert_eq!(s.core(1150, Event::Tick), [Effect::PollChord]);
+    assert_eq!(s.core(2000, Event::ChordUp), []);
+    assert_eq!(s.core(2100, Event::Tick), stop(J1));
+}
+
+#[test]
+fn typing_during_a_toggle_tail_keeps_the_job() {
+    let mut s = tailed(Mode::Toggle, 100);
+    s.at(0, Event::ChordDown);
+    s.at(50, Event::ChordUp);
+    assert_eq!(s.core(1000, Event::ChordDown), []);
+    assert_eq!(s.core(1050, Event::OtherKey), []);
+    // A down the hook repeats during the stopping press is not a new press.
+    assert_eq!(s.core(1060, Event::ChordDown), []);
+    assert_eq!(s.core(1100, Event::Tick), stop(J0));
+}
+
+#[test]
+fn max_recording_stops_at_once_without_a_tail() {
+    let mut s = tailed(Mode::Push, 100);
+    s.at(0, Event::ChordDown);
+    assert_eq!(s.core(600_000, Event::Tick), stop(J0));
+    // A release inside what would have been the tail changes nothing.
+    assert_eq!(s.core(600_050, Event::ChordUp), []);
+    assert_eq!(s.phase(), Phase::Transcribing);
+}
+
+#[test]
+fn machine_config_maps_the_file_settings() {
+    let mut file = Config::default();
+    assert_eq!(machine_config(&file), MachineConfig::default());
+    file.hotkey.mode = HotkeyMode::Toggle;
+    file.audio.tail_ms = 150;
+    file.audio.max_seconds = 300;
+    file.model.idle_unload_minutes = 0;
+    assert_eq!(
+        machine_config(&file),
+        MachineConfig {
+            mode: Mode::Toggle,
+            release_tail: Millis(150),
+            max_recording: Millis::from_secs(300),
+            idle_unload: Millis(0),
+            ..MachineConfig::default()
+        }
+    );
 }
