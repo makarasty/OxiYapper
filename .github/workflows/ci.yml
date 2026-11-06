@@ -1,0 +1,78 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev libasound2-dev
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo fmt --check
+      - run: cargo clippy --release -- -D warnings
+
+  build:
+    name: build (${{ matrix.os }}, ${{ matrix.feature }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, feature: vulkan }
+          - { os: windows-latest, feature: cuda }
+          - { os: ubuntu-latest, feature: vulkan }
+          - { os: macos-latest, feature: metal }
+    env:
+      # Windows: a long target path breaks the nested vulkan-shaders-gen build (MAX_PATH).
+      CARGO_TARGET_DIR: ${{ runner.os == 'Windows' && 'C:/t' || 'target' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Vulkan SDK (Windows)
+        if: matrix.feature == 'vulkan' && runner.os == 'Windows'
+        uses: jakoch/install-vulkan-sdk-action@7fe84289ddbf750f7eff9f8e4588e600e1dd06c8 # v1.8.1
+        with:
+          vulkan_version: 1.4.328.1
+          install_runtime: true
+          cache: true
+      - name: Install Vulkan build deps (Linux)
+        if: matrix.feature == 'vulkan' && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev libvulkan-dev glslc libasound2-dev
+      - name: Install CUDA toolkit (Windows)
+        if: matrix.feature == 'cuda'
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: 12.6.3
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "visual_studio_integration"]'
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.feature }}
+      - run: cargo build --release --features ${{ matrix.feature }}
+      - name: Run binary
+        shell: bash
+        run: "\"$CARGO_TARGET_DIR/release/oxi-yapper\" --version"

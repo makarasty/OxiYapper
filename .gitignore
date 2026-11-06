@@ -1,0 +1,13 @@
+target/
+*.wav
+*.webm
+*.bin
+*.gguf
+models/*.bin
+.env
+*.pfx
+*.p12
+*.pem
+*.key
+dictations/
+data/

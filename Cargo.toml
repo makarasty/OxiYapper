@@ -1,0 +1,24 @@
+[package]
+name = "oxi-yapper"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Push-to-talk dictation: hold a hotkey, speak, local whisper.cpp transcribes and pastes."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[features]
+default = []
+vulkan = ["whisper-rs/vulkan"]
+cuda = ["whisper-rs/cuda"]
+metal = ["whisper-rs/metal"]
+
+[dependencies]
+whisper-rs = "0.16"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+opt-level = 3
