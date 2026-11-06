@@ -942,11 +942,15 @@ fn paste_outcome_notices() {
             Some(Notice::AdminWindow),
         ),
         (PasteOutcome::PastedNoRestore, Some(Notice::RestoreSkipped)),
+        (PasteOutcome::Failed, Some(Notice::PasteFailed)),
     ];
     for (outcome, notice) in table {
         let mut s = pasting();
         let fx = s.core(1000, Event::PasteDone { job: J0, outcome });
-        let want: Effects = notice.map(Effect::Notify).into_iter().collect();
+        let mut want: Effects = notice.map(Effect::Notify).into_iter().collect();
+        if outcome == PasteOutcome::Failed {
+            want.insert(0, Effect::Play(Sound::Error));
+        }
         assert_eq!(fx, want, "{outcome:?}");
         assert_eq!(s.phase(), Phase::Idle, "{outcome:?}");
     }
@@ -960,6 +964,22 @@ fn clipboard_only_notifies_every_time() {
         s.core(3000, Event::PasteDone { job: J1, outcome }),
         [Effect::Notify(Notice::AdminWindow)]
     );
+}
+
+#[test]
+fn paste_failure_errors_every_time_and_shows_it() {
+    let outcome = PasteOutcome::Failed;
+    let mut s = second_paste(outcome);
+    let fx = s.at(3000, Event::PasteDone { job: J1, outcome });
+    assert_eq!(
+        fx,
+        [
+            Effect::Play(Sound::Error),
+            Effect::Notify(Notice::PasteFailed),
+            Effect::Overlay(OverlayState::Text(Notice::PasteFailed))
+        ]
+    );
+    assert_eq!(s.phase(), Phase::Idle);
 }
 
 #[test]

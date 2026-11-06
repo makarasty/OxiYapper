@@ -222,7 +222,7 @@ impl State {
             Event::PasteDone { job, outcome } => {
                 if self.job_in(job, Stage::Pasting).is_some() {
                     self.jobs.retain(|j| j.id != job);
-                    self.paste_notice(outcome, &mut fx);
+                    self.paste_notice(outcome, now, &mut fx);
                 }
             }
             Event::MicFellBack => {
@@ -257,9 +257,11 @@ impl State {
     }
 
     /// What the user must know about how the text arrived (items 35, 36; ARCHITECTURE 10
-    /// step 4). Clipboard-only says so every time, a skipped restore once per run.
-    fn paste_notice(&mut self, outcome: PasteOutcome, fx: &mut Effects) {
+    /// step 4, item 42). Clipboard-only and a failure say so every time, a skipped restore
+    /// once per run.
+    fn paste_notice(&mut self, outcome: PasteOutcome, now: Millis, fx: &mut Effects) {
         let notice = match outcome {
+            PasteOutcome::Failed => return self.fail(Notice::PasteFailed, now, fx),
             PasteOutcome::Pasted | PasteOutcome::Typed => None,
             PasteOutcome::ClipboardOnly(ClipboardOnlyWhy::ModifiersHeld) => {
                 Some(Notice::PressPaste)

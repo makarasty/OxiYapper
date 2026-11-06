@@ -11,6 +11,9 @@ pub enum PasteOutcome {
     ClipboardOnly(ClipboardOnlyWhy),
     /// Pasted, but the clipboard snapshot was incomplete, so the old one was not restored.
     PastedNoRestore,
+    /// Nothing landed: `SendInput` inserted no events, a secure desktop, or setting the
+    /// clipboard failed. The coordinator keeps the text for "Copy last text" (item 42).
+    Failed,
 }
 
 /// Why the paste worker did not send the paste chord itself.

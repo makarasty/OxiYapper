@@ -200,6 +200,8 @@ pub enum Notice {
     AdminWindow,
     /// Pasted, but the old clipboard could not be kept whole, so it was not restored.
     RestoreSkipped,
+    /// The paste worker could not deliver the text; "Copy last text" still has it (item 42).
+    PasteFailed,
     /// The configured microphone is missing; the system default records (item 15).
     MicFallback,
 }

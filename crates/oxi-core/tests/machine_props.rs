@@ -22,6 +22,7 @@ fn outcome() -> impl Strategy<Value = PasteOutcome> {
         Just(PasteOutcome::ClipboardOnly(ClipboardOnlyWhy::ModifiersHeld)),
         Just(PasteOutcome::ClipboardOnly(ClipboardOnlyWhy::Elevated)),
         Just(PasteOutcome::PastedNoRestore),
+        Just(PasteOutcome::Failed),
     ]
 }
 
