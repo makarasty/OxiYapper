@@ -27,6 +27,8 @@ export global AudioState {
     in property <bool> live;
     // Why there is no meter ("No microphone"), shown while `live` is off.
     in property <string> note;
+    // The configured mic is missing and the meter runs on the system default; empty otherwise.
+    in property <string> fallback;
     callback shown();
     callback edited(AudioKey, float);
 }
@@ -51,6 +53,9 @@ export component AudioPage inherits VerticalLayout {
                     AudioState.edited(AudioKey.device, self.current-index);
                 }
             }
+        }
+        if AudioState.fallback != "": InlineNote {
+            text: AudioState.fallback;
         }
         Row {
             label: @tr("Level");
@@ -151,12 +156,23 @@ export component AudioPage inherits VerticalLayout {
         }
         Row {
             label: @tr("Language");
-            for code[i] in [@tr("RU"), @tr("EN"), @tr("Auto")]: Button {
-                text: code;
-                primary: AudioState.language == i;
-                enabled: !Shell.locked;
-                clicked => {
-                    AudioState.edited(AudioKey.language, i);
+            // shortcut: buttons as a segmented control; a shared one belongs in widgets.slint.
+            Rectangle {
+                accessible-role: radio-group;
+                accessible-label: @tr("Language");
+                HorizontalLayout {
+                    spacing: 4px;
+                    for code[i] in [@tr("RU"), @tr("EN"), @tr("Auto")]: Button {
+                        text: code;
+                        primary: AudioState.language == i;
+                        enabled: !Shell.locked;
+                        accessible-role: radio-button;
+                        accessible-checkable: true;
+                        accessible-checked: AudioState.language == i;
+                        clicked => {
+                            AudioState.edited(AudioKey.language, i);
+                        }
+                    }
                 }
             }
         }

@@ -76,8 +76,12 @@ fn every_control_writes_its_key() {
         ("Auto", Language::Auto),
         ("RU", Language::Ru),
     ] {
-        with_role(&window, label, AccessibleRole::Button).invoke_accessible_default_action();
+        let button = with_role(&window, label, AccessibleRole::RadioButton);
+        assert_eq!(button.accessible_checked(), Some(false), "{label}");
+        button.invoke_accessible_default_action();
         assert_eq!(saved(&l).model.language, lang, "{label}");
+        let button = with_role(&window, label, AccessibleRole::RadioButton);
+        assert_eq!(button.accessible_checked(), Some(true), "{label}");
     }
 
     let text = fs::read_to_string(l.config_file()).unwrap();
@@ -118,7 +122,10 @@ fn missing_device_stays_picked_until_default_is_chosen() {
     );
     let window = open(&l);
     let picker = with_role(&window, "Device", AccessibleRole::Combobox);
-    assert_eq!(picker.accessible_value().as_deref(), Some("Test Mic 9"));
+    assert_eq!(
+        picker.accessible_value().as_deref(),
+        Some("Test Mic 9 (not connected)")
+    );
 
     picker.mock_single_click(PointerEventButton::Left);
     let rows = 1 + oxi_platform::capture::list_input_devices().map_or(0, |d| d.len());
@@ -140,7 +147,7 @@ fn locked_config_disables_the_controls() {
         ("Gain", AccessibleRole::Slider),
         ("Trim silence", AccessibleRole::Switch),
         ("Device", AccessibleRole::Combobox),
-        ("EN", AccessibleRole::Button),
+        ("EN", AccessibleRole::RadioButton),
     ] {
         let e = with_role(&window, label, role);
         assert_eq!(e.accessible_enabled(), Some(false), "{label}");
