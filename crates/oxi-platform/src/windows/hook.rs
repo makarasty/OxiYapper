@@ -277,9 +277,7 @@ fn on_key(event: &KBDLLHOOKSTRUCT, wparam: WPARAM) -> bool {
     let Some((suppress_start, swallow)) = verdict else {
         return false;
     };
-    if suppress_start
-        && let Err(e) = keys::send_start_blocker()
-    {
+    if suppress_start && let Err(e) = keys::send_start_blocker() {
         tracing::warn!(error = %e, "Start menu blocker not sent");
     }
     swallow
