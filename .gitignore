@@ -11,3 +11,4 @@ models/*.bin
 *.key
 dictations/
 data/
+.claude/settings.local.json
