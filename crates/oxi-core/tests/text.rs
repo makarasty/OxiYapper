@@ -69,7 +69,7 @@ fn user_lines_extend_the_default_list() {
 
 #[test]
 fn replace_rules_table() {
-    let rules = "git hub => GitHub\ngithub => GitHub\npull => fetch\npull request => PR\nджава скрипт => JavaScript\nc++ => C++\num =>\nm => meters\nll => will\ndon => do\ni => me\nwe => us\n";
+    let rules = "git hub => GitHub\ngithub => GitHub\npull => fetch\npull request => PR\nджава скрипт => JavaScript\nc++ => C++\num =>\nm => meters\nll => will\ndon => do\ni => me\nwe => us\nну =>\n";
     let cases = [
         ("Open Git Hub now", "Open GitHub now"),
         // Longest match first.
@@ -103,6 +103,15 @@ fn replace_rules_table() {
         ("fine. um, then", "fine. then"),
         ("(fine, um)", "(fine)"),
         ("well um um fine", "well fine"),
+        // A dropped duplicate keeps the left mark, even before a closer.
+        ("\"fine, um,\" he said", "\"fine,\" he said"),
+        ("\u{AB}да, ну,\u{BB} сказал", "\u{AB}да,\u{BB} сказал"),
+        // A straight quote after a space opens, whatever follows it.
+        ("say 'um yes'", "say 'yes'"),
+        ("costs um \"$5\"", "costs \"$5\""),
+        // A pair left empty goes, with its extra space.
+        ("say \"um\" ok", "say ok"),
+        ("(um) fine", "fine"),
         // Spacing away from a deletion is the user's and stays.
         ("a  b um c", "a  b c"),
         ("say \"well\" um ok", "say \"well\" ok"),

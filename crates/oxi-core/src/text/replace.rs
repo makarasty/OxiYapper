@@ -60,19 +60,33 @@ fn separator_rank(c: char) -> u8 {
     }
 }
 
-/// `c` closes what precedes it, so no space goes before it. A straight quote closes only
-/// when no word follows it.
-fn is_closer(c: char, next: Option<char>) -> bool {
+/// `chars[i]` closes what precedes it, so no space goes before it. A straight quote closes
+/// only when it touches the text before it; after a space or at the start it opens.
+fn is_closer(chars: &[char], i: usize) -> bool {
+    let c = chars[i];
     separator_rank(c) > 0
         || matches!(c, ')' | ']' | '}' | '\u{201D}' | '\u{BB}')
-        || (matches!(c, '"' | '\'') && !next.is_some_and(is_word))
+        || (matches!(c, '"' | '\'') && i > 0 && !chars[i - 1].is_whitespace())
 }
 
-/// `c` opens what follows it, so no space goes after it. A straight `"` opens only after a
+/// `c` opens what follows it, so no space goes after it. A straight quote opens only after a
 /// space, the start, or another opener.
 fn is_opener(c: char, prev: Option<char>) -> bool {
     matches!(c, '(' | '[' | '{' | '\u{201C}' | '\u{AB}')
-        || (c == '"' && prev.is_none_or(|p| p.is_whitespace() || is_opener(p, None)))
+        || (matches!(c, '"' | '\'') && prev.is_none_or(|p| p.is_whitespace() || is_opener(p, None)))
+}
+
+/// The closer that pairs with opener `c`.
+fn pair_of(c: char) -> Option<char> {
+    match c {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        '\u{201C}' => Some('\u{201D}'),
+        '\u{AB}' => Some('\u{BB}'),
+        '"' | '\'' => Some(c),
+        _ => None,
+    }
 }
 
 /// Join the text around a deleted word: `out` holds what came before, `chars[i..]` what
@@ -88,17 +102,26 @@ fn join_after_deletion(out: &mut String, chars: &[char], mut i: usize) -> usize 
     out.truncate(out.trim_end().len());
     i = skip_space(i);
     let mut rev = out.chars().rev();
-    let last = rev.next();
+    let (last, prev) = (rev.next(), rev.next());
     // At the start or after an opener the deleted word takes its separators with it.
-    if last.is_none_or(|c| is_opener(c, rev.next())) {
+    if last.is_none_or(|c| is_opener(c, prev)) {
         while chars.get(i).is_some_and(|&c| separator_rank(c) > 0) {
             i = skip_space(i + 1);
+        }
+        // A pair left empty goes too, with the space it leaves.
+        if let (Some(open), Some(&close)) = (last, chars.get(i))
+            && pair_of(open) == Some(close)
+            && is_closer(chars, i)
+        {
+            out.pop();
+            return join_after_deletion(out, chars, i + 1);
         }
         return i;
     }
     let left = last.map_or(0, separator_rank);
+    let mut dropped = false;
     while let Some(&next) = chars.get(i) {
-        if !is_closer(next, chars.get(i + 1).copied()) {
+        if !is_closer(chars, i) {
             out.push(' ');
             break;
         }
@@ -106,9 +129,10 @@ fn join_after_deletion(out: &mut String, chars: &[char], mut i: usize) -> usize 
         if left > 0 && right > 0 && right <= left {
             // Doubled separator: the left one is as strong, drop the right one.
             i = skip_space(i + 1);
+            dropped = true;
             continue;
         }
-        if left == 1 {
+        if left == 1 && !dropped {
             // A comma-like mark before a stronger mark or a closer goes.
             out.pop();
         }
