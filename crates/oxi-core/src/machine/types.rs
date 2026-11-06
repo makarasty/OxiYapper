@@ -240,6 +240,8 @@ pub enum Notice {
     PasteFailed,
     /// The configured microphone is missing; the system default records (item 15).
     MicFallback,
+    /// Every sample was zero: hardware mute or a privacy switch (item 17).
+    MicSilence,
 }
 
 /// What the overlay shows; emitted only when it changes.

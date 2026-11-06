@@ -842,10 +842,15 @@ fn job_without_audio_ends_with_its_notice_and_no_whisper_call() {
         Effect::Notify(Notice::CaptureFailed),
         Effect::Overlay(OverlayState::Text(Notice::CaptureFailed)),
     ];
+    let silent = [
+        Effect::Play(Sound::Error),
+        Effect::Notify(Notice::MicSilence),
+        Effect::Overlay(OverlayState::Text(Notice::MicSilence)),
+    ];
     let heard = [Effect::Overlay(OverlayState::Text(Notice::NothingHeard))];
     let cases: [(EmptyAudio, &[Effect]); 3] = [
         (EmptyAudio::NothingHeard, &heard),
-        (EmptyAudio::MicSilence, &failed),
+        (EmptyAudio::MicSilence, &silent),
         (EmptyAudio::Failed, &failed),
     ];
     for (why, want) in cases {

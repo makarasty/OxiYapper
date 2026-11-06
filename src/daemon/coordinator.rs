@@ -513,7 +513,7 @@ mod tests {
     fn job_without_audio_never_reaches_whisper() {
         let cases = [
             (EmptyAudio::NothingHeard, None),
-            (EmptyAudio::MicSilence, Some(Notice::CaptureFailed)),
+            (EmptyAudio::MicSilence, Some(Notice::MicSilence)),
             (EmptyAudio::Failed, Some(Notice::CaptureFailed)),
         ];
         for (why, notify) in cases {

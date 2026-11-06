@@ -283,11 +283,8 @@ impl State {
         self.jobs.retain(|j| j.id != job);
         match why {
             EmptyAudio::NothingHeard => self.show(Notice::NothingHeard, now),
-            // shortcut: no "microphone gives silence" notice yet (it needs text in strings.rs
-            // and a look); give MicSilence its own Notice when those get one.
-            EmptyAudio::MicSilence | EmptyAudio::Failed => {
-                self.fail(Notice::CaptureFailed, now, fx);
-            }
+            EmptyAudio::MicSilence => self.fail(Notice::MicSilence, now, fx),
+            EmptyAudio::Failed => self.fail(Notice::CaptureFailed, now, fx),
         }
     }
 

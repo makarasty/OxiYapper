@@ -17,7 +17,7 @@ const ALL_POSITIONS: [P; 6] = [
     P::TopLeft,
 ];
 
-const ALL_NOTICES: [Notice; 12] = [
+const ALL_NOTICES: [Notice; 13] = [
     Notice::Cancelled,
     Notice::NothingHeard,
     Notice::NoModel,
@@ -30,6 +30,7 @@ const ALL_NOTICES: [Notice; 12] = [
     Notice::RestoreSkipped,
     Notice::PasteFailed,
     Notice::MicFallback,
+    Notice::MicSilence,
 ];
 
 #[test]

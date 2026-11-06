@@ -24,6 +24,7 @@ pub const fn notice(notice: Notice) -> &'static str {
         Notice::RestoreSkipped => "Pasted. The previous clipboard could not be restored",
         Notice::PasteFailed => "Could not paste. Use Copy last text in the tray menu",
         Notice::MicFallback => "Selected microphone not found, using the system default",
+        Notice::MicSilence => "The microphone gives silence. Check its mute switch",
     }
 }
 
@@ -46,6 +47,7 @@ pub const fn notice_short(notice: Notice) -> &'static str {
         Notice::RestoreSkipped => "Not restored",
         Notice::PasteFailed => "Paste failed",
         Notice::MicFallback => "Mic changed",
+        Notice::MicSilence => "Mic silent",
     }
 }
 
