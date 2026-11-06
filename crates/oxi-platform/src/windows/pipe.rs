@@ -22,8 +22,7 @@ use windows_sys::Win32::Security::Authorization::{
 use windows_sys::Win32::Security::{
     ACL, GetAce, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
     LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSID, SYSTEM_MANDATORY_LABEL_ACE,
-    TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel,
-    TokenUser,
+    TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -38,11 +37,12 @@ const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
 const SECURITY_MANDATORY_MEDIUM_RID: u32 = 0x2000;
 
 /// Owned by and generic-all for `sid` only, protected from inherited ACEs: no Everyone, no
-/// other user. The explicit owner and the integrity label `il_sid` (ours, `S-1-16-<rid>`)
-/// are what clients check; without them an elevated token would default the owner to
-/// Administrators and leave the label at medium.
-pub fn owner_only_sddl(sid: &str, il_sid: &str) -> String {
-    format!("O:{sid}D:P(A;;GA;;;{sid})S:(ML;;NW;;;{il_sid})")
+/// other user. The explicit owner and the medium integrity label are what clients check;
+/// without them an elevated daemon would default the owner to Administrators, and a label at
+/// its own (high) level would lock a normal second launch out. Medium is the floor clients
+/// accept, so low-integrity squatters stay out at every daemon level.
+pub fn owner_only_sddl(sid: &str) -> String {
+    format!("O:{sid}D:P(A;;GA;;;{sid})S:(ML;;NW;;;ME)")
 }
 
 /// The current user's SID string, e.g. `S-1-5-21-...`.
@@ -50,17 +50,6 @@ pub fn user_sid() -> io::Result<String> {
     let buf = token_info(TokenUser)?;
     // SAFETY: TokenUser wrote a TOKEN_USER at the start of `buf`; its SID points into `buf`.
     unsafe { sid_string((*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid) }
-}
-
-/// This process's integrity level: its label SID string and RID.
-fn integrity() -> io::Result<(String, u32)> {
-    let buf = token_info(TokenIntegrityLevel)?;
-    // SAFETY: TokenIntegrityLevel wrote a TOKEN_MANDATORY_LABEL at the start of `buf`; its
-    // SID points into `buf`.
-    unsafe {
-        let sid = (*buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()).Label.Sid;
-        Ok((sid_string(sid)?, sid_rid(sid)))
-    }
 }
 
 /// `GetTokenInformation(class)` of the process token, in u64 cells so the struct at the
@@ -128,9 +117,9 @@ unsafe fn sid_rid(sid: PSID) -> u32 {
     }
 }
 
-/// Security descriptor for the IPC pipe: the current user only, at our integrity level.
+/// Security descriptor for the IPC pipe: the current user only, labelled medium.
 pub fn owner_only() -> io::Result<SecurityDescriptor> {
-    security_descriptor(&owner_only_sddl(&user_sid()?, &integrity()?.0))
+    security_descriptor(&owner_only_sddl(&user_sid()?))
 }
 
 /// A security descriptor from SDDL.
@@ -205,11 +194,20 @@ pub fn connect(path: &str, busy_wait: Duration) -> io::Result<OwnedHandle> {
     }
 }
 
-/// True when the pipe behind `h` is owned by the current user and labelled at our
-/// integrity level or above (no label counts as medium). Another account cannot create a
-/// pipe with our SID as owner, and a lower-integrity process of ours (sandbox, browser)
-/// cannot label it above its own level.
-pub fn trusted_server(h: BorrowedHandle<'_>) -> io::Result<bool> {
+/// What a client learns about the server end of a pipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Owned by the current user and labelled medium or above (no label counts as medium).
+    Trusted,
+    /// Owned by someone else: another account cannot make a pipe with our SID as owner.
+    OtherAccount,
+    /// Ours but labelled below medium: a sandboxed or low-integrity process of this user,
+    /// which cannot label it higher than its own level.
+    LowIntegrity,
+}
+
+/// Checks the owner and integrity label of the pipe behind `h`.
+pub fn check_server(h: BorrowedHandle<'_>) -> io::Result<Verdict> {
     let mut owner: PSID = null_mut();
     let mut sacl: *mut ACL = null_mut();
     let mut sd = null_mut();
@@ -235,7 +233,13 @@ pub fn trusted_server(h: BorrowedHandle<'_>) -> io::Result<bool> {
     // SAFETY: allocated by GetSecurityInfo and not used after this.
     unsafe { LocalFree(sd) };
     let label = label.unwrap_or(SECURITY_MANDATORY_MEDIUM_RID);
-    Ok(owner? == user_sid()? && label >= integrity()?.1)
+    Ok(if owner? != user_sid()? {
+        Verdict::OtherAccount
+    } else if label < SECURITY_MANDATORY_MEDIUM_RID {
+        Verdict::LowIntegrity
+    } else {
+        Verdict::Trusted
+    })
 }
 
 /// The integrity RID of the mandatory label ACE in `sacl`, if any.
@@ -291,10 +295,7 @@ pub fn with_deadline<R>(
         let fired = watchdog.join().unwrap_or(true);
         match result {
             Err(e) if fired && e.raw_os_error() == Some(ERROR_OPERATION_ABORTED.cast_signed()) => {
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "IPC read timed out",
-                ))
+                Err(io::Error::new(io::ErrorKind::TimedOut, "IPC I/O timed out"))
             }
             r => r,
         }

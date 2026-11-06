@@ -137,10 +137,10 @@ mod windows {
 
     #[test]
     fn sddl_admits_only_the_given_sid() {
-        let sddl = owner_only_sddl("S-1-5-21-1-2-3-1001", "S-1-16-8192");
+        let sddl = owner_only_sddl("S-1-5-21-1-2-3-1001");
         assert_eq!(
             sddl,
-            "O:S-1-5-21-1-2-3-1001D:P(A;;GA;;;S-1-5-21-1-2-3-1001)S:(ML;;NW;;;S-1-16-8192)"
+            "O:S-1-5-21-1-2-3-1001D:P(A;;GA;;;S-1-5-21-1-2-3-1001)S:(ML;;NW;;;ME)"
         );
         assert!(!sddl.contains("WD") && !sddl.contains("Everyone"));
     }
@@ -175,7 +175,7 @@ mod windows {
         // Takes the only waiting instance; nobody accepts it.
         let _hog = Client::connect(&n).unwrap();
         let err = within(10, move || Client::connect(&n).map(drop).unwrap_err());
-        assert!(matches!(err, Error::Io(e) if e.kind() == io::ErrorKind::TimedOut));
+        assert!(matches!(err, Error::Busy), "{err:?}");
     }
 
     #[test]
@@ -184,11 +184,15 @@ mod windows {
         let server = Server::bind(&n).unwrap();
         let n2 = n.clone();
         let (tx, rx) = mpsc::channel();
-        thread::spawn(move || tx.send(forward_open_settings(&n2)));
+        thread::spawn(move || {
+            let t = Instant::now();
+            tx.send((forward_open_settings(&n2), t.elapsed()))
+        });
         // Accepts and neither reads nor closes.
         let _conn = server.accept().unwrap();
-        let got = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (got, took) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(matches!(got, Err(Error::Io(e)) if e.kind() == io::ErrorKind::TimedOut));
+        assert!(took < Duration::from_millis(3500), "{took:?}");
     }
 
     #[test]
@@ -324,12 +328,12 @@ mod windows {
     }
 
     #[test]
-    fn name_held_busy_is_foreign_not_io() {
+    fn name_held_busy_is_busy_not_foreign() {
         let n = name("held");
         let _squatter = pipe_with(&n, &format!("D:P(A;;GA;;;{})", user_sid().unwrap()));
         let _hog = Client::connect(&n);
         let got = within(10, move || Server::bind(&n).map(drop));
-        assert!(matches!(got, Err(Error::ForeignServer)), "{got:?}");
+        assert!(matches!(got, Err(Error::Busy)), "{got:?}");
     }
 
     #[test]
@@ -352,10 +356,39 @@ mod windows {
     }
 
     #[test]
-    fn low_integrity_pipe_is_foreign() {
+    fn low_integrity_pipe_of_ours_is_other_privileges() {
         let n = name("lowil");
         let sid = user_sid().unwrap();
         let _squatter = pipe_with(&n, &format!("O:{sid}D:P(A;;GA;;;{sid})S:(ML;;NW;;;LW)"));
-        assert!(matches!(Client::connect(&n), Err(Error::ForeignServer)));
+        assert!(matches!(Client::connect(&n), Err(Error::OtherPrivileges)));
+    }
+
+    #[test]
+    fn medium_labelled_pipe_of_ours_is_trusted() {
+        let n = name("medium");
+        let sid = user_sid().unwrap();
+        let _daemon = pipe_with(&n, &owner_only_sddl(&sid));
+        assert!(Client::connect(&n).is_ok());
+    }
+
+    #[test]
+    fn write_timeout_ends_a_send_to_a_stalled_peer() {
+        let n = name("stallw");
+        let server = Server::bind(&n).unwrap();
+        let n2 = n.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut c = Client::connect(&n2).unwrap();
+            c.set_write_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            // Far more than the pipe buffer, so the write blocks on a peer that never reads.
+            let big = Request::DownloadModel {
+                id: "a".repeat(4 * MAX_LINE),
+            };
+            tx.send(c.send(&big).map_err(|e| e.kind())).unwrap();
+        });
+        let _conn = server.accept().unwrap();
+        let got = rx.recv_timeout(Duration::from_secs(10));
+        assert_eq!(got, Ok(Err(io::ErrorKind::TimedOut)));
     }
 }
