@@ -3,6 +3,7 @@
 mod common;
 
 use std::fs;
+use std::time::Duration;
 
 use common::layout;
 use i_slint_backend_testing::{AccessibleRole, ElementHandle};
@@ -154,12 +155,163 @@ fn unreadable_file_is_never_overwritten() {
     let window = open(&l);
     assert!(has(
         &window,
-        "Not a UTF-8 or UTF-16 text file: fix it in a text editor."
+        "replace.txt is not UTF-8 or UTF-16 text: fix it in a text editor."
     ));
     let save = one(&window, "Save replace.txt");
     assert_eq!(save.accessible_enabled(), Some(false));
     save.invoke_accessible_default_action();
     assert_eq!(fs::read(l.replace_file()).unwrap(), bytes);
+}
+
+#[test]
+fn save_keeps_a_file_changed_on_disk_until_overwrite() {
+    let l = layout("conflict", None);
+    fs::write(l.dictionary_file(), "synthalpha").unwrap();
+    let window = open(&l);
+    one(&window, "Dictionary").set_accessible_value("synthbeta");
+    assert!(has(&window, "Unsaved changes"));
+    // Notepad saves its own edit meanwhile.
+    fs::write(l.dictionary_file(), "synthgamma").unwrap();
+
+    one(&window, "Save dictionary.txt").invoke_accessible_default_action();
+    assert_eq!(
+        fs::read_to_string(l.dictionary_file()).unwrap(),
+        "synthgamma"
+    );
+    assert_eq!(
+        one(&window, "Dictionary").accessible_value().unwrap(),
+        "synthbeta"
+    );
+    let note = "dictionary.txt changed on disk since it was loaded.";
+    assert!(has(&window, note));
+
+    one(&window, "Overwrite dictionary.txt").invoke_accessible_default_action();
+    assert_eq!(
+        fs::read_to_string(l.dictionary_file()).unwrap(),
+        "synthbeta"
+    );
+    assert!(!has(&window, note));
+    assert!(!has(&window, "Unsaved changes"));
+}
+
+#[test]
+fn clean_editor_takes_a_file_changed_on_disk_instead_of_saving() {
+    let l = layout("clean-reload", None);
+    fs::write(l.replace_file(), "a => b").unwrap();
+    let window = open(&l);
+    fs::write(l.replace_file(), "c => d").unwrap();
+    one(&window, "Save replace.txt").invoke_accessible_default_action();
+    assert_eq!(fs::read_to_string(l.replace_file()).unwrap(), "c => d");
+    assert_eq!(
+        one(&window, "Replacements").accessible_value().unwrap(),
+        "c => d"
+    );
+}
+
+#[test]
+fn fixed_file_is_read_again_when_the_page_is_shown_or_on_reload() {
+    let l = layout("fixed", None);
+    fs::write(l.dictionary_file(), [b's', 0xFF]).unwrap();
+    fs::write(l.replace_file(), [b's', 0xFF]).unwrap();
+    let window = open(&l);
+    assert_eq!(
+        one(&window, "Save dictionary.txt").accessible_enabled(),
+        Some(false)
+    );
+    fs::write(l.dictionary_file(), "synthalpha").unwrap();
+    fs::write(l.replace_file(), "a => b").unwrap();
+
+    one(&window, "Reload replace.txt").invoke_accessible_default_action();
+    assert_eq!(
+        one(&window, "Replacements").accessible_value().unwrap(),
+        "a => b"
+    );
+    assert_eq!(
+        one(&window, "Save replace.txt").accessible_enabled(),
+        Some(true)
+    );
+
+    window.set_page(Page::About);
+    // The query builds the About page, so the Text page is really left.
+    assert!(has(&window, "Version"));
+    window.set_page(Page::Text);
+    assert_eq!(
+        one(&window, "Dictionary").accessible_value().unwrap(),
+        "synthalpha"
+    );
+    assert_eq!(
+        one(&window, "Save dictionary.txt").accessible_enabled(),
+        Some(true)
+    );
+}
+
+#[test]
+fn reset_keeps_unsaved_text_and_reloads_clean_files() {
+    let l = layout("reset", Some("version = 1\n[audio]\ngain_db = \n"));
+    fs::write(l.dictionary_file(), "synthalpha").unwrap();
+    fs::write(l.replace_file(), "a => b").unwrap();
+    let window = open(&l);
+    one(&window, "Dictionary").set_accessible_value("synthbeta");
+    fs::write(l.replace_file(), "c => d").unwrap();
+
+    one(&window, "Reset to defaults").invoke_accessible_default_action();
+    assert_eq!(
+        one(&window, "Dictionary").accessible_value().unwrap(),
+        "synthbeta"
+    );
+    assert!(has(&window, "Unsaved changes"));
+    assert_eq!(
+        one(&window, "Replacements").accessible_value().unwrap(),
+        "c => d"
+    );
+}
+
+#[test]
+fn read_error_names_its_kind_and_keeps_save_off() {
+    let l = layout("read-error", None);
+    // A directory in the file's place fails the read with an io error, not a decode error.
+    fs::create_dir(l.dictionary_file()).unwrap();
+    let window = open(&l);
+    let notes = labels(&window, "Could not read dictionary.txt: ");
+    assert_eq!(notes.len(), 1, "{:?}", labels(&window, ""));
+    assert!(!has(
+        &window,
+        "dictionary.txt is not UTF-8 or UTF-16 text: fix it in a text editor."
+    ));
+    let save = one(&window, "Save dictionary.txt");
+    assert_eq!(save.accessible_enabled(), Some(false));
+    save.invoke_accessible_default_action();
+    assert!(l.dictionary_file().is_dir());
+}
+
+#[test]
+fn restore_delay_is_saved_once_the_slider_rests() {
+    let l = layout("delay", None);
+    let window = open(&l);
+    let slider = with_role(&window, "Restore clipboard after", AccessibleRole::Slider);
+    slider.set_accessible_value("400");
+    slider.set_accessible_value("500");
+    assert!(has(&window, "500 ms"));
+    assert!(!l.config_file().exists(), "saved during the drag");
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(350));
+    assert_eq!(config(&l).config.paste.restore_delay_ms, 500);
+}
+
+#[test]
+fn duplicate_rule_shows_a_note() {
+    let l = layout("duplicate", None);
+    let window = open(&l);
+    one(&window, "New rule app").set_accessible_value("synth.exe");
+    one(&window, "Add rule").invoke_accessible_default_action();
+    one(&window, "New rule app").set_accessible_value("SYNTH.EXE");
+    one(&window, "Add rule").invoke_accessible_default_action();
+    let note = "SYNTH.EXE already has a rule: change its mode in the list above.";
+    assert!(has(&window, note), "{:?}", labels(&window, "SYNTH"));
+    assert_eq!(config(&l).config.paste.rules.len(), 2);
+
+    one(&window, "New rule app").set_accessible_value("other.exe");
+    one(&window, "Add rule").invoke_accessible_default_action();
+    assert!(!has(&window, note));
 }
 
 #[test]
@@ -181,10 +333,6 @@ fn mode_thumb_and_rules_write_the_config() {
 
     with_role(&window, "Trailing space", AccessibleRole::Switch).invoke_accessible_default_action();
     assert!(!config(&l).config.paste.trailing_space);
-    with_role(&window, "Restore clipboard after", AccessibleRole::Slider)
-        .set_accessible_value("500");
-    assert_eq!(config(&l).config.paste.restore_delay_ms, 500);
-    assert!(has(&window, "500 ms"));
 
     // The default rule is mstsc.exe; add one, refuse its case-insensitive twin, remove the first.
     assert!(has(&window, "Remove mstsc.exe"));

@@ -1,66 +1,66 @@
 //! Text page: `dictionary.txt` against the prompt budget, `replace.txt` with its ignored lines,
 //! and the `[paste]` config (mode, trailing space, restore delay, per-app rules).
 
-use std::io;
-use std::path::Path;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
+use std::{fs, io};
 
 use oxi_core::config::{Paste, PasteMode, PasteRule};
 use oxi_core::dictionary::{BUDGET, build_prompt, token_count};
+use oxi_core::paths::Layout;
 use oxi_core::text::{ReplaceRules, decode_text_file};
-use slint::{ComponentHandle, ModelRc, VecModel, Weak};
+use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
-use crate::generated::{FileState, PasteRuleRow, TextState};
+use crate::generated::{FileInfo, FileState, PasteRuleRow, TextFile, TextState};
 use crate::{AppWindow, Ctx, Error, report};
 
+const FILES: [TextFile; 2] = [TextFile::Dictionary, TextFile::Replacements];
+/// How long the restore delay slider rests before its value is saved.
+const SAVE_DELAY: Duration = Duration::from_millis(300);
+
+/// Runs again after Reset to defaults: an editor with unsaved edits keeps them, the rest reload.
+// shortcut: closing the window drops unsaved edits without asking; add a close confirm when the
+// shell gets a close hook.
 pub fn bind(window: &AppWindow, ctx: &Ctx) {
     let s = window.global::<TextState>();
     s.set_budget(int(BUDGET));
     bind_paste(window, ctx);
+    for file in FILES {
+        refresh(&s, &ctx.layout, file);
+    }
 
-    let (text, state) = load(&ctx.layout.dictionary_file());
-    s.set_dictionary(text.clone().into());
-    s.set_dictionary_state(state);
-    show_dictionary(&s, &text);
-    let (text, state) = load(&ctx.layout.replace_file());
-    s.set_replacements(text.clone().into());
-    s.set_replacements_state(state);
-    show_replacements(&s, &text);
-
-    let weak = window.as_weak();
-    s.on_dictionary_edited(move |text| with(&weak, |s| show_dictionary(&s, &text)));
-    let weak = window.as_weak();
-    s.on_replacements_edited(move |text| with(&weak, |s| show_replacements(&s, &text)));
-
-    let weak = window.as_weak();
-    let path = ctx.layout.dictionary_file();
-    s.on_save_dictionary(move || {
-        with(&weak, |s| {
-            if save(&weak, &path, &s.get_dictionary(), s.get_dictionary_state()) {
-                s.set_dictionary_state(FileState::Ok);
+    let (w, l) = (window.as_weak(), ctx.layout.clone());
+    s.on_shown(move || {
+        with(&w, |s| {
+            for file in FILES {
+                refresh(&s, &l, file);
             }
         });
     });
-    let weak = window.as_weak();
-    let path = ctx.layout.replace_file();
-    s.on_save_replacements(move || {
-        with(&weak, |s| {
-            if save(
-                &weak,
-                &path,
-                &s.get_replacements(),
-                s.get_replacements_state(),
-            ) {
-                s.set_replacements_state(FileState::Ok);
-            }
+    let w = window.as_weak();
+    s.on_edited(move |file, text| {
+        with(&w, |s| {
+            show(&s, file, &text);
+            let mut info = info(&s, file);
+            info.dirty = true;
+            set_info(&s, file, info);
         });
     });
-    let weak = window.as_weak();
-    let path = ctx.layout.dictionary_file();
-    s.on_open_dictionary(move || open(&weak, &path));
-    let weak = window.as_weak();
-    let path = ctx.layout.replace_file();
-    s.on_open_replacements(move || open(&weak, &path));
+    let (w, l) = (window.as_weak(), ctx.layout.clone());
+    s.on_save(move |file| save(&w, &l, file, false));
+    let (w, l) = (window.as_weak(), ctx.layout.clone());
+    s.on_overwrite(move |file| save(&w, &l, file, true));
+    let (w, l) = (window.as_weak(), ctx.layout.clone());
+    s.on_reload(move |file| with(&w, |s| reload(&s, &l, file)));
+    let (w, l) = (window.as_weak(), ctx.layout.clone());
+    s.on_open(move |file| {
+        report(
+            &w,
+            oxi_platform::open::open(&path(&l, file)).map_err(Error::from),
+        );
+    });
 }
 
 fn bind_paste(window: &AppWindow, ctx: &Ctx) {
@@ -76,6 +76,7 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
     let ms = paste.restore_delay_ms as f32;
     s.set_restore_delay_ms(ms);
     s.set_rules(rows(&paste.rules));
+    s.set_duplicate_app(SharedString::new());
     drop(file);
 
     let (w, c) = (window.as_weak(), ctx.clone());
@@ -90,6 +91,7 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
     let (w, c) = (window.as_weak(), ctx.clone());
     s.on_trailing_space_toggled(move |on| apply(&w, &c, |p| p.trailing_space = on));
     let (w, c) = (window.as_weak(), ctx.clone());
+    let timer = Rc::new(Timer::default());
     s.on_restore_delay_changed(move |ms| {
         #[allow(
             clippy::cast_possible_truncation,
@@ -97,7 +99,14 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
             reason = "clamped to the slider's 0..=1000 first"
         )]
         let ms = ms.round().clamp(0.0, 1000.0) as u32;
-        apply(&w, &c, |p| p.restore_delay_ms = ms);
+        c.config.borrow_mut().config.paste.restore_delay_ms = ms;
+        // A drag fires on every step: save once it rests, not one fsync per step.
+        // shortcut: closing the window within SAVE_DELAY drops the last value; flush on close
+        // when the shell gets a close hook.
+        let (w, c) = (w.clone(), c.clone());
+        timer.start(TimerMode::SingleShot, SAVE_DELAY, move || {
+            report(&w, c.save());
+        });
     });
     let (w, c) = (window.as_weak(), ctx.clone());
     s.on_rule_mode_picked(move |i, mode| {
@@ -123,17 +132,26 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
         });
     });
     let (w, c) = (window.as_weak(), ctx.clone());
-    s.on_rule_added(move |app| apply(&w, &c, |p| add_rule(p, app.trim())));
+    s.on_rule_added(move |app| {
+        let app = app.trim();
+        let mut added = false;
+        apply(&w, &c, |p| added = add_rule(p, app));
+        let duplicate = if added { "" } else { app };
+        with(&w, |s| s.set_duplicate_app(duplicate.into()));
+    });
 }
 
 /// A new rule types into `app`. The daemon takes the first rule whose app matches
-/// case-insensitively, so a second rule for the same app is not added: it would never apply.
-fn add_rule(paste: &mut Paste, app: &str) {
+/// case-insensitively, so a second rule for the same app is refused (false): it would never apply.
+fn add_rule(paste: &mut Paste, app: &str) -> bool {
     let taken = paste
         .rules
         .iter()
         .any(|r| r.app.to_lowercase() == app.to_lowercase());
-    if !app.is_empty() && !taken {
+    if taken {
+        return false;
+    }
+    if !app.is_empty() {
         paste.rules.push(PasteRule {
             app: app.to_owned(),
             mode: Some(PasteMode::Type),
@@ -141,6 +159,7 @@ fn add_rule(paste: &mut Paste, app: &str) {
             restore_delay_ms: None,
         });
     }
+    true
 }
 
 /// Change `[paste]`, show its rules again and save.
@@ -188,33 +207,130 @@ fn show_replacements(s: &TextState<'_>, text: &str) {
     s.set_bad_lines(bad.join(", ").into());
 }
 
-/// The file's text and how it was read; a missing file is an empty one.
-fn load(path: &Path) -> (String, FileState) {
-    match std::fs::read(path) {
-        Ok(bytes) => match decode_text_file(&bytes) {
-            Ok(text) if text.as_bytes() == bytes => (text, FileState::Ok),
-            Ok(text) => (text, FileState::Converted),
-            Err(_) => (String::new(), FileState::Unreadable),
-        },
-        Err(e) if e.kind() == io::ErrorKind::NotFound => (String::new(), FileState::Ok),
-        Err(_) => (String::new(), FileState::Unreadable),
+/// Read the file into the editor unless it has unsaved edits; then only flag a change on disk.
+fn refresh(s: &TextState<'_>, layout: &Layout, file: TextFile) {
+    let mut info = info(s, file);
+    if info.dirty {
+        info.conflict = stamp(&fs::read(path(layout, file))) != info.base;
+        set_info(s, file, info);
+    } else {
+        reload(s, layout, file);
     }
 }
 
-/// Write `text` over `path`; true when it was written. A file that could not be read is never
-/// written: the editor holds none of it, so saving would wipe it.
-fn save(weak: &Weak<AppWindow>, path: &Path, text: &str, state: FileState) -> bool {
-    if state == FileState::Unreadable {
-        return false;
+/// Read the file into the editor, dropping any edits.
+fn reload(s: &TextState<'_>, layout: &Layout, file: TextFile) {
+    let (text, info) = load(&path(layout, file));
+    match file {
+        TextFile::Dictionary => s.set_dictionary(text.as_str().into()),
+        TextFile::Replacements => s.set_replacements(text.as_str().into()),
     }
-    let result = oxi_platform::fs::write_atomic(path, text.as_bytes());
-    let written = result.is_ok();
+    set_info(s, file, info);
+    show(s, file, &text);
+}
+
+/// Write the editor over the file. Without `force`, only while the disk still holds what the
+/// editor was loaded from: a clean editor then takes the new file, a dirty one shows the conflict.
+fn save(weak: &Weak<AppWindow>, layout: &Layout, file: TextFile, force: bool) {
+    let Some(window) = weak.upgrade() else { return };
+    let s = window.global::<TextState>();
+    let path = path(layout, file);
+    let mut info = info(&s, file);
+    if !force {
+        // The editor holds nothing of a file it could not read: saving would wipe that file.
+        if matches!(info.state, FileState::NotText | FileState::Unreadable) {
+            return;
+        }
+        if stamp(&fs::read(&path)) != info.base {
+            if info.dirty {
+                info.conflict = true;
+                set_info(&s, file, info);
+            } else {
+                reload(&s, layout, file);
+            }
+            return;
+        }
+    }
+    let text = match file {
+        TextFile::Dictionary => s.get_dictionary(),
+        TextFile::Replacements => s.get_replacements(),
+    };
+    let result = oxi_platform::fs::write_atomic(&path, text.as_bytes());
+    if result.is_ok() {
+        let info = FileInfo {
+            state: FileState::Ok,
+            base: stamp(&Ok(text.as_bytes().to_vec())),
+            ..FileInfo::default()
+        };
+        set_info(&s, file, info);
+    }
     report(weak, result.map_err(Error::from));
-    written
 }
 
-fn open(weak: &Weak<AppWindow>, path: &Path) {
-    report(weak, oxi_platform::open::open(path).map_err(Error::from));
+/// The file's text and how it was read; a missing file is an empty one.
+fn load(path: &Path) -> (String, FileInfo) {
+    let read = fs::read(path);
+    let base = stamp(&read);
+    let (text, state, error) = match read {
+        Ok(bytes) => match decode_text_file(&bytes) {
+            Ok(text) if text.as_bytes() == bytes => (text, FileState::Ok, String::new()),
+            Ok(text) => (text, FileState::Converted, String::new()),
+            Err(_) => (String::new(), FileState::NotText, String::new()),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            (String::new(), FileState::Ok, String::new())
+        }
+        Err(e) => (String::new(), FileState::Unreadable, e.kind().to_string()),
+    };
+    let info = FileInfo {
+        state,
+        error: error.into(),
+        base,
+        ..FileInfo::default()
+    };
+    (text, info)
+}
+
+/// What a read found, to tell whether the file changed since: "missing", the error kind, or
+/// the length and a hash of the bytes.
+fn stamp(read: &io::Result<Vec<u8>>) -> SharedString {
+    match read {
+        Ok(bytes) => {
+            let mut hasher = DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            format!("{}:{:016x}", bytes.len(), hasher.finish()).into()
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => "missing".into(),
+        Err(e) => format!("error:{}", e.kind()).into(),
+    }
+}
+
+fn path(layout: &Layout, file: TextFile) -> PathBuf {
+    match file {
+        TextFile::Dictionary => layout.dictionary_file(),
+        TextFile::Replacements => layout.replace_file(),
+    }
+}
+
+fn info(s: &TextState<'_>, file: TextFile) -> FileInfo {
+    match file {
+        TextFile::Dictionary => s.get_dictionary_info(),
+        TextFile::Replacements => s.get_replacements_info(),
+    }
+}
+
+fn set_info(s: &TextState<'_>, file: TextFile, info: FileInfo) {
+    match file {
+        TextFile::Dictionary => s.set_dictionary_info(info),
+        TextFile::Replacements => s.set_replacements_info(info),
+    }
+}
+
+fn show(s: &TextState<'_>, file: TextFile, text: &str) {
+    match file {
+        TextFile::Dictionary => show_dictionary(s, text),
+        TextFile::Replacements => show_replacements(s, text),
+    }
 }
 
 fn with(weak: &Weak<AppWindow>, f: impl FnOnce(TextState<'_>)) {
