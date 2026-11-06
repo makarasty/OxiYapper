@@ -58,6 +58,71 @@ fn script(events: impl Strategy<Value = Event>) -> impl Strategy<Value = Vec<(Ev
     prop::collection::vec((events, delay()), 0..60)
 }
 
+/// What the user's hand does; the hook may lose a key-up.
+#[derive(Debug, Clone, Copy)]
+enum Key {
+    Press,
+    Release { delivered: bool },
+    Other,
+    Esc,
+}
+
+fn keyboard() -> impl Strategy<Value = Vec<(Key, u64)>> {
+    let key = prop_oneof![
+        3 => Just(Key::Press),
+        3 => any::<bool>().prop_map(|delivered| Key::Release { delivered }),
+        3 => Just(Key::Other),
+        1 => Just(Key::Esc),
+    ];
+    let delay = prop_oneof![8 => 0..400u64, 1 => 0..5_000u64];
+    prop::collection::vec((key, delay), 0..40)
+}
+
+/// The machine plus a physical chord key and a coordinator that fires every deadline on
+/// time and answers each `PollChord` with the key's real state.
+struct Keyboard {
+    state: State,
+    now: u64,
+    down: bool,
+    released_at: Option<u64>,
+}
+
+impl Keyboard {
+    fn new(cfg: MachineConfig) -> Self {
+        let mut state = State::new(cfg);
+        step(&mut state, Event::ModelLoaded, Millis(0));
+        Self {
+            state,
+            now: 0,
+            down: false,
+            released_at: None,
+        }
+    }
+
+    fn send(&mut self, event: Event) -> Vec<Effect> {
+        let fx = step(&mut self.state, event, Millis(self.now));
+        if fx.contains(&Effect::PollChord) {
+            let held = self.down;
+            step(
+                &mut self.state,
+                Event::ChordPolled { held },
+                Millis(self.now),
+            );
+        }
+        fx
+    }
+
+    /// Move the clock forward, firing every deadline on the way.
+    fn advance(&mut self, dt: u64) {
+        let until = self.now + dt;
+        while let Some(t) = self.state.next_deadline().filter(|t| t.0 <= until) {
+            self.now = self.now.max(t.0);
+            self.send(Event::Tick);
+        }
+        self.now = until;
+    }
+}
+
 /// Keeps what the workers would know about the jobs the machine handed out.
 #[derive(Default)]
 struct Workers {
@@ -164,25 +229,40 @@ proptest! {
         prop_assert_eq!(state.phase(), Phase::Idle);
     }
 
-    /// Typing after the chord is released never throws a recording away, in either mode:
-    /// only a key pressed while the chord is held cancels.
+    /// Typing after the chord is physically released never throws a recording away, in
+    /// either mode, even when the hook lost the key-up: one poll later the machine knows.
     #[test]
-    fn other_key_after_release_never_discards(cfg in config(), steps in script(event())) {
-        let mut state = State::new(cfg);
-        let mut now = 0;
-        let mut released = false;
-        for (event, dt) in steps {
-            now += dt;
-            let recording = state.phase() == Phase::Recording;
-            let fx = step(&mut state, event, Millis(now));
-            match event {
-                Event::ChordDown => released = false,
-                Event::ChordUp | Event::ChordPolled { held: false } => released = true,
-                Event::OtherKey if released && recording => {
-                    prop_assert!(!fx.contains(&Effect::DiscardCapture), "{fx:?}");
-                    prop_assert_eq!(state.phase(), Phase::Recording);
+    fn other_key_after_release_never_discards(cfg in config(), acts in keyboard()) {
+        let period = cfg.watchdog_period.0;
+        let mut kb = Keyboard::new(cfg);
+        for (act, dt) in acts {
+            kb.advance(dt);
+            match act {
+                Key::Press if !kb.down => {
+                    kb.down = true;
+                    kb.released_at = None;
+                    kb.send(Event::ChordDown);
                 }
-                _ => {}
+                Key::Release { delivered } if kb.down => {
+                    kb.down = false;
+                    kb.released_at = Some(kb.now);
+                    if delivered {
+                        kb.send(Event::ChordUp);
+                    }
+                }
+                Key::Other => {
+                    let recording = kb.state.phase() == Phase::Recording;
+                    let settled = kb.released_at.is_some_and(|t| kb.now >= t + period);
+                    let fx = kb.send(Event::OtherKey);
+                    if recording && settled {
+                        prop_assert!(!fx.contains(&Effect::DiscardCapture), "{fx:?}");
+                        prop_assert_eq!(kb.state.phase(), Phase::Recording);
+                    }
+                }
+                Key::Esc => {
+                    kb.send(Event::Esc);
+                }
+                Key::Press | Key::Release { .. } => {}
             }
         }
     }

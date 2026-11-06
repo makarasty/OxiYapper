@@ -426,6 +426,25 @@ fn edge_08_watchdog_polls_every_100_ms_and_a_released_chord_is_a_key_up() {
 }
 
 #[test]
+fn edge_08_toggle_start_press_held_three_periods_polls_three_times() {
+    let mut s = Sim::toggle();
+    s.at(0, Event::ChordDown);
+    let mut polls = 0;
+    for ms in [100, 200, 300] {
+        polls += s
+            .core(ms, Event::Tick)
+            .iter()
+            .filter(|e| **e == Effect::PollChord)
+            .count();
+        assert_eq!(s.core(ms, Event::ChordPolled { held: true }), []);
+    }
+    assert_eq!(polls, 3);
+    assert_eq!(s.core(350, Event::ChordUp), []);
+    assert_eq!(s.core(400, Event::Tick), []);
+    assert_eq!(s.phase(), Phase::Recording);
+}
+
+#[test]
 fn edge_08_a_poll_that_sees_a_short_press_end_discards_it() {
     let mut s = Sim::loaded();
     s.at(1000, Event::ChordDown);
