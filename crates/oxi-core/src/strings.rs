@@ -28,6 +28,7 @@ pub const fn notice(notice: Notice) -> &'static str {
             "config.toml has an error. Using the last good settings. Open Settings to see it"
         }
         Notice::ConfigAdjusted => "config.toml had values out of range. They were adjusted",
+        Notice::MicSilence => "The microphone gives silence. Check its mute switch",
     }
 }
 
@@ -52,6 +53,7 @@ pub const fn notice_short(notice: Notice) -> &'static str {
         Notice::MicFallback => "Mic changed",
         Notice::ConfigInvalid => "Config error",
         Notice::ConfigAdjusted => "Config adjusted",
+        Notice::MicSilence => "Mic silent",
     }
 }
 

@@ -1,9 +1,9 @@
 //! Invariants of the state machine over arbitrary event streams (ARCHITECTURE section 13).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use oxi_core::machine::{
-    Effect, Event, JobId, MachineConfig, Mode, ModelFailure, Phase, State, step,
+    Effect, EmptyAudio, Event, JobId, MachineConfig, Mode, ModelFailure, Phase, State, step,
 };
 use oxi_core::paste::{ClipboardOnlyWhy, PasteOutcome};
 use oxi_core::types::Millis;
@@ -51,6 +51,11 @@ fn quiet_event() -> impl Strategy<Value = Event> {
         1 => Just(Event::DeviceLost),
         1 => Just(Event::CaptureFailed),
         4 => job().prop_map(Event::JobAudioReady),
+        2 => (job(), prop_oneof![
+            Just(EmptyAudio::NothingHeard),
+            Just(EmptyAudio::MicSilence),
+            Just(EmptyAudio::Failed),
+        ]).prop_map(|(job, why)| Event::JobAudioEmpty { job, why }),
         4 => (job(), any::<bool>()).prop_map(|(job, empty)| Event::TranscriptionDone { job, empty }),
         1 => job().prop_map(Event::TranscriptionFailed),
         4 => (job(), outcome()).prop_map(|(job, outcome)| Event::PasteDone { job, outcome }),
@@ -148,6 +153,8 @@ impl Keyboard {
 #[derive(Default)]
 struct Workers {
     issued: BTreeSet<JobId>,
+    /// First audio answer of each issued job: true when it had audio.
+    audio: BTreeMap<JobId, bool>,
     pasted: Vec<JobId>,
     transcribed: Vec<JobId>,
     whisper_busy: BTreeSet<JobId>,
@@ -160,6 +167,12 @@ impl Workers {
     /// Feed the event the way the coordinator would see it, then check the effects.
     fn observe(&mut self, event: &Event, effects: &[Effect]) {
         match *event {
+            Event::JobAudioReady(job) if self.issued.contains(&job) => {
+                self.audio.entry(job).or_insert(true);
+            }
+            Event::JobAudioEmpty { job, .. } if self.issued.contains(&job) => {
+                self.audio.entry(job).or_insert(false);
+            }
             Event::TranscriptionDone { job, .. } | Event::TranscriptionFailed(job) => {
                 self.whisper_busy.remove(&job);
             }
@@ -183,6 +196,11 @@ impl Workers {
                 Effect::Transcribe(id) => {
                     assert!(self.issued.contains(&id), "{id:?} was never recorded");
                     assert!(!self.transcribed.contains(&id), "{id:?} transcribed twice");
+                    assert_eq!(
+                        self.audio.get(&id),
+                        Some(&true),
+                        "{id:?} sent without audio"
+                    );
                     self.transcribed.push(id);
                     self.whisper_busy.insert(id);
                     assert!(self.whisper_busy.len() <= 1, "two whisper jobs in flight");
@@ -210,7 +228,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(10_000))]
 
     /// One whisper job at a time, every job transcribed and pasted at most once and in
-    /// order, no unload under a transcription and no second unload without a load between,
+    /// order and only with audio, no unload under a transcription and no second unload without a load between,
     /// whatever the workers and the keyboard do.
     #[test]
     fn jobs_are_serial_ordered_and_unique(cfg in config(), steps in script(event())) {

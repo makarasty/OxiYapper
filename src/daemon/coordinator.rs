@@ -32,6 +32,8 @@ pub struct Coordinator<H> {
     config_error: Option<String>,
     /// A config received while busy, with its warnings; becomes active on `ApplyConfig`.
     pending: Option<(Config, Vec<String>)>,
+    /// `session` of the last `AudioCmd::Start`; capture events of older ones are stale.
+    capture: u64,
     /// Samples of stopped jobs, until whisper gets them.
     audio: HashMap<JobId, Vec<f32>>,
     /// Text of transcribed jobs, until their paste is done.
@@ -61,6 +63,7 @@ impl<H: ChordHook> Coordinator<H> {
             warnings,
             config_error: None,
             pending: None,
+            capture: 0,
             audio: HashMap::new(),
             text: HashMap::new(),
             last_text: None,
@@ -94,6 +97,11 @@ impl<H: ChordHook> Coordinator<H> {
                     self.keep_last_text(job);
                 }
                 self.feed(event, now);
+            }
+            Inbox::Capture { session, event } => {
+                if session == self.capture {
+                    self.feed(event, now);
+                }
             }
             Inbox::JobAudio { job, samples } => {
                 self.audio.insert(job, samples);
@@ -161,7 +169,11 @@ impl<H: ChordHook> Coordinator<H> {
     /// Runs one effect; returns the event it answers with, if any.
     fn execute(&mut self, effect: &Effect) -> Option<Event> {
         match *effect {
-            Effect::StartCapture => send(&self.workers.audio, AudioCmd::Start),
+            Effect::StartCapture => {
+                self.capture += 1;
+                let session = self.capture;
+                send(&self.workers.audio, AudioCmd::Start { session });
+            }
             Effect::StopCapture(job) => send(&self.workers.audio, AudioCmd::Stop(job)),
             Effect::DiscardCapture => send(&self.workers.audio, AudioCmd::Discard),
             Effect::DropJob(job) => {
@@ -279,7 +291,7 @@ mod tests {
     use std::sync::mpsc::channel;
 
     use oxi_core::config::Hotkey;
-    use oxi_core::machine::OverlayState;
+    use oxi_core::machine::{EmptyAudio, Notice, OverlayState};
 
     use super::*;
 
@@ -406,7 +418,7 @@ mod tests {
         let mut rig = Rig::new();
         rig.event(Event::ChordDown, 0);
 
-        assert_eq!(drain(&rig.audio), [AudioCmd::Start]);
+        assert_eq!(drain(&rig.audio), [AudioCmd::Start { session: 1 }]);
         assert!(
             drain(&rig.whisper)
                 .iter()
@@ -495,6 +507,60 @@ mod tests {
             assert!(drain(&rig.paste).is_empty());
             assert_eq!(rig.phase.load(), Phase::Idle);
         }
+    }
+
+    #[test]
+    fn job_without_audio_never_reaches_whisper() {
+        let cases = [
+            (EmptyAudio::NothingHeard, None),
+            (EmptyAudio::MicSilence, Some(Notice::MicSilence)),
+            (EmptyAudio::Failed, Some(Notice::CaptureFailed)),
+        ];
+        for (why, notify) in cases {
+            let mut rig = Rig::new();
+            rig.event(Event::ModelLoaded, 0);
+            let job = rig.record();
+            rig.drain_all();
+            rig.event(Event::JobAudioEmpty { job, why }, 2100);
+            assert!(
+                !drain(&rig.whisper)
+                    .iter()
+                    .any(|c| matches!(c, WhisperCmd::Transcribe { .. })),
+                "{why:?}"
+            );
+            let notices: Vec<_> = drain(&rig.ui)
+                .into_iter()
+                .filter_map(|c| match c {
+                    UiCmd::Notify(n) => Some(n),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(notices, Vec::from_iter(notify), "{why:?}");
+            assert_eq!(rig.phase.load(), Phase::Idle);
+        }
+    }
+
+    #[test]
+    fn stale_capture_event_does_not_touch_the_next_recording() {
+        let mut rig = Rig::new();
+        rig.record(); // session 1
+        rig.event(Event::ChordDown, 3000); // session 2
+        assert_eq!(drain(&rig.audio), [AudioCmd::Start { session: 2 }]);
+
+        let lost = |session| Inbox::Capture {
+            session,
+            event: Event::DeviceLost,
+        };
+        rig.c.handle(lost(1), Millis(3500));
+        assert!(drain(&rig.audio).is_empty(), "the old capture's loss");
+        assert_eq!(rig.phase.load(), Phase::Recording);
+
+        rig.c.handle(lost(2), Millis(3600));
+        assert!(
+            drain(&rig.audio)
+                .iter()
+                .any(|c| matches!(c, AudioCmd::Stop(_)))
+        );
     }
 
     #[test]
@@ -600,7 +666,7 @@ mod tests {
             tx.send(msg).expect("open channel");
         }
         rig.c.run(&rx, || Millis(0));
-        assert_eq!(drain(&rig.audio), [AudioCmd::Start]);
+        assert_eq!(drain(&rig.audio), [AudioCmd::Start { session: 1 }]);
     }
 
     #[test]

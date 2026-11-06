@@ -13,7 +13,7 @@ use tiny_skia::{Pixmap, PixmapPaint, Transform};
 
 const FONT: &str = "C:/Windows/Fonts/segoeui.ttf";
 const SCALES: [f32; 3] = [1.0, 1.5, 2.0];
-const NOTICES: [Notice; 14] = [
+const NOTICES: [Notice; 15] = [
     Notice::Cancelled,
     Notice::NothingHeard,
     Notice::NoModel,
@@ -28,6 +28,7 @@ const NOTICES: [Notice; 14] = [
     Notice::MicFallback,
     Notice::ConfigInvalid,
     Notice::ConfigAdjusted,
+    Notice::MicSilence,
 ];
 
 fn font_bytes() -> Option<Vec<u8>> {

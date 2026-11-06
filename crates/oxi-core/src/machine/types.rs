@@ -102,6 +102,17 @@ pub enum ModelFailure {
     Bad,
 }
 
+/// Why a stopped job has no audio for whisper (ARCHITECTURE 9 step 6, 11 item 17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyAudio {
+    /// Too little speech after the trim.
+    NothingHeard,
+    /// Every sample was zero: hardware mute or a privacy switch.
+    MicSilence,
+    /// The capture broke or was never open.
+    Failed,
+}
+
 /// Everything that happens, as the coordinator sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -123,6 +134,11 @@ pub enum Event {
     CaptureFailed,
     /// The audio of a job is trimmed and ready for whisper.
     JobAudioReady(JobId),
+    /// The job has no audio for whisper; it ends here, without a whisper call.
+    JobAudioEmpty {
+        job: JobId,
+        why: EmptyAudio,
+    },
     /// Whisper finished; `empty` is true when nothing is left to paste.
     TranscriptionDone {
         job: JobId,
@@ -229,6 +245,8 @@ pub enum Notice {
     ConfigInvalid,
     /// The config file loaded with warnings (a value was clamped or replaced).
     ConfigAdjusted,
+    /// Every sample was zero: hardware mute or a privacy switch (item 17).
+    MicSilence,
 }
 
 /// What the overlay shows; emitted only when it changes.
@@ -250,7 +268,8 @@ pub enum OverlayState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     StartCapture,
-    /// Stop capture, flush, and answer with [`Event::JobAudioReady`] for this job.
+    /// Stop capture, flush, and answer with [`Event::JobAudioReady`] or
+    /// [`Event::JobAudioEmpty`] for this job.
     StopCapture(JobId),
     /// Stop capture and throw the audio away.
     DiscardCapture,

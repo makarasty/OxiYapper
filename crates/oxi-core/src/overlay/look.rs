@@ -84,9 +84,10 @@ fn notice_look(notice: Notice) -> (Rgba, Icon) {
     match notice {
         Notice::Cancelled | Notice::NothingHeard => (palette::INFO, Icon::Info),
         Notice::PressPaste | Notice::AdminWindow => (palette::WARN, Icon::Paste),
-        Notice::RestoreSkipped | Notice::MicFallback | Notice::ConfigAdjusted => {
-            (palette::WARN, Icon::Warning)
-        }
+        Notice::RestoreSkipped
+        | Notice::MicFallback
+        | Notice::MicSilence
+        | Notice::ConfigAdjusted => (palette::WARN, Icon::Warning),
         Notice::NoModel
         | Notice::ModelBad
         | Notice::DeviceLost
