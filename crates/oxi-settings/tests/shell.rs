@@ -7,8 +7,10 @@ use std::fs;
 use common::layout;
 use i_slint_backend_testing::{AccessibleRole, ElementHandle, ElementQuery};
 use oxi_core::config::{ConfigFile, Theme};
+use oxi_core::ipc::Push;
 use oxi_core::paths::Layout;
-use oxi_settings::{AppWindow, Page, Shell, ThemeChoice};
+use oxi_settings::ipc::{Cmd, Event, Link};
+use oxi_settings::{AppWindow, Ipc, Page, Shell, ThemeChoice};
 use slint::ComponentHandle;
 use slint::platform::{Key, PointerEventButton, WindowEvent};
 
@@ -244,4 +246,82 @@ fn a_successful_save_clears_the_save_error() {
         ConfigFile::parse(&text).unwrap().config.ui.theme,
         Theme::Light
     );
+}
+
+/// A window on a fake daemon link; the receiver gets what the window sends to the daemon.
+fn linked(name: &str) -> (AppWindow, Ipc, std::sync::mpsc::Receiver<Cmd>) {
+    i_slint_backend_testing::init_no_event_loop();
+    let (ipc, rx) = Ipc::fake();
+    let window = oxi_settings::open_with(layout(name, None), ipc.clone()).unwrap();
+    window.show().unwrap();
+    (window, ipc, rx)
+}
+
+#[test]
+fn offline_daemon_shows_start_and_start_is_sent() {
+    let (window, ipc, rx) = linked("daemon-offline");
+    assert_eq!(banners(&window), Vec::<String>::new(), "online: no banner");
+    ipc.deliver(&Event::Link(Link::Offline));
+    assert_eq!(banners(&window).len(), 1);
+    assert!(window.get_daemon_text().contains("not running"));
+    assert!(!has(&window, "Restart"));
+    one(&window, "Start").invoke_accessible_default_action();
+    assert_eq!(rx.try_recv(), Ok(Cmd::Start));
+    ipc.deliver(&Event::Link(Link::Online));
+    assert_eq!(banners(&window), Vec::<String>::new(), "online clears it");
+}
+
+#[test]
+fn update_notice_shows_restart_and_restart_is_sent() {
+    let (window, ipc, rx) = linked("daemon-restart");
+    ipc.deliver(&Event::Link(Link::Mismatch { daemon_proto: 9 }));
+    assert_eq!(banners(&window), ["Restart OxiYapper to finish the update"]);
+    assert!(!has(&window, "Start"));
+    one(&window, "Restart").invoke_accessible_default_action();
+    assert_eq!(rx.try_recv(), Ok(Cmd::Restart));
+}
+
+#[test]
+fn untrusted_pipe_shows_the_note_without_a_button() {
+    let (window, ipc, rx) = linked("daemon-untrusted");
+    ipc.deliver(&Event::Link(Link::Untrusted));
+    assert!(window.get_daemon_text().contains("untrusted"));
+    assert_eq!(banners(&window).len(), 1);
+    assert!(!has(&window, "Start") && !has(&window, "Restart"));
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn daemon_config_error_uses_the_same_banner() {
+    let (window, ipc, _rx) = linked("daemon-config-error");
+    ipc.deliver(&Event::Push(Push::ConfigError {
+        file: "config.toml".into(),
+        line: 7,
+        message: "bad value".into(),
+    }));
+    assert_eq!(banners(&window), ["config.toml, line 7: bad value"]);
+    assert!(!has(&window, "Start") && !has(&window, "Restart"));
+    // Other pushes leave the banner alone.
+    ipc.deliver(&Event::Push(Push::Raise));
+    assert_eq!(banners(&window).len(), 1);
+}
+
+#[test]
+fn raise_unminimises_the_window() {
+    let (window, ipc, _rx) = linked("daemon-raise");
+    window.window().set_minimized(true);
+    assert!(window.window().is_minimized());
+    ipc.deliver(&Event::Push(Push::Raise));
+    assert!(!window.window().is_minimized());
+}
+
+#[test]
+fn a_failed_spawn_reason_shows_under_the_offline_note_until_online() {
+    let (window, ipc, _rx) = linked("daemon-spawn");
+    window.set_spawn_error("Could not start OxiYapper: entity not found.".into());
+    ipc.deliver(&Event::Link(Link::Offline));
+    let shown = banners(&window);
+    assert!(shown[0].contains("not running") && shown[0].contains("entity not found"));
+    ipc.deliver(&Event::Link(Link::Online));
+    assert_eq!(window.get_spawn_error(), "");
 }

@@ -5,13 +5,16 @@ pub mod ipc;
 mod pages;
 
 use std::io;
+use std::sync::{Arc, Mutex};
 
 use oxi_core::config::{ConfigError, Theme};
+use oxi_core::ipc::Push;
 use oxi_core::paths::Layout;
 use slint::{ComponentHandle, Weak};
 
 pub use ctx::Ctx;
 pub use ipc::Ipc;
+use ipc::{Action, Event, Link, Options};
 
 // Slint's generated code trips the workspace `unused_qualifications` lint; it is not ours to fix.
 #[allow(unused_qualifications)]
@@ -34,14 +37,56 @@ pub enum Error {
 pub fn run() -> Result<(), Error> {
     let layout = oxi_platform::dirs::layout()?;
     oxi_platform::dirs::ensure(&layout)?;
-    open(layout)?.run()?;
+    // The worker reports a failed daemon spawn before the window exists; the window is
+    // looked up when the report reaches the UI thread.
+    let slot = Arc::new(Mutex::new(Weak::default()));
+    let mut options = Options::daemon()?;
+    options.spawn = watch_spawn(options.spawn, &slot);
+    let window = open_with(layout, Ipc::connect(options)?)?;
+    if let Ok(mut weak) = slot.lock() {
+        *weak = window.as_weak();
+    }
+    window.run()?;
     Ok(())
 }
 
-/// The settings window on `layout`'s config, every page bound; the caller shows it.
+/// `spawn` that also shows why it failed (the error kind only) in the window.
+fn watch_spawn(
+    spawn: Box<dyn Fn() -> io::Result<()> + Send>,
+    slot: &Arc<Mutex<Weak<AppWindow>>>,
+) -> Box<dyn Fn() -> io::Result<()> + Send> {
+    let slot = Arc::clone(slot);
+    Box::new(move || {
+        let result = spawn();
+        if let Err(e) = &result {
+            let note = spawn_note(e);
+            let slot = Arc::clone(&slot);
+            // Err means the event loop is gone: the window is closing.
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = slot.lock().ok().and_then(|weak| weak.upgrade()) {
+                    window.set_spawn_error(note.into());
+                }
+            });
+        }
+        result
+    })
+}
+
+fn spawn_note(e: &io::Error) -> String {
+    format!("Could not start OxiYapper: {}.", e.kind())
+}
+
+/// The settings window on `layout`'s config with no daemon link (it stays offline and shows no
+/// daemon banner); the caller shows it.
 pub fn open(layout: Layout) -> Result<AppWindow, Error> {
+    open_with(layout, Ipc::default())
+}
+
+/// [`open`] with the link to the daemon: its state and notices show in the daemon banner.
+pub fn open_with(layout: Layout, ipc: Ipc) -> Result<AppWindow, Error> {
     let window = AppWindow::new()?;
-    let (ctx, problem) = Ctx::load(layout)?;
+    let (mut ctx, problem) = Ctx::load(layout)?;
+    ctx.ipc = ipc;
     if let Some(problem) = &problem {
         window.set_banner_text(problem.to_string().into());
         // A broken file gets "Open file" and "Reset to defaults"; a newer one only the message.
@@ -72,8 +117,47 @@ pub fn open(layout: Layout) -> Result<AppWindow, Error> {
         report(&weak, result);
     });
 
+    let weak = window.as_weak();
+    ctx.ipc.subscribe(move |event| {
+        if let Some(window) = weak.upgrade() {
+            on_daemon_event(&window, event);
+        }
+    });
+    let ipc = ctx.ipc.clone();
+    window.on_start_daemon({
+        let weak = window.as_weak();
+        move || {
+            if let Some(window) = weak.upgrade() {
+                window.set_spawn_error("".into());
+            }
+            ipc.start_daemon();
+        }
+    });
+    let ipc = ctx.ipc.clone();
+    window.on_restart_daemon(move || ipc.restart_daemon());
+
     bind(&window, &ctx);
     Ok(window)
+}
+
+/// The daemon banner follows the link; a push that is not a notice leaves it alone.
+fn on_daemon_event(window: &AppWindow, event: &Event) {
+    if matches!(event, Event::Push(Push::Raise)) {
+        // Un-minimise and show again: the shell puts a shown window in front.
+        window.window().set_minimized(false);
+        let _ = window.show();
+    }
+    let notice = ipc::notice(event);
+    if notice.is_none() && !matches!(event, Event::Link(_)) {
+        return;
+    }
+    let action = notice.as_ref().and_then(|n| n.action);
+    window.set_daemon_text(notice.map(|n| n.text).unwrap_or_default().into());
+    window.set_daemon_start(action == Some(Action::Start));
+    window.set_daemon_restart(action == Some(Action::Restart));
+    if matches!(event, Event::Link(Link::Online)) {
+        window.set_spawn_error("".into());
+    }
 }
 
 /// Push the config into the shell and every page.
@@ -112,15 +196,25 @@ const fn theme(choice: ThemeChoice) -> Theme {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppWindow, ThemeChoice, choice, theme};
+    use super::{AppWindow, ThemeChoice, choice, spawn_note, theme};
     use oxi_core::config::Theme;
     use slint::ComponentHandle;
+    use std::io::{Error, ErrorKind};
 
     #[test]
     fn window_builds_under_the_testing_backend() {
         i_slint_backend_testing::init_no_event_loop();
         let window = AppWindow::new().expect("window builds");
         assert!(window.show().is_ok());
+    }
+
+    #[test]
+    fn spawn_note_gives_the_kind_and_nothing_else() {
+        let e = Error::new(ErrorKind::NotFound, r"C:\Users\someone\oxi.exe");
+        assert_eq!(
+            spawn_note(&e),
+            "Could not start OxiYapper: entity not found."
+        );
     }
 
     #[test]

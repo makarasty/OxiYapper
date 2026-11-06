@@ -74,7 +74,16 @@ export component AppWindow inherits Window {
     in property <bool> banner-fixable;
     // The last failed save or file action; empty hides it. Shown under the config banner.
     in property <string> action-error;
+    // The daemon link's notice (not running, restart to update, a daemon-side config error);
+    // empty hides it. Start and Restart are the buttons it may carry.
+    in property <string> daemon-text;
+    in property <bool> daemon-start;
+    in property <bool> daemon-restart;
+    // Why the last daemon start failed; shown under the notice.
+    in property <string> spawn-error;
     callback theme-changed(ThemeChoice);
+    callback start-daemon();
+    callback restart-daemon();
     callback open-file();
     callback reset-config();
 
@@ -140,6 +149,22 @@ export component AppWindow inherits Window {
                     text: @tr("Reset to defaults");
                     clicked => {
                         root.reset-config();
+                    }
+                }
+            }
+            if root.daemon-text != "": Banner {
+                text: root.spawn-error == "" ? root.daemon-text : root.daemon-text + " " + root.spawn-error;
+                error: root.spawn-error != "";
+                if root.daemon-start: Button {
+                    text: @tr("Start");
+                    clicked => {
+                        root.start-daemon();
+                    }
+                }
+                if root.daemon-restart: Button {
+                    text: @tr("Restart");
+                    clicked => {
+                        root.restart-daemon();
                     }
                 }
             }
