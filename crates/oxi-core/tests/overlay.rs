@@ -17,7 +17,7 @@ const ALL_POSITIONS: [P; 6] = [
     P::TopLeft,
 ];
 
-const ALL_NOTICES: [Notice; 12] = [
+const ALL_NOTICES: [Notice; 14] = [
     Notice::Cancelled,
     Notice::NothingHeard,
     Notice::NoModel,
@@ -30,6 +30,8 @@ const ALL_NOTICES: [Notice; 12] = [
     Notice::RestoreSkipped,
     Notice::PasteFailed,
     Notice::MicFallback,
+    Notice::ConfigInvalid,
+    Notice::ConfigAdjusted,
 ];
 
 #[test]
@@ -213,6 +215,12 @@ fn every_notice_has_text() {
         strings::notice(Notice::AdminWindow),
         "Admin window: press Ctrl+V"
     );
+    for n in [Notice::ConfigInvalid, Notice::ConfigAdjusted] {
+        assert!(
+            strings::notice(n).contains(oxi_core::paths::CONFIG_FILE),
+            "{n:?}"
+        );
+    }
 }
 
 #[test]
