@@ -1,6 +1,8 @@
 # cargo-deny: licences, advisories, bans, sources. Run: cargo deny check
 [graph]
 all-features = false
+# iOS-only i-slint-renderer-skia (GPL option) is not in these targets, so it is not checked.
+targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "x86_64-apple-darwin", "aarch64-apple-darwin"]
 
 [advisories]
 # RustSec advisories fail the check; an ignore needs an id and a reason here.
@@ -21,6 +23,7 @@ allow = [
     "Unlicense", # whisper-rs, whisper-rs-sys
     "CC0-1.0",
     "BSL-1.0",
+    "CDLA-Permissive-2.0", # webpki-roots (ureq rustls)
     "0BSD", # doctest-file, recvmsg (interprocess)
 ]
 # Slint (settings UI, ROADMAP M9) is "GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR ...".
