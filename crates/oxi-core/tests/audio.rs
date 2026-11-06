@@ -286,28 +286,71 @@ fn trim_keeps_silence_between_voiced_parts() {
     assert!(t.len() >= 8_000 + 16_000 + 8_000 + 2 * pad - 4 * 256);
 }
 
+/// Uniform white noise amplitude for an RMS of `dbfs`.
+fn noise_amp(dbfs: f32) -> f32 {
+    10.0_f32.powf(dbfs / 20.0) * 3.0_f32.sqrt()
+}
+
+/// `tone` samples of 300 Hz at `amp` after `lead` and before 8000 samples of silence, all over
+/// white noise of `noise_amp`, through the default chain (denoise as given).
+fn gated(
+    lead: usize,
+    tone: usize,
+    amp: f32,
+    noise_amp: f32,
+    denoise: bool,
+) -> Result<Vec<f32>, AudioError> {
+    let mut s = vec![0.0; lead];
+    s.extend(sine(300.0, SAMPLE_RATE, tone, amp));
+    s.resize(lead + tone + 8_000, 0.0);
+    for (x, n) in s.iter_mut().zip(noise(lead + tone + 8_000, noise_amp)) {
+        *x += n;
+    }
+    process(
+        &s,
+        SAMPLE_RATE,
+        &Audio {
+            denoise,
+            ..Audio::default()
+        },
+    )
+}
+
 #[test]
 fn speech_gate_needs_250_ms_without_counting_the_hold() {
     // earshot's hold after a tone must not lift 200 ms over the 250 ms bar.
-    for background in [0.0, 0.003] {
-        let gated = |tone_ms: usize| {
-            let mut s = tone_in_silence(8_000, tone_ms * 16, 8_000);
-            for (x, n) in s.iter_mut().zip(noise(32_000, background)) {
-                *x += n;
+    for denoise in [false, true] {
+        for background in [0.0, noise_amp(-50.0)] {
+            let case = |ms: usize| gated(8_000, ms * 16, 0.5, background, denoise);
+            for ms in [100, 200] {
+                assert!(
+                    matches!(case(ms), Err(AudioError::NothingHeard)),
+                    "{ms} ms, noise {background}, denoise {denoise}"
+                );
             }
-            process(&s, SAMPLE_RATE, &Audio::default())
-        };
-        for tone_ms in [100, 200] {
-            assert!(
-                matches!(gated(tone_ms), Err(AudioError::NothingHeard)),
-                "{tone_ms} ms over noise {background}"
-            );
-        }
-        for tone_ms in [300, 600] {
-            assert!(
-                gated(tone_ms).is_ok(),
-                "{tone_ms} ms over noise {background}"
-            );
+            for ms in [300, 600] {
+                assert!(
+                    case(ms).is_ok(),
+                    "{ms} ms, noise {background}, denoise {denoise}"
+                );
+            }
         }
     }
+}
+
+#[test]
+fn speech_gate_does_not_depend_on_the_noise_level() {
+    // 2 s of -20 dBFS tone over -30 dBFS noise (10 dB SNR), and quieter at the same SNR.
+    for (tone_dbfs, noise_dbfs) in [(-20.0_f32, -30.0), (-22.0, -30.0), (-45.0, -55.0)] {
+        let amp = 10.0_f32.powf(tone_dbfs / 20.0) * 2.0_f32.sqrt();
+        assert!(
+            gated(8_000, 32_000, amp, noise_amp(noise_dbfs), false).is_ok(),
+            "{tone_dbfs} over {noise_dbfs} dBFS"
+        );
+    }
+}
+
+#[test]
+fn speech_from_the_first_sample_is_heard() {
+    assert!(gated(0, 9_600, 0.5, 0.0, false).is_ok());
 }
