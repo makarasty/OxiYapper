@@ -94,9 +94,9 @@ pub enum Event {
     /// Another key went down while the chord was held.
     OtherKey,
     /// Capture ended on its own (microphone unplugged); the audio so far is kept.
-    AudioStopped,
+    DeviceLost,
     /// Capture could not run (no permission, device error); nothing is kept.
-    AudioFailed,
+    CaptureFailed,
     /// The audio of a job is trimmed and ready for whisper.
     JobAudioReady(JobId),
     /// Whisper finished; `empty` is true when nothing is left to paste.
@@ -143,14 +143,14 @@ pub enum Notice {
     NothingHeard,
     NoModel,
     ModelBad,
-    MicLost,
-    MicFailed,
+    DeviceLost,
+    CaptureFailed,
     TranscriptionFailed,
 }
 
 /// What the overlay shows; emitted only when it changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Overlay {
+pub enum OverlayState {
     Hidden,
     /// `locked`: double tap locked it on. `ending_soon`: `warn_before` has passed.
     Recording {
@@ -185,7 +185,7 @@ pub enum Effect {
     /// Pending config became active: re-read hotkey, mic, sounds.
     ApplyConfig,
     Play(Sound),
-    Overlay(Overlay),
+    Overlay(OverlayState),
     /// OS notification.
     Notify(Notice),
 }

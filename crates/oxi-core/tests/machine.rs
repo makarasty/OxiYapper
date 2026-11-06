@@ -3,16 +3,16 @@
 
 use oxi_core::config::Config;
 use oxi_core::machine::{
-    Effect, Effects, Event, JobId, MachineConfig, Mode, ModelFailure, Notice, Overlay, Phase,
+    Effect, Effects, Event, JobId, MachineConfig, Mode, ModelFailure, Notice, OverlayState, Phase,
     Sound, State, step,
 };
 use oxi_core::types::Millis;
 
-const REC: Overlay = Overlay::Recording {
+const REC: OverlayState = OverlayState::Recording {
     locked: false,
     ending_soon: false,
 };
-const LOCKED: Overlay = Overlay::Recording {
+const LOCKED: OverlayState = OverlayState::Recording {
     locked: true,
     ending_soon: false,
 };
@@ -73,7 +73,7 @@ fn without_overlay(fx: Effects) -> Effects {
         .collect()
 }
 
-fn overlay_of(fx: &[Effect]) -> Option<Overlay> {
+fn overlay_of(fx: &[Effect]) -> Option<OverlayState> {
     fx.iter().find_map(|e| match e {
         Effect::Overlay(o) => Some(*o),
         _ => None,
@@ -303,7 +303,7 @@ fn edge_05_warns_30_s_before_the_cap_then_stops_and_keeps_the_audio() {
     let fx = s.at(1000 + 570_000, Event::Tick);
     assert_eq!(
         fx,
-        [Effect::Overlay(Overlay::Recording {
+        [Effect::Overlay(OverlayState::Recording {
             locked: false,
             ending_soon: true
         })]
@@ -338,14 +338,17 @@ fn edge_06_esc_cancels_a_recording_and_shows_it_for_a_moment() {
         [
             Effect::DiscardCapture,
             Effect::Play(Sound::Cancel),
-            Effect::Overlay(Overlay::Text(Notice::Cancelled))
+            Effect::Overlay(OverlayState::Text(Notice::Cancelled))
         ]
     );
     assert_eq!(s.phase(), Phase::Idle);
     // The key-up after the cancel does nothing, and the text goes away after 1.5 s.
     assert_eq!(s.core(600, Event::ChordUp), []);
     assert_eq!(s.0.next_deadline(), Some(Millis(2000)));
-    assert_eq!(s.at(2000, Event::Tick), [Effect::Overlay(Overlay::Hidden)]);
+    assert_eq!(
+        s.at(2000, Event::Tick),
+        [Effect::Overlay(OverlayState::Hidden)]
+    );
 }
 
 #[test]
@@ -372,7 +375,10 @@ fn edge_07_other_key_cancels_silently_in_both_modes() {
         // No sound, no notification, no overlay text: just gone.
         assert_eq!(
             fx,
-            [Effect::DiscardCapture, Effect::Overlay(Overlay::Hidden)],
+            [
+                Effect::DiscardCapture,
+                Effect::Overlay(OverlayState::Hidden)
+            ],
             "{mode:?}"
         );
         assert_eq!(s.core(900, Event::ChordUp), [], "{mode:?}");
@@ -489,7 +495,7 @@ fn edge_09_10_key_events_produce_no_key_injection_or_swallow_effect() {
         [
             Effect::StopCapture(J0),
             Effect::Play(Sound::Stop),
-            Effect::Overlay(Overlay::Transcribing)
+            Effect::Overlay(OverlayState::Transcribing)
         ]
     );
 }
@@ -605,7 +611,7 @@ fn model_loads_on_key_down_and_a_job_waits_for_it() {
         ]
     );
     let fx = s.at(700, Event::ChordUp);
-    assert_eq!(overlay_of(&fx), Some(Overlay::LoadingModel));
+    assert_eq!(overlay_of(&fx), Some(OverlayState::LoadingModel));
     // Audio is ready but the model is not: no whisper call yet.
     assert_eq!(s.core(750, Event::JobAudioReady(J0)), []);
     let fx = s.at(2000, Event::ModelLoaded);
@@ -613,7 +619,7 @@ fn model_loads_on_key_down_and_a_job_waits_for_it() {
         fx,
         [
             Effect::Transcribe(J0),
-            Effect::Overlay(Overlay::Transcribing)
+            Effect::Overlay(OverlayState::Transcribing)
         ]
     );
 }
@@ -649,13 +655,13 @@ fn model_missing_at_key_down_gives_error_and_no_recording() {
 fn mic_unplugged_keeps_what_was_captured_and_notifies() {
     let mut s = Sim::loaded();
     s.at(0, Event::ChordDown);
-    let fx = s.core(2000, Event::AudioStopped);
+    let fx = s.core(2000, Event::DeviceLost);
     assert_eq!(
         fx,
         [
             Effect::StopCapture(J0),
             Effect::Play(Sound::Stop),
-            Effect::Notify(Notice::MicLost)
+            Effect::Notify(Notice::DeviceLost)
         ]
     );
     assert_eq!(s.core(2500, Event::ChordUp), []);
@@ -665,13 +671,13 @@ fn mic_unplugged_keeps_what_was_captured_and_notifies() {
 fn mic_open_failure_gives_error_and_no_whisper_call() {
     let mut s = Sim::loaded();
     s.at(0, Event::ChordDown);
-    let fx = s.core(40, Event::AudioFailed);
+    let fx = s.core(40, Event::CaptureFailed);
     assert_eq!(
         fx,
         [
             Effect::DiscardCapture,
             Effect::Play(Sound::Error),
-            Effect::Notify(Notice::MicFailed)
+            Effect::Notify(Notice::CaptureFailed)
         ]
     );
     assert_eq!(s.phase(), Phase::Idle);
@@ -689,7 +695,10 @@ fn empty_transcript_pastes_nothing_and_says_so() {
             empty: true,
         },
     );
-    assert_eq!(fx, [Effect::Overlay(Overlay::Text(Notice::NothingHeard))]);
+    assert_eq!(
+        fx,
+        [Effect::Overlay(OverlayState::Text(Notice::NothingHeard))]
+    );
     assert_eq!(s.phase(), Phase::Idle);
 }
 

@@ -3,7 +3,8 @@
 use std::collections::VecDeque;
 
 use super::types::{
-    Effect, Effects, Event, JobId, MachineConfig, Mode, ModelFailure, Notice, Overlay, Phase, Sound,
+    Effect, Effects, Event, JobId, MachineConfig, Mode, ModelFailure, Notice, OverlayState, Phase,
+    Sound,
 };
 use crate::types::Millis;
 
@@ -77,7 +78,7 @@ pub struct State {
     idle_unload_at: Option<Millis>,
     /// Sleep asked for an unload; done as soon as nothing is in flight.
     unload_when_idle: bool,
-    shown: Overlay,
+    shown: OverlayState,
 }
 
 impl Default for State {
@@ -100,7 +101,7 @@ impl State {
             notice: None,
             idle_unload_at: None,
             unload_when_idle: false,
-            shown: Overlay::Hidden,
+            shown: OverlayState::Hidden,
         }
     }
 
@@ -176,16 +177,16 @@ impl State {
                     self.discard_recording(&mut fx);
                 }
             }
-            Event::AudioStopped => {
+            Event::DeviceLost => {
                 if self.rec.is_some() {
                     self.stop_recording(now, true, &mut fx);
-                    fx.push(Effect::Notify(Notice::MicLost));
+                    fx.push(Effect::Notify(Notice::DeviceLost));
                 }
             }
-            Event::AudioFailed => {
+            Event::CaptureFailed => {
                 if self.rec.is_some() {
                     self.discard_recording(&mut fx);
-                    self.fail(Notice::MicFailed, now, &mut fx);
+                    self.fail(Notice::CaptureFailed, now, &mut fx);
                 }
             }
             Event::JobAudioReady(id) => {
@@ -474,21 +475,21 @@ impl State {
         }
     }
 
-    fn overlay(&self) -> Overlay {
+    fn overlay(&self) -> OverlayState {
         if let Some(r) = &self.rec {
-            return Overlay::Recording {
+            return OverlayState::Recording {
                 locked: r.kind == Kind::Locked,
                 ending_soon: r.warned,
             };
         }
         if let Some((notice, _)) = self.notice {
-            return Overlay::Text(notice);
+            return OverlayState::Text(notice);
         }
         match self.phase() {
-            Phase::Idle | Phase::Recording => Overlay::Hidden,
-            Phase::Pasting => Overlay::Pasting,
-            Phase::Transcribing if self.model == ModelStatus::Loading => Overlay::LoadingModel,
-            Phase::Transcribing => Overlay::Transcribing,
+            Phase::Idle | Phase::Recording => OverlayState::Hidden,
+            Phase::Pasting => OverlayState::Pasting,
+            Phase::Transcribing if self.model == ModelStatus::Loading => OverlayState::LoadingModel,
+            Phase::Transcribing => OverlayState::Transcribing,
         }
     }
 }
