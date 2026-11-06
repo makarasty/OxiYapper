@@ -77,7 +77,7 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     bind_with(window, ctx, &io);
 }
 
-fn bind_with<C: 'static>(window: &AppWindow, ctx: &Ctx, io: &Io<C>) {
+fn bind_with<C: 'static>(window: &AppWindow, ctx: &Ctx, io: &Io<C>) -> Rc<PageState<C>> {
     let state = window.global::<AudioState>();
     push_config(&state, &ctx.config.borrow().config, &Devices::default());
 
@@ -101,6 +101,7 @@ fn bind_with<C: 'static>(window: &AppWindow, ctx: &Ctx, io: &Io<C>) {
     if window.get_page() == Page::Audio {
         page.shown();
     }
+    page
 }
 
 struct PageState<C> {
@@ -138,14 +139,20 @@ impl<C: 'static> PageState<C> {
     }
 
     /// Read the device list; the picker is only rebuilt when it changed (keeps an open popup).
-    fn relist(&self, state: &AudioState<'_>, configured: &str) {
+    /// True when it changed.
+    fn relist(&self, state: &AudioState<'_>, configured: &str) -> bool {
         self.listed_at.set((self.now)());
-        let devices = Devices::new((self.list)().unwrap_or_default(), configured);
-        if *self.devices.borrow() != devices {
-            state.set_devices(ModelRc::from(Rc::new(VecModel::from(devices.rows()))));
-            state.set_device(devices.row_of(configured));
-            *self.devices.borrow_mut() = devices;
+        let listed = (self.list)();
+        let error = listed.as_ref().err().map(note).unwrap_or_default();
+        state.set_list_error(error.into());
+        let devices = Devices::new(listed.unwrap_or_default(), configured);
+        if *self.devices.borrow() == devices {
+            return false;
         }
+        state.set_devices(ModelRc::from(Rc::new(VecModel::from(devices.rows()))));
+        state.set_device(devices.row_of(configured));
+        *self.devices.borrow_mut() = devices;
+        true
     }
 
     /// One meter frame, or the close of the capture once the page is gone.
@@ -158,12 +165,12 @@ impl<C: 'static> PageState<C> {
         if window.get_page() == Page::Audio && window.window().is_visible() {
             let opts = self.ctx.config.borrow().config.audio.clone();
             let now = (self.now)();
-            if now >= self.listed_at.get() + RELIST {
-                self.relist(&state, &opts.device);
-                if live.fell_back && self.devices.borrow().missing.is_none() {
-                    // The configured mic came back: move the meter onto it.
-                    live.tried = None;
-                }
+            if now >= self.listed_at.get() + RELIST
+                && self.relist(&state, &opts.device)
+                && (live.note.is_some() || live.fell_back)
+            {
+                // A mic was plugged in: retry the failed open, or leave the default for it.
+                live.tried = None;
             }
             live.tick(&opts, now);
             state.set_clipping(live.meter.clipping(now));
@@ -434,6 +441,7 @@ mod tests {
         static OPENED: Cell<u32> = const { Cell::new(0) };
         static NOW: Cell<Millis> = const { Cell::new(Millis(0)) };
         static LISTED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        static LIST_FAILS: Cell<bool> = const { Cell::new(false) };
     }
 
     struct Fake;
@@ -477,8 +485,22 @@ mod tests {
         Err(CaptureError::NoDevice)
     }
 
-    #[expect(clippy::unnecessary_wraps, reason = "has the lister signature")]
+    /// No listed device means no device at all.
+    fn fake_listed_only(
+        opts: &Audio,
+        meter: LevelMeter,
+        dead: Arc<AtomicBool>,
+    ) -> Result<Opened<Fake>, CaptureError> {
+        if LISTED.with_borrow(Vec::is_empty) {
+            return Err(CaptureError::NoDevice);
+        }
+        fake_fallback(opts, meter, dead)
+    }
+
     fn fake_list() -> Result<Vec<String>, CaptureError> {
+        if LIST_FAILS.get() {
+            return Err(CaptureError::PermissionDenied);
+        }
         Ok(LISTED.with_borrow(Clone::clone))
     }
 
@@ -491,12 +513,24 @@ mod tests {
         OPENED.set(0);
         NOW.set(Millis(0));
         LISTED.with_borrow_mut(Vec::clear);
+        LIST_FAILS.set(false);
     }
 
     /// The settings window on a fresh config dir, its Audio page on fakes.
     fn window(name: &str, config: Option<&str>, open: Opener<Fake>) -> AppWindow {
-        reset();
         i_slint_backend_testing::init_no_event_loop();
+        let (window, _) = window_on(name, config, open);
+        window.show().unwrap();
+        window
+    }
+
+    /// [`window`] on the platform already set, and the page state behind it.
+    fn window_on(
+        name: &str,
+        config: Option<&str>,
+        open: Opener<Fake>,
+    ) -> (AppWindow, Rc<PageState<Fake>>) {
+        reset();
         let dir = std::env::temp_dir().join(format!(
             "oxi-settings-lib-audio-{}-{name}",
             std::process::id()
@@ -518,9 +552,8 @@ mod tests {
             list: fake_list,
             now: fake_now,
         };
-        bind_with(&window, &ctx, &io);
-        window.show().unwrap();
-        window
+        let page = bind_with(&window, &ctx, &io);
+        (window, page)
     }
 
     /// Open the Audio page; building it runs its `init`, which starts the meter.
@@ -620,6 +653,89 @@ mod tests {
         live.tick(&opts, Millis(33));
         assert!(live.is_open());
         assert!(live.fell_back);
+    }
+
+    #[test]
+    fn plugging_the_first_mic_retries_the_open() {
+        let window = window("first-mic", None, fake_listed_only);
+        show_audio(&window);
+        frame(40);
+        let state = window.global::<AudioState>();
+        assert_eq!(state.get_note(), NO_MIC);
+        assert!(!state.get_live());
+        LISTED.set(vec!["USB Mic".into()]);
+        frame(RELIST.0);
+        assert!(state.get_live(), "no retry after the mic was plugged in");
+        assert_eq!(OPEN.get(), 1);
+        assert_eq!(state.get_note(), "");
+    }
+
+    #[test]
+    fn list_error_shows_its_kind() {
+        let window = window("list-error", None, fake);
+        LIST_FAILS.set(true);
+        show_audio(&window);
+        let state = window.global::<AudioState>();
+        assert_eq!(state.get_list_error(), "microphone permission denied");
+        LIST_FAILS.set(false);
+        frame(RELIST.0);
+        assert_eq!(state.get_list_error(), "");
+    }
+
+    /// With `OXI_SHOTS_DIR` set, draws the page with its configured mic not connected to
+    /// `settings-audio-not-connected-<theme>.png`. Run it alone (`--exact`): it installs its own
+    /// software-renderer platform, which the testing-backend tests in this binary cannot share.
+    #[test]
+    fn shot_not_connected() {
+        use slint::platform::software_renderer::{
+            MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
+        };
+        use slint::platform::{Platform, WindowAdapter};
+
+        struct Shots(Rc<MinimalSoftwareWindow>);
+        impl Platform for Shots {
+            fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
+                Ok(self.0.clone())
+            }
+        }
+
+        let Some(dir) = std::env::var_os("OXI_SHOTS_DIR") else {
+            return;
+        };
+        let (w, h) = (560_u32, 600_u32);
+        let surface = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+        slint::platform::set_platform(Box::new(Shots(surface.clone()))).unwrap();
+        let config = "version = 1\n[audio]\ndevice = \"USB Mic\"\n";
+        let (window, page) = window_on("shot", Some(config), fake_fallback);
+        LISTED.set(vec!["Built-in Microphone".into()]);
+        surface.set_size(slint::PhysicalSize::new(w, h));
+        window.show().unwrap();
+        window.set_page(Page::Audio);
+        page.shown();
+        page.tick();
+        for (theme, choice) in [
+            ("light", crate::ThemeChoice::Light),
+            ("dark", crate::ThemeChoice::Dark),
+        ] {
+            window.set_theme(choice);
+            slint::platform::update_timers_and_animations();
+            surface.request_redraw();
+            let mut buffer = vec![PremultipliedRgbaColor::default(); (w * h) as usize];
+            assert!(surface.draw_if_needed(|r| {
+                r.render(&mut buffer, w as usize);
+            }));
+            let bytes = buffer
+                .iter()
+                .flat_map(|p| [p.red, p.green, p.blue, p.alpha])
+                .collect();
+            let size = tiny_skia::IntSize::from_wh(w, h).unwrap();
+            let pixmap = tiny_skia::Pixmap::from_vec(bytes, size).unwrap();
+            let path = std::path::Path::new(&dir);
+            std::fs::create_dir_all(path).unwrap();
+            pixmap
+                .save_png(path.join(format!("settings-audio-not-connected-{theme}.png")))
+                .unwrap();
+        }
     }
 
     #[test]

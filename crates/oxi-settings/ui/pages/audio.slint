@@ -29,6 +29,8 @@ export global AudioState {
     in property <string> note;
     // The configured mic is missing and the meter runs on the system default; empty otherwise.
     in property <string> fallback;
+    // Listing the devices failed (the error kind); empty otherwise.
+    in property <string> list-error;
     callback shown();
     callback edited(AudioKey, float);
 }
@@ -53,6 +55,9 @@ export component AudioPage inherits VerticalLayout {
                     AudioState.edited(AudioKey.device, self.current-index);
                 }
             }
+        }
+        if AudioState.list-error != "": InlineNote {
+            text: AudioState.list-error;
         }
         if AudioState.fallback != "": InlineNote {
             text: AudioState.fallback;
