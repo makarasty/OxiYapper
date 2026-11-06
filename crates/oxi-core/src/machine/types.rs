@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::device::DeviceChoice;
 use crate::paste::PasteOutcome;
 use crate::types::Millis;
 
@@ -20,7 +21,7 @@ pub enum Mode {
 }
 
 /// The values the machine reads from the user config; `Default` is the SPEC set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineConfig {
     pub mode: Mode,
     /// A press shorter than this can be half of a double tap.
@@ -41,6 +42,17 @@ pub struct MachineConfig {
     pub overlay_hide: Millis,
     /// Capture keeps running this long after the stopping key, so the last syllable is kept.
     pub release_tail: Millis,
+    /// What a load depends on: a change unloads the loaded model, the next use loads the new one.
+    pub model: ModelIdentity,
+}
+
+/// The settings a model load depends on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelIdentity {
+    /// `[model] id`, or the file path for a custom model.
+    pub file: String,
+    /// `[model] gpu`: the device the model is loaded onto.
+    pub gpu: DeviceChoice,
 }
 
 impl From<&Config> for MachineConfig {
@@ -58,6 +70,14 @@ impl From<&Config> for MachineConfig {
             idle_unload: Millis::from_secs(u64::from(cfg.model.idle_unload_minutes) * 60),
             overlay_hide: Millis(1500),
             release_tail: Millis(cfg.audio.tail_ms.into()),
+            model: ModelIdentity {
+                file: if cfg.model.id == "custom" {
+                    cfg.model.custom_path.clone()
+                } else {
+                    cfg.model.id.clone()
+                },
+                gpu: cfg.model.gpu.clone(),
+            },
         }
     }
 }
@@ -83,7 +103,7 @@ pub enum ModelFailure {
 }
 
 /// Everything that happens, as the coordinator sees it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// The hook saw the whole chord become held.
     ChordDown,
