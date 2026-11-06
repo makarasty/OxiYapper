@@ -35,9 +35,12 @@ impl Os {
     }
 }
 
-/// Per-OS base directories, as `directories` reports them.
+/// Per-OS base directories, filled by the caller.
 ///
-/// - Windows: `config` = `%APPDATA%`, `data` = `%LOCALAPPDATA%`, `logs` unused.
+/// `directories` reports `config`, `data` and the Linux state dir only; the caller builds the
+/// rest itself: `~/Library/Logs` on macOS, and on Windows (no state dir) `logs` is not read.
+///
+/// - Windows: `config` = `%APPDATA%`, `data` = `%LOCALAPPDATA%`, `logs` unused (logs go under `data`).
 /// - macOS: `config` = `data` = `~/Library/Application Support`, `logs` = `~/Library/Logs`.
 /// - Linux: `config` = `$XDG_CONFIG_HOME`, `data` = `$XDG_DATA_HOME`, `logs` = `$XDG_STATE_HOME`.
 #[derive(Debug, Clone, PartialEq, Eq)]

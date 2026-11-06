@@ -4,23 +4,26 @@
 mod schema;
 
 pub use schema::{
-    Audio, Config, Debug, History, Hotkey, HotkeyMode, Model, Overlay, Paste, PasteMode, PasteRule,
-    Sounds, System,
+    Audio, Config, Debug, History, Hotkey, HotkeyMode, Model, Overlay, OverlayPosition, Paste,
+    PasteMode, PasteRule, Sounds, System,
 };
 
-use toml::{Table, Value};
+use std::borrow::Cow;
+use std::ops::Range;
+use toml_edit::{ArrayOfTables, Decor, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 /// Schema version this build writes. Equals `MIGRATIONS.len() + 1` (checked by a test).
 pub const CURRENT_VERSION: i64 = 1;
 
-/// A pure step `vN -> vN+1` on the raw table. It does not touch `version`; `parse_with` does.
-pub type Migration = fn(&mut Table);
+/// A pure step `vN -> vN+1` on the raw document. It does not touch `version`; `parse_with` does.
+pub type Migration = fn(&mut DocumentMut);
 
 /// `MIGRATIONS[i]` turns version `i + 1` into `i + 2`. Empty while v1 is the only schema.
 pub const MIGRATIONS: &[Migration] = &[];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// `line` and `column` are 1-based; `column` counts characters, not bytes.
     #[error("config.toml line {line}, column {column}: {message}")]
     Syntax {
         line: usize,
@@ -33,20 +36,20 @@ pub enum ConfigError {
     ReadOnly,
 }
 
-/// A loaded `config.toml`: typed settings plus the raw table, so keys this build does not
-/// know survive a write.
-#[derive(Debug, Clone, PartialEq)]
+/// A loaded `config.toml`: typed settings plus the raw document, so comments, key order and
+/// keys this build does not know survive a write.
+#[derive(Debug, Clone)]
 pub struct ConfigFile {
     pub config: Config,
     /// True when the file's `version` is newer than this build: never write it back.
     pub read_only: bool,
-    raw: Table,
+    raw: DocumentMut,
 }
 
 impl Default for ConfigFile {
     fn default() -> Self {
-        let mut raw = Table::new();
-        raw.insert("version".into(), Value::Integer(CURRENT_VERSION));
+        let mut raw = DocumentMut::new();
+        raw.insert("version", toml_edit::value(CURRENT_VERSION));
         Self {
             config: Config::default(),
             read_only: false,
@@ -62,33 +65,44 @@ impl ConfigFile {
 
     /// `parse` with an explicit migration list (tests ship their own).
     pub fn parse_with(text: &str, migrations: &[Migration]) -> Result<Self, ConfigError> {
-        let mut raw: Table = text.parse().map_err(|e| syntax_error(text, &e))?;
+        let mut raw: DocumentMut = text
+            .parse()
+            .map_err(|e: toml_edit::TomlError| located(text, e.span(), e.message()))?;
         let current = i64::try_from(migrations.len() + 1).unwrap_or(i64::MAX);
         let version = match raw.get("version") {
             None => 1,
-            Some(Value::Integer(v)) if *v >= 1 => *v,
-            Some(_) => {
-                return Err(ConfigError::Invalid(
-                    "`version` must be an integer >= 1".into(),
-                ));
-            }
+            Some(item) => match item.as_integer() {
+                Some(v) if v >= 1 => v,
+                _ => {
+                    return Err(ConfigError::Invalid(
+                        "`version` must be an integer >= 1".into(),
+                    ));
+                }
+            },
         };
         let read_only = version > current;
-        if !read_only {
-            // `version >= 1`, so the index is non-negative and at most `migrations.len()`.
-            let done = usize::try_from(version - 1).unwrap_or(0);
-            for migration in &migrations[done..] {
-                migration(&mut raw);
-            }
-            raw.insert("version".into(), Value::Integer(current));
+        // `version >= 1`, so the index is non-negative and at most `migrations.len()`.
+        let done = usize::try_from(version - 1).unwrap_or(0);
+        let pending = if read_only {
+            &[][..]
+        } else {
+            &migrations[done..]
+        };
+        for migration in pending {
+            migration(&mut raw);
         }
-        let config = raw.clone().try_into().map_err(|e: toml::de::Error| {
-            // A Table carries no spans; re-read the text for the line when it fails as is.
-            toml::from_str::<Config>(text).map_or_else(
-                |located| syntax_error(text, &located),
-                |_| ConfigError::Invalid(e.message().to_owned()),
-            )
-        })?;
+        // Typed values come from the migrated text, so error lines point into it; with no
+        // migration that text is the file itself.
+        let migrated = if pending.is_empty() {
+            Cow::Borrowed(text)
+        } else {
+            Cow::Owned(raw.to_string())
+        };
+        let config = toml::from_str::<Config>(&migrated)
+            .map_err(|e| located(&migrated, e.span(), e.message()))?;
+        if !read_only {
+            put(raw.as_table_mut(), "version", &toml_edit::value(current));
+        }
         Ok(Self {
             config,
             read_only,
@@ -96,40 +110,186 @@ impl ConfigFile {
         })
     }
 
-    /// Typed settings laid over the raw table, so unknown keys are written back.
+    /// The raw document with the typed settings written into its existing items, so an
+    /// unchanged file comes back byte-identical and a changed value changes only its text.
     /// Errors with `ReadOnly` for a file from a newer version.
     pub fn to_toml_string(&self) -> Result<String, ConfigError> {
         if self.read_only {
             return Err(ConfigError::ReadOnly);
         }
         let typed =
-            Table::try_from(&self.config).map_err(|e| ConfigError::Invalid(e.to_string()))?;
+            toml::to_string(&self.config).map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        let mut typed: DocumentMut = typed
+            .parse()
+            .map_err(|e: toml_edit::TomlError| ConfigError::Invalid(e.to_string()))?;
+        unplace(typed.as_table_mut());
         let mut out = self.raw.clone();
-        overlay(&mut out, typed);
-        toml::to_string(&out).map_err(|e| ConfigError::Invalid(e.to_string()))
+        merge(out.as_table_mut(), typed.as_table());
+        Ok(out.to_string())
     }
 }
 
-/// Recursive merge: tables merge key by key, anything else is replaced.
-fn overlay(base: &mut Table, top: Table) {
-    for (key, value) in top {
-        match (base.get_mut(&key), value) {
-            (Some(Value::Table(b)), Value::Table(t)) => overlay(b, t),
-            (_, value) => {
-                base.insert(key, value);
-            }
+/// Writes every key of `src` into `dst`: tables merge key by key, arrays of tables merge
+/// element by element on `app`, values replace only when they differ and keep their decor.
+fn merge(dst: &mut dyn TableLike, src: &dyn TableLike) {
+    for (key, new) in src.iter() {
+        let Some(old) = dst.get_mut(key) else {
+            dst.insert(key, new.clone());
+            continue;
+        };
+        if is_table_array(new) && is_table_array(old) {
+            merge_rules(old, new);
+        } else if let (Some(o), Some(n)) = (old.as_table_like_mut(), new.as_table_like()) {
+            merge(o, n);
+        } else {
+            put(dst, key, new);
         }
     }
 }
 
-fn syntax_error(text: &str, e: &toml::de::Error) -> ConfigError {
-    let at = e.span().map_or(0, |s| s.start).min(text.len());
+/// Sets `key` to `new` unless it already holds the same value; a replaced value keeps the
+/// old one's spacing and trailing comment.
+fn put(dst: &mut dyn TableLike, key: &str, new: &Item) {
+    match (dst.get_mut(key), new) {
+        (Some(Item::Value(old)), Item::Value(new)) => {
+            if !same(old, new) {
+                let decor = old.decor().clone();
+                *old = new.clone();
+                *old.decor_mut() = decor;
+            }
+        }
+        _ => {
+            dst.insert(key, new.clone());
+        }
+    }
+}
+
+fn same(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::String(a), Value::String(b)) => a.value() == b.value(),
+        (Value::Integer(a), Value::Integer(b)) => a.value() == b.value(),
+        (Value::Float(a), Value::Float(b)) => a.value().to_bits() == b.value().to_bits(),
+        (Value::Boolean(a), Value::Boolean(b)) => a.value() == b.value(),
+        (Value::Datetime(a), Value::Datetime(b)) => a.value() == b.value(),
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| same(a, b))
+        }
+        (Value::InlineTable(a), Value::InlineTable(b)) => {
+            a.len() == b.len() && a.iter().all(|(k, v)| b.get(k).is_some_and(|w| same(v, w)))
+        }
+        _ => false,
+    }
+}
+
+/// `[[x]]` or `x = [{ ... }, ...]` (an empty array counts: it may hold rules later).
+fn is_table_array(item: &Item) -> bool {
+    match item {
+        Item::ArrayOfTables(_) => true,
+        Item::Value(Value::Array(a)) => a.iter().all(Value::is_inline_table),
+        _ => false,
+    }
+}
+
+fn app(rule: &dyn TableLike) -> Option<&str> {
+    rule.get("app").and_then(Item::as_str)
+}
+
+/// The array of tables (only `paste.rules`) keyed by `app`: a rule that stays keeps its
+/// formatting and unknown keys, a known optional key the typed rule no longer has is removed,
+/// rules the typed list dropped go.
+fn merge_rules(old: &mut Item, new: &Item) {
+    let news: Vec<&dyn TableLike> = match new {
+        Item::ArrayOfTables(a) => a.iter().map(|t| t as &dyn TableLike).collect(),
+        Item::Value(Value::Array(a)) => a
+            .iter()
+            .filter_map(Value::as_inline_table)
+            .map(|t| t as &dyn TableLike)
+            .collect(),
+        _ => Vec::new(),
+    };
+    match old {
+        Item::ArrayOfTables(old) => {
+            // shortcut: a kept `[[...]]` rule keeps its place in the file, so a reordered list
+            // prints in file order; fine while rules are keyed by app, not by position.
+            let mut pool: Vec<Option<Table>> = old.iter().cloned().map(Some).collect();
+            let mut out = ArrayOfTables::new();
+            for n in news {
+                let mut t = take(&mut pool, app(n)).unwrap_or_default();
+                merge_rule(&mut t, n);
+                out.push(t);
+            }
+            *old = out;
+        }
+        Item::Value(Value::Array(old)) => {
+            let mut pool: Vec<Option<InlineTable>> = old
+                .iter()
+                .filter_map(Value::as_inline_table)
+                .cloned()
+                .map(Some)
+                .collect();
+            let mut out = Vec::new();
+            for n in news {
+                let mut t = take(&mut pool, app(n)).unwrap_or_default();
+                let keys: Vec<String> = t.iter().map(|(k, _)| k.to_owned()).collect();
+                merge_rule(&mut t, n);
+                if !t.iter().map(|(k, _)| k).eq(keys.iter().map(String::as_str)) {
+                    // A key came or went: respace the braces and commas of this rule only.
+                    t.fmt();
+                }
+                out.push(Value::InlineTable(t));
+            }
+            // Spacing between elements belongs to the slot, not the rule; `clear` keeps the
+            // array's own spacing and trailing comma.
+            let slots: Vec<Decor> = old.iter().map(|v| v.decor().clone()).collect();
+            old.clear();
+            for (i, mut v) in out.into_iter().enumerate() {
+                if let Some(decor) = slots.get(i) {
+                    *v.decor_mut() = decor.clone();
+                    old.push_formatted(v);
+                } else {
+                    old.push(v);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn take<T: TableLike>(pool: &mut [Option<T>], app_name: Option<&str>) -> Option<T> {
+    pool.iter_mut()
+        .find(|t| t.as_ref().is_some_and(|t| app(t) == app_name))
+        .and_then(Option::take)
+}
+
+fn merge_rule(dst: &mut dyn TableLike, src: &dyn TableLike) {
+    merge(dst, src);
+    for key in PasteRule::KEYS {
+        if !src.contains_key(key) {
+            dst.remove(key);
+        }
+    }
+}
+
+/// Tables this build adds have no place in the file yet: let them follow their neighbours.
+fn unplace(t: &mut Table) {
+    t.set_position(None);
+    for (_, item) in t.iter_mut() {
+        match item {
+            Item::Table(t) => unplace(t),
+            Item::ArrayOfTables(a) => a.iter_mut().for_each(unplace),
+            _ => {}
+        }
+    }
+}
+
+fn located(text: &str, span: Option<Range<usize>>, message: &str) -> ConfigError {
+    let at = span.map_or(0, |s| s.start).min(text.len());
     let before = text.get(..at).unwrap_or_default();
     let line = before.matches('\n').count() + 1;
     let line_start = before.rfind('\n').map_or(0, |i| i + 1);
     ConfigError::Syntax {
         line,
-        column: at - line_start + 1,
-        message: e.message().to_owned(),
+        column: before[line_start..].chars().count() + 1,
+        message: message.to_owned(),
     }
 }

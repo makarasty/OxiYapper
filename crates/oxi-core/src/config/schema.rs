@@ -114,6 +114,11 @@ pub struct PasteRule {
     pub restore_delay_ms: Option<u32>,
 }
 
+impl PasteRule {
+    /// Every key a rule can have; a save drops the optional ones a rule no longer sets.
+    pub(crate) const KEYS: [&str; 4] = ["app", "mode", "chord", "restore_delay_ms"];
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Paste {
@@ -129,17 +134,35 @@ impl Default for Paste {
             mode: PasteMode::Clipboard,
             restore_delay_ms: 300,
             trailing_space: true,
-            rules: Vec::new(),
+            // Remote desktop drops a synthetic Ctrl+V, so type there.
+            rules: vec![PasteRule {
+                app: "mstsc.exe".into(),
+                mode: Some(PasteMode::Type),
+                chord: None,
+                restore_delay_ms: None,
+            }],
         }
     }
+}
+
+/// Screen corner or edge centre the overlay sits at.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OverlayPosition {
+    #[default]
+    BottomRight,
+    BottomCentre,
+    BottomLeft,
+    TopRight,
+    TopCentre,
+    TopLeft,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Overlay {
     pub enabled: bool,
-    /// "bottom-right", "bottom-centre", "top-left", ...
-    pub position: String,
+    pub position: OverlayPosition,
     pub hide_over_fullscreen: bool,
 }
 
@@ -147,7 +170,7 @@ impl Default for Overlay {
     fn default() -> Self {
         Self {
             enabled: true,
-            position: "bottom-right".into(),
+            position: OverlayPosition::BottomRight,
             hide_over_fullscreen: false,
         }
     }
@@ -206,4 +229,25 @@ impl Default for System {
 pub struct Debug {
     /// Dictated text goes into logs only when true.
     pub log_text: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PasteMode, PasteRule};
+
+    #[test]
+    fn rule_keys_name_every_field() {
+        // A new field fails to compile here until it is set, then fails here until it is in KEYS.
+        let full = PasteRule {
+            app: String::new(),
+            mode: Some(PasteMode::Type),
+            chord: Some(Vec::new()),
+            restore_delay_ms: Some(0),
+        };
+        let table = toml::Table::try_from(&full).unwrap();
+        let keys: Vec<&str> = table.keys().map(String::as_str).collect();
+        let mut want = PasteRule::KEYS.to_vec();
+        want.sort_unstable();
+        assert_eq!(keys, want);
+    }
 }
