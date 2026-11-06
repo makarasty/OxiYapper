@@ -256,16 +256,21 @@ impl MainLoop {
     /// Runs the thread's message loop until [`Waker::quit`]. `on_wake` runs for each
     /// [`Waker::wake`] and `on_menu` for the chosen menu entry, both from the loop.
     ///
-    /// `on_session` gets Suspend, Resume, Lock and Unlock in arrival order, inside the window
-    /// procedure before it replies: Windows sends `PBT_APMSUSPEND` and sleeps about 2 s later
-    /// whether or not the reply came, so a queued Suspend could arrive only after resume
-    /// (item 46). Keep it bounded: forward the event. It can run re-entrantly inside a modal
-    /// loop that `on_wake` or `on_menu` starts (menu, message box), so it must never take a
-    /// lock they hold. Its panic leaves `run` as a panic once the window procedure returned.
+    /// `on_session` gets Suspend, Resume, Lock and Unlock in arrival order. When it is not
+    /// already running, it runs inside the window procedure before the reply: Windows sends
+    /// `PBT_APMSUSPEND` and sleeps about 2 s later whether or not the reply came, so a queued
+    /// Suspend could arrive only after resume (item 46). Rules for `on_session`:
+    /// - Keep it bounded: forward the event.
+    /// - Never pump messages in it (message box, cross-thread `SendMessage`): a Suspend that
+    ///   arrives meanwhile waits until it returns, possibly until after resume.
+    /// - It can run re-entrantly inside a modal loop that `on_wake` or `on_menu` starts (menu,
+    ///   message box), so never take a lock they hold.
+    /// - Its panic leaves `run` as a panic once the window procedure returned. In release
+    ///   builds (`panic = "abort"`) the panic aborts the process and Drop does not run.
     ///
     /// On [`Waker::quit`], pending session events are delivered and the wakes, menu requests and
     /// `TaskbarCreated` queued behind it are dropped: they belong to the ended run, and a later
-    /// `run` would replay them out of date.
+    /// `run` would replay them out of date. Each `run` checks that the icon is shown first.
     pub fn run(
         &mut self,
         mut on_wake: impl FnMut(&mut Self),
@@ -274,6 +279,11 @@ impl MainLoop {
     ) {
         SESSION.with_borrow_mut(|f| *f = Some(Box::new(on_session)));
         let _clear = SessionGuard;
+        // A TaskbarCreated dropped by an earlier quit may have left no icon.
+        let shown = shell(NIM_MODIFY, &self.data(NIF_ICON | NIF_TIP | NIF_SHOWTIP));
+        if let Err(e) = shown.or_else(|_| self.add()) {
+            tracing::warn!("tray icon add failed: {e}");
+        }
         // Events seen before `run` come before any sent while it pumps.
         flush();
         let mut msg = MSG::default();

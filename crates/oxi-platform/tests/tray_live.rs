@@ -343,3 +343,30 @@ fn panic_in_on_session_unwinds_out_of_run() {
     drop(ml);
     assert!(!shell(hwnd, NIM_MODIFY), "icon gone after drop");
 }
+
+/// A later `run` shows the icon even when the `TaskbarCreated` that would re-add it was dropped.
+#[test]
+fn run_after_quit_with_taskbar_created_queued_shows_the_icon() {
+    if !live() {
+        return;
+    }
+    let mut ml = MainLoop::new().expect("tray window");
+    let hwnd = ml.hwnd();
+    ml.waker().wake().expect("wake");
+    ml.run(
+        |ml| {
+            assert!(shell(ml.hwnd(), NIM_DELETE), "icon removed");
+            ml.waker().quit().expect("quit");
+            pump();
+            let name: Vec<u16> = "TaskbarCreated".encode_utf16().chain([0]).collect();
+            // SAFETY: a NUL-terminated string that outlives the call; then a send to our window.
+            unsafe { SendMessageW(ml.hwnd(), RegisterWindowMessageW(name.as_ptr()), 0, 0) };
+        },
+        |_, _| {},
+        |_| {},
+    );
+    assert!(!shell(hwnd, NIM_MODIFY), "the quit dropped the re-add");
+    let (woken, _, ()) = run_with(&mut ml, |_, waker, _| waker.quit().expect("quit"));
+    assert_eq!(woken, 0);
+    assert!(shell(hwnd, NIM_MODIFY), "icon back after the second run");
+}
