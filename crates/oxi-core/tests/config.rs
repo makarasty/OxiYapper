@@ -387,3 +387,31 @@ fn crlf_and_bom_survive_a_save() {
     assert!(lf_count_is_crlf_count(&out), "{out:?}");
     assert_eq!(ConfigFile::parse(&out).unwrap().config, file.config);
 }
+
+#[test]
+fn mixed_line_endings_normalise_to_the_dominant_one() {
+    for (text, want) in [
+        // Three CRLF lines, one LF line: CRLF wins.
+        (
+            "version = 1\r\n# c\r\n[audio]\ngain_db = 1.0\r\n",
+            "version = 1\r\n# c\r\n[audio]\r\ngain_db = 1.0\r\n",
+        ),
+        // One CRLF line, three LF lines: LF wins.
+        (
+            "version = 1\r\n# c\n[audio]\ngain_db = 1.0\n",
+            "version = 1\n# c\n[audio]\ngain_db = 1.0\n",
+        ),
+        // A tie goes to LF, or to CRLF in a BOM file.
+        (
+            "version = 1\r\n[audio]\ngain_db = 1.0\r\n# c\n",
+            "version = 1\n[audio]\ngain_db = 1.0\n# c\n",
+        ),
+        (
+            "\u{feff}version = 1\r\n[audio]\ngain_db = 1.0\r\n# c\n",
+            "\u{feff}version = 1\r\n[audio]\r\ngain_db = 1.0\r\n# c\r\n",
+        ),
+    ] {
+        let file = ConfigFile::parse(text).unwrap();
+        assert_eq!(file.to_toml_string().unwrap(), want, "{text:?}");
+    }
+}

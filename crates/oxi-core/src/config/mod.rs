@@ -48,7 +48,7 @@ pub struct ConfigFile {
     raw: DocumentMut,
     /// The file started with a UTF-8 byte order mark; written back with it.
     bom: bool,
-    /// Every line of the file ended in CRLF; written back, new lines included, with CRLF.
+    /// Most lines of the file ended in CRLF; every line is written back with CRLF.
     crlf: bool,
 }
 
@@ -77,10 +77,12 @@ impl ConfigFile {
     pub fn parse_with(text: &str, migrations: &[Migration]) -> Result<Self, ConfigError> {
         let bom = text.starts_with('\u{feff}');
         let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-        let crlf =
-            text.contains("\r\n") && text.matches('\n').count() == text.matches("\r\n").count();
+        // A mixed file is normalised to its dominant ending; a tie goes to CRLF in a BOM file.
+        let crlf_lines = text.matches("\r\n").count();
+        let lf_lines = text.matches('\n').count() - crlf_lines;
+        let crlf = crlf_lines > lf_lines || (crlf_lines == lf_lines && bom);
         // The document is kept with LF; `to_toml_string` puts the CRLF back.
-        let text = if crlf {
+        let text = if crlf_lines > 0 {
             Cow::Owned(text.replace("\r\n", "\n"))
         } else {
             Cow::Borrowed(text)
