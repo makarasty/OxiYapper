@@ -291,7 +291,9 @@ impl State {
             kind: if push { Kind::Held } else { Kind::Toggled },
             lock_candidate,
             warned: false,
-            next_poll: push.then(|| now + self.cfg.watchdog_period),
+            // Every recording starts with the chord held: watch for a lost key-up in both
+            // modes, so a stale `chord_held` never lets typing cancel a toggle recording.
+            next_poll: Some(now + self.cfg.watchdog_period),
         });
         fx.push(Effect::StartCapture);
         if self.model == ModelStatus::Unloaded {
@@ -302,13 +304,14 @@ impl State {
     }
 
     fn chord_up(&mut self, now: Millis, fx: &mut Effects) {
-        let Some(r) = self.rec.as_mut().filter(|r| r.kind == Kind::Held) else {
+        let Some(r) = self.rec.as_mut() else { return };
+        r.next_poll = None; // chord released: nothing left to watch
+        if r.kind != Kind::Held {
             return; // toggle ignores key-up; a poll may repeat a real one
-        };
+        }
         let held = now - r.started;
         if r.lock_candidate && held < self.cfg.double_tap_max_press {
             r.kind = Kind::Locked;
-            r.next_poll = None;
         } else if held < self.cfg.tap_max {
             // A tap makes "Thank you." hallucinations: throw it away.
             if !r.lock_candidate && held < self.cfg.double_tap_max_press {

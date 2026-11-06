@@ -164,6 +164,29 @@ proptest! {
         prop_assert_eq!(state.phase(), Phase::Idle);
     }
 
+    /// Typing after the chord is released never throws a recording away, in either mode:
+    /// only a key pressed while the chord is held cancels.
+    #[test]
+    fn other_key_after_release_never_discards(cfg in config(), steps in script(event())) {
+        let mut state = State::new(cfg);
+        let mut now = 0;
+        let mut released = false;
+        for (event, dt) in steps {
+            now += dt;
+            let recording = state.phase() == Phase::Recording;
+            let fx = step(&mut state, event, Millis(now));
+            match event {
+                Event::ChordDown => released = false,
+                Event::ChordUp | Event::ChordPolled { held: false } => released = true,
+                Event::OtherKey if released && recording => {
+                    prop_assert!(!fx.contains(&Effect::DiscardCapture), "{fx:?}");
+                    prop_assert_eq!(state.phase(), Phase::Recording);
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// A recording cancelled by Esc never reaches whisper or the paste worker: after it,
     /// with no new key-down, nothing is ever handed out.
     #[test]

@@ -258,9 +258,12 @@ fn edge_04_toggle_ignores_key_up_and_has_no_double_tap() {
     assert_eq!(s.core(1200, Event::ChordDown), [Effect::DiscardCapture]);
     assert_eq!(s.core(1250, Event::ChordUp), []);
     assert_eq!(s.phase(), Phase::Idle);
-    // No lock after a quick pair: the next press is a plain toggle start, polled never.
+    // No lock after a quick pair: the next press is a plain toggle start, polled only
+    // while the chord is held.
     assert_eq!(s.core(1300, Event::ChordDown), START);
+    assert_eq!(s.core(1350, Event::ChordUp), []);
     assert_eq!(s.core(1400, Event::Tick), []);
+    assert_eq!(s.phase(), Phase::Recording);
 }
 
 #[test]
@@ -283,6 +286,7 @@ fn edge_04_toggle_stops_on_second_press_at_300_ms() {
 fn edge_05_warns_30_s_before_the_cap_then_stops_and_keeps_the_audio() {
     let mut s = Sim::toggle();
     s.at(1000, Event::ChordDown);
+    s.at(1050, Event::ChordUp);
     assert_eq!(s.0.next_deadline(), Some(Millis(1000 + 570_000)));
 
     assert_eq!(s.at(1000 + 569_999, Event::Tick), Effects::new());
@@ -369,6 +373,24 @@ fn edge_07_other_key_cancels_silently_in_both_modes() {
         // Only the idle unload is armed.
         assert_eq!(s.0.next_deadline(), Some(Millis(50 + 300_000)), "{mode:?}");
     }
+}
+
+#[test]
+fn edge_07_08_lost_key_up_in_toggle_is_polled_and_typing_keeps_the_recording() {
+    // (event, ms, effects without overlay): the hook never delivers the key-up (UAC).
+    let table = [
+        (Event::ChordDown, 0, START.to_vec()),
+        (Event::Tick, 100, vec![Effect::PollChord]),
+        (Event::ChordPolled { held: false }, 110, vec![]),
+        (Event::Tick, 1000, vec![]), // released: no more polls
+        (Event::OtherKey, 5000, vec![]),
+    ];
+    let mut s = Sim::toggle();
+    for (event, ms, want) in table {
+        assert_eq!(s.core(ms, event), want, "{event:?} at {ms}");
+    }
+    assert_eq!(s.phase(), Phase::Recording);
+    assert_eq!(s.core(6000, Event::ChordDown), stop(J0));
 }
 
 #[test]
