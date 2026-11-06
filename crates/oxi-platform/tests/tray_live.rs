@@ -273,8 +273,9 @@ fn session_event_sent_from_on_session_comes_next() {
         |ml| send(ml.hwnd(), WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK),
         |_, _| {},
         move |e| {
+            let is_lock = e == Event::Lock;
             sink.lock().expect("events").push(e);
-            if e == Event::Lock {
+            if is_lock {
                 send(
                     std::ptr::with_exposed_provenance_mut(addr),
                     WM_WTSSESSION_CHANGE,
