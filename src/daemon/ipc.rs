@@ -281,10 +281,8 @@ impl FocusGuard {
         Ok(Self { stop, lost })
     }
 
-    /// Ends the guard; `true` when capture was still on (the caller turns it off).
-    fn end(&self) -> bool {
+    fn stop(&self) {
         self.stop.store(true, Ordering::Release);
-        !self.lost.load(Ordering::Acquire)
     }
 }
 
@@ -424,20 +422,24 @@ impl Ctx {
             && session.client != 0
             && self.host.settings_foreground(session.client)
         {
+            // On first, guard second: a guard that ran before the `on` could turn capture off and
+            // then be overtaken by it, leaving every key swallowed with nobody watching.
+            self.host.set_capture(true, true);
             match FocusGuard::start(&self.host, session.client) {
-                Ok(guard) => {
-                    self.host.set_capture(true, true);
-                    session.capture = Some(guard);
+                Ok(guard) => session.capture = Some(guard),
+                Err(e) => {
+                    tracing::warn!(kind = ?e.kind(), "capture not started");
+                    self.host.set_capture(false, false);
                 }
-                Err(e) => tracing::warn!(kind = ?e.kind(), "capture not started"),
             }
         }
     }
 
     fn end_capture(&self, session: &mut Session) {
-        if let Some(guard) = session.capture.take()
-            && guard.end()
-        {
+        if let Some(guard) = session.capture.take() {
+            guard.stop();
+            // Always off, even when the guard already did it: off is idempotent, a key
+            // swallowed for ever is not.
             self.host.set_capture(false, false);
         }
     }
@@ -557,6 +559,8 @@ impl Host for SystemHost {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU64;
+
     use oxi_core::config::OverlayPosition;
     use oxi_core::device::DeviceChoice;
     use oxi_core::ipc::MAX_LINE;
@@ -575,10 +579,18 @@ mod tests {
     struct Fake {
         foreground: AtomicBool,
         calls: Sender<Call>,
+        /// What the hook would be doing now: keys swallowed.
+        capturing: AtomicBool,
+        /// Milliseconds `set_capture(true, ..)` takes, as when its thread is preempted.
+        on_delay: AtomicU64,
     }
 
     impl Host for Fake {
         fn set_capture(&self, on: bool, swallow: bool) {
+            if on {
+                thread::sleep(Duration::from_millis(self.on_delay.load(Ordering::Relaxed)));
+            }
+            self.capturing.store(on, Ordering::SeqCst);
             let _ = self.calls.send(Call::Capture(on, swallow));
         }
         fn settings_foreground(&self, _client: u32) -> bool {
@@ -642,6 +654,8 @@ mod tests {
         let host = Arc::new(Fake {
             foreground: AtomicBool::new(true),
             calls: calls_tx,
+            capturing: AtomicBool::new(false),
+            on_delay: AtomicU64::new(0),
         });
         let pushes = Pushes::default();
         spawn(
@@ -937,6 +951,70 @@ mod tests {
             "{:?}",
             lost.elapsed()
         );
+    }
+
+    /// Waits until the fake hook stops swallowing.
+    fn capture_ends(rig: &Rig) -> bool {
+        let deadline = Instant::now() + WAIT;
+        while rig.host.capturing.load(Ordering::SeqCst) {
+            if Instant::now() > deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    #[test]
+    fn focus_lost_while_capture_turns_on_still_ends_capture() {
+        let rig = rig("slowon");
+        // The thread that turns capture on is held up (preempted) for longer than a focus poll.
+        rig.host.on_delay.store(150, Ordering::Relaxed);
+        let mut conn = settings(&rig);
+        conn.send(&Request::CaptureHotkey { on: true }).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        rig.host.foreground.store(false, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(250));
+        assert!(capture_ends(&rig), "keys still swallowed after focus loss");
+        drop(conn);
+        assert!(capture_ends(&rig), "keys still swallowed after disconnect");
+    }
+
+    #[test]
+    fn capture_is_off_once_the_connection_is_gone() {
+        #[derive(Clone, Copy, Debug)]
+        enum Op {
+            On,
+            Off,
+            FocusLost,
+            FocusBack,
+        }
+        use Op::{FocusBack, FocusLost, Off, On};
+        let sequences: [&[Op]; 7] = [
+            &[On],
+            &[On, FocusLost],
+            &[On, FocusLost, FocusBack, On],
+            &[FocusLost, On, FocusBack, On],
+            &[On, Off, On],
+            &[On, FocusLost, Off, FocusBack, On, Off],
+            &[On, On, FocusLost, FocusBack, FocusLost],
+        ];
+        for (i, ops) in sequences.into_iter().enumerate() {
+            let rig = rig(&format!("inv{i}"));
+            rig.host.on_delay.store(25, Ordering::Relaxed);
+            let mut conn = settings(&rig);
+            for op in ops {
+                match op {
+                    On => conn.send(&Request::CaptureHotkey { on: true }).unwrap(),
+                    Off => conn.send(&Request::CaptureHotkey { on: false }).unwrap(),
+                    FocusLost => rig.host.foreground.store(false, Ordering::Relaxed),
+                    FocusBack => rig.host.foreground.store(true, Ordering::Relaxed),
+                }
+                thread::sleep(Duration::from_millis(30));
+            }
+            drop(conn);
+            assert!(capture_ends(&rig), "keys swallowed after {ops:?}");
+        }
     }
 
     #[test]
