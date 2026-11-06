@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 
 use oxi_core::models::{
-    MODELS, Stamp, find, find_by_file_name, sha256_file, stamp_file_name, stamp_trusted,
+    MODELS, ModelStatus, Stamp, find, find_by_file_name, sha256_file, stamp_file_name,
+    stamp_trusted, status, write_stamp,
 };
 
 fn is_hex(s: &str, len: usize) -> bool {
@@ -160,4 +161,55 @@ fn stamp_policy() {
     for (name, stamp, actual, want) in cases {
         assert_eq!(stamp_trusted(stamp, actual, entry), want, "{name}");
     }
+}
+
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("oxi-status-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// A file of the registry size without writing its bytes (`set_len`; the content is never read).
+fn sized_file(dir: &std::path::Path, name: &str, len: u64) -> std::path::PathBuf {
+    let path = dir.join(name);
+    std::fs::File::create(&path).unwrap().set_len(len).unwrap();
+    path
+}
+
+#[test]
+fn status_follows_size_and_stamp() {
+    let entry = find("tiny").unwrap();
+    let dir = scratch("table");
+    let stamp = dir.join(stamp_file_name(entry.file_name));
+
+    assert_eq!(status(entry, &dir), ModelStatus::Missing);
+
+    let file = sized_file(&dir, entry.file_name, 5);
+    assert_eq!(status(entry, &dir), ModelStatus::Bad, "wrong size");
+
+    sized_file(&dir, entry.file_name, entry.size);
+    assert_eq!(status(entry, &dir), ModelStatus::NeedsHash, "no stamp");
+
+    write_stamp(&file).unwrap();
+    assert_eq!(status(entry, &dir), ModelStatus::Ready);
+
+    std::fs::write(&stamp, "garbage").unwrap();
+    assert_eq!(status(entry, &dir), ModelStatus::NeedsHash, "bad stamp");
+
+    let now = Stamp::of(&file).unwrap();
+    let old = Stamp {
+        mtime_ms: now.mtime_ms - 1,
+        ..now
+    };
+    std::fs::write(&stamp, old.to_line()).unwrap();
+    assert_eq!(status(entry, &dir), ModelStatus::NeedsHash, "file changed");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn write_stamp_needs_an_existing_file() {
+    let dir = scratch("nostamp");
+    assert!(write_stamp(&dir.join("absent.bin")).is_err());
+    std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -8,9 +8,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
-use oxi_core::models::{ModelEntry, Stamp, hash_file, hex, sha256_file, stamp_file_name};
+use oxi_core::models::{ModelEntry, hash_file, hex, sha256_file, stamp_file_name, write_stamp};
 use oxi_core::paths::part_path;
 use sha2::{Digest, Sha256};
 use ureq::Agent;
@@ -265,7 +265,7 @@ fn finish(
         let name = dest.file_name().unwrap_or_default().to_string_lossy();
         let stamp = dest.with_file_name(stamp_file_name(&name));
         // Best effort: failing here after the rename would make a retry download it again.
-        let stamp_error = write_stamp(dest, &stamp).err();
+        let stamp_error = write_stamp(dest).err();
         if stamp_error.is_some() {
             let _ = fs::remove_file(&stamp);
         }
@@ -280,20 +280,6 @@ fn finish(
             actual,
         })
     }
-}
-
-/// `<file>.ok` next to the verified file (ARCHITECTURE 8).
-fn write_stamp(file: &Path, stamp_path: &Path) -> io::Result<()> {
-    let meta = fs::metadata(file)?;
-    let since_epoch = meta
-        .modified()?
-        .duration_since(UNIX_EPOCH)
-        .map_err(io::Error::other)?;
-    let stamp = Stamp {
-        size: meta.len(),
-        mtime_ms: u64::try_from(since_epoch.as_millis()).map_err(io::Error::other)?,
-    };
-    fs::write(stamp_path, stamp.to_line())
 }
 
 /// GET with `Range: bytes=<have>-` (when `have > 0`), following redirects by hand so each
@@ -351,6 +337,7 @@ fn resolve(base: &Uri, location: &str) -> Result<Uri, DownloadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxi_core::models::Stamp;
     use std::io::BufRead;
     use std::net::TcpListener;
     use std::sync::Arc;

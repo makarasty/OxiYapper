@@ -2,7 +2,7 @@
 //! exhaustive match: a new variant does not compile until it has its text.
 
 use crate::APP_NAME;
-use crate::machine::{Notice, OverlayState, Phase};
+use crate::machine::{EngineWarning, Notice, OverlayState, Phase};
 
 pub const MENU_SETTINGS: &str = "Settings";
 pub const MENU_COPY_LAST: &str = "Copy last text";
@@ -29,6 +29,15 @@ pub const fn notice(notice: Notice) -> &'static str {
         }
         Notice::ConfigAdjusted => "config.toml had values out of range. They were adjusted",
         Notice::MicSilence => "The microphone gives silence. Check its mute switch",
+    }
+}
+
+/// Tray and `Status` line of an [`EngineWarning`].
+#[must_use]
+pub fn engine_warning(warning: &EngineWarning) -> String {
+    match warning {
+        EngineWarning::CpuFallback { reason } => format!("running on CPU: {reason}"),
+        EngineWarning::GpuNotFound { name } => format!("GPU {name:?} not found, using auto"),
     }
 }
 

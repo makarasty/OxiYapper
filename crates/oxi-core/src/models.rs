@@ -3,9 +3,10 @@
 //! Every URL is pinned to a Hugging Face commit, never `main`. Sizes and SHA256 come from
 //! the HF tree API (`/api/models/<repo>/tree/<commit>`, field `lfs.oid`).
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::Path;
+use std::time::UNIX_EPOCH;
 
 use sha2::{Digest, Sha256};
 
@@ -107,6 +108,19 @@ pub struct Stamp {
 }
 
 impl Stamp {
+    /// What the file at `path` is now: its size and modification time.
+    pub fn of(path: &Path) -> io::Result<Self> {
+        let meta = fs::metadata(path)?;
+        let since_epoch = meta
+            .modified()?
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?;
+        Ok(Self {
+            size: meta.len(),
+            mtime_ms: u64::try_from(since_epoch.as_millis()).map_err(io::Error::other)?,
+        })
+    }
+
     /// Contents of the `.ok` file: `<size> <mtime_ms>\n`.
     pub fn to_line(self) -> String {
         format!("{} {}\n", self.size, self.mtime_ms)
@@ -131,4 +145,50 @@ pub fn stamp_file_name(file_name: &str) -> String {
 /// a size other than the registry's means re-hash.
 pub fn stamp_trusted(stamp: Option<Stamp>, actual: Stamp, entry: &ModelEntry) -> bool {
     stamp == Some(actual) && actual.size == entry.size
+}
+
+/// Records the file as verified: writes `<file>.ok` next to it with its stamp as of now.
+pub fn write_stamp(file: &Path) -> io::Result<()> {
+    let name = file.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "model path has no file name")
+    })?;
+    fs::write(
+        file.with_file_name(stamp_file_name(name)),
+        Stamp::of(file)?.to_line(),
+    )
+}
+
+/// What the files on disk say about a registry model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelStatus {
+    /// No file.
+    Missing,
+    /// Right size and a stamp that still matches: load without hashing.
+    Ready,
+    /// Right size but no usable stamp: hash the file before the first load.
+    NeedsHash,
+    /// Wrong size (cut-off download, other file) or unreadable: cannot be used.
+    Bad,
+}
+
+/// Status of `entry` in `models_dir`, from the file's size and its `.ok` stamp. Reads the
+/// metadata only; the hash is the caller's step on [`ModelStatus::NeedsHash`].
+pub fn status(entry: &ModelEntry, models_dir: &Path) -> ModelStatus {
+    let file = models_dir.join(entry.file_name);
+    let actual = match Stamp::of(&file) {
+        Ok(actual) => actual,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return ModelStatus::Missing,
+        Err(_) => return ModelStatus::Bad,
+    };
+    if actual.size != entry.size {
+        return ModelStatus::Bad;
+    }
+    let stored = fs::read_to_string(models_dir.join(stamp_file_name(entry.file_name)))
+        .ok()
+        .and_then(|text| Stamp::parse(&text));
+    if stamp_trusted(stored, actual, entry) {
+        ModelStatus::Ready
+    } else {
+        ModelStatus::NeedsHash
+    }
 }

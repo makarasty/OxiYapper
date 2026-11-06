@@ -7,7 +7,8 @@ mod device;
 
 use std::path::Path;
 
-use oxi_core::device::{DeviceChoice, pick};
+use oxi_core::device::{DeviceChoice, Picked, pick};
+use oxi_core::machine::EngineWarning;
 use oxi_core::types::{Language, Millis};
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperError,
@@ -38,8 +39,18 @@ pub struct LoadInfo {
     /// the CPU fallback: per ARCHITECTURE 8 the caller then loads with
     /// [`DeviceChoice::Cpu`] until the config or the model changes.
     pub device: Option<String>,
-    /// Tray text: the named GPU was gone, or GPU init failed and CPU runs instead.
-    pub warning: Option<String>,
+    /// The named GPU was gone, or GPU init failed and CPU runs instead.
+    pub warning: Option<EngineWarning>,
+}
+
+/// The named GPU was not in the list and `pick` chose automatically.
+fn not_found(choice: &DeviceChoice, picked: &Picked) -> Option<EngineWarning> {
+    match choice {
+        DeviceChoice::Named(name) if picked.warning.is_some() => {
+            Some(EngineWarning::GpuNotFound { name: name.clone() })
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -100,12 +111,13 @@ impl Engine {
     pub fn load(path: &Path, choice: &DeviceChoice) -> Result<Self, Error> {
         let devices = list_devices();
         let picked = pick(&devices, choice);
+        let warning = not_found(choice, &picked);
         let gpu_err = match picked.index {
             None => {
                 let (ctx, state) = open(path, None, false).map_err(Error::Load)?;
                 let info = LoadInfo {
                     device: None,
-                    warning: picked.warning,
+                    warning,
                 };
                 return Ok(Self {
                     ctx,
@@ -120,7 +132,7 @@ impl Engine {
                 Ok((ctx, state)) => {
                     let info = LoadInfo {
                         device: Some(devices[i].name.clone()),
-                        warning: picked.warning,
+                        warning,
                     };
                     return Ok(Self {
                         ctx,
@@ -135,7 +147,7 @@ impl Engine {
         let (ctx, state) = open(path, None, false).map_err(Error::Load)?;
         let info = LoadInfo {
             device: None,
-            warning: Some(format!("running on CPU: {gpu_err}")),
+            warning: Some(EngineWarning::CpuFallback { reason: gpu_err }),
         };
         Ok(Self {
             ctx,
@@ -204,6 +216,23 @@ fn centis(t: i64) -> Millis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_missing_named_gpu_warns() {
+        let picked = |warns: bool| Picked {
+            index: None,
+            warning: warns.then(String::new),
+        };
+        let named = DeviceChoice::Named("Vulkan3".into());
+        assert_eq!(
+            not_found(&named, &picked(true)),
+            Some(EngineWarning::GpuNotFound {
+                name: "Vulkan3".into()
+            })
+        );
+        assert_eq!(not_found(&named, &picked(false)), None);
+        assert_eq!(not_found(&DeviceChoice::Auto, &picked(false)), None);
+    }
 
     #[test]
     fn thread_count_table() {

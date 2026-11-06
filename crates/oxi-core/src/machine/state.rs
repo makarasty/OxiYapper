@@ -221,7 +221,10 @@ impl State {
             Event::TranscriptionFailed(job) => {
                 if self.job_in(job, Stage::Transcribing).is_some() {
                     self.jobs.retain(|j| j.id != job);
-                    self.fail(Notice::TranscriptionFailed, now, &mut fx);
+                    // A model that failed to load for this job was announced already: one notice.
+                    if !matches!(self.model, ModelStatus::Failed(_)) {
+                        self.fail(Notice::TranscriptionFailed, now, &mut fx);
+                    }
                 }
             }
             Event::PasteDone { job, outcome } => {

@@ -9,8 +9,8 @@ mod types;
 
 pub use state::State;
 pub use types::{
-    Effect, Effects, EmptyAudio, Event, JobId, MachineConfig, Mode, ModelFailure, ModelIdentity,
-    Notice, OverlayState, Phase, PhaseCell, Sound,
+    Effect, Effects, EmptyAudio, EngineWarning, Event, JobId, MachineConfig, Mode, ModelFailure,
+    ModelIdentity, Notice, OverlayState, Phase, PhaseCell, Sound,
 };
 
 use crate::types::Millis;

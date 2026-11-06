@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use oxi_core::machine::{
-    Effect, EmptyAudio, Event, JobId, MachineConfig, Mode, ModelFailure, Phase, State, step,
+    Effect, EmptyAudio, Event, JobId, MachineConfig, Mode, ModelFailure, Phase, Sound, State, step,
 };
 use oxi_core::paste::{ClipboardOnlyWhy, PasteOutcome};
 use oxi_core::types::Millis;
@@ -276,6 +276,32 @@ proptest! {
             ticks += 1;
             prop_assert!(ticks < 10_000, "deadlines never drain");
         }
+        prop_assert_eq!(state.phase(), Phase::Idle);
+    }
+
+    /// A model that fails to load for the job in whisper (the worker answers `ModelFailed`,
+    /// then `TranscriptionFailed`) gives one error sound and one notice, whatever waits behind
+    /// it, and every job ends.
+    #[test]
+    fn one_failed_load_gives_at_most_one_error_notice(
+        jobs in 1..=3u64,
+        why in prop_oneof![Just(ModelFailure::Missing), Just(ModelFailure::Bad)],
+    ) {
+        let mut state = State::new(MachineConfig::default());
+        step(&mut state, Event::ModelLoaded, Millis(0));
+        let mut now = 0;
+        for n in 0..jobs {
+            step(&mut state, Event::ChordDown, Millis(now));
+            step(&mut state, Event::ChordUp, Millis(now + 1000));
+            now += 3000; // past the release tail
+            step(&mut state, Event::Tick, Millis(now));
+            step(&mut state, Event::JobAudioReady(JobId(n)), Millis(now));
+        }
+        let mut fx = step(&mut state, Event::ModelFailed(why), Millis(now));
+        fx.extend(step(&mut state, Event::TranscriptionFailed(JobId(0)), Millis(now)));
+        let errors = fx.iter().filter(|e| **e == Effect::Play(Sound::Error)).count();
+        let notices = fx.iter().filter(|e| matches!(e, Effect::Notify(_))).count();
+        prop_assert_eq!((errors, notices), (1, 1), "{:?}", fx);
         prop_assert_eq!(state.phase(), Phase::Idle);
     }
 
