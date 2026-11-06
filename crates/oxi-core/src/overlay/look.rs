@@ -19,6 +19,12 @@ pub mod palette {
     pub const ERROR: Rgba = Rgba(0xE5, 0x48, 0x4D, 0xFF);
     /// The meter while the input clips.
     pub const CLIP: Rgba = Rgba(0xFF, 0x2A, 0x2A, 0xFF);
+    /// The pill body: opaque near-black, readable over light and dark desktops alike.
+    pub const SURFACE: Rgba = Rgba(0x1E, 0x1F, 0x24, 0xFF);
+    /// Pill label text.
+    pub const TEXT: Rgba = Rgba(0xEE, 0xEF, 0xF2, 0xFF);
+    /// Hairline pill rim that keeps the outline visible on a dark desktop.
+    pub const EDGE: Rgba = Rgba(0xFF, 0xFF, 0xFF, 0x24);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

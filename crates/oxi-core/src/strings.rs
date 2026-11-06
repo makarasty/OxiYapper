@@ -55,14 +55,11 @@ pub const fn notice_short(notice: Notice) -> &'static str {
 pub const fn overlay_label(state: OverlayState) -> &'static str {
     match state {
         OverlayState::Hidden => "",
-        OverlayState::Recording {
-            locked: true,
-            ending_soon: true,
-        } => "Locked, ending",
-        OverlayState::Recording { locked: true, .. } => "Locked",
+        // Locked and ending: the lock icon shows the lock, the label the warning.
         OverlayState::Recording {
             ending_soon: true, ..
         } => "Ending soon",
+        OverlayState::Recording { locked: true, .. } => "Locked",
         OverlayState::Recording { .. } => "Recording",
         OverlayState::LoadingModel => "Loading model",
         OverlayState::Transcribing => "Transcribing",

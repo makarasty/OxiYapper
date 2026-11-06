@@ -8,6 +8,24 @@ pub const PILL_H_DIP: i32 = 40;
 /// Gap between the pill and the work-area edge.
 pub const MARGIN_DIP: i32 = 16;
 
+// Inside the pill, as shares of its height, so every DPI draws the same picture.
+/// Space between the pill's end and the icon or meter.
+pub const PILL_PAD: f32 = 0.34;
+/// Icon box side.
+pub const PILL_ICON: f32 = 0.46;
+/// Space between icon, label and meter.
+pub const PILL_GAP: f32 = 0.22;
+/// Label font em size.
+pub const PILL_EM: f32 = 0.33;
+/// Smallest label font, as a share of [`PILL_EM`], when the label must fit beside the meter.
+pub const PILL_EM_MIN: f32 = 0.85;
+/// Narrowest meter beside a label; a longer label shrinks its font instead.
+pub const PILL_METER_MIN: f32 = 0.7;
+/// Tallest meter bar.
+pub const PILL_BAR_MAX: f32 = 0.5;
+pub const PILL_BAR_W: f32 = 0.065;
+pub const PILL_BAR_GAP: f32 = 0.05;
+
 /// A rectangle in physical pixels of the virtual desktop; the origin is negative on a monitor
 /// left of or above the primary one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
