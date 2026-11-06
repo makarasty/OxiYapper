@@ -2,7 +2,7 @@
 //! exhaustive match: a new variant does not compile until it has its text.
 
 use crate::APP_NAME;
-use crate::machine::{Notice, OverlayState, Phase};
+use crate::machine::{EngineWarning, Notice, OverlayState, Phase};
 
 pub const MENU_SETTINGS: &str = "Settings";
 pub const MENU_COPY_LAST: &str = "Copy last text";
@@ -24,6 +24,15 @@ pub const fn notice(notice: Notice) -> &'static str {
         Notice::RestoreSkipped => "Pasted. The previous clipboard could not be restored",
         Notice::PasteFailed => "Could not paste. Use Copy last text in the tray menu",
         Notice::MicFallback => "Selected microphone not found, using the system default",
+    }
+}
+
+/// Tray and `Status` line of an [`EngineWarning`].
+#[must_use]
+pub fn engine_warning(warning: &EngineWarning) -> String {
+    match warning {
+        EngineWarning::CpuFallback { reason } => format!("running on CPU: {reason}"),
+        EngineWarning::GpuNotFound { name } => format!("GPU {name:?} not found, using auto"),
     }
 }
 

@@ -12,8 +12,9 @@ use std::thread::{self, JoinHandle};
 
 use oxi_core::config::Config;
 use oxi_core::device::DeviceChoice;
-use oxi_core::machine::{Event, MachineConfig, ModelFailure};
+use oxi_core::machine::{EngineWarning, Event, MachineConfig, ModelFailure};
 use oxi_core::paths::Layout;
+use oxi_core::strings;
 use oxi_core::text::Outcome;
 use oxi_core::types::Language;
 use oxi_whisper::{Engine, LoadInfo, Transcript};
@@ -74,11 +75,11 @@ struct Worker<R, L> {
     cfg: Config,
     assets: TextAssets,
     loaded: Option<R>,
-    /// Why the GPU is off ("running on CPU: <reason>"): set once a CPU load after a GPU failure
-    /// succeeded, cleared when the model or device setting changes. Loads go to CPU while set.
+    /// Why the GPU is off: set once a CPU load after a GPU failure succeeded, cleared when the
+    /// model or device setting changes. Loads go to CPU while set.
     cpu_reason: Option<String>,
     /// The last `Inbox::EngineWarning` sent.
-    reported: Option<String>,
+    reported: Option<EngineWarning>,
 }
 
 impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<R, L> {
@@ -105,18 +106,18 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
                 };
                 let _ = self.inbox.send(Inbox::Event(event));
             }
-            WhisperCmd::Unload => self.loaded = None,
+            WhisperCmd::Unload => {
+                self.loaded = None;
+                self.report(None);
+            }
             WhisperCmd::Transcribe { job, samples } => {
-                let (text, failure) = match self.transcribe(&samples) {
-                    Ok(text) => (text, None),
-                    Err(failure) => (None, Some(failure)),
-                };
-                let _ = self.inbox.send(Inbox::Transcribed { job, text });
-                // After the job's end, so the model notice is the one left showing, and the
-                // machine leaves Loaded instead of retrying a full load on every job.
-                if let Some(failure) = failure {
+                let text = self.transcribe(&samples).unwrap_or_else(|failure| {
+                    // First, so the machine leaves Loaded before this job ends: the jobs queued
+                    // behind it are not dispatched to a model that is not there, one notice.
                     let _ = self.inbox.send(Inbox::Event(Event::ModelFailed(failure)));
-                }
+                    None
+                });
+                let _ = self.inbox.send(Inbox::Transcribed { job, text });
             }
             WhisperCmd::Config(cfg) => {
                 if MachineConfig::from(&*cfg).model != MachineConfig::from(&self.cfg).model {
@@ -129,12 +130,22 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
         }
     }
 
-    /// Loads the configured model unless one is loaded. The state machine unloads a stale one.
-    /// `gpu_failed`: the GPU just failed this reason mid-job, so load on CPU now.
+    /// Loads the configured model unless one is loaded (the state machine unloads a stale one)
+    /// and reports what the load says about the device; a failed load clears the warning.
+    /// `gpu_failed`: the GPU just failed mid-job for this reason, so load on CPU now.
     fn ensure_loaded(&mut self, gpu_failed: Option<String>) -> Result<(), ModelFailure> {
         if self.loaded.is_some() {
             return Ok(());
         }
+        let warning = self.load_model(gpu_failed);
+        self.report(warning.clone().unwrap_or(None));
+        warning.map(drop)
+    }
+
+    fn load_model(
+        &mut self,
+        gpu_failed: Option<String>,
+    ) -> Result<Option<EngineWarning>, ModelFailure> {
         let models_dir = self.layout.models_dir();
         let model = pipeline::resolve_model(&self.cfg.model, &models_dir)?;
         pipeline::verify_stamped(&model, &models_dir)?;
@@ -148,7 +159,7 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
             Ok(engine) => engine,
             Err(e) if choice != DeviceChoice::Cpu => {
                 tracing::warn!("model load on the GPU failed ({e:#}), retrying on CPU");
-                reason = Some(cpu_reason(&e));
+                reason = Some(e.to_string());
                 (self.load)(&model.path, &DeviceChoice::Cpu).map_err(|e| {
                     tracing::warn!("model load on CPU failed: {e:#}");
                     ModelFailure::Bad
@@ -160,25 +171,32 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
             }
         };
         let info = engine.info();
-        if reason.is_none() && choice != DeviceChoice::Cpu && info.device.is_none() {
-            // The engine fell back to CPU by itself; its warning says why.
-            reason = Some(
-                info.warning
-                    .clone()
-                    .unwrap_or_else(|| "running on CPU".into()),
-            );
+        // The engine's own GPU-to-CPU retry pins CPU too; CPU with no GPU to fail is no warning.
+        if reason.is_none()
+            && let Some(EngineWarning::CpuFallback { reason: why }) = &info.warning
+        {
+            reason = Some(why.clone());
         }
-        let warning = reason.clone().or_else(|| info.warning.clone());
+        let warning = match &reason {
+            Some(why) => Some(EngineWarning::CpuFallback {
+                reason: why.clone(),
+            }),
+            None => info.warning.clone(),
+        };
         if let Some(w) = &warning {
-            tracing::warn!("{w}");
+            tracing::warn!("{}", strings::engine_warning(w));
         }
         self.cpu_reason = reason;
         self.loaded = Some(engine);
+        Ok(warning)
+    }
+
+    /// Sends `warning` when it differs from the last one sent.
+    fn report(&mut self, warning: Option<EngineWarning>) {
         if warning != self.reported {
             self.reported.clone_from(&warning);
             let _ = self.inbox.send(Inbox::EngineWarning(warning));
         }
-        Ok(())
     }
 
     /// `Ok(Some(""))` is nothing heard, `Ok(None)` a whisper failure, `Err` no model to run.
@@ -197,7 +215,7 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
                 }
                 // ARCHITECTURE 11 item 25: this job again on CPU, then CPU until a config change.
                 tracing::warn!("transcription on the GPU failed ({e:#}), retrying on CPU");
-                self.ensure_loaded(Some(cpu_reason(&e)))?;
+                self.ensure_loaded(Some(e.to_string()))?;
                 match self.run(samples) {
                     Ok(t) => t,
                     Err(e) => {
@@ -222,12 +240,6 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
             .ok_or_else(|| anyhow::anyhow!("no model loaded"))?;
         engine.transcribe(samples, self.cfg.model.language, &self.assets.prompt)
     }
-}
-
-/// Tray text for a GPU failure (ARCHITECTURE 8), in `oxi_whisper`'s own wording. Errors carry
-/// kinds and paths, never dictated text.
-fn cpu_reason(e: &anyhow::Error) -> String {
-    format!("running on CPU: {e}")
 }
 
 #[cfg(test)]
@@ -259,11 +271,13 @@ mod tests {
         /// Loads on CPU fail.
         cpu_load_fails: bool,
         /// `LoadInfo.warning` of a GPU engine (a named device gone).
-        load_warning: Option<String>,
+        load_warning: Option<EngineWarning>,
         /// The first transcription on a GPU engine fails.
         gpu_run_fails: bool,
         /// A GPU request is answered by an engine on CPU (the real `Engine::load` fallback).
         silent_cpu: bool,
+        /// No GPU at all (CPU-only build): a GPU request runs on CPU with no warning.
+        no_gpu: bool,
     }
 
     type Loader = Box<dyn FnMut(&Path, &DeviceChoice) -> anyhow::Result<Fake>>;
@@ -303,6 +317,7 @@ mod tests {
                 load_warning: None,
                 gpu_run_fails: false,
                 silent_cpu: false,
+                no_gpu: false,
             }
         }
 
@@ -310,7 +325,8 @@ mod tests {
             let s = self.clone();
             Box::new(move |_, choice| {
                 s.calls.borrow_mut().push(choice.clone());
-                let cpu = *choice == DeviceChoice::Cpu || s.silent_cpu;
+                let asked_gpu = *choice != DeviceChoice::Cpu;
+                let cpu = !asked_gpu || s.silent_cpu || s.no_gpu;
                 if !cpu && s.gpu_load_fails || cpu && s.cpu_load_fails {
                     anyhow::bail!("out of memory");
                 }
@@ -319,7 +335,11 @@ mod tests {
                     fail_run: s.gpu_run_fails,
                     info: LoadInfo {
                         device: (!cpu).then(|| "Vulkan0".into()),
-                        warning: s.load_warning.clone().filter(|_| !cpu),
+                        warning: if asked_gpu && s.silent_cpu {
+                            Some(oom())
+                        } else {
+                            s.load_warning.clone().filter(|_| !cpu)
+                        },
                     },
                 })
             })
@@ -327,6 +347,12 @@ mod tests {
 
         fn calls(&self) -> Vec<DeviceChoice> {
             self.calls.borrow().clone()
+        }
+    }
+
+    fn oom() -> EngineWarning {
+        EngineWarning::CpuFallback {
+            reason: "out of memory".into(),
         }
     }
 
@@ -394,7 +420,7 @@ mod tests {
     }
 
     /// Every `EngineWarning` sent so far; drains the other messages too.
-    fn warnings(rx: &Receiver<Inbox>) -> Vec<Option<String>> {
+    fn warnings(rx: &Receiver<Inbox>) -> Vec<Option<EngineWarning>> {
         rx.try_iter()
             .filter_map(|m| match m {
                 Inbox::EngineWarning(w) => Some(w),
@@ -450,8 +476,8 @@ mod tests {
         w.handle(WhisperCmd::Preload);
         assert_eq!(event(&rx), Event::ModelFailed(ModelFailure::Missing));
         job(&mut w);
-        assert_eq!(text(&rx), None);
         assert_eq!(event(&rx), Event::ModelFailed(ModelFailure::Missing));
+        assert_eq!(text(&rx), None);
         assert_eq!(s.calls(), Vec::<DeviceChoice>::new());
     }
 
@@ -514,20 +540,22 @@ mod tests {
                 DeviceChoice::Cpu
             ]
         );
-        assert_eq!(warnings(&rx), Vec::<Option<String>>::new());
+        assert_eq!(warnings(&rx), Vec::<Option<EngineWarning>>::new());
     }
 
     #[test]
-    fn cpu_fallback_is_reported_once_and_cleared_when_running_as_configured() {
+    fn cpu_fallback_is_reported_and_cleared_by_unload_or_running_as_configured() {
         let (r, mut s) = (rig("warn"), Script::new());
         s.gpu_load_fails = true;
         let (mut w, rx) = worker(&s, &r);
         w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Auto)));
         w.handle(WhisperCmd::Preload);
-        w.handle(WhisperCmd::Unload);
         w.handle(WhisperCmd::Preload);
-        let cpu = Some("running on CPU: out of memory".to_owned());
-        assert_eq!(warnings(&rx), [cpu]);
+        assert_eq!(warnings(&rx), [Some(oom())], "sent once");
+        w.handle(WhisperCmd::Unload);
+        assert_eq!(warnings(&rx), [None], "no model, nothing to warn about");
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(warnings(&rx), [Some(oom())], "still pinned to CPU");
         // CPU chosen in the config: no warning.
         w.handle(WhisperCmd::Unload);
         w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
@@ -536,15 +564,35 @@ mod tests {
     }
 
     #[test]
-    fn engine_load_warning_is_reported() {
+    fn no_gpu_at_all_is_no_warning_and_no_pin() {
+        let (r, mut s) = (rig("nogpu"), Script::new());
+        s.no_gpu = true;
+        let (mut w, rx) = worker(&s, &r);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Auto)));
+        w.handle(WhisperCmd::Preload);
+        w.handle(WhisperCmd::Unload);
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(warnings(&rx), Vec::<Option<EngineWarning>>::new());
+        assert_eq!(s.calls(), [DeviceChoice::Auto, DeviceChoice::Auto]);
+    }
+
+    #[test]
+    fn engine_load_warning_is_reported_and_cleared_when_a_reload_fails() {
         let (r, mut s) = (rig("gone"), Script::new());
-        s.load_warning = Some("Vulkan3 not found, using auto".into());
+        let gone = EngineWarning::GpuNotFound {
+            name: "Vulkan3".into(),
+        };
+        s.load_warning = Some(gone.clone());
+        (s.gpu_run_fails, s.cpu_load_fails) = (true, true);
         let (mut w, rx) = worker(&s, &r);
         w.handle(WhisperCmd::Config(
             r.cfg(DeviceChoice::Named("Vulkan3".into())),
         ));
         w.handle(WhisperCmd::Preload);
-        assert_eq!(warnings(&rx), [s.load_warning.clone()]);
+        assert_eq!(warnings(&rx), [Some(gone)]);
+        // GPU lost mid-job, CPU reload fails: no model, so no device warning either.
+        job(&mut w);
+        assert_eq!(warnings(&rx), [None]);
     }
 
     #[test]
@@ -556,8 +604,8 @@ mod tests {
         w.handle(WhisperCmd::Preload);
         assert_eq!(event(&rx), Event::ModelLoaded);
         job(&mut w);
-        assert_eq!(text(&rx), None);
         assert_eq!(event(&rx), Event::ModelFailed(ModelFailure::Bad));
+        assert_eq!(text(&rx), None);
         // CPU never came up, so the next load tries the GPU again.
         w.handle(WhisperCmd::Preload);
         assert_eq!(

@@ -102,6 +102,17 @@ pub enum ModelFailure {
     Bad,
 }
 
+/// Why whisper runs elsewhere than the config asked (ARCHITECTURE 8); the tray and `Status`
+/// show it through [`crate::strings::engine_warning`]. Never carries dictated text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineWarning {
+    /// The GPU failed (init, out of memory, lost mid-job); whisper runs on CPU. `reason` is
+    /// the error's own one-line `Display`.
+    CpuFallback { reason: String },
+    /// The configured GPU is not in the device list; the automatic choice runs instead.
+    GpuNotFound { name: String },
+}
+
 /// Everything that happens, as the coordinator sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {

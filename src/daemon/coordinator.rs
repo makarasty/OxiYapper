@@ -14,8 +14,11 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
 use oxi_core::config::Config;
-use oxi_core::machine::{self, Effect, Event, JobId, MachineConfig, Phase, PhaseCell, State};
+use oxi_core::machine::{
+    self, Effect, EngineWarning, Event, JobId, MachineConfig, Phase, PhaseCell, State,
+};
 use oxi_core::paste::PasteOutcome;
+use oxi_core::strings;
 use oxi_core::types::Millis;
 
 use super::cmd::{
@@ -30,7 +33,7 @@ pub struct Coordinator<H> {
     active: Config,
     warnings: Vec<String>,
     /// The whisper worker's latest `EngineWarning`.
-    engine_warning: Option<String>,
+    engine_warning: Option<EngineWarning>,
     config_error: Option<String>,
     /// A config received while busy, with its warnings; becomes active on `ApplyConfig`.
     pending: Option<(Config, Vec<String>)>,
@@ -248,9 +251,9 @@ impl<H: ChordHook> Coordinator<H> {
             warnings: self
                 .warnings
                 .iter()
-                .chain(&self.engine_warning)
-                .chain(&self.config_error)
                 .cloned()
+                .chain(self.engine_warning.as_ref().map(strings::engine_warning))
+                .chain(self.config_error.clone())
                 .collect(),
         }
     }
@@ -572,10 +575,10 @@ mod tests {
             .handle(Inbox::ConfigError(ConfigError::ReadOnly), Millis(0));
         let error = ConfigError::ReadOnly.to_string();
         assert_eq!(status(&mut rig), std::slice::from_ref(&error));
-        rig.c.handle(
-            Inbox::EngineWarning(Some("running on CPU: out of memory".into())),
-            Millis(0),
-        );
+        let oom = EngineWarning::CpuFallback {
+            reason: "out of memory".into(),
+        };
+        rig.c.handle(Inbox::EngineWarning(Some(oom)), Millis(0));
         assert_eq!(
             status(&mut rig),
             ["running on CPU: out of memory".to_owned(), error.clone()]

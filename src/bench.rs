@@ -17,6 +17,7 @@ use anyhow::{Context, Result, bail};
 use oxi_core::audio;
 use oxi_core::config::Audio;
 use oxi_core::device::DeviceChoice;
+use oxi_core::strings;
 use oxi_core::text::Outcome;
 use oxi_core::types::{Language, Millis};
 use oxi_platform::capture::{Capture, CaptureEvent, CpalCapture, LevelMeter};
@@ -213,7 +214,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let info = engine.info();
     println!("device: {}", info.device.as_deref().unwrap_or("CPU"));
     if let Some(w) = &info.warning {
-        println!("warning: {w}");
+        println!("warning: {}", strings::engine_warning(w));
     }
 
     let (mut times, mut heard) = (Vec::new(), 0_usize);
