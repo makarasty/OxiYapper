@@ -6,6 +6,8 @@ import { Palette, Switch, Slider } from "std-widgets.slint";
 export global Shell {
     // The config cannot be written (newer version, or a parse error until Reset): controls go grey.
     in-out property <bool> locked;
+    // Error text: 4.5:1 or better on the page and group backgrounds in both themes.
+    out property <color> error-text: Palette.color-scheme == ColorScheme.dark ? #ff8a80 : #b3261e;
 }
 
 // A titled box of rows.
@@ -34,15 +36,19 @@ export component Group inherits VerticalLayout {
     }
 }
 
-// A label on the left, its control (the children) on the right.
+// A label on the left, its control (the children) on the right. Every row has the same label
+// column, so the controls of a group start at one x whatever the label text.
 export component Row inherits HorizontalLayout {
     in property <string> label;
+    in property <length> label-width: 150px;
     min-height: 32px;
     spacing: 8px;
     Text {
         text: root.label;
+        width: root.label-width;
+        overflow: elide;
         vertical-alignment: center;
-        horizontal-stretch: 1;
+        horizontal-stretch: 0;
         color: Palette.foreground;
     }
     @children
