@@ -3,8 +3,10 @@
 
 use std::path::{Path, PathBuf};
 
+use oxi_core::audio::SAMPLE_RATE;
 use oxi_core::device::{DeviceChoice, pick};
 use oxi_core::types::Language;
+use oxi_platform::wav::read_wav_mono_f32;
 use oxi_whisper::{Engine, list_devices};
 
 const JFK: &str = "And so my fellow Americans, ask not what your country can do for you, \
@@ -23,27 +25,11 @@ fn jfk() -> Option<Vec<f32>> {
     if w.is_none() {
         eprintln!("skipped: set OXI_JFK_WAV");
     }
-    w.map(|p| read_wav(&p))
-}
-
-/// 16-bit PCM mono WAV to f32; walks the chunks to `data`.
-fn read_wav(path: &Path) -> Vec<f32> {
-    let b = std::fs::read(path).unwrap();
-    let mut at = 12;
-    while at + 8 <= b.len() {
-        let size = u32::from_le_bytes(b[at + 4..at + 8].try_into().unwrap()) as usize;
-        if &b[at..at + 4] == b"data" {
-            let end = (at + 8 + size).min(b.len());
-            return b[at + 8..end]
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|&c| f32::from(i16::from_le_bytes(c)) / 32768.0)
-                .collect();
-        }
-        at += 8 + size + (size & 1);
-    }
-    panic!("no data chunk in {}", path.display());
+    w.map(|p| {
+        let (mono, rate) = read_wav_mono_f32(&p).unwrap();
+        assert_eq!(rate, SAMPLE_RATE, "{} must be 16 kHz", p.display());
+        mono
+    })
 }
 
 fn words(s: &str) -> Vec<String> {

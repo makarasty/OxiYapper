@@ -950,6 +950,7 @@ name = "oxi-whisper"
 version = "0.1.0"
 dependencies = [
  "oxi-core",
+ "oxi-platform",
  "thiserror 2.0.21",
  "whisper-rs",
 ]

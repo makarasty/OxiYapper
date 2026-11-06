@@ -18,5 +18,8 @@ oxi-core.workspace = true
 whisper-rs = { workspace = true, features = ["raw-api"] } # raw-api re-exports whisper-rs-sys: ggml device list
 thiserror.workspace = true
 
+[dev-dependencies]
+oxi-platform.workspace = true # WAV reader for the jfk.wav test
+
 [lints]
 workspace = true
