@@ -31,6 +31,8 @@ pub struct MachineConfig {
     pub idle_unload: Millis,
     /// How long a transient overlay text (cancelled, nothing heard) stays up.
     pub overlay_hide: Millis,
+    /// Capture keeps running this long after the stopping key, so the last syllable is kept.
+    pub release_tail: Millis,
 }
 
 impl Default for MachineConfig {
@@ -45,6 +47,7 @@ impl Default for MachineConfig {
             watchdog_period: Millis(100),
             idle_unload: Millis::from_secs(300),
             overlay_hide: Millis(1500),
+            release_tail: Millis(100),
         }
     }
 }

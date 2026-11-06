@@ -30,6 +30,8 @@ struct Recording {
     /// `warn_before` has passed.
     warned: bool,
     next_poll: Option<Millis>,
+    /// The stopping key came; capture runs on until then (`release_tail`) and stops.
+    tail_until: Option<Millis>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,8 +120,8 @@ impl State {
         }
     }
 
-    /// The earliest armed timer: max recording, its warning, the watchdog poll, the
-    /// overlay hide, the idle unload.
+    /// The earliest armed timer: max recording, its warning, the watchdog poll, the release
+    /// tail, the overlay hide, the idle unload.
     pub fn next_deadline(&self) -> Option<Millis> {
         let rec = self
             .rec
@@ -129,6 +131,7 @@ impl State {
                     Some(self.max_at(r)),
                     (!r.warned).then(|| self.warn_at(r)),
                     r.next_poll,
+                    r.tail_until,
                 ]
             })
             .flatten();
@@ -149,8 +152,8 @@ impl State {
         let mut fx = Effects::new();
         match event {
             Event::ChordDown => {
-                self.chord_held = true;
-                self.chord_down(now, &mut fx);
+                let repeat = std::mem::replace(&mut self.chord_held, true);
+                self.chord_down(now, repeat, &mut fx);
             }
             // A poll that finds the chord released is a key-up the hook never delivered.
             Event::ChordUp | Event::ChordPolled { held: false } => {
@@ -168,8 +171,8 @@ impl State {
             Event::OtherKey => {
                 // The user meant a shortcut: cancel silently, in both modes. A recording that
                 // exists while the chord is held was started by this press: a press that stops
-                // one leaves none.
-                if self.chord_held {
+                // one leaves none, or only its tail.
+                if self.chord_held && self.rec.as_ref().is_some_and(|r| r.tail_until.is_none()) {
                     self.discard_recording(&mut fx);
                 }
             }
@@ -254,12 +257,20 @@ impl State {
         }
     }
 
-    fn chord_down(&mut self, now: Millis, fx: &mut Effects) {
-        match self.rec.as_ref().map(|r| r.kind) {
-            Some(Kind::Locked | Kind::Toggled) => self.stop_recording(now, true, fx),
-            Some(Kind::Held) => {} // down without an up: the hook repeated itself
-            None => self.start_recording(now, fx),
-        }
+    /// `repeat`: the chord was already held, so this is the hook repeating itself.
+    fn chord_down(&mut self, now: Millis, repeat: bool, fx: &mut Effects) {
+        let Some(r) = self.rec.as_ref() else {
+            return self.start_recording(now, fx);
+        };
+        if r.tail_until.is_some() {
+            if !repeat {
+                // A new press must not wait for the old tail: no lost words (ARCHITECTURE 3).
+                self.stop_recording(now, false, fx);
+                self.start_recording(now, fx);
+            }
+        } else if r.kind != Kind::Held {
+            self.release(now, fx);
+        } // Held: down without an up, the hook repeated itself
     }
 
     fn start_recording(&mut self, now: Millis, fx: &mut Effects) {
@@ -294,6 +305,7 @@ impl State {
             // Every recording starts with the chord held: watch for a lost key-up in both
             // modes, so a stale `chord_held` never lets typing cancel a toggle recording.
             next_poll: Some(now + self.cfg.watchdog_period),
+            tail_until: None,
         });
         fx.push(Effect::StartCapture);
         if self.model == ModelStatus::Unloaded {
@@ -306,7 +318,7 @@ impl State {
     fn chord_up(&mut self, now: Millis, fx: &mut Effects) {
         let Some(r) = self.rec.as_mut() else { return };
         r.next_poll = None; // chord released: nothing left to watch
-        if r.kind != Kind::Held {
+        if r.kind != Kind::Held || r.tail_until.is_some() {
             return; // toggle ignores key-up; a poll may repeat a real one
         }
         let held = now - r.started;
@@ -319,7 +331,19 @@ impl State {
             }
             self.discard_recording(fx);
         } else {
-            self.stop_recording(now, false, fx);
+            self.release(now, fx);
+        }
+    }
+
+    /// The user stopped the recording: discard a tap, else stop after `release_tail`.
+    fn release(&mut self, now: Millis, fx: &mut Effects) {
+        let tail = self.cfg.release_tail;
+        let tap_max = self.cfg.tap_max;
+        match self.rec.as_mut() {
+            Some(r) if tail > Millis(0) && now - r.started >= tap_max => {
+                r.tail_until = Some(now + tail);
+            }
+            _ => self.stop_recording(now, true, fx),
         }
     }
 
@@ -342,8 +366,8 @@ impl State {
 
     fn tick(&mut self, now: Millis, fx: &mut Effects) {
         if let Some(r) = self.rec.as_ref() {
-            if now >= self.max_at(r) {
-                // Never discard a long recording.
+            if now >= self.max_at(r) || r.tail_until.is_some_and(|t| now >= t) {
+                // Never discard a long recording; the cap stops it without a tail.
                 self.stop_recording(now, false, fx);
             } else {
                 let warn = !r.warned && now >= self.warn_at(r);
