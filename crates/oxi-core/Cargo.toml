@@ -15,6 +15,7 @@ toml_edit.workspace = true
 thiserror.workspace = true
 rubato.workspace = true
 earshot.workspace = true
+nnnoiseless = { workspace = true, default-features = false }
 
 [dev-dependencies]
 proptest.workspace = true
