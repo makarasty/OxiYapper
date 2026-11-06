@@ -39,6 +39,8 @@ struct FakeClip {
     seq: u32,
     /// Another app writes the clipboard after our set.
     foreign_write: bool,
+    /// `set_text` fails (nothing is written, the sequence stays).
+    set_fails: bool,
 }
 
 impl Clipboard for FakeClip {
@@ -53,6 +55,9 @@ impl Clipboard for FakeClip {
     }
     fn set_text(&mut self, text: &str) -> Result<u32, ClipError> {
         self.log.borrow_mut().push(Call::Set(text.to_owned()));
+        if self.set_fails {
+            return Err(ClipError::Locked);
+        }
         self.seq += 1;
         Ok(self.seq)
     }
@@ -73,6 +78,8 @@ struct FakeInput {
     /// Modifiers stay down until this much time has been slept.
     held_ms: u64,
     clock: Cell<u64>,
+    chord_blocked: bool,
+    type_blocked: bool,
 }
 
 impl Input for FakeInput {
@@ -89,17 +96,34 @@ impl Input for FakeInput {
     }
     fn send_chord(&mut self, keys: &[Key]) -> Result<(), InputBlocked> {
         self.log.borrow_mut().push(Call::Chord(keys.to_vec()));
-        Ok(())
+        if self.chord_blocked {
+            Err(InputBlocked)
+        } else {
+            Ok(())
+        }
     }
     fn type_units(&mut self, units: &[u16], gap: Millis) -> Result<(), InputBlocked> {
         assert_eq!(gap, TYPE_GAP);
         self.log.borrow_mut().push(Call::Type(units.to_vec()));
-        Ok(())
+        if self.type_blocked {
+            Err(InputBlocked)
+        } else {
+            Ok(())
+        }
     }
     fn sleep(&mut self, time: Millis) {
         self.log.borrow_mut().push(Call::Sleep(time.0));
         self.clock.set(self.clock.get() + time.0);
     }
+}
+
+/// Which call the fakes make fail.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fail {
+    Nothing,
+    SetText,
+    Chord,
+    Typing,
 }
 
 struct Case {
@@ -108,6 +132,7 @@ struct Case {
     held_ms: u64,
     snap: SnapKind,
     foreign_write: bool,
+    fail: Fail,
     config: Paste,
 }
 
@@ -119,6 +144,7 @@ impl Default for Case {
             held_ms: 0,
             snap: SnapKind::Complete,
             foreign_write: false,
+            fail: Fail::Nothing,
             config: Paste::default(),
         }
     }
@@ -131,6 +157,7 @@ fn run(case: &Case, text: &str) -> (PasteOutcome, Vec<Call>) {
         snap: case.snap,
         seq: 7,
         foreign_write: case.foreign_write,
+        set_fails: case.fail == Fail::SetText,
     };
     let mut input = FakeInput {
         log: log.clone(),
@@ -138,6 +165,8 @@ fn run(case: &Case, text: &str) -> (PasteOutcome, Vec<Call>) {
         elevated: case.elevated,
         held_ms: case.held_ms,
         clock: Cell::new(0),
+        chord_blocked: case.fail == Fail::Chord,
+        type_blocked: case.fail == Fail::Typing,
     };
     let out = paste(text, &case.config, &mut clip, &mut input);
     let calls = log.borrow().clone();
@@ -364,4 +393,116 @@ fn plan_takes_each_field_from_the_rule_or_the_default() {
             restore_delay: Millis(300),
         }
     );
+}
+
+fn sends(calls: &[Call]) -> bool {
+    has(calls, |c| matches!(c, Call::Chord(_) | Call::Type(_)))
+}
+
+#[test]
+fn set_text_error_fails_restores_the_clipboard_and_sends_nothing() {
+    let (out, calls) = run(
+        &Case {
+            fail: Fail::SetText,
+            ..Case::default()
+        },
+        "hi",
+    );
+    assert_eq!(out, PasteOutcome::Failed);
+    // The failed set may have emptied the clipboard: the saved data goes back.
+    assert!(has(&calls, |c| *c == Call::Restore));
+    assert!(!sends(&calls));
+}
+
+#[test]
+fn set_text_error_without_restore_fails_and_sends_nothing() {
+    let (out, calls) = run(
+        &Case {
+            snap: SnapKind::Incomplete,
+            fail: Fail::SetText,
+            ..Case::default()
+        },
+        &"я".repeat(301),
+    );
+    assert_eq!(out, PasteOutcome::Failed);
+    assert!(!has(&calls, |c| matches!(c, Call::Restore)));
+    assert!(!sends(&calls));
+}
+
+#[test]
+fn set_text_error_on_a_clipboard_only_path_fails() {
+    let (out, calls) = run(
+        &Case {
+            elevated: true,
+            fail: Fail::SetText,
+            ..Case::default()
+        },
+        "hi",
+    );
+    assert_eq!(out, PasteOutcome::Failed);
+    assert!(!sends(&calls));
+}
+
+#[test]
+fn blocked_chord_fails_without_waiting_but_still_restores() {
+    let (out, calls) = run(
+        &Case {
+            fail: Fail::Chord,
+            ..Case::default()
+        },
+        "hi",
+    );
+    assert_eq!(out, PasteOutcome::Failed);
+    assert!(has(&calls, |c| *c == ctrl_v()));
+    // Nothing was pasted, so no restore delay; our text is still removed from the clipboard.
+    assert!(!has(&calls, |c| matches!(c, Call::Sleep(_))));
+    assert!(has(&calls, |c| *c == Call::Restore));
+}
+
+#[test]
+fn blocked_chord_without_snapshot_data_fails_and_does_not_restore() {
+    let (out, calls) = run(
+        &Case {
+            snap: SnapKind::Incomplete,
+            fail: Fail::Chord,
+            ..Case::default()
+        },
+        &"я".repeat(301),
+    );
+    assert_eq!(out, PasteOutcome::Failed);
+    assert!(!has(&calls, |c| matches!(c, Call::Restore)));
+}
+
+#[test]
+fn blocked_typing_fails_in_every_typing_path() {
+    let type_mode = Paste {
+        mode: PasteMode::Type,
+        ..Paste::default()
+    };
+    for case in [
+        Case {
+            snap: SnapKind::Locked,
+            ..Case::default()
+        },
+        Case {
+            snap: SnapKind::Incomplete,
+            ..Case::default()
+        },
+        Case {
+            config: type_mode,
+            ..Case::default()
+        },
+    ] {
+        let case = Case {
+            fail: Fail::Typing,
+            ..case
+        };
+        let (out, calls) = run(&case, "hi");
+        assert_eq!(out, PasteOutcome::Failed);
+        assert!(has(&calls, |c| matches!(c, Call::Type(_))));
+        assert!(!has(&calls, |c| matches!(
+            c,
+            Call::Set(_) | Call::Chord(_) | Call::Restore
+        )));
+    }
 }
