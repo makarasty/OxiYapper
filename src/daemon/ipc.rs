@@ -1,1 +1,834 @@
 //! IPC server thread (ARCHITECTURE section 5).
+//!
+//! One thread accepts connections; each connection gets one thread of its own, so a client
+//! that stops reading stalls only itself. The first message decides a connection's role:
+//! `OpenSettings` is acted on and the connection closed (a second daemon launch waits for that
+//! close); `Hello` makes it *the* settings connection; anything else closes it. A new `Hello`
+//! replaces the old settings connection.
+//!
+//! Nothing outside the connection thread writes to a socket. Other threads (io progress, hook
+//! keys, the watcher) hand a [`Push`] to [`Pushes::send`], which only queues it and never
+//! blocks; the connection thread writes the queue with a write timeout. A full queue or a
+//! failed write ends that connection. The coordinator thread is never asked to wait for a client.
+//!
+//! Dictated text never reaches this module; log lines carry kinds and counts only.
+
+#![allow(dead_code, reason = "run.rs (t40) calls bind and spawn")]
+
+use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use anyhow::Context;
+use oxi_core::device::DeviceChoice;
+use oxi_core::hotkey::Key;
+use oxi_core::ipc::{PROTO, Push, Request};
+use oxi_platform::ipc::{Conn, Error, Server, default_name, forward_open_settings};
+
+use super::cmd::{Inbox, IoCmd, IpcAsk, StatusReport};
+
+/// Concurrent connections; more are closed unanswered.
+const MAX_CONNS: usize = 8;
+/// Pushes waiting for one connection's thread.
+const QUEUE: usize = 64;
+/// How long a connection thread waits for a message before it looks at its queue again, so
+/// this is also the delay of a push.
+const POLL: Duration = Duration::from_millis(50);
+/// A connection that sends no `Hello` within this long is closed.
+const FIRST_MESSAGE: Duration = Duration::from_secs(5);
+/// A write the client does not read within this long ends the connection.
+const WRITE_LIMIT: Duration = Duration::from_secs(2);
+/// How long `Status` waits for the coordinator.
+const ASK_LIMIT: Duration = Duration::from_secs(2);
+
+/// What the server needs from the OS and the rest of the daemon; fake in the tests.
+pub trait Host: Send + Sync + 'static {
+    /// Hotkey capture on or off; `swallow` while the settings window is foreground.
+    fn set_capture(&self, on: bool, swallow: bool);
+    /// Is a settings window the foreground window.
+    fn settings_foreground(&self) -> bool;
+    /// The `Devices` push.
+    fn devices(&self) -> Push;
+    /// Start a settings window.
+    fn open_settings(&self) -> io::Result<()>;
+    /// Backend in use, e.g. `Vulkan0` or `cpu`.
+    fn backend(&self) -> String;
+}
+
+/// Queue to the settings connection, shared by every thread that pushes. Cheap to clone.
+#[derive(Clone, Default)]
+pub struct Pushes(Arc<Mutex<Slot>>);
+
+#[derive(Default)]
+struct Slot {
+    next_id: u64,
+    current: Option<(u64, SyncSender<Push>)>,
+}
+
+impl Pushes {
+    /// Queues `push` for the settings connection. `false` when there is none, or when its
+    /// queue is full (it is then disconnected, so a stuck window cannot grow memory).
+    pub fn send(&self, push: Push) -> bool {
+        let mut slot = lock(&self.0);
+        let Some((_, tx)) = &slot.current else {
+            return false;
+        };
+        match tx.try_send(push) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                tracing::warn!("settings window not reading: connection dropped");
+                slot.current = None;
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                slot.current = None;
+                false
+            }
+        }
+    }
+
+    /// A new settings connection; the old one, if any, ends.
+    pub(super) fn claim(&self) -> (u64, Receiver<Push>) {
+        let (tx, rx) = mpsc::sync_channel(QUEUE);
+        let mut slot = lock(&self.0);
+        slot.next_id += 1;
+        let id = slot.next_id;
+        slot.current = Some((id, tx));
+        (id, rx)
+    }
+
+    fn release(&self, id: u64) {
+        let mut slot = lock(&self.0);
+        if slot.current.as_ref().is_some_and(|(cur, _)| *cur == id) {
+            slot.current = None;
+        }
+    }
+}
+
+/// Outcome of [`bind`].
+pub enum Start {
+    /// This process is the daemon: serve on it.
+    Serve(Server),
+    /// Another daemon runs; it was asked to open settings and this process should exit.
+    Forwarded,
+}
+
+/// Binds this user's socket. An error here is a refusal to start: its text says why and
+/// goes to the log and to stderr; the process must not exit silently.
+pub fn bind() -> anyhow::Result<Start> {
+    bind_at(&default_name().context("no IPC socket name")?)
+}
+
+fn bind_at(name: &str) -> anyhow::Result<Start> {
+    match Server::bind(name) {
+        Ok(server) => Ok(Start::Serve(server)),
+        Err(Error::AlreadyRunning) => {
+            forward_open_settings(name).map_err(refusal)?;
+            Ok(Start::Forwarded)
+        }
+        Err(e) => Err(refusal(e)),
+    }
+}
+
+/// The plain message for an error of binding or forwarding.
+fn refusal(e: Error) -> anyhow::Error {
+    let msg = match e {
+        Error::AlreadyRunning => "another OxiYapper is already running".to_owned(),
+        Error::Busy => {
+            "OxiYapper is running but not answering; end it in Task Manager and start again"
+                .to_owned()
+        }
+        Error::ForeignServer => {
+            "cannot start: the OxiYapper IPC pipe is held by another account or program".to_owned()
+        }
+        Error::Untrusted => {
+            "cannot start: the OxiYapper IPC pipe is held by an untrusted (low-integrity) program"
+                .to_owned()
+        }
+        Error::Io(e) if e.kind() == io::ErrorKind::TimedOut => {
+            "OxiYapper is running but did not answer in time".to_owned()
+        }
+        Error::Io(e) => format!("IPC failed: {e}"),
+    };
+    tracing::error!("{msg}");
+    anyhow::anyhow!(msg)
+}
+
+/// Starts the accept thread and the thread that turns captured keys into `Key` pushes.
+/// Neither ends before the process does.
+pub fn spawn(
+    server: Server,
+    inbox: Sender<Inbox>,
+    io: Sender<IoCmd>,
+    host: Arc<dyn Host>,
+    pushes: Pushes,
+    keys: Receiver<(Key, bool)>,
+) -> io::Result<JoinHandle<()>> {
+    let key_pushes = pushes.clone();
+    thread::Builder::new()
+        .name("ipc-keys".into())
+        .spawn(move || {
+            for (code, down) in keys {
+                key_pushes.send(Push::Key { code, down });
+            }
+        })?;
+    let ctx = Arc::new(Ctx {
+        inbox,
+        io,
+        host,
+        pushes,
+    });
+    thread::Builder::new()
+        .name("ipc".into())
+        .spawn(move || accept_loop(&server, &ctx))
+}
+
+fn accept_loop(server: &Server, ctx: &Arc<Ctx>) {
+    let live = Arc::new(AtomicUsize::new(0));
+    loop {
+        let conn = match server.accept() {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!(kind = ?e.kind(), "ipc accept failed");
+                thread::sleep(POLL); // an error that repeats must not spin
+                continue;
+            }
+        };
+        if live.fetch_add(1, Ordering::AcqRel) >= MAX_CONNS {
+            live.fetch_sub(1, Ordering::AcqRel);
+            tracing::warn!("ipc connection refused: {MAX_CONNS} are open");
+            continue; // dropping `conn` closes it
+        }
+        let (ctx, slot) = (ctx.clone(), Live(live.clone()));
+        let spawned = thread::Builder::new()
+            .name("ipc-conn".into())
+            .spawn(move || {
+                let _slot = slot;
+                ctx.connection(conn);
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(kind = ?e.kind(), "ipc connection thread not started");
+        }
+    }
+}
+
+/// Counts a connection while it lives.
+struct Live(Arc<AtomicUsize>);
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct Ctx {
+    inbox: Sender<Inbox>,
+    io: Sender<IoCmd>,
+    host: Arc<dyn Host>,
+    pushes: Pushes,
+}
+
+/// What one connection has become.
+#[derive(Default)]
+struct Session {
+    /// Set by `Hello`: this is the settings connection.
+    settings: Option<(u64, Receiver<Push>)>,
+    /// This connection switched hotkey capture on.
+    capture: bool,
+}
+
+impl Ctx {
+    fn connection(&self, mut conn: Conn) {
+        let mut session = Session::default();
+        if conn.set_write_timeout(Some(WRITE_LIMIT)).is_ok()
+            && conn.set_read_timeout(Some(POLL)).is_ok()
+        {
+            self.serve(&mut conn, &mut session);
+        }
+        if session.capture {
+            self.host.set_capture(false, false);
+        }
+        if let Some((id, _)) = session.settings {
+            self.pushes.release(id);
+        }
+    }
+
+    fn serve(&self, conn: &mut Conn, session: &mut Session) {
+        let opened = Instant::now();
+        loop {
+            if !flush(conn, session) {
+                return;
+            }
+            if session.capture && !self.host.settings_foreground() {
+                self.host.set_capture(false, false);
+                session.capture = false;
+            }
+            match conn.recv::<Request>() {
+                // A client that connects and closes (the probe of `Server::bind`) reads as `None`.
+                Ok(None) => return,
+                Ok(Some(req)) => {
+                    if !self.handle(req, conn, session) {
+                        return;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                    if session.settings.is_none() && opened.elapsed() > FIRST_MESSAGE {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(kind = ?e.kind(), "ipc connection ended");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Acts on `req`; `false` closes the connection.
+    fn handle(&self, req: Request, conn: &mut Conn, session: &mut Session) -> bool {
+        let first = session.settings.is_none();
+        match req {
+            Request::OpenSettings => {
+                if !self.pushes.send(Push::Raise)
+                    && let Err(e) = self.host.open_settings()
+                {
+                    tracing::warn!(kind = ?e.kind(), "settings window not started");
+                }
+                // The caller of a second launch waits for this close.
+                !first
+            }
+            Request::Hello { .. } => {
+                session.settings.get_or_insert_with(|| self.pushes.claim());
+                let ack = Push::HelloAck {
+                    proto: PROTO,
+                    version: crate::VERSION.into(),
+                };
+                conn.send(&ack).is_ok()
+            }
+            // Only the settings connection may ask for anything else.
+            _ if first => false,
+            Request::Status => self.status(conn),
+            Request::ListDevices => conn.send(&self.host.devices()).is_ok(),
+            Request::DownloadModel { id } => self.io.send(IoCmd::Download { id }).is_ok(),
+            Request::CancelDownload { id } => self.io.send(IoCmd::CancelDownload { id }).is_ok(),
+            Request::CaptureHotkey { on } => {
+                self.capture(on, session);
+                true
+            }
+            Request::PreviewOverlay { position } => self
+                .inbox
+                .send(Inbox::Ipc(IpcAsk::PreviewOverlay(position)))
+                .is_ok(),
+            Request::Shutdown => {
+                let _ = self.inbox.send(Inbox::Shutdown);
+                false
+            }
+        }
+    }
+
+    fn status(&self, conn: &mut Conn) -> bool {
+        let (tx, rx) = mpsc::channel();
+        if self.inbox.send(Inbox::Ipc(IpcAsk::Status(tx))).is_err() {
+            return false;
+        }
+        let Ok(report) = rx.recv_timeout(ASK_LIMIT) else {
+            tracing::warn!("coordinator did not answer Status");
+            return true;
+        };
+        conn.send(&status_push(report, self.host.backend())).is_ok()
+    }
+
+    /// Capture starts only while the settings window is foreground (it ends when it is not).
+    fn capture(&self, on: bool, session: &mut Session) {
+        if on && !session.capture && self.host.settings_foreground() {
+            self.host.set_capture(true, true);
+            session.capture = true;
+        } else if !on && session.capture {
+            self.host.set_capture(false, false);
+            session.capture = false;
+        }
+    }
+}
+
+/// Writes what other threads queued; `false` when the connection is over.
+fn flush(conn: &mut Conn, session: &Session) -> bool {
+    let Some((_, queue)) = &session.settings else {
+        return true;
+    };
+    loop {
+        match queue.try_recv() {
+            Ok(push) => {
+                if conn.send(&push).is_err() {
+                    return false;
+                }
+            }
+            Err(TryRecvError::Empty) => return true,
+            // Replaced by a newer window, or dropped for not reading.
+            Err(TryRecvError::Disconnected) => return false,
+        }
+    }
+}
+
+fn status_push(report: StatusReport, backend: String) -> Push {
+    Push::Status {
+        phase: report.phase,
+        model: report.model,
+        // shortcut: the report's `device` is the `[audio]` microphone, the push wants the GPU choice;
+        // fixed with the settings page that shows it (t30b).
+        device: DeviceChoice::from(report.device),
+        backend,
+        warnings: report.warnings,
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The real host: the hook handle, the foreground window, `current_exe settings`.
+pub struct SystemHost {
+    hook: Arc<oxi_platform::os::hook::HookHandle>,
+    backend: Box<dyn Fn() -> String + Send + Sync>,
+    /// Exe file name; the settings window is a process of our own exe.
+    exe_name: String,
+    /// The settings process this daemon started, kept so a window that is still starting is not
+    /// started twice.
+    child: Mutex<Option<std::process::Child>>,
+}
+
+impl SystemHost {
+    pub fn new(
+        hook: Arc<oxi_platform::os::hook::HookHandle>,
+        backend: Box<dyn Fn() -> String + Send + Sync>,
+    ) -> io::Result<Self> {
+        let exe = std::env::current_exe()?;
+        let exe_name = exe
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Ok(Self {
+            hook,
+            backend,
+            exe_name,
+            child: Mutex::default(),
+        })
+    }
+}
+
+impl Host for SystemHost {
+    fn set_capture(&self, on: bool, swallow: bool) {
+        self.hook.set_capture(on, swallow);
+    }
+
+    fn settings_foreground(&self) -> bool {
+        use oxi_core::paste::Input;
+        // The daemon's own windows (pill, tray menu) never take the foreground.
+        let app = oxi_platform::os::input::Keyboard.foreground().app;
+        !self.exe_name.is_empty() && app.eq_ignore_ascii_case(&self.exe_name)
+    }
+
+    fn devices(&self) -> Push {
+        let mics = oxi_platform::capture::list_input_devices().unwrap_or_else(|e| {
+            tracing::warn!("cannot list microphones: {e}");
+            Vec::new()
+        });
+        Push::Devices {
+            mics,
+            gpus: oxi_whisper::list_devices(),
+        }
+    }
+
+    fn open_settings(&self) -> io::Result<()> {
+        let mut child = lock(&self.child);
+        if let Some(running) = child.as_mut()
+            && running.try_wait()?.is_none()
+        {
+            return Ok(()); // still starting; it will connect
+        }
+        *child = Some(
+            std::process::Command::new(std::env::current_exe()?)
+                .arg("settings")
+                .spawn()?,
+        );
+        Ok(())
+    }
+
+    fn backend(&self) -> String {
+        (self.backend)()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+
+    use oxi_core::config::OverlayPosition;
+    use oxi_core::ipc::MAX_LINE;
+    use oxi_core::machine::Phase;
+
+    use super::*;
+
+    const WAIT: Duration = Duration::from_secs(3);
+
+    #[derive(Debug, PartialEq)]
+    enum Call {
+        Capture(bool, bool),
+        Open,
+    }
+
+    struct Fake {
+        foreground: AtomicBool,
+        calls: Sender<Call>,
+    }
+
+    impl Host for Fake {
+        fn set_capture(&self, on: bool, swallow: bool) {
+            let _ = self.calls.send(Call::Capture(on, swallow));
+        }
+        fn settings_foreground(&self) -> bool {
+            self.foreground.load(Ordering::Relaxed)
+        }
+        fn devices(&self) -> Push {
+            Push::Devices {
+                mics: vec!["mic".into()],
+                gpus: vec![],
+            }
+        }
+        fn open_settings(&self) -> io::Result<()> {
+            let _ = self.calls.send(Call::Open);
+            Ok(())
+        }
+        fn backend(&self) -> String {
+            "cpu".into()
+        }
+    }
+
+    /// A line that is no `Request`, written raw.
+    struct Raw(String);
+
+    impl oxi_platform::ipc::Message for Raw {
+        fn encode(&self) -> String {
+            self.0.clone()
+        }
+        fn decode(
+            _: &mut oxi_core::ipc::Decoder,
+        ) -> Option<Result<Self, oxi_core::ipc::DecodeError>> {
+            None
+        }
+    }
+
+    struct Rig {
+        name: String,
+        host: Arc<Fake>,
+        pushes: Pushes,
+        inbox: Receiver<Inbox>,
+        io: Receiver<IoCmd>,
+        calls: Receiver<Call>,
+        keys: Sender<(Key, bool)>,
+    }
+
+    fn rig(tag: &str) -> Rig {
+        let name = if cfg!(windows) {
+            format!(r"\\.\pipe\OxiYapper-test-{}-ipc-{tag}", std::process::id())
+        } else {
+            std::env::temp_dir()
+                .join(format!("OxiYapper-test-{}-ipc-{tag}", std::process::id()))
+                .to_string_lossy()
+                .into_owned()
+        };
+        let Ok(Start::Serve(server)) = bind_at(&name) else {
+            panic!("bind failed");
+        };
+        let (inbox_tx, inbox) = mpsc::channel();
+        let (io_tx, io) = mpsc::channel();
+        let (calls_tx, calls) = mpsc::channel();
+        let (keys, keys_rx) = mpsc::channel();
+        let host = Arc::new(Fake {
+            foreground: AtomicBool::new(true),
+            calls: calls_tx,
+        });
+        let pushes = Pushes::default();
+        spawn(
+            server,
+            inbox_tx,
+            io_tx,
+            host.clone(),
+            pushes.clone(),
+            keys_rx,
+        )
+        .unwrap();
+        Rig {
+            name,
+            host,
+            pushes,
+            inbox,
+            io,
+            calls,
+            keys,
+        }
+    }
+
+    fn connect(rig: &Rig) -> Conn {
+        let mut conn = Conn::connect(&rig.name).unwrap();
+        conn.set_read_timeout(Some(WAIT)).unwrap();
+        conn
+    }
+
+    /// A connection that said `Hello` and got its ack.
+    fn settings(rig: &Rig) -> Conn {
+        let mut conn = connect(rig);
+        conn.send(&Request::Hello {
+            proto: PROTO,
+            version: "test".into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            conn.recv::<Push>().unwrap(),
+            Some(Push::HelloAck { proto: PROTO, .. })
+        ));
+        conn
+    }
+
+    #[test]
+    fn status_and_devices_are_answered() {
+        let rig = rig("status");
+        let mut conn = settings(&rig);
+        let report = StatusReport {
+            phase: Phase::Recording,
+            model: "tiny".into(),
+            device: "auto".into(),
+            warnings: vec!["w".into()],
+        };
+        conn.send(&Request::Status).unwrap();
+        let Ok(Inbox::Ipc(IpcAsk::Status(reply))) = rig.inbox.recv_timeout(WAIT) else {
+            panic!("no Status ask");
+        };
+        reply.send(report).unwrap();
+        assert_eq!(
+            conn.recv::<Push>().unwrap(),
+            Some(Push::Status {
+                phase: Phase::Recording,
+                model: "tiny".into(),
+                device: DeviceChoice::Auto,
+                backend: "cpu".into(),
+                warnings: vec!["w".into()],
+            })
+        );
+        conn.send(&Request::ListDevices).unwrap();
+        assert_eq!(conn.recv::<Push>().unwrap(), Some(rig.host.devices()));
+    }
+
+    #[test]
+    fn second_launch_opens_settings_and_is_closed() {
+        let rig = rig("second");
+        // `bind_at` on a served name forwards and returns once the daemon closed the connection.
+        assert!(matches!(bind_at(&rig.name), Ok(Start::Forwarded)));
+        assert_eq!(rig.calls.recv_timeout(WAIT).unwrap(), Call::Open);
+    }
+
+    #[test]
+    fn open_settings_raises_a_connected_window() {
+        let rig = rig("raise");
+        let mut window = settings(&rig);
+        forward_open_settings(&rig.name).unwrap();
+        assert_eq!(window.recv::<Push>().unwrap(), Some(Push::Raise));
+        assert!(rig.calls.try_recv().is_err(), "no second window");
+    }
+
+    #[test]
+    fn empty_and_silent_connections_are_survived() {
+        let rig = rig("empty");
+        drop(Conn::connect(&rig.name).unwrap());
+        let _idle = connect(&rig); // sends nothing
+        let mut conn = settings(&rig);
+        conn.send(&Request::PreviewOverlay {
+            position: OverlayPosition::TopLeft,
+        })
+        .unwrap();
+        assert!(matches!(
+            rig.inbox.recv_timeout(WAIT),
+            Ok(Inbox::Ipc(IpcAsk::PreviewOverlay(OverlayPosition::TopLeft)))
+        ));
+    }
+
+    #[test]
+    fn only_hello_or_open_settings_may_start_a_connection() {
+        let rig = rig("stranger");
+        let mut conn = connect(&rig);
+        conn.send(&Request::Shutdown).unwrap();
+        assert!(conn.recv::<Push>().unwrap().is_none());
+        assert!(matches!(rig.inbox.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn oversized_line_closes_only_that_connection() {
+        let rig = rig("oversize");
+        let mut good = settings(&rig);
+        let mut bad = connect(&rig);
+        let mut line = "x".repeat(MAX_LINE + 2);
+        line.push('\n');
+        bad.send(&Raw(line)).unwrap();
+        assert!(bad.recv::<Push>().map_or(true, |m| m.is_none()));
+        good.send(&Request::ListDevices).unwrap();
+        assert!(matches!(
+            good.recv::<Push>().unwrap(),
+            Some(Push::Devices { .. })
+        ));
+    }
+
+    #[test]
+    fn requests_reach_their_owners() {
+        let rig = rig("route");
+        let mut conn = settings(&rig);
+        conn.send(&Request::DownloadModel { id: "tiny".into() })
+            .unwrap();
+        conn.send(&Request::CancelDownload { id: "tiny".into() })
+            .unwrap();
+        assert_eq!(
+            rig.io.recv_timeout(WAIT).unwrap(),
+            IoCmd::Download { id: "tiny".into() }
+        );
+        assert_eq!(
+            rig.io.recv_timeout(WAIT).unwrap(),
+            IoCmd::CancelDownload { id: "tiny".into() }
+        );
+        conn.send(&Request::Shutdown).unwrap();
+        assert!(matches!(rig.inbox.recv_timeout(WAIT), Ok(Inbox::Shutdown)));
+        assert!(conn.recv::<Push>().unwrap().is_none());
+    }
+
+    #[test]
+    fn dropping_the_connection_ends_capture() {
+        let rig = rig("drop");
+        let mut conn = settings(&rig);
+        conn.send(&Request::CaptureHotkey { on: true }).unwrap();
+        assert_eq!(
+            rig.calls.recv_timeout(WAIT).unwrap(),
+            Call::Capture(true, true)
+        );
+        drop(conn);
+        assert_eq!(
+            rig.calls.recv_timeout(WAIT).unwrap(),
+            Call::Capture(false, false)
+        );
+    }
+
+    #[test]
+    fn losing_focus_ends_capture_and_blocks_a_start() {
+        let rig = rig("focus");
+        let mut conn = settings(&rig);
+        conn.send(&Request::CaptureHotkey { on: true }).unwrap();
+        assert_eq!(
+            rig.calls.recv_timeout(WAIT).unwrap(),
+            Call::Capture(true, true)
+        );
+        rig.host.foreground.store(false, Ordering::Relaxed);
+        assert_eq!(
+            rig.calls.recv_timeout(WAIT).unwrap(),
+            Call::Capture(false, false)
+        );
+        conn.send(&Request::CaptureHotkey { on: true }).unwrap();
+        conn.send(&Request::ListDevices).unwrap();
+        assert!(matches!(
+            conn.recv::<Push>().unwrap(),
+            Some(Push::Devices { .. })
+        ));
+        assert!(
+            rig.calls.try_recv().is_err(),
+            "capture must not start unfocused"
+        );
+    }
+
+    #[test]
+    fn captured_keys_are_pushed() {
+        let rig = rig("keys");
+        let mut conn = settings(&rig);
+        rig.keys.send((Key::F13, true)).unwrap();
+        rig.keys.send((Key::F13, false)).unwrap();
+        for down in [true, false] {
+            assert_eq!(
+                conn.recv::<Push>().unwrap(),
+                Some(Push::Key {
+                    code: Key::F13,
+                    down
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn connections_are_capped() {
+        let rig = rig("cap");
+        let idle: Vec<Conn> = (0..MAX_CONNS).map(|_| connect(&rig)).collect();
+        let mut extra = connect(&rig);
+        // A refused connection is closed without reading it.
+        let hello = Request::Hello {
+            proto: PROTO,
+            version: "test".into(),
+        };
+        let _ = extra.send(&hello);
+        assert!(extra.recv::<Push>().map_or(true, |m| m.is_none()));
+        drop(idle);
+        // Slots free up as the threads see the closes.
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let mut conn = connect(&rig);
+            conn.send(&hello).unwrap();
+            if matches!(conn.recv::<Push>(), Ok(Some(Push::HelloAck { .. }))) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "no slot freed");
+        }
+    }
+
+    #[test]
+    fn a_window_that_stops_reading_never_blocks_the_sender() {
+        let rig = rig("stall");
+        let _stuck = settings(&rig); // never reads again
+        let big = Push::Status {
+            phase: Phase::Idle,
+            model: "tiny".into(),
+            device: DeviceChoice::Auto,
+            backend: "cpu".into(),
+            warnings: vec!["w".repeat(64 * 1024)],
+        };
+        let start = Instant::now();
+        let mut refused = false;
+        for _ in 0..4000 {
+            refused |= !rig.pushes.send(big.clone());
+        }
+        assert!(start.elapsed() < Duration::from_secs(1), "send blocked");
+        assert!(refused, "the queue never filled");
+    }
+
+    #[test]
+    fn newer_window_replaces_the_old_one() {
+        let rig = rig("replace");
+        let mut old = settings(&rig);
+        let mut new = settings(&rig);
+        assert!(old.recv::<Push>().map_or(true, |m| m.is_none()));
+        assert!(rig.pushes.send(Push::Raise));
+        assert_eq!(new.recv::<Push>().unwrap(), Some(Push::Raise));
+    }
+
+    #[test]
+    fn refusals_say_why() {
+        let cases = [
+            (Error::Busy, "not answering"),
+            (Error::ForeignServer, "another account"),
+            (Error::Untrusted, "untrusted"),
+            (Error::AlreadyRunning, "already running"),
+            (
+                Error::Io(io::ErrorKind::TimedOut.into()),
+                "did not answer in time",
+            ),
+        ];
+        for (error, text) in cases {
+            let msg = refusal(error).to_string();
+            assert!(msg.contains(text), "{msg:?} lacks {text:?}");
+        }
+    }
+}
