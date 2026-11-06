@@ -36,13 +36,9 @@ fn word_before(chars: &[char], i: usize) -> bool {
     }
 }
 
-/// The char at `i` continues a word: a word char, or an apostrophe before a word char.
+/// The char at `i` continues a word. An apostrophe does not: the stem of `GitHub's` matches.
 fn word_after(chars: &[char], i: usize) -> bool {
-    match chars.get(i) {
-        Some(&c) if is_word(c) => true,
-        Some(&c) if is_apostrophe(c) => chars.get(i + 1).is_some_and(|&n| is_word(n)),
-        _ => false,
-    }
+    chars.get(i).is_some_and(|&c| is_word(c))
 }
 
 impl ReplaceRules {
@@ -89,12 +85,15 @@ impl ReplaceRules {
             if let Some((heard, wanted)) = hit {
                 out.push_str(wanted);
                 i += heard.len();
-                // A deleted word must not leave two spaces behind.
-                if wanted.is_empty()
-                    && out.ends_with(char::is_whitespace)
-                    && chars.get(i).is_some_and(|c| c.is_whitespace())
-                {
-                    i += 1;
+                // A deleted word must not leave two spaces or a space before punctuation.
+                if wanted.is_empty() && out.ends_with(char::is_whitespace) {
+                    match chars.get(i) {
+                        Some(c) if c.is_whitespace() => i += 1,
+                        Some(c) if ".,!?;:\u{2026}".contains(*c) => {
+                            out.truncate(out.trim_end().len());
+                        }
+                        _ => {}
+                    }
                 }
             } else {
                 out.push(chars[i]);

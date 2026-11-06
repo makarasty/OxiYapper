@@ -69,7 +69,7 @@ fn user_lines_extend_the_default_list() {
 
 #[test]
 fn replace_rules_table() {
-    let rules = "git hub => GitHub\npull => fetch\npull request => PR\nджава скрипт => JavaScript\nc++ => C++\num =>\nm => meters\nll => will\n";
+    let rules = "git hub => GitHub\ngithub => GitHub\npull => fetch\npull request => PR\nджава скрипт => JavaScript\nc++ => C++\num =>\nm => meters\nll => will\n";
     let cases = [
         ("Open Git Hub now", "Open GitHub now"),
         // Longest match first.
@@ -86,10 +86,17 @@ fn replace_rules_table() {
         ("c++x", "C++x"),
         // Empty wanted deletes.
         ("well um fine", "well fine"),
+        // No space is left before punctuation.
+        ("well um, fine", "well, fine"),
+        ("so um\u{2026} ok", "so\u{2026} ok"),
         // Apostrophes inside a word do not make a boundary.
         ("I'm here", "I'm here"),
         ("I'll go", "I'll go"),
         ("I\u{2019}m here", "I\u{2019}m here"),
+        // The whole word before an apostrophe suffix still matches.
+        ("github's repo", "GitHub's repo"),
+        ("git hub's API", "GitHub's API"),
+        ("git hub\u{2019}s API", "GitHub\u{2019}s API"),
         // A quote around a word does.
         ("'pull' it", "'fetch' it"),
     ];
@@ -100,6 +107,13 @@ fn replace_rules_table() {
             "{input}"
         );
     }
+}
+
+#[test]
+fn deleted_word_leaves_no_space_before_punctuation() {
+    let rules = ReplaceRules::parse("well =>\n").rules;
+    assert_eq!(rules.apply("fine well."), "fine.");
+    assert_eq!(rules.apply("fine well, ok"), "fine, ok");
 }
 
 #[test]
