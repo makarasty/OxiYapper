@@ -7,13 +7,14 @@ mod device;
 
 use std::path::Path;
 
+use oxi_core::device::{DeviceChoice, pick};
 use oxi_core::types::{Language, Millis};
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperError,
     WhisperState,
 };
 
-pub use device::{Device, DeviceChoice, Picked, list_devices, pick};
+pub use device::list_devices;
 
 /// whisper.cpp build and CPU/GPU capability line, for `--version` style output.
 pub fn system_info() -> &'static str {
@@ -149,11 +150,7 @@ impl Engine {
         prompt: &str,
     ) -> Result<Transcript, Error> {
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_language(Some(match language {
-            Language::Ru => "ru",
-            Language::En => "en",
-            Language::Auto => "auto",
-        }));
+        params.set_language(Some(language.as_str()));
         // set_initial_prompt panics on NUL.
         let prompt = prompt.replace('\0', "");
         if !prompt.is_empty() {

@@ -75,10 +75,11 @@ Cargo workspace. The root package is the app binary, so `cargo build --release -
 Cargo.toml              workspace + app package (bin OxiYapper)
 src/main.rs             CLI dispatch; src/daemon/ wires threads and runs effects
 crates/oxi-core         pure logic: machine, config, text, dictionary, history policy,
-                        ipc messages, model registry, audio DSP (pure Rust only)
+                        ipc messages, model registry, GPU device choice, audio DSP
+                        (pure Rust only)
 crates/oxi-platform     OS code behind traits: hotkey, paste, clipboard, overlay, tray,
                         autostart, capture, power/session events, notifications, paths
-crates/oxi-whisper      whisper-rs wrapper: load/unload, device choice, transcribe;
+crates/oxi-whisper      whisper-rs wrapper: load/unload, ggml device list, transcribe;
                         owns the vulkan/cuda/metal features
 crates/oxi-settings     Slint UI (settings window and first-run wizard)
 ```

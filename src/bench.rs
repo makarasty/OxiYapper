@@ -12,13 +12,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use oxi_core::audio;
 use oxi_core::config::Audio;
+use oxi_core::device::DeviceChoice;
 use oxi_core::dictionary::build_prompt;
 use oxi_core::models::MODELS;
 use oxi_core::text::{self, HallucinationFilter, Outcome, ReplaceRules, decode_text_file};
 use oxi_core::types::Language;
 use oxi_platform::capture::{Capture, CaptureEvent, CpalCapture, LevelMeter};
 use oxi_platform::wav::{read_wav_mono_f32, write_wav};
-use oxi_whisper::{DeviceChoice, Engine};
+use oxi_whisper::Engine;
 
 use crate::net::sha256_file;
 
@@ -60,21 +61,8 @@ fn parse_args(args: &[String]) -> Result<Args> {
                 match arg.as_str() {
                     "--model" => model = Some(PathBuf::from(value)),
                     "--prompt-file" => prompt_file = Some(PathBuf::from(value)),
-                    "--gpu" => {
-                        gpu = match value.as_str() {
-                            "auto" => DeviceChoice::Auto,
-                            "cpu" => DeviceChoice::Cpu,
-                            name => DeviceChoice::Named(name.to_owned()),
-                        };
-                    }
-                    _ => {
-                        lang = match value.as_str() {
-                            "ru" => Language::Ru,
-                            "en" => Language::En,
-                            "auto" => Language::Auto,
-                            other => bail!("--lang: expected ru, en or auto, got {other:?}"),
-                        };
-                    }
+                    "--gpu" => gpu = DeviceChoice::from(value.clone()),
+                    _ => lang = value.parse().context("--lang")?,
                 }
             }
             flag if flag.starts_with("--") => bail!("unknown option {flag}\n{USAGE}"),

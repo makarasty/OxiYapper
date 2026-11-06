@@ -1,6 +1,7 @@
 //! Config schema v1 (ARCHITECTURE section 6). Every field has a default, so a partial
 //! or empty file loads. Unknown keys are not rejected here; `ConfigFile` keeps them.
 
+use crate::device::DeviceChoice;
 use crate::machine::Mode;
 use crate::types::Language;
 use serde::{Deserialize, Serialize};
@@ -70,8 +71,7 @@ pub struct Model {
     /// Registry id, or "custom".
     pub id: String,
     pub custom_path: String,
-    /// "auto", "cpu" or a device name.
-    pub gpu: String,
+    pub gpu: DeviceChoice,
     pub language: Language,
     /// 0 means never unload.
     pub idle_unload_minutes: u32,
@@ -82,7 +82,7 @@ impl Default for Model {
         Self {
             id: "turbo".into(),
             custom_path: String::new(),
-            gpu: "auto".into(),
+            gpu: DeviceChoice::Auto,
             language: Language::Ru,
             idle_unload_minutes: 5,
         }

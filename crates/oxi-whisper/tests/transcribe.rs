@@ -3,8 +3,9 @@
 
 use std::path::{Path, PathBuf};
 
+use oxi_core::device::{DeviceChoice, pick};
 use oxi_core::types::Language;
-use oxi_whisper::{DeviceChoice, Engine, list_devices, pick};
+use oxi_whisper::{Engine, list_devices};
 
 const JFK: &str = "And so my fellow Americans, ask not what your country can do for you, \
                    ask what you can do for your country.";

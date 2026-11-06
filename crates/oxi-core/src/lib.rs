@@ -8,6 +8,7 @@ pub const APP_NAME: &str = "OxiYapper";
 pub mod audio;
 pub mod cli;
 pub mod config;
+pub mod device;
 pub mod dictionary;
 pub mod ipc;
 pub mod machine;

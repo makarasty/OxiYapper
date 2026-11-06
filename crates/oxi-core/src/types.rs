@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::ops::{Add, Sub};
+use std::str::FromStr;
 
 /// A duration or timestamp in milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -29,13 +30,53 @@ impl Sub for Millis {
     }
 }
 
-/// Dictation language.
+/// Dictation language. [`Language::as_str`] is its one spelling: config, CLI and whisper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(into = "&'static str", try_from = "String")]
 pub enum Language {
     Ru,
     En,
     Auto,
+}
+
+impl Language {
+    const ALL: [Self; 3] = [Self::Ru, Self::En, Self::Auto];
+
+    /// The config and CLI value, also whisper.cpp's language code.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ru => "ru",
+            Self::En => "en",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("expected ru, en or auto, got {0:?}")]
+pub struct UnknownLanguage(pub String);
+
+impl FromStr for Language {
+    type Err = UnknownLanguage;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|l| l.as_str() == s)
+            .ok_or_else(|| UnknownLanguage(s.to_owned()))
+    }
+}
+
+impl TryFrom<String> for Language {
+    type Error = UnknownLanguage;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<Language> for &'static str {
+    fn from(l: Language) -> Self {
+        l.as_str()
+    }
 }
 
 #[cfg(test)]
@@ -69,5 +110,15 @@ mod tests {
             assert_eq!(serde_json::from_str::<Language>(&json).unwrap(), lang);
         }
         assert!(serde_json::from_str::<Language>("\"Ru\"").is_err());
+    }
+
+    #[test]
+    fn language_parses_its_own_spelling_only() {
+        for lang in Language::ALL {
+            assert_eq!(lang.as_str().parse(), Ok(lang));
+        }
+        for bad in ["", "de", "RU", " ru"] {
+            assert_eq!(bad.parse::<Language>(), Err(UnknownLanguage(bad.into())));
+        }
     }
 }
