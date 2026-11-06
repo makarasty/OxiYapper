@@ -10,5 +10,5 @@ models/*.bin
 *.pem
 *.key
 dictations/
-data/
+/data/
 .claude/settings.local.json
