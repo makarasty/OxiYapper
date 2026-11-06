@@ -10,17 +10,19 @@ pub enum Command {
     Bench(Vec<String>),
 }
 
+/// An argument the executable does not know; the message ends with the usage line.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("unknown argument: {0}\nusage: {app} [settings|--version]", app = crate::APP_NAME)]
+pub struct UsageError(pub String);
+
 /// Parses the command-line arguments after the program name.
-pub fn parse_command(args: &[String]) -> Result<Command, String> {
+pub fn parse_command(args: &[String]) -> Result<Command, UsageError> {
     match args.first().map(String::as_str) {
         None => Ok(Command::Daemon),
         Some("settings") => Ok(Command::Settings),
         Some("--version") => Ok(Command::Version),
         Some("bench") => Ok(Command::Bench(args[1..].to_vec())),
-        Some(other) => Err(format!(
-            "unknown argument: {other}\nusage: {} [settings|--version]",
-            crate::APP_NAME
-        )),
+        Some(other) => Err(UsageError(other.to_owned())),
     }
 }
 
@@ -40,6 +42,7 @@ mod tests {
         assert!(
             parse_command(&args(&["-v"]))
                 .unwrap_err()
+                .to_string()
                 .contains("usage:")
         );
     }
@@ -58,6 +61,7 @@ mod tests {
         assert!(
             !parse_command(&args(&["nope"]))
                 .unwrap_err()
+                .to_string()
                 .contains("bench")
         );
     }

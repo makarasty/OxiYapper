@@ -3,13 +3,6 @@
 //! Model download: `<file>.part` with `Range` resume, SHA256 while streaming, rename on
 //! match, `.part` removed on mismatch. Every URL, redirects included, passes the host
 //! allowlist before a request is made.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into the daemon in M3; only tests call it for now"
-    )
-)]
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -140,6 +133,13 @@ fn content_range_start(header: Option<&str>) -> Option<u64> {
 
 /// A verified model in place.
 #[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "wired into the daemon in M3; only tests read it for now"
+    )
+)]
 pub struct Downloaded {
     pub path: PathBuf,
     /// Why `<file>.ok` could not be written (any stale one was removed if possible). The
@@ -149,6 +149,13 @@ pub struct Downloaded {
 
 /// Download `entry` into `dest_dir` and return the verified file. `progress` gets
 /// `(done, total)` bytes; `cancel` stops the transfer and keeps `.part` for a later resume.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "wired into the daemon in M3; only tests call it for now"
+    )
+)]
 pub fn download(
     entry: &ModelEntry,
     dest_dir: &Path,
