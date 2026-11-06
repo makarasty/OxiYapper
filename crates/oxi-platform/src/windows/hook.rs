@@ -272,17 +272,17 @@ fn on_key(event: &KBDLLHOOKSTRUCT, wparam: WPARAM) -> bool {
         if let Some(captured) = verdict.captured {
             let _ = s.on_captured.send(captured);
         }
-        Some(verdict)
+        Some((verdict.suppress_start, verdict.swallow))
     });
-    let Some(verdict) = verdict else {
+    let Some((suppress_start, swallow)) = verdict else {
         return false;
     };
-    if verdict.suppress_start
+    if suppress_start
         && let Err(e) = keys::send_start_blocker()
     {
         tracing::warn!(error = %e, "Start menu blocker not sent");
     }
-    verdict.swallow
+    swallow
 }
 
 #[cfg(test)]
