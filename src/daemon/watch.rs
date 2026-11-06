@@ -31,10 +31,12 @@ use super::cmd::Inbox;
 /// the file at its flush) is retried: `READ_RETRIES` more tries, `READ_RETRY_DELAY` apart.
 const READ_RETRIES: u32 = 3;
 const READ_RETRY_DELAY: Duration = Duration::from_millis(100);
-/// Watching again after an error or the directory's removal: tries, first wait (doubling), cap.
+/// Watching again after an error or the directory's removal: the first `REWATCH_TRIES` waits
+/// start at `REWATCH_FIRST` and double up to `REWATCH_CAP`; after that, one try per `REWATCH_SLOW`.
 const REWATCH_TRIES: u32 = 8;
 const REWATCH_FIRST: Duration = Duration::from_millis(100);
 const REWATCH_CAP: Duration = Duration::from_secs(2);
+const REWATCH_SLOW: Duration = Duration::from_secs(30);
 
 const DEBOUNCE: Duration = Duration::from_millis(200);
 /// How often the thread checks that the watched directory is still the one it watches: Windows
@@ -140,7 +142,13 @@ fn run(
     loop {
         let (changed, lost) = match rx.recv_timeout(dir_check) {
             Ok(Msg::Events(Ok(events))) => {
-                (Changed::from_events(&events), dir_removed(&events, dir))
+                let lost = dir_removed(&events, dir);
+                let changed = if lost {
+                    Changed::ALL
+                } else {
+                    Changed::from_events(&events)
+                };
+                (changed, lost)
             }
             Ok(Msg::Events(Err(errors))) => {
                 for e in &errors {
@@ -171,19 +179,26 @@ fn run(
     }
 }
 
-/// Watch `dir` again with a bounded backoff. False when the owner stopped us meanwhile; after
-/// the last failed try it logs and returns true (the thread stays up, but blind).
+/// The wait before re-watch try number `attempt` (0-based).
+fn rewatch_delay(attempt: u32) -> Duration {
+    if attempt >= REWATCH_TRIES {
+        return REWATCH_SLOW;
+    }
+    REWATCH_FIRST.saturating_mul(1 << attempt).min(REWATCH_CAP)
+}
+
+/// Watch `dir` again, backing off, until it works. False when the owner stopped us meanwhile.
 fn rewatch(
     rx: &Receiver<Msg>,
     debouncer: &mut Debouncer<RecommendedWatcher, RecommendedCache>,
     dir: &Path,
 ) -> bool {
     let _ = debouncer.unwatch(dir);
-    let mut delay = REWATCH_FIRST;
-    for _ in 0..REWATCH_TRIES {
+    let mut attempt = 0u32;
+    loop {
         // The wait is also where a Stop gets through; events queued meanwhile are covered by
         // the full reload that follows.
-        match rx.recv_timeout(delay) {
+        match rx.recv_timeout(rewatch_delay(attempt)) {
             Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => return false,
             Ok(Msg::Events(_)) | Err(RecvTimeoutError::Timeout) => {}
         }
@@ -191,10 +206,11 @@ fn rewatch(
             Ok(()) => return true,
             Err(e) => tracing::warn!("config watch not re-armed: {:?}", e.kind),
         }
-        delay = (delay * 2).min(REWATCH_CAP);
+        if attempt + 1 == REWATCH_TRIES {
+            tracing::error!("config directory not watched; retrying every 30 s");
+        }
+        attempt = attempt.saturating_add(1);
     }
-    tracing::error!("config directory not watched any more; edits need a restart");
-    true
 }
 
 /// The watched directory itself was removed (inotify reports it as an event).
@@ -337,6 +353,17 @@ mod tests {
         fs::write(&path, "# mine\n").unwrap();
         ensure_config(&l).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "# mine\n");
+    }
+
+    #[test]
+    fn rewatch_backs_off_then_goes_slow() {
+        let ms = |a| rewatch_delay(a).as_millis();
+        assert_eq!(
+            [ms(0), ms(1), ms(4), ms(5), ms(7)],
+            [100, 200, 1600, 2000, 2000]
+        );
+        assert_eq!(rewatch_delay(REWATCH_TRIES), REWATCH_SLOW);
+        assert_eq!(rewatch_delay(u32::MAX), REWATCH_SLOW);
     }
 
     #[test]
@@ -509,7 +536,7 @@ device = \"Mic L\"
             .open(l.config_file())
             .unwrap();
         let release = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(120));
+            thread::sleep(Duration::from_millis(50));
             drop(held);
         });
         let (tx, rx) = mpsc::channel();
