@@ -167,7 +167,7 @@ jobs:
       - run: cargo build --locked --release --features ${{ matrix.feature }}
       - name: Run binary
         shell: bash
-        run: "\"$CARGO_TARGET_DIR/release/oxi-yapper\" --version"
+        run: "\"$CARGO_TARGET_DIR/release/OxiYapper\" --version"
 
   # Informational until ROADMAP M12 (macOS): on 2026-11-06 two runs in a row never got a
   # macos-latest runner for this job ("not acquired"), which would make ci-ok fail at random.
@@ -182,7 +182,7 @@ jobs:
         with:
           key: metal
       - run: cargo build --locked --release --features metal
-      - run: target/release/oxi-yapper --version
+      - run: target/release/OxiYapper --version
 
   # Informational until the Vulkan-vs-CUDA measurement (ROADMAP M5) keeps or drops CUDA.
   # Kept out of ci-ok: a job-level continue-on-error inside the build matrix hid a cancelled macOS leg.
@@ -208,7 +208,7 @@ jobs:
       # CUDA 13 keeps its runtime DLLs in bin/x64, which is not on PATH (exit 127 without it).
       - name: Run binary
         shell: bash
-        run: PATH="$(cygpath -u "$CUDA_PATH")/bin/x64:$PATH" "$CARGO_TARGET_DIR/release/oxi-yapper" --version
+        run: PATH="$(cygpath -u "$CUDA_PATH")/bin/x64:$PATH" "$CARGO_TARGET_DIR/release/OxiYapper" --version
 
   ci-ok:
     if: always()

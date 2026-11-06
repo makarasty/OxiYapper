@@ -1,10 +1,10 @@
-# oxi-yapper
+# OxiYapper
 
 Push-to-talk dictation for Windows, macOS and Linux. Hold a hotkey, speak, release: the audio is transcribed locally on your GPU with [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (through `whisper-rs`) and pasted into the focused field. Nothing leaves your machine.
 
 Status: **pre-alpha skeleton**. The binary only prints its version and the whisper.cpp system info.
 
-Design: one executable. `oxi-yapper` runs the small resident daemon (tray, hotkey, audio, transcription, paste). `oxi-yapper settings` opens a separate settings window ([Slint](https://slint.dev), software renderer) that exits when closed.
+Design: one executable. `OxiYapper` runs the small resident daemon (tray, hotkey, audio, transcription, paste). `OxiYapper settings` opens a separate settings window ([Slint](https://slint.dev), software renderer) that exits when closed.
 
 ## Build
 

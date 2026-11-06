@@ -30,7 +30,9 @@ cargo fmt --all --check
 typos && cargo machete && cargo deny check # if installed; CI runs them
 ```
 
-Whisper regression (from ROADMAP M3): set `OXI_TINY_MODEL` to a downloaded `ggml-tiny.bin`, otherwise the test skips. Owner acceptance runs `oxi-yapper bench <private dir>` locally; that data never enters the repo.
+Whisper regression (from ROADMAP M3): set `OXI_TINY_MODEL` to a downloaded `ggml-tiny.bin`, otherwise the test skips. Owner acceptance runs `OxiYapper bench <private dir>` locally; that data never enters the repo.
+
+The product and the executable are `OxiYapper`; the crates (`oxi-core`, `oxi-whisper`, `oxi-platform`, the `oxi-yapper` package) stay lowercase because crates.io requires it.
 
 ## Commits and PRs
 

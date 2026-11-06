@@ -1,4 +1,4 @@
-# oxi-yapper roadmap
+# OxiYapper roadmap
 
 Each milestone fits one agent session and ends with checks anyone can run. Windows first: it is the owner's daily driver and v0.x must replace the owner's current dictation tool there. Then macOS, then Linux.
 
@@ -26,7 +26,7 @@ Done when: proptest and insta suites from ARCHITECTURE section 13 pass; the toke
 
 ## M3 - Whisper worker and models
 
-Parallel with M1 and M2. `oxi-whisper`: load/unload, device list and choice by name, CPU fallback, transcribe with language and prompt, segment `no_speech` probabilities exposed. `oxi-core::models` registry with commit-pinned URLs and SHA256. Download with Range resume and hash check. Hidden `oxi-yapper bench <dir>` subcommand (wav in, text and timings out). CI: cache ggml-tiny.bin with a pinned SHA256 and run the jfk.wav WER test.
+Parallel with M1 and M2. `oxi-whisper`: load/unload, device list and choice by name, CPU fallback, transcribe with language and prompt, segment `no_speech` probabilities exposed. `oxi-core::models` registry with commit-pinned URLs and SHA256. Download with Range resume and hash check. Hidden `OxiYapper bench <dir>` subcommand (wav in, text and timings out). CI: cache ggml-tiny.bin with a pinned SHA256 and run the jfk.wav WER test.
 
 Done when: `bench` on jfk.wav prints the right sentence on CPU and on the RTX 4070 SUPER via Vulkan; the CI test job runs the WER test (WER under 0.2) instead of skipping; a corrupted model file is refused with a hash error.
 
@@ -34,7 +34,7 @@ Done when: `bench` on jfk.wav prints the right sentence on CPU and on the RTX 40
 
 Parallel with M3. `oxi-platform` crate appears with `Capture` (cpal, rtrb ring, level atomic, device list, device-lost event). `oxi-core::audio`: mono, gain, 48 kHz RNNoise path, streaming 16 kHz resample, trim with speech gate, normalise. Crash-safe wav writer (`.part` + rename).
 
-Done when: DSP unit tests on synthetic signals pass; `oxi-yapper bench --record 5 out.wav` (debug flag) records from the default mic on Windows and the wav plays back at 16 kHz mono; unplugging a USB mic mid-recording keeps the captured part.
+Done when: DSP unit tests on synthetic signals pass; `OxiYapper bench --record 5 out.wav` (debug flag) records from the default mic on Windows and the wav plays back at 16 kHz mono; unplugging a USB mic mid-recording keeps the captured part.
 
 ## M5 - Measurement: Vulkan vs CUDA, audio defaults, reference phrases
 
@@ -79,7 +79,7 @@ Done when: retention test deletes oldest first and nothing else; autostart survi
 
 Needs M5-M10. cargo-packager per-user NSIS installer (no admin) and portable zip with the `portable` marker, in `release.yml`. Full Windows QA checklist. Owner migration (SPEC round 4): copy the owner's dictionary into the local config, reuse the podlodka model already on disk after a SHA256 check, import the previous tool's history (its SQLite db + audio) through an import command; none of it enters the repo.
 
-Done when: a tagged pre-release installs without admin on a clean Windows user, the full Windows QA checklist passes, and the owner uses oxi-yapper as the only dictation tool for 3 days with no blocking bug.
+Done when: a tagged pre-release installs without admin on a clean Windows user, the full Windows QA checklist passes, and the owner uses OxiYapper as the only dictation tool for 3 days with no blocking bug.
 
 ## M12 - macOS
 

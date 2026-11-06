@@ -19,9 +19,9 @@ fn layout_per_os() {
         (
             Os::Windows,
             Layout {
-                config_dir: p("cfg/oxi-yapper/config"),
-                data_dir: p("dat/oxi-yapper/data"),
-                logs_dir: p("dat/oxi-yapper/data/logs"),
+                config_dir: p("cfg/OxiYapper/config"),
+                data_dir: p("dat/OxiYapper/data"),
+                logs_dir: p("dat/OxiYapper/data/logs"),
             },
         ),
         (
@@ -29,15 +29,15 @@ fn layout_per_os() {
             Layout {
                 config_dir: p("cfg/com.example.app"),
                 data_dir: p("dat/com.example.app"),
-                logs_dir: p("log/oxi-yapper"),
+                logs_dir: p("log/OxiYapper"),
             },
         ),
         (
             Os::Linux,
             Layout {
-                config_dir: p("cfg/oxi-yapper"),
-                data_dir: p("dat/oxi-yapper"),
-                logs_dir: p("log/oxi-yapper/logs"),
+                config_dir: p("cfg/OxiYapper"),
+                data_dir: p("dat/OxiYapper"),
+                logs_dir: p("log/OxiYapper/logs"),
             },
         ),
     ];
@@ -57,15 +57,15 @@ fn portable_puts_everything_under_exe_data() {
 #[test]
 fn file_locations_follow_the_table() {
     let l = layout(Os::Windows, &base(), "unused");
-    assert_eq!(l.config_file(), p("cfg/oxi-yapper/config/config.toml"));
+    assert_eq!(l.config_file(), p("cfg/OxiYapper/config/config.toml"));
     assert_eq!(
         l.dictionary_file(),
-        p("cfg/oxi-yapper/config/dictionary.txt")
+        p("cfg/OxiYapper/config/dictionary.txt")
     );
-    assert_eq!(l.replace_file(), p("cfg/oxi-yapper/config/replace.txt"));
-    assert_eq!(l.state_file(), p("dat/oxi-yapper/data/state.toml"));
-    assert_eq!(l.models_dir(), p("dat/oxi-yapper/data/models"));
-    assert_eq!(l.history_dir(), p("dat/oxi-yapper/data/history"));
+    assert_eq!(l.replace_file(), p("cfg/OxiYapper/config/replace.txt"));
+    assert_eq!(l.state_file(), p("dat/OxiYapper/data/state.toml"));
+    assert_eq!(l.models_dir(), p("dat/OxiYapper/data/models"));
+    assert_eq!(l.history_dir(), p("dat/OxiYapper/data/history"));
 }
 
 #[test]

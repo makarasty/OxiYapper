@@ -1,4 +1,4 @@
-//! Command-line parsing for the `oxi-yapper` executable.
+//! Command-line parsing for the `OxiYapper` executable.
 
 /// What the executable was asked to do.
 #[derive(Debug, PartialEq, Eq)]
@@ -18,7 +18,8 @@ pub fn parse_command(args: &[String]) -> Result<Command, String> {
         Some("--version") => Ok(Command::Version),
         Some("bench") => Ok(Command::Bench(args[1..].to_vec())),
         Some(other) => Err(format!(
-            "unknown argument: {other}\nusage: oxi-yapper [settings|--version]"
+            "unknown argument: {other}\nusage: {} [settings|--version]",
+            crate::APP_NAME
         )),
     }
 }

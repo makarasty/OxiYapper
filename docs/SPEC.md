@@ -1,4 +1,4 @@
-# oxi-yapper spec
+# OxiYapper spec
 
 Hold a hotkey, speak, release: the text appears in the focused field. Local whisper.cpp on GPU, no cloud, no AI post-processing. Windows, macOS, Linux.
 
@@ -7,7 +7,7 @@ Status: decisions from the owner interview (2026-11-06). Open items are marked O
 ## Processes
 
 - **Daemon** (default mode, autostart): tray, global hotkey hook, mic capture, whisper, paste, overlay. No GUI toolkit beyond what the overlay needs.
-- **Settings** (`oxi-yapper settings`): separate process, Slint with the software renderer, spawned from the tray, exits on close. Costs zero RAM when closed.
+- **Settings** (`OxiYapper settings`): separate process, Slint with the software renderer, spawned from the tray, exits on close. Costs zero RAM when closed.
 - One exe, one bundle id on macOS (one permission entry). Config is a TOML file; the settings process writes it (temp file + atomic rename), the daemon watches and reloads. While the settings window captures a hotkey it tells the daemon over IPC to pause the hook.
 - Single instance: a second launch asks the running daemon to open settings and exits.
 

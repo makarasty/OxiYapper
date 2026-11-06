@@ -8,6 +8,7 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 publish = false
+repository = "https://github.com/makarasty/OxiYapper"
 
 # One place for versions; a crate takes what it needs with `name.workspace = true`.
 # Entries no crate uses yet are not resolved and cost nothing. They are the picks from
@@ -62,13 +63,18 @@ dbg_macro = "warn"
 
 # The app binary. `cargo build --release --features vulkan` at the root builds it.
 [package]
-name = "oxi-yapper"
+name = "oxi-yapper" # crate names stay lowercase; the executable is OxiYapper
 description = "Push-to-talk dictation: hold a hotkey, speak, local whisper.cpp transcribes and pastes."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "OxiYapper"
+path = "src/main.rs"
 
 [features]
 default = []

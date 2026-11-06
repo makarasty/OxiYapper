@@ -1,8 +1,8 @@
-//! Hidden `oxi-yapper bench <dir> --model <path> [--gpu <name|cpu|auto>] [--lang ru|en|auto]
+//! Hidden `OxiYapper bench <dir> --model <path> [--gpu <name|cpu|auto>] [--lang ru|en|auto]
 //! [--prompt-file <f>]`: every `*.wav` in `<dir>` through the audio pipeline, whisper and the
 //! text pipeline. Prints text and timings; never touches the hotkey or the clipboard.
 //!
-//! `oxi-yapper bench --record <seconds> <out.wav>` records the default microphone instead. The
+//! `OxiYapper bench --record <seconds> <out.wav>` records the default microphone instead. The
 //! clip is raw: 16 kHz mono through the capture pipeline with trim and normalise off.
 
 use std::fs;
@@ -22,9 +22,21 @@ use oxi_whisper::{DeviceChoice, Engine};
 
 use crate::net::sha256_file;
 
-const USAGE: &str = "usage: oxi-yapper bench <dir> --model <path> [--gpu <name|cpu|auto>] \
-                     [--lang ru|en|auto] [--prompt-file <file>]\n       \
-                     oxi-yapper bench --record <seconds> <out.wav>  (raw 16 kHz mono: no trim, no normalise)";
+/// Usage text; a `Display` constant so `{USAGE}` still works while the name comes from `APP_NAME`.
+struct Usage;
+const USAGE: Usage = Usage;
+
+impl std::fmt::Display for Usage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = oxi_core::APP_NAME;
+        write!(
+            f,
+            "usage: {name} bench <dir> --model <path> [--gpu <name|cpu|auto>] \
+             [--lang ru|en|auto] [--prompt-file <file>]\n       \
+             {name} bench --record <seconds> <out.wav>  (raw 16 kHz mono: no trim, no normalise)"
+        )
+    }
+}
 
 #[derive(Debug)]
 struct Args {
@@ -337,7 +349,7 @@ mod tests {
 
     #[test]
     fn usage_has_no_space_runs_mid_line() {
-        for line in USAGE.lines() {
+        for line in USAGE.to_string().lines() {
             assert!(!line.trim_start().contains("   "), "{line:?}");
         }
     }

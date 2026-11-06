@@ -4,7 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
-pub const APP_DIR: &str = "oxi-yapper";
+use crate::APP_NAME;
+
 /// A file with this name next to the exe turns on portable mode.
 pub const PORTABLE_MARKER: &str = "portable";
 
@@ -85,9 +86,9 @@ impl Layout {
 pub fn layout(os: Os, base: &BaseDirs, bundle_id: &str) -> Layout {
     match os {
         Os::Windows => {
-            let data_dir = base.data.join(APP_DIR).join("data");
+            let data_dir = base.data.join(APP_NAME).join("data");
             Layout {
-                config_dir: base.config.join(APP_DIR).join("config"),
+                config_dir: base.config.join(APP_NAME).join("config"),
                 logs_dir: data_dir.join("logs"),
                 data_dir,
             }
@@ -95,12 +96,12 @@ pub fn layout(os: Os, base: &BaseDirs, bundle_id: &str) -> Layout {
         Os::MacOs => Layout {
             config_dir: base.config.join(bundle_id),
             data_dir: base.data.join(bundle_id),
-            logs_dir: base.logs.join(APP_DIR),
+            logs_dir: base.logs.join(APP_NAME),
         },
         Os::Linux => Layout {
-            config_dir: base.config.join(APP_DIR),
-            data_dir: base.data.join(APP_DIR),
-            logs_dir: base.logs.join(APP_DIR).join("logs"),
+            config_dir: base.config.join(APP_NAME),
+            data_dir: base.data.join(APP_NAME),
+            logs_dir: base.logs.join(APP_NAME).join("logs"),
         },
     }
 }

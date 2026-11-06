@@ -1,4 +1,4 @@
-# oxi-yapper architecture
+# OxiYapper architecture
 
 How the app is built. `docs/SPEC.md` holds the owner's decisions and wins any conflict with this file. `docs/ROADMAP.md` orders the work. Numbers marked (target) are budgets to measure, not measurements.
 
@@ -6,13 +6,13 @@ How the app is built. `docs/SPEC.md` holds the owner's decisions and wins any co
 
 One executable, three modes:
 
-- `oxi-yapper` - the **daemon**. Resident, autostarted. Owns the tray, the global hotkey, the mic, whisper, paste, the overlay, model downloads and the update check. It is the only process that touches the network.
-- `oxi-yapper settings` - the **settings** window (Slint, software renderer). Spawned by the daemon from the tray, exits on close. The only writer of `config.toml`, `dictionary.txt` and `replace.txt`.
-- `oxi-yapper bench <dir>` - hidden developer mode: runs the audio and text pipeline plus whisper on a folder of wav files and prints text and timings. Used for the reference phrases and the GPU measurement. Never touches the hotkey or the clipboard.
+- `OxiYapper` - the **daemon**. Resident, autostarted. Owns the tray, the global hotkey, the mic, whisper, paste, the overlay, model downloads and the update check. It is the only process that touches the network.
+- `OxiYapper settings` - the **settings** window (Slint, software renderer). Spawned by the daemon from the tray, exits on close. The only writer of `config.toml`, `dictionary.txt` and `replace.txt`.
+- `OxiYapper bench <dir>` - hidden developer mode: runs the audio and text pipeline plus whisper on a folder of wav files and prints text and timings. Used for the reference phrases and the GPU measurement. Never touches the hotkey or the clipboard.
 
 The overlay lives inside the daemon. It is a raw OS window (layered window on Windows, `NSPanel` on macOS, X11 override-redirect or wlr-layer-shell on Linux), not Slint, because Slint cannot do no-activate, click-through and no-taskbar.
 
-Single instance: the daemon binds a per-user local socket at start. If the bind fails, the new process connects, sends `OpenSettings` and exits 0. `oxi-yapper settings` started by hand starts the daemon first if nothing answers on the socket.
+Single instance: the daemon binds a per-user local socket at start. If the bind fails, the new process connects, sends `OpenSettings` and exits 0. `OxiYapper settings` started by hand starts the daemon first if nothing answers on the socket.
 
 ## 2. Threads
 
@@ -72,7 +72,7 @@ Clipboard restore happens 300 ms after Ctrl+V and is outside the budget. A cold 
 Cargo workspace. The root package is the app binary, so `cargo build --release --features vulkan` at the root keeps working.
 
 ```
-Cargo.toml              workspace + app package (bin oxi-yapper)
+Cargo.toml              workspace + app package (bin OxiYapper)
 src/main.rs             CLI dispatch; src/daemon/ wires threads and runs effects
 crates/oxi-core         pure logic: machine, config, text, dictionary, history policy,
                         ipc messages, model registry, audio DSP (pure Rust only)
@@ -95,7 +95,7 @@ Platform code: each concern is a trait in `oxi-platform` (`Hotkey`, `Paster`, `C
 
 ## 5. IPC, daemon <-> settings
 
-Transport: `interprocess` local socket. Windows: named pipe `\\.\pipe\oxi-yapper-<user SID>` created with a DACL for the current user only and `PIPE_REJECT_REMOTE_CLIENTS` (the default pipe DACL lets Everyone read). macOS/Linux: Unix socket `oxi-yapper.sock` in `$XDG_RUNTIME_DIR` (Linux) or the per-user `$TMPDIR` (macOS), directory mode 0700. A stale socket file (connect refused) is removed before bind.
+Transport: `interprocess` local socket. Windows: named pipe `\\.\pipe\OxiYapper-<user SID>` created with a DACL for the current user only and `PIPE_REJECT_REMOTE_CLIENTS` (the default pipe DACL lets Everyone read). macOS/Linux: Unix socket `OxiYapper.sock` in `$XDG_RUNTIME_DIR` (Linux) or the per-user `$TMPDIR` (macOS), directory mode 0700. A stale socket file (connect refused) is removed before bind.
 
 Framing: one JSON object per line (`serde_json`), max 1 MiB per line, tagged enum `{"t": "...", ...}`. Types live in `oxi-core::ipc` and are snapshot-tested so a field rename shows up in review.
 
@@ -111,7 +111,7 @@ Framing: one JSON object per line (`serde_json`), max 1 MiB per line, tagged enu
 | `Shutdown` | daemon exits |
 | | `ConfigError { file, line, message }` pushed on a bad reload |
 
-Versioning: `proto` is an integer, starting at 1. Adding an optional field (serde default) does not bump it; renaming or removing a field or changing meaning does. `Hello`, `HelloAck` and `Shutdown` never change shape. On a mismatch (exe updated while the old daemon runs) settings shows "Restart oxi-yapper to finish the update" and a button that sends `Shutdown` and relaunches the daemon.
+Versioning: `proto` is an integer, starting at 1. Adding an optional field (serde default) does not bump it; renaming or removing a field or changing meaning does. `Hello`, `HelloAck` and `Shutdown` never change shape. On a mismatch (exe updated while the old daemon runs) settings shows "Restart OxiYapper to finish the update" and a button that sends `Shutdown` and relaunches the daemon.
 
 Hotkey capture: while `CaptureHotkey { on: true }` the daemon pauses the chord, forwards raw key events and swallows them only while the settings window is foreground. Capture ends when settings sends `on: false`, loses focus, or the connection drops. This is the one place keystrokes leave the hook, which is why the socket is owner-only.
 
@@ -170,9 +170,9 @@ From `directories::ProjectDirs`. Portable mode: if a file named `portable` sits 
 
 | What | Windows | macOS | Linux |
 |---|---|---|---|
-| `config.toml`, `dictionary.txt`, `replace.txt` | `%APPDATA%\oxi-yapper\config\` | `~/Library/Application Support/<bundle id>/` | `$XDG_CONFIG_HOME/oxi-yapper/` |
-| `state.toml`, `models/`, `history/` | `%LOCALAPPDATA%\oxi-yapper\data\` | `~/Library/Application Support/<bundle id>/` | `$XDG_DATA_HOME/oxi-yapper/` |
-| `logs/` (daily files, 7 kept) | `%LOCALAPPDATA%\oxi-yapper\data\logs\` | `~/Library/Logs/oxi-yapper/` | `$XDG_STATE_HOME/oxi-yapper/logs/` |
+| `config.toml`, `dictionary.txt`, `replace.txt` | `%APPDATA%\OxiYapper\config\` | `~/Library/Application Support/<bundle id>/` | `$XDG_CONFIG_HOME/OxiYapper/` |
+| `state.toml`, `models/`, `history/` | `%LOCALAPPDATA%\OxiYapper\data\` | `~/Library/Application Support/<bundle id>/` | `$XDG_DATA_HOME/OxiYapper/` |
+| `logs/` (daily files, 7 kept) | `%LOCALAPPDATA%\OxiYapper\data\logs\` | `~/Library/Logs/OxiYapper/` | `$XDG_STATE_HOME/OxiYapper/logs/` |
 
 Models are local, not roaming (gigabytes). History entries are `history/YYYY-MM-DD/HHMMSS-mmm.{wav,txt}`. On Unix the data directory is created 0700. The macOS bundle id is chosen in ROADMAP M12 and never changes after the first release: TCC permissions and paths hang on it.
 
@@ -184,7 +184,7 @@ Models are local, not roaming (gigabytes). History entries are `history/YYYY-MM-
 - **Unload** after `idle_unload_minutes` without a job (default 5), and on suspend. Drop the context; M5 measures whether Vulkan really returns the VRAM.
 - **Device choice**: `gpu = "auto"` picks the first discrete GPU in ggml's device list, then integrated, then CPU. On the owner's machine ggml's Vulkan backend lists `Vulkan0 = RTX 4070 SUPER (uma: 0)` and `Vulkan1 = AMD Radeon iGPU (uma: 1)`; UMA marks the integrated one. A named device that is gone falls back to auto with a warning. The name-to-index mapping uses ggml's backend device API through `whisper-rs-sys` (unverified that it is exported; fallback is the index in the settings list).
 - **CPU fallback**: GPU init failure or OOM retries the load once on CPU, keeps CPU until the config or the model changes, and says so in the tray ("running on CPU: <reason>").
-- **Proposal, needs owner OK after M5**: run whisper in a child process (`oxi-yapper worker`, same exe) if M5 shows ggml aborting the process on GPU OOM or device loss. A child gives crash isolation and a guaranteed memory release on unload. The whisper thread already talks only through `WhisperCmd`/`Event`, so the move is local to `oxi-whisper` and the coordinator.
+- **Proposal, needs owner OK after M5**: run whisper in a child process (`OxiYapper worker`, same exe) if M5 shows ggml aborting the process on GPU OOM or device loss. A child gives crash isolation and a guaranteed memory release on unload. The whisper thread already talks only through `WhisperCmd`/`Event`, so the move is local to `oxi-whisper` and the coordinator.
 
 ## 9. Audio pipeline
 
@@ -327,7 +327,7 @@ Settings UI (`oxi-settings`): `i-slint-backend-testing` (pinned to the slint ver
 
 Platform smoke tests (`oxi-platform`, per OS in CI where the runner allows): clipboard snapshot/restore round trip, exclusion formats present, autostart register/unregister in a temp entry, overlay window flags. Input injection and hooks cannot run on CI runners.
 
-Owner acceptance (local, never in CI): `oxi-yapper bench "$OXI_BENCH_DIR"` on the 8 reference phrases; text must equal the bench text for all 8.
+Owner acceptance (local, never in CI): `OxiYapper bench "$OXI_BENCH_DIR"` on the 8 reference phrases; text must equal the bench text for all 8.
 
 Manual QA checklist per OS, run before each release, results kept in the release PR: hotkey in a normal app, an elevated app and a fullscreen game; double tap; Esc; paste in Notepad, a browser, Windows Terminal, an RDP window, a game chat (type mode), with an IME on; clipboard restored and absent from Win+V; overlay never takes focus in the game (open chat, dictate, Enter); two monitors with different DPI; sleep and lock during recording; first-run wizard; macOS permissions; Linux X11 and one Wayland compositor.
 
