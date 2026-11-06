@@ -1,6 +1,7 @@
 //! English text of every user-facing message of the daemon, one place. Each lookup is an
 //! exhaustive match: a new variant does not compile until it has its text.
 
+use crate::APP_NAME;
 use crate::machine::{Notice, OverlayState, Phase};
 
 pub const MENU_SETTINGS: &str = "Settings";
@@ -26,29 +27,57 @@ pub const fn notice(notice: Notice) -> &'static str {
     }
 }
 
-/// The line the overlay pill shows; empty while hidden.
+/// Longest overlay label, in characters: the pill is 168 DIP wide, about 16 characters at 12 px.
+pub const OVERLAY_LABEL_MAX: usize = 16;
+
+/// Short form of a [`Notice`] for the overlay pill; [`notice`] has the full text.
+#[must_use]
+pub const fn notice_short(notice: Notice) -> &'static str {
+    match notice {
+        Notice::Cancelled => "Cancelled",
+        Notice::NothingHeard => "Nothing heard",
+        Notice::NoModel => "No model",
+        Notice::ModelBad => "Model error",
+        Notice::DeviceLost => "Mic lost",
+        Notice::CaptureFailed => "Mic error",
+        Notice::TranscriptionFailed => "Speech failed",
+        Notice::PressPaste => "Press Ctrl+V",
+        Notice::AdminWindow => "Admin window",
+        Notice::RestoreSkipped => "Not restored",
+        Notice::PasteFailed => "Paste failed",
+        Notice::MicFallback => "Mic changed",
+    }
+}
+
+/// The line the overlay pill shows (at most [`OVERLAY_LABEL_MAX`] characters); empty while
+/// hidden.
 #[must_use]
 pub const fn overlay_label(state: OverlayState) -> &'static str {
     match state {
         OverlayState::Hidden => "",
         OverlayState::Recording {
+            locked: true,
+            ending_soon: true,
+        } => "Locked, ending",
+        OverlayState::Recording { locked: true, .. } => "Locked",
+        OverlayState::Recording {
             ending_soon: true, ..
-        } => "Recording ends soon",
-        OverlayState::Recording { locked: true, .. } => "Recording (locked)",
+        } => "Ending soon",
         OverlayState::Recording { .. } => "Recording",
         OverlayState::LoadingModel => "Loading model",
         OverlayState::Transcribing => "Transcribing",
         OverlayState::Pasting => "Pasting",
-        OverlayState::Text(n) => notice(n),
+        OverlayState::Text(n) => notice_short(n),
     }
 }
 
 #[must_use]
-pub const fn tray_tooltip(phase: Phase) -> &'static str {
-    match phase {
-        Phase::Idle => "OxiYapper: ready",
-        Phase::Recording => "OxiYapper: recording",
-        Phase::Transcribing => "OxiYapper: transcribing",
-        Phase::Pasting => "OxiYapper: pasting",
-    }
+pub fn tray_tooltip(phase: Phase) -> String {
+    let state = match phase {
+        Phase::Idle => "ready",
+        Phase::Recording => "recording",
+        Phase::Transcribing => "transcribing",
+        Phase::Pasting => "pasting",
+    };
+    format!("{APP_NAME}: {state}")
 }

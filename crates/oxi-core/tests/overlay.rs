@@ -179,6 +179,16 @@ fn meter_adds_a_bar_per_period_from_the_loudest_block() {
 }
 
 #[test]
+fn meter_keeps_30_hz_when_polled_every_32_ms() {
+    let mut m = Meter::new(64, 0.0);
+    for i in 0..32 {
+        m.push(level(0.0, 1.0), Millis(i * 32));
+    }
+    let bars = m.bars().filter(|b| *b > 0.5).count();
+    assert!((29..=31).contains(&bars), "{bars} bars in 1 s");
+}
+
+#[test]
 fn meter_clipping_on_then_off_after_500_ms() {
     let mut m = Meter::new(4, 0.0);
     assert!(!m.clipping(Millis(0)));
@@ -230,12 +240,30 @@ fn every_state_has_a_look_and_every_phase_a_tooltip() {
         assert!(!l.label.is_empty(), "{s:?}");
         assert_ne!(l.accent, palette::NONE, "{s:?}");
         assert_ne!(l.icon, Icon::None, "{s:?}");
+        assert!(
+            l.label.chars().count() <= strings::OVERLAY_LABEL_MAX,
+            "{s:?}: {:?}",
+            l.label
+        );
         assert_eq!(
             l.meter,
             matches!(s, OverlayState::Recording { .. }),
             "{s:?}"
         );
     }
+    let locked_ending = look(OverlayState::Recording {
+        locked: true,
+        ending_soon: true,
+    });
+    assert_eq!(locked_ending.icon, Icon::Lock);
+    assert_eq!(locked_ending.label, "Locked, ending");
+    // Clipping must be visible against the normal meter colour.
+    let (a, b) = (palette::RECORDING, palette::CLIP);
+    let dist = [(a.0, b.0), (a.1, b.1), (a.2, b.2)]
+        .map(|(x, y)| u32::from(x.abs_diff(y)))
+        .iter()
+        .sum::<u32>();
+    assert!(dist >= 300, "meter and clip colours too close: {dist}");
     let hidden = look(OverlayState::Hidden);
     assert_eq!(
         (hidden.label, hidden.icon, hidden.meter),
@@ -247,7 +275,7 @@ fn every_state_has_a_look_and_every_phase_a_tooltip() {
         Phase::Transcribing,
         Phase::Pasting,
     ] {
-        assert_ne!(strings::tray_tooltip(p), "");
+        assert!(strings::tray_tooltip(p).starts_with(oxi_core::APP_NAME));
     }
     assert_eq!(
         [

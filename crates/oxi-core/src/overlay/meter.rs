@@ -52,7 +52,12 @@ impl Meter {
             self.bars.pop_front();
             self.bars.push_back(bar(self.pending, self.sensitivity_db));
             self.pending = 0.0;
-            self.last_bar = Some(now);
+            // Step the schedule (not `now`) so a poll slightly slower than the period keeps
+            // 30 Hz; `now - PERIOD` drops the backlog after a stall.
+            self.last_bar = Some(
+                self.last_bar
+                    .map_or(now, |t| (t + PERIOD).max(now - PERIOD)),
+            );
         }
     }
 

@@ -10,7 +10,8 @@ pub mod palette {
     use super::Rgba;
 
     pub const NONE: Rgba = Rgba(0, 0, 0, 0);
-    pub const RECORDING: Rgba = Rgba(0xE5, 0x48, 0x4D, 0xFF);
+    /// Recording and its meter: calm teal, so [`CLIP`] stands out.
+    pub const RECORDING: Rgba = Rgba(0x2B, 0xB5, 0xA0, 0xFF);
     pub const BUSY: Rgba = Rgba(0x3E, 0x8E, 0xF7, 0xFF);
     pub const OK: Rgba = Rgba(0x30, 0xA4, 0x6C, 0xFF);
     pub const INFO: Rgba = Rgba(0x8B, 0x8D, 0x98, 0xFF);
@@ -46,10 +47,16 @@ pub fn look(state: OverlayState) -> Look {
     let (accent, icon, meter) = match state {
         OverlayState::Hidden => (palette::NONE, Icon::None, false),
         OverlayState::Recording {
-            ending_soon: true, ..
-        } => (palette::WARN, Icon::Mic, true),
-        OverlayState::Recording { locked: true, .. } => (palette::RECORDING, Icon::Lock, true),
-        OverlayState::Recording { .. } => (palette::RECORDING, Icon::Mic, true),
+            locked,
+            ending_soon,
+        } => {
+            let accent = if ending_soon {
+                palette::WARN
+            } else {
+                palette::RECORDING
+            };
+            (accent, if locked { Icon::Lock } else { Icon::Mic }, true)
+        }
         OverlayState::LoadingModel | OverlayState::Transcribing => {
             (palette::BUSY, Icon::Hourglass, false)
         }
