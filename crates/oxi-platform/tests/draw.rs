@@ -1,3 +1,5 @@
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::path::PathBuf;
 
 use ab_glyph::FontRef;
@@ -6,7 +8,7 @@ use oxi_core::config::OverlayPosition;
 use oxi_core::machine::{Notice, OverlayState, Phase};
 use oxi_core::overlay::{CLIP_HOLD, Meter, Rect, Rgba, palette, place};
 use oxi_core::types::Millis;
-use oxi_platform::draw::{bgra, pill, tray_icon};
+use oxi_platform::draw::{PillCanvas, bgra, bgra_into, pill, tray_icon};
 use tiny_skia::{Pixmap, PixmapPaint, Transform};
 
 const FONT: &str = "C:/Windows/Fonts/segoeui.ttf";
@@ -203,6 +205,74 @@ fn bgra_swaps_red_and_blue() {
     let i = (8 * 16 + 8) * 4;
     let c = palette::RECORDING;
     assert_eq!(&out[i..i + 4], &[c.2, c.1, c.0, c.3]);
+}
+
+#[test]
+fn a_reused_canvas_draws_what_a_fresh_pill_does() {
+    let bytes = font_bytes();
+    let font = bytes
+        .as_deref()
+        .map(|b| FontRef::try_from_slice(b).unwrap());
+    let mut canvas = PillCanvas::new(font.clone());
+    let (meter, now) = speech(0.5);
+    for scale in [1.0, 2.0, 2.0, 1.0] {
+        for (name, s) in states() {
+            let fresh = pill(s, &meter, now, rect(scale), font.as_ref()).unwrap();
+            let reused = canvas.draw(s, &meter, now, rect(scale)).unwrap();
+            assert_eq!(reused.data(), fresh.data(), "{name} @{scale}");
+        }
+    }
+}
+
+/// Counts the allocations of the current thread only, so parallel tests do not add to it.
+struct Counting;
+
+thread_local! {
+    static ALLOCS: Cell<usize> = const { Cell::new(0) };
+}
+
+// SAFETY: every call goes to the system allocator unchanged.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
+        // SAFETY: the caller's contract, passed on.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: as above.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: Counting = Counting;
+
+/// The overlay's 30 Hz tick: new levels, a frame, its BGRA copy into the window's buffer.
+#[test]
+fn a_recording_frame_allocates_nothing_once_its_state_is_drawn() {
+    let bytes = font_bytes();
+    let font = bytes
+        .as_deref()
+        .map(|b| FontRef::try_from_slice(b).unwrap());
+    let mut canvas = PillCanvas::new(font);
+    let (mut meter, mut now) = speech(0.5);
+    let rec = OverlayState::Recording {
+        locked: false,
+        ending_soon: false,
+    };
+    let r = rect(1.5);
+    let mut dib = vec![0; canvas.draw(rec, &meter, now, r).unwrap().data().len()];
+    let before = ALLOCS.with(Cell::get);
+    for i in 0..90u16 {
+        // Every 30th block clips, so both bar colours are drawn.
+        let peak = if i % 30 == 0 { 1.0 } else { 0.4 };
+        let rms = f32::from(i % 7) * 0.05;
+        meter.push(Level { peak, rms }, now);
+        now = now + Millis(33);
+        bgra_into(canvas.draw(rec, &meter, now, r).unwrap(), &mut dib);
+    }
+    assert_eq!(ALLOCS.with(Cell::get) - before, 0);
 }
 
 /// With `OXI_SHOTS_DIR` set: every state at every scale, tray icons, and one sheet per scale

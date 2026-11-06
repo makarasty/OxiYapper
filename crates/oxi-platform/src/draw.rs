@@ -14,12 +14,12 @@ use oxi_core::overlay::{
 };
 use oxi_core::types::Millis;
 use tiny_skia::{
-    FillRule, LineCap, LineJoin, Mask, Paint, Path, PathBuilder, Pixmap, Stroke, Transform,
+    Color, FillRule, LineCap, LineJoin, Mask, Paint, Path, PathBuilder, Pixmap, Stroke, Transform,
 };
 
 /// The overlay pill for `state`, sized `rect.w` x `rect.h` (the [`place`] result).
 /// `now` decides the clipping colour of the meter. Without a font the pill shows its icon and
-/// meter only. `None` when the rectangle is empty.
+/// meter only. `None` when the rectangle is empty. The one-off form of [`PillCanvas`].
 ///
 /// [`place`]: oxi_core::overlay::place
 #[must_use]
@@ -30,20 +30,87 @@ pub fn pill(
     rect: Rect,
     font: Option<&FontRef<'_>>,
 ) -> Option<Pixmap> {
-    let mut pm = Pixmap::new(u32::try_from(rect.w).ok()?, u32::try_from(rect.h).ok()?)?;
+    let mut canvas = PillCanvas::new(font.cloned());
+    canvas.draw(state, meter, now, rect)?;
+    canvas.cache.map(|c| c.frame)
+}
+
+/// The pill redrawn in place for the 30 Hz meter. The surface, icon, label and bar shapes are
+/// drawn when the state or the size changes; another frame of the same state copies them and
+/// adds the newest bars, so it allocates nothing.
+pub struct PillCanvas<'f> {
+    font: Option<FontRef<'f>>,
+    cache: Option<Cache>,
+}
+
+struct Cache {
+    state: OverlayState,
+    /// The pill without its bars.
+    base: Pixmap,
+    frame: Pixmap,
+    bars: Option<Bars>,
+}
+
+impl<'f> PillCanvas<'f> {
+    /// Without a font the pill shows its icon and meter only.
+    #[must_use]
+    pub fn new(font: Option<FontRef<'f>>) -> Self {
+        Self { font, cache: None }
+    }
+
+    /// The frame of [`pill`] for these arguments; `None` when the rectangle is empty.
+    pub fn draw(
+        &mut self,
+        state: OverlayState,
+        meter: &Meter,
+        now: Millis,
+        rect: Rect,
+    ) -> Option<&Pixmap> {
+        let size = (u32::try_from(rect.w).ok()?, u32::try_from(rect.h).ok()?);
+        let sized = |c: &Cache| (c.base.width(), c.base.height()) == size;
+        if self
+            .cache
+            .as_ref()
+            .is_none_or(|c| c.state != state || !sized(c))
+        {
+            let (mut base, frame) = match self.cache.take() {
+                Some(c) if sized(&c) => (c.base, c.frame),
+                _ => (Pixmap::new(size.0, size.1)?, Pixmap::new(size.0, size.1)?),
+            };
+            base.fill(Color::TRANSPARENT);
+            let bars = surface(&mut base, state, self.font.as_ref());
+            self.cache = Some(Cache {
+                state,
+                base,
+                frame,
+                bars,
+            });
+        }
+        let c = self.cache.as_mut()?;
+        c.frame.data_mut().copy_from_slice(c.base.data());
+        if let Some(bars) = &c.bars {
+            bars.draw(&mut c.frame, meter, meter.clipping(now));
+        }
+        Some(&c.frame)
+    }
+}
+
+/// Everything of the pill for `state` but its bars, into the clear `pm`; the bars when the
+/// state has a meter.
+fn surface(pm: &mut Pixmap, state: OverlayState, font: Option<&FontRef<'_>>) -> Option<Bars> {
     let look = look(state);
     if state == OverlayState::Hidden {
-        return Some(pm);
+        return None;
     }
     let (w, h) = (pm.width() as f32, pm.height() as f32);
     fill(
-        &mut pm,
+        pm,
         rounded(0.0, 0.0, w, h, h / 2.0).as_ref(),
         SURFACE,
         Transform::identity(),
     );
     stroke(
-        &mut pm,
+        pm,
         rounded(0.5, 0.5, w - 1.0, h - 1.0, (h - 1.0) / 2.0).as_ref(),
         EDGE,
         1.0,
@@ -67,7 +134,7 @@ pub fn pill(
     };
     let cy = h / 2.0;
     draw_icon(
-        &mut pm,
+        pm,
         look.icon,
         look.accent,
         x0,
@@ -76,18 +143,14 @@ pub fn pill(
     );
     let mut x = x0 + icon + gap;
     if let Some(t) = &text {
-        t.draw(&mut pm, x, cy, right);
+        t.draw(pm, x, cy, right);
         x += t.width + gap;
     }
     if look.meter {
-        let colour = if meter.clipping(now) {
-            palette::CLIP
-        } else {
-            look.accent
-        };
-        bars(&mut pm, meter, colour, x.round(), right, cy, h);
+        Bars::new(look.accent, x.round(), right, cy, h)
+    } else {
+        None
     }
-    Some(pm)
 }
 
 /// The tray icon for `phase` at `size` px (16, 20, 24 or 32). Idle is a grey ring, recording a
@@ -134,11 +197,17 @@ pub fn tray_icon(phase: Phase, size: u32) -> Option<Pixmap> {
 /// `UpdateLayeredWindow` and `CreateIconIndirect`.
 #[must_use]
 pub fn bgra(pixmap: &Pixmap) -> Vec<u8> {
-    let mut out = pixmap.data().to_vec();
+    let mut out = vec![0; pixmap.data().len()];
+    bgra_into(pixmap, &mut out);
+    out
+}
+
+/// [`bgra`] into `out`, which must hold exactly the pixmap's bytes (a reused DIB).
+pub fn bgra_into(pixmap: &Pixmap, out: &mut [u8]) {
+    out.copy_from_slice(pixmap.data());
     for px in out.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
     }
-    out
 }
 
 /// One line of text laid out with kerning, baseline at the cap-height centre.
@@ -237,30 +306,104 @@ impl<'f> Label<'f> {
     }
 }
 
-/// The newest bars that fit in `x0..right`, right-aligned, centred on `cy`; silence is a row
-/// of dots. Bar edges sit on whole pixels so the meter stays crisp at any scale.
-fn bars(pm: &mut Pixmap, meter: &Meter, colour: Rgba, x0: f32, right: f32, cy: f32, h: f32) {
-    let bar = (BAR_W * h).round().max(1.0);
-    let pitch = bar + (BAR_GAP * h).round().max(1.0);
-    let room = right.round() - x0 + (pitch - bar);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    // a few dozen bars at most; negative room is 0
-    let fit = (room / pitch).floor().max(0.0) as usize;
-    let tall = (BAR_MAX * h).round();
-    let len = meter.bars().len();
-    let shown = fit.min(len);
-    let mut x = right.round() - bar - (shown.max(1) - 1) as f32 * pitch;
-    for v in meter.bars().skip(len - shown) {
-        // Odd or even height to match the bar width, so the bar centres on the dot row.
-        let len = (bar + v * (tall - bar)).round();
-        let y = (cy - len / 2.0).round();
-        fill(
-            pm,
-            rounded(x, y, bar, len, bar / 2.0).as_ref(),
-            colour,
-            Transform::identity(),
+/// The meter: the newest bars that fit in `x0..right`, right-aligned, centred on `cy`; silence
+/// is a row of dots. Bar edges sit on whole pixels so the meter stays crisp at any scale. Each
+/// bar height is rasterised once; a frame only blends its coverage in the bar colour.
+struct Bars {
+    x0: f32,
+    right: f32,
+    cy: f32,
+    bar: f32,
+    pitch: f32,
+    tall: f32,
+    accent: Rgba,
+    /// Height of the first sprite.
+    lo: usize,
+    /// Coverage (the alpha) of every bar height from `lo`.
+    sprites: Vec<Pixmap>,
+}
+
+impl Bars {
+    fn new(accent: Rgba, x0: f32, right: f32, cy: f32, h: f32) -> Option<Self> {
+        let bar = (BAR_W * h).round().max(1.0);
+        let pitch = bar + (BAR_GAP * h).round().max(1.0);
+        let tall = (BAR_MAX * h).round();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        // whole pixels of a pill at most a few hundred high, at least 1
+        let (bar_px, lo, hi) = (
+            bar as u32,
+            bar.min(tall).max(1.0) as usize,
+            bar.max(tall) as usize,
         );
-        x += pitch;
+        let sprite = |len: usize| {
+            let mut pm = Pixmap::new(bar_px, u32::try_from(len).ok()?)?;
+            let path = rounded(0.0, 0.0, bar, len as f32, bar / 2.0);
+            fill(&mut pm, path.as_ref(), TEXT, Transform::identity());
+            Some(pm)
+        };
+        Some(Self {
+            x0,
+            right: right.round(),
+            cy,
+            bar,
+            pitch,
+            tall,
+            accent,
+            lo,
+            sprites: (lo..=hi).map(sprite).collect::<Option<_>>()?,
+        })
+    }
+
+    fn draw(&self, pm: &mut Pixmap, meter: &Meter, clipping: bool) {
+        let (bar, pitch) = (self.bar, self.pitch);
+        let room = self.right - self.x0 + (pitch - bar);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        // a few dozen bars at most; negative room is 0
+        let fit = (room / pitch).floor().max(0.0) as usize;
+        let len = meter.bars().len();
+        let shown = fit.min(len);
+        let mut x = self.right - bar - (shown.max(1) - 1) as f32 * pitch;
+        let colour = if clipping { palette::CLIP } else { self.accent };
+        for v in meter.bars().skip(len - shown) {
+            // Odd or even height to match the bar width, so the bar centres on the dot row.
+            let h = (bar + v * (self.tall - bar)).round();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            // whole pixels inside the pill; a height of 0 matches no sprite
+            if let Some(s) = self.sprites.get((h as usize).wrapping_sub(self.lo)) {
+                blend(pm, s, colour, x as i32, (self.cy - h / 2.0).round() as i32);
+            }
+            x += pitch;
+        }
+    }
+}
+
+/// Paints the opaque `colour` through the alpha of `cover`, its top-left at (`x`, `y`),
+/// clipped to `dst`, with tiny-skia's own rounding (`lerp` by coverage, `div255` as
+/// `(v + 255) >> 8`), so the bar lands exactly as a path fill of it would.
+fn blend(dst: &mut Pixmap, cover: &Pixmap, colour: Rgba, x: i32, y: i32) {
+    let (dw, dh) = (i64::from(dst.width()), i64::from(dst.height()));
+    let row = cover.width() as usize * 4;
+    let src = [colour.0, colour.1, colour.2, colour.3].map(u16::from);
+    let out = dst.data_mut();
+    for (sy, line) in (0i64..).zip(cover.data().chunks_exact(row)) {
+        let dy = i64::from(y) + sy;
+        if !(0..dh).contains(&dy) {
+            continue;
+        }
+        for (sx, px) in (0i64..).zip(line.as_chunks::<4>().0) {
+            let (dx, c) = (i64::from(x) + sx, u16::from(px[3]));
+            if !(0..dw).contains(&dx) || c == 0 {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            // inside `dst`: checked above
+            let at = ((dy * dw + dx) * 4) as usize;
+            for (d, s) in out[at..at + 4].iter_mut().zip(src) {
+                #[allow(clippy::cast_possible_truncation)] // (255 * 255 + 255) >> 8 is 255
+                let v = ((u16::from(*d) * (255 - c) + s * c + 255) >> 8) as u8;
+                *d = v;
+            }
+        }
     }
 }
 
