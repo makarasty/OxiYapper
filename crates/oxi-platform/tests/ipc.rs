@@ -137,10 +137,10 @@ mod windows {
 
     #[test]
     fn sddl_admits_only_the_given_sid() {
-        let sddl = owner_only_sddl("S-1-5-21-1-2-3-1001");
+        let sddl = owner_only_sddl("S-1-5-21-1-2-3-1001", "S-1-16-8192");
         assert_eq!(
             sddl,
-            "O:S-1-5-21-1-2-3-1001D:P(A;;GA;;;S-1-5-21-1-2-3-1001)"
+            "O:S-1-5-21-1-2-3-1001D:P(A;;GA;;;S-1-5-21-1-2-3-1001)S:(ML;;NW;;;S-1-16-8192)"
         );
         assert!(!sddl.contains("WD") && !sddl.contains("Everyone"));
     }
@@ -259,5 +259,103 @@ mod windows {
             level
         });
         assert_eq!(level, SecurityIdentification);
+    }
+
+    /// A pipe on `n` created by this process with the descriptor `sddl`.
+    fn pipe_with(n: &str, sddl: &str) -> interprocess::local_socket::Listener {
+        use interprocess::os::windows::local_socket::ListenerOptionsExt;
+        ListenerOptions::new()
+            .name(n.to_fs_name::<GenericFilePath>().unwrap())
+            .security_descriptor(oxi_platform::os::pipe::security_descriptor(sddl).unwrap())
+            .create_sync()
+            .unwrap()
+    }
+
+    #[test]
+    fn zero_read_timeout_still_returns() {
+        let n = name("zero");
+        let server = Server::bind(&n).unwrap();
+        let n2 = n.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut c = Client::connect(&n2).unwrap();
+            c.set_read_timeout(Some(Duration::ZERO)).unwrap();
+            // Many tries: the cancel can land before the read is pending.
+            for _ in 0..200 {
+                tx.send(c.recv::<Push>().map(drop).unwrap_err().kind())
+                    .unwrap();
+            }
+        });
+        let _conn = server.accept().unwrap();
+        for _ in 0..200 {
+            let got = rx.recv_timeout(Duration::from_secs(5));
+            assert_eq!(got, Ok(io::ErrorKind::TimedOut));
+        }
+    }
+
+    #[test]
+    fn forward_deadline_is_total_not_per_read() {
+        let n = name("chatty");
+        let server = Server::bind(&n).unwrap();
+        let n2 = n.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || tx.send(forward_open_settings(&n2)));
+        let mut conn = server.accept().unwrap();
+        // Read the request, as a real daemon does: interprocess holds a dropped, unread
+        // client handle open until its peer reads, and both ends live in this process.
+        assert_eq!(conn.recv::<Request>().unwrap(), Some(Request::OpenSettings));
+        // A daemon that pushes every 500 ms and never closes; stops when the peer goes.
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(10) && conn.send(&Push::Raise).is_ok() {
+            if let Ok(got) = rx.recv_timeout(Duration::from_millis(500)) {
+                assert!(matches!(got, Err(Error::Io(e)) if e.kind() == io::ErrorKind::TimedOut));
+                assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+                return;
+            }
+        }
+        panic!("forward_open_settings did not give up");
+    }
+
+    #[test]
+    fn pipe_that_denies_us_is_foreign() {
+        let n = name("deny");
+        let _squatter = pipe_with(&n, "D:P");
+        assert!(matches!(Server::bind(&n), Err(Error::ForeignServer)));
+    }
+
+    #[test]
+    fn name_held_busy_is_foreign_not_io() {
+        let n = name("held");
+        let _squatter = pipe_with(&n, &format!("D:P(A;;GA;;;{})", user_sid().unwrap()));
+        let _hog = Client::connect(&n);
+        let got = within(10, move || Server::bind(&n).map(drop));
+        assert!(matches!(got, Err(Error::ForeignServer)), "{got:?}");
+    }
+
+    #[test]
+    fn busy_pipe_that_vanishes_is_not_found() {
+        let n = name("vanish");
+        let server = Server::bind(&n).unwrap();
+        let hog = Client::connect(&n).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let n2 = n.clone();
+        thread::spawn(move || tx.send(Client::connect(&n2).map(drop)));
+        // Best effort: let the client reach WaitNamedPipeW; either order must give NotFound.
+        thread::sleep(Duration::from_millis(300));
+        drop(hog);
+        drop(server);
+        let got = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(
+            matches!(got, Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::NotFound),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn low_integrity_pipe_is_foreign() {
+        let n = name("lowil");
+        let sid = user_sid().unwrap();
+        let _squatter = pipe_with(&n, &format!("O:{sid}D:P(A;;GA;;;{sid})S:(ML;;NW;;;LW)"));
+        assert!(matches!(Client::connect(&n), Err(Error::ForeignServer)));
     }
 }

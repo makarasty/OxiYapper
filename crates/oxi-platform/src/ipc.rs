@@ -3,7 +3,7 @@
 //! Messages, framing and names come from `oxi_core::ipc`; this module only moves bytes.
 
 use std::io::{self, Read, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use interprocess::local_socket::{GenericFilePath, Listener, ListenerOptions, Stream, prelude::*};
 use oxi_core::ipc::{DecodeError, Decoder, Push, Request};
@@ -33,9 +33,10 @@ pub enum Error {
     /// From [`Server::bind`]: a daemon of this user already serves the name.
     #[error("another instance is already running")]
     AlreadyRunning,
-    /// The name is held by a server of another account (a squatter). Refuse to start or to
+    /// The name is held by a server of another account, a lower integrity level, or one that
+    /// denies us or stays busy (a squatter). Refuse to start or to
     /// talk to it; never treat it as a running daemon.
-    #[error("the IPC pipe is held by another account")]
+    #[error("the IPC pipe is held by another account or an unverifiable server")]
     ForeignServer,
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -73,24 +74,42 @@ impl Server {
     /// [`Error::ForeignServer`]; a stale Unix socket (connect refused) is removed and bound
     /// again.
     pub fn bind(name: &str) -> Result<Self, Error> {
-        let err = match listen(name) {
-            Ok(listener) => return Ok(Self { listener }),
-            Err(e) => e,
-        };
-        match Conn::connect(name) {
-            Ok(_) => Err(Error::AlreadyRunning),
-            // shortcut: two launches racing on one stale socket can both unlink it and one
-            // loses the name; when Unix lands, guard with a lock file or bind a temp path and
-            // rename it over.
-            // Only a socket file left by a crash refuses; a missing Windows pipe is NotFound.
-            Err(Error::Io(c)) if c.kind() == io::ErrorKind::ConnectionRefused => {
-                std::fs::remove_file(name)?;
-                Ok(Self {
-                    listener: listen(name)?,
-                })
-            }
-            Err(Error::Io(c)) if c.kind() != io::ErrorKind::TimedOut => Err(err.into()),
-            Err(e) => Err(e),
+        let mut retried = false;
+        loop {
+            let err = match listen(name) {
+                Ok(listener) => return Ok(Self { listener }),
+                Err(e) => e,
+            };
+            return match Conn::connect(name) {
+                Ok(_) => Err(Error::AlreadyRunning),
+                // The server exited between the failed listen and the probe: try once more.
+                Err(Error::Io(c)) if c.kind() == io::ErrorKind::NotFound && !retried => {
+                    retried = true;
+                    continue;
+                }
+                // shortcut: two launches racing on one stale socket can both unlink it and one
+                // loses the name; when Unix lands, guard with a lock file or bind a temp path
+                // and rename it over.
+                // Only a socket file left by a crash refuses; a missing Windows pipe is NotFound.
+                Err(Error::Io(c)) if c.kind() == io::ErrorKind::ConnectionRefused => {
+                    std::fs::remove_file(name)?;
+                    Ok(Self {
+                        listener: listen(name)?,
+                    })
+                }
+                // The name exists but its server denies us or never frees an instance; ours
+                // admits us and always keeps one free, so this one is not verifiably ours.
+                Err(Error::Io(c))
+                    if matches!(
+                        c.kind(),
+                        io::ErrorKind::PermissionDenied | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    Err(Error::ForeignServer)
+                }
+                Err(Error::Io(_)) => Err(err.into()),
+                Err(e) => Err(e),
+            };
         }
     }
 
@@ -134,14 +153,14 @@ impl Conn {
         }
     }
 
-    /// Connects to the server on `name` after checking it belongs to the current user.
+    /// Connects to the server on `name` after checking it belongs to the current user at our integrity level or above.
     #[cfg(windows)]
     pub fn connect(name: &str) -> Result<Self, Error> {
         use interprocess::os::windows::named_pipe::local_socket::Stream as PipeStream;
         use std::os::windows::io::AsHandle;
 
         let handle = crate::os::pipe::connect(name, BUSY_WAIT)?;
-        if !crate::os::pipe::owned_by_current_user(handle.as_handle())? {
+        if !crate::os::pipe::trusted_server(handle.as_handle())? {
             return Err(Error::ForeignServer);
         }
         let stream = PipeStream::try_from(handle).map_err(|e| {
@@ -205,13 +224,21 @@ impl Conn {
 }
 
 /// Second launch: ask the daemon serving `name` to open settings, then wait (a few seconds
-/// at most) until it closes the connection. The daemon closes a connection whose first
+/// in total) until it closes the connection. The daemon closes a connection whose first
 /// message is `OpenSettings` after acting on it (the settings window starts with `Hello`).
 pub fn forward_open_settings(name: &str) -> Result<(), Error> {
+    let deadline = Instant::now() + FORWARD_WAIT;
     let mut conn = Conn::connect(name)?;
-    conn.set_read_timeout(Some(FORWARD_WAIT))?;
     conn.send(&Request::OpenSettings)?;
     // A pipe closed before the daemon accepts it is discarded unread, so hold it open.
-    while conn.recv::<Push>()?.is_some() {}
-    Ok(())
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "daemon did not close").into());
+        }
+        conn.set_read_timeout(Some(left))?;
+        if conn.recv::<Push>()?.is_none() {
+            return Ok(());
+        }
+    }
 }

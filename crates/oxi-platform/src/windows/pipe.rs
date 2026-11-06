@@ -12,15 +12,18 @@ use interprocess::os::windows::security_descriptor::{
     AsSecurityDescriptorExt, BorrowedSecurityDescriptor, SecurityDescriptor,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
-    LocalFree,
+    ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE,
+    INVALID_HANDLE_VALUE, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
     SDDL_REVISION_1, SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, OWNER_SECURITY_INFORMATION, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    ACL, GetAce, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
+    LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSID, SYSTEM_MANDATORY_LABEL_ACE,
+    TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel,
+    TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -30,15 +33,39 @@ use windows_sys::Win32::System::IO::CancelIoEx;
 use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
+/// winnt.h values; their windows-sys module (`System_SystemServices`) is not enabled here.
+const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
+const SECURITY_MANDATORY_MEDIUM_RID: u32 = 0x2000;
+
 /// Owned by and generic-all for `sid` only, protected from inherited ACEs: no Everyone, no
-/// other user. The explicit owner lets clients check it even when an elevated token would
-/// default it to Administrators.
-pub fn owner_only_sddl(sid: &str) -> String {
-    format!("O:{sid}D:P(A;;GA;;;{sid})")
+/// other user. The explicit owner and the integrity label `il_sid` (ours, `S-1-16-<rid>`)
+/// are what clients check; without them an elevated token would default the owner to
+/// Administrators and leave the label at medium.
+pub fn owner_only_sddl(sid: &str, il_sid: &str) -> String {
+    format!("O:{sid}D:P(A;;GA;;;{sid})S:(ML;;NW;;;{il_sid})")
 }
 
 /// The current user's SID string, e.g. `S-1-5-21-...`.
 pub fn user_sid() -> io::Result<String> {
+    let buf = token_info(TokenUser)?;
+    // SAFETY: TokenUser wrote a TOKEN_USER at the start of `buf`; its SID points into `buf`.
+    unsafe { sid_string((*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid) }
+}
+
+/// This process's integrity level: its label SID string and RID.
+fn integrity() -> io::Result<(String, u32)> {
+    let buf = token_info(TokenIntegrityLevel)?;
+    // SAFETY: TokenIntegrityLevel wrote a TOKEN_MANDATORY_LABEL at the start of `buf`; its
+    // SID points into `buf`.
+    unsafe {
+        let sid = (*buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()).Label.Sid;
+        Ok((sid_string(sid)?, sid_rid(sid)))
+    }
+}
+
+/// `GetTokenInformation(class)` of the process token, in u64 cells so the struct at the
+/// start is pointer-aligned.
+fn token_info(class: TOKEN_INFORMATION_CLASS) -> io::Result<Vec<u64>> {
     let mut raw = null_mut();
     // SAFETY: GetCurrentProcess is a pseudo-handle; `raw` is a valid out pointer.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut raw) } == 0 {
@@ -46,25 +73,15 @@ pub fn user_sid() -> io::Result<String> {
     }
     // SAFETY: OpenProcessToken succeeded, so we own the token handle.
     let token = unsafe { OwnedHandle::from_raw_handle(raw) };
-
     let mut len = 0u32;
     // SAFETY: size query with a null buffer; it fails with the needed length in `len`.
-    unsafe {
-        GetTokenInformation(
-            token.as_raw_handle(),
-            TokenUser,
-            null_mut(),
-            0,
-            &raw mut len,
-        )
-    };
-    // u64 cells keep TOKEN_USER (pointer-aligned) aligned.
+    unsafe { GetTokenInformation(token.as_raw_handle(), class, null_mut(), 0, &raw mut len) };
     let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
     // SAFETY: `buf` holds at least `len` bytes.
     let ok = unsafe {
         GetTokenInformation(
             token.as_raw_handle(),
-            TokenUser,
+            class,
             buf.as_mut_ptr().cast(),
             len,
             &raw mut len,
@@ -73,9 +90,7 @@ pub fn user_sid() -> io::Result<String> {
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: GetTokenInformation(TokenUser) wrote a TOKEN_USER at the start of `buf`, and
-    // its SID points into `buf`, alive for the call.
-    unsafe { sid_string((*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid) }
+    Ok(buf)
 }
 
 /// # Safety
@@ -99,9 +114,28 @@ unsafe fn sid_string(sid: PSID) -> io::Result<String> {
     Ok(s)
 }
 
-/// Security descriptor for the IPC pipe: the current user only.
+/// The last sub-authority of `sid` (for `S-1-16-<rid>`, the integrity RID); 0 if it has none.
+///
+/// # Safety
+/// `sid` must point to a valid SID.
+unsafe fn sid_rid(sid: PSID) -> u32 {
+    // SAFETY: valid SID (caller); the index is below its sub-authority count.
+    unsafe {
+        match *GetSidSubAuthorityCount(sid) {
+            0 => 0,
+            n => *GetSidSubAuthority(sid, u32::from(n) - 1),
+        }
+    }
+}
+
+/// Security descriptor for the IPC pipe: the current user only, at our integrity level.
 pub fn owner_only() -> io::Result<SecurityDescriptor> {
-    let sddl = wide(&owner_only_sddl(&user_sid()?));
+    security_descriptor(&owner_only_sddl(&user_sid()?, &integrity()?.0))
+}
+
+/// A security descriptor from SDDL.
+pub fn security_descriptor(sddl: &str) -> io::Result<SecurityDescriptor> {
+    let sddl = wide(sddl);
     let mut sd: *mut c_void = null_mut();
     // SAFETY: `sddl` is NUL-terminated; `sd` is a valid out pointer.
     let ok = unsafe {
@@ -150,48 +184,82 @@ pub fn connect(path: &str, busy_wait: Duration) -> io::Result<OwnedHandle> {
             return Ok(unsafe { OwnedHandle::from_raw_handle(h) });
         }
         let err = io::Error::last_os_error();
-        let left = deadline.saturating_duration_since(Instant::now());
         if err.raw_os_error() != Some(ERROR_PIPE_BUSY.cast_signed()) {
             return Err(err);
         }
+        let left = deadline.saturating_duration_since(Instant::now());
         let ms = u32::try_from(left.as_millis()).unwrap_or(u32::MAX);
         // SAFETY: `path` is NUL-terminated. A 0 ms wait would mean the pipe's default timeout.
-        if ms == 0 || unsafe { WaitNamedPipeW(path.as_ptr(), ms) } == 0 {
+        let waited = ms != 0 && unsafe { WaitNamedPipeW(path.as_ptr(), ms) } != 0;
+        let timed_out = ms == 0
+            || (!waited
+                && io::Error::last_os_error().raw_os_error()
+                    == Some(ERROR_SEM_TIMEOUT.cast_signed()));
+        if timed_out {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "IPC pipe busy: every instance is taken",
             ));
         }
+        // Freed or gone (the server exited): CreateFileW again gives the real answer.
     }
 }
 
-/// True when the pipe behind `h` is owned by the current user. Only the user (or an
-/// administrator) can create a pipe with that owner, so another account's squatting pipe
-/// fails this check.
-pub fn owned_by_current_user(h: BorrowedHandle<'_>) -> io::Result<bool> {
+/// True when the pipe behind `h` is owned by the current user and labelled at our
+/// integrity level or above (no label counts as medium). Another account cannot create a
+/// pipe with our SID as owner, and a lower-integrity process of ours (sandbox, browser)
+/// cannot label it above its own level.
+pub fn trusted_server(h: BorrowedHandle<'_>) -> io::Result<bool> {
     let mut owner: PSID = null_mut();
+    let mut sacl: *mut ACL = null_mut();
     let mut sd = null_mut();
-    // SAFETY: valid handle and out pointers; `owner` points into `sd`, freed below.
+    // SAFETY: valid handle and out pointers; `owner` and `sacl` point into `sd`, freed below.
     let err = unsafe {
         GetSecurityInfo(
             h.as_raw_handle(),
             SE_KERNEL_OBJECT,
-            OWNER_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
             &raw mut owner,
             null_mut(),
             null_mut(),
-            null_mut(),
+            &raw mut sacl,
             &raw mut sd,
         )
     };
     if err != 0 {
         return Err(io::Error::from_raw_os_error(err.cast_signed()));
     }
-    // SAFETY: GetSecurityInfo succeeded, so `owner` is a valid SID inside `sd`.
-    let owner = unsafe { sid_string(owner) };
+    // SAFETY: GetSecurityInfo succeeded, so `owner` is a valid SID and `sacl` null or a
+    // valid ACL, both inside `sd`.
+    let (owner, label) = unsafe { (sid_string(owner), label_rid(sacl)) };
     // SAFETY: allocated by GetSecurityInfo and not used after this.
     unsafe { LocalFree(sd) };
-    Ok(owner? == user_sid()?)
+    let label = label.unwrap_or(SECURITY_MANDATORY_MEDIUM_RID);
+    Ok(owner? == user_sid()? && label >= integrity()?.1)
+}
+
+/// The integrity RID of the mandatory label ACE in `sacl`, if any.
+///
+/// # Safety
+/// `sacl` must be null or point to a valid ACL.
+unsafe fn label_rid(sacl: *const ACL) -> Option<u32> {
+    if sacl.is_null() {
+        return None;
+    }
+    // SAFETY: `sacl` is a valid ACL (caller), so each index below AceCount is a valid ACE.
+    unsafe {
+        for i in 0..u32::from((*sacl).AceCount) {
+            let mut ace = null_mut();
+            if GetAce(sacl, i, &raw mut ace) == 0 {
+                continue;
+            }
+            let ace = ace.cast::<SYSTEM_MANDATORY_LABEL_ACE>();
+            if (*ace).Header.AceType == SYSTEM_MANDATORY_LABEL_ACE_TYPE {
+                return Some(sid_rid((&raw mut (*ace).SidStart).cast()));
+            }
+        }
+    }
+    None
 }
 
 /// Runs `op`, a blocking I/O call on `h`, and cancels it with `TimedOut` if it is still
@@ -201,13 +269,18 @@ pub fn with_deadline<R>(
     limit: Duration,
     op: impl FnOnce() -> io::Result<R>,
 ) -> io::Result<R> {
+    // How often a cancel is repeated: the first may land before the read is pending.
+    const RETRY: Duration = Duration::from_millis(10);
     // A raw pointer is not Send; the scope keeps the handle alive while the watchdog runs.
     let raw = h.as_raw_handle().expose_provenance();
     let (done, wait) = mpsc::channel::<()>();
     thread::scope(|s| {
         let watchdog = s.spawn(move || {
-            let fired = wait.recv_timeout(limit) == Err(RecvTimeoutError::Timeout);
-            if fired {
+            let mut fired = false;
+            let mut wait_for = limit;
+            while wait.recv_timeout(wait_for) == Err(RecvTimeoutError::Timeout) {
+                fired = true;
+                wait_for = RETRY;
                 // SAFETY: the handle is open for the whole scope; this only aborts its I/O.
                 unsafe { CancelIoEx(std::ptr::with_exposed_provenance_mut(raw), null()) };
             }
