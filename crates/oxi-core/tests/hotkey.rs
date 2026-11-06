@@ -263,9 +263,9 @@ fn esc_while_recording_swallows_down_repeat_and_up() {
                 ..ev(Event::Esc)
             },
         ),
-        (dn(Key::Esc), IDLE, swallowed),
+        (dn(Key::Esc), IDLE, swallowed.clone()),
         // The up matches a swallowed down, whatever the phase is now.
-        (up(Key::Esc), IDLE, swallowed),
+        (up(Key::Esc), IDLE, swallowed.clone()),
         (up(Key::LCtrl), IDLE, ev(Event::ChordUp)),
         // Esc was swallowed, so Windows saw a bare Ctrl+Win: Start still needs blocking.
         (
@@ -557,7 +557,7 @@ proptest! {
                     if !input.ours {
                         let i = pool_index(input.key);
                         if input.down && down[i] {
-                            prop_assert_eq!(v.event, None, "repeat of {:?}", input.key);
+                            prop_assert_eq!(v.event.as_ref(), None, "repeat of {:?}", input.key);
                         }
                         down[i] = input.down;
                     }

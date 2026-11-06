@@ -33,7 +33,7 @@ pub struct Ctx {
 }
 
 /// What the hook must do with one key event.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Verdict {
     /// Post this to the coordinator.
     pub event: Option<Event>,
