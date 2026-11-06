@@ -1,24 +1,30 @@
 //! Hidden `oxi-yapper bench <dir> --model <path> [--gpu <name|cpu|auto>] [--lang ru|en|auto]
 //! [--prompt-file <f>]`: every `*.wav` in `<dir>` through the audio pipeline, whisper and the
 //! text pipeline. Prints text and timings; never touches the hotkey or the clipboard.
+//!
+//! `oxi-yapper bench --record <seconds> <out.wav>` records the default microphone instead. The
+//! clip is raw: 16 kHz mono through the capture pipeline with trim and normalise off.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use oxi_core::audio::{self, downmix};
+use oxi_core::audio;
 use oxi_core::config::Audio;
 use oxi_core::dictionary::build_prompt;
 use oxi_core::models::MODELS;
 use oxi_core::text::{self, HallucinationFilter, Outcome, ReplaceRules, decode_text_file};
 use oxi_core::types::Language;
+use oxi_platform::capture::{Capture, CpalCapture, LevelMeter};
+use oxi_platform::wav::{read_wav_mono_f32, write_wav};
 use oxi_whisper::{DeviceChoice, Engine};
 
 use crate::net::sha256_file;
 
 const USAGE: &str = "usage: oxi-yapper bench <dir> --model <path> [--gpu <name|cpu|auto>] \
-                     [--lang ru|en|auto] [--prompt-file <file>]";
+                     [--lang ru|en|auto] [--prompt-file <file>]
+                            oxi-yapper bench --record <seconds> <out.wav>  (raw 16 kHz mono: no trim,                      no normalise)";
 
 #[derive(Debug)]
 struct Args {
@@ -82,26 +88,6 @@ fn percentile(sorted: &[u128], pct: usize) -> u128 {
     }
 }
 
-/// A wav as mono f32 and its sample rate. Integer formats scale to -1..1.
-fn read_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
-    let mut reader = hound::WavReader::open(path)?;
-    let spec = reader.spec();
-    let interleaved = match spec.sample_format {
-        hound::SampleFormat::Float => reader.samples::<f32>().collect::<Result<Vec<_>, _>>()?,
-        hound::SampleFormat::Int => {
-            let scale = (1_i64 << (spec.bits_per_sample - 1)) as f32;
-            reader
-                .samples::<i32>()
-                .map(|s| s.map(|v| v as f32 / scale))
-                .collect::<Result<Vec<_>, _>>()?
-        }
-    };
-    Ok((
-        downmix(&interleaved, usize::from(spec.channels)),
-        spec.sample_rate,
-    ))
-}
-
 /// Refuse a file that carries a registry file name but not the registry hash. Any other
 /// name is a custom model and loads as is (ARCHITECTURE 8).
 fn verify_model(path: &Path) -> Result<()> {
@@ -132,7 +118,51 @@ fn wav_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// `--record <seconds> <out.wav>`: the whole argument list, nothing else.
+fn parse_record(args: &[String]) -> Result<(Duration, PathBuf)> {
+    let [_, secs, out] = args else {
+        bail!(
+            "--record takes <seconds> <out.wav>
+{USAGE}"
+        );
+    };
+    let secs: f64 = secs
+        .parse()
+        .ok()
+        .filter(|s: &f64| s.is_finite() && *s > 0.0)
+        .with_context(|| format!("--record: seconds must be a positive number, got {secs:?}"))?;
+    Ok((Duration::from_secs_f64(secs), PathBuf::from(out)))
+}
+
+fn record(args: &[String]) -> Result<()> {
+    let (len, out) = parse_record(args)?;
+    // Raw clip: the gate would cut silence and normalising would change levels.
+    let opts = Audio {
+        trim: false,
+        normalize: false,
+        ..Audio::default()
+    };
+    let capture = CpalCapture::open("", &opts, LevelMeter::default(), |_| {})?;
+    println!(
+        "recording {:.1} s from the default microphone",
+        len.as_secs_f64()
+    );
+    std::thread::sleep(len);
+    let clip = capture.finish()?;
+    write_wav(&out, &clip)?;
+    println!(
+        "{}: {} samples at {} Hz",
+        out.display(),
+        clip.len(),
+        audio::SAMPLE_RATE
+    );
+    Ok(())
+}
+
 pub fn run(args: &[String]) -> Result<()> {
+    if args.first().is_some_and(|a| a == "--record") {
+        return record(args);
+    }
     let args = parse_args(args)?;
     let files = wav_files(&args.dir)?;
     if files.is_empty() {
@@ -160,7 +190,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let (mut times, mut heard) = (Vec::new(), 0_usize);
     for path in &files {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        let (mono, rate) = match read_wav(path) {
+        let (mono, rate) = match read_wav_mono_f32(path) {
             Ok(wav) => wav,
             Err(e) => {
                 println!("{name}\terror: {e:#}");
@@ -260,6 +290,25 @@ mod tests {
     }
 
     #[test]
+    fn record_args_need_positive_seconds_and_a_path() {
+        let (len, out) = parse_record(&strs(&["--record", "2.5", "a.wav"])).unwrap();
+        assert_eq!(
+            (len, out),
+            (Duration::from_millis(2500), PathBuf::from("a.wav"))
+        );
+        for bad in [
+            &["--record"][..],
+            &["--record", "3"],
+            &["--record", "0", "a.wav"],
+            &["--record", "-1", "a.wav"],
+            &["--record", "x", "a.wav"],
+            &["--record", "3", "a.wav", "b.wav"],
+        ] {
+            assert!(parse_record(&strs(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn percentiles_use_nearest_rank() {
         assert_eq!(percentile(&[], 50), 0);
         assert_eq!(percentile(&[7], 95), 7);
@@ -282,7 +331,7 @@ mod tests {
             w.write_sample(r).unwrap();
         }
         w.finalize().unwrap();
-        let (mono, rate) = read_wav(&path).unwrap();
+        let (mono, rate) = read_wav_mono_f32(&path).unwrap();
         assert_eq!((rate, mono), (8000, vec![0.25, -0.5]));
     }
 
