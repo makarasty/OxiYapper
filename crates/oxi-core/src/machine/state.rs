@@ -490,7 +490,7 @@ impl State {
     fn settle(&mut self, now: Millis, fx: &mut Effects) {
         if self.phase() == Phase::Idle {
             if let Some(cfg) = self.pending_cfg.take() {
-                let new_model = cfg.model != self.cfg.model;
+                let new_model = (&cfg.model, &cfg.gpu) != (&self.cfg.model, &self.cfg.gpu);
                 self.cfg = cfg;
                 self.idle_unload_at = None;
                 fx.push(Effect::ApplyConfig);

@@ -2,6 +2,7 @@
 //! with time driven by hand.
 
 use oxi_core::config::Config;
+use oxi_core::device::DeviceChoice;
 use oxi_core::machine::{
     Effect, Effects, Event, JobId, MachineConfig, Mode, ModelFailure, Notice, OverlayState, Phase,
     PhaseCell, Sound, State, step,
@@ -572,32 +573,43 @@ fn with_model(model: &str) -> MachineConfig {
     }
 }
 
+/// Same model file, loaded onto another device.
+fn on_cpu() -> MachineConfig {
+    MachineConfig {
+        gpu: DeviceChoice::Cpu,
+        ..untailed()
+    }
+}
+
 #[test]
 fn new_model_setting_unloads_the_loaded_model() {
-    let same = untailed().model;
-    // (model in the new config, model loaded before, effects of the config, next press preloads)
+    let unload = vec![Effect::ApplyConfig, Effect::Unload];
+    // (case, new config, model loaded before, effects of the config, next press preloads)
     let cases = [
-        (same.as_str(), true, vec![Effect::ApplyConfig], false),
         (
-            "large-v3",
+            "same model",
+            untailed(),
             true,
-            vec![Effect::ApplyConfig, Effect::Unload],
+            vec![Effect::ApplyConfig],
+            false,
+        ),
+        ("new id", with_model("large-v3"), true, unload.clone(), true),
+        ("new gpu", on_cpu(), true, unload, true),
+        (
+            "new id, unloaded",
+            with_model("large-v3"),
+            false,
+            vec![Effect::ApplyConfig],
             true,
         ),
-        ("large-v3", false, vec![Effect::ApplyConfig], true),
     ];
-    for (model, loaded, want, preload) in cases {
+    for (case, cfg, loaded, want, preload) in cases {
         let mut s = if loaded {
             Sim::loaded()
         } else {
             Sim(State::new(untailed()))
         };
-        let case = format!("{model}, loaded {loaded}");
-        assert_eq!(
-            s.core(0, Event::ConfigChanged(with_model(model))),
-            want,
-            "{case}"
-        );
+        assert_eq!(s.core(0, Event::ConfigChanged(cfg)), want, "{case}");
         let fx = s.core(100, Event::ChordDown);
         assert_eq!(fx.contains(&Effect::Preload), preload, "{case}");
     }
@@ -605,15 +617,22 @@ fn new_model_setting_unloads_the_loaded_model() {
 
 #[test]
 fn new_model_setting_during_a_load_unloads_once_the_old_one_lands() {
-    let mut s = Sim(State::new(untailed()));
-    assert!(s.core(0, Event::ChordDown).contains(&Effect::Preload));
-    s.at(100, Event::Esc);
-    assert_eq!(
-        s.core(200, Event::ConfigChanged(with_model("large-v3"))),
-        [Effect::ApplyConfig]
-    );
-    assert_eq!(s.core(300, Event::ModelLoaded), [Effect::Unload]);
-    assert!(s.core(400, Event::ChordDown).contains(&Effect::Preload));
+    for cfg in [with_model("large-v3"), on_cpu()] {
+        let case = format!("{cfg:?}");
+        let mut s = Sim(State::new(untailed()));
+        assert!(s.core(0, Event::ChordDown).contains(&Effect::Preload));
+        s.at(100, Event::Esc);
+        assert_eq!(
+            s.core(200, Event::ConfigChanged(cfg)),
+            [Effect::ApplyConfig],
+            "{case}"
+        );
+        assert_eq!(s.core(300, Event::ModelLoaded), [Effect::Unload], "{case}");
+        assert!(
+            s.core(400, Event::ChordDown).contains(&Effect::Preload),
+            "{case}"
+        );
+    }
 }
 
 // ---- 12. hook removed after a stall ----------------------------------------------------------
@@ -923,6 +942,11 @@ fn machine_config_maps_the_file_settings() {
         file.model.custom_path = path.into();
         assert_eq!(MachineConfig::from(&file).model, want);
     }
+    file.model.gpu = DeviceChoice::Named("GPU 1".into());
+    assert_eq!(
+        MachineConfig::from(&file).gpu,
+        DeviceChoice::Named("GPU 1".into())
+    );
 }
 
 #[test]

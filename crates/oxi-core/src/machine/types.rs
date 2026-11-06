@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::device::DeviceChoice;
 use crate::paste::PasteOutcome;
 use crate::types::Millis;
 
@@ -44,6 +45,8 @@ pub struct MachineConfig {
     /// `[model] id`, or the file path for a custom model: a change means another model file,
     /// so a loaded model is unloaded and the next use loads the new one.
     pub model: String,
+    /// `[model] gpu`: the model is loaded onto this device, so a change reloads it too.
+    pub gpu: DeviceChoice,
 }
 
 impl From<&Config> for MachineConfig {
@@ -66,6 +69,7 @@ impl From<&Config> for MachineConfig {
             } else {
                 cfg.model.id.clone()
             },
+            gpu: cfg.model.gpu.clone(),
         }
     }
 }
