@@ -12,6 +12,7 @@ export component SystemPage inherits VerticalLayout {
     Group {
         title: @tr("Theme");
         ThumbPicker {
+            accessible-label: @tr("Theme");
             thumbs: [
                 { image: @image-url("../img/theme-system.svg"), caption: @tr("System") },
                 { image: @image-url("../img/theme-dark.svg"), caption: @tr("Dark") },

@@ -4,8 +4,7 @@ mod ctx;
 mod ipc;
 mod pages;
 
-use std::path::Path;
-use std::{io, process};
+use std::io;
 
 use oxi_core::config::{ConfigError, Theme};
 use oxi_core::paths::Layout;
@@ -44,37 +43,33 @@ pub fn open(layout: Layout) -> Result<AppWindow, Error> {
     let window = AppWindow::new()?;
     let (ctx, problem) = Ctx::load(layout)?;
     if let Some(problem) = &problem {
-        show_banner(&window, problem);
+        window.set_banner_text(problem.to_string().into());
+        // A broken file gets "Open file" and "Reset to defaults"; a newer one only the message.
+        window.set_banner_fixable(!matches!(problem, ConfigError::ReadOnly));
     }
 
     let weak = window.as_weak();
     let c = ctx.clone();
     window.on_theme_changed(move |choice| {
         c.config.borrow_mut().config.ui.theme = theme(choice);
-        if let Err(e) = c.save() {
-            report(&weak, &e);
-        }
+        report(&weak, c.save());
     });
 
     let weak = window.as_weak();
     let path = ctx.layout.config_file();
     window.on_open_file(move || {
-        if let Err(e) = open_in_editor(&path) {
-            report(&weak, &e.into());
-        }
+        report(&weak, oxi_platform::open::open(&path).map_err(Error::from));
     });
 
     let weak = window.as_weak();
     let c = ctx.clone();
     window.on_reset_config(move || {
-        let Some(window) = weak.upgrade() else { return };
-        match c.reset() {
-            Ok(()) => {
-                window.set_banner_text("".into());
-                bind(&window, &c);
-            }
-            Err(e) => report(&weak, &e),
+        let result = c.reset();
+        if let (Ok(()), Some(window)) = (&result, weak.upgrade()) {
+            window.set_banner_text("".into());
+            bind(&window, &c);
         }
+        report(&weak, result);
     });
 
     bind(&window, &ctx);
@@ -90,17 +85,12 @@ fn bind(window: &AppWindow, ctx: &Ctx) {
     pages::bind(window, ctx);
 }
 
-/// A broken file gets "Open file" and "Reset to defaults"; a newer one only the message.
-fn show_banner(window: &AppWindow, problem: &ConfigError) {
-    window.set_banner_text(problem.to_string().into());
-    window.set_banner_fixable(!matches!(problem, ConfigError::ReadOnly));
-}
-
-/// A failed save or file action: say so in the banner, without the fix buttons.
-fn report(window: &Weak<AppWindow>, error: &Error) {
+/// Outcome of a save or file action: a failure shows under the config banner, which stays with
+/// its buttons; a success clears the failure shown before.
+pub(crate) fn report(window: &Weak<AppWindow>, result: Result<(), Error>) {
     if let Some(window) = window.upgrade() {
-        window.set_banner_text(error.to_string().into());
-        window.set_banner_fixable(false);
+        let text = result.err().map(|e| e.to_string()).unwrap_or_default();
+        window.set_action_error(text.into());
     }
 }
 
@@ -118,23 +108,6 @@ const fn theme(choice: ThemeChoice) -> Theme {
         ThemeChoice::Dark => Theme::Dark,
         ThemeChoice::Light => Theme::Light,
     }
-}
-
-/// Open `path` in the user's default app for it. The path is one argument, never a shell string.
-// shortcut: lives here as the only caller; move to oxi_platform when the daemon needs it too.
-fn open_in_editor(path: &Path) -> io::Result<()> {
-    let opener = if cfg!(windows) {
-        "explorer"
-    } else if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    let mut child = process::Command::new(opener).arg(path).spawn()?;
-    // Reap it off the UI thread. explorer exits 1 even when it opened the file, so only a
-    // failed spawn is an error.
-    std::thread::spawn(move || child.wait());
-    Ok(())
 }
 
 #[cfg(test)]

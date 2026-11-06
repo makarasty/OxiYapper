@@ -1,30 +1,16 @@
 //! Settings shell under the testing backend, on a temporary config directory.
 
-use std::fs;
-use std::path::PathBuf;
+mod common;
 
-use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+use std::fs;
+
+use common::layout;
+use i_slint_backend_testing::{AccessibleRole, ElementHandle, ElementQuery};
 use oxi_core::config::{ConfigFile, Theme};
 use oxi_core::paths::Layout;
 use oxi_settings::{AppWindow, Page, Shell, ThemeChoice};
 use slint::ComponentHandle;
 use slint::platform::{Key, PointerEventButton, WindowEvent};
-
-/// A fresh directory per test; `config` is written as `config.toml` when given.
-fn layout(name: &str, config: Option<&str>) -> Layout {
-    let dir: PathBuf =
-        std::env::temp_dir().join(format!("oxi-settings-shell-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    if let Some(text) = config {
-        fs::write(dir.join("config.toml"), text).unwrap();
-    }
-    Layout {
-        config_dir: dir.clone(),
-        data_dir: dir.clone(),
-        logs_dir: dir,
-    }
-}
 
 fn open(layout: &Layout) -> AppWindow {
     i_slint_backend_testing::init_no_event_loop();
@@ -100,6 +86,7 @@ fn theme_pick_writes_ui_theme() {
     let l = layout("theme", Some("version = 1\n# mine\n"));
     let window = open(&l);
     window.set_page(Page::System);
+    with_role(&window, "Theme", AccessibleRole::RadioGroup);
     let dark = card(&window, "Dark");
     assert_eq!(dark.accessible_checked(), Some(false));
     dark.invoke_accessible_default_action();
@@ -176,6 +163,82 @@ fn thumb_picker_takes_a_click_then_arrow_keys() {
         ThemeChoice::Light,
         "stops at the last card"
     );
+    let text = fs::read_to_string(l.config_file()).unwrap();
+    assert_eq!(
+        ConfigFile::parse(&text).unwrap().config.ui.theme,
+        Theme::Light
+    );
+}
+
+/// Labels of the banners on screen, sorted, each once (a component instance and its root
+/// element both match the role).
+fn banners(window: &AppWindow) -> Vec<String> {
+    let mut labels: Vec<String> = ElementQuery::from_root(window)
+        .match_descendants()
+        .match_accessible_role(AccessibleRole::Banner)
+        .find_all()
+        .iter()
+        .filter_map(|e| e.accessible_label().map(|l| l.to_string()))
+        .collect();
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
+#[test]
+fn failed_reset_keeps_the_parse_banner_and_its_buttons() {
+    let original = "version = 1
+[audio]
+gain_db = 
+";
+    let l = layout("reset-fails", Some(original));
+    // A directory where the backup goes makes the copy fail.
+    fs::create_dir(l.config_dir.join("config.toml.bak")).unwrap();
+    let window = open(&l);
+    one(&window, "Reset to defaults").invoke_accessible_default_action();
+
+    assert!(window.global::<Shell>().get_locked());
+    assert!(window.get_banner_text().contains("line 3"));
+    assert!(has(&window, "Open file"));
+    assert!(has(&window, "Reset to defaults"));
+    assert_eq!(banners(&window).len(), 2, "parse banner plus the failure");
+    assert_eq!(fs::read_to_string(l.config_file()).unwrap(), original);
+}
+
+#[test]
+fn failed_open_file_keeps_the_parse_banner_and_its_buttons() {
+    let l = layout(
+        "open-fails",
+        Some(
+            "version = 1
+[audio]
+gain_db = 
+",
+        ),
+    );
+    let window = open(&l);
+    // Gone before "Open file", so the shell has nothing to open.
+    fs::remove_file(l.config_file()).unwrap();
+    one(&window, "Open file").invoke_accessible_default_action();
+
+    assert!(window.get_banner_text().contains("line 3"));
+    assert!(has(&window, "Reset to defaults"));
+    assert_eq!(banners(&window).len(), 2, "parse banner plus the failure");
+}
+
+#[test]
+fn a_successful_save_clears_the_save_error() {
+    let l = layout("save-recovers", None);
+    let window = open(&l);
+    window.set_page(Page::System);
+    // A directory in the file's place makes the atomic rename fail.
+    fs::create_dir(l.config_file()).unwrap();
+    card(&window, "Dark").invoke_accessible_default_action();
+    assert_eq!(banners(&window).len(), 1, "the save error shows");
+
+    fs::remove_dir(l.config_file()).unwrap();
+    card(&window, "Light").invoke_accessible_default_action();
+    assert_eq!(banners(&window), Vec::<String>::new());
     let text = fs::read_to_string(l.config_file()).unwrap();
     assert_eq!(
         ConfigFile::parse(&text).unwrap().config.ui.theme,

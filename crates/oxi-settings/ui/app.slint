@@ -72,6 +72,8 @@ export component AppWindow inherits Window {
     in property <string> banner-text;
     // The banner is for a broken file: offer "Open file" and "Reset to defaults".
     in property <bool> banner-fixable;
+    // The last failed save or file action; empty hides it. Shown under the config banner.
+    in property <string> action-error;
     callback theme-changed(ThemeChoice);
     callback open-file();
     callback reset-config();
@@ -140,6 +142,10 @@ export component AppWindow inherits Window {
                         root.reset-config();
                     }
                 }
+            }
+            if root.action-error != "": Banner {
+                text: root.action-error;
+                error: true;
             }
             if root.page == Page.hotkey: HotkeyPage { }
             if root.page == Page.audio: AudioPage { }

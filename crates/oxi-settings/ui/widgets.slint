@@ -97,6 +97,7 @@ export struct Thumb {
 
 // Selectable SVG cards. One-way: `selected` comes from the owner, a pick only fires `picked`,
 // and the owner updates the value `selected` is bound to. Left and Right move the pick.
+// Give each picker an `accessible-label` (its group title) so screen readers name the group.
 export component ThumbPicker inherits FocusScope {
     in property <[Thumb]> thumbs;
     in property <int> selected;

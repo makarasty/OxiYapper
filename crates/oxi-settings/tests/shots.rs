@@ -1,13 +1,14 @@
 //! Every settings screen drawn by the software renderer, the one the app ships with. With
 //! `OXI_SHOTS_DIR` set, each lands in `settings-<screen>-<theme>.png` for visual review.
 
+mod common;
+
 use std::cell::RefCell;
 use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use i_slint_backend_testing::{AccessibleRole, ElementHandle};
-use oxi_core::paths::Layout;
 use oxi_settings::{AppWindow, Page, ThemeChoice};
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
@@ -37,20 +38,7 @@ impl Platform for Shots {
 fn open(screen: &str, config: Option<&str>) -> AppWindow {
     // Once per thread; a second call on the same thread is the same platform.
     let _ = slint::platform::set_platform(Box::new(Shots));
-    let dir: PathBuf = std::env::temp_dir().join(format!(
-        "oxi-settings-shots-{}-{screen}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    if let Some(text) = config {
-        fs::write(dir.join("config.toml"), text).unwrap();
-    }
-    let layout = Layout {
-        config_dir: dir.clone(),
-        data_dir: dir.clone(),
-        logs_dir: dir,
-    };
+    let layout = common::layout(screen, config);
     oxi_settings::open(layout).unwrap()
 }
 
