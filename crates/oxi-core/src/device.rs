@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// One GPU that whisper.cpp can run on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Device {
     /// ggml device name, e.g. `Vulkan0`. Stable key for the config.
     pub name: String,

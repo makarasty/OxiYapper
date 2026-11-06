@@ -1,0 +1,13 @@
+---
+source: crates/oxi-core/tests/ipc.rs
+expression: lines(requests().iter().map(encode).collect())
+---
+{"t":"Hello","proto":1,"version":"0.1.0"}
+{"t":"OpenSettings"}
+{"t":"Status"}
+{"t":"ListDevices"}
+{"t":"DownloadModel","id":"turbo"}
+{"t":"CancelDownload","id":"turbo"}
+{"t":"CaptureHotkey","on":true}
+{"t":"PreviewOverlay","position":"top-centre"}
+{"t":"Shutdown"}
