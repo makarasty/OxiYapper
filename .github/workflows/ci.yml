@@ -100,17 +100,14 @@ jobs:
     name: build (${{ matrix.os }}, ${{ matrix.feature }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout }}
-    # CUDA stays informational until the Vulkan-vs-CUDA measurement (ROADMAP M5) keeps it.
-    continue-on-error: ${{ matrix.feature == 'cuda' }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # timeout ~2x the cold (no cache) run measured on 2026-11-06; unmeasured ones are guesses.
+          # timeout ~2x the cold (no cache) run measured on 2026-11-06.
           - { os: windows-latest, feature: vulkan, timeout: 25 } # 10 min cold
-          - { os: windows-latest, feature: cuda, timeout: 40 }   # not measured yet
-          - { os: ubuntu-latest, feature: vulkan, timeout: 25 }  # not measured yet
-          - { os: macos-latest, feature: metal, timeout: 25 }    # not measured yet
+          - { os: ubuntu-latest, feature: vulkan, timeout: 15 }  # 4 min cold build, apt aside
+          - { os: macos-latest, feature: metal, timeout: 25 }    # not measured yet (no runner on the first run)
     env:
       # Windows: a long target path breaks the nested vulkan-shaders-gen build (MAX_PATH).
       CARGO_TARGET_DIR: ${{ matrix.os == 'windows-latest' && 'C:/t' || 'target' }}
@@ -118,33 +115,50 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install Vulkan SDK (Windows)
-        if: matrix.feature == 'vulkan' && runner.os == 'Windows'
+      # Linux too: apt took 17 min for the Vulkan packages on the first run; the SDK comes from the cache.
+      - name: Install Vulkan SDK
+        if: matrix.feature == 'vulkan'
         uses: jakoch/install-vulkan-sdk-action@7fe84289ddbf750f7eff9f8e4588e600e1dd06c8 # v1.8.1
         with:
           vulkan_version: 1.4.328.1
           install_runtime: true
           cache: true
-      - name: Install Vulkan build deps (Linux)
-        if: matrix.feature == 'vulkan' && runner.os == 'Linux'
-        # A hung apt mirror must fail in minutes, not eat the job timeout (seen on the first run).
-        timeout-minutes: 5
+      - name: Install build deps (Linux)
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get -o Acquire::Retries=3 update
-          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends cmake clang libclang-dev libvulkan-dev glslc libasound2-dev
-      - name: Install CUDA toolkit (Windows)
-        if: matrix.feature == 'cuda'
-        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends libclang-dev libasound2-dev
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.feature }}
+      - run: cargo build --locked --release --features ${{ matrix.feature }}
+      - name: Run binary
+        shell: bash
+        run: "\"$CARGO_TARGET_DIR/release/oxi-yapper\" --version"
+
+  # Informational until the Vulkan-vs-CUDA measurement (ROADMAP M5) keeps or drops CUDA.
+  # Kept out of ci-ok: a job-level continue-on-error inside the build matrix hid a cancelled macOS leg.
+  build-cuda:
+    runs-on: windows-latest
+    timeout-minutes: 40 # not measured yet
+    env:
+      CARGO_TARGET_DIR: C:/t
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
         with:
           cuda: 12.6.3
           method: network
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "visual_studio_integration"]'
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          key: ${{ matrix.feature }}
-      - run: cargo build --locked --release --features ${{ matrix.feature }}
+          key: cuda
+      - run: cargo build --locked --release --features cuda
       - name: Run binary
         shell: bash
         run: "\"$CARGO_TARGET_DIR/release/oxi-yapper\" --version"
