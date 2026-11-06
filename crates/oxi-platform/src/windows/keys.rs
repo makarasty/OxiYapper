@@ -187,11 +187,21 @@ fn vk_held(code: u16) -> bool {
 /// Injects `(key, down)` events in order, tagged so our own hook ignores them.
 /// Fails when Windows took fewer events (UIPI: the foreground window is elevated).
 pub fn send_keys(keys: &[(Key, bool)]) -> io::Result<()> {
+    send_tagged(keys, INJECT_TAG)
+}
+
+/// Injects keys as another program would, so the hook tracks them.
+#[cfg(test)]
+pub(crate) fn send_keys_untagged(keys: &[(Key, bool)]) -> io::Result<()> {
+    send_tagged(keys, 0)
+}
+
+fn send_tagged(keys: &[(Key, bool)], tag: usize) -> io::Result<()> {
     let inputs: Vec<INPUT> = keys
         .iter()
         .map(|&(key, down)| {
             let (code, extended) = vk(key);
-            input(code, extended, down)
+            input(code, extended, down, tag)
         })
         .collect();
     send(&inputs)
@@ -200,12 +210,12 @@ pub fn send_keys(keys: &[(Key, bool)]) -> io::Result<()> {
 /// Injects the Start-menu blocker (VK 0xE8 down and up), tagged as ours.
 pub fn send_start_blocker() -> io::Result<()> {
     send(&[
-        input(START_BLOCKER_VK, false, true),
-        input(START_BLOCKER_VK, false, false),
+        input(START_BLOCKER_VK, false, true, INJECT_TAG),
+        input(START_BLOCKER_VK, false, false, INJECT_TAG),
     ])
 }
 
-fn input(code: u16, extended: bool, down: bool) -> INPUT {
+fn input(code: u16, extended: bool, down: bool, tag: usize) -> INPUT {
     let mut flags = 0;
     if extended {
         flags |= KEYEVENTF_EXTENDEDKEY;
@@ -221,7 +231,7 @@ fn input(code: u16, extended: bool, down: bool) -> INPUT {
                 wScan: 0,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: INJECT_TAG,
+                dwExtraInfo: tag,
             },
         },
     }

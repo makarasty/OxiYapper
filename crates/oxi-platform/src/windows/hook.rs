@@ -232,7 +232,9 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         // SAFETY: for WH_KEYBOARD_LL with code >= 0, `lparam` points to a KBDLLHOOKSTRUCT that
         // is valid for the duration of this call.
         let event = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
-        if on_key(event, wparam) {
+        // A panic must not unwind into Windows; in dev and test builds the key then passes.
+        // Release builds abort on panic, so `on_key` itself never panics on re-entry.
+        if std::panic::catch_unwind(|| on_key(event, wparam)).unwrap_or(false) {
             return 1;
         }
     }
@@ -251,26 +253,96 @@ fn on_key(event: &KBDLLHOOKSTRUCT, wparam: WPARAM) -> bool {
         down: matches!(u32::try_from(wparam), Ok(WM_KEYDOWN | WM_SYSKEYDOWN)),
         ours: event.dwExtraInfo == INJECT_TAG,
     };
-    STATE.with_borrow_mut(|state| {
-        let Some(s) = state.as_mut() else {
-            return false;
-        };
+    // The blocker's SendInput re-enters this callback on this thread before it returns, so the
+    // state is borrowed only to decide; a borrow that is still held passes the key untouched.
+    let verdict = STATE.with(|cell| {
+        let mut state = cell.try_borrow_mut().ok()?;
+        let s = state.as_mut()?;
         let ctx = Ctx {
             recording: s.phase.load() == Phase::Recording,
             capture_swallow: s.capture_swallow,
         };
-        let verdict = s.tracker.on_key(input, ctx);
+        #[cfg_attr(not(test), expect(unused_mut))]
+        let mut verdict = s.tracker.on_key(input, ctx);
+        #[cfg(test)]
+        tests::seam(input, &mut verdict);
         if let Some(event) = verdict.event {
             let _ = s.on_event.send(event);
         }
         if let Some(captured) = verdict.captured {
             let _ = s.on_captured.send(captured);
         }
-        if verdict.suppress_start
-            && let Err(e) = keys::send_start_blocker()
-        {
-            tracing::warn!(error = %e, "Start menu blocker not sent");
+        Some(verdict)
+    });
+    let Some(verdict) = verdict else {
+        return false;
+    };
+    if verdict.suppress_start
+        && let Err(e) = keys::send_start_blocker()
+    {
+        tracing::warn!(error = %e, "Start menu blocker not sent");
+    }
+    verdict.swallow
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use oxi_core::hotkey::{KeyId, Verdict};
+
+    use super::*;
+
+    /// Every untagged key-up asks for the Start blocker, as a Win-up ending a Win chord does,
+    /// so the blocker path runs from the callback without pressing Win.
+    static FORCE_START_BLOCKER: AtomicBool = AtomicBool::new(false);
+    /// Our own injected events the callback saw.
+    static OURS_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn seam(input: KeyInput, verdict: &mut Verdict) {
+        if input.ours {
+            OURS_SEEN.fetch_add(1, Ordering::Relaxed);
+        } else if !input.down && FORCE_START_BLOCKER.load(Ordering::Relaxed) {
+            verdict.suppress_start = true;
         }
-        verdict.swallow
-    })
+    }
+
+    // Live: needs OXI_HOOK_TEST=1 and `--test-threads=1`; injects F13 chords and a swallowed Esc.
+    #[test]
+    fn start_blocker_sent_inside_the_callback_reenters_it_safely() {
+        if std::env::var_os("OXI_HOOK_TEST").is_none_or(|v| v != "1") {
+            eprintln!("skipped: set OXI_HOOK_TEST=1");
+            return;
+        }
+        let chord = Chord::parse(&["Ctrl".into(), "Shift".into(), "F13".into()]).unwrap();
+        let phase = PhaseCell::default();
+        let (tx, events) = mpsc::channel();
+        let (captured, _) = mpsc::channel();
+        let handle = Hook::spawn(chord, phase.clone(), tx, captured).unwrap();
+        phase.store(Phase::Recording);
+        FORCE_START_BLOCKER.store(true, Ordering::Relaxed);
+        OURS_SEEN.store(0, Ordering::Relaxed);
+        keys::send_keys_untagged(&[
+            (Key::LCtrl, true),
+            (Key::LShift, true),
+            (Key::F13, true),
+            (Key::F13, false),
+            (Key::LShift, false),
+            (Key::LCtrl, false),
+            (Key::Esc, true),
+            (Key::Esc, false),
+        ])
+        .unwrap();
+        let wait = Duration::from_secs(2);
+        assert_eq!(events.recv_timeout(wait), Ok(Event::ChordDown));
+        assert_eq!(events.recv_timeout(wait), Ok(Event::ChordUp));
+        // Esc comes after the three key-ups, so their nested blocker events are all done.
+        assert_eq!(events.recv_timeout(wait), Ok(Event::Esc));
+        FORCE_START_BLOCKER.store(false, Ordering::Relaxed);
+        // Three key-ups, each a 0xE8 down and up seen by the same (re-entered) callback.
+        assert!(OURS_SEEN.load(Ordering::Relaxed) >= 6, "blocker not seen");
+        assert_eq!(keys::key_id(0xE8, false), KeyId::Other(0xE8));
+        drop(handle);
+    }
 }
