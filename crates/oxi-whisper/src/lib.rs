@@ -59,6 +59,20 @@ pub struct Engine {
     /// Made once per load and reused by every job.
     state: WhisperState,
     info: LoadInfo,
+    /// Threads for the decode loop, fixed per load: the device does not change under an Engine.
+    n_threads: i32,
+}
+
+/// Decode threads. whisper.cpp scales badly past the physical cores, and `std` only
+/// knows logical ones, so halve (SMT assumed). A GPU does the heavy work: 4 is plenty.
+fn thread_count(on_gpu: bool, logical: usize) -> i32 {
+    let n = if on_gpu { 4 } else { (logical / 2).clamp(1, 8) };
+    i32::try_from(n).unwrap_or(4)
+}
+
+fn threads_for(on_gpu: bool) -> i32 {
+    let logical = std::thread::available_parallelism().map_or(1, usize::from);
+    thread_count(on_gpu, logical)
 }
 
 fn open(path: &Path, gpu: Option<usize>) -> Result<(WhisperContext, WhisperState), WhisperError> {
@@ -86,7 +100,12 @@ impl Engine {
                     device: None,
                     warning: picked.warning,
                 };
-                return Ok(Self { ctx, state, info });
+                return Ok(Self {
+                    ctx,
+                    state,
+                    info,
+                    n_threads: threads_for(false),
+                });
             }
             Some(i) if !device::gpu_starts(i) => format!("cannot start {}", devices[i].name),
             Some(i) => match open(path, Some(i)) {
@@ -95,7 +114,12 @@ impl Engine {
                         device: Some(devices[i].name.clone()),
                         warning: picked.warning,
                     };
-                    return Ok(Self { ctx, state, info });
+                    return Ok(Self {
+                        ctx,
+                        state,
+                        info,
+                        n_threads: threads_for(true),
+                    });
                 }
                 Err(e) => e.to_string(),
             },
@@ -105,7 +129,12 @@ impl Engine {
             device: None,
             warning: Some(format!("running on CPU: {gpu_err}")),
         };
-        Ok(Self { ctx, state, info })
+        Ok(Self {
+            ctx,
+            state,
+            info,
+            n_threads: threads_for(false),
+        })
     }
 
     pub fn info(&self) -> &LoadInfo {
@@ -130,6 +159,7 @@ impl Engine {
         if !prompt.is_empty() {
             params.set_initial_prompt(&prompt);
         }
+        params.set_n_threads(self.n_threads);
         params.set_print_special(false);
         params.set_print_progress(false);
         params.set_print_realtime(false);
@@ -170,6 +200,26 @@ fn centis(t: i64) -> Millis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thread_count_table() {
+        // (on_gpu, logical threads, expected)
+        for (gpu, logical, want) in [
+            (false, 1, 1),
+            (false, 2, 1),
+            (false, 8, 4),
+            (false, 16, 8),
+            (false, 64, 8),
+            (true, 1, 4),
+            (true, 32, 4),
+        ] {
+            assert_eq!(
+                thread_count(gpu, logical),
+                want,
+                "gpu={gpu} logical={logical}"
+            );
+        }
+    }
 
     #[test]
     fn centis_to_millis() {
