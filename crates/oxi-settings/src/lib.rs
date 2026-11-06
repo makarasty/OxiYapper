@@ -1,7 +1,7 @@
 //! Slint settings window and first-run wizard (ARCHITECTURE section 4).
 
 mod ctx;
-mod ipc;
+pub mod ipc;
 mod pages;
 
 use std::io;

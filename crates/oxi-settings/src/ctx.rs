@@ -42,7 +42,7 @@ impl Ctx {
         let ctx = Self {
             layout,
             config: Rc::new(RefCell::new(file)),
-            ipc: Ipc,
+            ipc: Ipc::default(),
         };
         Ok((ctx, problem))
     }
