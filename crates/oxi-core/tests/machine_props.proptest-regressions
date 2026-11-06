@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 135db701878190818be14bebe0c84a8208dba702ea7776e10a462798798286a2 # shrinks to cfg = MachineConfig { mode: Push, double_tap_max_press: Millis(250), double_tap_gap: Millis(300), tap_max: Millis(300), max_recording: Millis(600000), warn_before: Millis(30000), watchdog_period: Millis(100), idle_unload: Millis(300000), overlay_hide: Millis(1500) }, steps = [(ChordDown, 0), (ChordDown, 53), (ChordUp, 247), (ModelLoaded, 0), (JobAudioReady(JobId(0)), 0), (ChordDown, 0), (ChordDown, 31), (ChordUp, 269), (JobAudioReady(JobId(1)), 0)]

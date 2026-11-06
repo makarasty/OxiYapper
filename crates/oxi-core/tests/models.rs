@@ -60,6 +60,37 @@ fn stamp_file_is_file_name_plus_ok() {
 }
 
 #[test]
+fn stamp_line_round_trips() {
+    let stamp = Stamp {
+        size: 77_691_713,
+        mtime_ms: 1_762_400_000_123,
+    };
+    assert_eq!(stamp.to_line(), "77691713 1762400000123\n");
+    assert_eq!(Stamp::parse(&stamp.to_line()), Some(stamp));
+    assert_eq!(Stamp::parse("77691713 1762400000123\r\n"), Some(stamp));
+    assert_eq!(Stamp::parse("77691713 1762400000123  \n"), Some(stamp));
+}
+
+#[test]
+fn stamp_garbage_is_rejected() {
+    for text in [
+        "",
+        "\n",
+        "77691713",
+        "77691713 ",
+        "77691713 x",
+        "-1 5",
+        "1 2 3",
+        "1  2",
+        " 1 2",
+        "1,2",
+        "ok",
+    ] {
+        assert_eq!(Stamp::parse(text), None, "{text:?}");
+    }
+}
+
+#[test]
 fn stamp_policy() {
     let entry = find("tiny").unwrap();
     let good = Stamp {
