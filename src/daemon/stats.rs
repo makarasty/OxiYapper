@@ -2,6 +2,7 @@
 //! summary the IPC thread reads from that file. Only counts reach this module: the coordinator
 //! sends word count and audio length, never the text (SPEC, History).
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
@@ -16,6 +17,53 @@ struct Entry {
     speech: Millis,
 }
 
+/// Entries kept while the file cannot be loaded; the oldest go first.
+const MAX_PENDING: usize = 64;
+
+/// The stats file and the entries not yet counted in it.
+struct Writer {
+    path: PathBuf,
+    /// Loaded on the first entry, and again after a failed load.
+    stats: Option<Stats>,
+    pending: VecDeque<Entry>,
+}
+
+impl Writer {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            stats: None,
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// Counts `entry` and any earlier one the file could not take. A file that cannot be loaded
+    /// keeps them for the next call.
+    fn add(&mut self, entry: Entry, today: Date) {
+        if self.pending.len() == MAX_PENDING {
+            self.pending.pop_front();
+        }
+        self.pending.push_back(entry);
+        if self.stats.is_none() {
+            self.stats = stats_store::load(&self.path)
+                .inspect_err(|e| tracing::warn!(kind = ?e.kind(), "stats not loaded"))
+                .ok();
+        }
+        let Some(stats) = self.stats.as_mut() else {
+            return;
+        };
+        for e in self.pending.drain(..) {
+            stats.record(today, e.words, e.speech);
+        }
+        // A file of a newer build is counted in memory only.
+        if stats.writable()
+            && let Err(e) = stats_store::save(&self.path, stats)
+        {
+            tracing::warn!(kind = ?e.kind(), "stats not saved");
+        }
+    }
+}
+
 /// Sends entries to the stats thread. Dropping it waits for the last write.
 pub struct Recorder {
     tx: Option<Sender<Entry>>,
@@ -27,21 +75,9 @@ impl Recorder {
     pub fn spawn(path: PathBuf, today: fn() -> Date) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::channel::<Entry>();
         let thread = thread::Builder::new().name("stats".into()).spawn(move || {
-            // Loaded on the first entry, and again after a failed load.
-            let mut stats: Option<Stats> = None;
+            let mut writer = Writer::new(path);
             for entry in rx {
-                if stats.is_none() {
-                    stats = stats_store::load(&path)
-                        .inspect_err(|e| tracing::warn!(kind = ?e.kind(), "stats not loaded"))
-                        .ok();
-                }
-                let Some(stats) = stats.as_mut().filter(|s| s.writable()) else {
-                    continue;
-                };
-                stats.record(today(), entry.words, entry.speech);
-                if let Err(e) = stats_store::save(&path, stats) {
-                    tracing::warn!(kind = ?e.kind(), "stats not saved");
-                }
+                writer.add(entry, today());
             }
         })?;
         Ok(Self {
@@ -123,6 +159,35 @@ mod tests {
             summary(None, today()),
             Stats::default().summary(today(), HEAT_WEEKS)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn entries_wait_for_a_file_that_cannot_be_loaded() {
+        let dir = std::env::temp_dir().join(format!("oxi-dstats-wait-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(stats::FILE)).unwrap(); // reading a directory fails
+        let today = Date::from_ymd(2026, 11, 7).unwrap();
+        let mut writer = Writer::new(dir.join(stats::FILE));
+        writer.add(
+            Entry {
+                words: 3,
+                speech: Millis(1_000),
+            },
+            today,
+        );
+        assert_eq!(writer.pending.len(), 1);
+        std::fs::remove_dir(dir.join(stats::FILE)).unwrap();
+        writer.add(
+            Entry {
+                words: 2,
+                speech: Millis(1_000),
+            },
+            today,
+        );
+        assert!(writer.pending.is_empty());
+        let sum = summary(Some(&dir.join(stats::FILE)), today);
+        assert_eq!((sum.dictations, sum.words), (2, 5));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

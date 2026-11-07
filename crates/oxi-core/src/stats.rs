@@ -15,13 +15,17 @@ use crate::types::Millis;
 
 /// The stats file in the data dir.
 pub const FILE: &str = "stats.json";
-/// A stats file that could not be read is renamed to this, and counting starts fresh.
+/// A stats file that could not be read is renamed to this (or `stats.bad-2`, `-3`, ...: an
+/// older copy is never replaced), and counting starts fresh.
 pub const BAD_FILE: &str = "stats.bad";
 /// Format version of [`FILE`]. A newer file is read for the fields this build knows and never
 /// written.
 pub const VERSION: u32 = 1;
 /// Rows older than this many days fold into [`Stats::before`], so the file stays small.
 pub const KEEP_DAYS: i32 = 3 * 366;
+/// A record dated further than this many days after the newest earlier row folds nothing: the
+/// clock is probably wrong, and folding is for good.
+const FOLD_MAX_JUMP: i32 = 31;
 /// Weeks the Home heatmap shows.
 pub const HEAT_WEEKS: u16 = 26;
 
@@ -202,6 +206,18 @@ impl Stats {
         Ok(serde_json::to_vec_pretty(self)?)
     }
 
+    /// The `version` of `json` if it is newer than [`VERSION`], even when the rest does not parse.
+    pub fn newer_version(json: &[u8]) -> Option<u32> {
+        #[derive(Deserialize)]
+        struct Head {
+            version: u32,
+        }
+        serde_json::from_slice::<Head>(json)
+            .ok()
+            .map(|h| h.version)
+            .filter(|&v| v > VERSION)
+    }
+
     /// A file of a newer build is never overwritten.
     pub const fn writable(&self) -> bool {
         self.version <= VERSION
@@ -209,6 +225,8 @@ impl Stats {
 
     /// One finished dictation on `today`, then rows older than [`KEEP_DAYS`] fold away.
     pub fn record(&mut self, today: Date, words: u64, speech: Millis) {
+        let newest = self.days.iter().rev().map(|d| d.date).find(|&d| d <= today);
+        let jumped = newest.is_some_and(|n| today > n.add_days(FOLD_MAX_JUMP));
         self.add(Day {
             date: today,
             n: Totals {
@@ -217,6 +235,9 @@ impl Stats {
                 speech_ms: speech.0,
             },
         });
+        if jumped {
+            return;
+        }
         let keep = self
             .days
             .partition_point(|d| d.date <= today.add_days(-KEEP_DAYS));

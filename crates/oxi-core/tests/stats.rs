@@ -203,11 +203,35 @@ mod stats {
         let mut s = Stats::default();
         s.record(today.add_days(-KEEP_DAYS - 10), 7, Millis(1000));
         s.record(today.add_days(-KEEP_DAYS + 1), 5, Millis(1000));
-        s.record(today, 3, Millis(1000));
+        s.record(today, 3, Millis(1000)); // far after the last row: folds nothing yet
+        assert_eq!(s.days.len(), 3);
+        s.record(today, 0, Millis(0));
         assert_eq!(s.days.len(), 2);
         assert_eq!(s.before.words, 7);
         let sum = s.summary(today, 1);
-        assert_eq!((sum.dictations, sum.words), (3, 15));
+        assert_eq!((sum.dictations, sum.words), (4, 15));
+    }
+
+    #[test]
+    fn a_wrong_future_clock_folds_no_history() {
+        let today = date(2026, 11, 7);
+        let mut s = used(&[today.add_days(-KEEP_DAYS + 5), today], 4);
+        s.record(today.add_days(2 * KEEP_DAYS), 1, Millis(1000)); // clock set years ahead
+        assert_eq!((s.days.len(), s.before), (3, Totals::default()));
+        s.record(today.add_days(1), 1, Millis(1000)); // clock fixed; the future row stays
+        assert_eq!(s.days.len(), 4);
+        assert_eq!(s.before, Totals::default());
+        s.record(today.add_days(2), 1, Millis(1000));
+        assert_eq!(s.before, Totals::default(), "the future row folds nothing");
+    }
+
+    #[test]
+    fn newer_version_is_read_even_when_the_rest_does_not_parse() {
+        let newer = format!(r#"{{"version":{},"days":{{"new":"shape"}}}}"#, VERSION + 1);
+        assert!(Stats::parse(newer.as_bytes()).is_err());
+        assert_eq!(Stats::newer_version(newer.as_bytes()), Some(VERSION + 1));
+        assert_eq!(Stats::newer_version(br#"{"version":1,"days":7}"#), None);
+        assert_eq!(Stats::newer_version(b"{half"), None);
     }
 
     #[test]

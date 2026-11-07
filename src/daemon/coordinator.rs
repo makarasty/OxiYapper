@@ -210,14 +210,18 @@ impl<H: ChordHook> Coordinator<H> {
             }
             Effect::Preload => send(&self.workers.whisper, WhisperCmd::Preload),
             Effect::Unload => send(&self.workers.whisper, WhisperCmd::Unload),
-            Effect::Transcribe(job) => match self.audio.remove(&job) {
-                Some(samples) => send(
-                    &self.workers.whisper,
-                    WhisperCmd::Transcribe { job, samples },
-                ),
-                // Cannot happen (the machine waits for JobAudioReady); fail the job, not the machine.
-                None => return Some(Event::TranscriptionFailed(job)),
-            },
+            Effect::Transcribe(job) => {
+                if let Some(samples) = self.audio.remove(&job) {
+                    send(
+                        &self.workers.whisper,
+                        WhisperCmd::Transcribe { job, samples },
+                    );
+                } else {
+                    // Cannot happen (the machine waits for JobAudioReady); fail the job, not the machine.
+                    self.spoken.remove(&job);
+                    return Some(Event::TranscriptionFailed(job));
+                }
+            }
             Effect::Paste(job) => match self.text.get(&job) {
                 Some(text) => send(
                     &self.workers.paste,
@@ -577,6 +581,16 @@ mod tests {
             (1, 2, 120, 1)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_job_without_audio_leaves_no_spoken_entry() {
+        let mut rig = Rig::new();
+        let job = JobId(9);
+        rig.c.spoken.insert(job, Millis(500));
+        let answer = rig.c.execute(&Effect::Transcribe(job));
+        assert_eq!(answer, Some(Event::TranscriptionFailed(job)));
+        assert!(rig.c.spoken.is_empty());
     }
 
     #[test]
