@@ -82,7 +82,7 @@ export component ClickCard inherits Rectangle {
     callback clicked;
     property <bool> down: root.enabled && (touch.pressed || root.force-pressed);
     property <bool> key-focus;
-    background: root.down ? Theme.bg-control-pressed : root.hover ? Theme.bg-control-hover : Theme.bg-card;
+    background: root.down ? Theme.bg-card-pressed : root.hover ? Theme.bg-control-hover : Theme.bg-card;
     border-color: Theme.stroke-card;
     border-width: 1px;
     border-radius: Theme.radius-card;

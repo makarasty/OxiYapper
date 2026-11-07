@@ -193,6 +193,24 @@ export component NumberField {
     accessible-role: spinbox;
     accessible-value: root.shown;
     accessible-enabled: root.live;
+    accessible-value-minimum: root.minimum;
+    accessible-value-maximum: root.maximum;
+    accessible-value-step: root.step;
+    accessible-action-increment => {
+        if (root.live) {
+            root.set(root.value + root.step);
+        }
+    }
+    accessible-action-decrement => {
+        if (root.live) {
+            root.set(root.value - root.step);
+        }
+    }
+    accessible-action-set-value(v) => {
+        if (root.live && v.is-float()) {
+            root.set(v.to-float());
+        }
+    }
 
     VerticalLayout {
         alignment: center;
@@ -210,7 +228,7 @@ export component NumberField {
                     input.focus();
                 }
                 scroll-event(event) => {
-                    if (!input.has-focus) {
+                    if (!input.has-focus || event.delta-y == 0) {
                         return reject;
                     }
                     root.set(root.value + (event.delta-y > 0 ? root.step : -root.step));

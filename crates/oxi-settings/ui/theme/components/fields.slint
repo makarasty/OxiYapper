@@ -107,6 +107,7 @@ export component Combo inherits ComboBox {
 export component TextField inherits LineEdit {
     in property <bool> locked: Shell.locked;
     read-only: root.locked;
+    opacity: root.locked ? 0.6 : 1;
     font-size: Theme.body-size;
     height: Theme.control-height;
     horizontal-stretch: 1;
@@ -116,6 +117,7 @@ export component TextField inherits LineEdit {
 export component TextArea inherits TextEdit {
     in property <bool> locked: Shell.locked;
     read-only: root.locked;
+    opacity: root.locked ? 0.6 : 1;
     font-size: Theme.body-size;
     min-height: 120px;
     wrap: word-wrap;

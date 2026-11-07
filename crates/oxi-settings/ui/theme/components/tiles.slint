@@ -43,7 +43,7 @@ export component Tile inherits Rectangle {
     border-radius: Theme.radius-card;
     border-width: 1px;
     border-color: Theme.stroke-card;
-    background: root.selected ? Theme.accent-tint : root.pressed && !root.read-only ? Theme.bg-control-pressed : root.hover && !root.read-only ? Theme.bg-control-hover : Theme.bg-card;
+    background: root.selected ? Theme.accent-tint : root.pressed && !root.read-only ? Theme.bg-card-pressed : root.hover && !root.read-only ? Theme.bg-control-hover : Theme.bg-card;
     opacity: root.read-only ? 0.4 : 1;
     inner := VerticalLayout {
         padding: Theme.space-3;

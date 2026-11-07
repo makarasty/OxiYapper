@@ -73,6 +73,8 @@ export component ActivityHeatmap {
     in property <[int]> levels;
     in property <[MonthLabel]> months;
     in property <int> today: -1;
+    // Spoken summary of the grid (the cells are drawn, not readable).
+    in property <string> summary;
     in property <[string]> day-labels: [@tr("Sun"), @tr("Mon"), @tr("Tue"), @tr("Wed"), @tr("Thu"), @tr("Fri"), @tr("Sat")];
     in property <string> less-text: @tr("Less");
     in property <string> more-text: @tr("More");
@@ -88,6 +90,7 @@ export component ActivityHeatmap {
     }
 
     accessible-role: image;
+    accessible-label: root.summary;
     min-width: root.label-w + root.weeks * root.pitch;
     min-height: grid.height + legend.height + Theme.space-3;
 

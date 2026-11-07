@@ -73,6 +73,8 @@ export global Theme {
     out property <color> bg-control: dark ? #2F2F2F : #FFFFFF;
     out property <color> bg-control-hover: dark ? #353535 : #F6F6F6;
     out property <color> bg-control-pressed: dark ? #2A2A2A : #EDEDED;
+    // Pressed fill for whole-card buttons: bg-control-pressed equals the dark card, so it needs its own step.
+    out property <color> bg-card-pressed: dark ? #222222 : #EDEDED;
     out property <color> bg-subtle-hover: dark ? #FFFFFF0F : #0000000A;
     out property <color> bg-subtle-selected: dark ? #FFFFFF14 : #0000000F;
     out property <color> bg-inset: dark ? #FFFFFF1A : #00000014;

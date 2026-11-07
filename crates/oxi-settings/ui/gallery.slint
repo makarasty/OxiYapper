@@ -1492,7 +1492,7 @@ component GallerySheet inherits VerticalLayout {
                             today: root.activity.length - 1;
                             cell: 16px;
                             gap: 4px;
-                            accessible-label: "Speaking activity, last 26 weeks";
+                            summary: "Speaking activity, last 26 weeks";
                         }
                     }
                 }
@@ -1528,6 +1528,7 @@ export component GalleryWindow inherits Window {
                 width: 200px;
                 items: ["Light", "Dark"];
                 selected: root.dark ? 1 : 0;
+                locked: false;
                 picked(i) => {
                     root.dark = i == 1;
                 }
