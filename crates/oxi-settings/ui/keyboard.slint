@@ -57,8 +57,9 @@ export component Keyboard inherits Rectangle {
             width: parent.width - 2px;
             accessible-role: none;
             text: cap.label;
-            // Sized so the longest word fits the cap without breaking inside it.
-            font-size: min(8px, (parent.width - 2px) / max(1, cap.word) * 1.4);
+            // Sized so the longest word fits the cap without breaking inside it; never under 7 px (the
+            // layout keeps 1-unit labels to 3 characters, which fit at 7 px).
+            font-size: max(7px, min(8px, (parent.width - 2px) / max(1, cap.word) * 1.5));
             wrap: word-wrap;
             overflow: elide;
             horizontal-alignment: center;

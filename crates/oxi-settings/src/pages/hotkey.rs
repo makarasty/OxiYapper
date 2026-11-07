@@ -31,6 +31,7 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     drop(file);
     s.set_columns(keyboard_layout::WIDTH);
     s.set_rows(keyboard_layout::HEIGHT);
+    s.set_online(ctx.ipc.link() == Link::Online);
 
     let layout = keyboard_layout::caps();
     let caps: Vec<KeyCap> = layout
@@ -95,8 +96,8 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         let Some(p) = p.upgrade() else { return };
         match event {
             Event::Push(Push::Key { code, down }) => p.pressed(*code, *down),
-            Event::Link(Link::Online) => p.relinked(),
-            _ => {}
+            Event::Link(link) => p.linked(*link),
+            Event::Push(_) => {}
         }
     });
 }
@@ -172,11 +173,16 @@ impl Picker {
         self.show();
     }
 
-    /// A new daemon (restart) has no capture: ask again, and forget keys whose key-up was lost.
-    fn relinked(&self) {
+    /// Without a daemon nothing captures and Apply is off. A new one (restart) has no capture:
+    /// ask again. Keys whose key-up was lost are forgotten either way.
+    fn linked(&self, link: Link) {
+        let online = link == Link::Online;
+        self.with(|s| s.set_online(online));
         if self.capturing.get() {
             self.held.borrow_mut().clear();
-            self.ctx.ipc.send(Request::CaptureHotkey { on: true });
+            if online {
+                self.ctx.ipc.send(Request::CaptureHotkey { on: true });
+            }
             self.show();
         }
     }
@@ -246,6 +252,10 @@ impl Picker {
     }
 
     fn apply(&self) {
+        // A disabled button still runs its accessible default action.
+        if self.ctx.ipc.link() != Link::Online {
+            return;
+        }
         let chord = Chord::from_keys(&self.pending.borrow());
         match chord {
             Ok(chord) => {
@@ -331,6 +341,7 @@ mod tests {
     use slint::ComponentHandle;
     use slint::platform::WindowEvent;
 
+    use crate::generated::HotkeyState;
     use crate::ipc::{Cmd, Event, Ipc, Link};
     use crate::{AppWindow, Ctx, Page};
 
@@ -491,23 +502,75 @@ mod tests {
         assert_eq!(captures(&sent), Vec::<bool>::new());
     }
 
+    /// Smallest font on any cap at the smallest window, 1x.
+    const CAP_FONT_FLOOR: f32 = 7.0;
+
     #[test]
-    fn long_labels_stay_readable_at_the_smallest_window() {
+    fn no_cap_text_falls_below_the_floor_at_the_smallest_window() {
         let (window, _ipc, _sent) = open("labels");
         window
             .window()
             .set_size(slint::LogicalSize::new(560.0, 600.0));
         one(&window, "Change hotkey").invoke_accessible_default_action();
-        for k in [Key::Backspace, Key::CapsLock, Key::NumLock] {
-            let label = super::keyboard_layout::cap_label(k);
-            let cap = one(&window, &super::keyboard_layout::spoken(k));
+        let mut smallest = f32::MAX;
+        for cap in super::keyboard_layout::caps() {
+            let label = super::keyboard_layout::cap_label(cap.key);
+            let el = one(&window, &super::keyboard_layout::spoken(cap.key));
             // keyboard.slint: the text box is the cap less 2 px, the font
-            // min(8px, box / longest word * 1.4).
-            let room = cap.size().width - 2.0;
+            // max(7px, min(8px, box / longest word * 1.5)). The floor must only absorb rounding:
+            // a word that needs a smaller font would not fit its cap.
+            let room = el.size().width - 2.0;
             #[allow(clippy::cast_precision_loss, reason = "a label has a few characters")]
-            let font = (room / label.chars().count() as f32 * 1.4).min(8.0);
-            assert!(!label.contains(' ') && font >= 6.5, "{label}: {font} px");
+            let fitted = (room / super::longest_word(label) as f32 * 1.5).min(8.0);
+            assert!(fitted >= CAP_FONT_FLOOR - 0.1, "{label}: {fitted} px");
+            let font = fitted.max(CAP_FONT_FLOOR);
+            smallest = smallest.min(font);
         }
+        println!("smallest cap font: {smallest} px");
+    }
+
+    #[test]
+    fn a_lost_daemon_clears_held_keys_and_turns_apply_off_until_it_is_back() {
+        let (window, ipc, sent) = open("offline");
+        one(&window, "Change hotkey").invoke_accessible_default_action();
+        let _ = one(&window, "Left Ctrl");
+        key(&ipc, Key::LAlt, true);
+        assert_eq!(captures(&sent), [true]);
+        let apply = || one(&window, "Apply hotkey").accessible_enabled();
+        assert_eq!(apply(), Some(true));
+        ipc.deliver(&Event::Link(Link::Offline));
+        assert_eq!(apply(), Some(false));
+        assert_eq!(
+            one(&window, "Left Alt").accessible_description().as_deref(),
+            Some("")
+        );
+        // The accessible default action of the disabled Apply does nothing.
+        one(&window, "Apply hotkey").invoke_accessible_default_action();
+        assert!(board_open(&window));
+        // Online again: capture is asked for once more and Apply is back.
+        ipc.deliver(&Event::Link(Link::Online));
+        assert_eq!(captures(&sent), [true]);
+        assert_eq!(apply(), Some(true));
+    }
+
+    #[test]
+    fn a_chord_ending_hands_the_focus_to_apply_and_esc_to_cancel() {
+        let (window, ipc, _sent) = open("focus-move");
+        let state = window.global::<HotkeyState>();
+        one(&window, "Change hotkey").invoke_accessible_default_action();
+        let _ = one(&window, "Left Ctrl");
+        assert_eq!(state.get_move_focus(), 0);
+        key(&ipc, Key::F13, true);
+        key(&ipc, Key::F13, false);
+        // The board's change handler moves the focus; `releasing_a_chord_ends_capture_and_space_
+        // applies_it` shows that Space then presses Apply.
+        assert_eq!(state.get_move_focus(), 1);
+        // Back on the board, Esc alone points at Cancel.
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
+        one(&window, "F5").mock_single_click(slint::platform::PointerEventButton::Left);
+        assert_eq!(state.get_move_focus(), 0);
+        key(&ipc, Key::Esc, true);
+        assert_eq!(state.get_move_focus(), 2);
     }
 
     #[test]
