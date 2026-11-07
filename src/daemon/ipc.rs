@@ -136,6 +136,11 @@ fn bind_at(name: &str) -> anyhow::Result<Start> {
     match Server::bind(name) {
         Ok(server) => Ok(Start::Serve(server)),
         Err(Error::AlreadyRunning) => {
+            // This launch has the user's input; without passing it on, the settings window the
+            // daemon raises or starts stays behind the app in front.
+            if let Err(e) = oxi_platform::os::foreground::allow_any() {
+                tracing::debug!(kind = ?e.kind(), "foreground not passed on");
+            }
             forward_open_settings(name).map_err(refusal)?;
             Ok(Start::Forwarded)
         }
@@ -550,11 +555,14 @@ impl Host for SystemHost {
         {
             return Ok(()); // still starting; it will connect
         }
-        *child = Some(
-            std::process::Command::new(std::env::current_exe()?)
-                .arg("settings")
-                .spawn()?,
-        );
+        let started = std::process::Command::new(std::env::current_exe()?)
+            .arg("settings")
+            .spawn()?;
+        // Its first window comes to the front only with this permission.
+        if let Err(e) = self.allow_foreground(started.id()) {
+            tracing::debug!(kind = ?e.kind(), "foreground not allowed for settings");
+        }
+        *child = Some(started);
         Ok(())
     }
 }

@@ -1,14 +1,23 @@
 //! Bring a window of this process to the front. Windows lets a process take the foreground only
-//! with the user's last input or with permission from the process that has it; the daemon grants
-//! it (`AllowSetForegroundWindow`) before it asks the settings window to raise.
+//! with the user's last input or with permission from the process that has it. A second launch has
+//! the user's input and grants it to every process ([`allow_any`]); the daemon passes it on
+//! (`AllowSetForegroundWindow`) to the settings window it raises or starts.
 
 use std::io;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumThreadWindows, IsIconic, IsWindowVisible, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    ASFW_ANY, EnumThreadWindows, IsIconic, IsWindowVisible, SW_RESTORE, SetForegroundWindow,
+    ShowWindow,
 };
+
+/// Lets any process take the foreground until the user's next input. A second launch calls it
+/// before it forwards `OpenSettings`: it does not know the daemon's process id, and the daemon
+/// can only pass on a permission it was given.
+pub fn allow_any() -> io::Result<()> {
+    super::pipe::allow_foreground(ASFW_ANY)
+}
 
 /// Restores `hwnd` if it is minimised, then makes it the foreground window. Refusal by the OS
 /// is logged by kind and otherwise ignored: the window stays where it is.

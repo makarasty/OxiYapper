@@ -8,11 +8,12 @@ mod pages;
 mod testing;
 
 use std::io;
+use std::time::Duration;
 
 use oxi_core::config::{ConfigError, Theme};
 use oxi_core::ipc::Push;
 use oxi_core::paths::Layout;
-use slint::{ComponentHandle, Weak};
+use slint::{ComponentHandle, Timer, TimerMode, Weak};
 
 pub use ctx::Ctx;
 pub use ipc::Ipc;
@@ -24,6 +25,12 @@ mod generated {
     slint::include_modules!();
 }
 pub use generated::{AppWindow, Page, Shell, ThemeChoice};
+
+/// How often the window looks for an edit of `config.toml` from outside (an editor, "Open
+/// file"): a fixed file clears the banner and refreshes the pages without reopening.
+// shortcut: a metadata poll, not a file watcher (`notify` is not a dependency of this crate);
+// switch to a watcher if the second of delay matters.
+pub const FILE_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -46,6 +53,13 @@ pub fn run() -> Result<(), Error> {
         options.spawn = watch_spawn(options.spawn, window.as_weak());
         Ok(Some(Ipc::connect(options)?))
     })?;
+    // A window opened by a second launch must not show behind the app the user is in; the
+    // daemon allowed this process to take the foreground. The callback runs once the event loop
+    // has created and shown the window.
+    #[cfg(windows)]
+    let _ = slint::invoke_from_event_loop(|| {
+        oxi_platform::os::foreground::raise_current_thread_window();
+    });
     window.run()?;
     Ok(())
 }
@@ -92,11 +106,7 @@ fn open_inner(
     if let Some(ipc) = &followed {
         ctx.ipc = ipc.clone();
     }
-    if let Some(problem) = &problem {
-        window.set_banner_text(problem.to_string().into());
-        // A broken file gets "Open file" and "Reset to defaults"; a newer one only the message.
-        window.set_banner_fixable(!matches!(problem, ConfigError::ReadOnly));
-    }
+    show_problem(&window, problem.as_ref());
 
     let weak = window.as_weak();
     let c = ctx.clone();
@@ -133,12 +143,22 @@ fn open_inner(
         on_daemon_event(&window, &Event::Link(ctx.ipc.link()));
         events
     });
+    let linked = followed.is_some();
+    let poll = Timer::default();
+    poll.start(TimerMode::Repeated, FILE_POLL, {
+        let (weak, c) = (window.as_weak(), ctx.clone());
+        move || {
+            if let Some(window) = weak.upgrade() {
+                reload(&window, &c, linked);
+            }
+        }
+    });
     let ipc = ctx.ipc.clone();
     window.on_start_daemon({
         let weak = window.as_weak();
         move || {
             // Held by this callback, which lives as long as the window.
-            let _ = &banner;
+            let _ = (&banner, &poll);
             if let Some(window) = weak.upgrade() {
                 window.set_spawn_error("".into());
             }
@@ -158,6 +178,30 @@ fn open_inner(
 
     bind(&window, &ctx);
     Ok(window)
+}
+
+/// The config banner for `problem`; `None` clears it.
+fn show_problem(window: &AppWindow, problem: Option<&ConfigError>) {
+    window.set_banner_text(problem.map(ToString::to_string).unwrap_or_default().into());
+    // A broken file gets "Open file" and "Reset to defaults"; a newer one only the message.
+    window.set_banner_fixable(!matches!(problem, Some(ConfigError::ReadOnly)));
+}
+
+/// Applies an edit of the file from outside: the banner, the lock and every page follow it. A
+/// valid file also drops what the last failure left: the save error and the daemon's
+/// `ConfigError` notice (the daemon sends nothing when a reload succeeds).
+fn reload(window: &AppWindow, ctx: &Ctx, linked: bool) {
+    let Some(problem) = ctx.reload_if_changed() else {
+        return;
+    };
+    show_problem(window, problem.as_ref());
+    if problem.is_none() {
+        window.set_action_error("".into());
+        if linked {
+            on_daemon_event(window, &Event::Link(ctx.ipc.link()));
+        }
+    }
+    bind(window, ctx);
 }
 
 /// The daemon banner follows the link; a push that is not a notice leaves it alone.
