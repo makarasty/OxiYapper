@@ -84,7 +84,7 @@ crates/oxi-whisper      whisper-rs wrapper: load/unload, ggml device list, trans
 crates/oxi-settings     Slint UI (settings window and first-run wizard)
 ```
 
-Only `oxi-core` and `oxi-whisper` exist today; the other two arrive with their milestones (`members = ["crates/*"]` picks them up).
+All four crates exist (`members = ["crates/*"]` picks up new ones). `oxi-platform` has only the Windows module so far; macOS and Linux arrive with their milestones. The daemon (`src/daemon/`) is `#[cfg(windows)]`: on other OSes `OxiYapper` prints "not supported on this OS yet" and exits, so the workspace still builds and tests there.
 
 Why a workspace and not one crate:
 
@@ -92,7 +92,13 @@ Why a workspace and not one crate:
 - **Compile time.** whisper.cpp (CMake, minutes) and Slint (build script, large) sit in their own crates. Editing the state machine or paste code recompiles neither, and `cargo test -p oxi-core` never builds them.
 - **Boundaries agents can see.** A change to paste behaviour on macOS touches `oxi-platform/src/macos/paste.rs`; a change to what happens on Esc touches `oxi-core/src/machine.rs`.
 
-Platform code: each concern is a trait in `oxi-platform` (`Hotkey`, `Paster`, `Clipboard`, `Overlay`, `Tray`, `Autostart`, `Capture`, `SessionEvents`). One implementation per OS in `src/windows/`, `src/macos/`, `src/linux/`, picked with `#[cfg(target_os = ...)]` and re-exported as `oxi_platform::Platform`. The app holds the traits generically, so daemon wiring tests use fakes. No `dyn` dispatch where one implementation exists per build.
+Platform code: one module per OS in `src/windows/`, `src/macos/`, `src/linux/`, picked with `#[cfg(target_os = ...)]` and re-exported as `oxi_platform::os`. A concern gets a trait where a fake is useful: `Capture` is in `oxi-platform`; the paste traits `Clipboard` and `Input` are in `oxi-core::paste` (below). The other Windows pieces (hook, tray, overlay, named pipe) are plain types for now. No `dyn` dispatch where one implementation exists per build.
+
+Paste in core: `oxi-core::paste` holds the traits `Clipboard` (snapshot, set text, sequence number, restore) and `Input` (modifier state, foreground app, chord, Unicode typing, sleep) and the whole algorithm of section 10 as `plan` (pick mode, chord, delay from the rules) and `paste`, plus `copy_only`. `oxi-platform` only implements the two traits per OS, so every branch of section 10 is tested with fakes and no clipboard. Result type: `PasteOutcome`.
+
+Tray: raw `Shell_NotifyIconW` through `windows-sys` (icon, menu, balloons, `TaskbarCreated`, power and session messages) on the main thread loop. No `tray-icon` and no `clipboard-win` crate; `windows-sys` features are listed in `crates/oxi-platform/Cargo.toml`.
+
+Overlay text: the label font is an `ab_glyph` `FontRef` handed to `Overlay::new`, meant to be the system Segoe UI. Without a font the pill shows its icon and meter only; the daemon passes no font yet.
 
 ## 5. IPC, daemon <-> settings
 
@@ -118,6 +124,8 @@ Framing: one JSON object per line (`serde_json`), max 1 MiB per line, tagged enu
 
 Versioning: `proto` is an integer, starting at 1. Adding an optional field (serde default) does not bump it; renaming or removing a field or changing meaning does. `Hello`, `HelloAck` and `Shutdown` never change shape. On a mismatch (exe updated while the old daemon runs) settings shows "Restart OxiYapper to finish the update" and a button that sends `Shutdown` and relaunches the daemon.
 
+Live meter: the settings Audio page does not read `LEVEL` over IPC. While the page is shown, settings opens its own capture (`CpalCapture`) and polls its `LevelMeter` at 30 Hz; the capture closes when the page goes away. The daemon's mic is still opened only on key-down. Settings reopens the stream every 60 s to bound the memory the capture keeps.
+
 Hotkey capture: while `CaptureHotkey { on: true }` the daemon pauses the chord, forwards raw key events and swallows them only while the settings window is foreground. Capture ends when settings sends `on: false`, loses focus, or the connection drops. This is the one place keystrokes leave the hook, which is why the socket is owner-only.
 
 ## 6. Config
@@ -139,6 +147,7 @@ denoise = false
 trim = true
 tail_ms = 100
 max_seconds = 600              # SPEC round 4: 10 min cap
+meter_sensitivity_db = 0.0     # level meter display only (overlay, settings); -20..+20
 [model]
 id = "turbo"                   # registry id, or "custom"
 custom_path = ""
@@ -165,7 +174,11 @@ autostart = true
 update_check = true
 [debug]
 log_text = false               # dictated text in logs only when true
+[ui]
+theme = "system"               # system | dark | light
 ```
+
+`audio.meter_sensitivity_db` scales only the meter that is drawn, never the audio whisper gets. A value outside -20..+20 is clamped (NaN becomes 0.0) and the load adds a message to `ConfigFile.warnings`. `[ui] theme` is the colour scheme of the settings window: `system` follows the OS light/dark setting. Both keys are optional, and an older file without them loads with the defaults.
 
 Per-app paste rules answer "games, terminals, remote desktop" without a toggle the user flips by hand. App identity: exe name on Windows, bundle id on macOS, `WM_CLASS` on X11.
 
@@ -288,7 +301,7 @@ Paste and clipboard
 
 System
 44. Overlay over a fullscreen game: no-activate, click-through, topmost, tool window, shown with `SW_SHOWNOACTIVATE`, drawn with `UpdateLayeredWindow` (no WM_PAINT, no flicker). `hide_over_fullscreen` uses `SHQueryUserNotificationState` (D3D fullscreen, busy, presentation).
-45. Two monitors, DPI change: position and scale are computed on every show from the monitor of the foreground window, its work area (taskbar excluded) and its DPI (per-monitor v2 manifest).
+45. Two monitors, DPI change: position and scale are computed on every show from the monitor of the foreground window, its work area (taskbar excluded) and its DPI. `Overlay::new` calls `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`, so DPI awareness does not depend on a manifest; the call failing because a manifest (planned in ROADMAP M11) or an earlier call already set it is fine.
 46. Sleep: cancel recording, unload the model. Resume: reinstall the hook; audio reopens on the next key-down anyway.
 47. Screen locked while recording: cancel and discard (the user walked away on purpose).
 48. Settings and daemon writing config at once: cannot happen, one writer per file (section 6).
@@ -331,6 +344,8 @@ Whisper (`oxi-whisper`, Linux CPU in CI): ggml-tiny.bin cached and checked again
 Settings UI (`oxi-settings`): `i-slint-backend-testing` (pinned to the slint version) for the hotkey picker, token counter warning and wizard steps, without a display.
 
 Platform smoke tests (`oxi-platform`, per OS in CI where the runner allows): clipboard snapshot/restore round trip, exclusion formats present, autostart register/unregister in a temp entry, overlay window flags. Input injection and hooks cannot run on CI runners.
+
+Live tests need a real desktop and are off unless their env var is `1` (list in `CONTRIBUTING.md`): hook, `SendInput`, clipboard, overlay window, tray icon, microphone and the whole daemon. Live tests never inject Ctrl+Win, because the owner's dictation tool listens on it; hook tests use F13 chords. Only the clipboard tests run in CI (Windows clippy job).
 
 Owner acceptance (local, never in CI): `OxiYapper bench "$OXI_BENCH_DIR"` on the 8 reference phrases; text must equal the bench text for all 8.
 
