@@ -254,7 +254,7 @@ impl Changed {
 }
 
 /// `read_to_string`, retried when the failure may pass (a sharing violation).
-fn read_with_retry(path: &Path) -> io::Result<String> {
+pub(super) fn read_with_retry(path: &Path) -> io::Result<String> {
     let mut retries = 0;
     loop {
         match fs::read_to_string(path) {
