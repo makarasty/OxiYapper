@@ -5,8 +5,6 @@
 //! `CancelDownload` is heard while the transfer runs. Progress and the end go to the settings
 //! window as pushes; with no window open they are dropped and the download carries on.
 
-#![allow(dead_code, reason = "run.rs (t40) calls spawn")]
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};

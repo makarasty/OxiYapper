@@ -4,8 +4,6 @@
 //! (Unload, then Preload); a `Config` alone never unloads or reloads. Dictated text and audio
 //! never reach a log: only lengths, kinds and model names do.
 
-#![allow(dead_code, reason = "run.rs (t40) calls spawn")]
-
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::{self, JoinHandle};

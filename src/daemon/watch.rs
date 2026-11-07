@@ -5,11 +5,6 @@
 //! life. `notify` is how a tray notice reaches the UI (`run.rs` wraps `UiCmd::Notify` and the
 //! UI wake-up): once per reload that failed (`ConfigInvalid`) or was corrected (`ConfigAdjusted`).
 
-#![allow(
-    dead_code,
-    reason = "run.rs (t40) starts the watcher; until then only the tests do"
-)]
-
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::path::Path;

@@ -13,8 +13,6 @@
 //!
 //! Dictated text never reaches this module; log lines carry kinds and counts only.
 
-#![allow(dead_code, reason = "run.rs (t40) calls bind and spawn")]
-
 use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

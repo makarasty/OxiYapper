@@ -4,11 +4,6 @@
 //! text by `JobId`, the active and pending config, the last pasted text. Every decision stays in
 //! the machine (ARCHITECTURE 3); this module only carries values to the right worker.
 
-#![allow(
-    dead_code,
-    reason = "run.rs (t40) spawns the coordinator; until then only the tests use it"
-)]
-
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
