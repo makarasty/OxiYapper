@@ -2,20 +2,22 @@
 //!
 //! The meter opens its own capture while the page is shown (decision D3) and polls it at
 //! [`METER_HZ`] through the core [`Meter`]; leaving the page or closing the window closes it.
+//! The Test button records [`TEST_LENGTH`] through the dictation pipeline and plays it back.
 
+use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use oxi_core::audio::db_to_linear;
+use oxi_core::audio::{AudioError, Level, SAMPLE_RATE, db_to_linear};
 use oxi_core::config::{Audio, Config};
 use oxi_core::overlay::{METER_HZ, Meter};
 use oxi_core::strings::{self, NO_MIC};
 use oxi_core::types::{Language, Millis};
 use oxi_platform::capture::{
-    Capture, CaptureError, CaptureEvent, CpalCapture, LevelMeter, list_input_devices,
+    Capture, CaptureError, CaptureEvent, CpalCapture, LevelMeter, list_input_devices, play,
 };
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
@@ -34,6 +36,11 @@ const REOPEN: Millis = Millis(60_000);
 const SETTLE: Millis = Millis(300);
 /// How often the device list is read again while the page is shown (a listing takes ~2 ms).
 const RELIST: Millis = Millis(2_000);
+/// An open mic that gave only exact zeros this long gets the no-signal note (a muted or switched
+/// off headset; a quiet room is never exactly zero).
+const NO_SIGNAL: Millis = Millis(1_000);
+/// Length of the Test button's recording.
+const TEST_LENGTH: Millis = Millis(3_000);
 
 /// Opens a capture feeding the meter; the flag is set when the stream stops on its own.
 type Opener<C> = fn(&Audio, LevelMeter, Arc<AtomicBool>) -> Result<Opened<C>, CaptureError>;
@@ -43,12 +50,18 @@ struct Io<C> {
     open: Opener<C>,
     list: fn() -> Result<Vec<String>, CaptureError>,
     now: fn() -> Millis,
+    play: Player,
 }
 
-/// An open capture, and whether its configured device was missing so the default opened.
+/// Plays a mono clip at the given rate; the handle keeps it playing.
+type Player = fn(&[f32], u32) -> Result<Box<dyn Any>, CaptureError>;
+
+/// An open capture, whether its configured device was missing so the default opened, and the
+/// name of the device it runs on.
 struct Opened<C> {
     capture: C,
     fell_back: bool,
+    name: String,
 }
 
 fn open_cpal(
@@ -60,7 +73,16 @@ fn open_cpal(
         dead.store(true, Ordering::Relaxed);
     })?;
     let fell_back = capture.fell_back_to_default();
-    Ok(Opened { capture, fell_back })
+    let name = capture.device_name().to_owned();
+    Ok(Opened {
+        capture,
+        fell_back,
+        name,
+    })
+}
+
+fn play_cpal(clip: &[f32], rate: u32) -> Result<Box<dyn Any>, CaptureError> {
+    Ok(Box::new(play(clip, rate)?))
 }
 
 fn since_start() -> Millis {
@@ -74,11 +96,12 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         open: open_cpal,
         list: list_input_devices,
         now: since_start,
+        play: play_cpal,
     };
     bind_with(window, ctx, &io);
 }
 
-fn bind_with<C: 'static>(window: &AppWindow, ctx: &Ctx, io: &Io<C>) -> Rc<PageState<C>> {
+fn bind_with<C: Capture + 'static>(window: &AppWindow, ctx: &Ctx, io: &Io<C>) -> Rc<PageState<C>> {
     let state = window.global::<AudioState>();
     push_config(&state, &ctx.config.borrow().config, &Devices::default());
 
@@ -92,12 +115,17 @@ fn bind_with<C: 'static>(window: &AppWindow, ctx: &Ctx, io: &Io<C>) -> Rc<PageSt
         list: io.list,
         now: io.now,
         timer: Timer::default(),
+        open: io.open,
+        play: io.play,
+        test: RefCell::new(None),
     });
 
     let p = Rc::clone(&page);
     state.on_shown(move || p.shown());
     let p = Rc::clone(&page);
     state.on_edited(move |key, value| p.edited(key, value));
+    let p = Rc::clone(&page);
+    state.on_test(move || p.start_test());
     // Reset to defaults rebinds while the page may be open: its meter must keep running.
     if window.get_page() == Page::Audio {
         page.shown();
@@ -114,9 +142,25 @@ struct PageState<C> {
     list: fn() -> Result<Vec<String>, CaptureError>,
     now: fn() -> Millis,
     timer: Timer,
+    open: Opener<C>,
+    play: Player,
+    test: RefCell<Option<MicTest<C>>>,
 }
 
-impl<C: 'static> PageState<C> {
+/// The Test button's run: a recording, then its playback; each step ends at `until`.
+enum MicTest<C> {
+    Recording {
+        capture: C,
+        name: String,
+        until: Millis,
+    },
+    Playing {
+        _sound: Box<dyn Any>,
+        until: Millis,
+    },
+}
+
+impl<C: Capture + 'static> PageState<C> {
     /// The page was built (opened from the rail): list the devices and start the meter.
     fn shown(self: &Rc<Self>) {
         let Some(window) = self.window.upgrade() else {
@@ -176,6 +220,8 @@ impl<C: 'static> PageState<C> {
             live.tick(&opts, now);
             state.set_clipping(live.meter.clipping(now));
             state.set_note(live.note.clone().unwrap_or_default().into());
+            state.set_silence(live.no_signal(now).unwrap_or_default().into());
+            self.advance_test(&state, now);
             let fallback = live.fell_back.then(|| {
                 format!(
                     "{} is not connected, showing the system default",
@@ -188,10 +234,78 @@ impl<C: 'static> PageState<C> {
             self.timer.stop();
             state.set_clipping(false);
             state.set_fallback(SharedString::new());
+            state.set_silence(SharedString::new());
+            *self.test.borrow_mut() = None;
+            state.set_testing(false);
+            state.set_test_status(SharedString::new());
         }
         state.set_live(live.is_open());
         let bars: Vec<f32> = live.meter.bars().collect();
         state.set_bars(ModelRc::from(Rc::new(VecModel::from(bars))));
+    }
+
+    /// The Test button: record from the configured mic through the dictation pipeline (trim off,
+    /// so a quiet test is still played), then play it back in `tick`.
+    fn start_test(&self) {
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let state = window.global::<AudioState>();
+        if self.test.borrow().is_some() {
+            return;
+        }
+        let opts = Audio {
+            trim: false,
+            ..self.ctx.config.borrow().config.audio.clone()
+        };
+        let dead = Arc::new(AtomicBool::new(false));
+        match (self.open)(&opts, LevelMeter::default(), dead) {
+            Ok(opened) => {
+                *self.test.borrow_mut() = Some(MicTest::Recording {
+                    capture: opened.capture,
+                    name: opened.name,
+                    until: (self.now)() + TEST_LENGTH,
+                });
+                state.set_test_status(strings::MIC_TEST_RECORDING.into());
+            }
+            Err(e) => state.set_test_status(strings::mic_test_failed(&note(&e)).into()),
+        }
+        state.set_testing(self.test.borrow().is_some());
+    }
+
+    /// Move the Test button's run on once its step is over.
+    fn advance_test(&self, state: &AudioState<'_>, now: Millis) {
+        let mut test = self.test.borrow_mut();
+        match test.take() {
+            Some(MicTest::Recording {
+                capture,
+                name,
+                until,
+            }) if now >= until => {
+                let played = capture
+                    .finish()
+                    .and_then(|clip| Ok(((self.play)(&clip, SAMPLE_RATE)?, clip.len())));
+                match played {
+                    Ok((sound, len)) => {
+                        let ms = len as u64 * 1000 / u64::from(SAMPLE_RATE);
+                        *test = Some(MicTest::Playing {
+                            _sound: sound,
+                            until: now + Millis(ms),
+                        });
+                        state.set_test_status(strings::MIC_TEST_PLAYING.into());
+                    }
+                    Err(CaptureError::Audio(AudioError::MicSilence)) => {
+                        state.set_test_status(strings::no_signal(&name).into());
+                    }
+                    Err(e) => state.set_test_status(strings::mic_test_failed(&note(&e)).into()),
+                }
+            }
+            Some(MicTest::Playing { until, .. }) if now >= until => {
+                state.set_test_status(SharedString::new());
+            }
+            other => *test = other,
+        }
+        state.set_testing(test.is_some());
     }
 
     fn edited(&self, key: AudioKey, value: f32) {
@@ -334,12 +448,15 @@ struct Live<C> {
     note: Option<String>,
     /// The open capture runs on the system default: the configured device is missing.
     fell_back: bool,
+    /// The open capture gave a non-zero sample.
+    heard: bool,
 }
 
 struct Running<C> {
     _capture: C,
     since: Millis,
     dead: Arc<AtomicBool>,
+    name: String,
 }
 
 impl<C> Live<C> {
@@ -354,6 +471,7 @@ impl<C> Live<C> {
             changed: None,
             note: None,
             fell_back: false,
+            heard: false,
         }
     }
 
@@ -386,15 +504,30 @@ impl<C> Live<C> {
         if stale || (settled && self.tried.as_ref() != Some(key)) {
             self.reopen(opts, now);
         }
+        self.show(self.level.read(), opts, now);
+    }
+
+    /// Feed one raw level into the meter, scaled by the gain.
+    fn show(&mut self, raw: Level, opts: &Audio, now: Millis) {
+        self.heard |= raw.peak > 0.0;
         #[expect(clippy::cast_possible_truncation, reason = "gain is a few dB")]
         let gain = db_to_linear(opts.gain_db as f32);
-        self.meter.push(self.level.read().scaled(gain), now);
+        self.meter.push(raw.scaled(gain), now);
+    }
+
+    /// The no-signal note once the open mic gave only exact zeros for [`NO_SIGNAL`].
+    fn no_signal(&self, now: Millis) -> Option<String> {
+        self.capture
+            .as_ref()
+            .filter(|r| !self.heard && now >= r.since + NO_SIGNAL)
+            .map(|r| strings::no_signal(&r.name))
     }
 
     fn reopen(&mut self, opts: &Audio, now: Millis) {
         // One stream at a time: the old one closes before the new one opens.
         self.capture = None;
         self.fell_back = false;
+        self.heard = false;
         self.tried = Some(opts.device.clone());
         self.changed = None;
         let dead = Arc::new(AtomicBool::new(false));
@@ -414,6 +547,7 @@ impl<C> Live<C> {
                     _capture: opened.capture,
                     since: now,
                     dead,
+                    name: opened.name,
                 });
             }
             Err(e) => self.note = Some(note(&e)),
@@ -446,6 +580,8 @@ mod tests {
         static NOW: Cell<Millis> = const { Cell::new(Millis(0)) };
         static LISTED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         static LIST_FAILS: Cell<bool> = const { Cell::new(false) };
+        static SILENT_CLIP: Cell<bool> = const { Cell::new(false) };
+        static PLAYED: Cell<usize> = const { Cell::new(0) };
     }
 
     struct Fake;
@@ -462,7 +598,41 @@ mod tests {
         Opened {
             capture: Fake,
             fell_back,
+            name: "Fake Mic".into(),
         }
+    }
+
+    /// The Test button's recording: `SILENT_CLIP` makes it all zeros, else one second.
+    impl Capture for Fake {
+        fn open(
+            _: &Audio,
+            _: LevelMeter,
+            _: impl FnMut(CaptureEvent) + Send + 'static,
+        ) -> Result<Self, CaptureError> {
+            Ok(opened(false).capture)
+        }
+        fn input_rate(&self) -> u32 {
+            SAMPLE_RATE
+        }
+        fn dropped_samples(&self) -> u64 {
+            0
+        }
+        fn fell_back_to_default(&self) -> bool {
+            false
+        }
+        fn finish(self) -> Result<Vec<f32>, CaptureError> {
+            if SILENT_CLIP.get() {
+                Err(AudioError::MicSilence.into())
+            } else {
+                Ok(vec![0.1; SAMPLE_RATE as usize])
+            }
+        }
+    }
+
+    #[expect(clippy::unnecessary_wraps, reason = "has the Player signature")]
+    fn fake_play(clip: &[f32], _: u32) -> Result<Box<dyn Any>, CaptureError> {
+        PLAYED.set(clip.len());
+        Ok(Box::new(()))
     }
 
     #[expect(clippy::unnecessary_wraps, reason = "has the Opener signature")]
@@ -518,6 +688,8 @@ mod tests {
         NOW.set(Millis(0));
         LISTED.with_borrow_mut(Vec::clear);
         LIST_FAILS.set(false);
+        SILENT_CLIP.set(false);
+        PLAYED.set(0);
     }
 
     /// The settings window on a fresh config dir, its Audio page on fakes.
@@ -545,6 +717,7 @@ mod tests {
             open,
             list: fake_list,
             now: fake_now,
+            play: fake_play,
         };
         let page = bind_with(&window, &ctx, &io);
         (window, page)
@@ -559,6 +732,80 @@ mod tests {
     fn frame(ms: u64) {
         NOW.set(NOW.get() + Millis(ms));
         mock_elapsed_time(Duration::from_millis(ms));
+    }
+
+    #[test]
+    fn mic_giving_only_zeros_gets_the_no_signal_note() {
+        reset();
+        let mut live = Live::new(fake, 0.0);
+        let opts = Audio::default();
+        let zero = Level {
+            peak: 0.0,
+            rms: 0.0,
+        };
+        live.tick(&opts, Millis(0));
+        live.show(zero, &opts, Millis(500));
+        assert_eq!(live.no_signal(Millis(500)), None, "too early");
+        live.show(zero, &opts, NO_SIGNAL);
+        let want = "No sound from Fake Mic. Reconnect it or pick another mic";
+        assert_eq!(live.no_signal(NO_SIGNAL).as_deref(), Some(want));
+        // A quiet room is not exactly zero: one tiny sample clears it.
+        let hiss = Level {
+            peak: 1e-5,
+            rms: 1e-6,
+        };
+        live.show(hiss, &opts, NO_SIGNAL + Millis(33));
+        assert_eq!(live.no_signal(NO_SIGNAL + Millis(33)), None);
+    }
+
+    #[test]
+    fn silent_mic_note_shows_on_the_page_and_clears_when_left() {
+        let window = window("silent", None, fake);
+        show_audio(&window);
+        frame(40);
+        let state = window.global::<AudioState>();
+        assert_eq!(state.get_silence(), "");
+        frame(NO_SIGNAL.0);
+        assert_eq!(
+            state.get_silence(),
+            "No sound from Fake Mic. Reconnect it or pick another mic"
+        );
+        window.set_page(Page::About);
+        frame(40);
+        assert_eq!(state.get_silence(), "");
+    }
+
+    #[test]
+    fn test_button_records_then_plays_back_then_clears() {
+        let window = window("mic-test", None, fake);
+        show_audio(&window);
+        frame(40);
+        let state = window.global::<AudioState>();
+        state.invoke_test();
+        assert_eq!(state.get_test_status(), strings::MIC_TEST_RECORDING);
+        assert!(state.get_testing());
+        frame(TEST_LENGTH.0);
+        assert_eq!(state.get_test_status(), strings::MIC_TEST_PLAYING);
+        assert_eq!(PLAYED.get(), SAMPLE_RATE as usize);
+        frame(1_000);
+        assert_eq!(state.get_test_status(), "");
+        assert!(!state.get_testing());
+    }
+
+    #[test]
+    fn test_button_on_a_silent_mic_says_no_signal() {
+        let window = window("mic-test-silent", None, fake);
+        show_audio(&window);
+        SILENT_CLIP.set(true);
+        let state = window.global::<AudioState>();
+        state.invoke_test();
+        frame(TEST_LENGTH.0);
+        assert_eq!(
+            state.get_test_status(),
+            "No sound from Fake Mic. Reconnect it or pick another mic"
+        );
+        assert_eq!(PLAYED.get(), 0);
+        assert!(!state.get_testing());
     }
 
     #[test]
@@ -711,7 +958,7 @@ mod tests {
         let (w, h) = (560_u32, 600_u32);
         slint::platform::set_platform(Box::new(Shots)).unwrap();
         let bars = |f: fn(usize) -> f32| -> Vec<f32> { (0..40).map(f).collect() };
-        let screens: [(&str, Option<&str>, Vec<f32>, bool); 3] = [
+        let screens: [(&str, Option<&str>, Vec<f32>, bool); 4] = [
             (
                 "not-connected",
                 Some(
@@ -735,6 +982,7 @@ device = \"USB Mic\"
                 bars(|i| if i > 32 { 1.0 } else { 0.3 }),
                 true,
             ),
+            ("no-signal", None, vec![], false),
         ];
         for (screen, config, bars, clipping) in screens {
             let (window, page) = window_on("shot", config, fake_fallback);
@@ -749,6 +997,11 @@ device = \"USB Mic\"
                 let state = window.global::<AudioState>();
                 state.set_bars(ModelRc::from(Rc::new(VecModel::from(bars))));
                 state.set_clipping(clipping);
+            }
+            if screen == "no-signal" {
+                let state = window.global::<AudioState>();
+                state.set_silence(strings::no_signal("Microphone (USB Headset)").into());
+                state.set_test_status(strings::MIC_TEST_RECORDING.into());
             }
             for (theme, choice) in [
                 ("light", crate::ThemeChoice::Light),
