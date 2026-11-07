@@ -3533,6 +3533,7 @@ dependencies = [
 name = "oxi-yapper"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "anyhow",
  "notify-debouncer-full",
  "oxi-core",

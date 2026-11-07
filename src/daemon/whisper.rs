@@ -66,6 +66,9 @@ pub fn spawn(
         })
 }
 
+/// `Status.backend` while no model is loaded (the coordinator's value before the first load).
+const NO_BACKEND: &str = "none";
+
 struct Worker<R, L> {
     load: L,
     inbox: Sender<Inbox>,
@@ -106,6 +109,7 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
             }
             WhisperCmd::Unload => {
                 self.loaded = None;
+                let _ = self.inbox.send(Inbox::Backend(NO_BACKEND.into()));
                 // A pinned CPU fallback still holds for the next load: keep saying so (no
                 // tray flicker around each idle unload).
                 if self.cpu_reason.is_none() {
@@ -143,6 +147,10 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
             return Ok(());
         }
         let warning = self.load_model(gpu_failed);
+        if warning.is_err() {
+            // Nothing is loaded: do not leave the last model's device in Status.
+            let _ = self.inbox.send(Inbox::Backend(NO_BACKEND.into()));
+        }
         self.report(warning.clone().unwrap_or(None));
         warning.map(drop)
     }
@@ -176,6 +184,8 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
             }
         };
         let info = engine.info();
+        let device = info.device.clone().unwrap_or_else(|| "cpu".into());
+        let _ = self.inbox.send(Inbox::Backend(device));
         // The engine's own GPU-to-CPU retry pins CPU too; CPU with no GPU to fail is no warning.
         if reason.is_none()
             && let Some(EngineWarning::CpuFallback { reason: why }) = &info.warning
@@ -404,10 +414,10 @@ mod tests {
         (Worker::new(script.loader(), tx, rig.layout()), rx)
     }
 
-    /// The next message that is not an `EngineWarning`.
+    /// The next message that is not an `EngineWarning` or a `Backend`.
     fn next(rx: &Receiver<Inbox>) -> Option<Inbox> {
         rx.try_iter()
-            .find(|m| !matches!(m, Inbox::EngineWarning(_)))
+            .find(|m| !matches!(m, Inbox::EngineWarning(_) | Inbox::Backend(_)))
     }
 
     fn event(rx: &Receiver<Inbox>) -> Event {
@@ -511,6 +521,68 @@ mod tests {
             s.calls()[3..],
             [DeviceChoice::Named("Vulkan1".into()), DeviceChoice::Cpu]
         );
+    }
+
+    #[test]
+    fn each_load_reports_the_device_it_ended_on() {
+        let backends = |rx: &Receiver<Inbox>| -> Vec<String> {
+            rx.try_iter()
+                .filter_map(|m| match m {
+                    Inbox::Backend(b) => Some(b),
+                    _ => None,
+                })
+                .collect()
+        };
+        // (script, expected): a GPU load, the engine's own CPU fallback, a failed GPU load.
+        let mut silent = Script::new();
+        silent.silent_cpu = true;
+        let mut failing = Script::new();
+        failing.gpu_load_fails = true;
+        for (i, (s, want)) in [
+            (Script::new(), "Vulkan0"),
+            (silent, "cpu"),
+            (failing, "cpu"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let r = rig(&format!("backend{i}"));
+            let (mut w, rx) = worker(&s, &r);
+            w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Auto)));
+            w.handle(WhisperCmd::Preload);
+            assert_eq!(backends(&rx), [want], "case {i}");
+        }
+    }
+
+    #[test]
+    fn unload_and_a_failed_load_report_no_backend() {
+        let backends = |rx: &Receiver<Inbox>| -> Vec<String> {
+            rx.try_iter()
+                .filter_map(|m| match m {
+                    Inbox::Backend(b) => Some(b),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (r, s) = (rig("nobackend"), Script::new());
+        let (mut w, rx) = worker(&s, &r);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Auto)));
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(backends(&rx), ["Vulkan0"]);
+        w.handle(WhisperCmd::Unload);
+        assert_eq!(backends(&rx), ["none"]);
+        // A model that cannot load (GPU and CPU both fail) leaves "none", not the old device.
+        let (r2, mut bad) = (rig("nobackend2"), Script::new());
+        (bad.gpu_load_fails, bad.cpu_load_fails) = (true, true);
+        let (mut w2, rx2) = worker(&bad, &r2);
+        w2.handle(WhisperCmd::Config(r2.cfg(DeviceChoice::Auto)));
+        w2.handle(WhisperCmd::Preload);
+        assert_eq!(backends(&rx2), ["none"]);
+        // And a missing model.
+        let (r3, s3) = (rig("nobackend3"), Script::new());
+        let (mut w3, rx3) = worker(&s3, &r3);
+        w3.handle(WhisperCmd::Preload);
+        assert_eq!(backends(&rx3), ["none"]);
     }
 
     #[test]

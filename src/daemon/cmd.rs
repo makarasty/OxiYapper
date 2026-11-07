@@ -13,7 +13,7 @@
 //!   `Stop(job)`, plus `Inbox::Capture` with `Event::DeviceLost`, `CaptureFailed` or
 //!   `MicFellBack`; whisper `Event::ModelLoaded` or `ModelFailed` for
 //!   `Preload` and `Inbox::Transcribed` for `Transcribe` (after `ModelFailed` when the model
-//!   could not be loaded for it), plus `Inbox::EngineWarning` when its device changes; paste `Event::PasteDone` for `Paste`
+//!   could not be loaded for it), plus `Inbox::EngineWarning` when its device changes and `Inbox::Backend` after each load; paste `Event::PasteDone` for `Paste`
 //!   and nothing for `CopyOnly`.
 //! - The hook thread sends the machine's `Event` on its own `Sender<Event>`; `run.rs` forwards
 //!   that channel into the inbox as [`Inbox::Event`]. The coordinator calls the hook only
@@ -44,6 +44,8 @@ pub enum Inbox {
     /// Whisper worker: why the model runs elsewhere than configured; `None` once it runs as
     /// configured again or no model is loaded.
     EngineWarning(Option<EngineWarning>),
+    /// Whisper worker: the device a model load ended up on (`LoadInfo.device`, `cpu` for none).
+    Backend(String),
     /// Watcher: a good `config.toml`, with the values the load corrected (`ConfigFile::warnings`).
     /// Held until the machine is Idle, then sent to the workers.
     Config {
@@ -70,7 +72,7 @@ pub enum IpcAsk {
     PreviewOverlay(OverlayPosition),
 }
 
-/// The coordinator's part of the IPC `Status` push; the IPC server adds the backend.
+/// What the IPC `Status` push carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusReport {
     pub phase: Phase,
@@ -80,6 +82,8 @@ pub struct StatusReport {
     pub device: String,
     /// Active `[model] gpu`.
     pub gpu: DeviceChoice,
+    /// Device of the last model load (`cpu` after a fallback); `none` before the first load.
+    pub backend: String,
     /// Load corrections of the active config, the engine warning, then the last parse error.
     pub warnings: Vec<String>,
 }
@@ -131,10 +135,12 @@ pub enum IoCmd {
     Download { id: String },
     /// Stop that download; its `.part` stays for a resume.
     CancelDownload { id: String },
+    /// A settings window connected: push the progress of every running download to it.
+    Subscribed,
 }
 
 /// Commands for the main (UI) thread.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum UiCmd {
     /// Show this overlay state, or hide it (`OverlayState::Hidden`).
     Overlay(OverlayState),
@@ -144,8 +150,13 @@ pub enum UiCmd {
     Notify(Notice),
     /// Show the pill at this position for 2 s (settings preview).
     PreviewOverlay(OverlayPosition),
-    /// Active overlay options: enabled, position, hide over fullscreen.
-    Config(Overlay),
+    /// The active config parts the overlay reads: its options and the meter sensitivity.
+    Config {
+        overlay: Overlay,
+        meter_sensitivity_db: f32,
+    },
+    /// Status warnings for the tray tooltip; sent when they change.
+    Warnings(Vec<String>),
     /// Enables the tray item "Copy last text"; sent once, when the first text exists.
     CanCopy,
 }

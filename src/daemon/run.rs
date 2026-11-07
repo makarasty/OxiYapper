@@ -7,6 +7,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
+use ab_glyph::FontRef;
 use anyhow::Context;
 use oxi_core::config::{Config, ConfigError, ConfigFile, Hotkey};
 use oxi_core::hotkey::Chord;
@@ -41,7 +42,7 @@ pub fn run() -> anyhow::Result<()> {
 
     // The overlay first: it makes the process per-monitor DPI aware (v2) before any window exists.
     let meter = LevelMeter::default();
-    let overlay = Overlay::new(meter.clone(), None).context("overlay window")?;
+    let overlay = Overlay::new(meter.clone(), label_font()).context("overlay window")?;
     let mut tray = MainLoop::new().context("tray icon")?;
     let waker = tray.waker();
     let (ui_tx, ui_rx) = mpsc::channel();
@@ -81,7 +82,7 @@ pub fn run() -> anyhow::Result<()> {
     let pushes = Pushes::default();
     // Never joined: the IPC threads hold its sender until the process ends.
     io::spawn(io_rx, pushes.clone(), layout.models_dir())?;
-    let host = Arc::new(SystemHost::new(Arc::clone(&hook), Box::new(backend)));
+    let host = Arc::new(SystemHost::new(Arc::clone(&hook)));
     ipc::spawn(server, inbox.clone(), io_tx, host, pushes.clone(), keys_rx)?;
 
     let (watch_tx, watch_rx) = mpsc::channel();
@@ -156,6 +157,23 @@ fn load_config(path: &Path) -> (Config, Vec<String>, Option<ConfigError>) {
     }
 }
 
+/// The overlay label font (decision D4): the system Segoe UI. Without it the pill shows its icon
+/// and meter only.
+fn label_font() -> Option<FontRef<'static>> {
+    let windir = std::env::var_os("WINDIR").unwrap_or_default();
+    font_from(&Path::new(&windir).join("Fonts").join("segoeui.ttf"))
+}
+
+fn font_from(path: &Path) -> Option<FontRef<'static>> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| tracing::warn!(kind = ?e.kind(), "overlay font not read, labels off"))
+        .ok()?;
+    // Leaked once: the overlay that borrows it lives until the process ends.
+    FontRef::try_from_slice(Box::leak(bytes.into_boxed_slice()))
+        .map_err(|e| tracing::warn!("overlay font not usable, labels off: {e}"))
+        .ok()
+}
+
 /// The hook's first chord; a chord that does not parse falls back to the default one, as a
 /// later `set_hotkey` keeps the old chord.
 fn start_chord(hotkey: &Hotkey) -> Chord {
@@ -216,22 +234,6 @@ fn config_error_push(e: &ConfigError) -> Push {
         line,
         message,
     }
-}
-
-/// `Status.backend`.
-// shortcut: the compiled backend, not the device the model loaded on; upgrade when the whisper
-// worker publishes `LoadInfo.device`.
-fn backend() -> String {
-    let compiled = if cfg!(feature = "cuda") {
-        "cuda"
-    } else if cfg!(feature = "vulkan") {
-        "vulkan"
-    } else if cfg!(feature = "metal") {
-        "metal"
-    } else {
-        "cpu"
-    };
-    compiled.to_owned()
 }
 
 /// The coordinator's calls into the hook thread.
@@ -352,6 +354,21 @@ mod tests {
         assert!(error.is_none(), "{error:?}");
         assert_eq!(config.hotkey.chord, ["Ctrl", "Shift", "F13"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn label_font_loads_a_font_file_and_refuses_anything_else() {
+        let dir = std::env::temp_dir().join(format!("oxi-font-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(font_from(&dir.join("missing.ttf")).is_none());
+        let junk = dir.join("junk.ttf");
+        std::fs::write(&junk, b"not a font").unwrap();
+        assert!(font_from(&junk).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        // Every Windows install ships Segoe UI.
+        if cfg!(windows) {
+            assert!(label_font().is_some(), "no Segoe UI");
+        }
     }
 
     #[test]
