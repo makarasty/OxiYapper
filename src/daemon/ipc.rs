@@ -518,6 +518,21 @@ impl SystemHost {
             child: Mutex::default(),
         }
     }
+
+    /// The tray's Quit ends the whole app: the settings window this daemon started goes too.
+    /// The Stop button does not come here; its window stays and offers Start.
+    pub fn close_settings(&self) {
+        kill_child(&self.child);
+    }
+}
+
+/// Ends the process in `slot`, if it still runs. An edit still in the 300 ms save debounce is
+/// lost; the window saves every other change as it is made.
+fn kill_child(slot: &Mutex<Option<std::process::Child>>) {
+    if let Some(mut child) = lock(slot).take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 impl Host for SystemHost {
@@ -621,6 +636,20 @@ mod tests {
             let _ = self.calls.send(Call::Open);
             Ok(())
         }
+    }
+
+    #[test]
+    fn kill_child_ends_a_running_process_and_ignores_an_empty_slot() {
+        let slot = Mutex::new(None);
+        kill_child(&slot);
+        let child = std::process::Command::new("cmd")
+            .args(["/c", "ping", "-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        *lock(&slot) = Some(child);
+        kill_child(&slot);
+        assert!(lock(&slot).is_none());
     }
 
     /// A line that is no `Request`, written raw.
