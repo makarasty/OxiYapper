@@ -9,8 +9,11 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+use oxi_core::device::Device;
+use oxi_core::ipc::{DownloadResult, Push};
 use oxi_core::paths::Layout;
-use oxi_settings::{AppWindow, Page, ThemeChoice};
+use oxi_settings::ipc::{Event, Link};
+use oxi_settings::{AppWindow, Ipc, Page, ThemeChoice};
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
 };
@@ -33,6 +36,12 @@ impl Platform for Shots {
         let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
         LAST.with_borrow_mut(|last| *last = Some(window.clone()));
         Ok(window)
+    }
+
+    // Timers (the model page's path check) run on this clock; the default one stands still.
+    fn duration_since_start(&self) -> std::time::Duration {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed()
     }
 }
 
@@ -169,6 +178,152 @@ fn shot_audio_config_missing() {
 #[test]
 fn shot_model() {
     shot("model", Page::Model, None);
+}
+
+/// A model page on a fake daemon link: `prepare` fills the layout, `drive` pushes what the daemon
+/// would send once the page is up.
+fn shot_model_linked(screen: &str, config: &str, prepare: fn(&Layout), drive: fn(&Ipc)) {
+    for (theme, choice) in [("light", ThemeChoice::Light), ("dark", ThemeChoice::Dark)] {
+        let _ = slint::platform::set_platform(Box::new(Shots));
+        let layout = common::layout(screen, Some(config));
+        prepare(&layout);
+        let (ipc, _sent) = Ipc::fake();
+        let window = oxi_settings::open_with(layout, ipc.clone()).unwrap();
+        window.set_page(Page::Model);
+        window.set_theme(choice);
+        // Showing builds the page, whose `init` starts the path check again.
+        window.show().unwrap();
+        drive(&ipc);
+        // The path check answers from its worker thread; let the page's poll timer take it.
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            slint::platform::update_timers_and_animations();
+        }
+        save(&render(&window, 1.0), screen, theme);
+    }
+}
+
+fn push(ipc: &Ipc, push: Push) {
+    ipc.deliver(&Event::Push(push));
+}
+
+const BUSY: &str = "version = 1
+[model]
+id = \"turbo\"
+gpu = \"Vulkan0\"
+";
+
+#[test]
+fn shot_model_busy() {
+    // Downloading with progress (selected), a failed download, a paused one, the GPU named.
+    shot_model_linked(
+        "model-busy",
+        BUSY,
+        |l| {
+            let dir = l.models_dir();
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("ggml-large-v3-russian-ties-podlodka-v1.2-f16.bin.part"),
+                b"half",
+            )
+            .unwrap();
+        },
+        |ipc| {
+            push(
+                ipc,
+                Push::Devices {
+                    mics: vec![],
+                    gpus: vec![Device {
+                        name: "Vulkan0".into(),
+                        description: "NVIDIA GeForce RTX 4070 SUPER".into(),
+                        uma: false,
+                    }],
+                },
+            );
+            push(
+                ipc,
+                Push::DownloadProgress {
+                    id: "turbo".into(),
+                    done: 650_000_000,
+                    total: 1_624_555_275,
+                },
+            );
+            push(
+                ipc,
+                Push::DownloadDone {
+                    id: "large-v3".into(),
+                    result: DownloadResult::Failed {
+                        message: "connection reset (os error 10054)".into(),
+                    },
+                },
+            );
+        },
+    );
+}
+
+#[test]
+fn shot_model_downloaded() {
+    // Ready (selected), downloaded but unchecked, and a damaged file.
+    shot_model_linked(
+        "model-downloaded",
+        BUSY,
+        |l| {
+            let dir = l.models_dir();
+            fs::create_dir_all(&dir).unwrap();
+            for (name, size) in [
+                ("ggml-large-v3-turbo.bin", 1_624_555_275),
+                ("ggml-large-v3.bin", 3_095_033_483),
+                ("ggml-large-v3-russian-ties-podlodka-v1.2-f16.bin", 1000),
+            ] {
+                let file = dir.join(name);
+                fs::File::create(&file).unwrap().set_len(size).unwrap();
+                if name.ends_with("turbo.bin") {
+                    oxi_core::models::write_stamp(&file).unwrap();
+                }
+            }
+        },
+        |_| {},
+    );
+}
+
+#[test]
+fn shot_model_custom_relative() {
+    shot_model_linked(
+        "model-custom-relative",
+        "version = 1
+[model]
+id = \"custom\"
+custom_path = \"mine.bin\"
+",
+        |_| {},
+        |_| {},
+    );
+}
+
+#[test]
+fn shot_model_custom_missing() {
+    shot_model_linked(
+        "model-custom-missing",
+        "version = 1
+[model]
+id = \"custom\"
+custom_path = \"C:/nowhere/gone.bin\"
+",
+        |_| {},
+        |_| {},
+    );
+}
+
+#[test]
+fn shot_model_offline() {
+    shot_model_linked(
+        "model-offline",
+        BUSY,
+        |_| {},
+        |ipc| {
+            ipc.deliver(&Event::Link(Link::Offline));
+        },
+    );
 }
 
 #[test]
