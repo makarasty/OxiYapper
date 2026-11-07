@@ -1,10 +1,154 @@
-// Hotkey page. A stub of the shell: the Hotkey page task fills it.
-import { Group } from "../widgets.slint";
+// Hotkey page (SPEC Recording, Settings UI): the chord in a compact field and "Change…", which
+// opens the full keyboard (click keys or press them, held keys light up); then the mode.
+import { Palette, Button } from "std-widgets.slint";
+import { Shell, Group, Row, ThumbPicker } from "../widgets.slint";
+import { Keyboard, KeyCap } from "../keyboard.slint";
+
+// Filled and read by `pages::hotkey`.
+export global HotkeyState {
+    // The saved chord, "Ctrl + Win".
+    in property <string> chord;
+    // 0 push-to-talk, 1 toggle.
+    in property <int> mode;
+    in property <bool> keyboard-open;
+    in property <[KeyCap]> caps;
+    in property <float> columns;
+    in property <float> rows;
+    // The pending chord as it would be saved; empty while it has no keys.
+    in property <string> pending;
+    // Why the pending chord cannot be saved; empty when it can.
+    in property <string> error;
+    // Set when a pressed chord ends the capture: 1 moves the focus to Apply, 2 to Cancel, 0 stays.
+    in property <int> move-focus;
+    // The page came into view.
+    callback shown();
+    callback change();
+    callback key-clicked(string);
+    // The keyboard gained (true) or lost (false) the keyboard focus: hotkey capture follows it.
+    callback focused(bool);
+    callback apply();
+    callback cancel();
+    callback mode-picked(int);
+}
 
 export component HotkeyPage inherits VerticalLayout {
+    init => {
+        HotkeyState.shown();
+    }
     alignment: start;
     spacing: 10px;
     Group {
         title: @tr("Hotkey");
+        Row {
+            label: @tr("Keys");
+            Rectangle {
+                horizontal-stretch: 1;
+                height: 26px;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: Palette.border;
+                background: Palette.control-background;
+                accessible-role: AccessibleRole.text;
+                accessible-label: HotkeyState.chord;
+                Text {
+                    x: 8px;
+                    text: HotkeyState.chord;
+                    vertical-alignment: center;
+                    color: Palette.foreground;
+                }
+            }
+            Button {
+                text: @tr("Change…");
+                accessible-label: @tr("Change hotkey");
+                enabled: !Shell.locked && !HotkeyState.keyboard-open;
+                clicked => {
+                    HotkeyState.change();
+                }
+            }
+        }
+        // Keys pressed while it has the focus come from the daemon's hook (CaptureHotkey), which
+        // swallows Tab and Esc too: so releasing a chord or pressing Esc alone hands the focus back.
+        if HotkeyState.keyboard-open: board := FocusScope {
+            property <int> move-focus: HotkeyState.move-focus;
+            accessible-role: groupbox;
+            accessible-label: @tr("Hotkey keyboard");
+            init => {
+                self.focus();
+            }
+            changed move-focus => {
+                if self.move-focus == 1 {
+                    apply.focus();
+                } else if self.move-focus == 2 {
+                    cancel.focus();
+                }
+            }
+            focus-gained => {
+                HotkeyState.focused(true);
+            }
+            focus-lost => {
+                HotkeyState.focused(false);
+            }
+            VerticalLayout {
+                spacing: 6px;
+                padding-top: 4px;
+                padding-bottom: 6px;
+                Text {
+                    text: @tr("Click keys or press them; modifiers match either side. Releasing the keys goes to Apply, Esc to Cancel; click the keyboard to press again.");
+                    wrap: word-wrap;
+                    font-size: 11px;
+                    color: Palette.foreground;
+                    opacity: 0.7;
+                }
+                Keyboard {
+                    caps: HotkeyState.caps;
+                    columns: HotkeyState.columns;
+                    rows: HotkeyState.rows;
+                    clicked(name) => {
+                        board.focus();
+                        HotkeyState.key-clicked(name);
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: HotkeyState.error != "" ? HotkeyState.error : HotkeyState.pending != "" ? @tr("New hotkey: {}", HotkeyState.pending) : @tr("No keys picked");
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                        color: HotkeyState.error != "" ? Shell.error-text : Palette.foreground;
+                    }
+                    cancel := Button {
+                        text: @tr("Cancel");
+                        accessible-label: @tr("Cancel hotkey change");
+                        clicked => {
+                            HotkeyState.cancel();
+                        }
+                    }
+                    apply := Button {
+                        text: @tr("Apply");
+                        accessible-label: @tr("Apply hotkey");
+                        enabled: !Shell.locked;
+                        primary: true;
+                        clicked => {
+                            HotkeyState.apply();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Group {
+        title: @tr("Recording mode");
+        ThumbPicker {
+            accessible-label: @tr("Recording mode");
+            thumbs: [
+                { image: @image-url("../img/hotkey-push.svg"), caption: @tr("Push to talk") },
+                { image: @image-url("../img/hotkey-toggle.svg"), caption: @tr("Toggle") },
+            ];
+            selected: HotkeyState.mode;
+            picked(i) => {
+                HotkeyState.mode-picked(i);
+            }
+        }
     }
 }

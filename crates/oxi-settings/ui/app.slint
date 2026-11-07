@@ -2,7 +2,8 @@
 // the page on the right, no scrolling (SPEC Settings UI).
 import { Palette, Button } from "std-widgets.slint";
 import { Shell, Banner } from "widgets.slint";
-import { HotkeyPage } from "pages/hotkey.slint";
+import { HotkeyPage, HotkeyState } from "pages/hotkey.slint";
+import { KeyCap } from "keyboard.slint";
 import { AudioPage, AudioState, AudioKey } from "pages/audio.slint";
 import { ModelPage, ModelState, ModelRow } from "pages/model.slint";
 import { TextPage, TextState, PasteRuleRow, FileState, FileInfo, TextFile } from "pages/text.slint";
@@ -10,7 +11,7 @@ import { OverlayPage, OverlayState } from "pages/overlay.slint";
 import { SystemPage, ThemeChoice, SystemState } from "pages/system.slint";
 import { AboutPage } from "pages/about.slint";
 
-export { Shell, ThemeChoice, AudioState, AudioKey, ModelState, ModelRow, TextState, PasteRuleRow, FileState, FileInfo, TextFile, OverlayState, SystemState }
+export { Shell, ThemeChoice, HotkeyState, KeyCap, AudioState, AudioKey, ModelState, ModelRow, TextState, PasteRuleRow, FileState, FileInfo, TextFile, OverlayState, SystemState }
 
 export enum Page { hotkey, audio, model, text, overlay, system, about }
 

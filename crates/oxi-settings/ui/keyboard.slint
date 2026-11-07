@@ -1,0 +1,75 @@
+// The full visual keyboard of the hotkey picker. `pages::keyboard_layout` places the keys;
+// this file only draws them, scaled so the board fills its width.
+import { Palette } from "std-widgets.slint";
+import { Shell } from "widgets.slint";
+
+export struct KeyCap {
+    // `Key::as_str` ("LCtrl"), sent back on a click.
+    name: string,
+    // The text on the cap, `keyboard_layout::cap_label`.
+    label: string,
+    // The accessible label, `keyboard_layout::spoken` ("Left Ctrl"): unique on the board.
+    spoken: string,
+    // Characters in the longest word of `label`: the cap shrinks its font to fit that word.
+    word: int,
+    // Position and size in key units.
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    // Physically down now (hotkey capture).
+    held: bool,
+    // In the pending chord.
+    picked: bool,
+}
+
+export component Keyboard inherits Rectangle {
+    in property <[KeyCap]> caps;
+    // Board size in key units.
+    in property <float> columns: 1;
+    in property <float> rows: 1;
+    callback clicked(string);
+    property <length> unit: self.width / root.columns;
+    height: root.unit * root.rows;
+    for cap in root.caps: Rectangle {
+        x: cap.x * root.unit + 1px;
+        y: cap.y * root.unit + 1px;
+        width: cap.w * root.unit - 2px;
+        height: cap.h * root.unit - 2px;
+        border-radius: 3px;
+        border-width: cap.picked ? 2px : 1px;
+        border-color: cap.picked ? Palette.accent-background : Palette.border;
+        background: cap.held ? Palette.accent-background : cap.picked ? Palette.selection-background.transparentize(0.5) : touch.has-hover && !Shell.locked ? Palette.alternate-background : Palette.control-background;
+        opacity: Shell.locked ? 0.5 : 1;
+        accessible-role: button;
+        accessible-label: cap.spoken;
+        accessible-checkable: true;
+        accessible-checked: cap.picked;
+        accessible-description: cap.held ? "held" : "";
+        accessible-enabled: !Shell.locked;
+        accessible-action-default => {
+            if (!Shell.locked) {
+                root.clicked(cap.name);
+            }
+        }
+        Text {
+            x: 1px;
+            width: parent.width - 2px;
+            accessible-role: none;
+            text: cap.label;
+            // Sized so the longest word fits the cap without breaking inside it.
+            font-size: min(8px, (parent.width - 2px) / max(1, cap.word) * 1.4);
+            wrap: word-wrap;
+            overflow: elide;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            color: cap.held ? Palette.accent-foreground : Palette.foreground;
+        }
+        touch := TouchArea {
+            enabled: !Shell.locked;
+            clicked => {
+                root.clicked(cap.name);
+            }
+        }
+    }
+}
