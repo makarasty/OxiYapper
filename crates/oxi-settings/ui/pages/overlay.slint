@@ -11,6 +11,8 @@ export global OverlayState {
     in-out property <bool> hide-over-fullscreen;
     // The daemon link is up: Preview needs it to show the pill.
     in property <bool> online;
+    // Why Preview is off; empty while online or connecting.
+    in property <string> note;
     callback enabled-toggled(bool);
     callback position-picked(int);
     callback hide-over-fullscreen-toggled(bool);
@@ -66,13 +68,13 @@ export component OverlayPage inherits VerticalLayout {
                 Button {
                     text: @tr("Preview");
                     enabled: OverlayState.online;
-                    accessible-description: OverlayState.online ? "" : @tr("OxiYapper is not running");
+                    accessible-description: OverlayState.note;
                     clicked => {
                         OverlayState.preview();
                     }
                 }
-                if !OverlayState.online: Text {
-                    text: @tr("OxiYapper is not running");
+                if OverlayState.note != "": Text {
+                    text: OverlayState.note;
                     vertical-alignment: center;
                     color: Palette.foreground;
                     opacity: 0.7;

@@ -6,7 +6,7 @@ use oxi_core::ipc::Request;
 use slint::{ComponentHandle, Weak};
 
 use crate::generated::OverlayState;
-use crate::ipc::{Event, Link};
+use crate::ipc::{Event, Link, notice};
 use crate::{AppWindow, Ctx, report};
 
 /// Picker order: the top row left to right, then the bottom row.
@@ -27,15 +27,13 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     s.set_position(index(overlay.position));
     s.set_hide_over_fullscreen(overlay.hide_over_fullscreen);
     drop(file);
-    s.set_online(ctx.ipc.link() == Link::Online);
+    set_link(&s, ctx.ipc.link());
     let w = window.as_weak();
     // shortcut: Reset rebinds and adds one more subscriber, each setting the same value; fine
     // for a handful of resets, subscribe once in the shell if pages ever do more here.
     ctx.ipc.subscribe(move |event| {
         if let (Event::Link(link), Some(window)) = (event, w.upgrade()) {
-            window
-                .global::<OverlayState>()
-                .set_online(*link == Link::Online);
+            set_link(&window.global::<OverlayState>(), *link);
         }
     });
 
@@ -54,6 +52,19 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         let position = c.config.borrow().config.overlay.position;
         c.ipc.send(Request::PreviewOverlay { position });
     });
+}
+
+/// Preview needs `Online`; any other state says why, with the shell banner's wording.
+fn set_link(s: &OverlayState, link: Link) {
+    s.set_online(link == Link::Online);
+    let note = match link {
+        Link::Online | Link::Connecting => String::new(),
+        Link::Offline => "OxiYapper is not running".to_owned(),
+        other => notice(&Event::Link(other))
+            .map(|n| n.text)
+            .unwrap_or_default(),
+    };
+    s.set_note(note.into());
 }
 
 /// Change `[overlay]`, show it again and save.
@@ -147,6 +158,20 @@ mod tests {
         assert_eq!(
             find("Preview", AccessibleRole::Button).accessible_enabled(),
             Some(true)
+        );
+
+        // Connecting says nothing; a version mismatch is not "not running".
+        ctx.ipc.deliver(&Event::Link(Link::Connecting));
+        let preview = find("Preview", AccessibleRole::Button);
+        assert_eq!(preview.accessible_enabled(), Some(false));
+        assert_eq!(preview.accessible_description().as_deref(), Some(""));
+        ctx.ipc
+            .deliver(&Event::Link(Link::Mismatch { daemon_proto: 9 }));
+        let preview = find("Preview", AccessibleRole::Button);
+        assert_eq!(preview.accessible_enabled(), Some(false));
+        assert_eq!(
+            preview.accessible_description().as_deref(),
+            Some("Restart OxiYapper to finish the update")
         );
     }
 }
