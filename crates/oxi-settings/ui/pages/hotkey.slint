@@ -11,6 +11,8 @@ export global HotkeyState {
     // 0 push-to-talk, 1 toggle.
     in property <int> mode;
     in property <bool> keyboard-open;
+    // The daemon link is up: without it no key is captured and Apply is off.
+    in property <bool> online;
     in property <[KeyCap]> caps;
     in property <float> columns;
     in property <float> rows;
@@ -93,7 +95,7 @@ export component HotkeyPage inherits VerticalLayout {
                 padding-top: 4px;
                 padding-bottom: 6px;
                 Text {
-                    text: @tr("Click keys or press them; modifiers match either side. Releasing the keys goes to Apply, Esc to Cancel; click the keyboard to press again.");
+                    text: HotkeyState.online ? @tr("Click keys or press them; modifiers match either side. Releasing the keys goes to Apply, Esc to Cancel; click the keyboard to press again.") : @tr("Not connected to OxiYapper: pressed keys are not seen and Apply is off. Click keys to pick them.");
                     wrap: word-wrap;
                     font-size: 11px;
                     color: Palette.foreground;
@@ -108,15 +110,15 @@ export component HotkeyPage inherits VerticalLayout {
                         HotkeyState.key-clicked(name);
                     }
                 }
+                // The status line has the whole width (the long error wraps); the buttons get their own row.
+                Text {
+                    text: HotkeyState.error != "" ? HotkeyState.error : HotkeyState.pending != "" ? @tr("New hotkey: {}", HotkeyState.pending) : @tr("No keys picked");
+                    wrap: word-wrap;
+                    color: HotkeyState.error != "" ? Shell.error-text : Palette.foreground;
+                }
                 HorizontalLayout {
                     spacing: 6px;
-                    Text {
-                        horizontal-stretch: 1;
-                        text: HotkeyState.error != "" ? HotkeyState.error : HotkeyState.pending != "" ? @tr("New hotkey: {}", HotkeyState.pending) : @tr("No keys picked");
-                        wrap: word-wrap;
-                        vertical-alignment: center;
-                        color: HotkeyState.error != "" ? Shell.error-text : Palette.foreground;
-                    }
+                    alignment: end;
                     cancel := Button {
                         text: @tr("Cancel");
                         accessible-label: @tr("Cancel hotkey change");
@@ -127,7 +129,7 @@ export component HotkeyPage inherits VerticalLayout {
                     apply := Button {
                         text: @tr("Apply");
                         accessible-label: @tr("Apply hotkey");
-                        enabled: !Shell.locked;
+                        enabled: !Shell.locked && HotkeyState.online;
                         primary: true;
                         clicked => {
                             HotkeyState.apply();

@@ -5,14 +5,14 @@ use oxi_core::hotkey::Key;
 
 /// Width of the whole board in key units: main block 15, gap, nav 3, gap, numpad 4.
 pub const WIDTH: f32 = 22.5;
-/// Height in key units: the F-row, a quarter gap, five rows.
-pub const HEIGHT: f32 = 6.25;
+/// Height in key units: the F-row, a quarter gap, five rows, a quarter gap, the F13-F24 row.
+pub const HEIGHT: f32 = 7.5;
 
 type Row = (f32, &'static [(Option<Key>, f32)]);
 
 /// Each row: its top in key units, then its keys and gaps from the left edge.
 #[rustfmt::skip]
-const ROWS: [Row; 6] = {
+const ROWS: [Row; 7] = {
     #[allow(clippy::enum_glob_use, reason = "the table reads as a keyboard only with bare names")]
     use Key::*;
     [
@@ -59,6 +59,13 @@ const ROWS: [Row; 6] = {
             (None, 0.25), (Some(Left), 1.0), (Some(Down), 1.0), (Some(Right), 1.0), (None, 0.25),
             (Some(Num0), 2.0), (Some(NumDecimal), 1.0),
         ]),
+        // Not on most boards, but a chord may use them: under F1-F12.
+        (6.5, &[
+            (None, 2.0),
+            (Some(F13), 1.0), (Some(F14), 1.0), (Some(F15), 1.0), (Some(F16), 1.0), (None, 0.5),
+            (Some(F17), 1.0), (Some(F18), 1.0), (Some(F19), 1.0), (Some(F20), 1.0), (None, 0.5),
+            (Some(F21), 1.0), (Some(F22), 1.0), (Some(F23), 1.0), (Some(F24), 1.0),
+        ]),
     ]
 };
 
@@ -93,13 +100,20 @@ pub fn caps() -> Vec<Cap> {
     caps
 }
 
-/// The text on the cap: [`Key::label`], shortened where its cap would shrink it below ~7 px at
-/// the smallest window ([`spoken`] keeps the full name).
+/// The text on the cap: [`Key::label`], shortened to 3 characters on 1-unit caps so the font
+/// stays at 7 px or more at the smallest window ([`spoken`] keeps the full name).
 pub fn cap_label(key: Key) -> &'static str {
     match key {
         Key::Backspace => "Bksp",
         Key::CapsLock => "Caps",
-        Key::NumLock => "Num",
+        Key::NumLock => "NL",
+        Key::Home => "Hm",
+        Key::PageUp => "PgU",
+        Key::PageDown => "PgD",
+        Key::PrintScreen => "Prt",
+        Key::ScrollLock => "SLk",
+        Key::Pause => "Pau",
+        Key::NumEnter => "Ent",
         _ => key.label(),
     }
 }
@@ -157,13 +171,11 @@ mod tests {
     }
 
     #[test]
-    fn every_ansi_key_is_on_the_board_once() {
+    fn every_key_a_chord_can_hold_is_on_the_board_once() {
         let caps = caps();
-        let f13_up = &Key::ALL[Key::F13 as usize..=Key::F24 as usize];
         for key in Key::ALL {
             let n = caps.iter().filter(|c| c.key == key).count();
-            let want = usize::from(!f13_up.contains(&key));
-            assert_eq!(n, want, "{key:?}");
+            assert_eq!(n, 1, "{key:?}");
         }
     }
 

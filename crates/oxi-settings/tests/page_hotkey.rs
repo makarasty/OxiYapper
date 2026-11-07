@@ -1,5 +1,5 @@
 //! Hotkey page under the testing backend, on a temporary Layout. The capture tests against the
-//! fake daemon link live in `src/pages/hotkey.rs`: `open` makes its own offline link.
+//! fake daemon link live in `src/pages/hotkey.rs`: `open` there makes its own offline link; here the link is a fake that stays online.
 
 mod common;
 
@@ -10,12 +10,13 @@ use i_slint_backend_testing::{AccessibleRole, ElementHandle};
 use oxi_core::config::ConfigFile;
 use oxi_core::machine::Mode;
 use oxi_core::paths::Layout;
-use oxi_settings::{AppWindow, Page};
+use oxi_settings::{AppWindow, Ipc, Page};
 use slint::ComponentHandle;
 
 fn open(layout: &Layout) -> AppWindow {
     i_slint_backend_testing::init_no_event_loop();
-    let window = oxi_settings::open(layout.clone()).unwrap();
+    // Apply needs the daemon link; the receiver is dropped and sends are ignored.
+    let window = oxi_settings::open_with(layout.clone(), Ipc::fake().0).unwrap();
     window.show().unwrap();
     window.set_page(Page::Hotkey);
     window
