@@ -32,8 +32,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DestroyMenu, DestroyWindow, DispatchMessageW, GetMessageW, HICON, MF_GRAYED, MF_STRING, MSG,
     PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW, RegisterClassExW, RegisterWindowMessageW,
     SM_CXSMICON, SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-    TranslateMessage, WM_APP, WM_CONTEXTMENU, WM_NULL, WM_POWERBROADCAST, WM_WTSSESSION_CHANGE,
-    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    TranslateMessage, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_NULL, WM_POWERBROADCAST,
+    WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP, WTS_SESSION_LOCK,
+    WTS_SESSION_UNLOCK,
 };
 
 use super::wide;
@@ -46,6 +47,8 @@ const WM_TRAY: u32 = WM_APP + 1;
 /// The [`Waker::quit`] message.
 const WM_EXIT: u32 = WM_APP + 2;
 const ICON_ID: u32 = 1;
+/// `WM_USER`: the `NOTIFYICON_VERSION_4` event of a left click or Enter on the icon.
+const NIN_SELECT: i32 = 0x400;
 
 pub use oxi_core::tray::MenuItem;
 
@@ -81,7 +84,12 @@ impl Waker {
 /// callback runs re-entrantly inside a Win32 call.
 enum Incoming {
     Wake,
-    Menu { x: i32, y: i32 },
+    Menu {
+        x: i32,
+        y: i32,
+    },
+    /// A left click on the icon: the same as the menu's Settings.
+    Click,
     TaskbarCreated,
     Exit,
 }
@@ -313,6 +321,7 @@ impl MainLoop {
                         Ok(None) => {}
                         Err(e) => tracing::warn!("tray menu failed: {e}"),
                     },
+                    Incoming::Click => on_menu(self, MenuItem::Settings),
                     Incoming::TaskbarCreated => {
                         if let Err(e) = self.add() {
                             tracing::warn!("tray icon re-add failed: {e}");
@@ -472,6 +481,20 @@ fn halves(bytes: &[u8]) -> (i16, i16) {
     )
 }
 
+/// What a tray callback (`NOTIFYICON_VERSION_4`: the event in the low word of `lparam`) asks for.
+/// A left click arrives as `WM_LBUTTONUP` and as `NIN_SELECT`; both open settings, and a second
+/// open of a window that is already starting is a no-op in the daemon.
+fn tray_event(event: i16, x: i32, y: i32) -> Option<Incoming> {
+    let event = i32::from(event);
+    if event == WM_CONTEXTMENU.cast_signed() {
+        Some(Incoming::Menu { x, y })
+    } else if event == WM_LBUTTONUP.cast_signed() || event == NIN_SELECT {
+        Some(Incoming::Click)
+    } else {
+        None
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let incoming = match msg {
         WM_WAKE => Some(Incoming::Wake),
@@ -479,10 +502,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_TRAY => {
             let (event, _) = halves(&lparam.to_le_bytes());
             let (x, y) = halves(&wparam.to_le_bytes());
-            (i32::from(event) == WM_CONTEXTMENU.cast_signed()).then_some(Incoming::Menu {
-                x: x.into(),
-                y: y.into(),
-            })
+            tray_event(event, x.into(), y.into())
         }
         WM_POWERBROADCAST | WM_WTSSESSION_CHANGE => {
             if let Some(event) = session_event(msg, wparam) {
@@ -561,6 +581,21 @@ fn copy_wide(dst: &mut [u16], s: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tray_events_map_to_menu_and_settings() {
+        assert!(matches!(
+            tray_event(WM_CONTEXTMENU.cast_signed().try_into().unwrap(), 3, 4),
+            Some(Incoming::Menu { x: 3, y: 4 })
+        ));
+        for click in [WM_LBUTTONUP.cast_signed(), NIN_SELECT] {
+            assert!(matches!(
+                tray_event(click.try_into().unwrap(), 0, 0),
+                Some(Incoming::Click)
+            ));
+        }
+        assert!(tray_event(0x200, 0, 0).is_none()); // WM_MOUSEMOVE
+    }
 
     #[test]
     fn copy_wide_never_splits_a_surrogate_pair() {

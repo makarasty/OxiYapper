@@ -1,4 +1,11 @@
+//! The release build on Windows is a GUI-subsystem program: Explorer starts it with no console
+//! window. A terminal still gets the output of `--version`, usage errors and `bench`:
+//! [`console::attach`] connects to the parent's console first.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod bench;
+#[cfg(windows)]
+mod console;
 #[cfg(windows)]
 mod daemon;
 mod log;
@@ -26,6 +33,8 @@ fn run_daemon() {
 }
 
 fn main() {
+    #[cfg(windows)]
+    console::attach();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match oxi_core::parse_command(&args) {
         Ok(Command::Daemon) => run_daemon(),
