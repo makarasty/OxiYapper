@@ -186,9 +186,14 @@ pub fn tray_icon(phase: Phase, size: u32, light_taskbar: bool, badge: TrayBadge)
         }
         Phase::Recording => {
             fill(&mut pm, m.bubble(0.0).as_ref(), palette::RECORDING, id);
-            if light_taskbar {
-                stroke(&mut pm, m.bubble(0.5).as_ref(), palette::BRAND_RIM, 1.0, id);
-            }
+            // A 1 px rim on every taskbar: teal alone is under 3:1 against accent taskbars
+            // (#8764B8, #005FB8), and white or dark keeps the edge on any colour.
+            let rim = if light_taskbar {
+                palette::BRAND_RIM
+            } else {
+                palette::WHITE
+            };
+            stroke(&mut pm, m.bubble(0.5).as_ref(), rim, 1.0, id);
             for bar in m.bars(false) {
                 fill(&mut pm, bar.as_ref(), palette::WHITE, id);
             }
@@ -333,6 +338,7 @@ fn tile_paint(size: u32) -> Paint<'static> {
 /// (`ox`, `oy`). Designed on a 16-unit grid: body 14 x 12 with corner radius 3, a tail 3 units
 /// deep under its bottom-left corner, bars 2 wide with 2 between, 4 / 8 / 4 tall. Every edge is
 /// rounded to a whole pixel of this size, so the mark stays crisp from 12 to 256 px.
+// Dimensions (body 14x12, bars 4/8/4, idle outline 2 px at 32) were chosen from the contact sheet over spec 8.1.
 struct Mark {
     x0: f32,
     y0: f32,
