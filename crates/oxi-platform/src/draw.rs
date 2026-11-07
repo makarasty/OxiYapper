@@ -155,38 +155,46 @@ fn surface(pm: &mut Pixmap, state: OverlayState, font: Option<&FontRef<'_>>) -> 
 
 /// The tray icon for `phase` at `size` px (16, 20, 24 or 32). Idle is a grey ring, recording a
 /// filled disc, transcribing (and the short paste after it) three dots: shape and colour both
-/// change, so the state reads without colour vision. `None` for size 0.
+/// change, so the state reads without colour vision. Each shape has a 1 px dark halo, so it
+/// stays apart from any taskbar, an accent-coloured one included. `None` for size 0.
 #[must_use]
 pub fn tray_icon(phase: Phase, size: u32) -> Option<Pixmap> {
     let mut pm = Pixmap::new(size, size)?;
     let n = size as f32;
     let at = Transform::from_scale(n, n);
+    // One pixel in the unit square the shapes are drawn in.
+    let px = 1.0 / n;
     match phase {
         Phase::Idle => {
-            stroke(
-                &mut pm,
-                PathBuilder::from_circle(0.5, 0.5, 0.33).as_ref(),
-                palette::INFO,
-                0.15,
-                at,
-            );
+            let ring = PathBuilder::from_circle(0.5, 0.5, 0.32);
+            stroke(&mut pm, ring.as_ref(), SURFACE, 0.17 + 2.0 * px, at);
+            stroke(&mut pm, ring.as_ref(), palette::INFO, 0.17, at);
         }
         Phase::Recording => {
             fill(
                 &mut pm,
-                PathBuilder::from_circle(0.5, 0.5, 0.4).as_ref(),
+                PathBuilder::from_circle(0.5, 0.5, 0.44).as_ref(),
+                SURFACE,
+                at,
+            );
+            fill(
+                &mut pm,
+                PathBuilder::from_circle(0.5, 0.5, 0.44 - px).as_ref(),
                 palette::RECORDING,
                 at,
             );
         }
         Phase::Transcribing | Phase::Pasting => {
-            for cx in [0.2, 0.5, 0.8] {
-                fill(
-                    &mut pm,
-                    PathBuilder::from_circle(cx, 0.5, 0.12).as_ref(),
-                    palette::BUSY,
-                    at,
-                );
+            // Every halo first, so a neighbour's halo never covers a dot.
+            for (r, c) in [(0.13 + px, SURFACE), (0.13, palette::BUSY)] {
+                for cx in [0.19, 0.5, 0.81] {
+                    fill(
+                        &mut pm,
+                        PathBuilder::from_circle(cx, 0.5, r).as_ref(),
+                        c,
+                        at,
+                    );
+                }
             }
         }
     }

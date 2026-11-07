@@ -23,8 +23,8 @@ pub mod palette {
     pub const SURFACE: Rgba = Rgba(0x1E, 0x1F, 0x24, 0xFF);
     /// Pill label text.
     pub const TEXT: Rgba = Rgba(0xEE, 0xEF, 0xF2, 0xFF);
-    /// Hairline pill rim that keeps the outline visible on a dark desktop.
-    pub const EDGE: Rgba = Rgba(0xFF, 0xFF, 0xFF, 0x24);
+    /// Hairline pill rim that keeps the outline visible on a dark desktop (3:1 over #202020).
+    pub const EDGE: Rgba = Rgba(0xFF, 0xFF, 0xFF, 0x66);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
