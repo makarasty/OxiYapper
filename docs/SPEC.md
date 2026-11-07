@@ -49,6 +49,7 @@ All measured against the 8 owner reference phrases before becoming defaults.
 ## History
 
 - Each dictation saves wav + text to a folder. On for the owner; off by default for other users (privacy).
+- Usage stats for the Home page (owner request 2026-11-07), always on: per local day only the number of dictations, their word count and audio length. Never the text, app names or a time finer than the day; nothing of it goes to logs or the network.
 
 ## Settings UI
 
