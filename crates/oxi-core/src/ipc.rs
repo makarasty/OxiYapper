@@ -15,9 +15,10 @@ use crate::config::OverlayPosition;
 use crate::device::{Device, DeviceChoice};
 use crate::hotkey::Key;
 use crate::machine::Phase;
+use crate::stats::Summary;
 
-/// Protocol version. `Hello`, `HelloAck` and `Shutdown` never change shape.
-pub const PROTO: u32 = 1;
+/// Protocol version. `Hello`, `HelloAck` and `Shutdown` never change shape. 2: `Stats`.
+pub const PROTO: u32 = 2;
 
 /// Longest accepted line, newline excluded.
 pub const MAX_LINE: usize = 1024 * 1024;
@@ -47,6 +48,8 @@ pub enum Request {
     PreviewOverlay {
         position: OverlayPosition,
     },
+    /// The Home page numbers; answered with [`Push::Stats`].
+    Stats,
     Shutdown,
 }
 
@@ -103,6 +106,8 @@ pub enum Push {
         line: usize,
         message: String,
     },
+    /// Counts only, never text (SPEC, History).
+    Stats(Summary),
 }
 
 /// Windows named pipe for one user: `\\.\pipe\OxiYapper-<SID>`.
