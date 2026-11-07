@@ -2,35 +2,52 @@
 //! daemon (the page itself never touches the network), "use my own .bin", the GPU and the idle
 //! unload.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::Path;
-use std::rc::Rc;
+use std::rc::{Rc, Weak as RcWeak};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::thread;
+use std::time::Duration;
 
 use oxi_core::device::{Device, DeviceChoice};
 use oxi_core::ipc::{DownloadResult, Push, Request};
 use oxi_core::models::{self, MODELS, ModelEntry, ModelStatus};
-use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel, Weak};
+use oxi_core::paths::part_path;
+use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
+use crate::debounce::SaveDebounce;
 use crate::generated::{ModelRow, ModelState};
 use crate::ipc::{Event, Link};
 use crate::{AppWindow, Ctx, Page, report};
 
 /// `[model] id` of "use my own .bin".
 const CUSTOM: &str = "custom";
+/// How often the page looks for the answer of a path check running on its worker.
+const POLL: Duration = Duration::from_millis(25);
 
 pub fn bind(window: &AppWindow, ctx: &Ctx) {
     let s = window.global::<ModelState>();
     let entries: Vec<&'static ModelEntry> = MODELS.iter().filter(|m| m.id != "tiny").collect();
     let dir = ctx.layout.models_dir();
     let rows: Vec<ModelRow> = entries.iter().map(|e| row(e, &dir)).collect();
-    let page = Rc::new(PageState {
+    let (tx, rx) = channel();
+    let page = Rc::new_cyclic(|me| PageState {
+        me: me.clone(),
         window: window.as_weak(),
         ctx: ctx.clone(),
         entries,
         rows: Rc::new(VecModel::from(rows)),
         listed: RefCell::new(None),
         choices: RefCell::new(Vec::new()),
+        idle_save: SaveDebounce::new(window.as_weak(), ctx.clone()),
+        checks: Checks {
+            latest: Cell::new(0),
+            running: Cell::new(0),
+            tx,
+            rx,
+            timer: Timer::default(),
+        },
     });
     s.set_rows(ModelRc::from(page.rows.clone()));
     s.set_can_browse(cfg!(windows));
@@ -70,6 +87,7 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
 }
 
 struct PageState {
+    me: RcWeak<Self>,
     window: Weak<AppWindow>,
     ctx: Ctx,
     /// The registry models the page offers, in row order.
@@ -79,6 +97,29 @@ struct PageState {
     listed: RefCell<Option<Vec<Device>>>,
     /// What each GPU picker row writes.
     choices: RefCell<Vec<DeviceChoice>>,
+    /// The idle slider saves once it rests.
+    idle_save: SaveDebounce,
+    checks: Checks,
+}
+
+/// A path's existence check, run on a worker thread: a UNC path to an offline host can block
+/// for a long time, and the window must not freeze with it.
+struct Checks {
+    /// Id of the newest check; an older answer is dropped.
+    latest: Cell<u64>,
+    /// Workers not answered yet; the poll timer runs while it is above zero.
+    running: Cell<usize>,
+    tx: Sender<Checked>,
+    rx: Receiver<Checked>,
+    timer: Timer,
+}
+
+struct Checked {
+    id: u64,
+    path: String,
+    problem: Option<&'static str>,
+    /// From an edit: a valid path is then saved and picks "use my own .bin".
+    save: bool,
 }
 
 impl PageState {
@@ -112,10 +153,11 @@ impl PageState {
         };
         s.set_selected(selected.map_or(-1, int));
         s.set_custom_path(model.custom_path.as_str().into());
-        s.set_custom_error(custom_note(&model.custom_path, model.id == CUSTOM).into());
         #[expect(clippy::cast_precision_loss, reason = "minutes are far below 2^24")]
         s.set_idle_minutes(model.idle_unload_minutes as f32);
+        let path = model.custom_path.clone();
         drop(file);
+        self.check_custom(&path, false);
         self.push_gpus(s);
     }
 
@@ -151,6 +193,9 @@ impl PageState {
         report(&self.window, self.ctx.save());
     }
 
+    // shortcut: the row waits for the daemon's DownloadProgress pushes; the daemon does not
+    // route DownloadModel and CancelDownload yet (another task), so Download shows nothing more
+    // than "Starting the download" until it does.
     fn download(&self, i: i32) {
         let Some((i, entry)) = self.entry(i) else {
             return;
@@ -186,18 +231,74 @@ impl PageState {
 
     /// A valid path is saved and picks "use my own .bin"; anything else only shows why not.
     fn custom_edited(&self, text: &str) {
-        let path = clean(text);
-        let problem = custom_problem(path);
-        if problem.is_none() {
+        self.check_custom(clean(text), true);
+    }
+
+    /// Show why `path` cannot be a custom model. What the text alone decides shows at once;
+    /// the file itself is looked at on a worker and shown (and saved, with `save`) when it
+    /// answers.
+    fn check_custom(&self, path: &str, save: bool) {
+        let id = self.checks.latest.get() + 1;
+        self.checks.latest.set(id);
+        if let Some(problem) = shape_problem(path) {
+            // An empty field is only an error while "use my own .bin" is picked.
+            let custom = self.ctx.config.borrow().config.model.id == CUSTOM;
+            let note = if custom || !path.is_empty() {
+                problem
+            } else {
+                ""
+            };
+            self.state(|s| s.set_custom_error(note.into()));
+            return;
+        }
+        self.state(|s| s.set_custom_error(SharedString::new()));
+        let (tx, path) = (self.checks.tx.clone(), path.to_owned());
+        self.checks.running.set(self.checks.running.get() + 1);
+        thread::spawn(move || {
+            let problem = custom_problem(&path);
+            // The page is gone when the window closed first.
+            let _ = tx.send(Checked {
+                id,
+                path,
+                problem,
+                save,
+            });
+        });
+        let me = self.me.clone();
+        self.checks.timer.start(TimerMode::Repeated, POLL, move || {
+            if let Some(page) = me.upgrade() {
+                page.poll();
+            }
+        });
+    }
+
+    fn poll(&self) {
+        while let Ok(answer) = self.checks.rx.try_recv() {
+            self.checks
+                .running
+                .set(self.checks.running.get().saturating_sub(1));
+            if answer.id == self.checks.latest.get() {
+                self.checked(&answer);
+            }
+        }
+        if self.checks.running.get() == 0 {
+            self.checks.timer.stop();
+        }
+    }
+
+    fn checked(&self, answer: &Checked) {
+        if answer.problem.is_none() && answer.save {
             let mut file = self.ctx.config.borrow_mut();
-            path.clone_into(&mut file.config.model.custom_path);
+            answer
+                .path
+                .as_str()
+                .clone_into(&mut file.config.model.custom_path);
             CUSTOM.clone_into(&mut file.config.model.id);
             drop(file);
             report(&self.window, self.ctx.save());
             self.state(|s| s.set_selected(int(self.entries.len())));
         }
-        let custom = self.ctx.config.borrow().config.model.id == CUSTOM;
-        self.state(|s| s.set_custom_error(custom_note(path, custom).into()));
+        self.state(|s| s.set_custom_error(answer.problem.unwrap_or_default().into()));
     }
 
     #[cfg(windows)]
@@ -239,7 +340,7 @@ impl PageState {
             .config
             .model
             .idle_unload_minutes = minutes;
-        report(&self.window, self.ctx.save());
+        self.idle_save.touch();
     }
 
     fn event(&self, event: &Event) {
@@ -301,11 +402,18 @@ impl PageState {
 
 fn row(entry: &ModelEntry, dir: &Path) -> ModelRow {
     let status = models::status(entry, dir);
+    // A cancelled or cut-off download leaves its `.part`; the next download resumes from it.
+    let paused = status == ModelStatus::Missing
+        && fs::metadata(part_path(&dir.join(entry.file_name))).is_ok_and(|m| m.len() > 0);
     ModelRow {
         id: entry.id.into(),
         name: entry.display_name.into(),
         size: gb(entry.size).into(),
-        status: status_text(status).into(),
+        status: if paused {
+            "Paused, Download resumes".into()
+        } else {
+            status_text(status).into()
+        },
         can_download: matches!(status, ModelStatus::Missing | ModelStatus::Bad),
         downloading: false,
         progress: 0.0,
@@ -351,8 +459,8 @@ fn clean(text: &str) -> &str {
     text.trim().trim_matches('"')
 }
 
-/// Why `path` cannot be loaded as a custom model; `None` when it can.
-fn custom_problem(path: &str) -> Option<&'static str> {
+/// Why `path` cannot be a custom model, from the text alone; `None` when it may be.
+fn shape_problem(path: &str) -> Option<&'static str> {
     if path.is_empty() {
         return Some("Choose a .bin model file");
     }
@@ -363,20 +471,23 @@ fn custom_problem(path: &str) -> Option<&'static str> {
     {
         return Some("The model file must end in .bin");
     }
+    // The daemon resolves a relative path against its own working directory, not ours.
+    if !path.is_absolute() {
+        return Some("Use the full path to the file, from the drive letter");
+    }
+    None
+}
+
+/// Why `path` cannot be loaded as a custom model; `None` when it can. Reads the disk, which a
+/// network path can stall: never on the UI thread.
+fn custom_problem(path: &str) -> Option<&'static str> {
+    if let Some(problem) = shape_problem(path) {
+        return Some(problem);
+    }
     match fs::metadata(path) {
         Ok(meta) if meta.is_file() => None,
         Ok(_) => Some("This is a folder, not a model file"),
         Err(_) => Some("File not found"),
-    }
-}
-
-/// The error under the path field: an empty field is only an error while "use my own .bin" is
-/// picked.
-fn custom_note(path: &str, custom: bool) -> &'static str {
-    let path = clean(path);
-    match custom_problem(path) {
-        Some(problem) if custom || !path.is_empty() => problem,
-        _ => "",
     }
 }
 
@@ -418,7 +529,7 @@ fn gpu_rows(
 mod tests {
     use std::sync::mpsc::Receiver;
 
-    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle, mock_elapsed_time};
     use oxi_core::config::ConfigFile;
     use oxi_core::machine::{EngineWarning, Phase};
     use oxi_core::paths::Layout;
@@ -463,6 +574,19 @@ mod tests {
         ElementHandle::find_by_accessible_label(window, label)
             .next()
             .is_some()
+    }
+
+    /// Wait for the path worker: step the mocked clock (which runs the page's poll timer) until
+    /// `ready`.
+    fn wait_for(ready: impl Fn() -> bool) {
+        for _ in 0..400 {
+            mock_elapsed_time(POLL);
+            if ready() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the path check did not answer");
     }
 
     fn requests(sent: &Receiver<Cmd>) -> Vec<Request> {
@@ -538,12 +662,76 @@ mod tests {
             message: message.into(),
         };
         push(&ipc, done("large-v3", failed));
-        assert!(has(&window, message));
+        // The text is labelled with the model it belongs to.
+        assert!(has(&window, &format!("Whisper large-v3: {message}")));
         assert_eq!(bar(&window), None);
         assert!(has(&window, "3.1 GB · Not downloaded"));
         // Trying again clears the old error.
         download_large(&window);
-        assert!(!has(&window, message));
+        assert!(!has(&window, &format!("Whisper large-v3: {message}")));
+    }
+
+    #[test]
+    fn download_button_is_not_inside_the_radio() {
+        let (window, _ipc, _sent, _) = window("nodes");
+        let radio = with_role(&window, "Whisper large-v3", AccessibleRole::RadioButton);
+        with_role(&window, "Download Whisper large-v3", AccessibleRole::Button);
+        let inside = radio
+            .query_descendants()
+            .match_accessible_role(AccessibleRole::Button)
+            .find_all();
+        assert!(inside.is_empty(), "the Download button is inside the radio");
+    }
+
+    #[test]
+    fn cancelled_download_with_a_part_file_shows_paused() {
+        let (window, ipc, _sent, layout) = window("paused");
+        push(&ipc, progress("large-v3", 5, 10));
+        fs::create_dir_all(layout.models_dir()).unwrap();
+        fs::write(layout.models_dir().join("ggml-large-v3.bin.part"), b"half").unwrap();
+        push(&ipc, done("large-v3", DownloadResult::Cancelled));
+        assert!(has(&window, "3.1 GB · Paused, Download resumes"));
+        // A model with no `.part` stays "Not downloaded".
+        assert!(has(&window, "1.6 GB · Not downloaded"));
+        with_role(&window, "Download Whisper large-v3", AccessibleRole::Button);
+    }
+
+    #[test]
+    fn relative_custom_path_is_refused_and_not_saved() {
+        let (window, _ipc, _sent, layout) = window("relative");
+        let field = with_role(&window, "Model file", AccessibleRole::TextInput);
+        field.set_accessible_value("mine.bin".to_owned());
+        assert!(has(&window, RELATIVE));
+        assert!(!layout.config_file().exists(), "a relative path was saved");
+    }
+
+    #[test]
+    fn an_answer_for_an_older_edit_is_dropped() {
+        let (window, _ipc, _sent, layout) = window("stale");
+        let good = layout.config_dir.join("good.bin");
+        fs::write(&good, b"synthetic").unwrap();
+        let field = with_role(&window, "Model file", AccessibleRole::TextInput);
+        field.set_accessible_value(good.to_string_lossy().into_owned());
+        field.set_accessible_value("notes.txt".to_owned());
+        for _ in 0..20 {
+            mock_elapsed_time(POLL);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(has(&window, "The model file must end in .bin"));
+        assert!(!layout.config_file().exists(), "the old answer was saved");
+    }
+
+    #[test]
+    fn idle_slider_saves_once_it_rests() {
+        let (window, _ipc, _sent, layout) = window("idle");
+        let s = window.global::<ModelState>();
+        s.invoke_idle_changed(12.0);
+        s.invoke_idle_changed(30.0);
+        assert!(!layout.config_file().exists(), "saved during the drag");
+        mock_elapsed_time(Duration::from_millis(350));
+        let text = fs::read_to_string(layout.config_file()).unwrap();
+        let file = ConfigFile::parse(&text).unwrap();
+        assert_eq!(file.config.model.idle_unload_minutes, 30);
     }
 
     #[test]
@@ -658,8 +846,10 @@ mod tests {
         }
     }
 
+    const RELATIVE: &str = "Use the full path to the file, from the drive letter";
+
     #[test]
-    fn custom_path_notes() {
+    fn custom_path_problems() {
         let dir = std::env::temp_dir().join(format!(
             "oxi-settings-lib-model-{}-custom",
             std::process::id()
@@ -668,18 +858,42 @@ mod tests {
         let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
         fs::write(dir.join("mine.BIN"), b"not a model").unwrap();
         let (file, folder, missing) = (path("mine.BIN"), path("folder.bin"), path("gone.bin"));
-        let quoted = format!("\"{file}\"");
-        for (path, custom, want) in [
-            ("", false, ""),
-            ("", true, "Choose a .bin model file"),
-            (file.as_str(), true, ""),
-            (quoted.as_str(), true, ""),
-            (missing.as_str(), false, "File not found"),
-            (folder.as_str(), true, "This is a folder, not a model file"),
-            ("notes.txt", false, "The model file must end in .bin"),
+        for (path, want) in [
+            ("", Some("Choose a .bin model file")),
+            (file.as_str(), None),
+            (missing.as_str(), Some("File not found")),
+            (folder.as_str(), Some("This is a folder, not a model file")),
+            ("notes.txt", Some("The model file must end in .bin")),
+            ("mine.bin", Some(RELATIVE)),
+            ("models/mine.bin", Some(RELATIVE)),
         ] {
-            assert_eq!(custom_note(path, custom), want, "{path:?} {custom}");
+            assert_eq!(custom_problem(path), want, "{path:?}");
         }
+        // The text alone decides these: no disk read on the UI thread.
+        assert_eq!(shape_problem(&missing), None);
+        assert_eq!(shape_problem("mine.bin"), Some(RELATIVE));
+    }
+
+    #[test]
+    fn custom_path_answers_come_from_the_worker() {
+        let (window, _ipc, _sent, layout) = window("worker");
+        let field = with_role(&window, "Model file", AccessibleRole::TextInput);
+        let missing = layout.config_dir.join("gone.bin");
+        field.set_accessible_value(missing.to_string_lossy().into_owned());
+        wait_for(|| has(&window, "File not found"));
+        assert!(!layout.config_file().exists());
+
+        let model = layout.config_dir.join("mine.bin");
+        fs::write(&model, b"synthetic").unwrap();
+        field.set_accessible_value(format!("\"{}\"", model.display()));
+        wait_for(|| layout.config_file().exists());
+        let text = fs::read_to_string(layout.config_file()).unwrap();
+        let saved = ConfigFile::parse(&text).unwrap().config.model;
+        assert_eq!(saved.id, "custom");
+        assert_eq!(saved.custom_path, model.to_string_lossy());
+        assert!(!has(&window, "File not found"));
+        let radio = with_role(&window, "Use my own .bin", AccessibleRole::RadioButton);
+        assert_eq!(radio.accessible_checked(), Some(true));
     }
 
     #[test]

@@ -44,6 +44,8 @@ export global ModelState {
 }
 
 // One choice of the model list: a radio mark, the name over a detail line, then the children.
+// The radio is its own accessible element; the children sit beside it, so a button there is not
+// part of the radio.
 // shortcut: a local radio row; move it to widgets.slint when a second page needs one.
 component Choice inherits Rectangle {
     in property <string> label;
@@ -51,56 +53,62 @@ component Choice inherits Rectangle {
     in property <bool> checked;
     callback picked();
     min-height: 40px;
-    accessible-role: radio-button;
-    accessible-label: root.label;
-    accessible-checkable: true;
-    accessible-checked: root.checked;
-    accessible-enabled: !Shell.locked;
-    accessible-action-default => {
-        if (!Shell.locked) {
-            root.picked();
-        }
-    }
-    TouchArea {
-        enabled: !Shell.locked;
-        clicked => {
-            root.picked();
-        }
-    }
     HorizontalLayout {
         spacing: 8px;
-        opacity: Shell.locked ? 0.5 : 1;
-        VerticalLayout {
-            alignment: center;
-            Rectangle {
-                width: 14px;
-                height: 14px;
-                border-radius: 7px;
-                border-width: 1.5px;
-                border-color: root.checked ? Palette.accent-background : Palette.foreground.transparentize(50%);
-                Rectangle {
-                    width: 6px;
-                    height: 6px;
-                    border-radius: 3px;
-                    background: Palette.accent-background;
-                    visible: root.checked;
+        Rectangle {
+            horizontal-stretch: 1;
+            accessible-role: radio-button;
+            accessible-label: root.label;
+            accessible-checkable: true;
+            accessible-checked: root.checked;
+            accessible-enabled: !Shell.locked;
+            accessible-action-default => {
+                if (!Shell.locked) {
+                    root.picked();
                 }
             }
-        }
-        VerticalLayout {
-            alignment: center;
-            horizontal-stretch: 1;
-            Text {
-                text: root.label;
-                overflow: elide;
-                color: Palette.foreground;
+            TouchArea {
+                enabled: !Shell.locked;
+                clicked => {
+                    root.picked();
+                }
             }
-            Text {
-                text: root.detail;
-                font-size: 11px;
-                overflow: elide;
-                color: Palette.foreground;
-                opacity: 0.7;
+            HorizontalLayout {
+                spacing: 8px;
+                opacity: Shell.locked ? 0.5 : 1;
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 14px;
+                        height: 14px;
+                        border-radius: 7px;
+                        border-width: 1.5px;
+                        border-color: root.checked ? Palette.accent-background : Palette.foreground.transparentize(50%);
+                        Rectangle {
+                            width: 6px;
+                            height: 6px;
+                            border-radius: 3px;
+                            background: Palette.accent-background;
+                            visible: root.checked;
+                        }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: root.label;
+                        overflow: elide;
+                        color: Palette.foreground;
+                    }
+                    Text {
+                        text: root.detail;
+                        font-size: 11px;
+                        overflow: elide;
+                        color: Palette.foreground;
+                        opacity: 0.7;
+                    }
+                }
             }
         }
         VerticalLayout {
@@ -152,6 +160,7 @@ export component ModelPage inherits VerticalLayout {
                 }
                 if row.error != "": Text {
                     text: row.error;
+                    accessible-label: @tr("{}: {}", row.name, row.error);
                     wrap: word-wrap;
                     color: Shell.error-text;
                 }

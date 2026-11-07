@@ -5,6 +5,8 @@
 mod common;
 
 use std::fs;
+use std::thread;
+use std::time::Duration;
 
 use common::layout;
 use i_slint_backend_testing::{AccessibleRole, ElementHandle};
@@ -36,6 +38,26 @@ fn has(window: &AppWindow, label: &str) -> bool {
     ElementHandle::find_by_accessible_label(window, label)
         .next()
         .is_some()
+}
+
+/// Wait for the path worker: step the mocked clock (which runs the page's poll timer) until
+/// `ready`.
+fn wait_for(ready: impl Fn() -> bool) {
+    for _ in 0..400 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(30));
+        if ready() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    panic!("the path check did not answer");
+}
+
+fn path_saved(layout: &Layout, path: &str) -> bool {
+    fs::read_to_string(layout.config_file())
+        .ok()
+        .and_then(|t| ConfigFile::parse(&t).ok())
+        .is_some_and(|f| f.config.model.custom_path == path)
 }
 
 fn saved(layout: &Layout) -> Model {
@@ -95,7 +117,7 @@ fn missing_custom_path_shows_an_error() {
         Some("version = 1\n[model]\nid = \"custom\"\ncustom_path = \"C:/nowhere/gone.bin\"\n"),
     );
     let window = open(&l);
-    assert!(has(&window, "File not found"));
+    wait_for(|| has(&window, "File not found"));
 
     let field = with_role(&window, "Model file", AccessibleRole::TextInput);
     let notes = l.config_dir.join("notes.txt");
@@ -108,10 +130,24 @@ fn missing_custom_path_shows_an_error() {
     fs::write(&model, b"synthetic").unwrap();
     let model = model.to_string_lossy().into_owned();
     field.set_accessible_value(model.clone());
+    wait_for(|| path_saved(&l, &model));
     assert!(!has(&window, "The model file must end in .bin"));
     assert!(!has(&window, "File not found"));
     let saved = saved(&l);
     assert_eq!((saved.id.as_str(), saved.custom_path), ("custom", model));
+}
+
+#[test]
+fn relative_custom_path_is_refused() {
+    let l = layout("relative", None);
+    let window = open(&l);
+    with_role(&window, "Model file", AccessibleRole::TextInput)
+        .set_accessible_value("mine.bin".to_owned());
+    assert!(has(
+        &window,
+        "Use the full path to the file, from the drive letter"
+    ));
+    assert!(!l.config_file().exists(), "a relative path was saved");
 }
 
 #[test]
@@ -128,6 +164,7 @@ fn typing_a_good_path_picks_the_custom_model() {
     fs::write(&model, b"synthetic").unwrap();
     with_role(&window, "Model file", AccessibleRole::TextInput)
         .set_accessible_value(format!("\"{}\"", model.display()));
+    wait_for(|| path_saved(&l, &model.to_string_lossy()));
     assert_eq!(saved(&l).id, "custom");
     assert_eq!(saved(&l).custom_path, model.to_string_lossy());
     assert_eq!(
@@ -162,9 +199,14 @@ fn idle_unload_slider_writes_minutes() {
     let window = open(&l);
     assert!(has(&window, "5 min"));
     let slider = with_role(&window, "Unload after idle", AccessibleRole::Slider);
+    let rest = || i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(350));
     slider.set_accessible_value("12");
-    assert_eq!(saved(&l).idle_unload_minutes, 12);
+    slider.set_accessible_value("20");
+    assert!(!l.config_file().exists(), "saved during the drag");
+    rest();
+    assert_eq!(saved(&l).idle_unload_minutes, 20);
     slider.set_accessible_value("0");
+    rest();
     assert_eq!(saved(&l).idle_unload_minutes, 0);
     assert!(has(&window, "Never"));
 }
@@ -175,7 +217,10 @@ fn download_without_the_daemon_says_to_start_it() {
     let window = open(&l);
     with_role(&window, "Download Whisper large-v3", AccessibleRole::Button)
         .invoke_accessible_default_action();
-    assert!(has(&window, "Start OxiYapper to download models"));
+    assert!(has(
+        &window,
+        "Whisper large-v3: Start OxiYapper to download models"
+    ));
     assert!(
         !ElementHandle::find_by_accessible_label(&window, "Whisper large-v3 download")
             .any(|e| e.accessible_role() == Some(AccessibleRole::ProgressIndicator))
