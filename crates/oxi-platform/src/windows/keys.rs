@@ -190,9 +190,9 @@ pub fn send_keys(keys: &[(Key, bool)]) -> io::Result<()> {
     send_tagged(keys, INJECT_TAG)
 }
 
-/// Injects keys as another program would, so the hook tracks them.
-#[cfg(test)]
-pub(crate) fn send_keys_untagged(keys: &[(Key, bool)]) -> io::Result<()> {
+/// Injects keys as another program would, so the hook tracks them. For tests only.
+#[doc(hidden)]
+pub fn send_keys_untagged(keys: &[(Key, bool)]) -> io::Result<()> {
     send_tagged(keys, 0)
 }
 

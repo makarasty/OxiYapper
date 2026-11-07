@@ -17,10 +17,7 @@ use oxi_platform::os::keys;
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, SendInput,
-    VK_ESCAPE, VK_F14,
-};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_F14};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetMessageW, KBDLLHOOKSTRUCT, MSG, PM_NOREMOVE, PeekMessageW,
     PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN,
@@ -64,33 +61,7 @@ impl Live {
 
 /// Injects keys as another program would: without our tag.
 fn press_untagged(keys: &[(Key, bool)]) {
-    let inputs: Vec<INPUT> = keys
-        .iter()
-        .map(|&(key, down)| {
-            let (code, extended) = keys::vk(key);
-            let mut flags = if extended { KEYEVENTF_EXTENDEDKEY } else { 0 };
-            if !down {
-                flags |= KEYEVENTF_KEYUP;
-            }
-            INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 {
-                    ki: KEYBDINPUT {
-                        wVk: code,
-                        wScan: 0,
-                        dwFlags: flags,
-                        time: 0,
-                        dwExtraInfo: 0,
-                    },
-                },
-            }
-        })
-        .collect();
-    let count = u32::try_from(inputs.len()).unwrap();
-    let size = i32::try_from(size_of::<INPUT>()).unwrap();
-    // SAFETY: a live slice of `count` initialised INPUT values.
-    let sent = unsafe { SendInput(count, inputs.as_ptr(), size) };
-    assert_eq!(sent, count, "SendInput blocked");
+    keys::send_keys_untagged(keys).expect("SendInput blocked");
 }
 
 /// Ctrl+Shift+F13 with two F13 auto-repeats and an F14 while held.

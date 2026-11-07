@@ -13,13 +13,13 @@ pub fn open(path: &Path) -> io::Result<()> {
 /// Windows: `ShellExecuteW` with the "open" verb.
 #[cfg(windows)]
 fn open_existing(path: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-    let wide = |s: &std::ffi::OsStr| s.encode_wide().chain([0]).collect::<Vec<u16>>();
-    let verb = wide("open".as_ref());
-    let file = wide(path.as_os_str());
+    use crate::os::wide;
+
+    let verb = wide("open");
+    let file = wide(path);
     // SAFETY: both strings are NUL-terminated and outlive the call; the null pointers are the
     // optional owner window, parameters and directory.
     let code = unsafe {

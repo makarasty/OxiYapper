@@ -35,6 +35,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, GetForegroundWindow, GetWindowThreadProcessId,
 };
 
+use super::wide;
+
 /// winnt.h values; their windows-sys module (`System_SystemServices`) is not enabled here.
 const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
 const SECURITY_MANDATORY_MEDIUM_RID: u32 = 0x2000;
@@ -148,10 +150,6 @@ pub fn security_descriptor(sddl: &str) -> io::Result<SecurityDescriptor> {
     // SAFETY: allocated by LocalAlloc in the call above and not used after this.
     unsafe { LocalFree(sd) };
     owned
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain([0]).collect()
 }
 
 /// Opens the client end of pipe `path` for overlapped I/O at identification level, so the
