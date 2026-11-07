@@ -89,3 +89,131 @@ fn default_mic_captures_one_second() {
     drop(capture);
     assert_eq!(meter.read(), SILENT, "drop stopped the capture");
 }
+
+/// Probe every input: default format, raw per-channel level from cpal, then the level through
+/// `CpalCapture` (the daemon's path) with and without trim/normalise. Numbers only, never audio.
+#[test]
+fn probe_every_input() {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    if !mic_test() {
+        return;
+    }
+    let host = cpal::default_host();
+    let default = host
+        .default_input_device()
+        .and_then(|d| d.description().ok())
+        .map(|d| d.name().to_owned());
+    eprintln!("default input: {default:?}");
+    for dev in host.input_devices().unwrap() {
+        let name = dev
+            .description()
+            .map(|d| d.name().to_owned())
+            .unwrap_or_default();
+        let Ok(cfg) = dev.default_input_config() else {
+            eprintln!("{name}: no default config");
+            continue;
+        };
+        let ch = usize::from(cfg.channels());
+        eprintln!(
+            "{name}: {ch} ch, {} Hz, {:?}",
+            cfg.sample_rate(),
+            cfg.sample_format()
+        );
+        raw_levels(&dev, &cfg);
+        for (label, trim) in [("pipeline no-trim", false), ("pipeline default", true)] {
+            let opts = Audio {
+                device: name.clone(),
+                trim,
+                normalize: trim,
+                ..Audio::default()
+            };
+            let meter = LevelMeter::default();
+            let capture = match CpalCapture::open(&opts, meter.clone(), |_| {}) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("  {label}: open failed: {e}");
+                    continue;
+                }
+            };
+            let mut loudest = SILENT;
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(3) {
+                let l = meter.read();
+                loudest.peak = loudest.peak.max(l.peak);
+                loudest.rms = loudest.rms.max(l.rms);
+                sleep(Duration::from_millis(33));
+            }
+            let fell = capture.fell_back_to_default();
+            match capture.finish() {
+                Ok(s) => {
+                    let l = level(&s);
+                    eprintln!(
+                        "  {label}: fell_back {fell}, out {} samples peak {:.5} rms {:.5}; meter max peak {:.5} rms {:.5}",
+                        s.len(),
+                        l.peak,
+                        l.rms,
+                        loudest.peak,
+                        loudest.rms
+                    );
+                }
+                Err(e) => eprintln!(
+                    "  {label}: fell_back {fell}, finish error: {e}; meter max peak {:.5} rms {:.5}",
+                    loudest.peak, loudest.rms
+                ),
+            }
+        }
+    }
+}
+
+/// Per-channel peak and RMS of 3 s straight from cpal, f32 streams only (the default format here).
+fn raw_levels(dev: &cpal::Device, cfg: &cpal::SupportedStreamConfig) {
+    use cpal::traits::{DeviceTrait, StreamTrait};
+    use std::sync::{Arc, Mutex};
+    let ch = usize::from(cfg.channels());
+    // Raw: per channel sum of squares and peak, f32 stream only (the default format here).
+    let acc = Arc::new(Mutex::new((vec![0.0_f64; ch], vec![0.0_f32; ch], 0_usize)));
+    let a = Arc::clone(&acc);
+    let stream = dev.build_input_stream(
+        cfg.config(),
+        move |data: &[f32], _: &cpal::InputCallbackInfo| {
+            let mut g = a.lock().unwrap();
+            for frame in data.chunks_exact(ch) {
+                for (c, s) in frame.iter().enumerate() {
+                    g.0[c] += f64::from(s * s);
+                    g.1[c] = g.1[c].max(s.abs());
+                }
+                g.2 += 1;
+            }
+        },
+        |_| {},
+        None,
+    );
+    match stream {
+        Ok(s) => {
+            s.play().unwrap();
+            sleep(Duration::from_secs(3));
+            drop(s);
+            let g = acc.lock().unwrap();
+            for c in 0..ch {
+                eprintln!(
+                    "  raw ch{c}: peak {:.5} rms {:.5} ({} frames)",
+                    g.1[c],
+                    (g.0[c] / g.2.max(1) as f64).sqrt(),
+                    g.2
+                );
+            }
+        }
+        Err(e) => eprintln!("  raw open failed: {e}"),
+    }
+}
+
+#[test]
+fn playback_opens_the_default_output() {
+    if !mic_test() {
+        return;
+    }
+    // Silence only: the probe must not make a sound on the owner's speakers.
+    let sound = oxi_platform::capture::play(&[0.0; 3_200], SAMPLE_RATE).unwrap();
+    sleep(Duration::from_millis(300));
+    drop(sound);
+}

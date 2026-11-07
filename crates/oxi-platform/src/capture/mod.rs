@@ -4,6 +4,7 @@
 //! thread downmixes, feeds [`oxi_core::audio::Pipeline`] in 20 ms windows (DSP lives in `oxi-core`,
 //! not here) and publishes each window's post-gain level to the [`LevelMeter`].
 
+mod play;
 mod stream;
 
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use oxi_core::audio::{AudioError, Level};
 use oxi_core::config::Audio;
 use thiserror::Error;
 
+pub use play::{Playback, play};
 pub use stream::{CpalCapture, list_input_devices};
 
 /// Post-gain peak and RMS of the last 20 ms window, for the overlay meter (ARCHITECTURE section 2).
@@ -61,6 +63,8 @@ pub enum CaptureEvent {
 pub enum CaptureError {
     #[error("no input device")]
     NoDevice,
+    #[error("no output device")]
+    NoOutput,
     /// The OS privacy setting (or macOS TCC) blocks the microphone.
     #[error("microphone permission denied")]
     PermissionDenied,

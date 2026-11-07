@@ -43,9 +43,16 @@ pub struct CpalCapture {
     meter: LevelMeter,
     rate: u32,
     fell_back: bool,
+    name: String,
 }
 
 impl CpalCapture {
+    /// Name of the device that was opened (the default's own name when none was configured).
+    #[must_use]
+    pub fn device_name(&self) -> &str {
+        &self.name
+    }
+
     /// Stop the callbacks, then the drain thread, and zero the meter; idempotent. With `cancel`
     /// the drain skips the pipeline flush and returns nothing.
     fn stop(&mut self, cancel: bool) -> Result<Vec<f32>, CaptureError> {
@@ -94,6 +101,10 @@ impl Capture for CpalCapture {
         let dev = named
             .or_else(|| host.default_input_device())
             .ok_or(CaptureError::NoDevice)?;
+        let name = dev
+            .description()
+            .map(|d| d.name().to_owned())
+            .unwrap_or_default();
 
         let supported = dev.default_input_config()?;
         let (channels, rate, format) = (
@@ -167,6 +178,7 @@ impl Capture for CpalCapture {
             meter,
             rate,
             fell_back,
+            name,
         })
     }
 

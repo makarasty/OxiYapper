@@ -109,6 +109,17 @@ fn normalise(samples: &mut [f32]) {
     }
 }
 
+/// A whole clip from `from` Hz to `to` Hz (the mic test plays 16 kHz audio on the output rate).
+///
+/// # Errors
+/// [`AudioError::Resample`] for a rate of zero or a buffer rubato rejects.
+pub fn resample(samples: &[f32], from: u32, to: u32) -> Result<Vec<f32>, AudioError> {
+    let mut r = resample::StreamResampler::new(from, to)?;
+    let mut out = r.push(samples)?;
+    out.extend(r.finish()?);
+    Ok(out)
+}
+
 /// Decibels to a linear amplitude factor.
 #[must_use]
 pub fn db_to_linear(db: f32) -> f32 {
@@ -118,6 +129,17 @@ pub fn db_to_linear(db: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resample_keeps_duration_and_level() {
+        let tone: Vec<f32> = (0..16_000)
+            .map(|i| 0.5 * (std::f32::consts::TAU * 440.0 * i as f32 / 16_000.0).sin())
+            .collect();
+        let out = resample(&tone, 16_000, 48_000).unwrap();
+        assert_eq!(out.len(), 48_000);
+        let (a, b) = (level(&tone), level(&out[480..out.len() - 480]));
+        assert!((a.rms - b.rms).abs() < 0.02, "{a:?} {b:?}");
+    }
 
     /// The settings meter opens its stream at 0 dB and scales the level by the gain instead.
     #[test]

@@ -31,8 +31,14 @@ export global AudioState {
     in property <string> fallback;
     // Listing the devices failed (the error kind); empty otherwise.
     in property <string> list-error;
+    // The open mic gives only exact zeros (muted or switched off); empty otherwise.
+    in property <string> silence;
+    // The Test button: true while it records and plays back; its status line.
+    in property <bool> testing;
+    in property <string> test-status;
     callback shown();
     callback edited(AudioKey, float);
+    callback test();
 }
 
 export component AudioPage inherits VerticalLayout {
@@ -93,6 +99,26 @@ export component AudioPage inherits VerticalLayout {
                         }
                     }
                 }
+            }
+        }
+        if AudioState.silence != "": InlineNote {
+            text: AudioState.silence;
+        }
+        Row {
+            label: @tr("Mic test");
+            Button {
+                text: @tr("Test");
+                enabled: !AudioState.testing;
+                clicked => {
+                    AudioState.test();
+                }
+            }
+            Text {
+                text: AudioState.test-status;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+                overflow: elide;
+                color: Palette.foreground;
             }
         }
         SliderRow {
