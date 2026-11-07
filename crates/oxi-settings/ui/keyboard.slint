@@ -4,10 +4,12 @@ import { Palette } from "std-widgets.slint";
 import { Shell } from "widgets.slint";
 
 export struct KeyCap {
-    // `Key::as_str` ("LCtrl"): unique, so it is also the accessible label.
+    // `Key::as_str` ("LCtrl"), sent back on a click.
     name: string,
-    // `Key::label`: the text on the cap.
+    // The text on the cap, `keyboard_layout::cap_label`.
     label: string,
+    // The accessible label, `keyboard_layout::spoken` ("Left Ctrl"): unique on the board.
+    spoken: string,
     // Characters in the longest word of `label`: the cap shrinks its font to fit that word.
     word: int,
     // Position and size in key units.
@@ -40,7 +42,7 @@ export component Keyboard inherits Rectangle {
         background: cap.held ? Palette.accent-background : cap.picked ? Palette.selection-background.transparentize(0.5) : touch.has-hover && !Shell.locked ? Palette.alternate-background : Palette.control-background;
         opacity: Shell.locked ? 0.5 : 1;
         accessible-role: button;
-        accessible-label: cap.name;
+        accessible-label: cap.spoken;
         accessible-checkable: true;
         accessible-checked: cap.picked;
         accessible-description: cap.held ? "held" : "";

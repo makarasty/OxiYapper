@@ -93,9 +93,68 @@ pub fn caps() -> Vec<Cap> {
     caps
 }
 
+/// The text on the cap: [`Key::label`], shortened where its cap would shrink it below ~7 px at
+/// the smallest window ([`spoken`] keeps the full name).
+pub fn cap_label(key: Key) -> &'static str {
+    match key {
+        Key::Backspace => "Bksp",
+        Key::CapsLock => "Caps",
+        Key::NumLock => "Num",
+        _ => key.label(),
+    }
+}
+
+/// The key in words for a screen reader, unique on the board: "Left Ctrl", "Numpad 7",
+/// "Page Up", "Up arrow".
+pub fn spoken(key: Key) -> String {
+    let name = key.as_str();
+    match key {
+        Key::Up | Key::Down | Key::Left | Key::Right => return format!("{name} arrow"),
+        Key::NumLock => return "Num Lock".to_owned(),
+        _ => {}
+    }
+    let (mut out, rest) = match name.as_bytes() {
+        [b'L', c, ..] if c.is_ascii_uppercase() => ("Left ".to_owned(), &name[1..]),
+        [b'R', c, ..] if c.is_ascii_uppercase() => ("Right ".to_owned(), &name[1..]),
+        [b'N', b'u', b'm', _, ..] => ("Numpad ".to_owned(), &name[3..]),
+        _ => (String::new(), name),
+    };
+    // "PrintScreen" reads "Print Screen".
+    for (i, ch) in rest.char_indices() {
+        if i > 0 && ch.is_ascii_uppercase() {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spoken_names_are_words_and_unique() {
+        let names: Vec<String> = caps().iter().map(|c| spoken(c.key)).collect();
+        for (i, n) in names.iter().enumerate() {
+            assert!(!names[i + 1..].contains(n), "{n} twice");
+        }
+        let want = [
+            (Key::LCtrl, "Left Ctrl"),
+            (Key::RShift, "Right Shift"),
+            (Key::R, "R"),
+            (Key::Left, "Left arrow"),
+            (Key::Num7, "Numpad 7"),
+            (Key::NumEnter, "Numpad Enter"),
+            (Key::NumLock, "Num Lock"),
+            (Key::PageUp, "Page Up"),
+            (Key::Minus, "Minus"),
+            (Key::Esc, "Esc"),
+        ];
+        for (key, name) in want {
+            assert_eq!(spoken(key), name);
+        }
+    }
 
     #[test]
     fn every_ansi_key_is_on_the_board_once() {

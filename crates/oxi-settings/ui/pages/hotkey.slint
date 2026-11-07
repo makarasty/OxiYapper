@@ -18,6 +18,8 @@ export global HotkeyState {
     in property <string> pending;
     // Why the pending chord cannot be saved; empty when it can.
     in property <string> error;
+    // Set when a pressed chord ends the capture: 1 moves the focus to Apply, 2 to Cancel, 0 stays.
+    in property <int> move-focus;
     // The page came into view.
     callback shown();
     callback change();
@@ -64,10 +66,21 @@ export component HotkeyPage inherits VerticalLayout {
                 }
             }
         }
-        // Keys pressed while it has the focus come from the daemon's hook (CaptureHotkey).
+        // Keys pressed while it has the focus come from the daemon's hook (CaptureHotkey), which
+        // swallows Tab and Esc too: so releasing a chord or pressing Esc alone hands the focus back.
         if HotkeyState.keyboard-open: board := FocusScope {
+            property <int> move-focus: HotkeyState.move-focus;
+            accessible-role: groupbox;
+            accessible-label: @tr("Hotkey keyboard");
             init => {
                 self.focus();
+            }
+            changed move-focus => {
+                if self.move-focus == 1 {
+                    apply.focus();
+                } else if self.move-focus == 2 {
+                    cancel.focus();
+                }
             }
             focus-gained => {
                 HotkeyState.focused(true);
@@ -80,7 +93,8 @@ export component HotkeyPage inherits VerticalLayout {
                 padding-top: 4px;
                 padding-bottom: 6px;
                 Text {
-                    text: @tr("Click keys or press them. Modifiers match either side.");
+                    text: @tr("Click keys or press them; modifiers match either side. Releasing the keys goes to Apply, Esc to Cancel; click the keyboard to press again.");
+                    wrap: word-wrap;
                     font-size: 11px;
                     color: Palette.foreground;
                     opacity: 0.7;
@@ -103,14 +117,14 @@ export component HotkeyPage inherits VerticalLayout {
                         vertical-alignment: center;
                         color: HotkeyState.error != "" ? Shell.error-text : Palette.foreground;
                     }
-                    Button {
+                    cancel := Button {
                         text: @tr("Cancel");
                         accessible-label: @tr("Cancel hotkey change");
                         clicked => {
                             HotkeyState.cancel();
                         }
                     }
-                    Button {
+                    apply := Button {
                         text: @tr("Apply");
                         accessible-label: @tr("Apply hotkey");
                         enabled: !Shell.locked;

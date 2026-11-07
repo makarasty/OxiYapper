@@ -49,23 +49,26 @@ fn clicked_keys_apply_as_the_new_chord() {
     let l = layout("apply", Some("version = 1\n[hotkey]\nchord = [\"F13\"]\n"));
     let window = open(&l);
     assert!(has(&window, "F13"));
-    assert!(!has(&window, "LCtrl"), "the keyboard is open before Change");
+    assert!(
+        !has(&window, "Left Ctrl"),
+        "the keyboard is open before Change"
+    );
 
     click(&window, "Change hotkey");
-    click(&window, "LCtrl");
-    click(&window, "LAlt");
-    click(&window, "LWin");
+    click(&window, "Left Ctrl");
+    click(&window, "Left Alt");
+    click(&window, "Left Win");
     // A second click takes a key out again.
-    click(&window, "LAlt");
-    assert_eq!(one(&window, "LCtrl").accessible_checked(), Some(true));
-    assert_eq!(one(&window, "LAlt").accessible_checked(), Some(false));
+    click(&window, "Left Alt");
+    assert_eq!(one(&window, "Left Ctrl").accessible_checked(), Some(true));
+    assert_eq!(one(&window, "Left Alt").accessible_checked(), Some(false));
     assert!(has(&window, "New hotkey: Ctrl + Win"));
 
     click(&window, "Apply hotkey");
     assert_eq!(config(&l).config.hotkey.chord, ["Ctrl", "Win"]);
     assert!(has(&window, "Ctrl + Win"));
     assert!(
-        !has(&window, "LCtrl"),
+        !has(&window, "Left Ctrl"),
         "the keyboard stays open after Apply"
     );
 }
@@ -75,8 +78,8 @@ fn both_sides_of_a_modifier_are_one_key() {
     let l = layout("sides", None);
     let window = open(&l);
     click(&window, "Change hotkey");
-    click(&window, "RCtrl");
-    click(&window, "LCtrl");
+    click(&window, "Right Ctrl");
+    click(&window, "Left Ctrl");
     click(&window, "F12");
     click(&window, "Apply hotkey");
     assert_eq!(config(&l).config.hotkey.chord, ["Ctrl", "F12"]);
@@ -87,7 +90,7 @@ fn esc_is_refused_with_a_message() {
     let l = layout("esc", None);
     let window = open(&l);
     click(&window, "Change hotkey");
-    click(&window, "LCtrl");
+    click(&window, "Left Ctrl");
     click(&window, "Esc");
     let message = "Esc cancels a recording and cannot be part of the hotkey";
     assert!(has(&window, message));
@@ -119,7 +122,7 @@ fn cancel_keeps_the_saved_chord() {
     click(&window, "Change hotkey");
     click(&window, "F12");
     click(&window, "Cancel hotkey change");
-    assert!(!has(&window, "LCtrl"));
+    assert!(!has(&window, "Left Ctrl"));
     assert!(has(&window, "Ctrl + Win"));
     assert!(!l.config_file().exists());
 
@@ -156,6 +159,6 @@ fn locked_config_keeps_change_off() {
     let change = one(&window, "Change hotkey");
     assert_eq!(change.accessible_enabled(), Some(false));
     change.invoke_accessible_default_action();
-    assert!(!has(&window, "LCtrl"));
+    assert!(!has(&window, "Left Ctrl"));
     assert_eq!(fs::read_to_string(l.config_file()).unwrap(), original);
 }

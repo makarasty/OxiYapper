@@ -15,7 +15,7 @@ use oxi_core::machine::Mode;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
 use crate::generated::{HotkeyState, KeyCap};
-use crate::ipc::Event;
+use crate::ipc::{Event, Link};
 use crate::{AppWindow, Ctx, Page, report};
 
 /// How often a running capture checks that its page is still shown.
@@ -37,8 +37,9 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         .iter()
         .map(|c| KeyCap {
             name: c.key.as_str().into(),
-            label: c.key.label().into(),
-            word: longest_word(c.key.label()),
+            label: keyboard_layout::cap_label(c.key).into(),
+            spoken: keyboard_layout::spoken(c.key).into(),
+            word: longest_word(keyboard_layout::cap_label(c.key)),
             x: c.x,
             y: c.y,
             w: c.w,
@@ -91,8 +92,11 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     // the old picker weakly, so it goes quiet once the callbacks above replace it.
     let p = Rc::downgrade(&picker);
     ctx.ipc.subscribe(move |event| {
-        if let (Some(p), Event::Push(Push::Key { code, down })) = (p.upgrade(), event) {
-            p.pressed(*code, *down);
+        let Some(p) = p.upgrade() else { return };
+        match event {
+            Event::Push(Push::Key { code, down }) => p.pressed(*code, *down),
+            Event::Link(Link::Online) => p.relinked(),
+            _ => {}
         }
     });
 }
@@ -149,6 +153,9 @@ impl Picker {
         if self.capturing.replace(on) != on {
             self.ctx.ipc.send(Request::CaptureHotkey { on });
         }
+        if on {
+            self.with(|s| s.set_move_focus(0));
+        }
         if on && !self.watch.running() {
             let me = self.me.clone();
             self.watch.start(TimerMode::Repeated, WATCH, move || {
@@ -163,6 +170,22 @@ impl Picker {
             self.held.borrow_mut().clear();
         }
         self.show();
+    }
+
+    /// A new daemon (restart) has no capture: ask again, and forget keys whose key-up was lost.
+    fn relinked(&self) {
+        if self.capturing.get() {
+            self.held.borrow_mut().clear();
+            self.ctx.ipc.send(Request::CaptureHotkey { on: true });
+            self.show();
+        }
+    }
+
+    /// Ends the capture from the keyboard (the hook swallows Tab and Esc, so the board would
+    /// trap the focus) and moves the focus to Apply (1) or Cancel (2).
+    fn hand_back(&self, to: i32) {
+        self.capture(false);
+        self.with(|s| s.set_move_focus(to));
     }
 
     fn check_page(&self) {
@@ -187,12 +210,17 @@ impl Picker {
         self.show();
     }
 
-    /// A key from the hook. The first key down after all were up starts a new chord.
+    /// A key from the hook. The first key down after all were up starts a new chord. Esc alone
+    /// goes to Cancel; releasing every key of a valid chord goes to Apply.
     fn pressed(&self, key: Key, down: bool) {
         if !self.capturing.get() {
             return;
         }
-        {
+        if down && key == Key::Esc && self.held.borrow().is_empty() {
+            self.hand_back(2);
+            return;
+        }
+        let released = {
             let mut held = self.held.borrow_mut();
             let mut pending = self.pending.borrow_mut();
             if down {
@@ -208,8 +236,13 @@ impl Picker {
             } else {
                 held.retain(|&k| k != key);
             }
+            !down && held.is_empty() && Chord::from_keys(&pending).is_ok()
+        };
+        if released {
+            self.hand_back(1);
+        } else {
+            self.show();
         }
-        self.show();
     }
 
     fn apply(&self) {
@@ -298,7 +331,7 @@ mod tests {
     use slint::ComponentHandle;
     use slint::platform::WindowEvent;
 
-    use crate::ipc::{Cmd, Event, Ipc};
+    use crate::ipc::{Cmd, Event, Ipc, Link};
     use crate::{AppWindow, Ctx, Page};
 
     fn open(name: &str) -> (AppWindow, Ipc, Receiver<Cmd>) {
@@ -333,7 +366,7 @@ mod tests {
     }
 
     fn board_open(window: &AppWindow) -> bool {
-        ElementHandle::find_by_accessible_label(window, "LCtrl")
+        ElementHandle::find_by_accessible_label(window, "Left Ctrl")
             .next()
             .is_some()
     }
@@ -369,35 +402,126 @@ mod tests {
         let (window, ipc, _sent) = open("push");
         one(&window, "Change hotkey").invoke_accessible_default_action();
         key(&ipc, Key::LShift, true);
-        let shift = one(&window, "LShift");
+        let shift = one(&window, "Left Shift");
         assert_eq!(shift.accessible_description().as_deref(), Some("held"));
         assert_eq!(shift.accessible_checked(), Some(true));
         key(&ipc, Key::F13, true);
         assert!(one(&window, "New hotkey: Shift + F13").is_valid());
-        key(&ipc, Key::LShift, false);
-        key(&ipc, Key::F13, false);
+        // Esc inside a chord is refused, and capture goes on once every key is up.
+        key(&ipc, Key::Esc, true);
+        for k in [Key::LShift, Key::F13, Key::Esc] {
+            key(&ipc, k, false);
+        }
         assert_eq!(
-            one(&window, "LShift").accessible_description().as_deref(),
+            one(&window, "Left Shift")
+                .accessible_description()
+                .as_deref(),
             Some("")
         );
         // A new press after all keys are up starts a new chord.
         key(&ipc, Key::F14, true);
         assert!(one(&window, "New hotkey: F14").is_valid());
-        assert_eq!(one(&window, "LShift").accessible_checked(), Some(false));
+        assert_eq!(one(&window, "Left Shift").accessible_checked(), Some(false));
+    }
+
+    fn press(window: &AppWindow, k: slint::platform::Key) {
+        // The focus moves in a change handler, which runs with the timers.
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
+        let text: slint::SharedString = k.into();
+        let w = window.window();
+        w.dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+        w.dispatch_event(WindowEvent::KeyReleased { text });
+    }
+
+    #[test]
+    fn releasing_a_chord_ends_capture_and_space_applies_it() {
+        let (window, ipc, sent) = open("release");
+        one(&window, "Change hotkey").invoke_accessible_default_action();
+        let _ = one(&window, "Left Ctrl");
+        for (k, down) in [(Key::LShift, true), (Key::F13, true), (Key::F13, false)] {
+            key(&ipc, k, down);
+        }
+        assert_eq!(captures(&sent), [true]);
+        key(&ipc, Key::LShift, false);
+        assert_eq!(captures(&sent), [false]);
+        // The hook is off, so the window gets the keys: the focus is on Apply.
+        press(&window, slint::platform::Key::Space);
+        assert!(!board_open(&window));
+        assert!(one(&window, "Shift + F13").is_valid());
+        assert_eq!(captures(&sent), Vec::<bool>::new());
+    }
+
+    #[test]
+    fn esc_alone_ends_capture_and_space_cancels() {
+        let (window, ipc, sent) = open("escape");
+        one(&window, "Change hotkey").invoke_accessible_default_action();
+        let _ = one(&window, "Left Ctrl");
+        key(&ipc, Key::F13, true);
+        key(&ipc, Key::F13, false);
+        assert_eq!(captures(&sent), [true, false]);
+        // Back on the board, capture runs again; Esc alone hands the focus to Cancel.
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
+        one(&window, "F5").mock_single_click(slint::platform::PointerEventButton::Left);
+        assert_eq!(captures(&sent), [true]);
+        key(&ipc, Key::Esc, true);
+        assert_eq!(captures(&sent), [false]);
+        press(&window, slint::platform::Key::Space);
+        assert!(!board_open(&window));
+        assert!(one(&window, "Ctrl + Win").is_valid());
+    }
+
+    #[test]
+    fn a_restarted_daemon_is_asked_to_capture_again() {
+        let (window, ipc, sent) = open("relink");
+        one(&window, "Change hotkey").invoke_accessible_default_action();
+        let _ = one(&window, "Left Ctrl");
+        key(&ipc, Key::LAlt, true);
+        assert_eq!(captures(&sent), [true]);
+        ipc.deliver(&Event::Link(Link::Offline));
+        ipc.deliver(&Event::Link(Link::Online));
+        assert_eq!(captures(&sent), [true]);
+        // The lost key-up of Alt does not stick.
+        assert_eq!(
+            one(&window, "Left Alt").accessible_description().as_deref(),
+            Some("")
+        );
+        one(&window, "Cancel hotkey change").invoke_accessible_default_action();
+        assert_eq!(captures(&sent), [false]);
+        ipc.deliver(&Event::Link(Link::Online));
+        assert_eq!(captures(&sent), Vec::<bool>::new());
+    }
+
+    #[test]
+    fn long_labels_stay_readable_at_the_smallest_window() {
+        let (window, _ipc, _sent) = open("labels");
+        window
+            .window()
+            .set_size(slint::LogicalSize::new(560.0, 600.0));
+        one(&window, "Change hotkey").invoke_accessible_default_action();
+        for k in [Key::Backspace, Key::CapsLock, Key::NumLock] {
+            let label = super::keyboard_layout::cap_label(k);
+            let cap = one(&window, &super::keyboard_layout::spoken(k));
+            // keyboard.slint: the text box is the cap less 2 px, the font
+            // min(8px, box / longest word * 1.4).
+            let room = cap.size().width - 2.0;
+            #[allow(clippy::cast_precision_loss, reason = "a label has a few characters")]
+            let font = (room / label.chars().count() as f32 * 1.4).min(8.0);
+            assert!(!label.contains(' ') && font >= 6.5, "{label}: {font} px");
+        }
     }
 
     #[test]
     fn focus_loss_ends_capture_and_drops_late_keys() {
         let (window, ipc, sent) = open("focus");
         one(&window, "Change hotkey").invoke_accessible_default_action();
-        let _ = one(&window, "LCtrl");
+        let _ = one(&window, "Left Ctrl");
         assert_eq!(captures(&sent), [true]);
         window
             .window()
             .dispatch_event(WindowEvent::WindowActiveChanged(false));
         assert_eq!(captures(&sent), [false]);
         key(&ipc, Key::LAlt, true);
-        assert_eq!(one(&window, "LAlt").accessible_checked(), Some(false));
+        assert_eq!(one(&window, "Left Alt").accessible_checked(), Some(false));
         // Back in front: the board still has the focus, capture resumes.
         window
             .window()
@@ -409,7 +533,7 @@ mod tests {
     fn leaving_the_page_from_the_rail_ends_capture() {
         let (window, _ipc, sent) = open("leave");
         one(&window, "Change hotkey").invoke_accessible_default_action();
-        let _ = one(&window, "LCtrl");
+        let _ = one(&window, "Left Ctrl");
         assert_eq!(captures(&sent), [true]);
         one(&window, "Audio").mock_single_click(slint::platform::PointerEventButton::Left);
         assert_eq!(window.get_page(), Page::Audio);
@@ -424,7 +548,7 @@ mod tests {
     fn closing_the_window_ends_capture() {
         let (window, _ipc, sent) = open("drop");
         one(&window, "Change hotkey").invoke_accessible_default_action();
-        let _ = one(&window, "LCtrl");
+        let _ = one(&window, "Left Ctrl");
         assert_eq!(captures(&sent), [true]);
         window.hide().unwrap();
         drop(window);
