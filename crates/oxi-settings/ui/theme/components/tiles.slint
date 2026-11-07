@@ -1,0 +1,294 @@
+// Visual pickers: icon tiles and the screen diagram. Large items, so selected = soft fill
+// (accent tint, accent icon and title, check badge); borders never change colour.
+import { Theme, Shell } from "../tokens.slint";
+import { Icons } from "../icons.slint";
+import { FocusRing, KeyFocus } from "base.slint";
+
+// 20 px accent circle with a white check; grey on a read-only picker.
+export component CheckBadge inherits Rectangle {
+    in property <bool> muted;
+    width: 20px;
+    height: 20px;
+    border-radius: 10px;
+    background: root.muted ? Theme.text-secondary : Theme.accent;
+    Image {
+        source: Icons.checkmark-12;
+        width: 12px;
+        height: 12px;
+        colorize: root.muted ? Theme.bg-card : Theme.on-accent;
+        accessible-role: none;
+    }
+}
+
+export struct TileItem {
+    // Regular icon; `icon-selected` (the filled one) is drawn while the tile is picked.
+    icon: image,
+    icon-selected: image,
+    title: string,
+    caption: string,
+}
+
+// One tile; `TilePicker` lays them out and handles keys. Exported for the gallery's state grid.
+export component Tile inherits Rectangle {
+    in property <TileItem> item;
+    in property <bool> selected;
+    in property <bool> hover;
+    in property <bool> pressed;
+    in property <bool> read-only;
+    in property <bool> focused;
+    in property <bool> tall;
+    min-width: 160px;
+    min-height: max(root.tall ? 128px : 104px, inner.min-height);
+    horizontal-stretch: 1;
+    border-radius: Theme.radius-card;
+    border-width: 1px;
+    border-color: Theme.stroke-card;
+    background: root.selected ? Theme.accent-tint : root.pressed && !root.read-only ? Theme.bg-card-pressed : root.hover && !root.read-only ? Theme.bg-control-hover : Theme.bg-card;
+    opacity: root.read-only ? 0.4 : 1;
+    inner := VerticalLayout {
+        padding: Theme.space-3;
+        spacing: Theme.space-1;
+        alignment: center;
+        HorizontalLayout {
+            alignment: center;
+            Image {
+                source: root.selected && root.item.icon-selected.width > 0 ? root.item.icon-selected : root.item.icon;
+                width: 32px;
+                height: 32px;
+                colorize: root.selected ? Theme.accent-text : Theme.text-primary;
+                accessible-role: none;
+            }
+        }
+        Text {
+            text: root.item.title;
+            font-size: Theme.body-size;
+            font-weight: Theme.weight-strong;
+            color: root.selected ? Theme.accent-text : Theme.text-primary;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+            accessible-role: none;
+        }
+        if root.item.caption != "": Text {
+            text: root.item.caption;
+            font-size: Theme.caption-size;
+            color: Theme.text-secondary;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+            accessible-role: none;
+        }
+    }
+    if root.selected: CheckBadge {
+        x: parent.width - self.width - 8px;
+        y: 8px;
+        muted: root.read-only;
+    }
+    FocusRing {
+        shown: root.focused;
+        radius: Theme.radius-card;
+    }
+}
+
+// A grid of equal tiles, `columns` to a row. One-way: `picked` fires, the owner updates
+// `selected`. Left/Right move in reading order, Up/Down by a row; each stops at the edge. Give
+// it an `accessible-label` (the group title).
+export component TilePicker {
+    in property <[TileItem]> tiles;
+    in property <int> selected;
+    in property <int> columns: root.tiles.length;
+    in property <bool> tall;
+    in property <bool> locked: Shell.locked;
+    in property <int> force-hover: -1;
+    in property <int> force-pressed: -1;
+    in property <bool> force-focus;
+    callback picked(int);
+    property <int> cols: max(1, min(root.columns, root.tiles.length));
+    property <bool> key-focus;
+
+    function pick(i: int) {
+        if (!root.locked && i >= 0 && i < root.tiles.length && i != root.selected) {
+            root.picked(i);
+        }
+    }
+
+    accessible-role: radio-group;
+    fs := FocusScope {
+        enabled: !root.locked;
+        focus-on-click: false;
+        focus-gained(reason) => {
+            root.key-focus = KeyFocus.from-key(reason);
+        }
+        key-pressed(event) => {
+            if (event.text == Key.LeftArrow) {
+                root.pick(root.selected - 1);
+                return accept;
+            }
+            if (event.text == Key.RightArrow) {
+                root.pick(root.selected + 1);
+                return accept;
+            }
+            if (event.text == Key.UpArrow && root.cols < root.tiles.length) {
+                root.pick(root.selected - root.cols);
+                return accept;
+            }
+            if (event.text == Key.DownArrow && root.cols < root.tiles.length) {
+                root.pick(root.selected + root.cols);
+                return accept;
+            }
+            reject
+        }
+    }
+    VerticalLayout {
+        spacing: Theme.tile-gap;
+        for row in ceil(root.tiles.length / root.cols): HorizontalLayout {
+            spacing: Theme.tile-gap;
+            // Every row has `cols` cells, so a short last row keeps the column width.
+            for col in root.cols: VerticalLayout {
+                horizontal-stretch: 1;
+                min-width: 160px;
+                if row * root.cols + col < root.tiles.length: Tile {
+                    property <int> i: row * root.cols + col;
+                    item: root.tiles[self.i];
+                    selected: self.i == root.selected;
+                    hover: touch.has-hover || root.force-hover == self.i;
+                    pressed: touch.pressed || root.force-pressed == self.i;
+                    read-only: root.locked;
+                    tall: root.tall;
+                    focused: self.i == root.selected && (root.force-focus || (root.key-focus && fs.has-focus));
+                    accessible-role: radio-button;
+                    accessible-label: self.item.title;
+                    accessible-checkable: true;
+                    accessible-checked: self.selected;
+                    accessible-enabled: !root.locked;
+                    accessible-action-default => {
+                        root.pick(self.i);
+                    }
+                    touch := TouchArea {
+                        enabled: !root.locked;
+                        clicked => {
+                            fs.focus();
+                            root.pick(parent.i);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Overlay position: one 16:10 monitor with a taskbar strip and six hit zones (3x2), each with a
+// small pill; the picked one is filled in the real pill teal with a check badge. `names` are the
+// six positions in reading order (top left .. bottom right); the picked one is captioned below.
+export component ScreenPicker {
+    in property <[string]> names;
+    in property <int> selected;
+    in property <bool> locked: Shell.locked;
+    in property <int> force-hover: -1;
+    in property <bool> force-focus;
+    callback picked(int);
+    property <bool> key-focus;
+
+    function pick(i: int) {
+        if (!root.locked && i >= 0 && i < 6 && i != root.selected) {
+            root.picked(i);
+        }
+    }
+
+    preferred-width: 320px;
+    min-width: 240px;
+    max-width: 480px;
+    accessible-role: radio-group;
+    fs := FocusScope {
+        enabled: !root.locked;
+        focus-on-click: false;
+        focus-gained(reason) => {
+            root.key-focus = KeyFocus.from-key(reason);
+        }
+        key-pressed(event) => {
+            if (event.text == Key.LeftArrow && mod(root.selected, 3) > 0) {
+                root.pick(root.selected - 1);
+                return accept;
+            }
+            if (event.text == Key.RightArrow && mod(root.selected, 3) < 2) {
+                root.pick(root.selected + 1);
+                return accept;
+            }
+            if (event.text == Key.UpArrow && root.selected >= 3) {
+                root.pick(root.selected - 3);
+                return accept;
+            }
+            if (event.text == Key.DownArrow && root.selected < 3) {
+                root.pick(root.selected + 3);
+                return accept;
+            }
+            reject
+        }
+    }
+    VerticalLayout {
+        spacing: Theme.space-2;
+        monitor := Rectangle {
+            height: self.width * 10 / 16;
+            border-radius: Theme.radius-card;
+            background: Theme.bg-control;
+            border-width: 1px;
+            border-color: Theme.stroke-control;
+            opacity: root.locked ? 0.4 : 1;
+            property <length> bar: max(10px, self.height * 0.07);
+            // Taskbar.
+            Rectangle {
+                x: 1px;
+                y: parent.height - parent.bar - 1px;
+                width: parent.width - 2px;
+                height: parent.bar;
+                background: Theme.bg-inset;
+            }
+            for i in 6: Rectangle {
+                property <bool> on: i == root.selected;
+                property <bool> hover: !root.locked && (touch.has-hover || root.force-hover == i);
+                x: mod(i, 3) * parent.width / 3;
+                y: i < 3 ? 0 : parent.height / 2;
+                width: parent.width / 3;
+                height: (parent.height - parent.bar) / 2;
+                accessible-role: radio-button;
+                accessible-label: i < root.names.length ? root.names[i] : "";
+                accessible-checkable: true;
+                accessible-checked: self.on;
+                accessible-enabled: !root.locked;
+                accessible-action-default => {
+                    root.pick(i);
+                }
+                pill := Rectangle {
+                    width: 32px;
+                    height: 8px;
+                    border-radius: 4px;
+                    x: mod(i, 3) == 0 ? 12px : mod(i, 3) == 1 ? (parent.width - self.width) / 2 : parent.width - self.width - 12px;
+                    y: i < 3 ? 12px : parent.height - self.height - 12px;
+                    background: parent.on ? Theme.pill-teal : parent.hover ? Theme.text-secondary.transparentize(0.6) : transparent;
+                    border-width: parent.on || parent.hover ? 0 : 1px;
+                    border-color: Theme.text-secondary;
+                }
+                if i == root.selected: CheckBadge {
+                    x: pill.x + pill.width / 2 - self.width / 2;
+                    y: i < 3 ? pill.y + pill.height + 6px : pill.y - self.height - 6px;
+                    muted: root.locked;
+                }
+                FocusRing {
+                    shown: parent.on && (root.force-focus || (root.key-focus && fs.has-focus));
+                    radius: Theme.radius-control;
+                }
+                touch := TouchArea {
+                    enabled: !root.locked;
+                    clicked => {
+                        fs.focus();
+                        root.pick(i);
+                    }
+                }
+            }
+        }
+        Text {
+            text: root.selected >= 0 && root.selected < root.names.length ? root.names[root.selected] : "";
+            font-size: Theme.caption-size;
+            color: Theme.text-secondary;
+            horizontal-alignment: center;
+        }
+    }
+}

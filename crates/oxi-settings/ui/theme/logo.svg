@@ -1,0 +1,9 @@
+<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+<!-- Placeholder of the yap mark (spec 8.1) until d4 regenerates it from draw.rs. -->
+<rect width="24" height="24" rx="5.25" fill="#0F766E"/>
+<rect x="4" y="5" width="16" height="12" rx="3.5" fill="#FFFFFF"/>
+<path d="M6 16V20L10.5 16Z" fill="#FFFFFF"/>
+<rect x="7" y="9" width="2" height="4" rx="1" fill="#0F766E"/>
+<rect x="11" y="7.5" width="2" height="7" rx="1" fill="#0F766E"/>
+<rect x="15" y="9" width="2" height="4" rx="1" fill="#0F766E"/>
+</svg>

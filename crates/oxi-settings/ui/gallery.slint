@@ -1,0 +1,1573 @@
+// The design-system gallery (the "Figma library" as code): tokens, icons and every component in
+// every variant and state, drawn from `theme/`. Not part of the app: the `gallery` example opens
+// it, `tests/gallery.rs` renders it to PNGs. Hover/pressed/focused come from the `force-*`
+// properties, since a static shot has no mouse.
+import { ScrollView, Palette } from "std-widgets.slint";
+import { Theme, Shell, Contrast, Icons, Tooltip, Button, ButtonKind, Switch, Radio, Slider, NumberField, Segmented, Combo, TextField, TextArea, PageHeader, Group, Card, ClickCard, Row, ToggleRow, SliderRow, TileItem, Tile, TilePicker, ScreenPicker, Keycap, KeycapRow, Severity, Banner, Note, Meter, ProgressBar, BadgeKind, Badge, StatCard, MonthLabel, ActivityHeatmap } from "theme/index.slint";
+
+// The test reads token values and the contrast function through these.
+export { Theme, Contrast }
+
+struct IconEntry {
+    name: string,
+    image: image,
+}
+
+struct Swatch {
+    name: string,
+    c: color,
+    // The ground the token is used on; the ratio is `c` on it.
+    bg: color,
+    bg-name: string,
+    ratio: bool,
+}
+
+global Hex {
+    pure function digit(n: int) -> string {
+        return ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F"][n];
+    }
+    pure function byte(n: int) -> string {
+        return digit(floor(n / 16)) + digit(mod(n, 16));
+    }
+    public pure function of(c: color) -> string {
+        return "#" + byte(c.red) + byte(c.green) + byte(c.blue) + (c.alpha < 255 ? byte(c.alpha) : "");
+    }
+}
+
+component Caption inherits Text {
+    font-size: Theme.caption-size;
+    color: Theme.text-secondary;
+    wrap: word-wrap;
+}
+
+component Section inherits VerticalLayout {
+    in property <string> title;
+    in property <string> note;
+    spacing: Theme.space-3;
+    Text {
+        text: root.title;
+        font-size: Theme.subtitle-size;
+        font-weight: Theme.weight-strong;
+        color: Theme.text-primary;
+    }
+    if root.note != "": Caption {
+        text: root.note;
+    }
+    @children
+}
+
+// One labelled cell of a variant x state grid; padded so focus rings are not clipped.
+component Cell inherits VerticalLayout {
+    in property <string> label;
+    width: 170px;
+    spacing: Theme.space-1;
+    padding: 4px;
+    alignment: start;
+    Caption {
+        text: root.label;
+    }
+    @children
+}
+
+// The variant name at the left of a grid row.
+component RowLabel inherits Text {
+    width: 110px;
+    font-size: Theme.body-size;
+    font-weight: Theme.weight-strong;
+    color: Theme.text-primary;
+    vertical-alignment: center;
+}
+
+component GridRow inherits HorizontalLayout {
+    in property <string> label;
+    spacing: Theme.space-2;
+    alignment: start;
+    RowLabel {
+        text: root.label;
+    }
+    @children
+}
+
+component SwatchView inherits VerticalLayout {
+    in property <Swatch> s;
+    width: 180px;
+    spacing: 2px;
+    Rectangle {
+        height: 40px;
+        border-radius: Theme.radius-control;
+        background: root.s.bg;
+        border-width: 1px;
+        border-color: Theme.stroke-card;
+        HorizontalLayout {
+            padding: 6px;
+            spacing: 8px;
+            Rectangle {
+                width: 28px;
+                border-radius: 3px;
+                background: root.s.c;
+            }
+            Text {
+                text: "Aa";
+                font-size: Theme.body-size;
+                font-weight: Theme.weight-strong;
+                color: root.s.c;
+                vertical-alignment: center;
+            }
+        }
+    }
+    Text {
+        text: root.s.name;
+        font-size: Theme.caption-size;
+        font-weight: Theme.weight-strong;
+        color: Theme.text-primary;
+    }
+    Caption {
+        text: Hex.of(root.s.c) + (root.s.ratio ? "  " + Contrast.ratio(root.s.c, root.s.bg).to-fixed(2) + ":1 on " + root.s.bg-name : "");
+    }
+}
+
+component GallerySheet inherits VerticalLayout {
+    property <[Swatch]> swatches: [
+        { name: "bg-page", c: Theme.bg-page, bg: Theme.bg-page, bg-name: "", ratio: false },
+        { name: "bg-card", c: Theme.bg-card, bg: Theme.bg-page, bg-name: "", ratio: false },
+        { name: "bg-control", c: Theme.bg-control, bg: Theme.bg-page, bg-name: "", ratio: false },
+        { name: "bg-control-hover", c: Theme.bg-control-hover, bg: Theme.bg-page, bg-name: "", ratio: false },
+        { name: "bg-control-pressed", c: Theme.bg-control-pressed, bg: Theme.bg-page, bg-name: "", ratio: false },
+        { name: "bg-subtle-hover", c: Theme.bg-subtle-hover, bg: Theme.bg-page, bg-name: "", ratio: false },
+        { name: "bg-subtle-selected", c: Theme.bg-subtle-selected, bg: Theme.bg-page, bg-name: "", ratio: false },
+        { name: "bg-inset", c: Theme.bg-inset, bg: Theme.bg-card, bg-name: "", ratio: false },
+        { name: "stroke-card", c: Theme.stroke-card, bg: Theme.bg-page, bg-name: "", ratio: false },
+        { name: "stroke-control", c: Theme.stroke-control, bg: Theme.bg-page, bg-name: "", ratio: false },
+        { name: "stroke-control-bottom", c: Theme.stroke-control-bottom, bg: Theme.bg-page, bg-name: "", ratio: false },
+        { name: "stroke-keycap", c: Theme.stroke-keycap, bg: Theme.bg-control, bg-name: "bg-control", ratio: true },
+        { name: "divider", c: Theme.divider, bg: Theme.bg-card, bg-name: "", ratio: false },
+        { name: "text-primary", c: Theme.text-primary, bg: Theme.bg-card, bg-name: "bg-card", ratio: true },
+        { name: "text-secondary", c: Theme.text-secondary, bg: Theme.bg-card, bg-name: "bg-card", ratio: true },
+        { name: "text-secondary", c: Theme.text-secondary, bg: Theme.bg-page, bg-name: "bg-page", ratio: true },
+        { name: "text-disabled", c: Theme.text-disabled, bg: Theme.bg-card, bg-name: "bg-card", ratio: true },
+        { name: "focus-outer", c: Theme.focus-outer, bg: Theme.bg-page, bg-name: "bg-page", ratio: true },
+        { name: "focus-inner", c: Theme.focus-inner, bg: Theme.bg-page, bg-name: "", ratio: false },
+        { name: "accent", c: Theme.accent, bg: Theme.bg-control, bg-name: "bg-control", ratio: true },
+        { name: "accent", c: Theme.accent, bg: Theme.bg-page, bg-name: "bg-page", ratio: true },
+        { name: "accent", c: Theme.accent, bg: Theme.bg-card, bg-name: "bg-card", ratio: true },
+        { name: "accent-hover", c: Theme.accent-hover, bg: Theme.bg-page, bg-name: "", ratio: false },
+        { name: "accent-pressed", c: Theme.accent-pressed, bg: Theme.bg-page, bg-name: "", ratio: false },
+        { name: "on-accent", c: Theme.on-accent, bg: Theme.accent, bg-name: "accent", ratio: true },
+        { name: "accent-text", c: Theme.accent-text, bg: Contrast.over(Theme.accent-tint, Theme.bg-card), bg-name: "accent-tint", ratio: true },
+        { name: "accent-tint", c: Theme.accent-tint, bg: Theme.bg-card, bg-name: "", ratio: false },
+        { name: "pill-teal", c: Theme.pill-teal, bg: Theme.bg-page, bg-name: "", ratio: false },
+        { name: "error-text", c: Theme.error-text, bg: Theme.bg-card, bg-name: "bg-card", ratio: true },
+        { name: "error-text", c: Theme.error-text, bg: Theme.error-fill, bg-name: "error-fill", ratio: true },
+        { name: "warning-text", c: Theme.warning-text, bg: Theme.warning-fill, bg-name: "warning-fill", ratio: true },
+        { name: "success-text", c: Theme.success-text, bg: Theme.bg-card, bg-name: "bg-card", ratio: true },
+        { name: "info-fill", c: Theme.info-fill, bg: Theme.bg-card, bg-name: "", ratio: false },
+    ];
+    property <[IconEntry]> icon-list: [
+        { name: "add-16", image: Icons.add-16 },
+        { name: "add", image: Icons.add },
+        { name: "app-generic", image: Icons.app-generic },
+        { name: "arrow-download-16", image: Icons.arrow-download-16 },
+        { name: "arrow-download", image: Icons.arrow-download },
+        { name: "arrow-sync-16", image: Icons.arrow-sync-16 },
+        { name: "arrow-sync", image: Icons.arrow-sync },
+        { name: "book-letter", image: Icons.book-letter },
+        { name: "brain-circuit-filled", image: Icons.brain-circuit-filled },
+        { name: "brain-circuit", image: Icons.brain-circuit },
+        { name: "bug", image: Icons.bug },
+        { name: "calendar", image: Icons.calendar },
+        { name: "checkmark-12", image: Icons.checkmark-12 },
+        { name: "checkmark-16", image: Icons.checkmark-16 },
+        { name: "checkmark-circle-16", image: Icons.checkmark-circle-16 },
+        { name: "checkmark-circle", image: Icons.checkmark-circle },
+        { name: "clipboard-paste-filled", image: Icons.clipboard-paste-filled },
+        { name: "clipboard-paste", image: Icons.clipboard-paste },
+        { name: "clipboard-paste-24-filled", image: Icons.clipboard-paste-24-filled },
+        { name: "clipboard-paste-24", image: Icons.clipboard-paste-24 },
+        { name: "cube", image: Icons.cube },
+        { name: "dark-theme-filled", image: Icons.dark-theme-filled },
+        { name: "dark-theme", image: Icons.dark-theme },
+        { name: "dark-theme-24-filled", image: Icons.dark-theme-24-filled },
+        { name: "dark-theme-24", image: Icons.dark-theme-24 },
+        { name: "data-usage", image: Icons.data-usage },
+        { name: "delete-16", image: Icons.delete-16 },
+        { name: "delete", image: Icons.delete },
+        { name: "desktop", image: Icons.desktop },
+        { name: "dismiss-16", image: Icons.dismiss-16 },
+        { name: "dismiss", image: Icons.dismiss },
+        { name: "edit-16", image: Icons.edit-16 },
+        { name: "edit", image: Icons.edit },
+        { name: "error-circle-16", image: Icons.error-circle-16 },
+        { name: "error-circle", image: Icons.error-circle },
+        { name: "eye-16", image: Icons.eye-16 },
+        { name: "eye", image: Icons.eye },
+        { name: "fire", image: Icons.fire },
+        { name: "folder-open-16", image: Icons.folder-open-16 },
+        { name: "folder-open", image: Icons.folder-open },
+        { name: "gauge", image: Icons.gauge },
+        { name: "hand-left-filled", image: Icons.hand-left-filled },
+        { name: "hand-left", image: Icons.hand-left },
+        { name: "hand-left-24-filled", image: Icons.hand-left-24-filled },
+        { name: "hand-left-24", image: Icons.hand-left-24 },
+        { name: "history-filled", image: Icons.history-filled },
+        { name: "history", image: Icons.history },
+        { name: "home-filled", image: Icons.home-filled },
+        { name: "home", image: Icons.home },
+        { name: "info-16", image: Icons.info-16 },
+        { name: "info-filled", image: Icons.info-filled },
+        { name: "info", image: Icons.info },
+        { name: "keyboard-filled", image: Icons.keyboard-filled },
+        { name: "keyboard", image: Icons.keyboard },
+        { name: "keyboard-24-filled", image: Icons.keyboard-24-filled },
+        { name: "keyboard-24", image: Icons.keyboard-24 },
+        { name: "local-language", image: Icons.local-language },
+        { name: "mic-filled", image: Icons.mic-filled },
+        { name: "mic", image: Icons.mic },
+        { name: "open-folder-16", image: Icons.open-folder-16 },
+        { name: "open-folder", image: Icons.open-folder },
+        { name: "play-16", image: Icons.play-16 },
+        { name: "play", image: Icons.play },
+        { name: "save-16", image: Icons.save-16 },
+        { name: "save", image: Icons.save },
+        { name: "settings-filled", image: Icons.settings-filled },
+        { name: "settings", image: Icons.settings },
+        { name: "slide-text-filled", image: Icons.slide-text-filled },
+        { name: "slide-text", image: Icons.slide-text },
+        { name: "speaker-2-filled", image: Icons.speaker-2-filled },
+        { name: "speaker-2", image: Icons.speaker-2 },
+        { name: "text-t-filled", image: Icons.text-t-filled },
+        { name: "text-t", image: Icons.text-t },
+        { name: "text-word-count", image: Icons.text-word-count },
+        { name: "timer", image: Icons.timer },
+        { name: "toggle-right-filled", image: Icons.toggle-right-filled },
+        { name: "toggle-right", image: Icons.toggle-right },
+        { name: "toggle-right-24-filled", image: Icons.toggle-right-24-filled },
+        { name: "toggle-right-24", image: Icons.toggle-right-24 },
+        { name: "top-speed", image: Icons.top-speed },
+        { name: "warning-16", image: Icons.warning-16 },
+        { name: "warning", image: Icons.warning },
+        { name: "weather-moon-filled", image: Icons.weather-moon-filled },
+        { name: "weather-moon", image: Icons.weather-moon },
+        { name: "weather-moon-24-filled", image: Icons.weather-moon-24-filled },
+        { name: "weather-moon-24", image: Icons.weather-moon-24 },
+        { name: "weather-sunny-filled", image: Icons.weather-sunny-filled },
+        { name: "weather-sunny", image: Icons.weather-sunny },
+        { name: "weather-sunny-24-filled", image: Icons.weather-sunny-24-filled },
+        { name: "weather-sunny-24", image: Icons.weather-sunny-24 },
+        { name: "window", image: Icons.window },
+    ];
+    property <[TileItem]> mode-tiles: [
+        { icon: Icons.hand-left-24, icon-selected: Icons.hand-left-24-filled, title: "Push to talk", caption: "Hold the keys while you speak. Double-tap to lock." },
+        { icon: Icons.toggle-right-24, icon-selected: Icons.toggle-right-24-filled, title: "Toggle", caption: "Press once to start, again to stop." },
+    ];
+    property <[TileItem]> theme-tiles: [
+        { icon: Icons.dark-theme-24, icon-selected: Icons.dark-theme-24-filled, title: "System", caption: "" },
+        { icon: Icons.weather-sunny-24, icon-selected: Icons.weather-sunny-24-filled, title: "Light", caption: "" },
+        { icon: Icons.weather-moon-24, icon-selected: Icons.weather-moon-24-filled, title: "Dark", caption: "" },
+    ];
+    property <[string]> positions: ["Top left", "Top centre", "Top right", "Bottom left", "Bottom centre", "Bottom right"];
+    property <[float]> bars: [0.1, 0.2, 0.15, 0.3, 0.5, 0.42, 0.6, 0.35, 0.2, 0.7, 0.85, 1.0, 0.9, 0.55, 0.4, 0.3, 0.45, 0.62, 0.5, 0.33, 0.2, 0.12, 0.25, 0.4, 0.58, 0.72, 0.5, 0.3, 0.2, 0.1, 0.18, 0.3, 0.52, 0.66, 0.48, 0.3];
+    property <[int]> activity: [
+            0, 2, 4, 2, 2, 0, 0, 0, 1, 0, 4, 2, 0, 0, 0, 0, 4, 2, 3, 3, 1, 1, 1, 0, 0, 4, 3, 0,
+            0, 0, 3, 3, 2, 0, 2, 0, 2, 3, 1, 4, 0, 0, 0, 0, 1, 3, 0, 4, 0, 0, 2, 1, 2, 2, 4, 0,
+            2, 4, 3, 2, 2, 2, 2, 0, 3, 4, 0, 0, 1, 1, 1, 2, 2, 4, 0, 1, 0, 2, 0, 1, 3, 0, 3, 1,
+            0, 3, 0, 3, 0, 0, 2, 0, 3, 3, 1, 2, 2, 1, 0, 0, 2, 1, 3, 3, 0, 2, 0, 3, 3, 2, 3, 2,
+            1, 0, 0, 0, 1, 0, 0, 2, 0, 3, 2, 2, 1, 0, 2, 3, 1, 0, 2, 2, 0, 0, 1, 2, 1, 3, 0, 1,
+            0, 1, 0, 0, 1, 2, 1, 0, 0, 0, 4, 4, 0, 0, 0, 4, 3, 1, 0, 1, 1, 1, 4, 3, 2, 1, 3, 0,
+            1, 3, 3, 0, 1, 3, 1, 0, 2, 3, 3, 1];
+    property <[MonthLabel]> months: [
+        { week: 0, text: "May" },
+        { week: 3, text: "Jun" },
+        { week: 7, text: "Jul" },
+        { week: 12, text: "Aug" },
+        { week: 16, text: "Sep" },
+        { week: 20, text: "Oct" },
+        { week: 25, text: "Nov" },
+    ];
+    property <[string]> devices: ["Microphone (USB Audio)", "Headset (Bluetooth)"];
+
+    padding: Theme.page-padding;
+    spacing: Theme.group-gap;
+
+    PageHeader {
+        padding-top: 0;
+        title: "OxiYapper design system";
+        caption: Theme.dark ? "Dark theme. Every value comes from theme/tokens.slint." : "Light theme. Every value comes from theme/tokens.slint.";
+    }
+
+    Section {
+        title: "Colour";
+        note: "Hex read back from the tokens; ratios are WCAG 2, computed by Contrast.ratio from the token values.";
+        for r in ceil(root.swatches.length / 6): HorizontalLayout {
+            spacing: Theme.space-3;
+            alignment: start;
+            for c in 6: SwatchView {
+                visible: r * 6 + c < root.swatches.length;
+                s: root.swatches[r * 6 + c];
+            }
+        }
+    }
+
+    Section {
+        title: "Type";
+        note: "Segoe UI Variable Text (Theme.font-family); Regular 400 and Semibold 600 only.";
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            alignment: start;
+            VerticalLayout {
+                spacing: Theme.space-2;
+                Text {
+                    text: "Title 28/36 semibold";
+                    font-size: Theme.title-size;
+                    font-weight: Theme.weight-strong;
+                    color: Theme.text-primary;
+                }
+                Text {
+                    text: "Subtitle 20/28 semibold";
+                    font-size: Theme.subtitle-size;
+                    font-weight: Theme.weight-strong;
+                    color: Theme.text-primary;
+                }
+                Text {
+                    text: "Body strong 14/20 semibold: group headers, tile titles";
+                    font-size: Theme.body-size;
+                    font-weight: Theme.weight-strong;
+                    color: Theme.text-primary;
+                }
+                Text {
+                    text: "Body 14/20 regular: row titles, controls, body text";
+                    font-size: Theme.body-size;
+                    color: Theme.text-primary;
+                }
+                Text {
+                    text: "Caption 12/16 regular: descriptions, captions, status lines";
+                    font-size: Theme.caption-size;
+                    color: Theme.text-secondary;
+                }
+                Text {
+                    text: "Disabled text";
+                    font-size: Theme.body-size;
+                    color: Theme.text-disabled;
+                }
+            }
+        }
+    }
+
+    Section {
+        title: "Spacing and radii";
+        note: "4 px base. Fixed uses: page 32 (16 under 900 px), title 28/24, groups 32, header 8, cards 4, card padding 16/12, icon gap 16, controls 8, tiles 8, keycaps 4.";
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            alignment: start;
+            for s in [Theme.space-1, Theme.space-2, Theme.space-3, Theme.space-4, Theme.space-5, Theme.space-6, Theme.space-8, Theme.space-10, Theme.space-12]: VerticalLayout {
+                spacing: Theme.space-1;
+                alignment: end;
+                HorizontalLayout {
+                    alignment: start;
+                    Rectangle {
+                        width: s;
+                        height: s;
+                        background: Theme.accent;
+                    }
+                }
+                Caption {
+                    text: round(s / 1px);
+                }
+            }
+            Rectangle {
+                width: Theme.space-8;
+            }
+            for r in [
+                { name: "control 4", radius: Theme.radius-control },
+                { name: "keycap @28", radius: Theme.radius-keycap(28px) },
+                { name: "keycap @52", radius: Theme.radius-keycap(52px) },
+                { name: "card 8", radius: Theme.radius-card },
+                { name: "pill", radius: 24px },
+            ]: VerticalLayout {
+                spacing: Theme.space-1;
+                Rectangle {
+                    width: 72px;
+                    height: 48px;
+                    border-radius: r.radius;
+                    background: Theme.bg-control;
+                    border-width: 1px;
+                    border-color: Theme.stroke-keycap;
+                }
+                Caption {
+                    text: r.name;
+                }
+            }
+        }
+    }
+
+    Section {
+        title: "Icons";
+        note: "Fluent UI System Icons (MIT), vendored in ui/icons. Name = Icons.<name>; no suffix is the 20 px regular master.";
+        for r in ceil(root.icon-list.length / 8): HorizontalLayout {
+            spacing: Theme.space-2;
+            alignment: start;
+            for c in 8: HorizontalLayout {
+                property <int> i: r * 8 + c;
+                width: 150px;
+                spacing: Theme.space-2;
+                visible: self.i < root.icon-list.length;
+                VerticalLayout {
+                    alignment: center;
+                    Image {
+                        source: root.icon-list[i].image;
+                        width: 20px;
+                        height: 20px;
+                        image-fit: contain;
+                        colorize: Theme.text-primary;
+                    }
+                }
+                Caption {
+                    text: root.icon-list[i].name;
+                    vertical-alignment: center;
+                    wrap: no-wrap;
+                    overflow: elide;
+                }
+            }
+        }
+    }
+
+    Section {
+        title: "Button";
+        note: "Disabled: text-disabled, fill at 50 %, reason in the tooltip. Locked config: buttons take enabled: false. Tooltip: hover 600 ms.";
+        GridRow {
+            label: "";
+            Cell {
+                label: "rest";
+            }
+            Cell {
+                label: "hover";
+            }
+            Cell {
+                label: "pressed";
+            }
+            Cell {
+                label: "focused (keyboard)";
+            }
+            Cell {
+                label: "disabled";
+            }
+        }
+        for k in [
+            { name: "primary", kind: ButtonKind.primary, text: "Apply", icon: Icons.checkmark-16 },
+            { name: "secondary", kind: ButtonKind.secondary, text: "Download", icon: Icons.arrow-download-16 },
+            { name: "subtle", kind: ButtonKind.subtle, text: "Open file", icon: Icons.open-folder-16 },
+            { name: "danger", kind: ButtonKind.danger, text: "Turn off", icon: Icons.dismiss-16 },
+            { name: "icon", kind: ButtonKind.icon, text: "Change hotkey", icon: Icons.edit-16 },
+        ]: VerticalLayout {
+            spacing: Theme.space-2;
+            GridRow {
+                label: k.name;
+                Cell {
+                    Button {
+                        kind: k.kind;
+                        text: k.text;
+                        icon: k.kind == ButtonKind.icon ? k.icon : @image-url("");
+                    }
+                }
+                Cell {
+                    Button {
+                        kind: k.kind;
+                        text: k.text;
+                        icon: k.kind == ButtonKind.icon ? k.icon : @image-url("");
+                        force-hover: true;
+                    }
+                }
+                Cell {
+                    Button {
+                        kind: k.kind;
+                        text: k.text;
+                        icon: k.kind == ButtonKind.icon ? k.icon : @image-url("");
+                        force-pressed: true;
+                    }
+                }
+                Cell {
+                    Button {
+                        kind: k.kind;
+                        text: k.text;
+                        icon: k.kind == ButtonKind.icon ? k.icon : @image-url("");
+                        force-focus: true;
+                    }
+                }
+                Cell {
+                    Button {
+                        kind: k.kind;
+                        text: k.text;
+                        icon: k.kind == ButtonKind.icon ? k.icon : @image-url("");
+                        enabled: false;
+                        tooltip: "Start OxiYapper to download.";
+                    }
+                }
+            }
+            if k.kind != ButtonKind.icon: GridRow {
+                label: k.name + " + icon";
+                Cell {
+                    Button {
+                        kind: k.kind;
+                        text: k.text;
+                        icon: k.icon;
+                    }
+                }
+                Cell {
+                    Button {
+                        kind: k.kind;
+                        text: k.text;
+                        icon: k.icon;
+                        force-hover: true;
+                    }
+                }
+                Cell {
+                    Button {
+                        kind: k.kind;
+                        text: k.text;
+                        icon: k.icon;
+                        force-pressed: true;
+                    }
+                }
+                Cell {
+                    Button {
+                        kind: k.kind;
+                        text: k.text;
+                        icon: k.icon;
+                        force-focus: true;
+                    }
+                }
+                Cell {
+                    Button {
+                        kind: k.kind;
+                        text: k.text;
+                        icon: k.icon;
+                        enabled: false;
+                    }
+                }
+            }
+        }
+        GridRow {
+            label: "tooltip";
+            Cell {
+                Tooltip {
+                    text: "Start OxiYapper to download.";
+                }
+            }
+            Cell {
+                label: "min width 88";
+                HorizontalLayout {
+                    spacing: Theme.space-2;
+                    alignment: start;
+                    Button {
+                        text: "OK";
+                    }
+                }
+            }
+        }
+    }
+
+    Section {
+        title: "Switch, radio, segmented";
+        note: "Small items: selected = strong accent fill. Locked = read-only config (Shell.locked).";
+        GridRow {
+            label: "";
+            Cell {
+                label: "rest";
+            }
+            Cell {
+                label: "hover";
+            }
+            Cell {
+                label: "pressed";
+            }
+            Cell {
+                label: "focused";
+            }
+            Cell {
+                label: "disabled";
+            }
+            Cell {
+                label: "locked";
+            }
+        }
+        for on in [false, true]: GridRow {
+            label: on ? "switch on" : "switch off";
+            Cell {
+                Switch {
+                    checked: on;
+                }
+            }
+            Cell {
+                Switch {
+                    checked: on;
+                    force-hover: true;
+                }
+            }
+            Cell {
+                Switch {
+                    checked: on;
+                    force-pressed: true;
+                }
+            }
+            Cell {
+                Switch {
+                    checked: on;
+                    force-focus: true;
+                }
+            }
+            Cell {
+                Switch {
+                    checked: on;
+                    enabled: false;
+                }
+            }
+            Cell {
+                Switch {
+                    checked: on;
+                    locked: true;
+                }
+            }
+        }
+        for on in [false, true]: GridRow {
+            label: on ? "radio on" : "radio off";
+            Cell {
+                Radio {
+                    checked: on;
+                }
+            }
+            Cell {
+                Radio {
+                    checked: on;
+                    hover: true;
+                }
+            }
+            Cell { }
+            Cell { }
+            Cell {
+                Radio {
+                    checked: on;
+                    enabled: false;
+                }
+            }
+            Cell { }
+        }
+        GridRow {
+            label: "segmented";
+            Cell {
+                Segmented {
+                    items: ["RU", "EN", "Auto"];
+                    selected: 0;
+                }
+            }
+            Cell {
+                label: "hover EN / Auto";
+                Segmented {
+                    items: ["RU", "EN", "Auto"];
+                    selected: 2;
+                    force-hover: 1;
+                }
+            }
+            Cell {
+                label: "pressed EN";
+                Segmented {
+                    items: ["RU", "EN", "Auto"];
+                    selected: 0;
+                    force-pressed: 1;
+                }
+            }
+            Cell {
+                Segmented {
+                    items: ["RU", "EN", "Auto"];
+                    selected: 1;
+                    force-focus: true;
+                }
+            }
+            Cell {
+                Segmented {
+                    items: ["RU", "EN", "Auto"];
+                    selected: 1;
+                    enabled: false;
+                }
+            }
+            Cell {
+                Segmented {
+                    items: ["RU", "EN", "Auto"];
+                    selected: 1;
+                    locked: true;
+                }
+            }
+        }
+    }
+
+    Section {
+        title: "Slider and number field";
+        note: "Bipolar sliders fill from 0. Field: Enter or blur commits (round to step, clamp); Up/Down step, Shift x10, wheel while focused; invalid text = red stroke, reverts on blur.";
+        GridRow {
+            label: "";
+            Cell {
+                label: "rest";
+            }
+            Cell {
+                label: "hover";
+            }
+            Cell {
+                label: "pressed";
+            }
+            Cell {
+                label: "focused";
+            }
+            Cell {
+                label: "disabled";
+            }
+            Cell {
+                label: "locked";
+            }
+        }
+        for b in [false, true]: GridRow {
+            label: b ? "slider bipolar" : "slider";
+            Cell {
+                Slider {
+                    minimum: b ? -20 : 0;
+                    maximum: b ? 20 : 1000;
+                    value: b ? 6 : 300;
+                    bipolar: b;
+                }
+            }
+            Cell {
+                Slider {
+                    minimum: b ? -20 : 0;
+                    maximum: b ? 20 : 1000;
+                    value: b ? -8 : 300;
+                    bipolar: b;
+                    force-hover: true;
+                }
+            }
+            Cell {
+                Slider {
+                    minimum: b ? -20 : 0;
+                    maximum: b ? 20 : 1000;
+                    value: b ? 6 : 300;
+                    bipolar: b;
+                    force-pressed: true;
+                }
+            }
+            Cell {
+                Slider {
+                    minimum: b ? -20 : 0;
+                    maximum: b ? 20 : 1000;
+                    value: b ? 6 : 300;
+                    bipolar: b;
+                    force-focus: true;
+                }
+            }
+            Cell {
+                Slider {
+                    minimum: b ? -20 : 0;
+                    maximum: b ? 20 : 1000;
+                    value: b ? 6 : 300;
+                    bipolar: b;
+                    enabled: false;
+                }
+            }
+            Cell {
+                Slider {
+                    minimum: b ? -20 : 0;
+                    maximum: b ? 20 : 1000;
+                    value: b ? 6 : 300;
+                    bipolar: b;
+                    locked: true;
+                }
+            }
+        }
+        GridRow {
+            label: "number";
+            Cell {
+                NumberField {
+                    value: 300;
+                    maximum: 1000;
+                    unit: "ms";
+                }
+            }
+            Cell {
+                NumberField {
+                    value: 300;
+                    maximum: 1000;
+                    unit: "ms";
+                    force-hover: true;
+                }
+            }
+            Cell {
+                label: "signed / never";
+                HorizontalLayout {
+                    spacing: Theme.space-2;
+                    alignment: start;
+                    NumberField {
+                        value: 3;
+                        minimum: -20;
+                        maximum: 20;
+                        unit: "dB";
+                        signed: true;
+                    }
+                    NumberField {
+                        value: 0;
+                        maximum: 60;
+                        unit: "min";
+                        zero-text: "never";
+                    }
+                }
+            }
+            Cell {
+                label: "focused / invalid";
+                HorizontalLayout {
+                    spacing: Theme.space-2;
+                    alignment: start;
+                    NumberField {
+                        value: 300;
+                        maximum: 1000;
+                        unit: "ms";
+                        force-focus: true;
+                    }
+                    NumberField {
+                        value: 300;
+                        maximum: 1000;
+                        unit: "ms";
+                        force-text: "3o0";
+                    }
+                }
+            }
+            Cell {
+                NumberField {
+                    value: 300;
+                    maximum: 1000;
+                    unit: "ms";
+                    enabled: false;
+                }
+            }
+            Cell {
+                NumberField {
+                    value: 300;
+                    maximum: 1000;
+                    unit: "ms";
+                    locked: true;
+                }
+            }
+        }
+    }
+
+    Section {
+        title: "Fields (std, sized by the theme)";
+        note: "LineEdit / TextEdit / ComboBox stay std for popups and IME. Their focus underline is the context accent, which the window sets to the teal (spec 7.3): not shown focused here.";
+        GridRow {
+            label: "combo";
+            Cell {
+                width: 260px;
+                label: "rest";
+                Combo {
+                    model: root.devices;
+                }
+            }
+            Cell {
+                width: 260px;
+                label: "disabled / locked";
+                Combo {
+                    model: root.devices;
+                    locked: true;
+                }
+            }
+        }
+        GridRow {
+            label: "text field";
+            Cell {
+                width: 260px;
+                label: "rest";
+                TextField {
+                    text: "app.exe";
+                }
+            }
+            Cell {
+                width: 260px;
+                label: "placeholder";
+                TextField {
+                    placeholder-text: "app.exe";
+                }
+            }
+            Cell {
+                width: 260px;
+                label: "locked (read-only)";
+                TextField {
+                    text: "C:\\models\\ggml-small.bin";
+                    locked: true;
+                }
+            }
+        }
+        GridRow {
+            label: "text area";
+            Cell {
+                width: 400px;
+                label: "min 6 lines";
+                TextArea {
+                    text: "OxiYapper\nWhisper\nSlint\nVulkan";
+                }
+            }
+            Cell {
+                width: 400px;
+                label: "locked";
+                TextArea {
+                    text: "heard => wanted";
+                    locked: true;
+                }
+            }
+        }
+    }
+
+    Section {
+        title: "Tiles";
+        note: "Large items: selected = accent tint, accent icon (filled) and title, check badge. Read-only: 40 %, grey badge. Borders never change colour.";
+        GridRow {
+            label: "";
+            Cell {
+                label: "rest";
+            }
+            Cell {
+                label: "hover";
+            }
+            Cell {
+                label: "pressed";
+            }
+            Cell {
+                label: "focused";
+            }
+            Cell {
+                label: "selected";
+            }
+            Cell {
+                label: "selected, locked";
+            }
+            Cell {
+                label: "locked";
+            }
+        }
+        GridRow {
+            label: "tile";
+            Cell {
+                Tile {
+                    item: root.theme-tiles[1];
+                }
+            }
+            Cell {
+                Tile {
+                    item: root.theme-tiles[1];
+                    hover: true;
+                }
+            }
+            Cell {
+                Tile {
+                    item: root.theme-tiles[1];
+                    pressed: true;
+                }
+            }
+            Cell {
+                Tile {
+                    item: root.theme-tiles[1];
+                    selected: true;
+                    focused: true;
+                }
+            }
+            Cell {
+                Tile {
+                    item: root.theme-tiles[1];
+                    selected: true;
+                }
+            }
+            Cell {
+                Tile {
+                    item: root.theme-tiles[1];
+                    selected: true;
+                    read-only: true;
+                }
+            }
+            Cell {
+                Tile {
+                    item: root.theme-tiles[1];
+                    read-only: true;
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-8;
+            alignment: start;
+            VerticalLayout {
+                width: 520px;
+                spacing: Theme.space-2;
+                Caption {
+                    text: "TilePicker, 2 columns, captions (Recording mode), hover on Toggle";
+                }
+                TilePicker {
+                    tiles: root.mode-tiles;
+                    selected: 0;
+                    columns: 2;
+                    force-hover: 1;
+                }
+            }
+            VerticalLayout {
+                width: 520px;
+                spacing: Theme.space-2;
+                Caption {
+                    text: "TilePicker, 3 columns (Appearance), keyboard focus";
+                }
+                TilePicker {
+                    tiles: root.theme-tiles;
+                    selected: 0;
+                    columns: 3;
+                    force-focus: true;
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-8;
+            alignment: start;
+            VerticalLayout {
+                spacing: Theme.space-2;
+                Caption {
+                    text: "ScreenPicker: Bottom centre picked, hover Top left";
+                }
+                ScreenPicker {
+                    width: 320px;
+                    names: root.positions;
+                    selected: 4;
+                    force-hover: 0;
+                }
+            }
+            VerticalLayout {
+                spacing: Theme.space-2;
+                Caption {
+                    text: "ScreenPicker focused";
+                }
+                ScreenPicker {
+                    width: 320px;
+                    names: root.positions;
+                    selected: 2;
+                    force-focus: true;
+                }
+            }
+            VerticalLayout {
+                spacing: Theme.space-2;
+                Caption {
+                    text: "ScreenPicker locked";
+                }
+                ScreenPicker {
+                    width: 320px;
+                    names: root.positions;
+                    selected: 4;
+                    locked: true;
+                }
+            }
+        }
+    }
+
+    Section {
+        title: "Keycaps";
+        note: "Board caps scale with the key unit (radius max(4, unit x 0.12), label clamp(unit x 0.30, 12, 15)). Picked = accent fill; held = pressed fill, 1 px lower.";
+        GridRow {
+            label: "";
+            for s in ["rest", "hover", "picked", "held", "invalid", "disabled"]: Cell {
+                width: 80px;
+                label: s;
+            }
+        }
+        for u in [28px, 44px, 52px]: GridRow {
+            label: "unit " + round(u / 1px);
+            for s[i] in ["rest", "hover", "picked", "held", "invalid", "disabled"]: Cell {
+                width: 80px;
+                height: u + 28px;
+                Keycap {
+                    width: u * (u < 40px ? 1.5 : 1.25) - Theme.keycap-gap-for(u);
+                    height: u - Theme.keycap-gap-for(u);
+                    unit: u;
+                    label: u < 36px ? "Ctl" : "Ctrl";
+                    force-hover: i == 1;
+                    picked: i == 2;
+                    held: i == 3;
+                    invalid: i == 4;
+                    enabled: i != 5;
+                }
+            }
+        }
+        GridRow {
+            label: "KeycapRow";
+            Cell {
+                width: 200px;
+                label: "chord";
+                KeycapRow {
+                    keys: ["Ctrl", "Win"];
+                    label: "Ctrl + Win";
+                }
+            }
+            Cell {
+                width: 200px;
+                label: "warning";
+                KeycapRow {
+                    keys: ["Alt", "F4"];
+                    warning: true;
+                }
+            }
+            Cell {
+                width: 200px;
+                label: "preview 40 px";
+                KeycapRow {
+                    keys: ["Ctrl", "Shift", "F13"];
+                    cap-height: 40px;
+                }
+            }
+            Cell {
+                width: 200px;
+                label: "empty";
+                KeycapRow {
+                    empty-text: "No keys yet";
+                }
+            }
+        }
+    }
+
+    Section {
+        title: "Page structure";
+        note: "PageHeader, Group (header 8 px above, cards 4 px apart), Card, Row, ToggleRow (whole card toggles), SliderRow, ClickCard. Shown at the content max width 880.";
+        HorizontalLayout {
+            alignment: start;
+            Rectangle {
+                width: 880px;
+                background: Theme.bg-page;
+                border-radius: Theme.radius-card;
+                VerticalLayout {
+                    padding-left: Theme.page-padding;
+                    padding-right: Theme.page-padding;
+                    padding-bottom: Theme.page-padding;
+                    spacing: Theme.group-gap;
+                    PageHeader {
+                        title: "Audio";
+                    }
+                    Group {
+                        title: "Microphone";
+                        Card {
+                            Row {
+                                icon: Icons.mic;
+                                title: "Device";
+                                Combo {
+                                    model: root.devices;
+                                }
+                            }
+                            Note {
+                                severity: Severity.warning;
+                                text: "Not connected: Headset (Bluetooth). Using the system default.";
+                            }
+                        }
+                        Card {
+                            Row {
+                                icon: Icons.data-usage;
+                                title: "Level";
+                                fill-controls: true;
+                                Meter {
+                                    bars: root.bars;
+                                }
+                            }
+                        }
+                        Card {
+                            SliderRow {
+                                icon: Icons.speaker-2;
+                                title: "Gain";
+                                description: "Boosts or cuts what Whisper hears.";
+                                minimum: -20;
+                                maximum: 20;
+                                value: 3;
+                                bipolar: true;
+                                signed: true;
+                                unit: "dB";
+                            }
+                        }
+                        Card {
+                            SliderRow {
+                                icon: Icons.timer;
+                                title: "Unload after idle";
+                                description: "Frees GPU memory when you have not dictated for a while.";
+                                minimum: 0;
+                                maximum: 60;
+                                value: 0;
+                                unit: "min";
+                                zero-text: "never";
+                            }
+                        }
+                    }
+                    Group {
+                        title: "Processing";
+                        ToggleRow {
+                            title: "Normalise level";
+                            description: "Evens out quiet and loud speech.";
+                            checked: true;
+                        }
+                        ToggleRow {
+                            title: "Trim silence (hover)";
+                            description: "Cuts silence at the start and end.";
+                            force-hover: true;
+                        }
+                        ToggleRow {
+                            title: "Noise suppression (focused)";
+                            description: "Can make Whisper worse; off by default.";
+                            force-focus: true;
+                        }
+                        ToggleRow {
+                            title: "Start at sign-in (disabled)";
+                            description: "Takes effect in a later version.";
+                            enabled: false;
+                        }
+                        ToggleRow {
+                            title: "Check for updates (locked)";
+                            description: "Once a day OxiYapper asks GitHub for the latest version. Nothing installs on its own.";
+                            checked: true;
+                            locked: true;
+                        }
+                    }
+                    Group {
+                        title: "Speech model";
+                        icon: Icons.brain-circuit;
+                        for m in [
+                            { name: "Whisper small", caption: "0.5 GB · fast, good for most", badge: "Ready", kind: BadgeKind.success, on: true, hover: false, pressed: false, focus: false, progress: -1 },
+                            { name: "Whisper large-v3 turbo (hover)", caption: "1.6 GB · best quality", badge: "Recommended", kind: BadgeKind.accent, on: false, hover: true, pressed: false, focus: false, progress: -1 },
+                            { name: "Whisper medium (pressed, downloading)", caption: "1.5 GB", badge: "Downloading", kind: BadgeKind.neutral, on: false, hover: false, pressed: true, focus: false, progress: 0.44 },
+                            { name: "Whisper base (focused)", caption: "0.1 GB · fastest", badge: "Not downloaded", kind: BadgeKind.neutral, on: false, hover: false, pressed: false, focus: true, progress: -1 },
+                        ]: ClickCard {
+                            force-hover: m.hover;
+                            force-pressed: m.pressed;
+                            force-focus: m.focus;
+                            accessible-label: m.name;
+                            HorizontalLayout {
+                                spacing: Theme.icon-gap;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Radio {
+                                        checked: m.on;
+                                        hover: m.hover;
+                                    }
+                                }
+                                VerticalLayout {
+                                    spacing: Theme.title-gap;
+                                    horizontal-stretch: 1;
+                                    alignment: center;
+                                    HorizontalLayout {
+                                        spacing: Theme.space-2;
+                                        alignment: start;
+                                        Text {
+                                            text: m.name;
+                                            font-size: Theme.body-size;
+                                            color: Theme.text-primary;
+                                            vertical-alignment: center;
+                                        }
+                                        Badge {
+                                            text: m.badge;
+                                            kind: m.kind;
+                                        }
+                                    }
+                                    Caption {
+                                        text: m.caption;
+                                    }
+                                    if m.progress >= 0: ProgressBar {
+                                        value: m.progress;
+                                        label: "0.7 of 1.5 GB";
+                                    }
+                                }
+                                if !m.on && m.progress < 0: VerticalLayout {
+                                    alignment: center;
+                                    Button {
+                                        text: "Download";
+                                        icon: Icons.arrow-download-16;
+                                    }
+                                }
+                                if m.progress >= 0: VerticalLayout {
+                                    alignment: center;
+                                    Button {
+                                        kind: ButtonKind.subtle;
+                                        text: "Cancel";
+                                        icon: Icons.dismiss-16;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Section {
+        title: "Banner";
+        note: "Window level: severity fill, 30 % stroke of the same hue, icon 20, actions right; under 560 px the text goes above the buttons.";
+        Banner {
+            severity: Severity.info;
+            text: "OxiYapper is not running. Settings are saved and apply when it starts.";
+            Button {
+                kind: ButtonKind.primary;
+                text: "Start";
+                icon: Icons.play-16;
+            }
+        }
+        Banner {
+            severity: Severity.warning;
+            text: "This config was written by a newer OxiYapper (version 99). Settings are read-only.";
+        }
+        Banner {
+            severity: Severity.error;
+            text: "config.toml has an error on line 3, column 11: expected a value. Settings are read-only until it is fixed or reset.";
+            Button {
+                text: "Open file";
+                icon: Icons.open-folder-16;
+            }
+            Button {
+                kind: ButtonKind.danger;
+                text: "Reset";
+            }
+        }
+        HorizontalLayout {
+            alignment: start;
+            Banner {
+                width: 480px;
+                severity: Severity.error;
+                text: "Narrow (480 px): the text wraps on its own line above the buttons.";
+                Button {
+                    text: "Open file";
+                }
+                Button {
+                    kind: ButtonKind.danger;
+                    text: "Reset";
+                }
+            }
+        }
+    }
+
+    Section {
+        title: "Note, meter, progress, badge";
+        note: "Note: inline under a control, no border, severity colour. Meter: newest at the right, clipping bars red, empty state with a reason.";
+        HorizontalLayout {
+            spacing: Theme.space-8;
+            alignment: start;
+            Card {
+                width: 520px;
+                Note {
+                    severity: Severity.info;
+                    text: "Takes effect in a later version.";
+                }
+                Note {
+                    severity: Severity.success;
+                    text: "All lines valid";
+                }
+                Note {
+                    severity: Severity.warning;
+                    text: "Noise suppression can make Whisper worse.";
+                }
+                Note {
+                    severity: Severity.error;
+                    text: "Line 2 has no =>: ignored";
+                }
+                Note {
+                    severity: Severity.warning;
+                    text: "Update checks will stop.";
+                    Button {
+                        kind: ButtonKind.subtle;
+                        text: "Turn off";
+                    }
+                    Button {
+                        kind: ButtonKind.primary;
+                        text: "Keep checking";
+                    }
+                }
+            }
+            VerticalLayout {
+                width: 420px;
+                spacing: Theme.space-3;
+                Caption {
+                    text: "Meter live (one clipping bar) / no meter";
+                }
+                Meter {
+                    bars: root.bars;
+                }
+                Meter {
+                    live: false;
+                    empty-text: "No microphone";
+                }
+                Caption {
+                    text: "ProgressBar 44 % / over budget / 0 / done";
+                }
+                ProgressBar {
+                    value: 0.44;
+                    label: "0.7 of 1.6 GB";
+                }
+                ProgressBar {
+                    value: 1;
+                    error: true;
+                    label: "240 / 223 tokens";
+                }
+                ProgressBar {
+                    value: 0;
+                }
+                ProgressBar {
+                    value: 1;
+                }
+                Caption {
+                    text: "Badge success / neutral / accent";
+                }
+                HorizontalLayout {
+                    spacing: Theme.space-2;
+                    alignment: start;
+                    Badge {
+                        text: "Ready";
+                        kind: BadgeKind.success;
+                    }
+                    Badge {
+                        text: "Not downloaded";
+                    }
+                    Badge {
+                        text: "Recommended";
+                        kind: BadgeKind.accent;
+                    }
+                }
+            }
+        }
+    }
+
+    Section {
+        title: "Home: stat cards and activity";
+        note: "StatCard: icon + label, big value, caption. ActivityHeatmap: weeks as columns, Sun..Sat rows, five levels of the accent, today outlined.";
+        HorizontalLayout {
+            alignment: start;
+            VerticalLayout {
+                width: 880px;
+                spacing: Theme.space-3;
+                HorizontalLayout {
+                    spacing: Theme.space-3;
+                    StatCard {
+                        icon: Icons.text-word-count;
+                        label: "Words dictated";
+                        value: "299.9K";
+                        caption: "All time";
+                    }
+                    StatCard {
+                        icon: Icons.top-speed;
+                        label: "Speaking speed";
+                        value: "142";
+                        caption: "Words per minute";
+                    }
+                    StatCard {
+                        icon: Icons.mic;
+                        label: "Dictations";
+                        value: "8,214";
+                        caption: "This year";
+                    }
+                    StatCard {
+                        icon: Icons.fire;
+                        label: "Streak";
+                        value: "12 days";
+                        caption: "Longest: 40 days";
+                    }
+                }
+                Card {
+                    HorizontalLayout {
+                        spacing: Theme.space-2;
+                        Image {
+                            source: Icons.calendar;
+                            width: 20px;
+                            height: 20px;
+                            colorize: Theme.text-primary;
+                        }
+                        Text {
+                            text: "Speaking activity";
+                            font-size: Theme.body-size;
+                            font-weight: Theme.weight-strong;
+                            color: Theme.text-primary;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                    HorizontalLayout {
+                        alignment: start;
+                        ActivityHeatmap {
+                            levels: root.activity;
+                            months: root.months;
+                            today: root.activity.length - 1;
+                            cell: 16px;
+                            gap: 4px;
+                            summary: "Speaking activity, last 26 weeks";
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The interactive gallery (`cargo run -p oxi-settings --example gallery`): theme switch on top.
+export component GalleryWindow inherits Window {
+    in-out property <bool> dark;
+    title: "OxiYapper design system";
+    default-font-family: Theme.font-family;
+    preferred-width: 1400px;
+    preferred-height: 900px;
+    background: Theme.bg-page;
+    function apply-theme() {
+        Palette.color-scheme = root.dark ? ColorScheme.dark : ColorScheme.light;
+    }
+    init => {
+        root.apply-theme();
+    }
+    changed dark => {
+        root.apply-theme();
+    }
+    VerticalLayout {
+        HorizontalLayout {
+            padding: Theme.space-3;
+            padding-left: Theme.page-padding;
+            spacing: Theme.space-3;
+            alignment: start;
+            Segmented {
+                width: 200px;
+                items: ["Light", "Dark"];
+                selected: root.dark ? 1 : 0;
+                locked: false;
+                picked(i) => {
+                    root.dark = i == 1;
+                }
+            }
+            lock-switch := Switch {
+                checked <=> Shell.locked;
+                locked: false;
+            }
+            Text {
+                text: "Shell.locked";
+                font-size: Theme.body-size;
+                color: Theme.text-primary;
+                vertical-alignment: center;
+            }
+        }
+        ScrollView {
+            GallerySheet { }
+        }
+    }
+}
+
+// The same sheet without scrolling, for the PNGs: the test sizes the window to `sheet-height`.
+export component GalleryShot inherits Window {
+    in-out property <bool> dark;
+    out property <length> sheet-height: sheet.preferred-height;
+    default-font-family: Theme.font-family;
+    background: Theme.bg-page;
+    function apply-theme() {
+        Palette.color-scheme = root.dark ? ColorScheme.dark : ColorScheme.light;
+    }
+    init => {
+        root.apply-theme();
+    }
+    changed dark => {
+        root.apply-theme();
+    }
+    sheet := GallerySheet {
+        width: root.width;
+        height: self.preferred-height;
+        y: 0;
+    }
+}

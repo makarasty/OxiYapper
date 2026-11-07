@@ -1,0 +1,91 @@
+// Small pieces every control shares: the focus visual and the hover tooltip.
+import { Theme } from "../tokens.slint";
+
+// Fluent focus visual: a 2 px focus-outer ring 2 px outside the parent plus a 1 px focus-inner
+// ring between them. Fills its parent; shown only on keyboard focus (see `KeyFocus`).
+export component FocusRing {
+    in property <bool> shown;
+    in property <length> radius: Theme.radius-control;
+    width: 100%;
+    height: 100%;
+    Rectangle {
+        visible: root.shown;
+        x: -3px;
+        y: -3px;
+        width: root.width + 6px;
+        height: root.height + 6px;
+        border-width: 2px;
+        border-color: Theme.focus-outer;
+        border-radius: root.radius + 3px;
+        Rectangle {
+            x: 2px;
+            y: 2px;
+            width: parent.width - 4px;
+            height: parent.height - 4px;
+            border-width: 1px;
+            border-color: Theme.focus-inner;
+            border-radius: root.radius + 1px;
+        }
+    }
+}
+
+// Whether focus came from the keyboard, so a click does not draw the ring. A `FocusScope`
+// forwards its `focus-gained` reason here.
+export global KeyFocus {
+    public pure function from-key(reason: FocusReason) -> bool {
+        return reason != FocusReason.pointer-click;
+    }
+}
+
+// The tooltip bubble: caption text on a control-coloured card.
+export component Tooltip inherits Rectangle {
+    in property <string> text;
+    background: Theme.bg-control;
+    border-color: Theme.stroke-control;
+    border-width: 1px;
+    border-radius: Theme.radius-control;
+    accessible-role: none;
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        padding-top: 4px;
+        padding-bottom: 4px;
+        Text {
+            max-width: 320px;
+            text: root.text;
+            font-size: Theme.caption-size;
+            color: Theme.text-primary;
+            wrap: word-wrap;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// A tooltip that opens after 600 ms of hover and closes when the pointer leaves (Slint 1.18 has
+// no tooltip widget). Place it inside the hovered element; it fills it and takes no input.
+export component Tip {
+    in property <string> text;
+    in property <bool> hovered;
+    property <bool> open;
+    Timer {
+        interval: 600ms;
+        running: root.hovered && root.text != "" && !root.open;
+        triggered => {
+            root.open = true;
+            popup.show();
+        }
+    }
+    changed hovered => {
+        if (!self.hovered && self.open) {
+            self.open = false;
+            popup.close();
+        }
+    }
+    popup := PopupWindow {
+        close-policy: no-auto-close;
+        y: root.height + 4px;
+        Tooltip {
+            text: root.text;
+        }
+    }
+}

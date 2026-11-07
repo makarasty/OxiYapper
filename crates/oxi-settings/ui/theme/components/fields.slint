@@ -1,0 +1,124 @@
+// Segmented choice and the std text/combo fields with our sizes and fonts. LineEdit, TextEdit
+// and ComboBox stay std for their popups and IME; their focus underline is the context accent,
+// which the window sets to our teal (spec 7.3, d2).
+import { ComboBox, LineEdit, TextEdit } from "std-widgets.slint";
+import { Theme, Shell } from "../tokens.slint";
+import { FocusRing, KeyFocus } from "base.slint";
+
+// Equal segments on an inset track; the selected one is a strong accent fill (replaces the
+// language buttons). Left/Right move the pick. One-way like the pickers: `picked` fires, the
+// owner updates `selected`.
+export component Segmented {
+    in property <[string]> items;
+    in property <int> selected;
+    in property <bool> enabled: true;
+    in property <bool> locked: Shell.locked;
+    // Gallery: the segment drawn hovered and pressed (-1: none).
+    in property <int> force-hover: -1;
+    in property <int> force-pressed: -1;
+    in property <bool> force-focus;
+    callback picked(int);
+
+    property <bool> live: root.enabled && !root.locked;
+    property <bool> key-focus;
+
+    function pick(i: int) {
+        if (root.live && i >= 0 && i < root.items.length && i != root.selected) {
+            root.picked(i);
+        }
+    }
+
+    height: Theme.control-height;
+    min-width: root.items.length * 44px;
+    accessible-role: radio-group;
+    accessible-enabled: root.live;
+
+    Rectangle {
+        border-radius: Theme.radius-control;
+        background: Theme.bg-inset;
+        HorizontalLayout {
+            padding: 2px;
+            spacing: 2px;
+            for item[i] in root.items: Rectangle {
+                property <bool> on: i == root.selected;
+                property <bool> hover: root.live && (touch.has-hover || root.force-hover == i);
+                property <bool> down: root.live && (touch.pressed || root.force-pressed == i);
+                horizontal-stretch: 1;
+                border-radius: Theme.radius-control - 1px;
+                background: self.on ? (!root.live ? Theme.text-disabled : self.down ? Theme.accent-pressed : self.hover ? Theme.accent-hover : Theme.accent) : self.down ? Theme.bg-subtle-selected : self.hover ? Theme.bg-subtle-hover : transparent;
+                accessible-role: radio-button;
+                accessible-label: item;
+                accessible-checkable: true;
+                accessible-checked: self.on;
+                accessible-enabled: root.live;
+                accessible-action-default => {
+                    root.pick(i);
+                }
+                Text {
+                    text: item;
+                    font-size: Theme.body-size;
+                    color: parent.on ? Theme.on-accent : root.live ? Theme.text-primary : Theme.text-disabled;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    accessible-role: none;
+                }
+                touch := TouchArea {
+                    enabled: root.live;
+                    clicked => {
+                        fs.focus();
+                        root.pick(i);
+                    }
+                }
+            }
+        }
+        FocusRing {
+            shown: root.force-focus || (root.key-focus && fs.has-focus);
+        }
+    }
+    fs := FocusScope {
+        enabled: root.live;
+        focus-on-click: false;
+        focus-gained(reason) => {
+            root.key-focus = KeyFocus.from-key(reason);
+        }
+        key-pressed(event) => {
+            if (event.text == Key.LeftArrow) {
+                root.pick(root.selected - 1);
+                return accept;
+            }
+            if (event.text == Key.RightArrow) {
+                root.pick(root.selected + 1);
+                return accept;
+            }
+            reject
+        }
+    }
+}
+
+// std ComboBox sized to the control column (240..360 px).
+export component Combo inherits ComboBox {
+    in property <bool> locked: Shell.locked;
+    enabled: !root.locked;
+    min-width: Theme.control-column-min;
+    max-width: Theme.control-column-max;
+    horizontal-stretch: 1;
+}
+
+export component TextField inherits LineEdit {
+    in property <bool> locked: Shell.locked;
+    read-only: root.locked;
+    opacity: root.locked ? 0.6 : 1;
+    font-size: Theme.body-size;
+    height: Theme.control-height;
+    horizontal-stretch: 1;
+}
+
+// At least six lines; give it `vertical-stretch` on the Text page to take the rest of the page.
+export component TextArea inherits TextEdit {
+    in property <bool> locked: Shell.locked;
+    read-only: root.locked;
+    opacity: root.locked ? 0.6 : 1;
+    font-size: Theme.body-size;
+    min-height: 120px;
+    wrap: word-wrap;
+}
