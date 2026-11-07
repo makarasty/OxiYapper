@@ -13,12 +13,13 @@ use oxi_core::machine::{
     self, Effect, EngineWarning, Event, JobId, MachineConfig, Phase, PhaseCell, State,
 };
 use oxi_core::paste::PasteOutcome;
-use oxi_core::strings;
 use oxi_core::types::Millis;
+use oxi_core::{stats, strings};
 
 use super::cmd::{
     AudioCmd, ChordHook, Inbox, IpcAsk, PasteCmd, StatusReport, UiCmd, WhisperCmd, Workers,
 };
+use super::stats::Recorder;
 
 pub struct Coordinator<H> {
     state: State,
@@ -44,6 +45,10 @@ pub struct Coordinator<H> {
     text: HashMap<JobId, String>,
     /// For "Copy last text". Memory only: never written to disk or logs.
     last_text: Option<String>,
+    /// Audio length of each job from its audio to its paste, for the usage stats.
+    spoken: HashMap<JobId, Millis>,
+    /// Counts of finished dictations go here; never their text.
+    stats: Option<Recorder>,
     workers: Workers,
     hook: H,
 }
@@ -74,6 +79,8 @@ impl<H: ChordHook> Coordinator<H> {
             audio: HashMap::new(),
             text: HashMap::new(),
             last_text: None,
+            spoken: HashMap::new(),
+            stats: Recorder::system(),
             workers,
             hook,
         };
@@ -106,7 +113,8 @@ impl<H: ChordHook> Coordinator<H> {
     fn dispatch(&mut self, msg: Inbox, now: Millis) {
         match msg {
             Inbox::Event(event) => {
-                if let Event::PasteDone { job, .. } = event {
+                if let Event::PasteDone { job, outcome } = event {
+                    self.count(job, outcome);
                     self.keep_last_text(job);
                 }
                 self.feed(event, now);
@@ -117,10 +125,12 @@ impl<H: ChordHook> Coordinator<H> {
                 }
             }
             Inbox::JobAudio { job, samples } => {
+                self.spoken.insert(job, stats::audio_length(samples.len()));
                 self.audio.insert(job, samples);
                 self.feed(Event::JobAudioReady(job), now);
             }
             Inbox::Transcribed { job, text: None } => {
+                self.spoken.remove(&job);
                 self.feed(Event::TranscriptionFailed(job), now);
             }
             Inbox::Transcribed {
@@ -128,7 +138,9 @@ impl<H: ChordHook> Coordinator<H> {
                 text: Some(text),
             } => {
                 let empty = text.trim().is_empty();
-                if !empty {
+                if empty {
+                    self.spoken.remove(&job);
+                } else {
                     self.text.insert(job, text);
                 }
                 self.feed(Event::TranscriptionDone { job, empty }, now);
@@ -194,6 +206,7 @@ impl<H: ChordHook> Coordinator<H> {
             Effect::DropJob(job) => {
                 self.audio.remove(&job);
                 self.text.remove(&job);
+                self.spoken.remove(&job);
             }
             Effect::Preload => send(&self.workers.whisper, WhisperCmd::Preload),
             Effect::Unload => send(&self.workers.whisper, WhisperCmd::Unload),
@@ -241,6 +254,17 @@ impl<H: ChordHook> Coordinator<H> {
             Effect::Notify(notice) => self.ui(UiCmd::Notify(notice)),
         }
         None
+    }
+
+    /// A dictation that reached the field or the clipboard adds its word count and audio length
+    /// to the usage stats.
+    fn count(&mut self, job: JobId, outcome: PasteOutcome) {
+        let speech = self.spoken.remove(&job).unwrap_or_default();
+        if let (Some(stats), Some(text)) = (&self.stats, self.text.get(&job))
+            && outcome != PasteOutcome::Failed
+        {
+            stats.add(stats::word_count(text), speech);
+        }
     }
 
     /// Every outcome keeps the text, a failed paste too: "Copy last text" still has it (item 42).
@@ -522,6 +546,37 @@ mod tests {
             };
             assert_eq!(text, "hello");
         }
+    }
+
+    #[test]
+    fn a_finished_dictation_updates_the_stats_file_a_failed_one_does_not() {
+        let dir = std::env::temp_dir().join(format!("oxi-coord-stats-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(stats::FILE);
+        let today = || stats::Date::from_ymd(2026, 11, 7).unwrap();
+        for outcome in [PasteOutcome::Failed, PasteOutcome::Pasted] {
+            let mut rig = Rig::new();
+            rig.c.stats = Some(Recorder::spawn(path.clone(), today).unwrap());
+            rig.event(Event::ModelLoaded, 0);
+            let job = rig.record();
+            let samples = vec![0.1; 16_000]; // 1 s
+            rig.c.handle(Inbox::JobAudio { job, samples }, Millis(2100));
+            let text = Some("Привет, мир".to_owned());
+            rig.c.handle(Inbox::Transcribed { job, text }, Millis(2500));
+            rig.event(Event::PasteDone { job, outcome }, 3000);
+            drop(rig.c.stats.take()); // waits for the write
+            assert!(rig.c.spoken.is_empty());
+            if outcome == PasteOutcome::Failed {
+                assert!(!path.exists(), "a failed paste is not counted");
+            }
+        }
+        let sum = crate::daemon::stats::summary(Some(&path), today());
+        assert_eq!(
+            (sum.dictations, sum.words, sum.wpm, sum.streak),
+            (1, 2, 120, 1)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

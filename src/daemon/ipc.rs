@@ -59,6 +59,8 @@ pub trait Host: Send + Sync + 'static {
     fn allow_foreground(&self, client: u32) -> io::Result<()>;
     /// The `Devices` push.
     fn devices(&self) -> Push;
+    /// The `Stats` push.
+    fn stats(&self) -> Push;
     /// Start a settings window.
     fn open_settings(&self) -> io::Result<()>;
 }
@@ -382,6 +384,7 @@ impl Ctx {
             _ if first => false,
             Request::Status => self.status(session),
             Request::ListDevices => conn.send(&self.host.devices()).is_ok(),
+            Request::Stats => conn.send(&self.host.stats()).is_ok(),
             Request::DownloadModel { id } => self.io.send(IoCmd::Download { id }).is_ok(),
             Request::CancelDownload { id } => self.io.send(IoCmd::CancelDownload { id }).is_ok(),
             Request::CaptureHotkey { on } => {
@@ -597,10 +600,11 @@ mod close {
     }
 }
 
-/// The real host: the hook handle, the foreground window, `current_exe settings`.
+/// The real host: the hook handle, the foreground window, `current_exe settings`, the stats file.
 pub struct SystemHost {
     hook: Arc<oxi_platform::os::hook::HookHandle>,
     settings: SettingsProc,
+    stats: Option<std::path::PathBuf>,
 }
 
 impl SystemHost {
@@ -608,6 +612,7 @@ impl SystemHost {
         Self {
             hook,
             settings: SettingsProc::default(),
+            stats: super::stats::path(),
         }
     }
 
@@ -652,6 +657,13 @@ impl Host for SystemHost {
             mics,
             gpus: oxi_whisper::list_devices(),
         }
+    }
+
+    fn stats(&self) -> Push {
+        Push::Stats(super::stats::summary(
+            self.stats.as_deref(),
+            oxi_platform::stats_store::today(),
+        ))
     }
 
     fn open_settings(&self) -> io::Result<()> {
@@ -717,6 +729,13 @@ mod tests {
                 mics: vec!["mic".into()],
                 gpus: vec![],
             }
+        }
+        fn stats(&self) -> Push {
+            Push::Stats(oxi_core::stats::Summary {
+                words: 7,
+                heat: vec![0, 4],
+                ..Default::default()
+            })
         }
         fn open_settings(&self) -> io::Result<()> {
             let _ = self.calls.send(Call::Open);
@@ -900,6 +919,8 @@ mod tests {
         );
         conn.send(&Request::ListDevices).unwrap();
         assert_eq!(conn.recv::<Push>().unwrap(), Some(rig.host.devices()));
+        conn.send(&Request::Stats).unwrap();
+        assert_eq!(conn.recv::<Push>().unwrap(), Some(rig.host.stats()));
     }
 
     #[test]
