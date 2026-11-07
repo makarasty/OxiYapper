@@ -1,9 +1,9 @@
-<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-<!-- Placeholder of the yap mark (spec 8.1) until d4 regenerates it from draw.rs. -->
-<rect width="24" height="24" rx="5.25" fill="#0F766E"/>
-<rect x="4" y="5" width="16" height="12" rx="3.5" fill="#FFFFFF"/>
-<path d="M6 16V20L10.5 16Z" fill="#FFFFFF"/>
-<rect x="7" y="9" width="2" height="4" rx="1" fill="#0F766E"/>
-<rect x="11" y="7.5" width="2" height="7" rx="1" fill="#0F766E"/>
-<rect x="15" y="9" width="2" height="4" rx="1" fill="#0F766E"/>
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+<!-- Generated from oxi-platform draw::logo by the regen_icons test; do not edit. -->
+<defs><linearGradient id="tile" x1="0" y1="0" x2="0" y2="256" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#14A394"/><stop offset="1" stop-color="#0F766E"/></linearGradient></defs>
+<path d="M56 0L200 0C230.92795 0 256 25.072052 256 56L256 200C256 230.92795 230.92795 256 200 256L56 256C25.072052 256 0 230.92795 0 200L0 56C0 25.072052 25.072052 0 56 0Z" fill="url(#tile)"/>
+<path d="M80 38L176 38C195.88225 38 212 54.11775 212 74L212 146C212 165.88225 195.88225 182 176 182L116 182L80 218L80 182L80 182C60.11775 182 44 165.88225 44 146L44 74C44 54.11775 60.11775 38 80 38Z" fill="#FFFFFF"/>
+<path d="M80 86L80 86C86.62742 86 92 91.37258 92 98L92 122C92 128.62741 86.62742 134 80 134L80 134C73.37258 134 68 128.62741 68 122L68 98C68 91.37258 73.37258 86 80 86Z" fill="url(#tile)"/>
+<path d="M128 62L128 62C134.62741 62 140 67.37258 140 74L140 146C140 152.62741 134.62741 158 128 158L128 158C121.37258 158 116 152.62741 116 146L116 74C116 67.37258 121.37258 62 128 62Z" fill="url(#tile)"/>
+<path d="M176 86L176 86C182.62741 86 188 91.37258 188 98L188 122C188 128.62741 182.62741 134 176 134L176 134C169.37259 134 164 128.62741 164 122L164 98C164 91.37258 169.37259 86 176 86Z" fill="url(#tile)"/>
 </svg>

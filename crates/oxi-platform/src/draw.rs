@@ -1,4 +1,5 @@
-//! Overlay pill and tray icons as premultiplied RGBA pixmaps (`tiny-skia`, `ab_glyph`).
+//! Overlay pill, tray icons and the app icon as premultiplied RGBA pixmaps (`tiny-skia`,
+//! `ab_glyph`). The app's mark is drawn here once: tray, exe icon and settings logo use it.
 //!
 //! Sizes, colours, labels and icons come from [`oxi_core::overlay`]: the pill size is the
 //! [`place`](oxi_core::overlay::place) rectangle, and every inner distance is a share of its
@@ -12,9 +13,11 @@ use oxi_core::overlay::{
     PILL_EM as EM, PILL_EM_MIN as EM_MIN, PILL_GAP as GAP, PILL_ICON as ICON,
     PILL_METER_MIN as METER_MIN, PILL_PAD as PAD, Rect, Rgba, look, palette,
 };
+use oxi_core::tray::TrayBadge;
 use oxi_core::types::Millis;
 use tiny_skia::{
-    Color, FillRule, LineCap, LineJoin, Mask, Paint, Path, PathBuilder, Pixmap, Stroke, Transform,
+    BlendMode, Color, FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Mask, Paint, Path,
+    PathBuilder, PathSegment, Pixmap, SpreadMode, Stroke, Transform,
 };
 
 /// The overlay pill for `state`, sized `rect.w` x `rect.h` (the [`place`] result).
@@ -122,16 +125,13 @@ fn surface(pm: &mut Pixmap, state: OverlayState, font: Option<&FontRef<'_>>) -> 
     let mut text = font
         .filter(|_| !look.label.is_empty())
         .map(|f| Label::new(f, look.label, EM * h));
-    let x0 = if look.meter {
-        if let Some(t) = text.as_mut() {
-            t.fit(right - (pad + icon + gap) - gap - METER_MIN * h);
-        }
-        pad
-    } else {
-        // No meter: centre the icon and label as one group.
-        let group = icon + text.as_ref().map_or(0.0, |t| gap + t.width);
-        ((w - group) / 2.0).round().max(pad)
-    };
+    // Icon and label start at the left padding in every state, so the icon never jumps.
+    let x0 = pad;
+    if look.meter
+        && let Some(t) = text.as_mut()
+    {
+        t.fit(right - (pad + icon + gap) - gap - METER_MIN * h);
+    }
     let cy = h / 2.0;
     draw_icon(
         pm,
@@ -153,52 +153,281 @@ fn surface(pm: &mut Pixmap, state: OverlayState, font: Option<&FontRef<'_>>) -> 
     }
 }
 
-/// The tray icon for `phase` at `size` px (16, 20, 24 or 32). Idle is a grey ring, recording a
-/// filled disc, transcribing (and the short paste after it) three dots: shape and colour both
-/// change, so the state reads without colour vision. Each shape has a 1 px dark halo, so it
-/// stays apart from any taskbar, an accent-coloured one included. `None` for size 0.
+/// The tray icon for `phase` at `size` px (16, 20, 24 or 32), drawn per size, never scaled.
+/// Every state is the yap mark, a speech bubble, so the icon reads as this app in any state:
+/// idle is its outline with the voice bars, recording the bubble filled teal, transcribing (and
+/// the short paste after it) the bubble filled with three knocked-out dots. Shape changes with
+/// the state and only recording has colour, so it reads on a light, dark or accent taskbar and
+/// without colour vision. `light_taskbar` picks near-black over white glyphs. `badge` adds a
+/// dot in a knocked-out ring. `None` for size 0.
 #[must_use]
-pub fn tray_icon(phase: Phase, size: u32) -> Option<Pixmap> {
+pub fn tray_icon(phase: Phase, size: u32, light_taskbar: bool, badge: TrayBadge) -> Option<Pixmap> {
     let mut pm = Pixmap::new(size, size)?;
     let n = size as f32;
-    let at = Transform::from_scale(n, n);
-    // One pixel in the unit square the shapes are drawn in.
-    let px = 1.0 / n;
+    let k = n / 16.0;
+    let m = Mark::new(0.0, 0.0, n);
+    let ink = if light_taskbar {
+        palette::INK
+    } else {
+        palette::WHITE
+    };
+    let id = Transform::identity();
     match phase {
         Phase::Idle => {
-            let ring = PathBuilder::from_circle(0.5, 0.5, 0.32);
-            stroke(&mut pm, ring.as_ref(), SURFACE, 0.17 + 2.0 * px, at);
-            stroke(&mut pm, ring.as_ref(), palette::INFO, 0.17, at);
+            let line = if size < 24 {
+                1.0
+            } else {
+                (k * 2.0).floor() / 2.0
+            };
+            stroke(&mut pm, m.bubble(line / 2.0).as_ref(), ink, line, id);
+            for bar in m.bars(true) {
+                fill(&mut pm, bar.as_ref(), ink, id);
+            }
         }
         Phase::Recording => {
-            fill(
-                &mut pm,
-                PathBuilder::from_circle(0.5, 0.5, 0.44).as_ref(),
-                SURFACE,
-                at,
-            );
-            fill(
-                &mut pm,
-                PathBuilder::from_circle(0.5, 0.5, 0.44 - px).as_ref(),
-                palette::RECORDING,
-                at,
-            );
+            fill(&mut pm, m.bubble(0.0).as_ref(), palette::RECORDING, id);
+            if light_taskbar {
+                stroke(&mut pm, m.bubble(0.5).as_ref(), palette::BRAND_RIM, 1.0, id);
+            }
+            for bar in m.bars(false) {
+                fill(&mut pm, bar.as_ref(), palette::WHITE, id);
+            }
         }
         Phase::Transcribing | Phase::Pasting => {
-            // Every halo first, so a neighbour's halo never covers a dot.
-            for (r, c) in [(0.13 + px, SURFACE), (0.13, palette::BUSY)] {
-                for cx in [0.19, 0.5, 0.81] {
-                    fill(
-                        &mut pm,
-                        PathBuilder::from_circle(cx, 0.5, r).as_ref(),
-                        c,
-                        at,
-                    );
-                }
+            fill(&mut pm, m.bubble(0.0).as_ref(), ink, id);
+            for dot in m.dots() {
+                knock(&mut pm, dot.as_ref());
             }
         }
     }
+    // A dot `d` units wide in the right corner, `bottom` or top, cut free of the bubble by a
+    // 1-unit ring.
+    let mut dot = |d: f32, bottom: bool, c: Rgba| {
+        let r = d * k / 2.0;
+        let (cx, cy) = (n - r, if bottom { n - r } else { r });
+        let ring = k.round().max(1.0);
+        knock(&mut pm, PathBuilder::from_circle(cx, cy, r + ring).as_ref());
+        fill(&mut pm, PathBuilder::from_circle(cx, cy, r).as_ref(), c, id);
+    };
+    match badge {
+        TrayBadge::None => {}
+        TrayBadge::Error => dot(6.0, true, palette::ERROR),
+        TrayBadge::Update => dot(5.0, false, palette::RECORDING),
+    }
     Some(pm)
+}
+
+/// The app icon at `size` px: the yap mark in white on a teal rounded-square tile. The tile
+/// has a top-down gradient from 48 px, and a dark rim up to 32 px where a light background
+/// would swallow its edge. `None` for size 0.
+#[must_use]
+pub fn logo(size: u32) -> Option<Pixmap> {
+    let mut pm = Pixmap::new(size, size)?;
+    let id = Transform::identity();
+    let logo = Logo::new(size);
+    let tile = tile_paint(size);
+    if let Some(p) = &logo.tile {
+        pm.fill_path(p, &tile, FillRule::Winding, id, None);
+    }
+    stroke(&mut pm, logo.rim.as_ref(), palette::BRAND_RIM, 1.0, id);
+    fill(&mut pm, logo.bubble.as_ref(), palette::WHITE, id);
+    for bar in logo.bars.iter().flatten() {
+        pm.fill_path(bar, &tile, FillRule::Winding, id, None);
+    }
+    Some(pm)
+}
+
+/// [`logo`] at 256 px as SVG for the settings window: the same paths, so the two never drift.
+#[must_use]
+pub fn logo_svg() -> String {
+    use std::fmt::Write;
+    const SIZE: u32 = 256;
+    let logo = Logo::new(SIZE);
+    let hex = |c: Rgba| format!("#{:02X}{:02X}{:02X}", c.0, c.1, c.2);
+    let mut svg = format!(
+        "<svg width=\"{SIZE}\" height=\"{SIZE}\" viewBox=\"0 0 {SIZE} {SIZE}\" \
+         xmlns=\"http://www.w3.org/2000/svg\">\n\
+         <!-- Generated from oxi-platform draw::logo by the regen_icons test; do not edit. -->\n\
+         <defs><linearGradient id=\"tile\" x1=\"0\" y1=\"0\" x2=\"0\" y2=\"{SIZE}\" \
+         gradientUnits=\"userSpaceOnUse\"><stop offset=\"0\" stop-color=\"{}\"/>\
+         <stop offset=\"1\" stop-color=\"{}\"/></linearGradient></defs>\n",
+        hex(palette::BRAND_LIGHT),
+        hex(palette::BRAND),
+    );
+    let mut path = |p: Option<&Path>, paint: &str| {
+        let Some(p) = p else { return };
+        svg.push_str("<path d=\"");
+        for seg in p.segments() {
+            let _ = match seg {
+                PathSegment::MoveTo(a) => write!(svg, "M{} {}", a.x, a.y),
+                PathSegment::LineTo(a) => write!(svg, "L{} {}", a.x, a.y),
+                PathSegment::QuadTo(a, b) => write!(svg, "Q{} {} {} {}", a.x, a.y, b.x, b.y),
+                PathSegment::CubicTo(a, b, c) => {
+                    write!(svg, "C{} {} {} {} {} {}", a.x, a.y, b.x, b.y, c.x, c.y)
+                }
+                PathSegment::Close => write!(svg, "Z"),
+            };
+        }
+        let _ = writeln!(svg, "\" fill=\"{paint}\"/>");
+    };
+    path(logo.tile.as_ref(), "url(#tile)");
+    path(logo.bubble.as_ref(), &hex(palette::WHITE));
+    for bar in &logo.bars {
+        path(bar.as_ref(), "url(#tile)");
+    }
+    svg.push_str("</svg>\n");
+    svg
+}
+
+/// The paths of [`logo`] at one size.
+struct Logo {
+    tile: Option<Path>,
+    rim: Option<Path>,
+    bubble: Option<Path>,
+    bars: [Option<Path>; 3],
+}
+
+impl Logo {
+    fn new(size: u32) -> Self {
+        let n = size as f32;
+        let corner = (0.22 * n).round();
+        let mark = (0.75 * n).round();
+        let margin = (n - mark) / 2.0;
+        // The mark fills units 1 to 16 of its 16 high: half a unit up centres it.
+        let mark = Mark::new(margin.round(), (margin - mark / 32.0).round(), mark);
+        Self {
+            tile: rounded(0.0, 0.0, n, n, corner),
+            rim: if size <= 32 {
+                rounded(0.5, 0.5, n - 1.0, n - 1.0, corner - 0.5)
+            } else {
+                None
+            },
+            bubble: mark.bubble(0.0),
+            bars: mark.bars(false),
+        }
+    }
+}
+
+/// The tile fill: flat teal, or the top-down gradient from 48 px.
+fn tile_paint(size: u32) -> Paint<'static> {
+    let mut p = paint(palette::BRAND);
+    let colour = |c: Rgba| Color::from_rgba8(c.0, c.1, c.2, c.3);
+    if size >= 48
+        && let Some(shader) = LinearGradient::new(
+            tiny_skia::Point::from_xy(0.0, 0.0),
+            tiny_skia::Point::from_xy(0.0, size as f32),
+            vec![
+                GradientStop::new(0.0, colour(palette::BRAND_LIGHT)),
+                GradientStop::new(1.0, colour(palette::BRAND)),
+            ],
+            SpreadMode::Pad,
+            Transform::identity(),
+        )
+    {
+        p.shader = shader;
+    }
+    p
+}
+
+/// The yap mark, a speech bubble holding a three-bar voice meter, in a `side`-pixel square at
+/// (`ox`, `oy`). Designed on a 16-unit grid: body 14 x 12 with corner radius 3, a tail 3 units
+/// deep under its bottom-left corner, bars 2 wide with 2 between, 4 / 8 / 4 tall. Every edge is
+/// rounded to a whole pixel of this size, so the mark stays crisp from 12 to 256 px.
+struct Mark {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    r: f32,
+    tail_w: f32,
+    tip: f32,
+    /// Pixels per design unit.
+    k: f32,
+}
+
+impl Mark {
+    fn new(ox: f32, oy: f32, side: f32) -> Self {
+        let k = side / 16.0;
+        let at = |o: f32, v: f32| o + (v * k).round();
+        Self {
+            x0: at(ox, 1.0),
+            y0: at(oy, 1.0),
+            x1: at(ox, 15.0),
+            y1: at(oy, 13.0),
+            r: (3.0 * k).round().max(1.0),
+            tail_w: (3.0 * k).round().max(1.0),
+            tip: at(oy, 16.0),
+            k,
+        }
+    }
+
+    /// The bubble as one contour, every edge moved in by `inset`: 0 for a fill, half the line
+    /// width for a stroke whose outer edge is the fill's edge.
+    fn bubble(&self, inset: f32) -> Option<Path> {
+        let (x0, y0) = (self.x0 + inset, self.y0 + inset);
+        let (x1, y1) = (self.x1 - inset, self.y1 - inset);
+        let r = (self.r - inset).max(0.0);
+        let c = 0.552_284_8 * r; // cubic control distance of a quarter circle
+        // The tail's left edge continues the bottom-left corner straight down.
+        let tx = self.x0 + self.r + inset;
+        let tip = self.tip - 2.0 * inset;
+        let mut p = PathBuilder::new();
+        p.move_to(x0 + r, y0);
+        p.line_to(x1 - r, y0);
+        p.cubic_to(x1 - r + c, y0, x1, y0 + r - c, x1, y0 + r);
+        p.line_to(x1, y1 - r);
+        p.cubic_to(x1, y1 - r + c, x1 - r + c, y1, x1 - r, y1);
+        p.line_to(tx + self.tail_w - inset, y1);
+        p.line_to(tx, tip);
+        p.line_to(tx, y1);
+        p.line_to(x0 + r, y1);
+        p.cubic_to(x0 + r - c, y1, x0, y1 - r + c, x0, y1 - r);
+        p.line_to(x0, y0 + r);
+        p.cubic_to(x0, y0 + r - c, x0 + r - c, y0, x0 + r, y0);
+        p.close();
+        p.finish()
+    }
+
+    /// Three boxes `w` wide with `w` between, centred as a group in the body, each `h[i]` tall
+    /// and centred on the body's middle.
+    fn row(&self, w: f32, h: [f32; 3]) -> [(f32, f32, f32, f32); 3] {
+        let left = (f32::midpoint(self.x0, self.x1) - 2.5 * w).round();
+        let cy = f32::midpoint(self.y0, self.y1);
+        let mut x = left - 2.0 * w;
+        h.map(|h| {
+            x += 2.0 * w;
+            (x, (cy - h / 2.0).round(), w, h)
+        })
+    }
+
+    /// The voice bars; `thin` (inside an outline) rounds their width down, so they keep clear of
+    /// the line.
+    fn bars(&self, thin: bool) -> [Option<Path>; 3] {
+        let k = self.k;
+        let w = if thin {
+            (2.0 * k).floor()
+        } else {
+            (2.0 * k).round()
+        };
+        // Five bar widths with a pixel to spare each side, or the bars merge into the edge.
+        let w = w.min(((self.x1 - self.x0 - 2.0) / 5.0).floor()).max(1.0);
+        let h = [4.0, 8.0, 4.0].map(|u: f32| (u * k).round().max(1.0));
+        // Round ends once a bar is wide enough to show them.
+        let r = if w >= 4.0 { w / 2.0 } else { 0.0 };
+        self.row(w, h).map(|(x, y, w, h)| rounded(x, y, w, h, r))
+    }
+
+    /// The three "typing" dots in the bars' places.
+    fn dots(&self) -> [Option<Path>; 3] {
+        let d = (2.0 * self.k).round().max(2.0);
+        self.row(d, [d; 3]).map(|(x, y, w, h)| {
+            if d >= 3.0 {
+                PathBuilder::from_circle(x + w / 2.0, y + h / 2.0, w / 2.0)
+            } else {
+                tiny_skia::Rect::from_xywh(x, y, w, h).map(PathBuilder::from_rect)
+            }
+        })
+    }
 }
 
 /// The pixmap's premultiplied RGBA bytes as premultiplied BGRA, the order of a 32-bit DIB for
@@ -578,6 +807,15 @@ fn paint(c: Rgba) -> Paint<'static> {
 fn fill(pm: &mut Pixmap, path: Option<&Path>, c: Rgba, at: Transform) {
     if let Some(path) = path {
         pm.fill_path(path, &paint(c), FillRule::Winding, at, None);
+    }
+}
+
+/// Clears `path` out of `pm`: a hole the taskbar shows through.
+fn knock(pm: &mut Pixmap, path: Option<&Path>) {
+    if let Some(path) = path {
+        let mut p = paint(palette::WHITE);
+        p.blend_mode = BlendMode::DestinationOut;
+        pm.fill_path(path, &p, FillRule::Winding, Transform::identity(), None);
     }
 }
 
