@@ -1,6 +1,7 @@
 //! Slint settings window and first-run wizard (ARCHITECTURE section 4).
 
 mod ctx;
+mod debounce;
 pub mod ipc;
 mod pages;
 

@@ -1,25 +1,22 @@
 //! Text page: `dictionary.txt` against the prompt budget, `replace.txt` with its ignored lines,
 //! and the `[paste]` config (mode, trailing space, restore delay, per-app rules).
 
-use std::cell::RefCell;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
 use std::{fs, io};
 
 use oxi_core::config::{Paste, PasteMode, PasteRule};
 use oxi_core::dictionary::{BUDGET, build_prompt, token_count};
 use oxi_core::paths::Layout;
 use oxi_core::text::{ReplaceRules, decode_text_file};
-use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
+use slint::{ComponentHandle, ModelRc, SharedString, VecModel, Weak};
 
+use crate::debounce::SaveDebounce;
 use crate::generated::{FileInfo, FileState, PasteRuleRow, TextFile, TextState};
 use crate::{AppWindow, Ctx, Error, report};
 
 const FILES: [TextFile; 2] = [TextFile::Dictionary, TextFile::Replacements];
-/// How long the restore delay slider rests before its value is saved.
-const SAVE_DELAY: Duration = Duration::from_millis(300);
 
 /// Runs again after Reset to defaults: an editor with unsaved edits keeps them, the rest reload.
 // shortcut: closing the window drops unsaved edits without asking; add a close confirm when the
@@ -92,8 +89,7 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
     let (w, c) = (window.as_weak(), ctx.clone());
     s.on_trailing_space_toggled(move |on| apply(&w, &c, |p| p.trailing_space = on));
     let (w, c) = (window.as_weak(), ctx.clone());
-    let timer = Rc::new(Timer::default());
-    let pending: Rc<RefCell<Option<PendingSave>>> = Rc::default();
+    let save = SaveDebounce::new(w, c.clone());
     s.on_restore_delay_changed(move |ms| {
         #[allow(
             clippy::cast_possible_truncation,
@@ -102,17 +98,7 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
         )]
         let ms = ms.round().clamp(0.0, 1000.0) as u32;
         c.config.borrow_mut().config.paste.restore_delay_ms = ms;
-        // A drag fires on every step: save once it rests, not one fsync per step. The pending
-        // save also runs when the window closes first: dropping the page drops it.
-        pending.borrow_mut().get_or_insert_with(|| PendingSave {
-            weak: w.clone(),
-            ctx: c.clone(),
-        });
-        let pending = pending.clone();
-        timer.start(TimerMode::SingleShot, SAVE_DELAY, move || {
-            let job = pending.borrow_mut().take();
-            drop(job);
-        });
+        save.touch();
     });
     let (w, c) = (window.as_weak(), ctx.clone());
     s.on_rule_mode_picked(move |i, mode| {
@@ -146,19 +132,6 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
         let duplicate = if added { "" } else { app };
         with(&w, |s| s.set_duplicate_app(duplicate.into()));
     });
-}
-
-/// A config save not run yet. Dropping it runs it, so a window closed before the debounce
-/// fires still saves.
-struct PendingSave {
-    weak: Weak<AppWindow>,
-    ctx: Ctx,
-}
-
-impl Drop for PendingSave {
-    fn drop(&mut self) {
-        report(&self.weak, self.ctx.save());
-    }
 }
 
 /// A new rule types into `app`. The daemon takes the first rule whose app matches
