@@ -29,7 +29,7 @@ pub const fn notice(notice: Notice) -> &'static str {
             "config.toml has an error. Using the last good settings. Open Settings to see it"
         }
         Notice::ConfigAdjusted => "config.toml had values out of range. They were adjusted",
-        Notice::MicSilence => "The microphone gives silence. Check its mute switch",
+        Notice::MicSilence => "The microphone gives no sound. Reconnect it or pick another mic",
     }
 }
 
@@ -132,6 +132,21 @@ pub fn not_connected(name: &str) -> String {
 }
 
 pub const NO_MIC: &str = "No microphone";
+
+/// The open microphone gives only exact zeros: the OS or the device mutes it, not a quiet room.
+#[must_use]
+pub fn no_signal(name: &str) -> String {
+    format!("No sound from {name}. Reconnect it or pick another mic")
+}
+
+/// Status of the Audio page's Test button: record, then play back.
+pub const MIC_TEST_RECORDING: &str = "Speak now: recording 3 s";
+pub const MIC_TEST_PLAYING: &str = "Playing back";
+/// The test recording or its playback failed; the error kind only, never audio.
+#[must_use]
+pub fn mic_test_failed(kind: &str) -> String {
+    format!("Test failed: {kind}")
+}
 pub const SYSTEM_DEFAULT_MIC: &str = "System default";
 
 pub const DOWNLOAD_NEEDS_DAEMON: &str = "Start OxiYapper to download models";
@@ -197,6 +212,14 @@ mod tests {
             "config.toml, line 3: bad"
         );
         assert_eq!(not_connected("USB Mic"), "Not connected: USB Mic");
+        assert_eq!(
+            no_signal("USB Mic"),
+            "No sound from USB Mic. Reconnect it or pick another mic"
+        );
+        assert_eq!(
+            mic_test_failed("no output device"),
+            "Test failed: no output device"
+        );
         assert_eq!(download_failed("reset"), "Download failed: reset");
     }
 }
