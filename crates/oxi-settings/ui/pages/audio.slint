@@ -69,7 +69,7 @@ export component AudioPage inherits VerticalLayout {
                 horizontal-stretch: 2;
                 height: 22px;
                 border-radius: 3px;
-                background: Palette.border.transparentize(0.75);
+                background: Palette.foreground.transparentize(0.88);
                 accessible-role: progress-indicator;
                 accessible-label: AudioState.clipping ? @tr("Level, clipping") : @tr("Level");
                 if !AudioState.live: Text {

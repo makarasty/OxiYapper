@@ -149,128 +149,137 @@ component FileEditor inherits VerticalLayout {
     }
 }
 
-// No scrolling (SPEC Settings UI): the editors are short and the rules list is capped, so the
-// page fits the window with the banner and the notes of the files showing.
-export component TextPage inherits VerticalLayout {
+// No scrolling in the normal states (SPEC Settings UI): the editors are short and the rules list
+// is capped, so the page fits the window with the banner and the notes of the files showing.
+// The ScrollView is only the fallback when banner, notes and rules together outgrow it.
+export component TextPage inherits ScrollView {
     init => {
         TextState.shown();
     }
-    alignment: start;
-    spacing: 8px;
-    Group {
-        title: @tr("Dictionary: words that help whisper, one per line");
-        FileEditor {
-            file: TextFile.dictionary;
-            name: "dictionary.txt";
-            label: @tr("Dictionary");
-            info: TextState.dictionary-info;
-            editor-height: 56px;
-            text <=> TextState.dictionary;
-            Text {
-                text: @tr("{} / {} tokens", TextState.tokens, TextState.budget);
-                color: TextState.dropped-from > 0 ? Shell.error-text : Palette.foreground;
-            }
-            if TextState.dropped-from > 0: Text {
-                text: @tr("Over the limit: line {} and after are not sent.", TextState.dropped-from);
-                wrap: word-wrap;
-                font-size: 11px;
-                color: Shell.error-text;
-            }
-        }
-    }
-    Group {
-        title: @tr("Replacements: heard => wanted, one per line");
-        FileEditor {
-            file: TextFile.replacements;
-            name: "replace.txt";
-            label: @tr("Replacements");
-            info: TextState.replacements-info;
-            editor-height: 56px;
-            text <=> TextState.replacements;
-            Text {
-                text: TextState.bad-lines == "" ? @tr("Every line has =>.") : @tr("Ignored, no =>: line {}", TextState.bad-lines);
-                wrap: word-wrap;
-                color: TextState.bad-lines == "" ? Palette.foreground : Shell.error-text;
+    preferred-height: content.preferred-height;
+    max-height: content.preferred-height;
+    min-height: 0;
+    content-width: self.visible-width;
+    content-height: content.preferred-height;
+    content := VerticalLayout {
+        width: root.visible-width;
+        alignment: start;
+        spacing: 8px;
+        Group {
+            title: @tr("Dictionary: words that help whisper, one per line");
+            FileEditor {
+                file: TextFile.dictionary;
+                name: "dictionary.txt";
+                label: @tr("Dictionary");
+                info: TextState.dictionary-info;
+                editor-height: 56px;
+                text <=> TextState.dictionary;
+                Text {
+                    text: @tr("{} / {} tokens", TextState.tokens, TextState.budget);
+                    color: TextState.dropped-from > 0 ? Shell.error-text : Palette.foreground;
+                }
+                if TextState.dropped-from > 0: Text {
+                    text: @tr("Over the limit: line {} and after are not sent.", TextState.dropped-from);
+                    wrap: word-wrap;
+                    font-size: 11px;
+                    color: Shell.error-text;
+                }
             }
         }
-    }
-    Group {
-        title: @tr("Paste");
-        ThumbPicker {
-            accessible-label: @tr("Paste mode");
-            thumbs: [
-                { image: @image-url("../img/text-clipboard.svg"), caption: @tr("Clipboard") },
-                { image: @image-url("../img/text-type.svg"), caption: @tr("Type") },
-            ];
-            selected: TextState.paste-mode;
-            picked(i) => {
-                TextState.paste-mode = i;
-                TextState.paste-mode-picked(i);
+        Group {
+            title: @tr("Replacements: heard => wanted, one per line");
+            FileEditor {
+                file: TextFile.replacements;
+                name: "replace.txt";
+                label: @tr("Replacements");
+                info: TextState.replacements-info;
+                editor-height: 56px;
+                text <=> TextState.replacements;
+                Text {
+                    text: TextState.bad-lines == "" ? @tr("Every line has =>.") : @tr("Ignored, no =>: line {}", TextState.bad-lines);
+                    wrap: word-wrap;
+                    color: TextState.bad-lines == "" ? Palette.foreground : Shell.error-text;
+                }
             }
         }
-        ToggleRow {
-            label: @tr("Trailing space");
-            checked <=> TextState.trailing-space;
-            toggled(on) => {
-                TextState.trailing-space-toggled(on);
+        Group {
+            title: @tr("Paste");
+            ThumbPicker {
+                accessible-label: @tr("Paste mode");
+                thumbs: [
+                    { image: @image-url("../img/text-clipboard.svg"), caption: @tr("Clipboard") },
+                    { image: @image-url("../img/text-type.svg"), caption: @tr("Type") },
+                ];
+                selected: TextState.paste-mode;
+                picked(i) => {
+                    TextState.paste-mode = i;
+                    TextState.paste-mode-picked(i);
+                }
             }
-        }
-        SliderRow {
-            label: @tr("Restore clipboard after");
-            minimum: 0;
-            maximum: 1000;
-            step: 25;
-            value <=> TextState.restore-delay-ms;
-            value-text: @tr("{} ms", round(TextState.restore-delay-ms));
-            changed(v) => {
-                TextState.restore-delay-changed(v);
+            ToggleRow {
+                label: @tr("Trailing space");
+                checked <=> TextState.trailing-space;
+                toggled(on) => {
+                    TextState.trailing-space-toggled(on);
+                }
             }
-        }
-        ListView {
-            // One row per rule, two at most; more rules scroll inside the list.
-            height: min(TextState.rules.length, 2) * 32px;
-            for rule[i] in TextState.rules: Row {
-                label: rule.app;
-                ComboBox {
-                    width: 110px;
-                    model: [@tr("Default"), @tr("Clipboard"), @tr("Type")];
-                    current-index: rule.mode;
-                    enabled: !Shell.locked;
-                    accessible-label: @tr("Mode for {}", rule.app);
-                    selected => {
-                        TextState.rule-mode-picked(i, self.current-index);
+            SliderRow {
+                label: @tr("Restore clipboard after");
+                minimum: 0;
+                maximum: 1000;
+                step: 25;
+                value <=> TextState.restore-delay-ms;
+                value-text: @tr("{} ms", round(TextState.restore-delay-ms));
+                changed(v) => {
+                    TextState.restore-delay-changed(v);
+                }
+            }
+            ListView {
+                // One row per rule, two at most; more rules scroll inside the list.
+                height: min(TextState.rules.length, 2) * 32px;
+                for rule[i] in TextState.rules: Row {
+                    label: rule.app;
+                    ComboBox {
+                        width: 110px;
+                        model: [@tr("Default"), @tr("Clipboard"), @tr("Type")];
+                        current-index: rule.mode;
+                        enabled: !Shell.locked;
+                        accessible-label: @tr("Mode for {}", rule.app);
+                        selected => {
+                            TextState.rule-mode-picked(i, self.current-index);
+                        }
                     }
+                    Button {
+                        text: @tr("Remove");
+                        accessible-label: @tr("Remove {}", rule.app);
+                        enabled: !Shell.locked;
+                        clicked => {
+                            TextState.rule-removed(i);
+                        }
+                    }
+                }
+            }
+            Row {
+                label: @tr("Per-app rule");
+                new-app := LineEdit {
+                    width: 150px;
+                    placeholder-text: @tr("app.exe");
+                    enabled: !Shell.locked;
+                    accessible-label: @tr("New rule app");
                 }
                 Button {
-                    text: @tr("Remove");
-                    accessible-label: @tr("Remove {}", rule.app);
-                    enabled: !Shell.locked;
+                    text: @tr("Add");
+                    accessible-label: @tr("Add rule");
+                    enabled: !Shell.locked && new-app.text != "";
                     clicked => {
-                        TextState.rule-removed(i);
+                        TextState.rule-added(new-app.text);
+                        new-app.text = "";
                     }
                 }
             }
-        }
-        Row {
-            label: @tr("Per-app rule");
-            new-app := LineEdit {
-                width: 150px;
-                placeholder-text: @tr("app.exe");
-                enabled: !Shell.locked;
-                accessible-label: @tr("New rule app");
+            if TextState.duplicate-app != "": InlineNote {
+                text: @tr("{} already has a rule: change its mode in the list above.", TextState.duplicate-app);
             }
-            Button {
-                text: @tr("Add");
-                accessible-label: @tr("Add rule");
-                enabled: !Shell.locked && new-app.text != "";
-                clicked => {
-                    TextState.rule-added(new-app.text);
-                    new-app.text = "";
-                }
-            }
-        }
-        if TextState.duplicate-app != "": InlineNote {
-            text: @tr("{} already has a rule: change its mode in the list above.", TextState.duplicate-app);
         }
     }
 }

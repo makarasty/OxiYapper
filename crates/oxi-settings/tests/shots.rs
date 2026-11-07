@@ -235,8 +235,8 @@ fn shot_audio_denoise() {
     shot("audio-denoise", Page::Audio, Some(DENOISE));
 }
 
-// The configured-mic-missing page is `shot_not_connected` in `pages::audio`: it lists the devices
-// through a fake, where this binary could only ask the real sound system.
+// The not-connected, level and clipping states are `shots_audio` in `pages::audio`: they list the
+// devices through a fake, where this binary could only ask the real sound system.
 
 #[test]
 fn shot_model() {
@@ -423,6 +423,78 @@ fn shot_text_unreadable() {
     shot_with("text-unreadable", Page::Text, None, |l| {
         fs::create_dir(l.replace_file()).unwrap();
     });
+}
+
+#[test]
+fn shot_text_worst_case() {
+    // Daemon banner, both files unreadable (a note each), three rules and the duplicate note: more
+    // than the window holds, so the page scrolls; Add must be reachable by wheel and by Tab.
+    // Items outside the viewport are not in the element search, so "found" means "in view".
+    use slint::platform::Key as Tab;
+    for (theme, choice) in [("light", ThemeChoice::Light), ("dark", ThemeChoice::Dark)] {
+        let _ = slint::platform::set_platform(Box::new(Shots));
+        let layout = common::layout("text-worst", None);
+        fs::create_dir(layout.dictionary_file()).unwrap();
+        fs::create_dir(layout.replace_file()).unwrap();
+        let (ipc, _sent) = Ipc::fake();
+        let window = oxi_settings::open_with(layout, ipc.clone()).unwrap();
+        window.set_page(Page::Text);
+        window.set_theme(choice);
+        window.show().unwrap();
+        ipc.deliver(&Event::Link(Link::Offline));
+        let surface = LAST.with_borrow(Clone::clone).unwrap();
+        let _ = render(&window, 1.0);
+        let wheel = |dy: f32| {
+            surface.dispatch_event(WindowEvent::PointerScrolled {
+                position: slint::LogicalPosition::new(280.0, 300.0),
+                delta_x: 0.0,
+                delta_y: dy,
+            });
+            slint::platform::update_timers_and_animations();
+        };
+        // The Add button, when it is on screen.
+        let add_in_view = || {
+            ElementHandle::find_by_accessible_label(&window, "Add rule")
+                .next()
+                .is_some_and(|e| e.absolute_position().y + e.size().height <= HEIGHT)
+        };
+        assert!(
+            !add_in_view(),
+            "the worst case should not fit: no scrolling to test"
+        );
+        wheel(-2000.0);
+        assert!(add_in_view(), "Add not reachable by wheel");
+        for app in ["a.exe", "b.exe", "A.EXE"] {
+            common::one(&window, "New rule app").set_accessible_value(app);
+            common::one(&window, "Add rule").invoke_accessible_default_action();
+        }
+        wheel(-2000.0);
+        assert!(common::has(
+            &window,
+            "A.EXE already has a rule: change its mode in the list above."
+        ));
+        save(&render(&window, 1.0), "text-worst-bottom", theme);
+        wheel(2000.0);
+        save(&render(&window, 1.0), "text-worst-top", theme);
+        // Keyboard only: from the top, Tab until Add is on screen.
+        wheel(-2000.0);
+        common::one(&window, "New rule app").set_accessible_value("c.exe");
+        wheel(2000.0);
+        assert!(!add_in_view());
+        let mut tabs = 0;
+        while !add_in_view() && tabs < 60 {
+            surface.dispatch_event(WindowEvent::KeyPressed {
+                text: Tab::Tab.into(),
+            });
+            surface.dispatch_event(WindowEvent::KeyReleased {
+                text: Tab::Tab.into(),
+            });
+            slint::platform::update_timers_and_animations();
+            tabs += 1;
+        }
+        assert!(add_in_view(), "Tab never brought Add into view");
+        save(&render(&window, 1.0), "text-worst-tabbed", theme);
+    }
 }
 
 #[test]

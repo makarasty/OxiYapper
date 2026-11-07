@@ -676,15 +676,17 @@ mod tests {
         assert_eq!(state.get_list_error(), "");
     }
 
-    /// Draws the page to `$OXI_SHOTS_DIR/settings-audio-<screen>-<theme>.png`: the configured mic
-    /// not connected, the level meter with bars, and with clipping. The page lists and opens
-    /// devices through fakes. It installs its own software-renderer platform, which the
-    /// testing-backend tests in this binary cannot share: run it alone,
-    /// `OXI_SHOTS_DIR=<dir> cargo test -p oxi-settings --lib -- --ignored shots_audio`.
-    /// Ignored rather than skipped, so a plain run never reports it as passed.
+    /// Draws the page: the configured mic not connected, the level meter with bars, and with
+    /// clipping, each frame non-empty and not one colour; the page lists and opens devices through
+    /// fakes. With `OXI_SHOTS_DIR` set the frames land in `settings-audio-<screen>-<theme>.png`.
+    /// The renderer platform is per thread and the other tests here use the testing backend, so
+    /// the drawing runs on a thread of its own.
     #[test]
-    #[ignore = "needs its own renderer platform; run alone with OXI_SHOTS_DIR set"]
     fn shots_audio() {
+        std::thread::spawn(draw_audio).join().unwrap();
+    }
+
+    fn draw_audio() {
         use slint::platform::software_renderer::{
             MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
         };
@@ -702,9 +704,10 @@ mod tests {
             }
         }
 
-        let dir =
-            std::path::PathBuf::from(std::env::var_os("OXI_SHOTS_DIR").expect("set OXI_SHOTS_DIR"));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::env::var_os("OXI_SHOTS_DIR").map(std::path::PathBuf::from);
+        if let Some(dir) = &dir {
+            std::fs::create_dir_all(dir).unwrap();
+        }
         let (w, h) = (560_u32, 600_u32);
         slint::platform::set_platform(Box::new(Shots)).unwrap();
         let bars = |f: fn(usize) -> f32| -> Vec<f32> { (0..40).map(f).collect() };
@@ -766,12 +769,18 @@ device = \"USB Mic\"
                 let pixmap = tiny_skia::Pixmap::from_vec(bytes, size).unwrap();
                 let first = pixmap.pixels()[0];
                 assert!(
+                    pixmap.pixels().iter().any(|p| p.alpha() > 0),
+                    "{screen} {theme} drew nothing"
+                );
+                assert!(
                     pixmap.pixels().iter().any(|p| *p != first),
                     "{screen} {theme} is one flat colour"
                 );
-                pixmap
-                    .save_png(dir.join(format!("settings-audio-{screen}-{theme}.png")))
-                    .unwrap();
+                if let Some(dir) = &dir {
+                    pixmap
+                        .save_png(dir.join(format!("settings-audio-{screen}-{theme}.png")))
+                        .unwrap();
+                }
             }
         }
     }
