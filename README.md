@@ -8,7 +8,7 @@ Design: one executable. `OxiYapper` runs the small resident daemon (tray, hotkey
 
 ## Build
 
-Needs Rust 1.88+, CMake and LLVM/clang (bindgen). Pick a GPU backend with a feature flag:
+Needs Rust 1.92+, CMake and LLVM/clang (bindgen). Pick a GPU backend with a feature flag:
 
 | Feature  | Backend | Extra requirements |
 |----------|---------|--------------------|

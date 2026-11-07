@@ -41,7 +41,7 @@ Live tests touch the real desktop, so each is off unless its variable is `1`. Ru
 | `OXI_TRAY_TEST` | `tray_live` | adds and removes tray icons |
 | `OXI_DAEMON_TEST` | `daemon_smoke` | runs a copy of the real daemon: hook, tray icon, pipe |
 | `OXI_MIC_TEST` | `mic`, settings `page_audio` | opens the default microphone; audio is never written to disk |
-| `OXI_SHOTS_DIR` | draw, overlay, settings shots | a folder; when set, tests save PNGs of overlay states, tray icons and settings screens there for review |
+| `OXI_SHOTS_DIR` | draw, overlay, settings shots | a folder; when set, tests save PNG files of overlay states, tray icons and settings screens there for review |
 
 Live tests never use Ctrl+Win: the owner's dictation tool listens on it. Use F13 chords. Quit any other dictation tool before running them.
 

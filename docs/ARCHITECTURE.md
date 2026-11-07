@@ -77,8 +77,9 @@ src/main.rs             CLI dispatch; src/daemon/ wires threads and runs effects
 crates/oxi-core         pure logic: machine, config, text, dictionary, history policy,
                         ipc messages, model registry, GPU device choice, audio DSP
                         (pure Rust only)
-crates/oxi-platform     OS code behind traits: hotkey, paste, clipboard, overlay, tray,
-                        autostart, capture, power/session events, notifications, paths
+crates/oxi-platform     OS code, one module per OS: hook, clipboard and input (implement the
+                        paste traits of oxi-core), overlay, tray, pipe, capture (trait
+                        `Capture`), paths, file helpers
 crates/oxi-whisper      whisper-rs wrapper: load/unload, ggml device list, transcribe;
                         owns the vulkan/cuda/metal features
 crates/oxi-settings     Slint UI (settings window and first-run wizard)
@@ -301,7 +302,7 @@ Paste and clipboard
 
 System
 44. Overlay over a fullscreen game: no-activate, click-through, topmost, tool window, shown with `SW_SHOWNOACTIVATE`, drawn with `UpdateLayeredWindow` (no WM_PAINT, no flicker). `hide_over_fullscreen` uses `SHQueryUserNotificationState` (D3D fullscreen, busy, presentation).
-45. Two monitors, DPI change: position and scale are computed on every show from the monitor of the foreground window, its work area (taskbar excluded) and its DPI. `Overlay::new` calls `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`, so DPI awareness does not depend on a manifest; the call failing because a manifest (planned in ROADMAP M11) or an earlier call already set it is fine.
+45. Two monitors, DPI change: position and scale are computed on every show from the monitor of the foreground window, its work area (taskbar excluded) and its DPI. `Overlay::new` calls `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`, so DPI awareness does not depend on a manifest; the call failing because a manifest (not planned yet) or an earlier call already set it is fine.
 46. Sleep: cancel recording, unload the model. Resume: reinstall the hook; audio reopens on the next key-down anyway.
 47. Screen locked while recording: cancel and discard (the user walked away on purpose).
 48. Settings and daemon writing config at once: cannot happen, one writer per file (section 6).
