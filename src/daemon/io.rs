@@ -60,6 +60,9 @@ struct Worker {
 /// One running download: its cancel flag and the last progress it reported.
 struct Running {
     cancel: AtomicBool,
+    /// Held across "record progress, then push it" and across "read progress, then replay it", so
+    /// a replay never lands after a newer push.
+    order: Mutex<()>,
     done: AtomicU64,
     total: AtomicU64,
 }
@@ -93,6 +96,7 @@ impl Worker {
         };
         let run = Arc::new(Running {
             cancel: AtomicBool::new(false),
+            order: Mutex::new(()),
             done: AtomicU64::new(0),
             total: AtomicU64::new(entry.size),
         });
@@ -128,6 +132,7 @@ impl Worker {
     /// lock: a download leaves the map before its `DownloadDone`, so none of these can follow it.
     fn replay(&self) {
         for (id, run) in lock(&self.active).iter() {
+            let _ordered = lock(&run.order);
             self.pushes.send(Push::DownloadProgress {
                 id: id.clone(),
                 done: run.done.load(Ordering::Relaxed),
@@ -153,6 +158,7 @@ fn transfer(
 ) -> DownloadResult {
     let mut throttle = Throttle::default();
     let mut progress = |done, total| {
+        let _ordered = lock(&run.order);
         run.done.store(done, Ordering::Relaxed);
         run.total.store(total, Ordering::Relaxed);
         if throttle.allow(Instant::now(), done, total) {
@@ -343,6 +349,34 @@ mod tests {
         let (_, last) = worker.pushes.claim(0);
         worker.handle(IoCmd::Subscribed);
         assert!(last.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn a_replay_waits_for_a_progress_that_is_mid_push() {
+        let (go, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let fake: Arc<DownloadFn> = Arc::new(move |entry, dir, progress, _| {
+            progress(5, 40);
+            let _ = lock(&gate).recv_timeout(WAIT);
+            Ok(downloaded(entry, dir))
+        });
+        let (worker, old) = rig(fake);
+        worker.handle(id("tiny"));
+        let _ = old.recv_timeout(WAIT).unwrap();
+        let (_, new) = worker.pushes.claim(0);
+        let run = lock(&worker.active)["tiny"].clone();
+        // The download thread is between its store and its push: replay must not read yet.
+        let held = lock(&run.order);
+        thread::scope(|s| {
+            s.spawn(|| worker.handle(IoCmd::Subscribed));
+            assert!(new.recv_timeout(Duration::from_millis(200)).is_err());
+            drop(held);
+            assert!(matches!(
+                new.recv_timeout(WAIT).unwrap(),
+                Push::DownloadProgress { done: 5, .. }
+            ));
+        });
+        drop(go);
     }
 
     #[test]

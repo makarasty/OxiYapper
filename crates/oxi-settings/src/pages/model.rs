@@ -193,9 +193,6 @@ impl PageState {
         report(&self.window, self.ctx.save());
     }
 
-    // shortcut: the row waits for the daemon's DownloadProgress pushes; the daemon does not
-    // route DownloadModel and CancelDownload yet (another task), so Download shows nothing more
-    // than "Starting the download" until it does.
     fn download(&self, i: i32) {
         let Some((i, entry)) = self.entry(i) else {
             return;

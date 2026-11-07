@@ -561,12 +561,29 @@ fn copy_wide(dst: &mut [u16], s: &str) {
         *d = c;
         n += 1;
     }
+    // A cut between the halves of a surrogate pair leaves a lone high surrogate: drop it.
+    if n > 0 && n == room && (0xD800..0xDC00).contains(&dst[n - 1]) {
+        n -= 1;
+    }
     dst[n..].fill(0);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_wide_never_splits_a_surrogate_pair() {
+        let mut dst = [0xFFFFu16; 8];
+        // 6 units, then an emoji (2 units) that would straddle the 7-unit room.
+        copy_wide(&mut dst, "abcdef\u{1F600}");
+        assert_eq!(String::from_utf16(&dst[..6]).unwrap(), "abcdef");
+        assert_eq!(dst[6..], [0, 0]);
+        // An emoji that fits whole stays.
+        copy_wide(&mut dst, "abcde\u{1F600}");
+        assert_eq!(String::from_utf16_lossy(&dst[..7]), "abcde\u{1F600}");
+        assert_eq!(dst[7], 0);
+    }
 
     #[test]
     fn tooltip_lists_each_warning_under_the_phase() {
