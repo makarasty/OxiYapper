@@ -8,6 +8,8 @@ import { Palette } from "std-widgets.slint";
 export global Shell {
     // The config cannot be written (newer version, or a parse error until Reset): controls go grey.
     in-out property <bool> locked;
+    // shortcut: for the old pages only (`ui/widgets.slint` era); drop with them in d3a/d3b.
+    out property <color> error-text: Palette.color-scheme == ColorScheme.dark ? #ff8a80 : #b3261e;
 }
 
 export global Theme {

@@ -1,14 +1,9 @@
-// Shared widgets of the settings window. This file is their only home: a page that needs a
-// new kind of row adds it here, never a local copy (SPEC Settings UI, compact XClicker-like panel).
+// The old page widgets, kept until d3a/d3b move the pages onto `theme/` and delete this file. New
+// code imports `theme/index.slint`; `Shell` is the one from there, so the lock greys both.
 import { Palette, Switch, Slider } from "std-widgets.slint";
+import { Shell } from "theme/index.slint";
 
-// Window-wide state every control reads.
-export global Shell {
-    // The config cannot be written (newer version, or a parse error until Reset): controls go grey.
-    in-out property <bool> locked;
-    // Error text: 4.5:1 or better on the page and group backgrounds in both themes.
-    out property <color> error-text: Palette.color-scheme == ColorScheme.dark ? #ff8a80 : #b3261e;
-}
+export { Shell }
 
 // A titled box of rows.
 export component Group inherits VerticalLayout {
@@ -191,31 +186,6 @@ export component ThumbPicker inherits FocusScope {
                 }
             }
         }
-    }
-}
-
-// A message across the top of the page; its actions are the children (buttons).
-export component Banner inherits Rectangle {
-    in property <string> text;
-    // Error tint for a broken file; warning tint otherwise.
-    in property <bool> error;
-    background: root.error ? Shell.error-text.transparentize(0.8) : #f7b50033;
-    border-color: root.error ? Shell.error-text : #f7b500;
-    border-width: 1px;
-    border-radius: 6px;
-    accessible-role: banner;
-    accessible-label: root.text;
-    HorizontalLayout {
-        padding: 8px;
-        spacing: 8px;
-        Text {
-            text: root.text;
-            wrap: word-wrap;
-            vertical-alignment: center;
-            horizontal-stretch: 1;
-            color: Palette.foreground;
-        }
-        @children
     }
 }
 

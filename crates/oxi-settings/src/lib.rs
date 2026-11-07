@@ -12,8 +12,9 @@ use std::time::Duration;
 
 use oxi_core::config::{ConfigError, Theme};
 use oxi_core::ipc::Push;
+use oxi_core::overlay::Rect;
 use oxi_core::paths::Layout;
-use slint::{ComponentHandle, Timer, TimerMode, Weak};
+use slint::{Color, ComponentHandle, LogicalSize, PhysicalPosition, Timer, TimerMode, Weak};
 
 pub use ctx::Ctx;
 pub use ipc::Ipc;
@@ -24,13 +25,22 @@ use ipc::{Action, Event, Link, Options};
 mod generated {
     slint::include_modules!();
 }
-pub use generated::{AppWindow, Page, Shell, ThemeChoice};
+pub use generated::{AppWindow, DaemonStatus, Page, Shell, ThemeChoice};
 
 /// How often the window looks for an edit of `config.toml` from outside (an editor, "Open
 /// file"): a fixed file clears the banner and refreshes the pages without reopening.
 // shortcut: a metadata poll, not a file watcher (`notify` is not a dependency of this crate);
 // switch to a watcher if the second of delay matters.
 pub const FILE_POLL: Duration = Duration::from_secs(1);
+
+/// The accent the std widgets (`LineEdit`, `TextEdit`, `ComboBox`) derive their focus line and
+/// selection from: our teal (token `accent`), never the Windows accent (redesign spec 7.3).
+const ACCENT: Color = Color::from_rgb_u8(0x0F, 0x76, 0x6E);
+
+/// Default size: `min(1120, 85 %)` x `min(780, 88 %)` of the work area, at least the 720 x 520
+/// minimum (redesign spec section 2).
+const DEFAULT: (f32, f32) = (1120.0, 780.0);
+const MIN: (f32, f32) = (720.0, 520.0);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -53,12 +63,25 @@ pub fn run() -> Result<(), Error> {
         options.spawn = watch_spawn(options.spawn, window.as_weak());
         Ok(Some(Ipc::connect(options)?))
     })?;
+    #[cfg(windows)]
+    if let Ok((area, scale)) = oxi_platform::os::display::work_area() {
+        let (size, position) = placement(area, scale);
+        window.window().set_size(size);
+        window.window().set_position(position);
+    }
     // A window opened by a second launch must not show behind the app the user is in; the
     // daemon allowed this process to take the foreground. The callback runs once the event loop
     // has created and shown the window.
     #[cfg(windows)]
-    let _ = slint::invoke_from_event_loop(|| {
-        oxi_platform::os::foreground::raise_current_thread_window();
+    let _ = slint::invoke_from_event_loop({
+        let weak = window.as_weak();
+        move || {
+            // The backend wrote the system accent when it created the window.
+            if let Some(window) = weak.upgrade() {
+                own_accent(&window);
+            }
+            oxi_platform::os::foreground::raise_current_thread_window();
+        }
     });
     window.run()?;
     Ok(())
@@ -84,6 +107,33 @@ fn spawn_note(e: &io::Error) -> String {
     oxi_core::strings::spawn_failed(e.kind())
 }
 
+/// Logical size and physical top-left of a new window centred in `area` (physical pixels, at
+/// `scale`).
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)] // screen pixels
+fn placement(area: Rect, scale: f32) -> (LogicalSize, PhysicalPosition) {
+    let (w, h) = (area.w as f32 / scale, area.h as f32 / scale);
+    let size = LogicalSize::new(
+        DEFAULT.0.min(w * 0.85).max(MIN.0),
+        DEFAULT.1.min(h * 0.88).max(MIN.1),
+    );
+    let position = PhysicalPosition::new(
+        area.x + ((w - size.width) * scale / 2.0).round() as i32,
+        area.y + ((h - size.height) * scale / 2.0).round() as i32,
+    );
+    (size, position)
+}
+
+/// Puts our teal where Slint keeps the system accent, which the fluent std widgets tint from.
+// shortcut: private Slint API, safe only while `slint` is pinned `=1.18.1`; re-check it on every
+// Slint bump. The backend writes the system accent back when it creates the window and on a theme
+// change: `run` calls this once the window is up and the file poll repeats it (a no-op write when
+// nothing changed), so a new Windows accent can show for up to a second.
+fn own_accent(window: &AppWindow) {
+    slint::private_unstable_api::re_exports::WindowInner::from_pub(window.window())
+        .context()
+        .set_accent_color(ACCENT);
+}
+
 /// The settings window on `layout`'s config with no daemon link (it stays offline and shows no
 /// daemon banner); the caller shows it.
 pub fn open(layout: Layout) -> Result<AppWindow, Error> {
@@ -101,6 +151,7 @@ fn open_inner(
     link: impl FnOnce(&AppWindow) -> Result<Option<Ipc>, Error>,
 ) -> Result<AppWindow, Error> {
     let window = AppWindow::new()?;
+    own_accent(&window);
     let (mut ctx, problem) = Ctx::load(layout)?;
     let followed = link(&window)?;
     if let Some(ipc) = &followed {
@@ -149,6 +200,7 @@ fn open_inner(
         let (weak, c) = (window.as_weak(), ctx.clone());
         move || {
             if let Some(window) = weak.upgrade() {
+                own_accent(&window);
                 reload(&window, &c, linked);
             }
         }
@@ -218,6 +270,9 @@ fn on_daemon_event(window: &AppWindow, event: &Event) {
     if notice.is_none() && !matches!(event, Event::Link(_)) {
         return;
     }
+    if let Event::Link(link) = event {
+        window.set_daemon_status(status(*link));
+    }
     let action = notice.as_ref().and_then(|n| n.action);
     window.set_daemon_text(notice.map(|n| n.text).unwrap_or_default().into());
     window.set_daemon_start(action == Some(Action::Start));
@@ -225,6 +280,15 @@ fn on_daemon_event(window: &AppWindow, event: &Event) {
     // Connecting and Offline keep it: the failure is reported just before them.
     if matches!(event, Event::Link(link) if !matches!(link, Link::Connecting | Link::Offline)) {
         window.set_spawn_error("".into());
+    }
+}
+
+/// The rail's daemon chip for `link`.
+const fn status(link: Link) -> DaemonStatus {
+    match link {
+        Link::Online | Link::Mismatch { .. } => DaemonStatus::Running,
+        Link::Connecting | Link::Offline => DaemonStatus::Stopped,
+        Link::Busy | Link::Stuck | Link::Untrusted | Link::Foreign => DaemonStatus::Stuck,
     }
 }
 
@@ -264,8 +328,11 @@ const fn theme(choice: ThemeChoice) -> Theme {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppWindow, ThemeChoice, choice, spawn_note, theme};
+    use super::{
+        AppWindow, DaemonStatus, Link, ThemeChoice, choice, placement, spawn_note, status, theme,
+    };
     use oxi_core::config::Theme;
+    use oxi_core::overlay::Rect;
     use slint::ComponentHandle;
     use std::io::{Error, ErrorKind};
 
@@ -294,6 +361,46 @@ mod tests {
             window.invoke_reset_config();
         }
         assert_eq!(ipc.subscribers(), 4);
+    }
+
+    #[test]
+    fn placement_fits_the_work_area_and_centres() {
+        let rect = |x, y, w, h| Rect { x, y, w, h };
+        // (work area, scale, logical size, physical top-left)
+        let cases = [
+            // 1920x1080 at 100 %, taskbar 48: the full default size.
+            (rect(0, 0, 1920, 1032), 1.0, (1120.0, 780.0), (400, 126)),
+            // 1366x768 laptop: 85 % of 1366 is 1161, 88 % of 720 is 633.6.
+            (rect(0, 0, 1366, 720), 1.0, (1120.0, 633.6), (123, 43)),
+            // 2560x1440 at 150 %: 1706x928 logical, the default size again.
+            (rect(0, 0, 2560, 1392), 1.5, (1120.0, 780.0), (440, 111)),
+            // A tiny screen still gets the minimum; a monitor left of the primary keeps its origin.
+            (rect(-800, 0, 800, 600), 1.0, (720.0, 528.0), (-760, 36)),
+        ];
+        for (area, scale, (w, h), (x, y)) in cases {
+            let (size, pos) = placement(area, scale);
+            assert!(
+                (size.width - w).abs() < 0.01 && (size.height - h).abs() < 0.01,
+                "{area:?}: {size:?}"
+            );
+            assert_eq!((pos.x, pos.y), (x, y), "{area:?}");
+        }
+    }
+
+    #[test]
+    fn daemon_chip_follows_the_link() {
+        for (link, want) in [
+            (Link::Online, DaemonStatus::Running),
+            (Link::Mismatch { daemon_proto: 9 }, DaemonStatus::Running),
+            (Link::Connecting, DaemonStatus::Stopped),
+            (Link::Offline, DaemonStatus::Stopped),
+            (Link::Busy, DaemonStatus::Stuck),
+            (Link::Stuck, DaemonStatus::Stuck),
+            (Link::Untrusted, DaemonStatus::Stuck),
+            (Link::Foreign, DaemonStatus::Stuck),
+        ] {
+            assert_eq!(status(link), want, "{link:?}");
+        }
     }
 
     #[test]
