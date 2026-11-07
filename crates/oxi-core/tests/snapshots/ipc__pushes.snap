@@ -2,7 +2,7 @@
 source: crates/oxi-core/tests/ipc.rs
 expression: lines(pushes().iter().map(encode).collect())
 ---
-{"t":"HelloAck","proto":1,"version":"0.1.0"}
+{"t":"HelloAck","proto":2,"version":"0.1.0"}
 {"t":"Raise"}
 {"t":"Status","phase":"recording","model":"turbo","device":"Vulkan0","backend":"Vulkan0","warnings":["gpu not found"]}
 {"t":"Devices","mics":["Mic"],"gpus":[{"name":"Vulkan0","description":"Test GPU","uma":false}]}
@@ -12,3 +12,4 @@ expression: lines(pushes().iter().map(encode).collect())
 {"t":"DownloadDone","id":"tiny","result":{"r":"Failed","message":"hash mismatch"}}
 {"t":"Key","code":"F13","down":true}
 {"t":"ConfigError","file":"config.toml","line":3,"message":"bad"}
+{"t":"Stats","dictations":11300,"words":299900,"wpm":146,"streak":6,"longest_streak":40,"heat_start":"2026-11-02","heat":[0,1,4,2,3,0]}

@@ -17,6 +17,7 @@ pub mod models;
 pub mod overlay;
 pub mod paste;
 pub mod paths;
+pub mod stats;
 pub mod strings;
 pub mod text;
 pub mod tray;

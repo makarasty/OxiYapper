@@ -6,6 +6,7 @@ use oxi_core::ipc::{
     socket_file,
 };
 use oxi_core::machine::Phase;
+use oxi_core::stats::{Date, Summary};
 
 fn requests() -> Vec<Request> {
     vec![
@@ -22,6 +23,7 @@ fn requests() -> Vec<Request> {
         Request::PreviewOverlay {
             position: OverlayPosition::TopCentre,
         },
+        Request::Stats,
         Request::Shutdown,
     ]
 }
@@ -76,6 +78,15 @@ fn pushes() -> Vec<Push> {
             line: 3,
             message: "bad".into(),
         },
+        Push::Stats(Summary {
+            dictations: 11_300,
+            words: 299_900,
+            wpm: 146,
+            streak: 6,
+            longest_streak: 40,
+            heat_start: Date::from_ymd(2026, 11, 2).unwrap(),
+            heat: vec![0, 1, 4, 2, 3, 0],
+        }),
     ]
 }
 

@@ -7,6 +7,7 @@ mod io;
 mod ipc;
 mod paste;
 mod run;
+mod stats;
 mod ui;
 mod watch;
 mod whisper;

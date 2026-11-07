@@ -120,10 +120,11 @@ Framing: one JSON object per line (`serde_json`), max 1 MiB per line, tagged enu
 | `DownloadModel { id }`, `CancelDownload { id }` | `DownloadProgress { id, done, total }`, `DownloadDone { id, result }` |
 | `CaptureHotkey { on }` | `Key { code, down }` while on |
 | `PreviewOverlay { position }` | overlay shows for 2 s |
+| `Stats` | `Stats { dictations, words, wpm, streak, longest_streak, heat_start, heat }`, read from `stats.json` |
 | `Shutdown` | daemon exits |
 | | `ConfigError { file, line, message }` pushed on a bad reload |
 
-Versioning: `proto` is an integer, starting at 1. Adding an optional field (serde default) does not bump it; renaming or removing a field or changing meaning does. `Hello`, `HelloAck` and `Shutdown` never change shape. On a mismatch (exe updated while the old daemon runs) settings shows "Restart OxiYapper to finish the update" and a button that sends `Shutdown` and relaunches the daemon.
+Versioning: `proto` is an integer, starting at 1. Adding an optional field (serde default) does not bump it; renaming or removing a field or changing meaning does, and so does a new request (an older daemon drops a connection that sends one). Proto 2 added `Stats`. `Hello`, `HelloAck` and `Shutdown` never change shape. On a mismatch (exe updated while the old daemon runs) settings shows "Restart OxiYapper to finish the update" and a button that sends `Shutdown` and relaunches the daemon.
 
 Live meter: the settings Audio page does not read `LEVEL` over IPC. While the page is shown, settings opens its own capture (`CpalCapture`) and polls its `LevelMeter` at 30 Hz; the capture closes when the page goes away. The daemon's mic is still opened only on key-down. Settings reopens the stream every 60 s to bound the memory the capture keeps.
 
@@ -190,10 +191,10 @@ From `directories::ProjectDirs`. Portable mode: if a file named `portable` sits 
 | What | Windows | macOS | Linux |
 |---|---|---|---|
 | `config.toml`, `dictionary.txt`, `replace.txt` | `%APPDATA%\OxiYapper\config\` | `~/Library/Application Support/<bundle id>/` | `$XDG_CONFIG_HOME/OxiYapper/` |
-| `state.toml`, `models/`, `history/` | `%LOCALAPPDATA%\OxiYapper\data\` | `~/Library/Application Support/<bundle id>/` | `$XDG_DATA_HOME/OxiYapper/` |
+| `state.toml`, `stats.json`, `models/`, `history/` | `%LOCALAPPDATA%\OxiYapper\data\` | `~/Library/Application Support/<bundle id>/` | `$XDG_DATA_HOME/OxiYapper/` |
 | `logs/` (daily files, 7 kept) | `%LOCALAPPDATA%\OxiYapper\data\logs\` | `~/Library/Logs/OxiYapper/` | `$XDG_STATE_HOME/OxiYapper/logs/` |
 
-Models are local, not roaming (gigabytes). History entries are `history/YYYY-MM-DD/HHMMSS-mmm.{wav,txt}`. On Unix the data directory is created 0700. The macOS bundle id is chosen in ROADMAP M12 and never changes after the first release: TCC permissions and paths hang on it.
+Models are local, not roaming (gigabytes). History entries are `history/YYYY-MM-DD/HHMMSS-mmm.{wav,txt}`. `stats.json` (usage stats for the Home page, `oxi-core::stats`, versioned) holds one row per local day: date, dictations, words, audio ms; rows older than about 3 years fold into one totals row. The daemon's stats thread rewrites it atomically after each dictation that reached the field or the clipboard; a corrupt file is renamed `stats.bad` and counting starts fresh. On Unix the data directory is created 0700. The macOS bundle id is chosen in ROADMAP M12 and never changes after the first release: TCC permissions and paths hang on it.
 
 ## 8. Model lifecycle
 
