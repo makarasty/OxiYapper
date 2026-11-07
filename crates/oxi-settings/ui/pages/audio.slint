@@ -64,25 +64,32 @@ export component AudioPage inherits VerticalLayout {
         }
         Row {
             label: @tr("Level");
-            if !AudioState.live: Text {
-                text: AudioState.note;
-                horizontal-stretch: 2;
-                vertical-alignment: center;
-                color: Palette.foreground;
-            }
-            if AudioState.live: Rectangle {
+            // The track is always there: empty while there is no meter, with the reason on it.
+            Rectangle {
                 horizontal-stretch: 2;
                 height: 22px;
+                border-radius: 3px;
+                background: Palette.border.transparentize(0.75);
                 accessible-role: progress-indicator;
                 accessible-label: AudioState.clipping ? @tr("Level, clipping") : @tr("Level");
-                HorizontalLayout {
+                if !AudioState.live: Text {
+                    x: 6px;
+                    text: AudioState.note;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    width: parent.width - 12px;
+                    color: Palette.foreground;
+                    opacity: 0.7;
+                }
+                if AudioState.live: HorizontalLayout {
+                    padding: 2px;
                     spacing: 2px;
                     for bar in AudioState.bars: Rectangle {
                         Rectangle {
                             y: parent.height - self.height;
                             height: max(1px, parent.height * bar);
                             border-radius: 1px;
-                            background: AudioState.clipping ? #c42b1c : Palette.accent-background;
+                            background: AudioState.clipping ? Shell.error-text : Palette.accent-background;
                         }
                     }
                 }

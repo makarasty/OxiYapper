@@ -1,6 +1,6 @@
 // Model page (SPEC Models, ARCHITECTURE section 8): the curated models with their state on disk,
 // download and cancel through the daemon, "use my own .bin", the GPU and the idle unload.
-import { Palette, Button, ComboBox, LineEdit, ProgressIndicator } from "std-widgets.slint";
+import { Palette, Button, ComboBox, LineEdit } from "std-widgets.slint";
 import { Shell, Group, Row, SliderRow, InlineNote } from "../widgets.slint";
 
 export struct ModelRow {
@@ -154,9 +154,22 @@ export component ModelPage inherits VerticalLayout {
             // Under the name, past the radio mark.
             VerticalLayout {
                 padding-left: 22px;
-                if row.downloading: ProgressIndicator {
-                    progress: row.progress;
+                // Drawn here: the style's bar is 3 px and its track a 1 px line.
+                if row.downloading: Rectangle {
+                    height: 6px;
+                    border-radius: 3px;
+                    background: Palette.border;
+                    accessible-role: progress-indicator;
                     accessible-label: @tr("{} download", row.name);
+                    accessible-value: row.progress;
+                    accessible-value-minimum: 0;
+                    accessible-value-maximum: 1;
+                    Rectangle {
+                        x: 0;
+                        width: parent.width * clamp(row.progress, 0, 1);
+                        border-radius: 3px;
+                        background: Palette.accent-background;
+                    }
                 }
                 if row.error != "": Text {
                     text: row.error;

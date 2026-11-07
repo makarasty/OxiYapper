@@ -120,10 +120,6 @@ const DENOISE: &str = "version = 1
 [audio]
 denoise = true
 ";
-const NO_MIC: &str = "version = 1
-[audio]
-device = \"Missing Test Mic\"
-";
 const BROKEN: &str = "version = 1\n[audio]\ngain_db = \n";
 
 #[test]
@@ -239,10 +235,8 @@ fn shot_audio_denoise() {
     shot("audio-denoise", Page::Audio, Some(DENOISE));
 }
 
-#[test]
-fn shot_audio_config_missing() {
-    shot("audio-config-missing", Page::Audio, Some(NO_MIC));
-}
+// The configured-mic-missing page is `shot_not_connected` in `pages::audio`: it lists the devices
+// through a fake, where this binary could only ask the real sound system.
 
 #[test]
 fn shot_model() {
@@ -439,6 +433,38 @@ fn shot_overlay() {
 #[test]
 fn shot_system() {
     shot("system", Page::System, None);
+}
+
+#[test]
+fn shot_system_update_off() {
+    // Turning the update check off asks for a confirmation first.
+    for (theme, choice) in [("light", ThemeChoice::Light), ("dark", ThemeChoice::Dark)] {
+        let window = open("system-update-off", None);
+        window.set_page(Page::System);
+        window.set_theme(choice);
+        window.show().unwrap();
+        ElementHandle::find_by_accessible_label(&window, "Check for updates")
+            .find(|e| e.accessible_checkable() == Some(true))
+            .unwrap()
+            .invoke_accessible_default_action();
+        save(&render(&window, 1.0), "system-update-off", theme);
+    }
+}
+
+#[test]
+fn shot_overlay_mismatch() {
+    // An old daemon still runs after an update: Preview is off and says to restart.
+    for (theme, choice) in [("light", ThemeChoice::Light), ("dark", ThemeChoice::Dark)] {
+        let _ = slint::platform::set_platform(Box::new(Shots));
+        let (ipc, _sent) = Ipc::fake();
+        let layout = common::layout("overlay-mismatch", None);
+        let window = oxi_settings::open_with(layout, ipc.clone()).unwrap();
+        window.set_page(Page::Overlay);
+        window.set_theme(choice);
+        window.show().unwrap();
+        ipc.deliver(&Event::Link(Link::Mismatch { daemon_proto: 9 }));
+        save(&render(&window, 1.0), "overlay-mismatch", theme);
+    }
 }
 
 #[test]
