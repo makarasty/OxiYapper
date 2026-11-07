@@ -65,7 +65,7 @@ Done when: the fullscreen game case passes (open chat, dictate, Enter sends the 
 
 ## M9 - Settings UI, IPC, config watch
 
-Needs M1; parallel with M6-M8. `oxi-settings` crate (Slint, software renderer), IPC messages, config writer (temp + rename), daemon watcher, hotkey picker with visual keyboard and capture mode, mic picker with live meter, model page with download progress, dictionary token counter, replacements editor, overlay position pickers, About with the "Made with Slint" badge. Add the Slint licence exception to `deny.toml`.
+Needs M1; parallel with M6-M8. `oxi-settings` crate (Slint), IPC messages, config writer (temp + rename), daemon watcher, hotkey picker with visual keyboard and capture mode, mic picker with live meter, model page with download progress, dictionary token counter, replacements editor, overlay position pickers, About with the "Made with Slint" badge. Add the Slint licence exception to `deny.toml`.
 
 Done when: Slint UI tests pass headless; changing the hotkey in settings takes effect in the daemon without restart; killing settings during hotkey capture restores the hotkey; a broken hand-edited config shows its line number.
 

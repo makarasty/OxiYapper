@@ -7,7 +7,7 @@ Status: decisions from the owner interview (2026-11-06). Open items are marked O
 ## Processes
 
 - **Daemon** (default mode, autostart): tray, global hotkey hook, mic capture, whisper, paste, overlay. No GUI toolkit beyond what the overlay needs.
-- **Settings** (`OxiYapper settings`): separate process, Slint with the software renderer, spawned from the tray, exits on close. Costs zero RAM when closed.
+- **Settings** (`OxiYapper settings`): separate process, Slint (software or Skia renderer, picked by the text-quality spike), spawned from the tray, exits on close. Costs zero RAM when closed.
 - One exe, one bundle id on macOS (one permission entry). Config is a TOML file; the settings process writes it (temp file + atomic rename), the daemon watches and reloads. While the settings window captures a hotkey it tells the daemon over IPC to pause the hook.
 - Single instance: a second launch asks the running daemon to open settings and exits.
 
@@ -29,7 +29,7 @@ All measured against the 8 owner reference phrases before becoming defaults.
 ## Feedback
 
 - Start and stop sounds.
-- Tray icon colour by state: idle, recording, transcribing.
+- Tray icon: monochrome shapes for idle and transcribing; colour only for recording and the update badge.
 - Overlay pill with a live volume meter. Position chosen in settings (bottom-right default, bottom-centre, other corners), never at the mouse cursor. Can be turned off.
 - Overlay must never take focus or flicker: no-activate, click-through, topmost, no taskbar entry. Case to hold: a player in a fullscreen game opens chat, dictates, presses Enter. Option to hide the overlay over fullscreen apps.
 
@@ -52,14 +52,14 @@ All measured against the 8 owner reference phrases before becoming defaults.
 
 ## Settings UI
 
-- English only for now (strings kept in one place for later languages).
+- Look modelled on Windows 11 Settings: opens large and resizable (min 720x520); page scrolling allowed as a fallback. Own teal accent, not the Windows accent.
 - Look modelled on XClicker: one compact panel.
-- Visual pickers instead of long lists: small SVG previews (like theme pickers) for overlay position, mode and the like.
+- Visual pickers instead of long lists: Fluent icons in tiles and a drawn screen picker for overlay position, mode and the like.
 - Hotkey picker: a minimal field plus a button that opens a full visual keyboard; click keys or press them, held keys light up.
 - Confirmations only for important actions (example: turning off update checks shows a short note why it is recommended to keep it).
 - First-run wizard: microphone, model, hotkey; on macOS also the permissions.
 - About screen carries the "Made with Slint" badge (Slint royalty-free licence).
-- Icon: minimal, based on an open icon set (licence must allow it).
+- Icon: own logo mark (own drawing, no licence issue); UI icons from Fluent UI System Icons (MIT), pinned to a commit.
 
 ## System
 
@@ -80,7 +80,7 @@ All measured against the 8 owner reference phrases before becoming defaults.
 
 ## Decided in round 4
 
-- Theme follows the OS, with a visual picker (system, dark, light).
+- Theme follows the OS, with a visual picker (System, Light, Dark; Windows order).
 - Sounds: a set of 3-4 own synthesised sounds (no third-party rights), volume slider, preview in settings, custom wav allowed.
 - Recording cap: 10 minutes, configurable; the overlay warns 30 s before; long audio is transcribed in chunks.
 - Moving from the previous tool (owner's machine, never in the repo): copy the 59-word `C:\Users\mky\Desktop\dictionary.txt` into the local config; reuse the podlodka model already on disk (SHA256 checked, no 3 GB re-download); import its history (transcriptions.db + audio) as an app feature or a one-off script.

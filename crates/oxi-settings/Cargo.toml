@@ -1,6 +1,6 @@
 [package]
 name = "oxi-settings"
-description = "Slint settings window and first-run wizard (software renderer, no Qt, no Skia)."
+description = "Slint settings window and first-run wizard (no Qt)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
