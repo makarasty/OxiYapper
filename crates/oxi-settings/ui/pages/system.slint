@@ -1,12 +1,25 @@
-// System page. The shell owns the theme picker (config `ui.theme`); the System page task
-// fills in the rest.
-import { Group, ThumbPicker } from "../widgets.slint";
+// System page (SPEC System). The shell owns the theme picker (config `ui.theme`); the rest is
+// `[system]` and `debug.log_text`, filled and read by `pages::system`.
+import { Button } from "std-widgets.slint";
+import { Group, ToggleRow, ThumbPicker, InlineNote } from "../widgets.slint";
 
 export enum ThemeChoice { system, dark, light }
+
+export global SystemState {
+    in-out property <bool> autostart;
+    in-out property <bool> update-check;
+    in-out property <bool> log-text;
+    callback autostart-toggled(bool);
+    // Off fires only after the note is confirmed.
+    callback update-check-toggled(bool);
+    callback log-text-toggled(bool);
+}
 
 export component SystemPage inherits VerticalLayout {
     in property <ThemeChoice> theme;
     callback theme-picked(ThemeChoice);
+    // The update switch was turned off: it stays on until the note is confirmed (SPEC Settings UI).
+    property <bool> confirm-update-off;
     alignment: start;
     spacing: 10px;
     Group {
@@ -22,6 +35,63 @@ export component SystemPage inherits VerticalLayout {
             picked(i) => {
                 root.theme-picked(i == 1 ? ThemeChoice.dark : i == 2 ? ThemeChoice.light : ThemeChoice.system);
             }
+        }
+    }
+    Group {
+        title: @tr("Startup and updates");
+        ToggleRow {
+            label: @tr("Start at sign-in");
+            checked <=> SystemState.autostart;
+            toggled(on) => {
+                SystemState.autostart-toggled(on);
+            }
+        }
+        // Until the OS registration lands (ROADMAP M10) the switch only saves the setting.
+        InlineNote {
+            text: @tr("Takes effect in a later version: OxiYapper does not add itself to sign-in yet.");
+        }
+        ToggleRow {
+            label: @tr("Check for updates");
+            checked <=> SystemState.update-check;
+            toggled(on) => {
+                if (on) {
+                    root.confirm-update-off = false;
+                    SystemState.update-check-toggled(true);
+                } else {
+                    self.checked = true;
+                    root.confirm-update-off = true;
+                }
+            }
+        }
+        if root.confirm-update-off: InlineNote {
+            text: @tr("Update checks tell you when a fix is out. Once a day OxiYapper asks GitHub for the latest version; it never installs anything on its own.");
+            Button {
+                text: @tr("Turn off update checks");
+                clicked => {
+                    root.confirm-update-off = false;
+                    SystemState.update-check = false;
+                    SystemState.update-check-toggled(false);
+                }
+            }
+            Button {
+                text: @tr("Keep checking");
+                clicked => {
+                    root.confirm-update-off = false;
+                }
+            }
+        }
+    }
+    Group {
+        title: @tr("Debug");
+        ToggleRow {
+            label: @tr("Log dictated text");
+            checked <=> SystemState.log-text;
+            toggled(on) => {
+                SystemState.log-text-toggled(on);
+            }
+        }
+        if SystemState.log-text: InlineNote {
+            text: @tr("Dictated text is written to the log files while this is on. Turn it off when you are done.");
         }
     }
 }
