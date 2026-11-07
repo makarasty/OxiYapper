@@ -7,7 +7,7 @@ use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use oxi_core::config::Config;
+use oxi_core::config::{self, Config};
 use oxi_core::machine::OverlayState;
 use oxi_platform::os::overlay::Overlay;
 use oxi_platform::os::tray::{MainLoop, Waker};
@@ -29,7 +29,7 @@ pub struct Ui {
 }
 
 impl Ui {
-    /// `cfg` is the start config; later `UiCmd::Config` replace its overlay part.
+    /// `cfg` is the start config; later `UiCmd::Config` replace the parts the overlay reads.
     pub fn new(rx: Receiver<UiCmd>, overlay: Overlay<'static>, cfg: Config, waker: Waker) -> Self {
         Self {
             rx,
@@ -91,10 +91,18 @@ impl Ui {
                     tracing::warn!(kind = ?e.kind(), "preview timer not started");
                 }
             }
-            UiCmd::Config(overlay) => {
-                self.cfg.overlay = overlay;
+            UiCmd::Config {
+                overlay,
+                meter_sensitivity_db,
+            } => {
+                take_config(&mut self.cfg, overlay, meter_sensitivity_db);
                 if self.preview_until.is_none() {
                     self.show(self.state);
+                }
+            }
+            UiCmd::Warnings(warnings) => {
+                if let Err(e) = tray.set_warnings(&warnings) {
+                    tracing::warn!("tray tooltip not updated: {e}");
                 }
             }
             UiCmd::CanCopy => tray.set_copy_last(true),
@@ -119,6 +127,13 @@ fn preview_state(current: OverlayState) -> OverlayState {
     }
 }
 
+/// Puts the parts of a new active config the overlay reads into `cfg`. The meter sensitivity is
+/// read when a recording starts, so the next one meters with it.
+fn take_config(cfg: &mut Config, overlay: config::Overlay, meter_sensitivity_db: f32) {
+    cfg.overlay = overlay;
+    cfg.audio.meter_sensitivity_db = meter_sensitivity_db;
+}
+
 fn preview_over(until: Option<Instant>, now: Instant) -> bool {
     until.is_some_and(|until| now >= until)
 }
@@ -138,6 +153,18 @@ mod tests {
         assert_eq!(preview_state(OverlayState::Hidden), recording);
         let text = OverlayState::Text(Notice::Cancelled);
         assert_eq!(preview_state(text), text);
+    }
+
+    #[test]
+    fn a_new_config_replaces_the_overlay_and_the_meter_sensitivity() {
+        let mut cfg = Config::default();
+        let overlay = config::Overlay {
+            enabled: !cfg.overlay.enabled,
+            ..cfg.overlay.clone()
+        };
+        take_config(&mut cfg, overlay.clone(), -9.0);
+        assert_eq!(cfg.overlay, overlay);
+        assert!((cfg.audio.meter_sensitivity_db + 9.0).abs() < f32::EPSILON);
     }
 
     #[test]

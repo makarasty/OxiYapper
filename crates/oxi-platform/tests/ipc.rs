@@ -219,10 +219,13 @@ mod windows {
     fn default_name_holds_the_user_sid() {
         let sid = user_sid().unwrap();
         assert!(sid.starts_with("S-1-5-"), "{sid}");
-        assert_eq!(
-            oxi_platform::ipc::default_name().unwrap(),
-            oxi_core::ipc::pipe_name(&sid)
-        );
+        let plain = oxi_core::ipc::pipe_name(&sid);
+        let name = oxi_platform::ipc::default_name().unwrap();
+        // The shell may set the test seam; then only its (valid) value may follow the SID.
+        match std::env::var(oxi_platform::ipc::PIPE_SUFFIX_ENV) {
+            Ok(suffix) if name != plain => assert_eq!(name, format!("{plain}-{suffix}")),
+            _ => assert_eq!(name, plain),
+        }
     }
 
     #[test]

@@ -54,18 +54,36 @@ const BUSY_WAIT: Duration = Duration::from_secs(2);
 /// The whole second launch: connect, send `OpenSettings`, wait for the daemon to close.
 const FORWARD_WAIT: Duration = Duration::from_secs(3);
 
-/// Test seam: a non-empty value gives the pipe `<default name>-<value>`, so a test daemon never
-/// meets the user's real one. Children inherit it, so a daemon and its settings agree.
+/// For tests only: `[A-Za-z0-9-]{1,32}` gives the pipe `<default name>-<value>`, so a test daemon
+/// never meets the user's real one. Children inherit it, so a daemon and its settings agree.
 pub const PIPE_SUFFIX_ENV: &str = "OXI_PIPE_SUFFIX";
 
 /// This user's socket name: `\\.\pipe\OxiYapper-<SID>` on Windows.
 #[cfg(windows)]
 pub fn default_name() -> io::Result<String> {
     let name = oxi_core::ipc::pipe_name(&crate::os::pipe::user_sid()?);
-    Ok(match std::env::var(PIPE_SUFFIX_ENV) {
-        Ok(suffix) if !suffix.is_empty() => format!("{name}-{suffix}"),
-        _ => name,
-    })
+    Ok(
+        match pipe_suffix(std::env::var_os(PIPE_SUFFIX_ENV).as_deref()) {
+            Some(suffix) => format!("{name}-{suffix}"),
+            None => name,
+        },
+    )
+}
+
+/// The valid [`PIPE_SUFFIX_ENV`] value; any other is ignored with a log line.
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only the Windows pipe name takes it")
+)]
+fn pipe_suffix(value: Option<&std::ffi::OsStr>) -> Option<&str> {
+    let value = value.filter(|v| !v.is_empty())?;
+    let ok = value
+        .to_str()
+        .filter(|s| s.len() <= 32 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
+    if ok.is_none() {
+        tracing::warn!("{PIPE_SUFFIX_ENV} ignored: only 1 to 32 of A-Z, a-z, 0-9 and -");
+    }
+    ok
 }
 
 // shortcut: Unix has no per-user socket directory yet, fill it with the Unix platform module.
@@ -364,6 +382,31 @@ pub fn forward_open_settings(name: &str) -> Result<(), Error> {
             None => return Err(Error::Busy),
             Some(Push::HelloAck { .. }) => acked = true,
             Some(_) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use super::pipe_suffix;
+
+    #[test]
+    fn pipe_suffix_takes_only_short_plain_names() {
+        let long = "a".repeat(33);
+        let cases = [
+            (None, None),
+            (Some(""), None),
+            (Some("smoke-1234"), Some("smoke-1234")),
+            (Some(&*"Z9".repeat(16)), Some(&*"Z9".repeat(16))),
+            (Some(&*long), None),
+            (Some(r"..\evil"), None),
+            (Some("a b"), None),
+            (Some("ünï"), None),
+        ];
+        for (value, want) in cases {
+            assert_eq!(pipe_suffix(value.map(OsStr::new)), want, "{value:?}");
         }
     }
 }

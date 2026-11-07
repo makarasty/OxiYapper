@@ -148,6 +148,8 @@ pub struct MainLoop {
     phase: Phase,
     icon: HICON,
     copy_last: bool,
+    /// Status warnings, one tooltip line each under the phase.
+    warnings: Vec<String>,
     /// The handle every [`Waker`] posts to; `None` once dropped.
     slot: Arc<Mutex<Option<usize>>>,
 }
@@ -207,6 +209,7 @@ impl MainLoop {
             phase: Phase::Idle,
             icon: ptr::null_mut(),
             copy_last: false,
+            warnings: Vec::new(),
             slot: Arc::new(Mutex::new(Some(hwnd.expose_provenance()))),
         };
         // SAFETY: `hwnd` is our live window.
@@ -236,6 +239,12 @@ impl MainLoop {
         let shown = shell(NIM_MODIFY, &self.data(NIF_ICON | NIF_TIP | NIF_SHOWTIP));
         destroy_icon(old);
         shown
+    }
+
+    /// Shows `warnings` (config corrections, a GPU fallback, a parse error) in the tooltip.
+    pub fn set_warnings(&mut self, warnings: &[String]) -> io::Result<()> {
+        warnings.clone_into(&mut self.warnings);
+        shell(NIM_MODIFY, &self.data(NIF_TIP | NIF_SHOWTIP))
     }
 
     /// Enables "Copy last text" in the menu (item 42: there is a last text in memory).
@@ -428,7 +437,7 @@ impl MainLoop {
             hIcon: self.icon,
             ..Default::default()
         };
-        copy_wide(&mut data.szTip, &strings::tray_tooltip(self.phase));
+        copy_wide(&mut data.szTip, &tooltip(self.phase, &self.warnings));
         data
     }
 }
@@ -534,6 +543,16 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
 }
 
+/// The phase line, then one line per warning; Windows cuts the tip at 127 characters.
+fn tooltip(phase: Phase, warnings: &[String]) -> String {
+    let mut tip = strings::tray_tooltip(phase);
+    for w in warnings {
+        tip.push('\n');
+        tip.push_str(w);
+    }
+    tip
+}
+
 /// Copies `s` into a fixed UTF-16 field, cut to fit and always NUL-terminated.
 fn copy_wide(dst: &mut [u16], s: &str) {
     let room = dst.len().saturating_sub(1);
@@ -543,4 +562,36 @@ fn copy_wide(dst: &mut [u16], s: &str) {
         n += 1;
     }
     dst[n..].fill(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tooltip_lists_each_warning_under_the_phase() {
+        assert_eq!(
+            tooltip(Phase::Idle, &[]),
+            strings::tray_tooltip(Phase::Idle)
+        );
+        let warnings = [
+            "running on CPU: out of memory".to_owned(),
+            "bad line".to_owned(),
+        ];
+        assert_eq!(
+            tooltip(Phase::Recording, &warnings),
+            format!(
+                "{}\nrunning on CPU: out of memory\nbad line",
+                strings::tray_tooltip(Phase::Recording)
+            )
+        );
+    }
+
+    #[test]
+    fn a_long_tooltip_is_cut_and_terminated() {
+        let mut tip = [1u16; 8];
+        copy_wide(&mut tip, &tooltip(Phase::Idle, &["x".repeat(50)]));
+        assert_eq!(tip[7], 0);
+        assert_eq!(String::from_utf16_lossy(&tip[..7]), "OxiYapp");
+    }
 }

@@ -176,6 +176,8 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
             }
         };
         let info = engine.info();
+        let device = info.device.clone().unwrap_or_else(|| "cpu".into());
+        let _ = self.inbox.send(Inbox::Backend(device));
         // The engine's own GPU-to-CPU retry pins CPU too; CPU with no GPU to fail is no warning.
         if reason.is_none()
             && let Some(EngineWarning::CpuFallback { reason: why }) = &info.warning
@@ -404,10 +406,10 @@ mod tests {
         (Worker::new(script.loader(), tx, rig.layout()), rx)
     }
 
-    /// The next message that is not an `EngineWarning`.
+    /// The next message that is not an `EngineWarning` or a `Backend`.
     fn next(rx: &Receiver<Inbox>) -> Option<Inbox> {
         rx.try_iter()
-            .find(|m| !matches!(m, Inbox::EngineWarning(_)))
+            .find(|m| !matches!(m, Inbox::EngineWarning(_) | Inbox::Backend(_)))
     }
 
     fn event(rx: &Receiver<Inbox>) -> Event {
@@ -511,6 +513,37 @@ mod tests {
             s.calls()[3..],
             [DeviceChoice::Named("Vulkan1".into()), DeviceChoice::Cpu]
         );
+    }
+
+    #[test]
+    fn each_load_reports_the_device_it_ended_on() {
+        let backends = |rx: &Receiver<Inbox>| -> Vec<String> {
+            rx.try_iter()
+                .filter_map(|m| match m {
+                    Inbox::Backend(b) => Some(b),
+                    _ => None,
+                })
+                .collect()
+        };
+        // (script, expected): a GPU load, the engine's own CPU fallback, a failed GPU load.
+        let mut silent = Script::new();
+        silent.silent_cpu = true;
+        let mut failing = Script::new();
+        failing.gpu_load_fails = true;
+        for (i, (s, want)) in [
+            (Script::new(), "Vulkan0"),
+            (silent, "cpu"),
+            (failing, "cpu"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let r = rig(&format!("backend{i}"));
+            let (mut w, rx) = worker(&s, &r);
+            w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Auto)));
+            w.handle(WhisperCmd::Preload);
+            assert_eq!(backends(&rx), [want], "case {i}");
+        }
     }
 
     #[test]

@@ -60,8 +60,6 @@ pub trait Host: Send + Sync + 'static {
     fn devices(&self) -> Push;
     /// Start a settings window.
     fn open_settings(&self) -> io::Result<()>;
-    /// Backend in use, e.g. `Vulkan0` or `cpu`.
-    fn backend(&self) -> String;
 }
 
 /// Queue to the settings connection, shared by every thread that pushes. Cheap to clone.
@@ -318,7 +316,7 @@ impl Ctx {
             {
                 session.capture = None;
             }
-            if !self.answer_status(conn, session) {
+            if !answer_status(conn, session) {
                 return;
             }
             match conn.recv::<Request>() {
@@ -367,10 +365,11 @@ impl Ctx {
             }
             Request::Hello { .. } => {
                 session.client = conn.peer_pid().unwrap_or(0);
-                let client = session.client;
-                session
-                    .settings
-                    .get_or_insert_with(|| self.pushes.claim(client));
+                if session.settings.is_none() {
+                    session.settings = Some(self.pushes.claim(session.client));
+                    // A window that opens during a download shows it (no second DownloadModel).
+                    let _ = self.io.send(IoCmd::Subscribed);
+                }
                 conn.send(&hello_ack()).is_ok()
             }
             // Only the settings connection may ask for anything else.
@@ -394,7 +393,7 @@ impl Ctx {
         }
     }
 
-    /// Asks the coordinator; the answer is sent by [`Ctx::answer_status`], so a busy
+    /// Asks the coordinator; the answer is sent by [`answer_status`], so a busy
     /// coordinator never holds up this connection's loop.
     fn status(&self, session: &mut Session) -> bool {
         if session.asks.len() >= MAX_ASKS {
@@ -403,29 +402,6 @@ impl Ctx {
         let (tx, rx) = mpsc::channel();
         session.asks.push_back((rx, Instant::now()));
         self.inbox.send(Inbox::Ipc(IpcAsk::Status(tx))).is_ok()
-    }
-
-    /// Sends the answers that came in; drops asks the coordinator left unanswered too long.
-    fn answer_status(&self, conn: &mut Conn, session: &mut Session) -> bool {
-        while let Some((rx, asked)) = session.asks.front() {
-            match rx.try_recv() {
-                Ok(report) => {
-                    session.asks.pop_front();
-                    if conn
-                        .send(&status_push(report, self.host.backend()))
-                        .is_err()
-                    {
-                        return false;
-                    }
-                }
-                Err(TryRecvError::Empty) if asked.elapsed() < ASK_LIMIT => break,
-                Err(_) => {
-                    tracing::warn!("coordinator did not answer Status");
-                    session.asks.pop_front();
-                }
-            }
-        }
-        true
     }
 
     /// Capture starts only while the settings window is foreground and ends the moment it is not.
@@ -459,6 +435,26 @@ impl Ctx {
     }
 }
 
+/// Sends the answers that came in; drops asks the coordinator left unanswered too long.
+fn answer_status(conn: &mut Conn, session: &mut Session) -> bool {
+    while let Some((rx, asked)) = session.asks.front() {
+        match rx.try_recv() {
+            Ok(report) => {
+                session.asks.pop_front();
+                if conn.send(&status_push(report)).is_err() {
+                    return false;
+                }
+            }
+            Err(TryRecvError::Empty) if asked.elapsed() < ASK_LIMIT => break,
+            Err(_) => {
+                tracing::warn!("coordinator did not answer Status");
+                session.asks.pop_front();
+            }
+        }
+    }
+    true
+}
+
 /// Writes what other threads queued; `false` when the connection is over.
 fn flush(conn: &mut Conn, session: &Session) -> bool {
     let Some((_, queue)) = &session.settings else {
@@ -485,12 +481,12 @@ fn hello_ack() -> Push {
     }
 }
 
-fn status_push(report: StatusReport, backend: String) -> Push {
+fn status_push(report: StatusReport) -> Push {
     Push::Status {
         phase: report.phase,
         model: report.model,
         device: report.gpu,
-        backend,
+        backend: report.backend,
         warnings: report.warnings,
     }
 }
@@ -508,20 +504,15 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// The real host: the hook handle, the foreground window, `current_exe settings`.
 pub struct SystemHost {
     hook: Arc<oxi_platform::os::hook::HookHandle>,
-    backend: Box<dyn Fn() -> String + Send + Sync>,
     /// The settings process this daemon started, kept so a window that is still starting is not
     /// started twice.
     child: Mutex<Option<std::process::Child>>,
 }
 
 impl SystemHost {
-    pub fn new(
-        hook: Arc<oxi_platform::os::hook::HookHandle>,
-        backend: Box<dyn Fn() -> String + Send + Sync>,
-    ) -> Self {
+    pub fn new(hook: Arc<oxi_platform::os::hook::HookHandle>) -> Self {
         Self {
             hook,
-            backend,
             child: Mutex::default(),
         }
     }
@@ -568,10 +559,6 @@ impl Host for SystemHost {
                 .spawn()?,
         );
         Ok(())
-    }
-
-    fn backend(&self) -> String {
-        (self.backend)()
     }
 }
 
@@ -628,9 +615,6 @@ mod tests {
         fn open_settings(&self) -> io::Result<()> {
             let _ = self.calls.send(Call::Open);
             Ok(())
-        }
-        fn backend(&self) -> String {
-            "cpu".into()
         }
     }
 
@@ -731,6 +715,7 @@ mod tests {
             model: "tiny".into(),
             device: "mic".into(),
             gpu: DeviceChoice::Named("Vulkan0".into()),
+            backend: "cpu".into(),
             warnings: vec!["w".into()],
         };
         conn.send(&Request::Status).unwrap();
@@ -816,6 +801,17 @@ mod tests {
     fn requests_reach_their_owners() {
         let rig = rig("route");
         let mut conn = settings(&rig);
+        assert_eq!(rig.io.recv_timeout(WAIT).unwrap(), IoCmd::Subscribed);
+        // A second Hello on the same connection subscribes nothing new.
+        conn.send(&Request::Hello {
+            proto: PROTO,
+            version: "test".into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            conn.recv::<Push>().unwrap(),
+            Some(Push::HelloAck { .. })
+        ));
         conn.send(&Request::DownloadModel { id: "tiny".into() })
             .unwrap();
         conn.send(&Request::CancelDownload { id: "tiny".into() })
@@ -847,6 +843,24 @@ mod tests {
             rig.calls.recv_timeout(WAIT).unwrap(),
             Call::Capture(false, false)
         );
+    }
+
+    #[test]
+    fn a_reconnected_window_can_capture_again() {
+        let rig = rig("recapture");
+        for _ in 0..2 {
+            let mut conn = settings(&rig);
+            conn.send(&Request::CaptureHotkey { on: true }).unwrap();
+            assert_eq!(
+                rig.calls.recv_timeout(WAIT).unwrap(),
+                Call::Capture(true, true)
+            );
+            drop(conn);
+            assert_eq!(
+                rig.calls.recv_timeout(WAIT).unwrap(),
+                Call::Capture(false, false)
+            );
+        }
     }
 
     #[test]
@@ -1057,6 +1071,7 @@ mod tests {
                 model: "tiny".into(),
                 device: String::new(),
                 gpu: DeviceChoice::Auto,
+                backend: "none".into(),
                 warnings: vec![],
             })
             .unwrap();

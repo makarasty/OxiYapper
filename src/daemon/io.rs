@@ -3,11 +3,13 @@
 //!
 //! The worker thread only routes [`IoCmd`]s. Each download runs on its own thread, so a
 //! `CancelDownload` is heard while the transfer runs. Progress and the end go to the settings
-//! window as pushes; with no window open they are dropped and the download carries on.
+//! window as pushes; with no window open they are dropped and the download carries on. A window
+//! that connects gets the last progress of each running download (`IoCmd::Subscribed`).
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -51,8 +53,15 @@ struct Worker {
     download: Arc<DownloadFn>,
     pushes: Pushes,
     models_dir: PathBuf,
-    /// Cancel flag of every running download, by model id.
-    active: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// Every running download, by model id.
+    active: Arc<Mutex<HashMap<String, Arc<Running>>>>,
+}
+
+/// One running download: its cancel flag and the last progress it reported.
+struct Running {
+    cancel: AtomicBool,
+    done: AtomicU64,
+    total: AtomicU64,
 }
 
 impl Worker {
@@ -69,10 +78,11 @@ impl Worker {
         match cmd {
             IoCmd::Download { id } => self.start(id),
             IoCmd::CancelDownload { id } => {
-                if let Some(flag) = lock(&self.active).get(&id) {
-                    flag.store(true, Ordering::Relaxed);
+                if let Some(run) = lock(&self.active).get(&id) {
+                    run.cancel.store(true, Ordering::Relaxed);
                 }
             }
+            IoCmd::Subscribed => self.replay(),
         }
     }
 
@@ -81,12 +91,17 @@ impl Worker {
             self.failed(id, "unknown model".into());
             return;
         };
-        let cancel = Arc::new(AtomicBool::new(false));
-        if lock(&self.active)
-            .insert(id.clone(), cancel.clone())
-            .is_some()
-        {
-            return; // already running: its progress reaches the window anyway
+        let run = Arc::new(Running {
+            cancel: AtomicBool::new(false),
+            done: AtomicU64::new(0),
+            total: AtomicU64::new(entry.size),
+        });
+        match lock(&self.active).entry(id.clone()) {
+            // Already running: its progress reaches the window anyway, and its cancel flag stays.
+            Entry::Occupied(_) => return,
+            Entry::Vacant(slot) => {
+                slot.insert(run.clone());
+            }
         }
         let (download, pushes, dir, active) = (
             self.download.clone(),
@@ -94,8 +109,8 @@ impl Worker {
             self.models_dir.clone(),
             self.active.clone(),
         );
-        let run = move || {
-            let result = transfer(&*download, entry, &dir, &pushes, &cancel);
+        let job = move || {
+            let result = transfer(&*download, entry, &dir, &pushes, &run);
             // Free the id before the push: a window that asks again on `Done` must be heard.
             lock(&active).remove(entry.id);
             pushes.send(Push::DownloadDone {
@@ -103,9 +118,21 @@ impl Worker {
                 result,
             });
         };
-        if let Err(e) = thread::Builder::new().name("download".into()).spawn(run) {
+        if let Err(e) = thread::Builder::new().name("download".into()).spawn(job) {
             lock(&self.active).remove(&id);
             self.failed(id, format!("no thread: {e}"));
+        }
+    }
+
+    /// The last progress of each running download, for a window that just connected. Under the
+    /// lock: a download leaves the map before its `DownloadDone`, so none of these can follow it.
+    fn replay(&self) {
+        for (id, run) in lock(&self.active).iter() {
+            self.pushes.send(Push::DownloadProgress {
+                id: id.clone(),
+                done: run.done.load(Ordering::Relaxed),
+                total: run.total.load(Ordering::Relaxed),
+            });
         }
     }
 
@@ -122,10 +149,12 @@ fn transfer(
     entry: &'static ModelEntry,
     dir: &Path,
     pushes: &Pushes,
-    cancel: &AtomicBool,
+    run: &Running,
 ) -> DownloadResult {
     let mut throttle = Throttle::default();
     let mut progress = |done, total| {
+        run.done.store(done, Ordering::Relaxed);
+        run.total.store(total, Ordering::Relaxed);
         if throttle.allow(Instant::now(), done, total) {
             pushes.send(Push::DownloadProgress {
                 id: entry.id.into(),
@@ -134,7 +163,7 @@ fn transfer(
             });
         }
     };
-    match download(entry, dir, &mut progress, cancel) {
+    match download(entry, dir, &mut progress, &run.cancel) {
         Ok(got) => {
             tracing::info!(model = entry.id, file = ?got.path.file_name(), "model downloaded");
             if let Some(e) = got.stamp_error {
@@ -274,6 +303,49 @@ mod tests {
     }
 
     #[test]
+    fn a_window_that_connects_mid_download_gets_its_progress() {
+        let (go, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let fake: Arc<DownloadFn> = Arc::new(move |entry, dir, progress, _| {
+            progress(5, 40);
+            progress(7, 40); // inside the throttle window: not pushed, still recorded
+            let _ = lock(&gate).recv_timeout(WAIT);
+            Ok(downloaded(entry, dir))
+        });
+        let (worker, old) = rig(fake);
+        worker.handle(id("tiny"));
+        assert!(matches!(
+            old.recv_timeout(WAIT).unwrap(),
+            Push::DownloadProgress { done: 5, .. }
+        ));
+        // The id is in the map before the first progress; wait for the second one to land.
+        let deadline = Instant::now() + WAIT;
+        while lock(&worker.active)["tiny"].done.load(Ordering::Relaxed) != 7 {
+            assert!(Instant::now() < deadline, "second progress never recorded");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let (_, new) = worker.pushes.claim(0);
+        worker.handle(IoCmd::Subscribed);
+        assert_eq!(
+            new.recv_timeout(WAIT).unwrap(),
+            Push::DownloadProgress {
+                id: "tiny".into(),
+                done: 7,
+                total: 40
+            }
+        );
+        drop(go);
+        assert!(matches!(
+            new.recv_timeout(WAIT).unwrap(),
+            Push::DownloadDone { .. }
+        ));
+        // Nothing running: a later window hears nothing.
+        let (_, last) = worker.pushes.claim(0);
+        worker.handle(IoCmd::Subscribed);
+        assert!(last.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
     fn failure_and_unknown_id_are_reported() {
         let fake: Arc<DownloadFn> = Arc::new(|_, _, _, _| Err(DownloadError::Http(503)));
         let (worker, rx) = rig(fake);
@@ -299,19 +371,27 @@ mod tests {
         let gate = Mutex::new(gate);
         let runs = Arc::new(Mutex::new(0));
         let counted = runs.clone();
-        let fake: Arc<DownloadFn> = Arc::new(move |entry, dir, _, _| {
+        let fake: Arc<DownloadFn> = Arc::new(move |entry, dir, _, cancel| {
             *lock(&counted) += 1;
             let _ = lock(&gate).recv_timeout(WAIT);
+            if cancel.load(Ordering::Relaxed) {
+                return Err(DownloadError::Cancelled);
+            }
             Ok(downloaded(entry, dir))
         });
         let (worker, rx) = rig(fake);
         worker.handle(id("tiny"));
         worker.handle(id("tiny"));
+        // The cancel reaches the running download, not a flag the second request left.
+        worker.handle(IoCmd::CancelDownload { id: "tiny".into() });
         drop(go);
-        assert!(matches!(
+        assert_eq!(
             rx.recv_timeout(WAIT).unwrap(),
-            Push::DownloadDone { .. }
-        ));
+            Push::DownloadDone {
+                id: "tiny".into(),
+                result: DownloadResult::Cancelled
+            }
+        );
         assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
         assert_eq!(*lock(&runs), 1);
     }

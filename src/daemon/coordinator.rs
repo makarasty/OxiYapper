@@ -29,7 +29,11 @@ pub struct Coordinator<H> {
     warnings: Vec<String>,
     /// The whisper worker's latest `EngineWarning`.
     engine_warning: Option<EngineWarning>,
+    /// The whisper worker's latest `Inbox::Backend`.
+    backend: String,
     config_error: Option<String>,
+    /// Last warnings sent as `UiCmd::Warnings`.
+    shown_warnings: Vec<String>,
     /// A config received while busy, with its warnings; becomes active on `ApplyConfig`.
     pending: Option<(Config, Vec<String>)>,
     /// `session` of the last `AudioCmd::Start`; capture events of older ones are stale.
@@ -55,14 +59,16 @@ impl<H: ChordHook> Coordinator<H> {
         phase: PhaseCell,
     ) -> Self {
         phase.store(Phase::Idle);
-        let c = Self {
+        let mut c = Self {
             state: State::new(MachineConfig::from(&config)),
             phase,
             tray: Phase::Idle,
             active: config,
             warnings,
             engine_warning: None,
+            backend: "none".into(),
             config_error: None,
+            shown_warnings: Vec::new(),
             pending: None,
             capture: 0,
             audio: HashMap::new(),
@@ -72,6 +78,7 @@ impl<H: ChordHook> Coordinator<H> {
             hook,
         };
         c.send_config();
+        c.sync_warnings();
         c
     }
 
@@ -92,6 +99,11 @@ impl<H: ChordHook> Coordinator<H> {
     }
 
     pub fn handle(&mut self, msg: Inbox, now: Millis) {
+        self.dispatch(msg, now);
+        self.sync_warnings();
+    }
+
+    fn dispatch(&mut self, msg: Inbox, now: Millis) {
         match msg {
             Inbox::Event(event) => {
                 if let Event::PasteDone { job, .. } = event {
@@ -132,6 +144,7 @@ impl<H: ChordHook> Coordinator<H> {
                 self.config_error = Some(e.to_string());
             }
             Inbox::EngineWarning(warning) => self.engine_warning = warning,
+            Inbox::Backend(device) => self.backend = device,
             Inbox::AssetsChanged => send(&self.workers.whisper, WhisperCmd::ReloadAssets),
             Inbox::Ipc(IpcAsk::Status(reply)) => {
                 // The asking connection may be gone already; nothing to do then.
@@ -246,7 +259,10 @@ impl<H: ChordHook> Coordinator<H> {
             &self.workers.whisper,
             WhisperCmd::Config(Box::new(cfg.clone())),
         );
-        self.ui(UiCmd::Config(cfg.overlay.clone()));
+        self.ui(UiCmd::Config {
+            overlay: cfg.overlay.clone(),
+            meter_sensitivity_db: cfg.audio.meter_sensitivity_db,
+        });
         self.hook.set_hotkey(&cfg.hotkey);
     }
 
@@ -256,13 +272,27 @@ impl<H: ChordHook> Coordinator<H> {
             model: self.active.model.id.clone(),
             device: self.active.audio.device.clone(),
             gpu: self.active.model.gpu.clone(),
-            warnings: self
-                .warnings
-                .iter()
-                .cloned()
-                .chain(self.engine_warning.as_ref().map(strings::engine_warning))
-                .chain(self.config_error.clone())
-                .collect(),
+            backend: self.backend.clone(),
+            warnings: self.warnings(),
+        }
+    }
+
+    /// Load corrections of the active config, the engine warning, then the last parse error.
+    fn warnings(&self) -> Vec<String> {
+        self.warnings
+            .iter()
+            .cloned()
+            .chain(self.engine_warning.as_ref().map(strings::engine_warning))
+            .chain(self.config_error.clone())
+            .collect()
+    }
+
+    /// Tells the tray when the warnings changed.
+    fn sync_warnings(&mut self) {
+        let now = self.warnings();
+        if now != self.shown_warnings {
+            self.shown_warnings.clone_from(&now);
+            self.ui(UiCmd::Warnings(now));
         }
     }
 
@@ -594,6 +624,7 @@ mod tests {
         rig.event(Event::ChordDown, 0);
         let mut config = Config::default();
         config.audio.device = "Mic X".into();
+        config.audio.meter_sensitivity_db = -6.0;
         config.model.gpu = oxi_core::device::DeviceChoice::Named("Vulkan1".into());
         rig.c.handle(
             Inbox::Config {
@@ -617,7 +648,12 @@ mod tests {
             [AudioCmd::Config(config.audio.clone())]
         );
         assert_eq!(rig.hook.hotkeys.borrow().len(), hotkeys_before + 1);
-        assert!(drain(&rig.ui).contains(&UiCmd::Config(config.overlay.clone())));
+        let ui = drain(&rig.ui);
+        assert!(ui.contains(&UiCmd::Config {
+            overlay: config.overlay.clone(),
+            meter_sensitivity_db: config.audio.meter_sensitivity_db,
+        }));
+        assert!(ui.contains(&UiCmd::Warnings(vec!["gain clamped".into()])));
 
         let (tx, rx) = channel();
         rig.c.handle(Inbox::Ipc(IpcAsk::Status(tx)), Millis(600));
@@ -651,7 +687,38 @@ mod tests {
             ["running on CPU: out of memory".to_owned(), error.clone()]
         );
         rig.c.handle(Inbox::EngineWarning(None), Millis(0));
-        assert_eq!(status(&mut rig), [error]);
+        assert_eq!(status(&mut rig), std::slice::from_ref(&error));
+        // The tray heard each change once, the last one being the current list.
+        let tray: Vec<_> = drain(&rig.ui)
+            .into_iter()
+            .filter_map(|c| match c {
+                UiCmd::Warnings(w) => Some(w),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tray,
+            [
+                vec![error.clone()],
+                vec!["running on CPU: out of memory".to_owned(), error.clone()],
+                vec![error],
+            ]
+        );
+    }
+
+    #[test]
+    fn status_backend_is_the_device_the_model_loaded_on() {
+        let mut rig = Rig::new();
+        let backend = |rig: &mut Rig| {
+            let (tx, rx) = channel();
+            rig.c.handle(Inbox::Ipc(IpcAsk::Status(tx)), Millis(0));
+            rx.try_recv().expect("status answered").backend
+        };
+        assert_eq!(backend(&mut rig), "none");
+        rig.c.handle(Inbox::Backend("Vulkan0".into()), Millis(0));
+        assert_eq!(backend(&mut rig), "Vulkan0");
+        rig.c.handle(Inbox::Backend("cpu".into()), Millis(0));
+        assert_eq!(backend(&mut rig), "cpu");
     }
 
     #[test]
