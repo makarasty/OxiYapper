@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,7 @@ use oxi_core::ipc::{PROTO, Push, Request};
 use oxi_platform::ipc::{Conn, Error, Server, default_name, forward_open_settings};
 
 use super::cmd::{Inbox, IoCmd, IpcAsk, StatusReport};
+use super::lock;
 
 /// Concurrent connections; more are closed unanswered.
 const MAX_CONNS: usize = 8;
@@ -146,10 +147,10 @@ fn bind_at(name: &str) -> anyhow::Result<Start> {
 fn refusal(e: Error) -> anyhow::Error {
     let msg = match e {
         Error::AlreadyRunning => "another OxiYapper is already running".to_owned(),
-        Error::Busy => {
-            "OxiYapper is running but not answering; end it in Task Manager and start again"
-                .to_owned()
-        }
+        Error::Busy => format!(
+            "{}; end it in Task Manager and start again",
+            oxi_core::strings::DAEMON_BUSY
+        ),
         Error::ForeignServer => {
             "cannot start: the OxiYapper IPC pipe is held by another account or program".to_owned()
         }
@@ -497,10 +498,6 @@ fn is_settings(foreground: u32, client: u32, own: u32) -> bool {
     foreground != 0 && foreground == client && foreground != own
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 /// The real host: the hook handle, the foreground window, `current_exe settings`.
 pub struct SystemHost {
     hook: Arc<oxi_platform::os::hook::HookHandle>,
@@ -643,14 +640,8 @@ mod tests {
     }
 
     fn rig(tag: &str) -> Rig {
-        let name = if cfg!(windows) {
-            format!(r"\\.\pipe\OxiYapper-test-{}-ipc-{tag}", std::process::id())
-        } else {
-            std::env::temp_dir()
-                .join(format!("OxiYapper-test-{}-ipc-{tag}", std::process::id()))
-                .to_string_lossy()
-                .into_owned()
-        };
+        // The daemon is Windows-only: the name is always a pipe.
+        let name = oxi_core::ipc::pipe_name(&format!("test-{}-ipc-{tag}", std::process::id()));
         let Ok(Start::Serve(server)) = bind_at(&name) else {
             panic!("bind failed");
         };

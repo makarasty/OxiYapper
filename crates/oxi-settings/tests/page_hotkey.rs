@@ -5,44 +5,19 @@ mod common;
 
 use std::fs;
 
-use common::layout;
+use common::{config, has, layout, one, open_linked};
 use i_slint_backend_testing::{AccessibleRole, ElementHandle};
-use oxi_core::config::ConfigFile;
 use oxi_core::machine::Mode;
 use oxi_core::paths::Layout;
 use oxi_settings::{AppWindow, Ipc, Page};
-use slint::ComponentHandle;
 
 fn open(layout: &Layout) -> AppWindow {
-    i_slint_backend_testing::init_no_event_loop();
     // Apply needs the daemon link; the receiver is dropped and sends are ignored.
-    let window = oxi_settings::open_with(layout.clone(), Ipc::fake().0).unwrap();
-    window.show().unwrap();
-    window.set_page(Page::Hotkey);
-    window
-}
-
-fn one(window: &AppWindow, label: &str) -> ElementHandle {
-    let mut found = ElementHandle::find_by_accessible_label(window, label);
-    let first = found
-        .next()
-        .unwrap_or_else(|| panic!("no element labelled {label}"));
-    assert!(found.next().is_none(), "more than one labelled {label}");
-    first
-}
-
-fn has(window: &AppWindow, label: &str) -> bool {
-    ElementHandle::find_by_accessible_label(window, label)
-        .next()
-        .is_some()
+    open_linked(layout, Page::Hotkey, Ipc::fake().0)
 }
 
 fn click(window: &AppWindow, label: &str) {
     one(window, label).invoke_accessible_default_action();
-}
-
-fn config(l: &Layout) -> ConfigFile {
-    ConfigFile::parse(&fs::read_to_string(l.config_file()).unwrap()).unwrap()
 }
 
 #[test]

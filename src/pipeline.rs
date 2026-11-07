@@ -115,7 +115,7 @@ pub fn verify_stamped(model: &ResolvedModel, models_dir: &Path) -> Result<(), Mo
     };
     match status(entry, models_dir) {
         ModelStatus::Ready => Ok(()),
-        ModelStatus::Missing => Err(ModelFailure::Missing),
+        ModelStatus::Missing | ModelStatus::Partial => Err(ModelFailure::Missing),
         ModelStatus::Bad => Err(ModelFailure::Bad),
         ModelStatus::NeedsHash => {
             hash_matches(&model.path, entry).map_err(|e| {

@@ -10,6 +10,8 @@ use std::time::UNIX_EPOCH;
 
 use sha2::{Digest, Sha256};
 
+use crate::paths::part_path;
+
 /// One curated model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelEntry {
@@ -163,6 +165,9 @@ pub fn write_stamp(file: &Path) -> io::Result<()> {
 pub enum ModelStatus {
     /// No file.
     Missing,
+    /// No file, but a cancelled or cut-off download left its `.part`; the next download
+    /// resumes from it.
+    Partial,
     /// Right size and a stamp that still matches: load without hashing.
     Ready,
     /// Right size but no usable stamp: hash the file before the first load.
@@ -171,13 +176,20 @@ pub enum ModelStatus {
     Bad,
 }
 
-/// Status of `entry` in `models_dir`, from the file's size and its `.ok` stamp. Reads the
-/// metadata only; the hash is the caller's step on [`ModelStatus::NeedsHash`].
+/// Status of `entry` in `models_dir`, from the file's size, its `.ok` stamp and its `.part`.
+/// Reads the metadata only; the hash is the caller's step on [`ModelStatus::NeedsHash`].
 pub fn status(entry: &ModelEntry, models_dir: &Path) -> ModelStatus {
     let file = models_dir.join(entry.file_name);
     let actual = match Stamp::of(&file) {
         Ok(actual) => actual,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return ModelStatus::Missing,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let partial = fs::metadata(part_path(&file)).is_ok_and(|m| m.len() > 0);
+            return if partial {
+                ModelStatus::Partial
+            } else {
+                ModelStatus::Missing
+            };
+        }
         Err(_) => return ModelStatus::Bad,
     };
     if actual.size != entry.size {
@@ -190,5 +202,30 @@ pub fn status(entry: &ModelEntry, models_dir: &Path) -> ModelStatus {
         ModelStatus::Ready
     } else {
         ModelStatus::NeedsHash
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_non_empty_part_file_is_partial() {
+        let entry = find("tiny").unwrap();
+        let dir = std::env::temp_dir().join(format!("oxi-core-partial-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let part = part_path(&dir.join(entry.file_name));
+        fs::write(&part, b"").unwrap();
+        assert_eq!(status(entry, &dir), ModelStatus::Missing, "empty .part");
+        fs::write(&part, b"half").unwrap();
+        assert_eq!(status(entry, &dir), ModelStatus::Partial);
+        fs::write(dir.join(entry.file_name), b"cut").unwrap();
+        assert_eq!(
+            status(entry, &dir),
+            ModelStatus::Bad,
+            "the file wins over its .part"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

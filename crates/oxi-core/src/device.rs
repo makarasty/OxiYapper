@@ -49,8 +49,8 @@ impl From<DeviceChoice> for String {
 pub struct Picked {
     /// Index in the device list, `None` = CPU.
     pub index: Option<usize>,
-    /// Set when a named device was not found and `Auto` was used instead.
-    pub warning: Option<String>,
+    /// A named device was not found and `Auto` was used instead.
+    pub missing: bool,
 }
 
 /// Auto: first discrete GPU, then first integrated one, then CPU.
@@ -66,20 +66,20 @@ pub fn pick(devices: &[Device], choice: &DeviceChoice) -> Picked {
     match choice {
         DeviceChoice::Auto => Picked {
             index: pick_auto(devices),
-            warning: None,
+            missing: false,
         },
         DeviceChoice::Cpu => Picked {
             index: None,
-            warning: None,
+            missing: false,
         },
         DeviceChoice::Named(name) => match devices.iter().position(|d| &d.name == name) {
             Some(i) => Picked {
                 index: Some(i),
-                warning: None,
+                missing: false,
             },
             None => Picked {
                 index: pick_auto(devices),
-                warning: Some(format!("GPU {name:?} not found, using auto")),
+                missing: true,
             },
         },
     }
@@ -127,7 +127,7 @@ mod tests {
         for (devices, choice, index, warns) in cases {
             let got = pick(&devices, &choice);
             assert_eq!(got.index, index, "{devices:?} {choice:?}");
-            assert_eq!(got.warning.is_some(), warns, "{devices:?} {choice:?}");
+            assert_eq!(got.missing, warns, "{devices:?} {choice:?}");
         }
     }
 

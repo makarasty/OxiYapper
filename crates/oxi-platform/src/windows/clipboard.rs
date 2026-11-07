@@ -28,6 +28,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 use windows_sys::w;
 
+use super::wide;
+
 /// Registered formats that keep data out of clipboard managers, Win+V history and cloud sync.
 const EXCLUDE: [&str; 3] = [
     "ExcludeClipboardContentFromMonitorProcessing",
@@ -63,9 +65,9 @@ impl WinClipboard {
     pub fn new() -> Result<Self, ClipError> {
         let mut exclude = [0; 3];
         for (id, name) in exclude.iter_mut().zip(EXCLUDE) {
-            let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
-            // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the call.
-            *id = unsafe { RegisterClipboardFormatW(wide.as_ptr()) };
+            let name = wide(name);
+            // SAFETY: `name` is a NUL-terminated UTF-16 string that outlives the call.
+            *id = unsafe { RegisterClipboardFormatW(name.as_ptr()) };
             if *id == 0 {
                 return Err(os_error("RegisterClipboardFormatW"));
             }

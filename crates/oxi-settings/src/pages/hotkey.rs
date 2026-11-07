@@ -15,7 +15,7 @@ use oxi_core::machine::Mode;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
 use crate::generated::{HotkeyState, KeyCap};
-use crate::ipc::{Event, Link};
+use crate::ipc::{Event, Link, Subscription};
 use crate::{AppWindow, Ctx, Page, report};
 
 /// How often a running capture checks that its page is still shown.
@@ -38,9 +38,9 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         .iter()
         .map(|c| KeyCap {
             name: c.key.as_str().into(),
-            label: keyboard_layout::cap_label(c.key).into(),
-            spoken: keyboard_layout::spoken(c.key).into(),
-            word: longest_word(keyboard_layout::cap_label(c.key)),
+            label: c.key.label().into(),
+            spoken: c.key.spoken().into(),
+            word: longest_word(c.key.label()),
             x: c.x,
             y: c.y,
             w: c.w,
@@ -49,8 +49,21 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
             picked: false,
         })
         .collect();
-    let picker = Rc::new_cyclic(|me| Picker {
+    let picker = Rc::new_cyclic(|me: &RcWeak<Picker>| Picker {
         me: me.clone(),
+        // Reset to defaults binds again: the callbacks below replace the old picker's, which
+        // drops it and with it this subscription.
+        _events: ctx.ipc.subscribe({
+            let me = me.clone();
+            move |event| {
+                let Some(p) = me.upgrade() else { return };
+                match event {
+                    Event::Push(Push::Key { code, down }) => p.pressed(*code, *down),
+                    Event::Link(link) => p.linked(*link),
+                    Event::Push(_) => {}
+                }
+            }
+        }),
         window: window.as_weak(),
         ctx: ctx.clone(),
         keys: layout.iter().map(|c| c.key).collect(),
@@ -88,23 +101,12 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         }
         report(&w, c.save());
     });
-
-    // Reset to defaults binds again and subscribes once more: the old subscription only holds
-    // the old picker weakly, so it goes quiet once the callbacks above replace it.
-    let p = Rc::downgrade(&picker);
-    ctx.ipc.subscribe(move |event| {
-        let Some(p) = p.upgrade() else { return };
-        match event {
-            Event::Push(Push::Key { code, down }) => p.pressed(*code, *down),
-            Event::Link(link) => p.linked(*link),
-            Event::Push(_) => {}
-        }
-    });
 }
 
 /// The open keyboard and the chord being picked on it.
 struct Picker {
     me: RcWeak<Picker>,
+    _events: Subscription,
     window: Weak<AppWindow>,
     ctx: Ctx,
     /// The key of each row of `caps`.
@@ -325,55 +327,24 @@ fn chord_text(names: &[String]) -> SharedString {
 
 #[cfg(test)]
 mod tests {
-    //! The page against the fake daemon link. `oxi_settings::open` makes its own offline link,
-    //! so these build the window here with `Ipc::fake()`.
-    // shortcut: move them to tests/page_hotkey.rs once lib.rs can open a window on a given Ipc.
+    //! The page against the fake daemon link.
 
-    use std::cell::RefCell;
-    use std::rc::Rc;
     use std::sync::mpsc::Receiver;
 
     use i_slint_backend_testing::ElementHandle;
-    use oxi_core::config::ConfigFile;
     use oxi_core::hotkey::Key;
     use oxi_core::ipc::{Push, Request};
-    use oxi_core::paths::Layout;
     use slint::ComponentHandle;
     use slint::platform::WindowEvent;
 
     use crate::generated::HotkeyState;
     use crate::ipc::{Cmd, Event, Ipc, Link};
-    use crate::{AppWindow, Ctx, Page};
+    use crate::testing::{linked, one};
+    use crate::{AppWindow, Page};
 
     fn open(name: &str) -> (AppWindow, Ipc, Receiver<Cmd>) {
-        i_slint_backend_testing::init_no_event_loop();
-        let dir = std::env::temp_dir().join(format!(
-            "oxi-settings-unit-{}-hotkey-{name}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let (ipc, sent) = Ipc::fake();
-        let ctx = Ctx {
-            layout: Layout {
-                config_dir: dir.clone(),
-                data_dir: dir.clone(),
-                logs_dir: dir,
-            },
-            config: Rc::new(RefCell::new(ConfigFile::default())),
-            ipc: ipc.clone(),
-        };
-        let window = AppWindow::new().unwrap();
-        crate::bind(&window, &ctx);
-        window.show().unwrap();
-        window.set_page(Page::Hotkey);
+        let (window, ipc, sent, _) = linked("hotkey", name, Page::Hotkey);
         (window, ipc, sent)
-    }
-
-    fn one(window: &AppWindow, label: &str) -> ElementHandle {
-        ElementHandle::find_by_accessible_label(window, label)
-            .next()
-            .unwrap_or_else(|| panic!("no element labelled {label}"))
     }
 
     fn board_open(window: &AppWindow) -> bool {
@@ -514,8 +485,8 @@ mod tests {
         one(&window, "Change hotkey").invoke_accessible_default_action();
         let mut smallest = f32::MAX;
         for cap in super::keyboard_layout::caps() {
-            let label = super::keyboard_layout::cap_label(cap.key);
-            let el = one(&window, &super::keyboard_layout::spoken(cap.key));
+            let label = cap.key.label();
+            let el = one(&window, &cap.key.spoken());
             // keyboard.slint: the text box is the cap less 2 px, the font
             // max(7px, min(8px, box / longest word * 1.5)). The floor must only absorb rounding:
             // a word that needs a smaller font would not fit its cap.

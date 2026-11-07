@@ -1,8 +1,9 @@
-//! English text of every user-facing message of the daemon, one place. Each lookup is an
-//! exhaustive match: a new variant does not compile until it has its text.
+//! English text of every user-facing message of the daemon and the settings window, one place.
+//! Each lookup is an exhaustive match: a new variant does not compile until it has its text.
 
 use crate::APP_NAME;
 use crate::machine::{EngineWarning, Notice, OverlayState, Phase};
+use crate::models::ModelStatus;
 
 pub const MENU_SETTINGS: &str = "Settings";
 pub const MENU_COPY_LAST: &str = "Copy last text";
@@ -94,4 +95,95 @@ pub fn tray_tooltip(phase: Phase) -> String {
         Phase::Pasting => "pasting",
     };
     format!("{APP_NAME}: {state}")
+}
+
+// The settings window's link to the daemon: one text per state, for its banner and its pages.
+pub const DAEMON_OFFLINE: &str = "OxiYapper is not running. Settings are saved to the config file.";
+pub const DAEMON_MISMATCH: &str = "Restart OxiYapper to finish the update";
+/// Also the IPC `Busy` error and the start of the daemon's own refusal.
+pub const DAEMON_BUSY: &str = "OxiYapper is running but not answering";
+pub const DAEMON_STUCK: &str =
+    "The old OxiYapper did not exit. Quit it from the tray, then press Start.";
+pub const PIPE_UNTRUSTED: &str =
+    "The OxiYapper pipe is held by an untrusted program. Not connecting.";
+pub const PIPE_FOREIGN: &str = "The OxiYapper pipe is held by another account. Not connecting.";
+
+/// Banner of a config reload that failed; `line` is 1-based.
+#[must_use]
+pub fn config_error(file: &str, line: usize, message: &str) -> String {
+    format!("{file}, line {line}: {message}")
+}
+
+/// The daemon could not be started; only the error kind, never the path.
+#[must_use]
+pub fn spawn_failed(kind: std::io::ErrorKind) -> String {
+    format!("Could not start {APP_NAME}: {kind}.")
+}
+
+/// A configured device that is not plugged in, as its picker row shows it.
+#[must_use]
+pub fn not_connected(name: &str) -> String {
+    format!("{name} (not connected)")
+}
+
+pub const NO_MIC: &str = "No microphone";
+pub const SYSTEM_DEFAULT_MIC: &str = "System default";
+
+pub const DOWNLOAD_NEEDS_DAEMON: &str = "Start OxiYapper to download models";
+pub const DOWNLOAD_STARTING: &str = "Starting the download";
+
+/// Decimal gigabytes with one digit, the unit Hugging Face shows.
+#[must_use]
+pub fn gb(bytes: u64) -> String {
+    #[expect(clippy::cast_precision_loss, reason = "one decimal digit is shown")]
+    let gb = bytes as f64 / 1e9;
+    format!("{gb:.1} GB")
+}
+
+/// Progress line of a model download.
+#[must_use]
+pub fn downloading(done: u64, total: u64) -> String {
+    format!("Downloading {} of {}", gb(done), gb(total))
+}
+
+/// Status line of a registry model from its files.
+#[must_use]
+pub const fn model_status(status: ModelStatus) -> &'static str {
+    match status {
+        ModelStatus::Missing => "Not downloaded",
+        ModelStatus::Partial => "Paused, Download resumes",
+        ModelStatus::Ready => "Ready",
+        ModelStatus::NeedsHash => "Downloaded, checked before first use",
+        ModelStatus::Bad => "Damaged or incomplete, download it again",
+    }
+}
+
+// Why a path cannot be a custom model.
+pub const MODEL_PATH_EMPTY: &str = "Choose a .bin model file";
+pub const MODEL_PATH_NOT_BIN: &str = "The model file must end in .bin";
+pub const MODEL_PATH_RELATIVE: &str = "Use the full path to the file, from the drive letter";
+pub const MODEL_PATH_FOLDER: &str = "This is a folder, not a model file";
+pub const MODEL_PATH_MISSING: &str = "File not found";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sizes_and_messages() {
+        assert_eq!(gb(1_624_555_275), "1.6 GB");
+        assert_eq!(gb(0), "0.0 GB");
+        assert_eq!(
+            downloading(1_000_000_000, 4_000_000_000),
+            "Downloading 1.0 GB of 4.0 GB"
+        );
+        assert_eq!(
+            spawn_failed(std::io::ErrorKind::NotFound),
+            "Could not start OxiYapper: entity not found."
+        );
+        assert_eq!(
+            config_error("config.toml", 3, "bad"),
+            "config.toml, line 3: bad"
+        );
+    }
 }

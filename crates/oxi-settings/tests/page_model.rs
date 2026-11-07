@@ -8,37 +8,11 @@ use std::fs;
 use std::thread;
 use std::time::Duration;
 
-use common::layout;
+use common::{config, has, layout, open, open_again, with_role};
 use i_slint_backend_testing::{AccessibleRole, ElementHandle};
 use oxi_core::config::{ConfigFile, Model};
 use oxi_core::paths::Layout;
 use oxi_settings::{AppWindow, Page};
-use slint::ComponentHandle;
-
-fn open(layout: &Layout) -> AppWindow {
-    i_slint_backend_testing::init_no_event_loop();
-    open_again(layout)
-}
-
-/// [`open`] for a second window in the same test: the platform is set once per test.
-fn open_again(layout: &Layout) -> AppWindow {
-    let window = oxi_settings::open(layout.clone()).unwrap();
-    window.show().unwrap();
-    window.set_page(Page::Model);
-    window
-}
-
-fn with_role(window: &AppWindow, label: &str, role: AccessibleRole) -> ElementHandle {
-    ElementHandle::find_by_accessible_label(window, label)
-        .find(|e| e.accessible_role() == Some(role))
-        .unwrap_or_else(|| panic!("no {role:?} labelled {label}"))
-}
-
-fn has(window: &AppWindow, label: &str) -> bool {
-    ElementHandle::find_by_accessible_label(window, label)
-        .next()
-        .is_some()
-}
 
 /// Wait for the path worker: step the mocked clock (which runs the page's poll timer) until
 /// `ready`.
@@ -61,8 +35,7 @@ fn path_saved(layout: &Layout, path: &str) -> bool {
 }
 
 fn saved(layout: &Layout) -> Model {
-    let text = fs::read_to_string(layout.config_file()).unwrap();
-    ConfigFile::parse(&text).unwrap().config.model
+    config(layout).config.model
 }
 
 fn radio(window: &AppWindow, label: &str) -> ElementHandle {
@@ -75,7 +48,7 @@ fn rows_show_size_and_status_from_the_files() {
     fs::create_dir_all(l.models_dir()).unwrap();
     // A cut-off download: the right name, far from the right size.
     fs::write(l.models_dir().join("ggml-large-v3.bin"), b"synthetic").unwrap();
-    let window = open(&l);
+    let window = open(&l, Page::Model);
     assert!(has(&window, "1.6 GB · Not downloaded"));
     assert!(has(
         &window,
@@ -91,7 +64,7 @@ fn rows_show_size_and_status_from_the_files() {
 #[test]
 fn picking_a_row_writes_model_id() {
     let l = layout("pick", Some("version = 1\n# mine\n"));
-    let window = open(&l);
+    let window = open(&l, Page::Model);
     assert_eq!(
         radio(&window, "Whisper large-v3 turbo").accessible_checked(),
         Some(true)
@@ -116,7 +89,7 @@ fn missing_custom_path_shows_an_error() {
         "custom",
         Some("version = 1\n[model]\nid = \"custom\"\ncustom_path = \"C:/nowhere/gone.bin\"\n"),
     );
-    let window = open(&l);
+    let window = open(&l, Page::Model);
     wait_for(|| has(&window, "File not found"));
 
     let field = with_role(&window, "Model file", AccessibleRole::TextInput);
@@ -140,7 +113,7 @@ fn missing_custom_path_shows_an_error() {
 #[test]
 fn relative_custom_path_is_refused() {
     let l = layout("relative", None);
-    let window = open(&l);
+    let window = open(&l, Page::Model);
     with_role(&window, "Model file", AccessibleRole::TextInput)
         .set_accessible_value("mine.bin".to_owned());
     assert!(has(
@@ -153,7 +126,7 @@ fn relative_custom_path_is_refused() {
 #[test]
 fn typing_a_good_path_picks_the_custom_model() {
     let l = layout("custom-pick", None);
-    let window = open(&l);
+    let window = open(&l, Page::Model);
     assert!(!has(&window, "Choose a .bin model file"));
     radio(&window, "Use my own .bin").invoke_accessible_default_action();
     assert!(has(&window, "Choose a .bin model file"));
@@ -183,7 +156,7 @@ fn gpu_picker_shows_the_configured_choice() {
         ("gpu = \"Vulkan7\"", "Vulkan7"),
     ] {
         let l = layout("gpu", Some(&format!("version = 1\n[model]\n{config}\n")));
-        let window = open_again(&l);
+        let window = open_again(&l, Page::Model);
         let picker = with_role(&window, "GPU", AccessibleRole::Combobox);
         assert_eq!(
             picker.accessible_value().as_deref(),
@@ -196,7 +169,7 @@ fn gpu_picker_shows_the_configured_choice() {
 #[test]
 fn idle_unload_slider_writes_minutes() {
     let l = layout("idle", None);
-    let window = open(&l);
+    let window = open(&l, Page::Model);
     assert!(has(&window, "5 min"));
     let slider = with_role(&window, "Unload after idle", AccessibleRole::Slider);
     let rest = || i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(350));
@@ -214,7 +187,7 @@ fn idle_unload_slider_writes_minutes() {
 #[test]
 fn download_without_the_daemon_says_to_start_it() {
     let l = layout("offline", None);
-    let window = open(&l);
+    let window = open(&l, Page::Model);
     with_role(&window, "Download Whisper large-v3", AccessibleRole::Button)
         .invoke_accessible_default_action();
     assert!(has(
@@ -231,7 +204,7 @@ fn download_without_the_daemon_says_to_start_it() {
 fn locked_config_disables_the_controls() {
     let original = "version = 99\n[model]\nid = \"large-v3\"\n";
     let l = layout("locked", Some(original));
-    let window = open(&l);
+    let window = open(&l, Page::Model);
     for (label, role) in [
         ("Whisper large-v3 turbo", AccessibleRole::RadioButton),
         ("Use my own .bin", AccessibleRole::RadioButton),

@@ -85,6 +85,10 @@ fn render(window: &AppWindow, scale: f32) -> Pixmap {
 fn save(pixmap: &Pixmap, screen: &str, theme: &str) {
     let pixels = pixmap.pixels();
     assert!(
+        pixels.iter().any(|p| p.alpha() > 0),
+        "{screen} {theme} drew nothing"
+    );
+    assert!(
         pixels.iter().any(|p| *p != pixels[0]),
         "{screen} {theme} is one flat colour"
     );

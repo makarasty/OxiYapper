@@ -4,6 +4,8 @@ mod ctx;
 mod debounce;
 pub mod ipc;
 mod pages;
+#[cfg(test)]
+mod testing;
 
 use std::io;
 
@@ -65,7 +67,7 @@ fn watch_spawn(
 }
 
 fn spawn_note(e: &io::Error) -> String {
-    format!("Could not start OxiYapper: {}.", e.kind())
+    oxi_core::strings::spawn_failed(e.kind())
 }
 
 /// The settings window on `layout`'s config with no daemon link (it stays offline and shows no
@@ -120,20 +122,23 @@ fn open_inner(
         report(&weak, result);
     });
 
-    if followed.is_some() {
+    let banner = followed.is_some().then(|| {
         let weak = window.as_weak();
-        ctx.ipc.subscribe(move |event| {
+        let events = ctx.ipc.subscribe(move |event| {
             if let Some(window) = weak.upgrade() {
                 on_daemon_event(&window, event);
             }
         });
         // The worker may have reported before the subscription: show the state as it is now.
         on_daemon_event(&window, &Event::Link(ctx.ipc.link()));
-    }
+        events
+    });
     let ipc = ctx.ipc.clone();
     window.on_start_daemon({
         let weak = window.as_weak();
         move || {
+            // Held by this callback, which lives as long as the window.
+            let _ = &banner;
             if let Some(window) = weak.upgrade() {
                 window.set_spawn_error("".into());
             }
@@ -234,6 +239,17 @@ mod tests {
             spawn_note(&e),
             "Could not start OxiYapper: entity not found."
         );
+    }
+
+    #[test]
+    fn resets_leave_one_subscriber_per_page() {
+        let (window, ipc, _sent, _) = crate::testing::linked("lib", "resets", super::Page::Hotkey);
+        // The banner, Hotkey, Model and Overlay.
+        assert_eq!(ipc.subscribers(), 4);
+        for _ in 0..3 {
+            window.invoke_reset_config();
+        }
+        assert_eq!(ipc.subscribers(), 4);
     }
 
     #[test]

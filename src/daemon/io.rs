@@ -11,7 +11,7 @@ use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,7 @@ use oxi_core::models::{self, ModelEntry};
 
 use super::cmd::IoCmd;
 use super::ipc::Pushes;
+use super::lock;
 use crate::net::{self, DownloadError, Downloaded};
 
 /// Shortest gap between two progress pushes (10 a second).
@@ -204,10 +205,6 @@ impl Throttle {
         }
         pass
     }
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]

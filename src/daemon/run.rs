@@ -14,11 +14,12 @@ use oxi_core::hotkey::Chord;
 use oxi_core::ipc::Push;
 use oxi_core::machine::{Notice, PhaseCell};
 use oxi_core::paths::CONFIG_FILE;
+use oxi_core::tray::MenuItem;
 use oxi_core::types::Millis;
 use oxi_platform::capture::LevelMeter;
 use oxi_platform::os::hook::{Hook, HookHandle};
 use oxi_platform::os::overlay::Overlay;
-use oxi_platform::os::tray::{MainLoop, MenuItem, Waker};
+use oxi_platform::os::tray::{MainLoop, Waker};
 
 use super::cmd::{ChordHook, Inbox, UiCmd, Workers};
 use super::coordinator::Coordinator;
@@ -145,7 +146,7 @@ pub fn run() -> anyhow::Result<()> {
 /// The start config. One that does not parse starts on the defaults and is reported like a
 /// bad reload; the watcher applies the file once it is fixed.
 fn load_config(path: &Path) -> (Config, Vec<String>, Option<ConfigError>) {
-    let parsed = std::fs::read_to_string(path)
+    let parsed = watch::read_with_retry(path)
         .map_err(|e| ConfigError::Invalid(e.kind().to_string()))
         .and_then(|text| ConfigFile::parse(&text));
     match parsed {

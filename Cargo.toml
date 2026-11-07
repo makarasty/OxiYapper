@@ -44,7 +44,6 @@ rfd = { version = "0.17", default-features = false }
 slint = { version = "=1.18.1", default-features = false }
 slint-build = "=1.18.1"
 i-slint-backend-testing = "=1.18.1"
-notify = "8.2"
 notify-debouncer-full = "0.7"
 sha2 = "0.11"
 ureq = { version = "3.5", default-features = false }
@@ -94,7 +93,6 @@ oxi-whisper.workspace = true
 oxi-platform.workspace = true
 oxi-settings.workspace = true
 anyhow.workspace = true
-serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
@@ -126,7 +124,3 @@ lto = "thin"
 codegen-units = 16
 strip = false
 debug = "line-tables-only"
-
-# Added ahead of the task that uses them (wave 2 daemon); remove the entry when it does.
-[package.metadata.cargo-machete]
-ignored = ["serde_json"]
