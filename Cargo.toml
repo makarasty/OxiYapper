@@ -49,6 +49,7 @@ sha2 = "0.11"
 ureq = { version = "3.5", default-features = false }
 proptest = "1.12"
 insta = "1.49"
+embed-resource = "3.0"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -101,6 +102,10 @@ notify-debouncer-full.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 ureq = { workspace = true, features = ["rustls"] }
+
+# Icon and manifest into the Windows executable (build.rs).
+[build-dependencies]
+embed-resource.workspace = true
 
 [lints]
 workspace = true
