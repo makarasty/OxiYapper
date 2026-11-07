@@ -1,0 +1,96 @@
+// Keycaps: the on-screen keyboard style the owner likes (bright caps, crisp 1 px stroke, small
+// radius, solid accent fill when picked) and the inline chord keycaps.
+import { Theme, Shell } from "../tokens.slint";
+
+// One cap of the board. It fills the size it is given; `unit` (the board's key unit) sets the
+// radius and the label size (12..15 px). States: rest, hover, picked, held (physically down:
+// pressed fill, 1 px lower), invalid, disabled (40 %).
+export component Keycap {
+    in property <string> label;
+    in property <length> unit: 44px;
+    in property <bool> picked;
+    in property <bool> held;
+    in property <bool> invalid;
+    in property <bool> enabled: true;
+    in property <bool> locked: Shell.locked;
+    in property <bool> force-hover;
+    callback clicked;
+    property <bool> live: root.enabled && !root.locked;
+    property <bool> hover: root.live && (touch.has-hover || root.force-hover);
+    accessible-role: button;
+    accessible-checkable: true;
+    accessible-checked: root.picked;
+    accessible-description: root.held ? "held" : "";
+    accessible-enabled: root.live;
+    accessible-action-default => {
+        if (root.live) {
+            root.clicked();
+        }
+    }
+    cap := Rectangle {
+        y: root.held ? 1px : 0;
+        border-radius: Theme.radius-keycap(root.unit);
+        border-width: root.picked || root.held ? 0 : 1px;
+        border-color: root.invalid ? Theme.error-text.transparentize(0.5) : Theme.stroke-keycap;
+        background: root.held ? Theme.accent-pressed : root.picked ? Theme.accent : root.invalid ? Theme.error-fill : root.hover ? Theme.bg-control-hover : Theme.bg-control;
+        opacity: root.live ? 1 : 0.4;
+        Text {
+            x: 2px;
+            width: parent.width - 4px;
+            text: root.label;
+            font-size: clamp(root.unit * 0.30, 12px, 15px);
+            wrap: word-wrap;
+            overflow: elide;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            color: root.picked || root.held ? Theme.on-accent : root.invalid ? Theme.error-text : Theme.text-primary;
+            accessible-role: none;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.live;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// A chord as inline keycaps (PowerToys KeyVisual): accent caps, min width 36, padding 8, gap 4.
+// `warning` draws them on the warning fill; with no keys, `empty-text` shows instead. `label` is
+// the accessible text of the whole chord ("Ctrl + Win").
+export component KeycapRow inherits HorizontalLayout {
+    in property <[string]> keys;
+    in property <length> cap-height: Theme.control-height;
+    in property <bool> warning;
+    in property <string> empty-text;
+    in property <string> label;
+    spacing: Theme.keycap-gap;
+    alignment: start;
+    accessible-role: AccessibleRole.text;
+    accessible-label: root.label;
+    for key in root.keys: Rectangle {
+        height: root.cap-height;
+        min-width: max(36px, t.preferred-width + 16px);
+        border-radius: Theme.radius-control;
+        background: root.warning ? Theme.warning-fill : Theme.accent;
+        border-width: root.warning ? 1px : 0;
+        border-color: Theme.warning-text.transparentize(0.7);
+        t := Text {
+            text: key;
+            font-size: Theme.body-size;
+            font-weight: Theme.weight-strong;
+            color: root.warning ? Theme.warning-text : Theme.on-accent;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+    }
+    if root.keys.length == 0: Text {
+        height: root.cap-height;
+        text: root.empty-text;
+        font-size: Theme.body-size;
+        color: Theme.text-secondary;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+}

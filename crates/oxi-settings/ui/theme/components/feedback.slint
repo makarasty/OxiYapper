@@ -1,0 +1,195 @@
+// Messages and status: window banner, inline note, level meter, progress bar, badge.
+import { Theme } from "../tokens.slint";
+import { Icons } from "../icons.slint";
+
+export enum Severity { info, success, warning, error }
+
+// Colour and icon of a severity, one place for Banner and Note.
+export global Look {
+    public pure function ink(s: Severity) -> color {
+        return s == Severity.error ? Theme.error-text : s == Severity.warning ? Theme.warning-text : s == Severity.success ? Theme.success-text : Theme.text-secondary;
+    }
+    public pure function fill(s: Severity) -> color {
+        return s == Severity.error ? Theme.error-fill : s == Severity.warning ? Theme.warning-fill : Theme.info-fill;
+    }
+    public pure function icon(s: Severity) -> image {
+        return s == Severity.error ? Icons.error-circle : s == Severity.warning ? Icons.warning : s == Severity.success ? Icons.checkmark-circle : Icons.info;
+    }
+    public pure function icon-16(s: Severity) -> image {
+        return s == Severity.error ? Icons.error-circle-16 : s == Severity.warning ? Icons.warning-16 : s == Severity.success ? Icons.checkmark-circle-16 : Icons.info-16;
+    }
+}
+
+// Window-level message: card-shaped, severity fill with a 30 % stroke of the same hue, icon 20,
+// wrapping text, actions (children, buttons) on the right. Under 560 px the text takes its own
+// line above the buttons.
+export component Banner inherits Rectangle {
+    in property <string> text;
+    in property <Severity> severity: Severity.warning;
+    property <bool> narrow: root.width < 560px;
+    property <length> pad-h: Theme.space-4;
+    property <length> pad-v: Theme.space-3;
+    property <length> text-x: root.pad-h + 20px + Theme.space-3;
+    property <bool> has-actions: actions.preferred-width > 0;
+    property <length> text-w: root.narrow || !root.has-actions ? root.width - root.text-x - root.pad-h : root.width - root.text-x - root.pad-h - actions.preferred-width - Theme.space-4;
+    property <length> body-h: root.narrow && root.has-actions ? message.preferred-height + Theme.space-2 + actions.preferred-height : max(message.preferred-height, actions.preferred-height, 20px);
+    background: Look.fill(root.severity);
+    border-width: 1px;
+    border-color: Look.ink(root.severity).transparentize(0.7);
+    border-radius: Theme.radius-card;
+    accessible-role: banner;
+    accessible-label: root.text;
+    min-width: 280px;
+    height: root.body-h + 2 * root.pad-v;
+    Image {
+        x: root.pad-h;
+        y: root.pad-v + (root.narrow && root.has-actions ? 0 : (root.body-h - 20px) / 2);
+        width: 20px;
+        height: 20px;
+        source: Look.icon(root.severity);
+        colorize: Look.ink(root.severity);
+        accessible-role: none;
+    }
+    message := Text {
+        x: root.text-x;
+        y: root.pad-v + (root.narrow && root.has-actions ? 0 : (root.body-h - self.height) / 2);
+        width: root.text-w;
+        height: self.preferred-height;
+        text: root.text;
+        font-size: Theme.body-size;
+        color: Theme.text-primary;
+        wrap: word-wrap;
+        accessible-role: none;
+    }
+    actions := HorizontalLayout {
+        x: root.width - root.pad-h - self.preferred-width;
+        y: root.narrow ? root.pad-v + message.preferred-height + Theme.space-2 : root.pad-v + (root.body-h - self.preferred-height) / 2;
+        width: self.preferred-width;
+        height: self.preferred-height;
+        spacing: Theme.space-2;
+        @children
+    }
+}
+
+// Inline note under a control inside a Card: no border, icon 16 and caption text in the severity
+// colour, optional buttons (children) on the right.
+export component Note inherits HorizontalLayout {
+    in property <string> text;
+    in property <Severity> severity: Severity.info;
+    spacing: Theme.space-2;
+    accessible-role: AccessibleRole.text;
+    accessible-label: root.text;
+    VerticalLayout {
+        alignment: center;
+        Image {
+            source: Look.icon-16(root.severity);
+            width: 16px;
+            height: 16px;
+            colorize: Look.ink(root.severity);
+            accessible-role: none;
+        }
+    }
+    Text {
+        text: root.text;
+        font-size: Theme.caption-size;
+        color: Look.ink(root.severity);
+        wrap: word-wrap;
+        vertical-alignment: center;
+        horizontal-stretch: 1;
+        accessible-role: none;
+    }
+    @children
+}
+
+// Live level: 24 px inset track with 3 px accent bars 2 px apart, newest at the right and centred
+// on the track; bars at 1.0 (clipping) are error red. With `live` off the track shows
+// `empty-text` ("No microphone") instead.
+export component Meter inherits Rectangle {
+    // Bar heights 0..1, oldest first.
+    in property <[float]> bars;
+    in property <bool> live: true;
+    in property <string> empty-text;
+    height: 24px;
+    min-width: 120px;
+    horizontal-stretch: 1;
+    border-radius: Theme.radius-control;
+    background: Theme.bg-inset;
+    clip: true;
+    accessible-role: progress-indicator;
+    accessible-label: root.live ? "" : root.empty-text;
+    if root.live: Rectangle {
+        for level[i] in root.bars: Rectangle {
+            x: root.width - 4px - (root.bars.length - i) * 5px;
+            width: 3px;
+            height: max(2px, clamp(level, 0, 1) * (root.height - 6px));
+            border-radius: 1.5px;
+            background: level >= 1 ? Theme.error-text : Theme.accent;
+            visible: self.x >= 2px;
+        }
+    }
+    if !root.live: Text {
+        text: root.empty-text;
+        font-size: Theme.caption-size;
+        color: Theme.text-secondary;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+}
+
+// 4 px rail with the accent fill; `error` turns the fill red (token budget exceeded). `label`
+// ("0.7 of 1.6 GB") sits right of the rail.
+export component ProgressBar inherits HorizontalLayout {
+    in property <float> value;
+    in property <bool> error;
+    in property <string> label;
+    spacing: Theme.space-2;
+    accessible-role: progress-indicator;
+    accessible-value: round(clamp(root.value, 0, 1) * 100) + " %";
+    VerticalLayout {
+        alignment: center;
+        horizontal-stretch: 1;
+        Rectangle {
+            height: 4px;
+            min-width: 80px;
+            border-radius: 2px;
+            background: Theme.bg-inset;
+            Rectangle {
+                x: 0;
+                width: parent.width * clamp(root.value, 0, 1);
+                border-radius: 2px;
+                background: root.error ? Theme.error-text : Theme.accent;
+            }
+        }
+    }
+    if root.label != "": Text {
+        text: root.label;
+        font-size: Theme.caption-size;
+        color: root.error ? Theme.error-text : Theme.text-secondary;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+}
+
+export enum BadgeKind { success, neutral, accent }
+
+// Small pill label: "Ready" (success), "Not downloaded" (neutral), "Recommended" (accent).
+export component Badge inherits Rectangle {
+    in property <string> text;
+    in property <BadgeKind> kind: BadgeKind.neutral;
+    property <color> ink: root.kind == BadgeKind.success ? Theme.success-text : root.kind == BadgeKind.accent ? Theme.accent-text : Theme.text-secondary;
+    border-radius: self.height / 2;
+    background: root.kind == BadgeKind.neutral ? Theme.bg-inset : root.ink.transparentize(0.86);
+    accessible-role: AccessibleRole.text;
+    accessible-label: root.text;
+    min-width: t.preferred-width + 16px;
+    min-height: t.preferred-height + 4px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    t := Text {
+        text: root.text;
+        font-size: Theme.caption-size;
+        color: root.ink;
+        accessible-role: none;
+    }
+}

@@ -1,0 +1,119 @@
+// Switch and radio dot: small selectable items, so selected = strong accent fill.
+import { Theme, Shell } from "../tokens.slint";
+import { FocusRing, KeyFocus } from "base.slint";
+
+// 40x20 track with the Fluent "On"/"Off" caption on its left. `locked` (read-only config) and
+// `enabled` both grey it out.
+export component Switch {
+    in-out property <bool> checked;
+    in property <bool> enabled: true;
+    in property <bool> locked: Shell.locked;
+    in property <bool> force-hover;
+    in property <bool> force-pressed;
+    in property <bool> force-focus;
+    callback toggled(bool);
+
+    property <bool> live: root.enabled && !root.locked;
+    property <bool> hover: root.live && (touch.has-hover || root.force-hover);
+    property <bool> down: root.live && (touch.pressed || root.force-pressed);
+    property <bool> key-focus;
+    property <color> ink: !root.live ? Theme.text-disabled : root.checked ? Theme.accent : Theme.text-secondary;
+
+    public function toggle() {
+        if (root.live) {
+            root.checked = !root.checked;
+            root.toggled(root.checked);
+        }
+    }
+
+    accessible-role: switch;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-enabled: root.live;
+    accessible-action-default => {
+        root.toggle();
+    }
+    height: Theme.control-height;
+
+    HorizontalLayout {
+        spacing: Theme.space-3;
+        Text {
+            text: root.checked ? @tr("On") : @tr("Off");
+            font-size: Theme.body-size;
+            color: root.live ? Theme.text-secondary : Theme.text-disabled;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            min-width: 24px;
+            accessible-role: none;
+        }
+        VerticalLayout {
+            alignment: center;
+            track := Rectangle {
+                width: 40px;
+                height: 20px;
+                border-radius: self.height / 2;
+                background: root.checked ? root.ink : transparent;
+                border-width: root.checked ? 0 : 1px;
+                border-color: root.ink;
+                // Knob: 12 px, 14 on hover, 17x14 while pressed.
+                knob := Rectangle {
+                    width: root.down ? 17px : root.hover ? 14px : 12px;
+                    height: root.down || root.hover ? 14px : 12px;
+                    border-radius: self.height / 2;
+                    x: root.checked ? parent.width - self.width - 4px : 4px;
+                    y: (parent.height - self.height) / 2;
+                    background: root.checked ? (root.live ? Theme.on-accent : Theme.bg-card) : root.ink;
+                    animate x, width { duration: 120ms; }
+                }
+                FocusRing {
+                    shown: root.force-focus || (root.key-focus && fs.has-focus);
+                    radius: 10px;
+                }
+            }
+        }
+    }
+    touch := TouchArea {
+        enabled: root.live;
+        clicked => {
+            root.toggle();
+        }
+    }
+    fs := FocusScope {
+        enabled: root.live;
+        focus-on-click: false;
+        focus-gained(reason) => {
+            root.key-focus = KeyFocus.from-key(reason);
+        }
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                root.toggle();
+                return accept;
+            }
+            reject
+        }
+    }
+}
+
+// The radio dot of a choice card (Model page): 16 px; selected = accent fill with an on-accent
+// centre. Visual only: the card around it carries the role and the click.
+export component Radio {
+    in property <bool> checked;
+    in property <bool> enabled: true;
+    in property <bool> hover;
+    width: 16px;
+    height: 16px;
+    accessible-role: none;
+    Rectangle {
+        border-radius: self.width / 2;
+        background: root.checked ? (root.enabled ? Theme.accent : Theme.text-disabled) : root.hover && root.enabled ? Theme.bg-subtle-hover : transparent;
+        border-width: root.checked ? 0 : 1px;
+        border-color: root.enabled ? Theme.text-secondary : Theme.text-disabled;
+        Rectangle {
+            visible: root.checked;
+            width: root.hover && root.enabled ? 8px : 6px;
+            height: self.width;
+            border-radius: self.width / 2;
+            background: Theme.on-accent;
+        }
+    }
+}

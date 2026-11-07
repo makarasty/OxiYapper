@@ -1,0 +1,280 @@
+// Page structure: header, groups, cards and the setting rows inside them (Windows 11 Settings
+// pattern: one card per setting, label and description left, control right).
+import { Theme, Shell } from "../tokens.slint";
+import { FocusRing, KeyFocus } from "base.slint";
+import { Switch } from "switch.slint";
+import { Slider, NumberField } from "slider.slint";
+
+export component PageHeader inherits VerticalLayout {
+    in property <string> title;
+    in property <string> caption;
+    padding-top: Theme.title-top;
+    padding-bottom: Theme.title-bottom;
+    spacing: Theme.space-1;
+    Text {
+        text: root.title;
+        font-size: Theme.title-size;
+        font-weight: Theme.weight-strong;
+        color: Theme.text-primary;
+        accessible-role: none;
+    }
+    if root.caption != "": Text {
+        text: root.caption;
+        font-size: Theme.body-size;
+        color: Theme.text-secondary;
+        wrap: word-wrap;
+    }
+}
+
+// An optional header 8 px above its cards; the cards (children) 4 px apart. No box of its own.
+export component Group inherits VerticalLayout {
+    in property <string> title;
+    in property <image> icon;
+    spacing: Theme.card-gap;
+    if root.title != "": HorizontalLayout {
+        padding-bottom: Theme.header-gap - Theme.card-gap;
+        spacing: Theme.space-2;
+        if root.icon.width > 0: Image {
+            source: root.icon;
+            width: 16px;
+            colorize: Theme.text-primary;
+            accessible-role: none;
+        }
+        Text {
+            text: root.title;
+            font-size: Theme.body-size;
+            font-weight: Theme.weight-strong;
+            color: Theme.text-primary;
+            horizontal-stretch: 1;
+        }
+    }
+    @children
+}
+
+// bg-card, 1 px stroke, radius 8, padding 16/12. The children stack with 8 px gaps.
+export component Card inherits Rectangle {
+    background: Theme.bg-card;
+    border-color: Theme.stroke-card;
+    border-width: 1px;
+    border-radius: Theme.radius-card;
+    // The wrapped texts inside make the card's height depend on its width; take it from the layout.
+    min-height: inner.min-height;
+    preferred-height: inner.preferred-height;
+    inner := VerticalLayout {
+        padding-left: Theme.card-padding-h;
+        padding-right: Theme.card-padding-h;
+        padding-top: Theme.card-padding-v;
+        padding-bottom: Theme.card-padding-v;
+        spacing: Theme.space-2;
+        alignment: start;
+        @children
+    }
+}
+
+// A whole-card button (model choice, About links): hover and pressed fills, focus ring, Enter
+// and Space click it.
+export component ClickCard inherits Rectangle {
+    in property <bool> enabled: true;
+    in property <bool> force-hover;
+    in property <bool> force-pressed;
+    in property <bool> force-focus;
+    out property <bool> hover: root.enabled && (touch.has-hover || root.force-hover);
+    callback clicked;
+    property <bool> down: root.enabled && (touch.pressed || root.force-pressed);
+    property <bool> key-focus;
+    background: root.down ? Theme.bg-control-pressed : root.hover ? Theme.bg-control-hover : Theme.bg-card;
+    border-color: Theme.stroke-card;
+    border-width: 1px;
+    border-radius: Theme.radius-card;
+    accessible-role: button;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        if (root.enabled) {
+            root.clicked();
+        }
+    }
+    min-height: inner.min-height;
+    preferred-height: inner.preferred-height;
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            root.clicked();
+        }
+    }
+    fs := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: false;
+        focus-gained(reason) => {
+            root.key-focus = KeyFocus.from-key(reason);
+        }
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+    inner := VerticalLayout {
+        padding-left: Theme.card-padding-h;
+        padding-right: Theme.card-padding-h;
+        padding-top: Theme.card-padding-v;
+        padding-bottom: Theme.card-padding-v;
+        spacing: Theme.space-2;
+        alignment: start;
+        @children
+    }
+    FocusRing {
+        shown: root.force-focus || (root.key-focus && fs.has-focus);
+        radius: Theme.radius-card;
+    }
+}
+
+// `[icon 20?] [title + description, both wrap] .... [control column]` inside a Card. The control
+// column (children, right-aligned) takes about 36 % of the row, 240 to 360 px.
+export component Row inherits HorizontalLayout {
+    in property <image> icon;
+    in property <string> title;
+    in property <string> description;
+    in property <bool> enabled: true;
+    in property <length> control-min: Theme.control-column-min;
+    // Stretch the controls over the column (slider, meter) instead of packing them right.
+    in property <bool> fill-controls;
+    spacing: Theme.icon-gap;
+    min-height: root.description == "" ? 24px : 32px;
+    if root.icon.width > 0: VerticalLayout {
+        alignment: center;
+        Image {
+            source: root.icon;
+            width: 20px;
+            height: 20px;
+            colorize: root.enabled ? Theme.text-primary : Theme.text-disabled;
+            accessible-role: none;
+        }
+    }
+    VerticalLayout {
+        alignment: center;
+        spacing: Theme.title-gap;
+        horizontal-stretch: 64;
+        preferred-width: 0;
+        Text {
+            text: root.title;
+            font-size: Theme.body-size;
+            color: root.enabled ? Theme.text-primary : Theme.text-disabled;
+            wrap: word-wrap;
+        }
+        if root.description != "": Text {
+            text: root.description;
+            font-size: Theme.caption-size;
+            color: root.enabled ? Theme.text-secondary : Theme.text-disabled;
+            wrap: word-wrap;
+        }
+    }
+    HorizontalLayout {
+        horizontal-stretch: 36;
+        preferred-width: 0;
+        min-width: root.control-min;
+        max-width: Theme.control-column-max;
+        alignment: root.fill-controls ? LayoutAlignment.stretch : LayoutAlignment.end;
+        spacing: Theme.control-gap;
+        @children
+    }
+}
+
+// A Card with one Row and a Switch; a click anywhere on the card toggles it (Windows 11). The
+// Switch keeps the role and takes the row title as its label.
+export component ToggleRow inherits Rectangle {
+    in property <image> icon;
+    in property <string> title;
+    in property <string> description;
+    in-out property <bool> checked;
+    in property <bool> enabled: true;
+    in property <bool> locked: Shell.locked;
+    in property <bool> force-hover;
+    in property <bool> force-focus;
+    callback toggled(bool);
+    property <bool> live: root.enabled && !root.locked;
+    background: root.live && (touch.has-hover || root.force-hover) ? Theme.bg-control-hover : Theme.bg-card;
+    border-color: Theme.stroke-card;
+    border-width: 1px;
+    border-radius: Theme.radius-card;
+    min-height: inner.min-height;
+    preferred-height: inner.preferred-height;
+    touch := TouchArea {
+        enabled: root.live;
+        clicked => {
+            switch.toggle();
+        }
+    }
+    inner := VerticalLayout {
+        padding-left: Theme.card-padding-h;
+        padding-right: Theme.card-padding-h;
+        padding-top: Theme.card-padding-v;
+        padding-bottom: Theme.card-padding-v;
+        Row {
+            icon: root.icon;
+            title: root.title;
+            description: root.description;
+            enabled: root.live;
+            switch := Switch {
+                checked <=> root.checked;
+                enabled: root.enabled;
+                locked: root.locked;
+                force-hover: root.force-hover;
+                force-focus: root.force-focus;
+                accessible-label: root.title;
+                toggled(on) => {
+                    root.toggled(on);
+                }
+            }
+        }
+    }
+}
+
+// A Row whose control column holds a Slider and its NumberField, bound to one value.
+export component SliderRow inherits Row {
+    in-out property <float> value;
+    in property <float> minimum: 0;
+    in property <float> maximum: 1;
+    in property <float> step: 1;
+    in property <float> default-value: root.minimum;
+    in property <bool> bipolar;
+    in property <int> decimals: 0;
+    in property <string> unit;
+    in property <bool> signed;
+    in property <string> zero-text;
+    in property <bool> locked: Shell.locked;
+    callback changed(float);
+    control-min: 280px;
+    fill-controls: true;
+    Slider {
+        value <=> root.value;
+        minimum: root.minimum;
+        maximum: root.maximum;
+        step: root.step;
+        default-value: root.default-value;
+        bipolar: root.bipolar;
+        enabled: root.enabled;
+        locked: root.locked;
+        accessible-label: root.title;
+        changed(v) => {
+            root.changed(v);
+        }
+    }
+    NumberField {
+        value <=> root.value;
+        minimum: root.minimum;
+        maximum: root.maximum;
+        step: root.step;
+        decimals: root.decimals;
+        unit: root.unit;
+        signed: root.signed;
+        zero-text: root.zero-text;
+        enabled: root.enabled;
+        locked: root.locked;
+        accessible-label: root.title;
+        changed(v) => {
+            root.changed(v);
+        }
+    }
+}

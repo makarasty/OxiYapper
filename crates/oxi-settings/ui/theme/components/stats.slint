@@ -1,0 +1,171 @@
+// Home dashboard pieces: stat cards and the speaking-activity heatmap.
+import { Theme } from "../tokens.slint";
+
+// One number on a card: icon + label, the big value ("299.9K"), a caption ("All time").
+export component StatCard inherits Rectangle {
+    in property <image> icon;
+    in property <string> label;
+    in property <string> value;
+    in property <string> caption;
+    background: Theme.bg-card;
+    border-color: Theme.stroke-card;
+    border-width: 1px;
+    border-radius: Theme.radius-card;
+    min-width: 160px;
+    horizontal-stretch: 1;
+    min-height: inner.min-height;
+    preferred-height: inner.preferred-height;
+    accessible-role: AccessibleRole.text;
+    accessible-label: root.label + ": " + root.value + (root.caption == "" ? "" : ", " + root.caption);
+    inner := VerticalLayout {
+        padding: Theme.space-4;
+        spacing: Theme.space-1;
+        HorizontalLayout {
+            spacing: Theme.space-2;
+            if root.icon.width > 0: VerticalLayout {
+                alignment: center;
+                Image {
+                    source: root.icon;
+                    width: 20px;
+                    height: 20px;
+                    colorize: Theme.accent-text;
+                    accessible-role: none;
+                }
+            }
+            Text {
+                text: root.label;
+                font-size: Theme.body-size;
+                color: Theme.text-secondary;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+                accessible-role: none;
+            }
+        }
+        Text {
+            text: root.value;
+            font-size: Theme.title-size;
+            font-weight: Theme.weight-strong;
+            color: Theme.text-primary;
+            accessible-role: none;
+        }
+        Text {
+            text: root.caption;
+            font-size: Theme.caption-size;
+            color: Theme.text-secondary;
+            overflow: elide;
+            accessible-role: none;
+        }
+    }
+}
+
+export struct MonthLabel {
+    // Week column the month starts in.
+    week: int,
+    text: string,
+}
+
+// GitHub-style activity grid: weeks as columns, Sunday..Saturday as rows, month labels on top,
+// five levels from empty to full accent, a Less..More legend, today's cell outlined.
+// `levels` is one 0..4 per day, week by week (index = week * 7 + weekday, Sunday first); the
+// last week may be partial. `today` is the index of today's cell (-1: none).
+export component ActivityHeatmap {
+    in property <[int]> levels;
+    in property <[MonthLabel]> months;
+    in property <int> today: -1;
+    in property <[string]> day-labels: [@tr("Sun"), @tr("Mon"), @tr("Tue"), @tr("Wed"), @tr("Thu"), @tr("Fri"), @tr("Sat")];
+    in property <string> less-text: @tr("Less");
+    in property <string> more-text: @tr("More");
+    in property <length> cell: 12px;
+    in property <length> gap: 3px;
+    property <length> pitch: root.cell + root.gap;
+    property <int> weeks: ceil(root.levels.length / 7);
+    property <length> label-w: 32px;
+    property <length> top: 20px;
+
+    public pure function level-color(level: int) -> color {
+        return level <= 0 ? Theme.bg-inset : level == 1 ? Theme.accent.transparentize(0.75) : level == 2 ? Theme.accent.transparentize(0.5) : level == 3 ? Theme.accent.transparentize(0.25) : Theme.accent;
+    }
+
+    accessible-role: image;
+    min-width: root.label-w + root.weeks * root.pitch;
+    min-height: grid.height + legend.height + Theme.space-3;
+
+    grid := Rectangle {
+        x: 0;
+        y: 0;
+        width: root.label-w + root.weeks * root.pitch;
+        height: root.top + 7 * root.pitch;
+        for m in root.months: Text {
+            x: root.label-w + m.week * root.pitch;
+            y: 0;
+            text: m.text;
+            font-size: Theme.caption-size;
+            color: Theme.text-secondary;
+            accessible-role: none;
+        }
+        for d[i] in root.day-labels: Text {
+            x: 0;
+            y: root.top + i * root.pitch + (root.cell - Theme.caption-line) / 2;
+            height: Theme.caption-line;
+            text: d;
+            font-size: Theme.caption-size;
+            color: Theme.text-secondary;
+            accessible-role: none;
+        }
+        for level[i] in root.levels: Rectangle {
+            x: root.label-w + floor(i / 7) * root.pitch;
+            y: root.top + mod(i, 7) * root.pitch;
+            width: root.cell;
+            height: root.cell;
+            border-radius: 2px;
+            background: root.level-color(level);
+            // Today: outlined in the text colour, 1 px outside the cell.
+            if i == root.today: Rectangle {
+                x: -2px;
+                y: -2px;
+                width: parent.width + 4px;
+                height: parent.height + 4px;
+                border-radius: 3px;
+                border-width: 1.5px;
+                border-color: Theme.text-primary;
+            }
+        }
+    }
+    legend := HorizontalLayout {
+        x: grid.width - self.preferred-width;
+        y: grid.height + Theme.space-3;
+        width: self.preferred-width;
+        height: Theme.caption-line;
+        spacing: root.gap;
+        Text {
+            text: root.less-text;
+            font-size: Theme.caption-size;
+            color: Theme.text-secondary;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+        Rectangle {
+            width: Theme.space-1;
+        }
+        for level in 5: VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: root.cell;
+                height: root.cell;
+                border-radius: 2px;
+                background: root.level-color(level);
+            }
+        }
+        Rectangle {
+            width: Theme.space-1;
+        }
+        Text {
+            text: root.more-text;
+            font-size: Theme.caption-size;
+            color: Theme.text-secondary;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+    }
+}
