@@ -36,6 +36,7 @@ features = [
     "Win32_System_Ole",                # CF_UNICODETEXT
     "Win32_System_Pipes",              # CreateNamedPipeW
     "Win32_System_RemoteDesktop",      # WTSRegisterSessionNotification
+    "Win32_System_SystemInformation",  # GetLocalTime
     "Win32_System_Threading",          # OpenProcess, QueryFullProcessImageNameW, OpenProcessToken
     "Win32_UI_HiDpi",                  # GetDpiForMonitor, SetProcessDpiAwarenessContext
     "Win32_UI_Input_KeyboardAndMouse", # SendInput, GetAsyncKeyState
