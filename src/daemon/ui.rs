@@ -65,6 +65,11 @@ impl Ui {
                     tracing::warn!("tray icon not updated: {e}");
                 }
             }
+            UiCmd::Badge(badge) => {
+                if let Err(e) = tray.set_badge(badge) {
+                    tracing::warn!("tray badge not updated: {e}");
+                }
+            }
             UiCmd::Notify(notice) => {
                 if let Err(e) = tray.notify(notice) {
                     tracing::warn!(?notice, "tray balloon not shown: {e}");

@@ -13,6 +13,7 @@ use oxi_core::machine::{
     self, Effect, EngineWarning, Event, JobId, MachineConfig, Phase, PhaseCell, State,
 };
 use oxi_core::paste::PasteOutcome;
+use oxi_core::tray::{self, TrayBadge};
 use oxi_core::types::Millis;
 use oxi_core::{stats, strings};
 
@@ -26,6 +27,10 @@ pub struct Coordinator<H> {
     phase: PhaseCell,
     /// Last phase sent as `UiCmd::Tray`.
     tray: Phase,
+    /// An error notice was raised and no dictation reached a field or the clipboard since.
+    failed: bool,
+    /// Last badge sent as `UiCmd::Badge`.
+    badge: TrayBadge,
     active: Config,
     warnings: Vec<String>,
     /// The whisper worker's latest `EngineWarning`.
@@ -68,6 +73,8 @@ impl<H: ChordHook> Coordinator<H> {
             state: State::new(MachineConfig::from(&config)),
             phase,
             tray: Phase::Idle,
+            failed: false,
+            badge: TrayBadge::None,
             active: config,
             warnings,
             engine_warning: None,
@@ -108,6 +115,7 @@ impl<H: ChordHook> Coordinator<H> {
     pub fn handle(&mut self, msg: Inbox, now: Millis) {
         self.dispatch(msg, now);
         self.sync_warnings();
+        self.sync_badge();
     }
 
     fn dispatch(&mut self, msg: Inbox, now: Millis) {
@@ -116,6 +124,8 @@ impl<H: ChordHook> Coordinator<H> {
                 if let Event::PasteDone { job, outcome } = event {
                     self.count(job, outcome);
                     self.keep_last_text(job);
+                    // A failed paste raises its notice again in `feed`.
+                    self.failed = false;
                 }
                 self.feed(event, now);
             }
@@ -255,7 +265,10 @@ impl<H: ChordHook> Coordinator<H> {
             // shortcut: sounds land in M10; until then a played sound is only logged.
             Effect::Play(sound) => tracing::debug!(?sound, "sound"),
             Effect::Overlay(state) => self.ui(UiCmd::Overlay(state)),
-            Effect::Notify(notice) => self.ui(UiCmd::Notify(notice)),
+            Effect::Notify(notice) => {
+                self.failed |= tray::is_error(notice);
+                self.ui(UiCmd::Notify(notice));
+            }
         }
         None
     }
@@ -321,6 +334,20 @@ impl<H: ChordHook> Coordinator<H> {
         if now != self.shown_warnings {
             self.shown_warnings.clone_from(&now);
             self.ui(UiCmd::Warnings(now));
+        }
+    }
+
+    /// The error badge while the last dictation failed or the config file is invalid; tells
+    /// the tray when it changed.
+    fn sync_badge(&mut self) {
+        let badge = if self.failed || self.config_error.is_some() {
+            TrayBadge::Error
+        } else {
+            TrayBadge::None
+        };
+        if badge != self.badge {
+            self.badge = badge;
+            self.ui(UiCmd::Badge(badge));
         }
     }
 
@@ -773,6 +800,60 @@ mod tests {
                 vec![error],
             ]
         );
+    }
+
+    #[test]
+    fn errors_raise_the_tray_badge_until_a_dictation_lands_or_the_config_is_fixed() {
+        let badges = |rig: &Rig| -> Vec<TrayBadge> {
+            drain(&rig.ui)
+                .into_iter()
+                .filter_map(|c| match c {
+                    UiCmd::Badge(b) => Some(b),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut rig = Rig::new();
+        let job = rig.transcribed("one");
+        rig.event(
+            Event::PasteDone {
+                job,
+                outcome: PasteOutcome::Failed,
+            },
+            3000,
+        );
+        assert_eq!(badges(&rig), [TrayBadge::Error], "a failed paste");
+        let job = rig.transcribed("two");
+        rig.event(
+            Event::PasteDone {
+                job,
+                outcome: PasteOutcome::Pasted,
+            },
+            4000,
+        );
+        assert_eq!(badges(&rig), [TrayBadge::None], "the next one landed");
+
+        let job = rig.record();
+        rig.event(
+            Event::JobAudioEmpty {
+                job,
+                why: EmptyAudio::MicSilence,
+            },
+            2100,
+        );
+        assert!(badges(&rig).is_empty(), "a hint is no error");
+
+        rig.c
+            .handle(Inbox::ConfigError(ConfigError::ReadOnly), Millis(5000));
+        assert_eq!(badges(&rig), [TrayBadge::Error], "an invalid config");
+        rig.c.handle(
+            Inbox::Config {
+                config: Box::new(Config::default()),
+                warnings: Vec::new(),
+            },
+            Millis(5100),
+        );
+        assert_eq!(badges(&rig), [TrayBadge::None], "the config was fixed");
     }
 
     #[test]
