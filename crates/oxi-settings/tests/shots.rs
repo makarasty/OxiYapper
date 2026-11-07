@@ -10,6 +10,7 @@ use std::rc::Rc;
 
 use i_slint_backend_testing::{AccessibleRole, ElementHandle};
 use oxi_core::device::Device;
+use oxi_core::hotkey::Key;
 use oxi_core::ipc::{DownloadResult, Push};
 use oxi_core::paths::Layout;
 use oxi_settings::ipc::{Event, Link};
@@ -154,10 +155,74 @@ fn shot_hotkey() {
     shot("hotkey", Page::Hotkey, None);
 }
 
+/// The hotkey page with its keyboard open on a fake daemon link; `drive` presses keys or drops the
+/// link before the shot.
+fn shot_board(screen: &str, drive: fn(&Ipc)) {
+    for (theme, choice) in [("light", ThemeChoice::Light), ("dark", ThemeChoice::Dark)] {
+        let _ = slint::platform::set_platform(Box::new(Shots));
+        let (ipc, _sent) = Ipc::fake();
+        let window = oxi_settings::open_with(common::layout(screen, None), ipc.clone()).unwrap();
+        window.set_page(Page::Hotkey);
+        window.set_theme(choice);
+        window.show().unwrap();
+        ElementHandle::find_by_accessible_label(&window, "Change hotkey")
+            .next()
+            .unwrap()
+            .invoke_accessible_default_action();
+        drive(&ipc);
+        save(&render(&window, 1.0), screen, theme);
+    }
+}
+
+fn key(ipc: &Ipc, code: Key, down: bool) {
+    push(ipc, Push::Key { code, down });
+}
+
 #[test]
 fn shot_keyboard() {
-    // shortcut: the hotkey page until its task adds the visual keyboard; open it here then.
-    shot("keyboard", Page::Hotkey, None);
+    // Open with nothing pressed.
+    shot_board("keyboard", |_| {});
+}
+
+#[test]
+fn shot_keyboard_held() {
+    // Ctrl + Shift + F13 down: held keys lit.
+    shot_board("keyboard-held", |ipc| {
+        for k in [Key::LCtrl, Key::LShift, Key::F13] {
+            key(ipc, k, true);
+        }
+    });
+}
+
+#[test]
+fn shot_keyboard_invalid() {
+    // Esc inside a chord: the error line.
+    shot_board("keyboard-invalid", |ipc| {
+        key(ipc, Key::LCtrl, true);
+        key(ipc, Key::Esc, true);
+    });
+}
+
+#[test]
+fn shot_keyboard_ready() {
+    // Every key released after Ctrl + F13: the focus moves to Apply.
+    shot_board("keyboard-ready", |ipc| {
+        for k in [Key::LCtrl, Key::F13] {
+            key(ipc, k, true);
+        }
+        for k in [Key::LCtrl, Key::F13] {
+            key(ipc, k, false);
+        }
+    });
+}
+
+#[test]
+fn shot_keyboard_offline() {
+    // The daemon goes away with the board open.
+    shot_board("keyboard-offline", |ipc| {
+        key(ipc, Key::LCtrl, true);
+        ipc.deliver(&Event::Link(Link::Offline));
+    });
 }
 
 #[test]
