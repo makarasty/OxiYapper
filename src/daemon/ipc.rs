@@ -503,35 +503,126 @@ fn is_settings(foreground: u32, client: u32, own: u32) -> bool {
     foreground != 0 && foreground == client && foreground != own
 }
 
+/// The settings process this daemon started.
+#[derive(Default)]
+struct SettingsProc {
+    /// Kept so a window that is still starting is not started twice.
+    child: Mutex<Option<std::process::Child>>,
+    /// Set once the daemon is going down: no new window may outlive it.
+    closing: AtomicBool,
+}
+
+impl SettingsProc {
+    /// `start` runs unless a window is still starting or the daemon is going down.
+    fn open(&self, start: impl FnOnce() -> io::Result<std::process::Child>) -> io::Result<()> {
+        let mut child = lock(&self.child);
+        if self.closing.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if let Some(running) = child.as_mut()
+            && running.try_wait()?.is_none()
+        {
+            return Ok(()); // still starting; it will connect
+        }
+        *child = Some(start()?);
+        Ok(())
+    }
+
+    /// From now on `open` does nothing; returns the running child, if any.
+    fn stop_opening(&self) -> Option<std::process::Child> {
+        // Under the lock, so an `open` that is running finishes first and its child is taken.
+        let mut child = lock(&self.child);
+        self.closing.store(true, Ordering::SeqCst);
+        child.take()
+    }
+}
+
+/// How long a window gets to close itself and save before the process is ended.
+const CLOSE_WAIT: Duration = Duration::from_millis(1500);
+
+/// Asks `child` to close its windows (`WM_CLOSE`, so the page saves a pending edit), waits up
+/// to [`CLOSE_WAIT`], then ends it. A child with no window yet is ended at once.
+fn end_child(child: &mut std::process::Child) {
+    if close::post_close(child.id()) > 0 {
+        let deadline = Instant::now() + CLOSE_WAIT;
+        while Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// `WM_CLOSE` to the top-level windows of a process.
+mod close {
+    use core::ffi::c_void;
+
+    type Hwnd = *mut c_void;
+    const WM_CLOSE: u32 = 0x0010;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumWindows(f: unsafe extern "system" fn(Hwnd, isize) -> i32, lparam: isize) -> i32;
+        fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
+        fn PostMessageW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> i32;
+    }
+
+    struct Query {
+        pid: u32,
+        posted: usize,
+    }
+
+    unsafe extern "system" fn visit(hwnd: Hwnd, lparam: isize) -> i32 {
+        // SAFETY: `lparam` is the `&mut Query` that `post_close` passed and keeps alive.
+        let query = unsafe { &mut *(lparam as *mut Query) };
+        let mut pid = 0;
+        // SAFETY: `hwnd` comes from EnumWindows; `pid` is a valid out-pointer.
+        unsafe { GetWindowThreadProcessId(hwnd, &raw mut pid) };
+        // SAFETY: a posted message needs only the handle EnumWindows gave.
+        if pid == query.pid && unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) } != 0 {
+            query.posted += 1;
+        }
+        1
+    }
+
+    /// How many windows of `pid` were asked to close.
+    pub fn post_close(pid: u32) -> usize {
+        let mut query = Query { pid, posted: 0 };
+        // SAFETY: `visit` only uses `query` during this call, which it outlives.
+        unsafe { EnumWindows(visit, (&raw mut query) as isize) };
+        query.posted
+    }
+}
+
 /// The real host: the hook handle, the foreground window, `current_exe settings`.
 pub struct SystemHost {
     hook: Arc<oxi_platform::os::hook::HookHandle>,
-    /// The settings process this daemon started, kept so a window that is still starting is not
-    /// started twice.
-    child: Mutex<Option<std::process::Child>>,
+    settings: SettingsProc,
 }
 
 impl SystemHost {
     pub fn new(hook: Arc<oxi_platform::os::hook::HookHandle>) -> Self {
         Self {
             hook,
-            child: Mutex::default(),
+            settings: SettingsProc::default(),
         }
     }
 
-    /// The tray's Quit ends the whole app: the settings window this daemon started goes too.
-    /// The Stop button does not come here; its window stays and offers Start.
-    pub fn close_settings(&self) {
-        kill_child(&self.child);
+    /// The daemon is going down: a later `OpenSettings` starts nothing. An open settings window
+    /// stays (the Stop button's way: it shows the daemon offline and Start).
+    pub fn stop_opening_settings(&self) {
+        drop(self.settings.stop_opening());
     }
-}
 
-/// Ends the process in `slot`, if it still runs. An edit still in the 300 ms save debounce is
-/// lost; the window saves every other change as it is made.
-fn kill_child(slot: &Mutex<Option<std::process::Child>>) {
-    if let Some(mut child) = lock(slot).take() {
-        let _ = child.kill();
-        let _ = child.wait();
+    /// The tray's Quit ends the whole app: no new settings window, and the one this daemon
+    /// started closes. The lock is not held while it does.
+    pub fn close_settings(&self) {
+        if let Some(mut child) = self.settings.stop_opening() {
+            end_child(&mut child);
+        }
     }
 }
 
@@ -564,21 +655,16 @@ impl Host for SystemHost {
     }
 
     fn open_settings(&self) -> io::Result<()> {
-        let mut child = lock(&self.child);
-        if let Some(running) = child.as_mut()
-            && running.try_wait()?.is_none()
-        {
-            return Ok(()); // still starting; it will connect
-        }
-        let started = std::process::Command::new(std::env::current_exe()?)
-            .arg("settings")
-            .spawn()?;
-        // Its first window comes to the front only with this permission.
-        if let Err(e) = self.allow_foreground(started.id()) {
-            tracing::debug!(kind = ?e.kind(), "foreground not allowed for settings");
-        }
-        *child = Some(started);
-        Ok(())
+        self.settings.open(|| {
+            let started = std::process::Command::new(std::env::current_exe()?)
+                .arg("settings")
+                .spawn()?;
+            // Its first window comes to the front only with this permission.
+            if let Err(e) = self.allow_foreground(started.id()) {
+                tracing::debug!(kind = ?e.kind(), "foreground not allowed for settings");
+            }
+            Ok(started)
+        })
     }
 }
 
@@ -638,18 +724,69 @@ mod tests {
         }
     }
 
-    #[test]
-    fn kill_child_ends_a_running_process_and_ignores_an_empty_slot() {
-        let slot = Mutex::new(None);
-        kill_child(&slot);
-        let child = std::process::Command::new("cmd")
-            .args(["/c", "ping", "-n", "30", "127.0.0.1"])
+    /// A one-process child (`ping` starts no grandchild), so nothing is left behind.
+    fn sleeper() -> std::process::Child {
+        std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn end_child_leaves_no_process_behind() {
+        let mut child = sleeper();
+        end_child(&mut child); // no window: ended at once
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn end_child_lets_a_window_close_itself() {
+        // A Forms window exits with 0 on WM_CLOSE; a killed process exits with 1.
+        let script = "Add-Type -AssemblyName System.Windows.Forms; \
+                      [Windows.Forms.Application]::Run((New-Object Windows.Forms.Form))";
+        let mut child = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .spawn()
             .unwrap();
-        *lock(&slot) = Some(child);
-        kill_child(&slot);
-        assert!(lock(&slot).is_none());
+        let up = Instant::now() + Duration::from_secs(30);
+        while !has_window(child.id()) {
+            assert!(Instant::now() < up, "the test window never opened");
+            thread::sleep(Duration::from_millis(100));
+        }
+        end_child(&mut child);
+        assert_eq!(child.try_wait().unwrap().and_then(|s| s.code()), Some(0));
+    }
+
+    /// Does `pid` own a window yet? Asked of Windows through another process, since
+    /// `post_close` would close it.
+    fn has_window(pid: u32) -> bool {
+        let out = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("(Get-Process -Id {pid}).MainWindowHandle -ne 0"),
+            ])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim() == "True"
+    }
+
+    #[test]
+    fn settings_proc_opens_once_and_never_after_closing() {
+        let settings = SettingsProc::default();
+        let started = std::cell::Cell::new(0);
+        let start = || {
+            started.set(started.get() + 1);
+            Ok(sleeper())
+        };
+        settings.open(start).unwrap();
+        settings.open(start).unwrap(); // still running: not started twice
+        assert_eq!(started.get(), 1);
+        let mut child = settings.stop_opening().unwrap();
+        end_child(&mut child);
+        settings.open(start).unwrap();
+        assert_eq!(started.get(), 1, "opened after the daemon went down");
     }
 
     /// A line that is no `Request`, written raw.

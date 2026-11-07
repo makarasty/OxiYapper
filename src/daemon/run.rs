@@ -131,6 +131,8 @@ pub fn run() -> anyhow::Result<()> {
         },
     );
 
+    // Whatever ended the loop (tray Quit, IPC Shutdown, a panic), no settings window starts now.
+    quit_host.stop_opening_settings();
     // In order: the coordinator, whose end closed every worker's channel, then the workers,
     // then the watcher. The tray icon and the overlay go with `tray` and `ui`.
     join(coordinator);

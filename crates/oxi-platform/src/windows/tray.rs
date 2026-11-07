@@ -47,8 +47,10 @@ const WM_TRAY: u32 = WM_APP + 1;
 /// The [`Waker::quit`] message.
 const WM_EXIT: u32 = WM_APP + 2;
 const ICON_ID: u32 = 1;
-/// `WM_USER`: the `NOTIFYICON_VERSION_4` event of a left click or Enter on the icon.
+/// `WM_USER`: the `NOTIFYICON_VERSION_4` event of a mouse selection of the icon.
 const NIN_SELECT: i32 = 0x400;
+/// `WM_USER + 1`: the same by keyboard (Enter or Space on the focused icon).
+const NIN_KEYSELECT: i32 = 0x401;
 
 pub use oxi_core::tray::MenuItem;
 
@@ -482,13 +484,14 @@ fn halves(bytes: &[u8]) -> (i16, i16) {
 }
 
 /// What a tray callback (`NOTIFYICON_VERSION_4`: the event in the low word of `lparam`) asks for.
-/// A left click arrives as `WM_LBUTTONUP` and as `NIN_SELECT`; both open settings, and a second
-/// open of a window that is already starting is a no-op in the daemon.
+/// A left click arrives as `WM_LBUTTONUP` and `NIN_SELECT`, a keyboard activation as
+/// `NIN_KEYSELECT`; each opens settings, and a repeat while the window is starting is a no-op
+/// in the daemon.
 fn tray_event(event: i16, x: i32, y: i32) -> Option<Incoming> {
     let event = i32::from(event);
     if event == WM_CONTEXTMENU.cast_signed() {
         Some(Incoming::Menu { x, y })
-    } else if event == WM_LBUTTONUP.cast_signed() || event == NIN_SELECT {
+    } else if [WM_LBUTTONUP.cast_signed(), NIN_SELECT, NIN_KEYSELECT].contains(&event) {
         Some(Incoming::Click)
     } else {
         None
@@ -588,7 +591,7 @@ mod tests {
             tray_event(WM_CONTEXTMENU.cast_signed().try_into().unwrap(), 3, 4),
             Some(Incoming::Menu { x: 3, y: 4 })
         ));
-        for click in [WM_LBUTTONUP.cast_signed(), NIN_SELECT] {
+        for click in [WM_LBUTTONUP.cast_signed(), NIN_SELECT, NIN_KEYSELECT] {
             assert!(matches!(
                 tray_event(click.try_into().unwrap(), 0, 0),
                 Some(Incoming::Click)
