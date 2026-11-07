@@ -84,6 +84,7 @@ pub fn run() -> anyhow::Result<()> {
     // Never joined: the IPC threads hold its sender until the process ends.
     io::spawn(io_rx, pushes.clone(), layout.models_dir())?;
     let host = Arc::new(SystemHost::new(Arc::clone(&hook)));
+    let quit_host = Arc::clone(&host);
     ipc::spawn(server, inbox.clone(), io_tx, host, pushes.clone(), keys_rx)?;
 
     let (watch_tx, watch_rx) = mpsc::channel();
@@ -124,12 +125,14 @@ pub fn run() -> anyhow::Result<()> {
     let session = inbox.clone();
     tray.run(
         |tray| ui.on_wake(tray),
-        |_, item| on_menu(item, &inbox, &waker),
+        |_, item| on_menu(item, &inbox, &waker, &quit_host),
         move |event| {
             let _ = session.send(Inbox::Event(event));
         },
     );
 
+    // Whatever ended the loop (tray Quit, IPC Shutdown, a panic), no settings window starts now.
+    quit_host.stop_opening_settings();
     // In order: the coordinator, whose end closed every worker's channel, then the workers,
     // then the watcher. The tray icon and the overlay go with `tray` and `ui`.
     join(coordinator);
@@ -193,13 +196,14 @@ fn notifier(ui: &Sender<UiCmd>, waker: &Waker) -> impl Fn(Notice) + Send + 'stat
     }
 }
 
-fn on_menu(item: MenuItem, inbox: &Sender<Inbox>, waker: &Waker) {
+fn on_menu(item: MenuItem, inbox: &Sender<Inbox>, waker: &Waker, host: &SystemHost) {
     match item {
         MenuItem::Settings => open_settings(),
         MenuItem::CopyLast => {
             let _ = inbox.send(Inbox::CopyLastText);
         }
         MenuItem::Quit => {
+            host.close_settings();
             if inbox.send(Inbox::Shutdown).is_err() {
                 let _ = waker.quit(); // no coordinator left to end the loop
             }
