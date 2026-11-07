@@ -57,6 +57,17 @@ pub struct Level {
     pub rms: f32,
 }
 
+impl Level {
+    /// The level of the same samples after a linear `gain`: both measures scale with it.
+    #[must_use]
+    pub fn scaled(self, gain: f32) -> Self {
+        Self {
+            peak: self.peak * gain,
+            rms: self.rms * gain,
+        }
+    }
+}
+
 /// Average the interleaved channels into one.
 #[must_use]
 pub fn downmix(interleaved: &[f32], channels: usize) -> Vec<f32> {
@@ -98,6 +109,28 @@ fn normalise(samples: &mut [f32]) {
     }
 }
 
-fn db_to_linear(db: f32) -> f32 {
+/// Decibels to a linear amplitude factor.
+#[must_use]
+pub fn db_to_linear(db: f32) -> f32 {
     10.0_f32.powf(db / 20.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The settings meter opens its stream at 0 dB and scales the level by the gain instead.
+    #[test]
+    fn scaled_level_equals_the_level_after_gain() {
+        let mono = [0.1, -0.2, 0.05];
+        let raw = level(&mono);
+        for gain_db in [-12.0_f32, 0.0, 6.0, 20.0] {
+            let gain = db_to_linear(gain_db);
+            let gained: Vec<f32> = mono.iter().map(|s| s * gain).collect();
+            let (after, scaled) = (level(&gained), raw.scaled(gain));
+            assert!((after.peak - scaled.peak).abs() < 1e-6, "{gain_db}");
+            assert!((after.rms - scaled.rms).abs() < 1e-6, "{gain_db}");
+        }
+        assert!((db_to_linear(6.0) - 1.9953).abs() < 1e-4);
+    }
 }

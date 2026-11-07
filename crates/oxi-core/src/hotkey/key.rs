@@ -23,7 +23,9 @@ macro_rules! keys {
                 }
             }
 
-            /// Text printed on the keycap in the settings keyboard.
+            /// Text printed on the keycap in the settings keyboard: at most 3 characters on a
+            /// 1-unit cap, so its font stays at 7 px or more at the smallest window
+            /// ([`Key::spoken`] has the full name).
             pub const fn label(self) -> &'static str {
                 match self {
                     $(Key::$variant => $label,)*
@@ -45,13 +47,13 @@ keys! {
     Digit1 = "1", "1"; Digit2 = "2", "2"; Digit3 = "3", "3"; Digit4 = "4", "4";
     Digit5 = "5", "5"; Digit6 = "6", "6"; Digit7 = "7", "7"; Digit8 = "8", "8";
     Digit9 = "9", "9"; Digit0 = "0", "0";
-    Minus = "Minus", "-"; Equal = "Equal", "="; Backspace = "Backspace", "Backspace";
+    Minus = "Minus", "-"; Equal = "Equal", "="; Backspace = "Backspace", "Bksp";
     Tab = "Tab", "Tab";
     Q = "Q", "Q"; W = "W", "W"; E = "E", "E"; R = "R", "R"; T = "T", "T";
     Y = "Y", "Y"; U = "U", "U"; I = "I", "I"; O = "O", "O"; P = "P", "P";
     BracketLeft = "BracketLeft", "["; BracketRight = "BracketRight", "]";
     Backslash = "Backslash", "\\";
-    CapsLock = "CapsLock", "Caps Lock";
+    CapsLock = "CapsLock", "Caps";
     A = "A", "A"; S = "S", "S"; D = "D", "D"; F = "F", "F"; G = "G", "G";
     H = "H", "H"; J = "J", "J"; K = "K", "K"; L = "L", "L";
     Semicolon = "Semicolon", ";"; Quote = "Quote", "'"; Enter = "Enter", "Enter";
@@ -63,17 +65,17 @@ keys! {
     LCtrl = "LCtrl", "Ctrl"; LWin = "LWin", "Win"; LAlt = "LAlt", "Alt";
     Space = "Space", "Space";
     RAlt = "RAlt", "Alt"; RWin = "RWin", "Win"; Menu = "Menu", "Menu"; RCtrl = "RCtrl", "Ctrl";
-    PrintScreen = "PrintScreen", "PrtSc"; ScrollLock = "ScrollLock", "ScrLk";
-    Pause = "Pause", "Pause";
-    Insert = "Insert", "Ins"; Home = "Home", "Home"; PageUp = "PageUp", "PgUp";
-    Delete = "Delete", "Del"; End = "End", "End"; PageDown = "PageDown", "PgDn";
+    PrintScreen = "PrintScreen", "Prt"; ScrollLock = "ScrollLock", "SLk";
+    Pause = "Pause", "Pau";
+    Insert = "Insert", "Ins"; Home = "Home", "Hm"; PageUp = "PageUp", "PgU";
+    Delete = "Delete", "Del"; End = "End", "End"; PageDown = "PageDown", "PgD";
     Up = "Up", "\u{2191}"; Left = "Left", "\u{2190}"; Down = "Down", "\u{2193}";
     Right = "Right", "\u{2192}";
-    NumLock = "NumLock", "Num Lock"; NumDivide = "NumDivide", "/";
+    NumLock = "NumLock", "NL"; NumDivide = "NumDivide", "/";
     NumMultiply = "NumMultiply", "*"; NumSubtract = "NumSubtract", "-";
     Num7 = "Num7", "7"; Num8 = "Num8", "8"; Num9 = "Num9", "9"; NumAdd = "NumAdd", "+";
     Num4 = "Num4", "4"; Num5 = "Num5", "5"; Num6 = "Num6", "6";
-    Num1 = "Num1", "1"; Num2 = "Num2", "2"; Num3 = "Num3", "3"; NumEnter = "NumEnter", "Enter";
+    Num1 = "Num1", "1"; Num2 = "Num2", "2"; Num3 = "Num3", "3"; NumEnter = "NumEnter", "Ent";
     Num0 = "Num0", "0"; NumDecimal = "NumDecimal", ".";
 }
 
@@ -118,6 +120,31 @@ impl Key {
             .find(|k| k.as_str().eq_ignore_ascii_case(name))
     }
 
+    /// The key in words for a screen reader, unique on the board: "Left Ctrl", "Numpad 7",
+    /// "Page Up", "Up arrow".
+    pub fn spoken(self) -> String {
+        let name = self.as_str();
+        match self {
+            Key::Up | Key::Down | Key::Left | Key::Right => return format!("{name} arrow"),
+            Key::NumLock => return "Num Lock".to_owned(),
+            _ => {}
+        }
+        let (mut out, rest) = match name.as_bytes() {
+            [b'L', c, ..] if c.is_ascii_uppercase() => ("Left ".to_owned(), &name[1..]),
+            [b'R', c, ..] if c.is_ascii_uppercase() => ("Right ".to_owned(), &name[1..]),
+            [b'N', b'u', b'm', _, ..] => ("Numpad ".to_owned(), &name[3..]),
+            _ => (String::new(), name),
+        };
+        // "PrintScreen" reads "Print Screen".
+        for (i, ch) in rest.char_indices() {
+            if i > 0 && ch.is_ascii_uppercase() {
+                out.push(' ');
+            }
+            out.push(ch);
+        }
+        out
+    }
+
     pub(super) const fn modifier(self) -> Option<Modifier> {
         match self {
             Key::LCtrl | Key::RCtrl => Some(Modifier::Ctrl),
@@ -139,5 +166,33 @@ impl<'de> Deserialize<'de> for Key {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let name = String::deserialize(d)?;
         Key::from_name(&name).ok_or_else(|| de::Error::custom(format!("unknown key {name:?}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Key;
+
+    #[test]
+    fn spoken_names_are_words_and_unique() {
+        let names: Vec<String> = Key::ALL.iter().map(|k| k.spoken()).collect();
+        for (i, n) in names.iter().enumerate() {
+            assert!(!names[i + 1..].contains(n), "{n} twice");
+        }
+        let want = [
+            (Key::LCtrl, "Left Ctrl"),
+            (Key::RShift, "Right Shift"),
+            (Key::R, "R"),
+            (Key::Left, "Left arrow"),
+            (Key::Num7, "Numpad 7"),
+            (Key::NumEnter, "Numpad Enter"),
+            (Key::NumLock, "Num Lock"),
+            (Key::PageUp, "Page Up"),
+            (Key::Minus, "Minus"),
+            (Key::Esc, "Esc"),
+        ];
+        for (key, name) in want {
+            assert_eq!(key.spoken(), name);
+        }
     }
 }

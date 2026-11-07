@@ -6,28 +6,14 @@ mod common;
 use std::fs;
 use std::time::Duration;
 
-use common::layout;
+use common::{config, has, layout, open, with_role};
 use i_slint_backend_testing::{AccessibleRole, ElementHandle};
-use oxi_core::config::{ConfigFile, OverlayPosition, Theme};
+use oxi_core::config::{OverlayPosition, Theme};
 use oxi_core::overlay::{Rgba, palette};
 use oxi_core::paths::Layout;
 use oxi_settings::{AppWindow, Page, Shell, ThemeChoice};
 use slint::platform::{Key, PointerEventButton, WindowEvent};
 use slint::{Color, ComponentHandle};
-
-fn open(layout: &Layout, page: Page) -> AppWindow {
-    i_slint_backend_testing::init_no_event_loop();
-    let window = oxi_settings::open(layout.clone()).unwrap();
-    window.show().unwrap();
-    window.set_page(page);
-    window
-}
-
-fn with_role(window: &AppWindow, label: &str, role: AccessibleRole) -> ElementHandle {
-    ElementHandle::find_by_accessible_label(window, label)
-        .find(|e| e.accessible_role() == Some(role))
-        .unwrap_or_else(|| panic!("no {role:?} labelled {label}"))
-}
 
 fn card(window: &AppWindow, label: &str) -> ElementHandle {
     with_role(window, label, AccessibleRole::RadioButton)
@@ -37,18 +23,8 @@ fn switch(window: &AppWindow, label: &str) -> ElementHandle {
     with_role(window, label, AccessibleRole::Switch)
 }
 
-fn has(window: &AppWindow, label: &str) -> bool {
-    ElementHandle::find_by_accessible_label(window, label)
-        .next()
-        .is_some()
-}
-
 fn text(l: &Layout) -> String {
     fs::read_to_string(l.config_file()).unwrap_or_default()
-}
-
-fn config(l: &Layout) -> ConfigFile {
-    ConfigFile::parse(&text(l)).unwrap()
 }
 
 #[test]
@@ -301,7 +277,7 @@ fn preview_is_off_without_the_daemon() {
     assert_eq!(preview.accessible_enabled(), Some(false));
     assert_eq!(
         preview.accessible_description().as_deref(),
-        Some("OxiYapper is not running")
+        Some(oxi_core::strings::DAEMON_OFFLINE)
     );
 }
 

@@ -9,8 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use oxi_core::audio::db_to_linear;
 use oxi_core::config::{Audio, Config};
 use oxi_core::overlay::{METER_HZ, Meter};
+use oxi_core::strings::{self, NO_MIC};
 use oxi_core::types::{Language, Millis};
 use oxi_platform::capture::{
     Capture, CaptureError, CaptureEvent, CpalCapture, LevelMeter, list_input_devices,
@@ -24,12 +26,11 @@ use crate::{AppWindow, Ctx, Page, report};
 const BARS: usize = 40;
 /// Picker order of the language buttons.
 const LANGUAGES: [Language; 3] = [Language::Ru, Language::En, Language::Auto];
-const NO_MIC: &str = "No microphone";
 // shortcut: CpalCapture keeps the processed audio until it stops, so the meter reopens it this
 // often to bound memory (~4 MB); upgrade when capture gets a meter-only mode.
 const REOPEN: Millis = Millis(60_000);
-/// A device or gain change reopens the stream once it has held this long: a slider drag is many
-/// changes, and each reopen blocks the UI thread on the audio driver.
+/// A device change reopens the stream once it has held this long: each reopen blocks the UI
+/// thread on the audio driver.
 const SETTLE: Millis = Millis(300);
 /// How often the device list is read again while the page is shown (a listing takes ~2 ms).
 const RELIST: Millis = Millis(2_000);
@@ -245,12 +246,12 @@ impl Devices {
     }
 
     fn rows(&self) -> Vec<SharedString> {
-        let mut rows = vec![SharedString::from("System default")];
+        let mut rows = vec![SharedString::from(strings::SYSTEM_DEFAULT_MIC)];
         rows.extend(self.listed.iter().map(SharedString::from));
         rows.extend(
             self.missing
                 .iter()
-                .map(|n| SharedString::from(format!("{n} (not connected)"))),
+                .map(|n| SharedString::from(strings::not_connected(n))),
         );
         rows
     }
@@ -324,11 +325,11 @@ struct Live<C> {
     meter: Meter,
     sensitivity: f32,
     capture: Option<Running<C>>,
-    /// Device and gain of the last open attempt; a failed one is not retried until they change
-    /// or the page is shown again.
-    tried: Option<(String, f64)>,
-    /// A device and gain that differ from `tried`, and since when.
-    changed: Option<((String, f64), Millis)>,
+    /// Device of the last open attempt; a failed one is not retried until it changes or the
+    /// page is shown again.
+    tried: Option<String>,
+    /// A device that differs from `tried`, and since when.
+    changed: Option<(String, Millis)>,
     /// Why the meter is off, after a failed open.
     note: Option<String>,
     /// The open capture runs on the system default: the configured device is missing.
@@ -360,17 +361,17 @@ impl<C> Live<C> {
         self.capture.is_some()
     }
 
-    /// Keep a capture open on `opts` and feed one level into the meter. The level depends only
-    /// on device and gain; a change of them reopens the stream once it has settled.
+    /// Keep a capture open on `opts` and feed one level into the meter. The stream depends only
+    /// on the device, whose change reopens it once settled; the gain scales the level read.
     fn tick(&mut self, opts: &Audio, now: Millis) {
         if self.sensitivity.to_bits() != opts.meter_sensitivity_db.to_bits() {
             self.sensitivity = opts.meter_sensitivity_db;
             self.meter = Meter::new(BARS, self.sensitivity);
         }
-        let key = (opts.device.clone(), opts.gain_db);
-        if self.tried.as_ref() == Some(&key) {
+        let key = &opts.device;
+        if self.tried.as_ref() == Some(key) {
             self.changed = None;
-        } else if self.changed.as_ref().is_none_or(|(k, _)| *k != key) {
+        } else if self.changed.as_ref().is_none_or(|(k, _)| k != key) {
             self.changed = Some((key.clone(), now));
         }
         let settled = self.tried.is_none()
@@ -382,21 +383,25 @@ impl<C> Live<C> {
             .capture
             .as_ref()
             .is_some_and(|r| r.dead.load(Ordering::Relaxed) || now >= r.since + REOPEN);
-        if stale || (settled && self.tried.as_ref() != Some(&key)) {
-            self.reopen(opts, key, now);
+        if stale || (settled && self.tried.as_ref() != Some(key)) {
+            self.reopen(opts, now);
         }
-        self.meter.push(self.level.read(), now);
+        #[expect(clippy::cast_possible_truncation, reason = "gain is a few dB")]
+        let gain = db_to_linear(opts.gain_db as f32);
+        self.meter.push(self.level.read().scaled(gain), now);
     }
 
-    fn reopen(&mut self, opts: &Audio, key: (String, f64), now: Millis) {
+    fn reopen(&mut self, opts: &Audio, now: Millis) {
         // One stream at a time: the old one closes before the new one opens.
         self.capture = None;
         self.fell_back = false;
-        self.tried = Some(key);
+        self.tried = Some(opts.device.clone());
         self.changed = None;
         let dead = Arc::new(AtomicBool::new(false));
-        // The meter shows the level before denoise and trim: skip their work.
+        // The meter shows the level before denoise and trim: skip their work. The gain is
+        // applied to the level in `tick`, so a slider drag needs no reopen.
         let meter_opts = Audio {
+            gain_db: 0.0,
             denoise: false,
             trim: false,
             ..opts.clone()
@@ -431,7 +436,6 @@ mod tests {
     use std::cell::Cell;
 
     use i_slint_backend_testing::{ElementHandle, mock_elapsed_time};
-    use oxi_core::paths::Layout;
 
     use super::*;
 
@@ -531,20 +535,10 @@ mod tests {
         open: Opener<Fake>,
     ) -> (AppWindow, Rc<PageState<Fake>>) {
         reset();
-        let dir = std::env::temp_dir().join(format!(
-            "oxi-settings-lib-audio-{}-{name}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let layout = crate::testing::layout("audio", name);
         if let Some(text) = config {
-            std::fs::write(dir.join("config.toml"), text).unwrap();
+            std::fs::write(layout.config_file(), text).unwrap();
         }
-        let layout = Layout {
-            config_dir: dir.clone(),
-            data_dir: dir.clone(),
-            logs_dir: dir,
-        };
         let window = crate::open(layout.clone()).unwrap();
         let (ctx, _) = Ctx::load(layout).unwrap();
         let io = Io {
@@ -755,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn gain_drag_reopens_once_after_it_settles() {
+    fn gain_drag_keeps_the_stream_and_a_device_change_reopens_once_settled() {
         reset();
         let mut live = Live::new(fake, 0.0);
         let mut opts = Audio::default();
@@ -764,12 +758,14 @@ mod tests {
             opts.gain_db = f64::from(u32::try_from(i).unwrap());
             live.tick(&opts, Millis(t));
         }
-        assert_eq!(OPENED.get(), 1, "reopened during the drag");
-        opts.tail_ms = 300;
-        live.tick(&opts, Millis(297 + SETTLE.0));
+        assert_eq!(OPENED.get(), 1, "a gain change reopened the stream");
+        opts.device = "USB Mic".into();
+        live.tick(&opts, Millis(330));
+        assert_eq!(OPENED.get(), 1, "reopened before the device settled");
+        live.tick(&opts, Millis(330) + SETTLE);
         assert_eq!(OPENED.get(), 2);
         assert_eq!(OPEN.get(), 1);
-        assert_eq!(live.tried, Some((String::new(), opts.gain_db)));
+        assert_eq!(live.tried.as_deref(), Some("USB Mic"));
     }
 
     #[test]

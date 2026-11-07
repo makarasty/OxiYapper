@@ -35,7 +35,7 @@ pub enum Error {
     AlreadyRunning,
     /// The name exists but no instance came free in time: a stalled daemon, or a squatter
     /// that cannot be told apart from one.
-    #[error("OxiYapper is running but not answering")]
+    #[error("{}", oxi_core::strings::DAEMON_BUSY)]
     Busy,
     /// The name is held by a server of another account, or by one that denies us (a
     /// squatter). Refuse to start or to talk to it; never treat it as a running daemon.

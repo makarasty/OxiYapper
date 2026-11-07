@@ -21,11 +21,15 @@ impl Message for Raw {
 
 /// A name no other test or running daemon uses.
 fn name(tag: &str) -> String {
-    let id = format!("OxiYapper-test-{}-{tag}", std::process::id());
+    let id = format!("test-{}-{tag}", std::process::id());
     if cfg!(windows) {
-        format!(r"\\.\pipe\{id}")
+        oxi_core::ipc::pipe_name(&id)
     } else {
-        std::env::temp_dir().join(id).to_string_lossy().into_owned()
+        let file = format!("{}-{id}", oxi_core::APP_NAME);
+        std::env::temp_dir()
+            .join(file)
+            .to_string_lossy()
+            .into_owned()
     }
 }
 

@@ -6,45 +6,23 @@ mod common;
 use std::fs;
 use std::time::Duration;
 
-use common::layout;
+use common::{config, has, layout, open, with_role};
 use i_slint_backend_testing::{AccessibleRole, ElementHandle};
-use oxi_core::config::{Config, ConfigFile};
+use oxi_core::config::Config;
 use oxi_core::paths::Layout;
 use oxi_core::types::Language;
-use oxi_settings::{AppWindow, Page};
+use oxi_settings::Page;
 use slint::ComponentHandle;
 use slint::platform::{Key, PointerEventButton, WindowEvent};
 
-fn open(layout: &Layout) -> AppWindow {
-    i_slint_backend_testing::init_no_event_loop();
-    let window = oxi_settings::open(layout.clone()).unwrap();
-    window.show().unwrap();
-    window.set_page(Page::Audio);
-    window
-}
-
-/// The element labelled `label` with `role` (a row's label text shares the control's label).
-fn with_role(window: &AppWindow, label: &str, role: AccessibleRole) -> ElementHandle {
-    ElementHandle::find_by_accessible_label(window, label)
-        .find(|e| e.accessible_role() == Some(role))
-        .unwrap_or_else(|| panic!("no {role:?} labelled {label}"))
-}
-
-fn has(window: &AppWindow, label: &str) -> bool {
-    ElementHandle::find_by_accessible_label(window, label)
-        .next()
-        .is_some()
-}
-
 fn saved(layout: &Layout) -> Config {
-    let text = fs::read_to_string(layout.config_file()).unwrap();
-    ConfigFile::parse(&text).unwrap().config
+    config(layout).config
 }
 
 #[test]
 fn every_control_writes_its_key() {
     let l = layout("controls", Some("version = 1\n# mine\n"));
-    let window = open(&l);
+    let window = open(&l, Page::Audio);
     let defaults = Config::default();
 
     let slider = |label: &str, value: &str| {
@@ -91,7 +69,7 @@ fn every_control_writes_its_key() {
 #[test]
 fn denoise_shows_the_whisper_note() {
     let l = layout("denoise", None);
-    let window = open(&l);
+    let window = open(&l, Page::Audio);
     let note = "Noise suppression can make Whisper worse.";
     assert!(!has(&window, note));
     with_role(&window, "Noise suppression", AccessibleRole::Switch)
@@ -105,7 +83,7 @@ fn config_values_show_on_the_page() {
         "values",
         Some("version = 1\n[audio]\ngain_db = 4.0\ntail_ms = 250\n[model]\nlanguage = \"en\"\n"),
     );
-    let window = open(&l);
+    let window = open(&l, Page::Audio);
     let gain = with_role(&window, "Gain", AccessibleRole::Slider);
     assert_eq!(gain.accessible_value().as_deref(), Some("4"));
     assert!(has(&window, "250 ms"));
@@ -120,7 +98,7 @@ fn missing_device_stays_picked_until_default_is_chosen() {
         "device",
         Some("version = 1\n[audio]\ndevice = \"Test Mic 9\"\n"),
     );
-    let window = open(&l);
+    let window = open(&l, Page::Audio);
     let picker = with_role(&window, "Device", AccessibleRole::Combobox);
     assert_eq!(
         picker.accessible_value().as_deref(),
@@ -142,7 +120,7 @@ fn missing_device_stays_picked_until_default_is_chosen() {
 fn locked_config_disables_the_controls() {
     let original = "version = 99\n[audio]\ngain_db = 3.0\n";
     let l = layout("locked", Some(original));
-    let window = open(&l);
+    let window = open(&l, Page::Audio);
     for (label, role) in [
         ("Gain", AccessibleRole::Slider),
         ("Trim silence", AccessibleRole::Switch),
@@ -163,7 +141,7 @@ fn mic_meter_closes_when_the_page_is_left() {
         return;
     }
     let l = layout("mic", None);
-    let window = open(&l);
+    let window = open(&l, Page::Audio);
     let live = || {
         ElementHandle::find_by_accessible_label(&window, "Level")
             .any(|e| e.accessible_role() == Some(AccessibleRole::ProgressIndicator))

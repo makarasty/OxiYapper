@@ -4,41 +4,14 @@ mod common;
 
 use std::fs;
 
-use common::layout;
+use common::{has, layout, one, open, open_linked, with_role};
 use i_slint_backend_testing::{AccessibleRole, ElementHandle, ElementQuery};
 use oxi_core::config::{ConfigFile, Theme};
 use oxi_core::ipc::Push;
-use oxi_core::paths::Layout;
 use oxi_settings::ipc::{Cmd, Event, Link};
 use oxi_settings::{AppWindow, Ipc, Page, Shell, ThemeChoice};
 use slint::ComponentHandle;
 use slint::platform::{Key, PointerEventButton, WindowEvent};
-
-fn open(layout: &Layout) -> AppWindow {
-    i_slint_backend_testing::init_no_event_loop();
-    let window = oxi_settings::open(layout.clone()).unwrap();
-    window.show().unwrap();
-    window
-}
-
-fn one(window: &AppWindow, label: &str) -> ElementHandle {
-    let mut found = ElementHandle::find_by_accessible_label(window, label);
-    let first = found
-        .next()
-        .unwrap_or_else(|| panic!("no element labelled {label}"));
-    assert!(
-        found.next().is_none(),
-        "more than one element labelled {label}"
-    );
-    first
-}
-
-/// The element labelled `label` with `role` (a rail tab and a thumbnail can share a label).
-fn with_role(window: &AppWindow, label: &str, role: AccessibleRole) -> ElementHandle {
-    ElementHandle::find_by_accessible_label(window, label)
-        .find(|e| e.accessible_role() == Some(role))
-        .unwrap_or_else(|| panic!("no {role:?} labelled {label}"))
-}
 
 fn tab(window: &AppWindow, label: &str) -> ElementHandle {
     with_role(window, label, AccessibleRole::Tab)
@@ -48,16 +21,10 @@ fn card(window: &AppWindow, label: &str) -> ElementHandle {
     with_role(window, label, AccessibleRole::RadioButton)
 }
 
-fn has(window: &AppWindow, label: &str) -> bool {
-    ElementHandle::find_by_accessible_label(window, label)
-        .next()
-        .is_some()
-}
-
 #[test]
 fn rail_switches_pages() {
     let l = layout("rail", None);
-    let window = open(&l);
+    let window = open(&l, Page::Hotkey);
     assert_eq!(window.get_page(), Page::Hotkey);
     assert!(!has(&window, "Version"));
     tab(&window, "About").invoke_accessible_default_action();
@@ -72,7 +39,7 @@ fn rail_switches_pages() {
 #[test]
 fn about_shows_name_version_and_licence() {
     let l = layout("about", None);
-    let window = open(&l);
+    let window = open(&l, Page::Hotkey);
     window.set_page(Page::About);
     for text in [
         oxi_core::APP_NAME,
@@ -86,7 +53,7 @@ fn about_shows_name_version_and_licence() {
 #[test]
 fn theme_pick_writes_ui_theme() {
     let l = layout("theme", Some("version = 1\n# mine\n"));
-    let window = open(&l);
+    let window = open(&l, Page::Hotkey);
     window.set_page(Page::System);
     with_role(&window, "Theme", AccessibleRole::RadioGroup);
     let dark = card(&window, "Dark");
@@ -106,7 +73,7 @@ fn theme_pick_writes_ui_theme() {
 fn newer_config_is_read_only() {
     let original = "version = 99\n[ui]\ntheme = \"light\"\n";
     let l = layout("newer", Some(original));
-    let window = open(&l);
+    let window = open(&l, Page::Hotkey);
     assert!(window.global::<Shell>().get_locked());
     assert!(window.get_banner_text().contains("newer version"));
     assert!(!has(&window, "Reset to defaults"));
@@ -124,7 +91,7 @@ fn newer_config_is_read_only() {
 fn broken_config_shows_its_line_and_resets_keeping_a_backup() {
     let original = "version = 1\n[audio]\ngain_db = \n";
     let l = layout("broken", Some(original));
-    let window = open(&l);
+    let window = open(&l, Page::Hotkey);
     let banner = window.get_banner_text();
     assert!(banner.contains("line 3"), "banner: {banner}");
     assert!(window.global::<Shell>().get_locked());
@@ -143,7 +110,7 @@ fn broken_config_shows_its_line_and_resets_keeping_a_backup() {
 #[test]
 fn thumb_picker_takes_a_click_then_arrow_keys() {
     let l = layout("keys", None);
-    let window = open(&l);
+    let window = open(&l, Page::Hotkey);
     window.set_page(Page::System);
     card(&window, "Light").mock_single_click(PointerEventButton::Left);
     assert_eq!(window.get_theme(), ThemeChoice::Light);
@@ -196,7 +163,7 @@ gain_db =
     let l = layout("reset-fails", Some(original));
     // A directory where the backup goes makes the copy fail.
     fs::create_dir(l.config_dir.join("config.toml.bak")).unwrap();
-    let window = open(&l);
+    let window = open(&l, Page::Hotkey);
     one(&window, "Reset to defaults").invoke_accessible_default_action();
 
     assert!(window.global::<Shell>().get_locked());
@@ -218,7 +185,7 @@ gain_db =
 ",
         ),
     );
-    let window = open(&l);
+    let window = open(&l, Page::Hotkey);
     // Gone before "Open file", so the shell has nothing to open.
     fs::remove_file(l.config_file()).unwrap();
     one(&window, "Open file").invoke_accessible_default_action();
@@ -231,7 +198,7 @@ gain_db =
 #[test]
 fn a_successful_save_clears_the_save_error() {
     let l = layout("save-recovers", None);
-    let window = open(&l);
+    let window = open(&l, Page::Hotkey);
     window.set_page(Page::System);
     // A directory in the file's place makes the atomic rename fail.
     fs::create_dir(l.config_file()).unwrap();
@@ -250,10 +217,8 @@ fn a_successful_save_clears_the_save_error() {
 
 /// A window on a fake daemon link; the receiver gets what the window sends to the daemon.
 fn linked(name: &str) -> (AppWindow, Ipc, std::sync::mpsc::Receiver<Cmd>) {
-    i_slint_backend_testing::init_no_event_loop();
     let (ipc, rx) = Ipc::fake();
-    let window = oxi_settings::open_with(layout(name, None), ipc.clone()).unwrap();
-    window.show().unwrap();
+    let window = open_linked(&layout(name, None), Page::Hotkey, ipc.clone());
     (window, ipc, rx)
 }
 

@@ -5,37 +5,12 @@ mod common;
 use std::fs;
 use std::time::Duration;
 
-use common::layout;
-use i_slint_backend_testing::{AccessibleRole, ElementHandle};
-use oxi_core::config::{ConfigFile, PasteMode};
+use common::{config, has, layout, one, open, with_role};
+use i_slint_backend_testing::AccessibleRole;
+use oxi_core::config::PasteMode;
 use oxi_core::dictionary::{BUDGET, build_prompt};
-use oxi_core::paths::Layout;
 use oxi_settings::{AppWindow, Page};
 use slint::ComponentHandle;
-
-fn open(layout: &Layout) -> AppWindow {
-    i_slint_backend_testing::init_no_event_loop();
-    let window = oxi_settings::open(layout.clone()).unwrap();
-    window.show().unwrap();
-    window.set_page(Page::Text);
-    window
-}
-
-fn one(window: &AppWindow, label: &str) -> ElementHandle {
-    let mut found = ElementHandle::find_by_accessible_label(window, label);
-    let first = found
-        .next()
-        .unwrap_or_else(|| panic!("no element labelled {label}"));
-    assert!(found.next().is_none(), "more than one labelled {label}");
-    first
-}
-
-/// The element labelled `label` with `role` (a row's text and its control share a label).
-fn with_role(window: &AppWindow, label: &str, role: AccessibleRole) -> ElementHandle {
-    ElementHandle::find_by_accessible_label(window, label)
-        .find(|e| e.accessible_role() == Some(role))
-        .unwrap_or_else(|| panic!("no {role:?} labelled {label}"))
-}
 
 /// Labels of every element on screen that start with `prefix`.
 fn labels(window: &AppWindow, prefix: &str) -> Vec<String> {
@@ -50,22 +25,12 @@ fn labels(window: &AppWindow, prefix: &str) -> Vec<String> {
     found
 }
 
-fn has(window: &AppWindow, label: &str) -> bool {
-    ElementHandle::find_by_accessible_label(window, label)
-        .next()
-        .is_some()
-}
-
-fn config(l: &Layout) -> ConfigFile {
-    ConfigFile::parse(&fs::read_to_string(l.config_file()).unwrap()).unwrap()
-}
-
 #[test]
 fn over_budget_dictionary_marks_the_tail() {
     let words: Vec<String> = (1..=300).map(|i| format!("synthword{i}")).collect();
     let l = layout("budget", None);
     fs::write(l.dictionary_file(), words.join("\n")).unwrap();
-    let window = open(&l);
+    let window = open(&l, Page::Text);
 
     let first_dropped = build_prompt(words.iter().map(String::as_str)).dropped[0] + 1;
     assert!(first_dropped > 1 && first_dropped < 300, "{first_dropped}");
@@ -92,7 +57,7 @@ fn over_budget_dictionary_marks_the_tail() {
 #[test]
 fn replacement_line_without_arrow_reports_its_line() {
     let l = layout("replace", None);
-    let window = open(&l);
+    let window = open(&l, Page::Text);
     assert!(has(&window, "Every line has =>."));
     one(&window, "Replacements").set_accessible_value("alpha => beta\nfoo bar\n\ngamma => delta");
     assert!(
@@ -111,7 +76,7 @@ fn replacement_line_without_arrow_reports_its_line() {
 #[test]
 fn dictionary_is_saved_into_the_layout() {
     let l = layout("save-dict", None);
-    let window = open(&l);
+    let window = open(&l, Page::Text);
     one(&window, "Dictionary").set_accessible_value("synthalpha\nsynthbeta");
     assert!(!l.dictionary_file().exists(), "saved before Save");
     one(&window, "Save dictionary.txt").invoke_accessible_default_action();
@@ -131,7 +96,7 @@ fn utf16_file_is_rewritten_as_utf8_with_a_note_until_saved() {
             .flat_map(u16::to_le_bytes),
     );
     fs::write(l.dictionary_file(), bytes).unwrap();
-    let window = open(&l);
+    let window = open(&l, Page::Text);
     let note = "Saved as UTF-16 or with a BOM: Save rewrites it as UTF-8.";
     assert!(has(&window, note));
     assert_eq!(
@@ -152,7 +117,7 @@ fn unreadable_file_is_never_overwritten() {
     let l = layout("unreadable", None);
     let bytes = [b's', 0xFF, b'x'];
     fs::write(l.replace_file(), bytes).unwrap();
-    let window = open(&l);
+    let window = open(&l, Page::Text);
     assert!(has(
         &window,
         "replace.txt is not UTF-8 or UTF-16 text: fix it in a text editor."
@@ -167,7 +132,7 @@ fn unreadable_file_is_never_overwritten() {
 fn save_keeps_a_file_changed_on_disk_until_overwrite() {
     let l = layout("conflict", None);
     fs::write(l.dictionary_file(), "synthalpha").unwrap();
-    let window = open(&l);
+    let window = open(&l, Page::Text);
     one(&window, "Dictionary").set_accessible_value("synthbeta");
     assert!(has(&window, "Unsaved changes"));
     // Notepad saves its own edit meanwhile.
@@ -198,7 +163,7 @@ fn save_keeps_a_file_changed_on_disk_until_overwrite() {
 fn clean_editor_takes_a_file_changed_on_disk_instead_of_saving() {
     let l = layout("clean-reload", None);
     fs::write(l.replace_file(), "a => b").unwrap();
-    let window = open(&l);
+    let window = open(&l, Page::Text);
     fs::write(l.replace_file(), "c => d").unwrap();
     one(&window, "Save replace.txt").invoke_accessible_default_action();
     assert_eq!(fs::read_to_string(l.replace_file()).unwrap(), "c => d");
@@ -213,7 +178,7 @@ fn fixed_file_is_read_again_when_the_page_is_shown_or_on_reload() {
     let l = layout("fixed", None);
     fs::write(l.dictionary_file(), [b's', 0xFF]).unwrap();
     fs::write(l.replace_file(), [b's', 0xFF]).unwrap();
-    let window = open(&l);
+    let window = open(&l, Page::Text);
     assert_eq!(
         one(&window, "Save dictionary.txt").accessible_enabled(),
         Some(false)
@@ -250,7 +215,7 @@ fn reset_keeps_unsaved_text_and_reloads_clean_files() {
     let l = layout("reset", Some("version = 1\n[audio]\ngain_db = \n"));
     fs::write(l.dictionary_file(), "synthalpha").unwrap();
     fs::write(l.replace_file(), "a => b").unwrap();
-    let window = open(&l);
+    let window = open(&l, Page::Text);
     one(&window, "Dictionary").set_accessible_value("synthbeta");
     fs::write(l.replace_file(), "c => d").unwrap();
 
@@ -271,7 +236,7 @@ fn read_error_names_its_kind_and_keeps_save_off() {
     let l = layout("read-error", None);
     // A directory in the file's place fails the read with an io error, not a decode error.
     fs::create_dir(l.dictionary_file()).unwrap();
-    let window = open(&l);
+    let window = open(&l, Page::Text);
     let notes = labels(&window, "Could not read dictionary.txt: ");
     assert_eq!(notes.len(), 1, "{:?}", labels(&window, ""));
     assert!(!has(
@@ -287,7 +252,7 @@ fn read_error_names_its_kind_and_keeps_save_off() {
 #[test]
 fn restore_delay_is_saved_once_the_slider_rests() {
     let l = layout("delay", None);
-    let window = open(&l);
+    let window = open(&l, Page::Text);
     let slider = with_role(&window, "Restore clipboard after", AccessibleRole::Slider);
     slider.set_accessible_value("400");
     slider.set_accessible_value("500");
@@ -300,7 +265,7 @@ fn restore_delay_is_saved_once_the_slider_rests() {
 #[test]
 fn duplicate_rule_shows_a_note() {
     let l = layout("duplicate", None);
-    let window = open(&l);
+    let window = open(&l, Page::Text);
     one(&window, "New rule app").set_accessible_value("synth.exe");
     one(&window, "Add rule").invoke_accessible_default_action();
     one(&window, "New rule app").set_accessible_value("SYNTH.EXE");
@@ -325,7 +290,7 @@ fn duplicate_rule_shows_a_note() {
 #[test]
 fn closing_within_the_debounce_still_saves_the_delay() {
     let l = layout("delay-close", None);
-    let window = open(&l);
+    let window = open(&l, Page::Text);
     with_role(&window, "Restore clipboard after", AccessibleRole::Slider)
         .set_accessible_value("700");
     assert!(!l.config_file().exists(), "saved during the drag");
@@ -338,7 +303,7 @@ fn closing_within_the_debounce_still_saves_the_delay() {
 fn dirty_editor_names_the_read_error_of_its_file() {
     let l = layout("dirty-unreadable", None);
     fs::write(l.dictionary_file(), "synthalpha").unwrap();
-    let window = open(&l);
+    let window = open(&l, Page::Text);
     one(&window, "Dictionary").set_accessible_value("synthbeta");
     fs::remove_file(l.dictionary_file()).unwrap();
     fs::create_dir(l.dictionary_file()).unwrap();
@@ -365,7 +330,7 @@ fn dirty_editor_names_the_read_error_of_its_file() {
 #[test]
 fn mode_thumb_and_rules_write_the_config() {
     let l = layout("paste", Some("version = 1\n# mine\n"));
-    let window = open(&l);
+    let window = open(&l, Page::Text);
     with_role(&window, "Paste mode", AccessibleRole::RadioGroup);
     let card = |label: &str| with_role(&window, label, AccessibleRole::RadioButton);
     assert_eq!(card("Clipboard").accessible_checked(), Some(true));
@@ -401,7 +366,7 @@ fn mode_thumb_and_rules_write_the_config() {
 fn locked_config_keeps_paste_controls_off() {
     let original = "version = 99\n";
     let l = layout("locked", Some(original));
-    let window = open(&l);
+    let window = open(&l, Page::Text);
     let add = one(&window, "Add rule");
     assert_eq!(add.accessible_enabled(), Some(false));
     assert_eq!(

@@ -46,7 +46,7 @@ pub struct LoadInfo {
 /// The named GPU was not in the list and `pick` chose automatically.
 fn not_found(choice: &DeviceChoice, picked: &Picked) -> Option<EngineWarning> {
     match choice {
-        DeviceChoice::Named(name) if picked.warning.is_some() => {
+        DeviceChoice::Named(name) if picked.missing => {
             Some(EngineWarning::GpuNotFound { name: name.clone() })
         }
         _ => None,
@@ -221,7 +221,7 @@ mod tests {
     fn only_a_missing_named_gpu_warns() {
         let picked = |warns: bool| Picked {
             index: None,
-            warning: warns.then(String::new),
+            missing: warns,
         };
         let named = DeviceChoice::Named("Vulkan3".into());
         assert_eq!(

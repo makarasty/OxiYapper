@@ -13,11 +13,15 @@ use oxi_settings::ipc::{Action, Cmd, Event, Ipc, Link, Notice, Options, notice, 
 
 /// A name no other test or running daemon uses.
 fn name(tag: &str) -> String {
-    let id = format!("OxiYapper-test-{}-{tag}", std::process::id());
+    let id = format!("test-{}-{tag}", std::process::id());
     if cfg!(windows) {
-        format!(r"\\.\pipe\{id}")
+        oxi_core::ipc::pipe_name(&id)
     } else {
-        std::env::temp_dir().join(id).to_string_lossy().into_owned()
+        let file = format!("{}-{id}", oxi_core::APP_NAME);
+        std::env::temp_dir()
+            .join(file)
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -295,7 +299,7 @@ fn fake_ipc_records_requests_and_delivers_pushes() {
     let (ipc, sent) = Ipc::fake();
     let got = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let sink = got.clone();
-    ipc.subscribe(move |e| sink.borrow_mut().push(e.clone()));
+    let _sub = ipc.subscribe(move |e| sink.borrow_mut().push(e.clone()));
     ipc.send(Request::ListDevices);
     assert_eq!(sent.try_recv(), Ok(Cmd::Send(Request::ListDevices)));
     ipc.deliver(&Event::Push(Push::Raise));
@@ -322,7 +326,7 @@ fn pushes_reach_subscribers_on_the_ui_thread() {
     let ui = thread::current().id();
     let raised = std::rc::Rc::new(std::cell::Cell::new(false));
     let flag = raised.clone();
-    ipc.subscribe(move |e| {
+    let _sub = ipc.subscribe(move |e| {
         assert_eq!(thread::current().id(), ui);
         if *e == Event::Push(Push::Raise) {
             flag.set(true);

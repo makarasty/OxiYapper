@@ -19,6 +19,7 @@ pub mod paste;
 pub mod paths;
 pub mod strings;
 pub mod text;
+pub mod tray;
 pub mod types;
 
 pub use cli::{Command, parse_command};

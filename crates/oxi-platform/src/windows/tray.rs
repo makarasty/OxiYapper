@@ -36,6 +36,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
+use super::wide;
 use crate::draw::tray_icon;
 
 /// The [`Waker::wake`] message.
@@ -46,13 +47,7 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_EXIT: u32 = WM_APP + 2;
 const ICON_ID: u32 = 1;
 
-/// A tray menu entry; the discriminant is its menu command id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MenuItem {
-    Settings = 1,
-    CopyLast = 2,
-    Quit = 3,
-}
+pub use oxi_core::tray::MenuItem;
 
 /// Wakes or ends [`MainLoop::run`] from any thread.
 #[derive(Debug, Clone)]
@@ -536,11 +531,6 @@ fn destroy_icon(icon: HICON) {
         // SAFETY: an icon we created and no longer hand to the shell.
         unsafe { DestroyIcon(icon) };
     }
-}
-
-/// `s` as a NUL-terminated UTF-16 string.
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain([0]).collect()
 }
 
 /// The phase line, then one line per warning; Windows cuts the tip at 127 characters.

@@ -13,6 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use oxi_core::ipc::{PROTO, Push, Request};
+use oxi_core::strings;
 use oxi_platform::ipc::{Client, Error, default_name};
 
 /// How long the worker waits on the pipe before it looks at the commands again. Pushes wake
@@ -87,32 +88,19 @@ pub enum Action {
 /// The banner an event calls for; `None` leaves the banner as it is.
 pub fn notice(event: &Event) -> Option<Notice> {
     let (text, action) = match event {
-        Event::Link(Link::Offline) => (
-            "OxiYapper is not running. Settings are saved to the config file.".to_owned(),
-            Some(Action::Start),
-        ),
-        Event::Link(Link::Mismatch { .. }) => (
-            "Restart OxiYapper to finish the update".to_owned(),
-            Some(Action::Restart),
-        ),
-        Event::Link(Link::Busy) => ("OxiYapper is running but not answering".to_owned(), None),
-        Event::Link(Link::Stuck) => (
-            "The old OxiYapper did not exit. Quit it from the tray, then press Start.".to_owned(),
-            Some(Action::Start),
-        ),
-        Event::Link(Link::Untrusted) => (
-            "The OxiYapper pipe is held by an untrusted program. Not connecting.".to_owned(),
-            None,
-        ),
-        Event::Link(Link::Foreign) => (
-            "The OxiYapper pipe is held by another account. Not connecting.".to_owned(),
-            None,
-        ),
+        Event::Link(Link::Offline) => (strings::DAEMON_OFFLINE.to_owned(), Some(Action::Start)),
+        Event::Link(Link::Mismatch { .. }) => {
+            (strings::DAEMON_MISMATCH.to_owned(), Some(Action::Restart))
+        }
+        Event::Link(Link::Busy) => (strings::DAEMON_BUSY.to_owned(), None),
+        Event::Link(Link::Stuck) => (strings::DAEMON_STUCK.to_owned(), Some(Action::Start)),
+        Event::Link(Link::Untrusted) => (strings::PIPE_UNTRUSTED.to_owned(), None),
+        Event::Link(Link::Foreign) => (strings::PIPE_FOREIGN.to_owned(), None),
         Event::Push(Push::ConfigError {
             file,
             line,
             message,
-        }) => (format!("{file}, line {line}: {message}"), None),
+        }) => (strings::config_error(file, *line, message), None),
         _ => return None,
     };
     Some(Notice { text, action })
@@ -446,8 +434,25 @@ type Subscriber = Rc<dyn Fn(&Event)>;
 #[derive(Default)]
 struct Inner {
     tx: Option<Sender<Cmd>>,
-    subs: RefCell<Vec<Subscriber>>,
+    /// Each with the id its [`Subscription`] removes it by.
+    subs: RefCell<Vec<(u64, Subscriber)>>,
+    next_sub: Cell<u64>,
     link: Cell<Link>,
+}
+
+/// Keeps an [`Ipc::subscribe`] callback alive; dropping it unsubscribes.
+#[must_use = "dropping the subscription unsubscribes at once"]
+pub struct Subscription {
+    inner: Weak<Inner>,
+    id: u64,
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.upgrade() {
+            inner.subs.borrow_mut().retain(|(id, _)| *id != self.id);
+        }
+    }
 }
 
 thread_local! {
@@ -506,17 +511,35 @@ impl Ipc {
         self.0.link.get()
     }
 
-    /// Calls `f` for every event from now on, on the UI thread. Read [`Ipc::link`] for the
-    /// state before the call.
-    pub fn subscribe(&self, f: impl Fn(&Event) + 'static) {
-        self.0.subs.borrow_mut().push(Rc::new(f));
+    /// Calls `f` for every event from now on, on the UI thread, until the returned
+    /// [`Subscription`] is dropped. Read [`Ipc::link`] for the state before the call.
+    pub fn subscribe(&self, f: impl Fn(&Event) + 'static) -> Subscription {
+        let id = self.0.next_sub.get();
+        self.0.next_sub.set(id + 1);
+        self.0.subs.borrow_mut().push((id, Rc::new(f)));
+        Subscription {
+            inner: Rc::downgrade(&self.0),
+            id,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn subscribers(&self) -> usize {
+        self.0.subs.borrow().len()
     }
 
     pub fn deliver(&self, event: &Event) {
         if let Event::Link(link) = event {
             self.0.link.set(*link);
         }
-        let subs = self.0.subs.borrow().clone();
+        // A copy: a callback may subscribe or drop a subscription.
+        let subs: Vec<Subscriber> = self
+            .0
+            .subs
+            .borrow()
+            .iter()
+            .map(|(_, f)| f.clone())
+            .collect();
         for sub in subs {
             sub(event);
         }
@@ -569,11 +592,29 @@ mod tests {
     #[test]
     fn notices_for_the_blocked_states() {
         let n = notice(&Event::Link(Link::Mismatch { daemon_proto: 9 })).unwrap();
-        assert_eq!(n.text, "Restart OxiYapper to finish the update");
+        assert_eq!(n.text, strings::DAEMON_MISMATCH);
         assert_eq!(n.action, Some(Action::Restart));
         let n = notice(&Event::Link(Link::Untrusted)).unwrap();
         assert!(n.text.contains("untrusted") && n.action.is_none());
         assert!(notice(&Event::Link(Link::Online)).is_none());
+    }
+
+    #[test]
+    fn dropping_a_subscription_unsubscribes() {
+        let (ipc, _rx) = Ipc::fake();
+        let seen = Rc::new(Cell::new(0));
+        let s = Rc::clone(&seen);
+        let first = ipc.subscribe(move |_| s.set(s.get() + 1));
+        let s = Rc::clone(&seen);
+        let second = ipc.subscribe(move |_| s.set(s.get() + 10));
+        ipc.deliver(&Event::Link(Link::Online));
+        assert_eq!(seen.get(), 11);
+        drop(first);
+        ipc.deliver(&Event::Link(Link::Online));
+        assert_eq!(seen.get(), 21);
+        assert_eq!(ipc.subscribers(), 1);
+        drop(second);
+        assert_eq!(ipc.subscribers(), 0);
     }
 
     #[test]

@@ -13,12 +13,12 @@ use std::time::Duration;
 use oxi_core::device::{Device, DeviceChoice};
 use oxi_core::ipc::{DownloadResult, Push, Request};
 use oxi_core::models::{self, MODELS, ModelEntry, ModelStatus};
-use oxi_core::paths::part_path;
+use oxi_core::strings::{self, gb};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
 use crate::debounce::SaveDebounce;
 use crate::generated::{ModelRow, ModelState};
-use crate::ipc::{Event, Link};
+use crate::ipc::{Event, Link, Subscription};
 use crate::{AppWindow, Ctx, Page, report};
 
 /// `[model] id` of "use my own .bin".
@@ -32,8 +32,18 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     let dir = ctx.layout.models_dir();
     let rows: Vec<ModelRow> = entries.iter().map(|e| row(e, &dir)).collect();
     let (tx, rx) = channel();
-    let page = Rc::new_cyclic(|me| PageState {
+    let page = Rc::new_cyclic(|me: &RcWeak<PageState>| PageState {
         me: me.clone(),
+        // A rebind (Reset) replaces the callbacks below, which drops this page and with it
+        // this subscription.
+        _events: ctx.ipc.subscribe({
+            let me = me.clone();
+            move |event| {
+                if let Some(page) = me.upgrade() {
+                    page.event(event);
+                }
+            }
+        }),
         window: window.as_weak(),
         ctx: ctx.clone(),
         entries,
@@ -71,15 +81,6 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     let p = Rc::clone(&page);
     s.on_idle_changed(move |v| p.idle_changed(v));
 
-    // Held weakly: a rebind (Reset) replaces the callbacks above, which drops this page, so the
-    // old subscriber goes quiet.
-    // shortcut: `Ipc` has no unsubscribe, so each Reset leaves one dead closure behind.
-    let weak = Rc::downgrade(&page);
-    ctx.ipc.subscribe(move |event| {
-        if let Some(page) = weak.upgrade() {
-            page.event(event);
-        }
-    });
     // Reset to defaults rebinds while the page may be open; its `init` does not run again.
     if window.get_page() == Page::Model {
         page.shown();
@@ -88,6 +89,7 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
 
 struct PageState {
     me: RcWeak<Self>,
+    _events: Subscription,
     window: Weak<AppWindow>,
     ctx: Ctx,
     /// The registry models the page offers, in row order.
@@ -198,7 +200,7 @@ impl PageState {
             return;
         };
         if self.ctx.ipc.link() != Link::Online {
-            self.update(i, |r| r.error = "Start OxiYapper to download models".into());
+            self.update(i, |r| r.error = strings::DOWNLOAD_NEEDS_DAEMON.into());
             return;
         }
         self.ctx.ipc.send(Request::DownloadModel {
@@ -207,7 +209,7 @@ impl PageState {
         self.update(i, |r| {
             r.downloading = true;
             r.progress = 0.0;
-            r.status = "Starting the download".into();
+            r.status = strings::DOWNLOAD_STARTING.into();
             r.error = SharedString::new();
         });
     }
@@ -362,7 +364,7 @@ impl PageState {
                     self.update(i, |r| {
                         r.downloading = true;
                         r.progress = fraction(*done, *total);
-                        r.status = format!("Downloading {} of {}", gb(*done), gb(*total)).into();
+                        r.status = strings::downloading(*done, *total).into();
                     });
                 }
             }
@@ -399,39 +401,19 @@ impl PageState {
 
 fn row(entry: &ModelEntry, dir: &Path) -> ModelRow {
     let status = models::status(entry, dir);
-    // A cancelled or cut-off download leaves its `.part`; the next download resumes from it.
-    let paused = status == ModelStatus::Missing
-        && fs::metadata(part_path(&dir.join(entry.file_name))).is_ok_and(|m| m.len() > 0);
     ModelRow {
         id: entry.id.into(),
         name: entry.display_name.into(),
         size: gb(entry.size).into(),
-        status: if paused {
-            "Paused, Download resumes".into()
-        } else {
-            status_text(status).into()
-        },
-        can_download: matches!(status, ModelStatus::Missing | ModelStatus::Bad),
+        status: strings::model_status(status).into(),
+        can_download: matches!(
+            status,
+            ModelStatus::Missing | ModelStatus::Partial | ModelStatus::Bad
+        ),
         downloading: false,
         progress: 0.0,
         error: SharedString::new(),
     }
-}
-
-const fn status_text(status: ModelStatus) -> &'static str {
-    match status {
-        ModelStatus::Missing => "Not downloaded",
-        ModelStatus::Ready => "Ready",
-        ModelStatus::NeedsHash => "Downloaded, checked before first use",
-        ModelStatus::Bad => "Damaged or incomplete, download it again",
-    }
-}
-
-/// Decimal gigabytes with one digit, the unit Hugging Face shows.
-fn gb(bytes: u64) -> String {
-    #[expect(clippy::cast_precision_loss, reason = "one decimal digit is shown")]
-    let gb = bytes as f64 / 1e9;
-    format!("{gb:.1} GB")
 }
 
 fn fraction(done: u64, total: u64) -> f32 {
@@ -459,18 +441,18 @@ fn clean(text: &str) -> &str {
 /// Why `path` cannot be a custom model, from the text alone; `None` when it may be.
 fn shape_problem(path: &str) -> Option<&'static str> {
     if path.is_empty() {
-        return Some("Choose a .bin model file");
+        return Some(strings::MODEL_PATH_EMPTY);
     }
     let path = Path::new(path);
     if !path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("bin"))
     {
-        return Some("The model file must end in .bin");
+        return Some(strings::MODEL_PATH_NOT_BIN);
     }
     // The daemon resolves a relative path against its own working directory, not ours.
     if !path.is_absolute() {
-        return Some("Use the full path to the file, from the drive letter");
+        return Some(strings::MODEL_PATH_RELATIVE);
     }
     None
 }
@@ -483,8 +465,8 @@ fn custom_problem(path: &str) -> Option<&'static str> {
     }
     match fs::metadata(path) {
         Ok(meta) if meta.is_file() => None,
-        Ok(_) => Some("This is a folder, not a model file"),
-        Err(_) => Some("File not found"),
+        Ok(_) => Some(strings::MODEL_PATH_FOLDER),
+        Err(_) => Some(strings::MODEL_PATH_MISSING),
     }
 }
 
@@ -511,7 +493,7 @@ fn gpu_rows(
         && !rows.iter().any(|(_, c)| c == current)
     {
         let label = if listed.is_some() {
-            format!("{name} (not connected)")
+            strings::not_connected(name)
         } else {
             name.clone()
         };
@@ -534,43 +516,14 @@ mod tests {
 
     use super::*;
     use crate::ipc::{Cmd, Ipc};
+    use crate::testing::{has, linked, with_role};
 
-    /// The settings window on a fresh config dir, its Model page bound to a fake daemon link.
+    /// The settings window on a fresh config dir and a fake daemon link, on the Model page.
     fn window(name: &str) -> (AppWindow, Ipc, Receiver<Cmd>, Layout) {
-        i_slint_backend_testing::init_no_event_loop();
-        let dir = std::env::temp_dir().join(format!(
-            "oxi-settings-lib-model-{}-{name}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let layout = Layout {
-            config_dir: dir.clone(),
-            data_dir: dir.clone(),
-            logs_dir: dir,
-        };
-        let window = crate::open(layout.clone()).unwrap();
-        let (ipc, sent) = Ipc::fake();
-        let (mut ctx, _) = Ctx::load(layout.clone()).unwrap();
-        ctx.ipc = ipc.clone();
-        bind(&window, &ctx);
-        window.show().unwrap();
-        window.set_page(Page::Model);
+        let opened = linked("model", name, Page::Model);
         // Building the page runs its `init`, which asks the daemon.
-        assert!(has(&window, "Use my own .bin"));
-        (window, ipc, sent, layout)
-    }
-
-    fn with_role(window: &AppWindow, label: &str, role: AccessibleRole) -> ElementHandle {
-        ElementHandle::find_by_accessible_label(window, label)
-            .find(|e| e.accessible_role() == Some(role))
-            .unwrap_or_else(|| panic!("no {role:?} labelled {label}"))
-    }
-
-    fn has(window: &AppWindow, label: &str) -> bool {
-        ElementHandle::find_by_accessible_label(window, label)
-            .next()
-            .is_some()
+        assert!(has(&opened.0, "Use my own .bin"));
+        opened
     }
 
     /// Wait for the path worker: step the mocked clock (which runs the page's poll timer) until
@@ -843,7 +796,7 @@ mod tests {
         }
     }
 
-    const RELATIVE: &str = "Use the full path to the file, from the drive letter";
+    const RELATIVE: &str = strings::MODEL_PATH_RELATIVE;
 
     #[test]
     fn custom_path_problems() {
@@ -894,9 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn sizes_and_fractions() {
-        assert_eq!(gb(1_624_555_275), "1.6 GB");
-        assert_eq!(gb(0), "0.0 GB");
+    fn fractions() {
         assert!((fraction(1, 4) - 0.25).abs() < f32::EPSILON);
         assert!(fraction(1, 0).abs() < f32::EPSILON);
         assert!((fraction(9, 4) - 1.0).abs() < f32::EPSILON);
