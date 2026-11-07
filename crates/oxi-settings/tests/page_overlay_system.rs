@@ -277,7 +277,7 @@ fn preview_is_off_without_the_daemon() {
     assert_eq!(preview.accessible_enabled(), Some(false));
     assert_eq!(
         preview.accessible_description().as_deref(),
-        Some(oxi_core::strings::DAEMON_OFFLINE)
+        Some(oxi_core::strings::PREVIEW_OFFLINE)
     );
 }
 
