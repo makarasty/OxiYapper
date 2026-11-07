@@ -1,11 +1,6 @@
 //! Paste worker: clipboard and synthetic input (ARCHITECTURE section 10). It runs one command at
 //! a time in arrival order, so two queued pastes never interleave. Dictated text is never logged.
 
-#![allow(
-    dead_code,
-    reason = "run.rs (t40) spawns the worker; until then only the tests do"
-)]
-
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::{Builder, JoinHandle};
 

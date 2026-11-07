@@ -54,10 +54,18 @@ const BUSY_WAIT: Duration = Duration::from_secs(2);
 /// The whole second launch: connect, send `OpenSettings`, wait for the daemon to close.
 const FORWARD_WAIT: Duration = Duration::from_secs(3);
 
+/// Test seam: a non-empty value gives the pipe `<default name>-<value>`, so a test daemon never
+/// meets the user's real one. Children inherit it, so a daemon and its settings agree.
+pub const PIPE_SUFFIX_ENV: &str = "OXI_PIPE_SUFFIX";
+
 /// This user's socket name: `\\.\pipe\OxiYapper-<SID>` on Windows.
 #[cfg(windows)]
 pub fn default_name() -> io::Result<String> {
-    Ok(oxi_core::ipc::pipe_name(&crate::os::pipe::user_sid()?))
+    let name = oxi_core::ipc::pipe_name(&crate::os::pipe::user_sid()?);
+    Ok(match std::env::var(PIPE_SUFFIX_ENV) {
+        Ok(suffix) if !suffix.is_empty() => format!("{name}-{suffix}"),
+        _ => name,
+    })
 }
 
 // shortcut: Unix has no per-user socket directory yet, fill it with the Unix platform module.

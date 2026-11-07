@@ -2,11 +2,6 @@
 //! and 11). It opens a [`Capture`] on `Start`, hands the finished 16 kHz audio to the coordinator
 //! on `Stop`, and turns capture events into machine events. Audio is never logged.
 
-#![allow(
-    dead_code,
-    reason = "run.rs (t40) spawns the worker; until then only the tests do"
-)]
-
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::{Builder, JoinHandle};
 

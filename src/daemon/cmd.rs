@@ -22,11 +22,6 @@
 //!
 //! Types that carry dictated text have no `Debug`, so the text cannot reach a log by `{:?}`.
 
-#![allow(
-    dead_code,
-    reason = "the workers and run.rs (t28a-t40) use these; until then only the coordinator tests do"
-)]
-
 use std::sync::mpsc::Sender;
 
 use oxi_core::config::{Audio, Config, ConfigError, Hotkey, Overlay, OverlayPosition, Paste};
