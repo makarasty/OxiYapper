@@ -601,7 +601,7 @@ mod tests {
         let rows: Vec<SharedString> = slint::Model::iter(&state.get_devices()).collect();
         assert_eq!(
             rows,
-            ["System default", "Built-in", "USB Mic (not connected)"]
+            ["System default", "Built-in", "Not connected: USB Mic"]
         );
         assert_eq!(state.get_device(), 2);
     }
@@ -676,59 +676,112 @@ mod tests {
         assert_eq!(state.get_list_error(), "");
     }
 
-    /// With `OXI_SHOTS_DIR` set, draws the page with its configured mic not connected to
-    /// `settings-audio-not-connected-<theme>.png`. Run it alone (`--exact`): it installs its own
-    /// software-renderer platform, which the testing-backend tests in this binary cannot share.
+    /// Draws the page: the configured mic not connected, the level meter with bars, and with
+    /// clipping, each frame non-empty and not one colour; the page lists and opens devices through
+    /// fakes. With `OXI_SHOTS_DIR` set the frames land in `settings-audio-<screen>-<theme>.png`.
+    /// The renderer platform is per thread and the other tests here use the testing backend, so
+    /// the drawing runs on a thread of its own.
     #[test]
-    fn shot_not_connected() {
+    fn shots_audio() {
+        std::thread::spawn(draw_audio).join().unwrap();
+    }
+
+    fn draw_audio() {
         use slint::platform::software_renderer::{
             MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
         };
         use slint::platform::{Platform, WindowAdapter};
 
-        struct Shots(Rc<MinimalSoftwareWindow>);
+        thread_local! {
+            static LAST: RefCell<Option<Rc<MinimalSoftwareWindow>>> = const { RefCell::new(None) };
+        }
+        struct Shots;
         impl Platform for Shots {
             fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
-                Ok(self.0.clone())
+                let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+                LAST.with_borrow_mut(|last| *last = Some(window.clone()));
+                Ok(window)
             }
         }
 
-        let Some(dir) = std::env::var_os("OXI_SHOTS_DIR") else {
-            return;
-        };
+        let dir = std::env::var_os("OXI_SHOTS_DIR").map(std::path::PathBuf::from);
+        if let Some(dir) = &dir {
+            std::fs::create_dir_all(dir).unwrap();
+        }
         let (w, h) = (560_u32, 600_u32);
-        let surface = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
-        slint::platform::set_platform(Box::new(Shots(surface.clone()))).unwrap();
-        let config = "version = 1\n[audio]\ndevice = \"USB Mic\"\n";
-        let (window, page) = window_on("shot", Some(config), fake_fallback);
-        LISTED.set(vec!["Built-in Microphone".into()]);
-        surface.set_size(slint::PhysicalSize::new(w, h));
-        window.show().unwrap();
-        window.set_page(Page::Audio);
-        page.shown();
-        page.tick();
-        for (theme, choice) in [
-            ("light", crate::ThemeChoice::Light),
-            ("dark", crate::ThemeChoice::Dark),
-        ] {
-            window.set_theme(choice);
-            slint::platform::update_timers_and_animations();
-            surface.request_redraw();
-            let mut buffer = vec![PremultipliedRgbaColor::default(); (w * h) as usize];
-            assert!(surface.draw_if_needed(|r| {
-                r.render(&mut buffer, w as usize);
-            }));
-            let bytes = buffer
-                .iter()
-                .flat_map(|p| [p.red, p.green, p.blue, p.alpha])
-                .collect();
-            let size = tiny_skia::IntSize::from_wh(w, h).unwrap();
-            let pixmap = tiny_skia::Pixmap::from_vec(bytes, size).unwrap();
-            let path = std::path::Path::new(&dir);
-            std::fs::create_dir_all(path).unwrap();
-            pixmap
-                .save_png(path.join(format!("settings-audio-not-connected-{theme}.png")))
-                .unwrap();
+        slint::platform::set_platform(Box::new(Shots)).unwrap();
+        let bars = |f: fn(usize) -> f32| -> Vec<f32> { (0..40).map(f).collect() };
+        let screens: [(&str, Option<&str>, Vec<f32>, bool); 3] = [
+            (
+                "not-connected",
+                Some(
+                    "version = 1
+[audio]
+device = \"USB Mic\"
+",
+                ),
+                vec![],
+                false,
+            ),
+            (
+                "level",
+                None,
+                bars(|i| 0.1 + 0.8 * ((i as f32) * 0.5).sin().abs()),
+                false,
+            ),
+            (
+                "clipping",
+                None,
+                bars(|i| if i > 32 { 1.0 } else { 0.3 }),
+                true,
+            ),
+        ];
+        for (screen, config, bars, clipping) in screens {
+            let (window, page) = window_on("shot", config, fake_fallback);
+            LISTED.set(vec!["Built-in Microphone".into()]);
+            let surface = LAST.with_borrow(Clone::clone).unwrap();
+            surface.set_size(slint::PhysicalSize::new(w, h));
+            window.show().unwrap();
+            window.set_page(Page::Audio);
+            page.shown();
+            page.tick();
+            if !bars.is_empty() {
+                let state = window.global::<AudioState>();
+                state.set_bars(ModelRc::from(Rc::new(VecModel::from(bars))));
+                state.set_clipping(clipping);
+            }
+            for (theme, choice) in [
+                ("light", crate::ThemeChoice::Light),
+                ("dark", crate::ThemeChoice::Dark),
+            ] {
+                window.set_theme(choice);
+                slint::platform::update_timers_and_animations();
+                surface.request_redraw();
+                let mut buffer = vec![PremultipliedRgbaColor::default(); (w * h) as usize];
+                assert!(surface.draw_if_needed(|r| {
+                    r.render(&mut buffer, w as usize);
+                }));
+                let bytes = buffer
+                    .iter()
+                    .flat_map(|p| [p.red, p.green, p.blue, p.alpha])
+                    .collect();
+                let size = tiny_skia::IntSize::from_wh(w, h).unwrap();
+                let pixmap = tiny_skia::Pixmap::from_vec(bytes, size).unwrap();
+                let first = pixmap.pixels()[0];
+                assert!(
+                    pixmap.pixels().iter().any(|p| p.alpha() > 0),
+                    "{screen} {theme} drew nothing"
+                );
+                assert!(
+                    pixmap.pixels().iter().any(|p| *p != first),
+                    "{screen} {theme} is one flat colour"
+                );
+                if let Some(dir) = &dir {
+                    pixmap
+                        .save_png(dir.join(format!("settings-audio-{screen}-{theme}.png")))
+                        .unwrap();
+                }
+            }
         }
     }
 
@@ -820,10 +873,7 @@ mod tests {
     fn device_rows_map_to_config_names() {
         let names = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         let d = Devices::new(names(&["A", "B"]), "USB");
-        assert_eq!(
-            d.rows(),
-            ["System default", "A", "B", "USB (not connected)"]
-        );
+        assert_eq!(d.rows(), ["System default", "A", "B", "Not connected: USB"]);
         for (row, want) in [(0, ""), (1, "A"), (3, "USB"), (9, "")] {
             assert_eq!(d.name(row), want, "row {row}");
         }

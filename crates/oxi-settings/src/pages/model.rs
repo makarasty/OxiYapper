@@ -373,7 +373,9 @@ impl PageState {
                     self.update(i, |r| {
                         r.downloading = false;
                         r.error = match result {
-                            DownloadResult::Failed { message } => message.as_str().into(),
+                            DownloadResult::Failed { message } => {
+                                strings::download_failed(message).into()
+                            }
                             DownloadResult::Ok | DownloadResult::Cancelled => SharedString::new(),
                         };
                     });
@@ -485,7 +487,7 @@ fn gpu_rows(
         let label = if d.description.is_empty() {
             d.name.clone()
         } else {
-            format!("{} ({})", d.description, d.name)
+            format!("{} · {}", d.name, d.description)
         };
         rows.push((label, DeviceChoice::Named(d.name.clone())));
     }
@@ -613,12 +615,18 @@ mod tests {
         };
         push(&ipc, done("large-v3", failed));
         // The text is labelled with the model it belongs to.
-        assert!(has(&window, &format!("Whisper large-v3: {message}")));
+        assert!(has(
+            &window,
+            &format!("Whisper large-v3: Download failed: {message}")
+        ));
         assert_eq!(bar(&window), None);
         assert!(has(&window, "3.1 GB · Not downloaded"));
         // Trying again clears the old error.
         download_large(&window);
-        assert!(!has(&window, &format!("Whisper large-v3: {message}")));
+        assert!(!has(
+            &window,
+            &format!("Whisper large-v3: Download failed: {message}")
+        ));
     }
 
     #[test]
@@ -737,8 +745,8 @@ mod tests {
         let want = [
             "Auto",
             "CPU",
-            "NVIDIA GeForce RTX 4070 SUPER (Vulkan0)",
-            "AMD Radeon(TM) Graphics (Vulkan1)",
+            "Vulkan0 · NVIDIA GeForce RTX 4070 SUPER",
+            "Vulkan1 · AMD Radeon(TM) Graphics",
         ];
         assert_eq!(rows, want);
         s.invoke_gpu_picked(3);
@@ -786,7 +794,7 @@ mod tests {
             (
                 Some(&listed),
                 named("Vulkan1"),
-                &["Auto", "CPU", "Vulkan0", "Vulkan1 (not connected)"],
+                &["Auto", "CPU", "Vulkan0", "Not connected: Vulkan1"],
             ),
         ];
         for (listed, current, want) in table {

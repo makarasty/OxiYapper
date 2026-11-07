@@ -149,7 +149,9 @@ component FileEditor inherits VerticalLayout {
     }
 }
 
-// Scrolls only when notes and banners outgrow the window.
+// No scrolling in the normal states (SPEC Settings UI): the editors are short and the rules list
+// is capped, so the page fits the window with the banner and the notes of the files showing.
+// The ScrollView is only the fallback when banner, notes and rules together outgrow it.
 export component TextPage inherits ScrollView {
     init => {
         TextState.shown();
@@ -161,8 +163,7 @@ export component TextPage inherits ScrollView {
     content-height: content.preferred-height;
     content := VerticalLayout {
         width: root.visible-width;
-        // Room for the scrollbar, so it does not sit on the boxes' border.
-        padding-right: 10px;
+        alignment: start;
         spacing: 8px;
         Group {
             title: @tr("Dictionary: words that help whisper, one per line");
@@ -171,7 +172,7 @@ export component TextPage inherits ScrollView {
                 name: "dictionary.txt";
                 label: @tr("Dictionary");
                 info: TextState.dictionary-info;
-                editor-height: 72px;
+                editor-height: 56px;
                 text <=> TextState.dictionary;
                 Text {
                     text: @tr("{} / {} tokens", TextState.tokens, TextState.budget);
@@ -192,7 +193,7 @@ export component TextPage inherits ScrollView {
                 name: "replace.txt";
                 label: @tr("Replacements");
                 info: TextState.replacements-info;
-                editor-height: 64px;
+                editor-height: 56px;
                 text <=> TextState.replacements;
                 Text {
                     text: TextState.bad-lines == "" ? @tr("Every line has =>.") : @tr("Ignored, no =>: line {}", TextState.bad-lines);
@@ -234,7 +235,8 @@ export component TextPage inherits ScrollView {
                 }
             }
             ListView {
-                height: 64px;
+                // One row per rule, two at most; more rules scroll inside the list.
+                height: min(TextState.rules.length, 2) * 32px;
                 for rule[i] in TextState.rules: Row {
                     label: rule.app;
                     ComboBox {

@@ -14,6 +14,8 @@ export global Shell {
 export component Group inherits VerticalLayout {
     in property <string> title;
     spacing: 4px;
+    // The card fills the page whatever its rows can stretch to (a switch row has a fixed control).
+    max-width: 100000px;
     Text {
         text: root.title;
         font-size: 11px;
@@ -42,6 +44,7 @@ export component Row inherits HorizontalLayout {
     in property <string> label;
     in property <length> label-width: 150px;
     min-height: 32px;
+    max-width: 100000px;
     spacing: 8px;
     Text {
         text: root.label;
@@ -196,8 +199,8 @@ export component Banner inherits Rectangle {
     in property <string> text;
     // Error tint for a broken file; warning tint otherwise.
     in property <bool> error;
-    background: root.error ? #c42b1c33 : #f7b50033;
-    border-color: root.error ? #c42b1c : #f7b500;
+    background: root.error ? Shell.error-text.transparentize(0.8) : #f7b50033;
+    border-color: root.error ? Shell.error-text : #f7b500;
     border-width: 1px;
     border-radius: 6px;
     accessible-role: banner;
@@ -226,7 +229,11 @@ export component InlineNote inherits Rectangle {
     border-radius: 6px;
     accessible-role: AccessibleRole.text;
     accessible-label: root.text;
-    VerticalLayout {
+    // A Rectangle does not take its child layout's height: a wrapped text and its buttons would
+    // spill out of the box into the next group.
+    min-height: inner.min-height;
+    preferred-height: inner.preferred-height;
+    inner := VerticalLayout {
         padding: 8px;
         spacing: 6px;
         Text {

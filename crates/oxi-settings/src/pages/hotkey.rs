@@ -380,6 +380,32 @@ mod tests {
     }
 
     #[test]
+    fn apply_is_off_while_the_chord_is_invalid() {
+        let (window, ipc, _sent) = open("invalid-apply");
+        one(&window, "Change hotkey").invoke_accessible_default_action();
+        key(&ipc, Key::F13, true);
+        assert_eq!(
+            one(&window, "Apply hotkey").accessible_enabled(),
+            Some(true)
+        );
+        // Esc inside a chord shows the error: nothing to apply until a valid chord is pressed.
+        key(&ipc, Key::Esc, true);
+        assert!(!window.global::<HotkeyState>().get_error().is_empty());
+        assert_eq!(
+            one(&window, "Apply hotkey").accessible_enabled(),
+            Some(false)
+        );
+        for k in [Key::F13, Key::Esc] {
+            key(&ipc, k, false);
+        }
+        key(&ipc, Key::F14, true);
+        assert_eq!(
+            one(&window, "Apply hotkey").accessible_enabled(),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn pushed_keys_light_up_and_fill_the_chord() {
         let (window, ipc, _sent) = open("push");
         one(&window, "Change hotkey").invoke_accessible_default_action();
@@ -483,21 +509,22 @@ mod tests {
             .window()
             .set_size(slint::LogicalSize::new(560.0, 600.0));
         one(&window, "Change hotkey").invoke_accessible_default_action();
+        // The font comes from the component's own `CapFont`, the one every cap uses. The floor
+        // must only absorb rounding: a word that needs a smaller font would not fit its cap.
+        let font = window.global::<crate::generated::CapFont>();
         let mut smallest = f32::MAX;
         for cap in super::keyboard_layout::caps() {
             let label = cap.key.label();
-            let el = one(&window, &cap.key.spoken());
-            // keyboard.slint: the text box is the cap less 2 px, the font
-            // max(7px, min(8px, box / longest word * 1.5)). The floor must only absorb rounding:
-            // a word that needs a smaller font would not fit its cap.
-            let room = el.size().width - 2.0;
-            #[allow(clippy::cast_precision_loss, reason = "a label has a few characters")]
-            let fitted = (room / super::longest_word(label) as f32 * 1.5).min(8.0);
+            let room = one(&window, &cap.key.spoken()).size().width - 2.0;
+            let word = super::longest_word(label);
+            let fitted = font.invoke_fit(room, word);
             assert!(fitted >= CAP_FONT_FLOOR - 0.1, "{label}: {fitted} px");
-            let font = fitted.max(CAP_FONT_FLOOR);
-            smallest = smallest.min(font);
+            smallest = smallest.min(font.invoke_size(room, word));
         }
-        println!("smallest cap font: {smallest} px");
+        assert!(
+            smallest >= CAP_FONT_FLOOR,
+            "smallest cap font: {smallest} px"
+        );
     }
 
     #[test]

@@ -102,7 +102,7 @@ fn missing_device_stays_picked_until_default_is_chosen() {
     let picker = with_role(&window, "Device", AccessibleRole::Combobox);
     assert_eq!(
         picker.accessible_value().as_deref(),
-        Some("Test Mic 9 (not connected)")
+        Some("Not connected: Test Mic 9")
     );
 
     picker.mock_single_click(PointerEventButton::Left);

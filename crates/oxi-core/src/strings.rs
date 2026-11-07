@@ -108,6 +108,10 @@ pub const PIPE_UNTRUSTED: &str =
     "The OxiYapper pipe is held by an untrusted program. Not connecting.";
 pub const PIPE_FOREIGN: &str = "The OxiYapper pipe is held by another account. Not connecting.";
 
+// Beside the disabled Preview button there is room for a few words, not the banner's two sentences.
+pub const PREVIEW_OFFLINE: &str = "OxiYapper is not running";
+pub const PREVIEW_MISMATCH: &str = "Restart OxiYapper first";
+
 /// Banner of a config reload that failed; `line` is 1-based.
 #[must_use]
 pub fn config_error(file: &str, line: usize, message: &str) -> String {
@@ -120,10 +124,11 @@ pub fn spawn_failed(kind: std::io::ErrorKind) -> String {
     format!("Could not start {APP_NAME}: {kind}.")
 }
 
-/// A configured device that is not plugged in, as its picker row shows it.
+/// A configured device that is not plugged in, as its picker row shows it: the marker first, so
+/// a narrow picker never cuts it off.
 #[must_use]
 pub fn not_connected(name: &str) -> String {
-    format!("{name} (not connected)")
+    format!("Not connected: {name}")
 }
 
 pub const NO_MIC: &str = "No microphone";
@@ -131,6 +136,12 @@ pub const SYSTEM_DEFAULT_MIC: &str = "System default";
 
 pub const DOWNLOAD_NEEDS_DAEMON: &str = "Start OxiYapper to download models";
 pub const DOWNLOAD_STARTING: &str = "Starting the download";
+
+/// The daemon's reason for a failed model download, under the model's row.
+#[must_use]
+pub fn download_failed(message: &str) -> String {
+    format!("Download failed: {message}")
+}
 
 /// Decimal gigabytes with one digit, the unit Hugging Face shows.
 #[must_use]
@@ -185,5 +196,7 @@ mod tests {
             config_error("config.toml", 3, "bad"),
             "config.toml, line 3: bad"
         );
+        assert_eq!(not_connected("USB Mic"), "Not connected: USB Mic");
+        assert_eq!(download_failed("reset"), "Download failed: reset");
     }
 }

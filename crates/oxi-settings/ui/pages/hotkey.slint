@@ -45,7 +45,8 @@ export component HotkeyPage inherits VerticalLayout {
             label: @tr("Keys");
             Rectangle {
                 horizontal-stretch: 1;
-                height: 26px;
+                height: 32px;
+                opacity: Shell.locked ? 0.5 : 1;
                 border-radius: 4px;
                 border-width: 1px;
                 border-color: Palette.border;
@@ -90,12 +91,15 @@ export component HotkeyPage inherits VerticalLayout {
             focus-lost => {
                 HotkeyState.focused(false);
             }
-            VerticalLayout {
+            // A FocusScope does not take its child layout's height: the card ends above the buttons.
+            min-height: inner.min-height;
+            preferred-height: inner.preferred-height;
+            inner := VerticalLayout {
                 spacing: 6px;
                 padding-top: 4px;
                 padding-bottom: 6px;
                 Text {
-                    text: HotkeyState.online ? @tr("Click keys or press them; modifiers match either side. Releasing the keys goes to Apply, Esc to Cancel; click the keyboard to press again.") : @tr("Not connected to OxiYapper: pressed keys are not seen and Apply is off. Click keys to pick them.");
+                    text: HotkeyState.online ? @tr("Click keys or press them; modifiers match either side. Releasing the keys goes to Apply, Esc to Cancel; click the keyboard to press again.") : @tr("Not connected to OxiYapper: pressed keys are not seen and Apply is off. Start OxiYapper to pick a hotkey.");
                     wrap: word-wrap;
                     font-size: 11px;
                     color: Palette.foreground;
@@ -129,7 +133,7 @@ export component HotkeyPage inherits VerticalLayout {
                     apply := Button {
                         text: @tr("Apply");
                         accessible-label: @tr("Apply hotkey");
-                        enabled: !Shell.locked && HotkeyState.online;
+                        enabled: !Shell.locked && HotkeyState.online && HotkeyState.error == "";
                         primary: true;
                         clicked => {
                             HotkeyState.apply();

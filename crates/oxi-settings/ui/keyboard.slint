@@ -23,6 +23,18 @@ export struct KeyCap {
     picked: bool,
 }
 
+// The font of a cap label. `fit` is the size at which the longest word fills `room` (8 px at most);
+// `size` never goes under 7 px (the layout keeps 1-unit labels to 3 characters, which fit at 7 px).
+// A global so the unit test reads the very numbers the caps use.
+export global CapFont {
+    pure public function fit(room: length, word: int) -> length {
+        return min(8px, room / max(1, word) * 1.5);
+    }
+    pure public function size(room: length, word: int) -> length {
+        return max(7px, CapFont.fit(room, word));
+    }
+}
+
 export component Keyboard inherits Rectangle {
     in property <[KeyCap]> caps;
     // Board size in key units.
@@ -57,9 +69,8 @@ export component Keyboard inherits Rectangle {
             width: parent.width - 2px;
             accessible-role: none;
             text: cap.label;
-            // Sized so the longest word fits the cap without breaking inside it; never under 7 px (the
-            // layout keeps 1-unit labels to 3 characters, which fit at 7 px).
-            font-size: max(7px, min(8px, (parent.width - 2px) / max(1, cap.word) * 1.5));
+            // Sized so the longest word fits the cap without breaking inside it.
+            font-size: CapFont.size(self.width, cap.word);
             wrap: word-wrap;
             overflow: elide;
             horizontal-alignment: center;

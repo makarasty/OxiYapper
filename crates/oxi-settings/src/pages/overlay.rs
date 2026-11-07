@@ -3,6 +3,7 @@
 
 use oxi_core::config::{Overlay, OverlayPosition};
 use oxi_core::ipc::Request;
+use oxi_core::strings;
 use slint::{ComponentHandle, Weak};
 
 use crate::generated::OverlayState;
@@ -54,10 +55,15 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     });
 }
 
-/// Preview needs `Online`; any other state says why, with the shell banner's text.
+/// Preview needs `Online`; any other state says why: a short text for the two usual ones, the
+/// shell banner's text for the rest.
 fn set_link(s: &OverlayState, link: Link) {
     s.set_online(link == Link::Online);
-    let note = notice(&Event::Link(link)).map(|n| n.text);
+    let note = match link {
+        Link::Offline => Some(strings::PREVIEW_OFFLINE.to_owned()),
+        Link::Mismatch { .. } => Some(strings::PREVIEW_MISMATCH.to_owned()),
+        _ => notice(&Event::Link(link)).map(|n| n.text),
+    };
     s.set_note(note.unwrap_or_default().into());
 }
 
@@ -120,7 +126,7 @@ mod tests {
         assert_eq!(preview.accessible_enabled(), Some(false));
         assert_eq!(
             preview.accessible_description().as_deref(),
-            Some(oxi_core::strings::DAEMON_OFFLINE)
+            Some(oxi_core::strings::PREVIEW_OFFLINE)
         );
         ipc.deliver(&Event::Link(Link::Online));
         assert_eq!(
@@ -138,7 +144,7 @@ mod tests {
         assert_eq!(preview.accessible_enabled(), Some(false));
         assert_eq!(
             preview.accessible_description().as_deref(),
-            Some(oxi_core::strings::DAEMON_MISMATCH)
+            Some(oxi_core::strings::PREVIEW_MISMATCH)
         );
     }
 }
