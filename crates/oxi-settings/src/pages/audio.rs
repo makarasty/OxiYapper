@@ -36,9 +36,11 @@ const REOPEN: Millis = Millis(60_000);
 const SETTLE: Millis = Millis(300);
 /// How often the device list is read again while the page is shown (a listing takes ~2 ms).
 const RELIST: Millis = Millis(2_000);
-/// An open mic that gave only exact zeros this long gets the no-signal note (a muted or switched
-/// off headset; a quiet room is never exactly zero).
-const NO_SIGNAL: Millis = Millis(1_000);
+/// An open mic that gave only exact zeros this long gets the no-signal note (a muted headset, or
+/// one behind a noise gate; a quiet room is never exactly zero).
+const NO_SIGNAL: Millis = Millis(3_000);
+/// The Test playback stays open this much longer than the clip, so wireless outputs are not cut.
+const PLAY_TAIL: Millis = Millis(300);
 /// Length of the Test button's recording.
 const TEST_LENGTH: Millis = Millis(3_000);
 
@@ -244,8 +246,8 @@ impl<C: Capture + 'static> PageState<C> {
         state.set_bars(ModelRc::from(Rc::new(VecModel::from(bars))));
     }
 
-    /// The Test button: record from the configured mic through the dictation pipeline (trim off,
-    /// so a quiet test is still played), then play it back in `tick`.
+    /// The Test button: record from the configured mic through the dictation pipeline (trim and
+    /// normalise off: it plays what the mic really gives), then play it back in `tick`.
     fn start_test(&self) {
         let Some(window) = self.window.upgrade() else {
             return;
@@ -256,6 +258,7 @@ impl<C: Capture + 'static> PageState<C> {
         }
         let opts = Audio {
             trim: false,
+            normalize: false,
             ..self.ctx.config.borrow().config.audio.clone()
         };
         let dead = Arc::new(AtomicBool::new(false));
@@ -290,7 +293,7 @@ impl<C: Capture + 'static> PageState<C> {
                         let ms = len as u64 * 1000 / u64::from(SAMPLE_RATE);
                         *test = Some(MicTest::Playing {
                             _sound: sound,
-                            until: now + Millis(ms),
+                            until: now + Millis(ms) + PLAY_TAIL,
                         });
                         state.set_test_status(strings::MIC_TEST_PLAYING.into());
                     }
@@ -448,8 +451,10 @@ struct Live<C> {
     note: Option<String>,
     /// The open capture runs on the system default: the configured device is missing.
     fell_back: bool,
-    /// The open capture gave a non-zero sample.
-    heard: bool,
+    /// Device that gave a non-zero sample in this page session; a reopen keeps it.
+    heard: Option<String>,
+    /// Since when the open capture gave only zeros (the last signal, or the open of an unheard one).
+    zeros_since: Millis,
 }
 
 struct Running<C> {
@@ -471,7 +476,8 @@ impl<C> Live<C> {
             changed: None,
             note: None,
             fell_back: false,
-            heard: false,
+            heard: None,
+            zeros_since: Millis(0),
         }
     }
 
@@ -509,17 +515,25 @@ impl<C> Live<C> {
 
     /// Feed one raw level into the meter, scaled by the gain.
     fn show(&mut self, raw: Level, opts: &Audio, now: Millis) {
-        self.heard |= raw.peak > 0.0;
+        if raw.peak > 0.0 {
+            self.zeros_since = now;
+            if let Some(r) = &self.capture
+                && self.heard.as_deref() != Some(&r.name)
+            {
+                self.heard = Some(r.name.clone());
+            }
+        }
         #[expect(clippy::cast_possible_truncation, reason = "gain is a few dB")]
         let gain = db_to_linear(opts.gain_db as f32);
         self.meter.push(raw.scaled(gain), now);
     }
 
-    /// The no-signal note once the open mic gave only exact zeros for [`NO_SIGNAL`].
+    /// The no-signal note once the open mic gave only exact zeros for [`NO_SIGNAL`]; any signal
+    /// clears it, and a reopen of a device already heard does not start the wait over.
     fn no_signal(&self, now: Millis) -> Option<String> {
         self.capture
             .as_ref()
-            .filter(|r| !self.heard && now >= r.since + NO_SIGNAL)
+            .filter(|_| now >= self.zeros_since + NO_SIGNAL)
             .map(|r| strings::no_signal(&r.name))
     }
 
@@ -527,7 +541,6 @@ impl<C> Live<C> {
         // One stream at a time: the old one closes before the new one opens.
         self.capture = None;
         self.fell_back = false;
-        self.heard = false;
         self.tried = Some(opts.device.clone());
         self.changed = None;
         let dead = Arc::new(AtomicBool::new(false));
@@ -541,6 +554,10 @@ impl<C> Live<C> {
         };
         match (self.open)(&meter_opts, self.level.clone(), Arc::clone(&dead)) {
             Ok(opened) => {
+                if self.heard.as_deref() != Some(&opened.name) {
+                    self.heard = None;
+                    self.zeros_since = now;
+                }
                 self.note = None;
                 self.fell_back = opened.fell_back;
                 self.capture = Some(Running {
@@ -561,6 +578,7 @@ impl<C> Live<C> {
         self.changed = None;
         self.note = None;
         self.fell_back = false;
+        self.heard = None;
         self.meter = Meter::new(BARS, self.sensitivity);
     }
 }
@@ -582,6 +600,8 @@ mod tests {
         static LIST_FAILS: Cell<bool> = const { Cell::new(false) };
         static SILENT_CLIP: Cell<bool> = const { Cell::new(false) };
         static PLAYED: Cell<usize> = const { Cell::new(0) };
+        /// `normalize` of the last open through `fake`.
+        static NORMALIZE: Cell<Option<bool>> = const { Cell::new(None) };
     }
 
     struct Fake;
@@ -636,7 +656,8 @@ mod tests {
     }
 
     #[expect(clippy::unnecessary_wraps, reason = "has the Opener signature")]
-    fn fake(_: &Audio, _: LevelMeter, _: Arc<AtomicBool>) -> Result<Opened<Fake>, CaptureError> {
+    fn fake(o: &Audio, _: LevelMeter, _: Arc<AtomicBool>) -> Result<Opened<Fake>, CaptureError> {
+        NORMALIZE.set(Some(o.normalize));
         Ok(opened(false))
     }
 
@@ -690,6 +711,7 @@ mod tests {
         LIST_FAILS.set(false);
         SILENT_CLIP.set(false);
         PLAYED.set(0);
+        NORMALIZE.set(None);
     }
 
     /// The settings window on a fresh config dir, its Audio page on fakes.
@@ -747,7 +769,8 @@ mod tests {
         live.show(zero, &opts, Millis(500));
         assert_eq!(live.no_signal(Millis(500)), None, "too early");
         live.show(zero, &opts, NO_SIGNAL);
-        let want = "No sound from Fake Mic. Reconnect it or pick another mic";
+        let want =
+            "No sound from Fake Mic yet. Speak, check that it is not muted, or reconnect it.";
         assert_eq!(live.no_signal(NO_SIGNAL).as_deref(), Some(want));
         // A quiet room is not exactly zero: one tiny sample clears it.
         let hiss = Level {
@@ -756,6 +779,38 @@ mod tests {
         };
         live.show(hiss, &opts, NO_SIGNAL + Millis(33));
         assert_eq!(live.no_signal(NO_SIGNAL + Millis(33)), None);
+    }
+
+    #[test]
+    fn a_heard_mic_is_not_flagged_again_by_a_reopen_but_is_by_new_zeros() {
+        reset();
+        let mut live = Live::new(fake, 0.0);
+        let opts = Audio::default();
+        let zero = Level {
+            peak: 0.0,
+            rms: 0.0,
+        };
+        let hiss = Level {
+            peak: 1e-5,
+            rms: 1e-6,
+        };
+        live.tick(&opts, Millis(0));
+        live.show(hiss, &opts, Millis(100));
+        // Gated while nobody speaks: zeros for the whole REOPEN, then a reopen.
+        live.tick(&opts, REOPEN);
+        live.show(zero, &opts, REOPEN + Millis(33));
+        assert!(
+            live.no_signal(REOPEN + Millis(33)).is_some(),
+            "3 s of zeros after a signal"
+        );
+        live.show(hiss, &opts, REOPEN + Millis(66));
+        assert_eq!(live.no_signal(REOPEN + Millis(66)), None);
+        // Another reopen right after a signal: the wait is not restarted by the reopen itself.
+        let t = REOPEN + REOPEN;
+        live.show(hiss, &opts, t - Millis(33));
+        live.tick(&opts, t);
+        live.show(zero, &opts, t + Millis(33));
+        assert_eq!(live.no_signal(t + Millis(33)), None, "zeros for 66 ms only");
     }
 
     #[test]
@@ -768,7 +823,7 @@ mod tests {
         frame(NO_SIGNAL.0);
         assert_eq!(
             state.get_silence(),
-            "No sound from Fake Mic. Reconnect it or pick another mic"
+            "No sound from Fake Mic yet. Speak, check that it is not muted, or reconnect it."
         );
         window.set_page(Page::About);
         frame(40);
@@ -787,7 +842,14 @@ mod tests {
         frame(TEST_LENGTH.0);
         assert_eq!(state.get_test_status(), strings::MIC_TEST_PLAYING);
         assert_eq!(PLAYED.get(), SAMPLE_RATE as usize);
+        assert_eq!(
+            NORMALIZE.get(),
+            Some(false),
+            "test clip must not be normalised"
+        );
         frame(1_000);
+        assert!(state.get_testing(), "playback stays open for a tail");
+        frame(PLAY_TAIL.0);
         assert_eq!(state.get_test_status(), "");
         assert!(!state.get_testing());
     }
@@ -802,7 +864,7 @@ mod tests {
         frame(TEST_LENGTH.0);
         assert_eq!(
             state.get_test_status(),
-            "No sound from Fake Mic. Reconnect it or pick another mic"
+            "No sound from Fake Mic yet. Speak, check that it is not muted, or reconnect it."
         );
         assert_eq!(PLAYED.get(), 0);
         assert!(!state.get_testing());

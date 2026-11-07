@@ -29,7 +29,9 @@ pub const fn notice(notice: Notice) -> &'static str {
             "config.toml has an error. Using the last good settings. Open Settings to see it"
         }
         Notice::ConfigAdjusted => "config.toml had values out of range. They were adjusted",
-        Notice::MicSilence => "The microphone gives no sound. Reconnect it or pick another mic",
+        Notice::MicSilence => {
+            "The microphone gives no sound. Check mute, reconnect it or pick another mic"
+        }
     }
 }
 
@@ -133,10 +135,10 @@ pub fn not_connected(name: &str) -> String {
 
 pub const NO_MIC: &str = "No microphone";
 
-/// The open microphone gives only exact zeros: the OS or the device mutes it, not a quiet room.
+/// The open microphone gives only exact zeros: muted, or behind a noise gate while nobody speaks.
 #[must_use]
 pub fn no_signal(name: &str) -> String {
-    format!("No sound from {name}. Reconnect it or pick another mic")
+    format!("No sound from {name} yet. Speak, check that it is not muted, or reconnect it.")
 }
 
 /// Status of the Audio page's Test button: record, then play back.
@@ -214,7 +216,7 @@ mod tests {
         assert_eq!(not_connected("USB Mic"), "Not connected: USB Mic");
         assert_eq!(
             no_signal("USB Mic"),
-            "No sound from USB Mic. Reconnect it or pick another mic"
+            "No sound from USB Mic yet. Speak, check that it is not muted, or reconnect it."
         );
         assert_eq!(
             mic_test_failed("no output device"),
