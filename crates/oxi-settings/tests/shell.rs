@@ -4,7 +4,7 @@ mod common;
 
 use std::fs;
 
-use common::{has, layout, one, open, open_linked, with_role};
+use common::{has, layout, one, open, open_default, open_linked, with_role};
 use i_slint_backend_testing::{AccessibleRole, ElementHandle, ElementQuery};
 use oxi_core::config::{ConfigFile, Theme};
 use oxi_core::ipc::Push;
@@ -24,7 +24,7 @@ fn card(window: &AppWindow, label: &str) -> ElementHandle {
 #[test]
 fn rail_switches_pages() {
     let l = layout("rail", None);
-    let window = open(&l, Page::Hotkey);
+    let window = open_default(&l);
     assert_eq!(window.get_page(), Page::Hotkey);
     assert!(!has(&window, "Version"));
     tab(&window, "About").invoke_accessible_default_action();

@@ -35,6 +35,14 @@ pub fn open(layout: &Layout, page: Page) -> AppWindow {
     open_again(layout, page)
 }
 
+/// [`open`] without choosing a page: the window as it starts, on its default page.
+pub fn open_default(layout: &Layout) -> AppWindow {
+    i_slint_backend_testing::init_no_event_loop();
+    let window = oxi_settings::open(layout.clone()).unwrap();
+    window.show().unwrap();
+    window
+}
+
 /// [`open`] on a backend that is already set up.
 pub fn open_again(layout: &Layout, page: Page) -> AppWindow {
     shown(oxi_settings::open(layout.clone()).unwrap(), page)
@@ -77,5 +85,5 @@ pub fn has(window: &AppWindow, label: &str) -> bool {
 
 /// The saved `config.toml`.
 pub fn config(l: &Layout) -> ConfigFile {
-    ConfigFile::parse(&fs::read_to_string(l.config_file()).unwrap()).unwrap()
+    ConfigFile::parse(&fs::read_to_string(l.config_file()).unwrap_or_default()).unwrap()
 }
