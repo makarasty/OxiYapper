@@ -326,3 +326,52 @@ fn spawn_reason_clears_on_a_blocked_link_and_on_restart_but_not_on_connecting() 
     one(&window, "Restart").invoke_accessible_default_action();
     assert_eq!(window.get_spawn_error(), "");
 }
+
+/// One poll of the file from outside.
+fn poll() {
+    i_slint_backend_testing::mock_elapsed_time(oxi_settings::FILE_POLL);
+}
+
+#[test]
+fn a_file_fixed_outside_clears_the_banner_and_refreshes_the_pages() {
+    let l = layout("fixed-outside", Some("version = 1\n[audio]\ngain_db = \n"));
+    let window = open(&l, Page::Hotkey);
+    assert!(window.get_banner_text().contains("line 3"));
+    assert!(window.global::<Shell>().get_locked());
+
+    fs::write(l.config_file(), "version = 1\n[ui]\ntheme = \"dark\"\n").unwrap();
+    poll();
+    assert_eq!(window.get_banner_text(), "");
+    assert!(!window.global::<Shell>().get_locked());
+    assert_eq!(window.get_theme(), ThemeChoice::Dark);
+    assert!(!has(&window, "Reset to defaults"));
+
+    // Broken again: the banner comes back, the hand edit stays on disk.
+    let broken = "version = 1\n[ui]\ntheme = \n";
+    fs::write(l.config_file(), broken).unwrap();
+    poll();
+    assert!(window.get_banner_text().contains("line 3"));
+    assert!(window.global::<Shell>().get_locked());
+    assert_eq!(fs::read_to_string(l.config_file()).unwrap(), broken);
+}
+
+#[test]
+fn a_file_fixed_outside_drops_the_daemons_config_error() {
+    let l = layout("fixed-linked", Some("version = 1\n[audio]\ngain_db = \n"));
+    let (ipc, _rx) = Ipc::fake();
+    let window = open_linked(&l, Page::Hotkey, ipc.clone());
+    ipc.deliver(&Event::Push(Push::ConfigError {
+        file: "config.toml".into(),
+        line: 3,
+        message: "bad value".into(),
+    }));
+    assert_eq!(
+        banners(&window).len(),
+        2,
+        "the file's banner and the daemon's"
+    );
+
+    fs::write(l.config_file(), "version = 1\n").unwrap();
+    poll();
+    assert_eq!(banners(&window), Vec::<String>::new());
+}
