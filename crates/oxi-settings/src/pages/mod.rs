@@ -11,6 +11,11 @@ mod text;
 
 use crate::{AppWindow, Ctx};
 
+/// Called on the file poll: the pages that show a file follow it.
+pub fn poll(window: &AppWindow, ctx: &Ctx) {
+    text::poll(window, &ctx.layout);
+}
+
 pub fn bind(window: &AppWindow, ctx: &Ctx) {
     hotkey::bind(window, ctx);
     audio::bind(window, ctx);

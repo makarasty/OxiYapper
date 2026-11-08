@@ -1,7 +1,6 @@
 // System page (SPEC System). The shell owns the theme picker (config `ui.theme`); the rest is
 // `[system]` and `debug.log_text`, filled and read by `pages::system`.
-import { Button } from "std-widgets.slint";
-import { Group, ToggleRow, ThumbPicker, InlineNote } from "../widgets.slint";
+import { Theme, Icons, Group, Card, Row, ToggleRow, TilePicker, Button, ButtonKind, Note, Severity } from "../theme/index.slint";
 
 export enum ThemeChoice { system, dark, light }
 
@@ -13,6 +12,8 @@ export global SystemState {
     // Off fires only after the note is confirmed.
     callback update-check-toggled(bool);
     callback log-text-toggled(bool);
+    callback open-settings-folder();
+    callback open-logs-folder();
 }
 
 export component SystemPage inherits VerticalLayout {
@@ -21,37 +22,37 @@ export component SystemPage inherits VerticalLayout {
     // The update switch was turned off: it stays on until the note is confirmed (SPEC Settings UI).
     property <bool> confirm-update-off;
     alignment: start;
-    spacing: 10px;
+    spacing: Theme.group-gap;
     Group {
-        title: @tr("Theme");
-        ThumbPicker {
+        title: @tr("Appearance");
+        TilePicker {
             accessible-label: @tr("Theme");
-            thumbs: [
-                { image: @image-url("../img/theme-system.svg"), caption: @tr("System") },
-                { image: @image-url("../img/theme-dark.svg"), caption: @tr("Dark") },
-                { image: @image-url("../img/theme-light.svg"), caption: @tr("Light") },
+            columns: 3;
+            tiles: [
+                { icon: Icons.dark-theme-24, icon-selected: Icons.dark-theme-24-filled, title: @tr("System") },
+                { icon: Icons.weather-sunny-24, icon-selected: Icons.weather-sunny-24-filled, title: @tr("Light") },
+                { icon: Icons.weather-moon-24, icon-selected: Icons.weather-moon-24-filled, title: @tr("Dark") },
             ];
-            selected: root.theme == ThemeChoice.dark ? 1 : root.theme == ThemeChoice.light ? 2 : 0;
+            selected: root.theme == ThemeChoice.light ? 1 : root.theme == ThemeChoice.dark ? 2 : 0;
             picked(i) => {
-                root.theme-picked(i == 1 ? ThemeChoice.dark : i == 2 ? ThemeChoice.light : ThemeChoice.system);
+                root.theme-picked(i == 1 ? ThemeChoice.light : i == 2 ? ThemeChoice.dark : ThemeChoice.system);
             }
         }
     }
     Group {
         title: @tr("Startup and updates");
         ToggleRow {
-            label: @tr("Start at sign-in");
+            title: @tr("Start at sign-in");
+            // Until the OS registration lands (ROADMAP M10) the switch only saves the setting.
+            description: @tr("Takes effect in a later version.");
             checked <=> SystemState.autostart;
             toggled(on) => {
                 SystemState.autostart-toggled(on);
             }
         }
-        // Until the OS registration lands (ROADMAP M10) the switch only saves the setting.
-        InlineNote {
-            text: @tr("Takes effect in a later version: OxiYapper does not add itself to sign-in yet.");
-        }
         ToggleRow {
-            label: @tr("Check for updates");
+            title: @tr("Check for updates");
+            description: @tr("Once a day OxiYapper asks GitHub for the latest version. Nothing installs on its own.");
             checked <=> SystemState.update-check;
             toggled(on) => {
                 if (on) {
@@ -63,10 +64,15 @@ export component SystemPage inherits VerticalLayout {
                 }
             }
         }
-        if root.confirm-update-off: InlineNote {
-            text: @tr("Update checks tell you when a fix is out. Once a day OxiYapper asks GitHub for the latest version; it never installs anything on its own.");
+        if root.confirm-update-off: Note {
+            padding-left: Theme.card-padding-h;
+            padding-top: Theme.space-1;
+            text: @tr("Update checks tell you when a fix is out.");
+            severity: Severity.warning;
             Button {
-                text: @tr("Turn off update checks");
+                text: @tr("Turn off");
+                kind: ButtonKind.subtle;
+                accessible-label: @tr("Turn off update checks");
                 clicked => {
                     root.confirm-update-off = false;
                     SystemState.update-check = false;
@@ -75,6 +81,7 @@ export component SystemPage inherits VerticalLayout {
             }
             Button {
                 text: @tr("Keep checking");
+                kind: ButtonKind.primary;
                 clicked => {
                     root.confirm-update-off = false;
                 }
@@ -84,14 +91,48 @@ export component SystemPage inherits VerticalLayout {
     Group {
         title: @tr("Debug");
         ToggleRow {
-            label: @tr("Log dictated text");
+            title: @tr("Log dictated text");
             checked <=> SystemState.log-text;
             toggled(on) => {
                 SystemState.log-text-toggled(on);
             }
         }
-        if SystemState.log-text: InlineNote {
+        if SystemState.log-text: Note {
+            padding-left: Theme.card-padding-h;
+            padding-top: Theme.space-1;
             text: @tr("Dictated text is written to the log files while this is on. Turn it off when you are done.");
+            severity: Severity.warning;
+        }
+    }
+    Group {
+        title: @tr("Files");
+        Card {
+            Row {
+                icon: Icons.folder-open;
+                title: @tr("Settings folder");
+                Button {
+                    text: @tr("Open");
+                    kind: ButtonKind.subtle;
+                    icon: Icons.open-folder-16;
+                    accessible-label: @tr("Open settings folder");
+                    clicked => {
+                        SystemState.open-settings-folder();
+                    }
+                }
+            }
+            Row {
+                icon: Icons.folder-open;
+                title: @tr("Logs");
+                Button {
+                    text: @tr("Open");
+                    kind: ButtonKind.subtle;
+                    icon: Icons.open-folder-16;
+                    accessible-label: @tr("Open logs folder");
+                    clicked => {
+                        SystemState.open-logs-folder();
+                    }
+                }
+            }
         }
     }
 }

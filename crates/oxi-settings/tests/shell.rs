@@ -45,6 +45,8 @@ fn about_shows_name_version_and_licence() {
         oxi_core::APP_NAME,
         env!("CARGO_PKG_VERSION"),
         env!("CARGO_PKG_LICENSE"),
+        "MIT licence",
+        "Apache-2.0 licence",
     ] {
         assert!(has(&window, text), "About lacks {text}");
     }
@@ -108,12 +110,29 @@ fn broken_config_shows_its_line_and_resets_keeping_a_backup() {
 }
 
 #[test]
+fn reset_drops_the_daemons_stale_config_error() {
+    let l = layout("reset-linked", Some("version = 1\n[audio]\ngain_db = \n"));
+    let (ipc, _rx) = Ipc::fake();
+    let window = open_linked(&l, Page::Hotkey, ipc.clone());
+    ipc.deliver(&Event::Push(Push::ConfigError {
+        file: "config.toml".into(),
+        line: 3,
+        message: "bad value".into(),
+    }));
+    assert_eq!(banners(&window).len(), 1);
+
+    one(&window, "Reset to defaults").invoke_accessible_default_action();
+    assert_eq!(window.get_banner_text(), "");
+    assert_eq!(banners(&window), Vec::<String>::new());
+}
+
+#[test]
 fn thumb_picker_takes_a_click_then_arrow_keys() {
     let l = layout("keys", None);
     let window = open(&l, Page::Hotkey);
     window.set_page(Page::System);
-    card(&window, "Light").mock_single_click(PointerEventButton::Left);
-    assert_eq!(window.get_theme(), ThemeChoice::Light);
+    card(&window, "Dark").mock_single_click(PointerEventButton::Left);
+    assert_eq!(window.get_theme(), ThemeChoice::Dark);
     let key = |key: Key| {
         window
             .window()
@@ -123,19 +142,19 @@ fn thumb_picker_takes_a_click_then_arrow_keys() {
             .dispatch_event(WindowEvent::KeyReleased { text: key.into() });
     };
     key(Key::LeftArrow);
-    assert_eq!(window.get_theme(), ThemeChoice::Dark);
-    assert_eq!(card(&window, "Dark").accessible_checked(), Some(true));
+    assert_eq!(window.get_theme(), ThemeChoice::Light);
+    assert_eq!(card(&window, "Light").accessible_checked(), Some(true));
     key(Key::RightArrow);
     key(Key::RightArrow);
     assert_eq!(
         window.get_theme(),
-        ThemeChoice::Light,
+        ThemeChoice::Dark,
         "stops at the last card"
     );
     let text = fs::read_to_string(l.config_file()).unwrap();
     assert_eq!(
         ConfigFile::parse(&text).unwrap().config.ui.theme,
-        Theme::Light
+        Theme::Dark
     );
 }
 
@@ -366,9 +385,9 @@ fn a_file_fixed_outside_drops_the_daemons_config_error() {
         message: "bad value".into(),
     }));
     assert_eq!(
-        banners(&window).len(),
-        2,
-        "the file's banner and the daemon's"
+        banners(&window),
+        [window.get_banner_text().to_string()],
+        "the same broken file is reported once"
     );
 
     fs::write(l.config_file(), "version = 1\n").unwrap();
