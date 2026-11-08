@@ -45,6 +45,8 @@ fn about_shows_name_version_and_licence() {
         oxi_core::APP_NAME,
         env!("CARGO_PKG_VERSION"),
         env!("CARGO_PKG_LICENSE"),
+        "MIT licence",
+        "Apache-2.0 licence",
     ] {
         assert!(has(&window, text), "About lacks {text}");
     }
@@ -105,6 +107,23 @@ fn broken_config_shows_its_line_and_resets_keeping_a_backup() {
     assert_eq!(window.get_banner_text(), "");
     assert!(!window.global::<Shell>().get_locked());
     assert!(!has(&window, "Reset to defaults"));
+}
+
+#[test]
+fn reset_drops_the_daemons_stale_config_error() {
+    let l = layout("reset-linked", Some("version = 1\n[audio]\ngain_db = \n"));
+    let (ipc, _rx) = Ipc::fake();
+    let window = open_linked(&l, Page::Hotkey, ipc.clone());
+    ipc.deliver(&Event::Push(Push::ConfigError {
+        file: "config.toml".into(),
+        line: 3,
+        message: "bad value".into(),
+    }));
+    assert_eq!(banners(&window).len(), 1);
+
+    one(&window, "Reset to defaults").invoke_accessible_default_action();
+    assert_eq!(window.get_banner_text(), "");
+    assert_eq!(banners(&window), Vec::<String>::new());
 }
 
 #[test]

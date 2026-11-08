@@ -203,8 +203,9 @@ impl PageState {
         let Some((i, entry)) = self.entry(i) else {
             return;
         };
-        if self.ctx.ipc.link() != Link::Online {
-            self.update(i, |r| r.error = strings::DOWNLOAD_NEEDS_DAEMON.into());
+        let off = download_off(self.ctx.ipc.link());
+        if !off.is_empty() {
+            self.update(i, |r| r.error = off.into());
             return;
         }
         self.ctx.ipc.send(Request::DownloadModel {
@@ -440,10 +441,13 @@ fn row(entry: &ModelEntry, dir: &Path) -> ModelRow {
 
 /// Why Download is off on `link`; empty while it is on.
 fn download_off(link: Link) -> &'static str {
-    if link == Link::Online {
-        ""
-    } else {
-        strings::DOWNLOAD_NEEDS_DAEMON
+    match link {
+        Link::Online => "",
+        Link::Connecting | Link::Offline | Link::Stuck => strings::DOWNLOAD_NEEDS_DAEMON,
+        Link::Mismatch { .. } => strings::PREVIEW_MISMATCH,
+        Link::Busy => strings::DAEMON_BUSY,
+        Link::Untrusted => strings::PIPE_UNTRUSTED,
+        Link::Foreign => strings::PIPE_FOREIGN,
     }
 }
 
@@ -537,6 +541,20 @@ fn gpu_rows(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn download_tooltip_follows_the_link_state() {
+        let off = download_off;
+        assert_eq!(off(Link::Online), "");
+        for link in [Link::Offline, Link::Stuck] {
+            assert_eq!(off(link), "Start OxiYapper to download.", "{link:?}");
+        }
+        assert_eq!(
+            off(Link::Mismatch { daemon_proto: 9 }),
+            "Restart OxiYapper first"
+        );
+        assert_eq!(off(Link::Busy), strings::DAEMON_BUSY);
+    }
+
     use std::sync::mpsc::Receiver;
 
     use i_slint_backend_testing::{AccessibleRole, ElementHandle, mock_elapsed_time};

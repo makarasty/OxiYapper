@@ -280,12 +280,13 @@ fn ctrl_s_saves_the_focused_file_and_only_when_dirty() {
             WindowEvent::KeyReleased { text }
         });
     };
-    let ctrl_s = || {
+    let chord = |letter: &str| {
         key(true, Key::Control.into());
-        key(true, "s".into());
-        key(false, "s".into());
+        key(true, letter.into());
+        key(false, letter.into());
         key(false, Key::Control.into());
     };
+    let ctrl_s = || chord("s");
     // Tab to the editor; the first character that lands in it shows the focus is there.
     let dictionary = editor(&window, "Dictionary");
     for _ in 0..10 {
@@ -310,6 +311,43 @@ fn ctrl_s_saves_the_focused_file_and_only_when_dirty() {
         fs::read_to_string(l.dictionary_file()).unwrap(),
         "synthother"
     );
+
+    // The poll brings the clean editor up to date; Ctrl+S then saves what is typed next.
+    i_slint_backend_testing::mock_elapsed_time(oxi_settings::FILE_POLL);
+    assert_eq!(dictionary.accessible_value().as_deref(), Some("synthother"));
+    // A Ukrainian layout sends "і" for the S key, a Russian one "ы".
+    for letter in ["s", "і", "ы"] {
+        key(true, "q".into());
+        key(false, "q".into());
+        assert!(has(&window, "Unsaved changes"), "{letter}");
+        chord(letter);
+        let saved = fs::read_to_string(l.dictionary_file()).unwrap();
+        assert!(saved.contains('q'), "Ctrl+{letter} did not save: {saved}");
+        assert!(!has(&window, "Unsaved changes"), "{letter}");
+    }
+}
+
+#[test]
+fn a_clean_editor_follows_the_file_and_a_dirty_one_keeps_its_text() {
+    let l = layout("follow", None);
+    fs::write(l.dictionary_file(), "synthone").unwrap();
+    let window = open_tall(&l);
+    let value = || editor(&window, "Dictionary").accessible_value().unwrap();
+    assert_eq!(value(), "synthone");
+
+    fs::write(l.dictionary_file(), "synthtwo").unwrap();
+    i_slint_backend_testing::mock_elapsed_time(oxi_settings::FILE_POLL);
+    assert_eq!(value(), "synthtwo");
+    assert!(!has(&window, "Unsaved changes"));
+
+    editor(&window, "Dictionary").set_accessible_value("synthmine");
+    fs::write(l.dictionary_file(), "synththree").unwrap();
+    i_slint_backend_testing::mock_elapsed_time(oxi_settings::FILE_POLL);
+    assert_eq!(value(), "synthmine");
+    assert!(has(
+        &window,
+        "dictionary.txt changed on disk since it was loaded."
+    ));
 }
 
 #[test]

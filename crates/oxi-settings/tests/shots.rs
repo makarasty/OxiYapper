@@ -784,10 +784,14 @@ fn tile_icon_renders_inside_its_card() {
         .find(|e| e.accessible_role() == Some(AccessibleRole::RadioButton))
         .unwrap();
     let (pos, size) = (card.absolute_position(), card.size());
-    // The ink of the icon and title inside the card, on a light page with no other dark fill.
+    // The icon is 32px wide and centred, above the title: its column in the card's top half holds
+    // no title ink, so only the icon can fill it (on a light page with no other dark fill).
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // logical px at scale 1
-    let dark = (pos.y as u32..(pos.y + size.height) as u32)
-        .flat_map(|y| (pos.x as u32..(pos.x + size.width) as u32).map(move |x| (x, y)))
+    let dark = (pos.y as u32..(pos.y + size.height / 2.0) as u32)
+        .flat_map(|y| {
+            let mid = pos.x + size.width / 2.0;
+            ((mid - 16.0) as u32..(mid + 16.0) as u32).map(move |x| (x, y))
+        })
         .filter_map(|(x, y)| pixmap.pixel(x, y))
         .filter(|p| p.red() < 0x40 && p.green() < 0x40 && p.blue() < 0x40)
         .count();

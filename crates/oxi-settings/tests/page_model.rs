@@ -184,6 +184,7 @@ fn idle_unload_slider_writes_minutes() {
     rest();
     assert_eq!(saved(&l).idle_unload_minutes, 0);
     assert_eq!(slider.accessible_value().as_deref(), Some("0"));
+    assert!(has(&window, "Never") && !has(&window, "never"));
 }
 
 #[test]

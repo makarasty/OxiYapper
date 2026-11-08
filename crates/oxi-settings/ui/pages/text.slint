@@ -88,8 +88,8 @@ component FileEditor inherits Card {
         focus-on-click: false;
         focus-on-tab-navigation: false;
         capture-key-pressed(event) => {
-            // Ctrl+S on an English or a Russian layout.
-            if (event.modifiers.control && (event.text == "s" || event.text == "S" || event.text == "ы" || event.text == "Ы")) {
+            // Ctrl+S on an English, a Russian or a Ukrainian layout.
+            if (event.modifiers.control && (event.text == "s" || event.text == "S" || event.text == "ы" || event.text == "Ы" || event.text == "і" || event.text == "І")) {
                 if (root.can-save) {
                     TextState.save(root.file);
                 }

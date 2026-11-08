@@ -65,13 +65,24 @@ export component AboutPage inherits VerticalLayout {
             }
         }
         ClickCard {
-            accessible-label: @tr("Licence");
+            accessible-label: @tr("MIT licence");
             clicked => {
                 Platform.open-url(root.repository + "/blob/main/LICENSE-MIT");
             }
             Row {
                 icon: Icons.book-letter;
-                title: @tr("Licence");
+                title: @tr("MIT licence");
+                control-min: 0;
+            }
+        }
+        ClickCard {
+            accessible-label: @tr("Apache-2.0 licence");
+            clicked => {
+                Platform.open-url(root.repository + "/blob/main/LICENSE-APACHE");
+            }
+            Row {
+                icon: Icons.book-letter;
+                title: @tr("Apache-2.0 licence");
                 control-min: 0;
             }
         }

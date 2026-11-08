@@ -249,7 +249,7 @@ export component ModelPage inherits VerticalLayout {
                 minimum: 0;
                 maximum: 60;
                 unit: "min";
-                zero-text: @tr("never");
+                zero-text: @tr("Never");
                 default-value: ModelState.default-idle-minutes;
                 value <=> ModelState.idle-minutes;
                 changed(v) => {

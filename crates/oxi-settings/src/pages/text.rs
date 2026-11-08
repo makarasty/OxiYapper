@@ -201,6 +201,18 @@ fn show_replacements(s: &TextState<'_>, text: &str) {
     s.set_bad_lines(strings::replace_bad_lines(&ReplaceRules::parse(text).bad_lines).into());
 }
 
+/// Follows an edit of the files from outside: a clean editor takes the new text, a dirty one shows
+/// the conflict (both through `refresh`). Nothing happens while a clean editor is up to date.
+pub fn poll(window: &AppWindow, layout: &Layout) {
+    let s = window.global::<TextState>();
+    for file in FILES {
+        let current = info(&s, file).base == stamp(&fs::read(path(layout, file)));
+        if !current || info(&s, file).dirty {
+            refresh(&s, layout, file);
+        }
+    }
+}
+
 /// Read the file into the editor unless it has unsaved edits; then only flag a change on disk.
 fn refresh(s: &TextState<'_>, layout: &Layout, file: TextFile) {
     let mut info = info(s, file);

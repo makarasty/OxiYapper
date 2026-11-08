@@ -246,10 +246,15 @@ fn open_inner(
 
     let weak = window.as_weak();
     let c = ctx.clone();
+    let linked = followed.is_some();
     window.on_reset_config(move || {
         let result = c.reset();
         if let (Ok(()), Some(window)) = (&result, weak.upgrade()) {
             window.set_banner_text("".into());
+            // The file is valid now: drop the daemon's stale `ConfigError` notice, as `reload` does.
+            if linked {
+                on_daemon_event(&window, &Event::Link(c.ipc.link()));
+            }
             bind(&window, &c);
         }
         report(&weak, result);
@@ -266,7 +271,6 @@ fn open_inner(
         on_daemon_event(&window, &Event::Link(ctx.ipc.link()));
         events
     });
-    let linked = followed.is_some();
     let poll = Timer::default();
     poll.start(TimerMode::Repeated, FILE_POLL, {
         let (weak, c) = (window.as_weak(), ctx.clone());
@@ -274,6 +278,7 @@ fn open_inner(
             if let Some(window) = weak.upgrade() {
                 own_accent(&window);
                 reload(&window, &c, linked);
+                pages::poll(&window, &c);
             }
         }
     });

@@ -151,7 +151,7 @@ pub fn mic_test_failed(kind: &str) -> String {
 }
 pub const SYSTEM_DEFAULT_MIC: &str = "System default";
 
-pub const DOWNLOAD_NEEDS_DAEMON: &str = "Start OxiYapper to download models";
+pub const DOWNLOAD_NEEDS_DAEMON: &str = "Start OxiYapper to download.";
 pub const DOWNLOAD_STARTING: &str = "Starting the download";
 
 /// The daemon's reason for a failed model download, under the model's row.
