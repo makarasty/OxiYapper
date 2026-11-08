@@ -1,6 +1,6 @@
 // Hotkey page (SPEC Recording, Settings UI): the chord as keycaps and an edit button, which opens
 // the full keyboard (click keys or press them, held keys light up); then the mode.
-import { Theme, Shell, Icons, Group, Card, Row, KeycapRow, TilePicker, Note, Severity, Button, ButtonKind } from "../theme/index.slint";
+import { Theme, Shell, Icons, Caption, Group, Card, Row, KeycapRow, TilePicker, Note, Severity, Button, ButtonKind } from "../theme/index.slint";
 import { Keyboard, KeyCap } from "../keyboard.slint";
 
 // Filled and read by `pages::hotkey`.
@@ -13,6 +13,8 @@ export global HotkeyState {
     in property <bool> keyboard-open;
     // The daemon link is up: without it no key is captured and Apply is off.
     in property <bool> online;
+    // Why Apply is off on this link (empty while online): its tooltip.
+    in property <string> note;
     in property <[KeyCap]> caps;
     in property <float> columns;
     in property <float> rows;
@@ -106,11 +108,9 @@ export component HotkeyPage inherits VerticalLayout {
                     font-weight: Theme.weight-strong;
                     color: Theme.text-primary;
                 }
-                Text {
+                Caption {
                     text: @tr("Click keys or press them. Left and right modifiers both count.");
                     wrap: word-wrap;
-                    font-size: Theme.caption-size;
-                    color: Theme.text-secondary;
                 }
                 KeycapRow {
                     keys: HotkeyState.pending-keys;
@@ -148,7 +148,7 @@ export component HotkeyPage inherits VerticalLayout {
                         kind: ButtonKind.primary;
                         enabled: !Shell.locked && HotkeyState.online && HotkeyState.error == "";
                         // The reason sits on the button; the banner already says OxiYapper is off.
-                        tooltip: Shell.locked ? Shell.locked-tip : !HotkeyState.online ? @tr("Pressed keys are seen only while OxiYapper runs") : "";
+                        tooltip: Shell.locked ? Shell.locked-tip : HotkeyState.note;
                         clicked => {
                             HotkeyState.apply();
                         }

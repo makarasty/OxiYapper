@@ -1,13 +1,20 @@
 //! Helpers shared by the settings test binaries.
-#![allow(dead_code, reason = "each test binary uses only some of the helpers")]
+#![allow(
+    dead_code,
+    unused_imports,
+    reason = "each test binary uses only some of the helpers"
+)]
 
 use std::fs;
 
-use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+use i_slint_backend_testing::ElementHandle;
 use oxi_core::config::ConfigFile;
 use oxi_core::paths::Layout;
 use oxi_settings::{AppWindow, Ipc, Page};
 use slint::ComponentHandle;
+
+mod elements;
+pub use elements::{has, with_role};
 
 /// A fresh directory per test and test binary; `config` is written as `config.toml` when given.
 pub fn layout(name: &str, config: Option<&str>) -> Layout {
@@ -68,19 +75,6 @@ pub fn one(window: &AppWindow, label: &str) -> ElementHandle {
         .unwrap_or_else(|| panic!("no element labelled {label}"));
     assert!(found.next().is_none(), "more than one labelled {label}");
     first
-}
-
-/// The element labelled `label` with `role`: a row's text and its control can share a label.
-pub fn with_role(window: &AppWindow, label: &str, role: AccessibleRole) -> ElementHandle {
-    ElementHandle::find_by_accessible_label(window, label)
-        .find(|e| e.accessible_role() == Some(role))
-        .unwrap_or_else(|| panic!("no {role:?} labelled {label}"))
-}
-
-pub fn has(window: &AppWindow, label: &str) -> bool {
-    ElementHandle::find_by_accessible_label(window, label)
-        .next()
-        .is_some()
 }
 
 /// The saved `config.toml`.

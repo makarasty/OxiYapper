@@ -170,7 +170,8 @@ fn mic_meter_closes_when_the_page_is_left() {
 }
 
 /// At the minimum width the control columns of all rows start at one x: before, the column
-/// followed the wrapping of the text on its left, so equal sliders sat 3 to 11 px apart.
+/// followed the wrapping of the text on its left, so equal sliders sat 3 to 11 px apart; and a
+/// slider row asked for a wider column (280 px) than the device row (240 px), 30 px apart.
 #[test]
 fn control_columns_start_at_one_x_at_the_minimum_width() {
     let l = layout("columns", None);
@@ -181,8 +182,13 @@ fn control_columns_start_at_one_x_at_the_minimum_width() {
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(50));
     let x = |label: &str, role| with_role(&window, label, role).absolute_position().x;
     let gain = x("Gain", AccessibleRole::Slider);
-    for label in ["Meter sensitivity", "Tail after release", "Max length"] {
-        let at = x(label, AccessibleRole::Slider);
+    for (label, role) in [
+        ("Device", AccessibleRole::Combobox),
+        ("Meter sensitivity", AccessibleRole::Slider),
+        ("Tail after release", AccessibleRole::Slider),
+        ("Max length", AccessibleRole::Slider),
+    ] {
+        let at = x(label, role);
         assert!((at - gain).abs() < 0.5, "{label}: {at}, Gain {gain}");
     }
 }

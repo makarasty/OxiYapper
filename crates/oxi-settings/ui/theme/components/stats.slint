@@ -1,16 +1,16 @@
 // Home dashboard pieces: stat cards and the speaking-activity heatmap.
 import { Theme } from "../tokens.slint";
+import { Caption, CardFrame } from "base.slint";
 
 // One number on a card: icon + label, the big value ("299.9K"), a caption ("All time").
-export component StatCard inherits Rectangle {
+export component StatCard inherits CardFrame {
     in property <image> icon;
     in property <string> label;
     in property <string> value;
     in property <string> caption;
-    background: Theme.bg-card;
-    border-color: Theme.stroke-card;
-    border-width: 1px;
-    border-radius: Theme.radius-card;
+    // Lines the label may need. The owner sets it for the whole row, so the four values sit on one
+    // baseline even when one label wraps (a wrapped label is under 2 x 20 px).
+    in property <int> label-lines: 1;
     min-width: 160px;
     horizontal-stretch: 1;
     min-height: inner.min-height;
@@ -20,14 +20,17 @@ export component StatCard inherits Rectangle {
     inner := VerticalLayout {
         padding: Theme.space-4;
         spacing: Theme.space-1;
+        // The row makes the cards one height: the spare goes below, not between the texts.
+        alignment: start;
         HorizontalLayout {
             spacing: Theme.space-2;
+            min-height: root.label-lines * 20px;
             if root.icon.width > 0: VerticalLayout {
                 alignment: center;
                 Image {
                     source: root.icon;
-                    width: 20px;
-                    height: 20px;
+                    width: Theme.icon-size;
+                    height: Theme.icon-size;
                     colorize: Theme.text-secondary;
                     accessible-role: none;
                 }
@@ -49,10 +52,8 @@ export component StatCard inherits Rectangle {
             color: Theme.text-primary;
             accessible-role: none;
         }
-        Text {
+        Caption {
             text: root.caption;
-            font-size: Theme.caption-size;
-            color: Theme.text-secondary;
             wrap: word-wrap;
             accessible-role: none;
         }
@@ -75,7 +76,7 @@ export component ActivityHeatmap {
     in property <int> today: -1;
     // Spoken summary of the grid (the cells are drawn, not readable).
     in property <string> summary;
-    in property <[string]> day-labels: [@tr("Sun"), @tr("Mon"), @tr("Tue"), @tr("Wed"), @tr("Thu"), @tr("Fri"), @tr("Sat")];
+    in property <[string]> day-labels: [@tr("Mon"), @tr("Tue"), @tr("Wed"), @tr("Thu"), @tr("Fri"), @tr("Sat"), @tr("Sun")];
     in property <string> less-text: @tr("Less");
     in property <string> more-text: @tr("More");
     in property <length> cell: 12px;
@@ -84,7 +85,8 @@ export component ActivityHeatmap {
     in property <length> legend-cell: 12px;
     property <length> pitch: root.cell + root.gap;
     property <int> weeks: ceil(root.levels.length / 7);
-    property <length> label-w: 32px;
+    // Width of the day labels, and what the owner needs to fit the grid to a width.
+    in property <length> label-w: 32px;
     property <length> top: 20px;
 
     public pure function level-color(level: int) -> color {
@@ -101,21 +103,17 @@ export component ActivityHeatmap {
         y: 0;
         width: root.label-w + root.weeks * root.pitch;
         height: root.top + 7 * root.pitch;
-        for m in root.months: Text {
+        for m in root.months: Caption {
             x: root.label-w + m.week * root.pitch;
             y: 0;
             text: m.text;
-            font-size: Theme.caption-size;
-            color: Theme.text-secondary;
             accessible-role: none;
         }
-        for d[i] in root.day-labels: Text {
+        for d[i] in root.day-labels: Caption {
             x: 0;
             y: root.top + i * root.pitch + (root.cell - Theme.caption-line) / 2;
             height: Theme.caption-line;
             text: d;
-            font-size: Theme.caption-size;
-            color: Theme.text-secondary;
             accessible-role: none;
         }
         for level[i] in root.levels: Rectangle {
@@ -143,10 +141,8 @@ export component ActivityHeatmap {
         width: self.preferred-width;
         height: max(root.cell, Theme.caption-line);
         spacing: root.gap;
-        Text {
+        Caption {
             text: root.less-text;
-            font-size: Theme.caption-size;
-            color: Theme.text-secondary;
             vertical-alignment: center;
             accessible-role: none;
         }
@@ -165,10 +161,8 @@ export component ActivityHeatmap {
         Rectangle {
             width: Theme.space-1;
         }
-        Text {
+        Caption {
             text: root.more-text;
-            font-size: Theme.caption-size;
-            color: Theme.text-secondary;
             vertical-alignment: center;
             accessible-role: none;
         }

@@ -53,6 +53,22 @@ pub enum Link {
     Foreign,
 }
 
+impl Link {
+    /// Why a control that needs the daemon is off on this link; empty while it is on. `needs_daemon`
+    /// is the control's own words for "no daemon yet", the states the banner explains in full.
+    #[must_use]
+    pub fn off_reason(self, needs_daemon: &'static str) -> &'static str {
+        match self {
+            Link::Online => "",
+            Link::Connecting | Link::Offline | Link::Stuck => needs_daemon,
+            Link::Mismatch { .. } => strings::PREVIEW_MISMATCH,
+            Link::Busy => strings::DAEMON_BUSY,
+            Link::Untrusted => strings::PIPE_UNTRUSTED,
+            Link::Foreign => strings::PIPE_FOREIGN,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Link(Link),

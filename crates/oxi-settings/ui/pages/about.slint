@@ -1,7 +1,7 @@
 // About page: logo, name, version and licence, the project links and the "Made with Slint" badge
 // (SPEC Settings UI).
 import { AboutSlint } from "std-widgets.slint";
-import { Theme, Icons, Group, Card, ClickCard, Row } from "../theme/index.slint";
+import { Theme, Icons, Caption, Group, Card, ClickCard, Row } from "../theme/index.slint";
 
 export component AboutPage inherits VerticalLayout {
     in property <string> app-name;
@@ -32,21 +32,15 @@ export component AboutPage inherits VerticalLayout {
                     HorizontalLayout {
                         alignment: start;
                         spacing: Theme.space-1;
-                        Text {
+                        Caption {
                             text: @tr("Version");
-                            font-size: Theme.caption-size;
-                            color: Theme.text-secondary;
                         }
-                        Text {
+                        Caption {
                             text: root.version;
-                            font-size: Theme.caption-size;
-                            color: Theme.text-secondary;
                         }
                     }
-                    Text {
+                    Caption {
                         text: root.licence;
-                        font-size: Theme.caption-size;
-                        color: Theme.text-secondary;
                     }
                 }
             }
@@ -58,10 +52,8 @@ export component AboutPage inherits VerticalLayout {
                 Platform.open-url(root.repository);
             }
             Row {
-                icon: Icons.home;
                 title: @tr("Project page");
                 description: root.repository;
-                control-min: 0;
             }
         }
         ClickCard {
@@ -70,9 +62,7 @@ export component AboutPage inherits VerticalLayout {
                 Platform.open-url(root.repository + "/blob/main/LICENSE-MIT");
             }
             Row {
-                icon: Icons.book-letter;
                 title: @tr("MIT licence");
-                control-min: 0;
             }
         }
         ClickCard {
@@ -81,9 +71,7 @@ export component AboutPage inherits VerticalLayout {
                 Platform.open-url(root.repository + "/blob/main/LICENSE-APACHE");
             }
             Row {
-                icon: Icons.book-letter;
                 title: @tr("Apache-2.0 licence");
-                control-min: 0;
             }
         }
     }

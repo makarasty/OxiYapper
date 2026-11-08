@@ -12,6 +12,7 @@ use std::time::Duration;
 use oxi_core::hotkey::{Chord, ChordError, Key};
 use oxi_core::ipc::{Push, Request};
 use oxi_core::machine::Mode;
+use oxi_core::strings;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
 use crate::generated::{HotkeyState, KeyCap};
@@ -31,7 +32,7 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     drop(file);
     s.set_columns(keyboard_layout::WIDTH);
     s.set_rows(keyboard_layout::HEIGHT);
-    s.set_online(ctx.ipc.link() == Link::Online);
+    set_link(&s, ctx.ipc.link());
 
     let layout = keyboard_layout::caps();
     let caps: Vec<KeyCap> = layout
@@ -180,11 +181,10 @@ impl Picker {
     /// Without a daemon nothing captures and Apply is off. A new one (restart) has no capture:
     /// ask again. Keys whose key-up was lost are forgotten either way.
     fn linked(&self, link: Link) {
-        let online = link == Link::Online;
-        self.with(|s| s.set_online(online));
+        self.with(|s| set_link(&s, link));
         if self.capturing.get() {
             self.held.borrow_mut().clear();
-            if online {
+            if link == Link::Online {
                 self.ctx.ipc.send(Request::CaptureHotkey { on: true });
             }
             self.show();
@@ -333,6 +333,12 @@ fn chord_text(names: &[String]) -> SharedString {
 fn string_model(items: &[String]) -> ModelRc<SharedString> {
     let items: Vec<SharedString> = items.iter().map(SharedString::from).collect();
     ModelRc::from(Rc::new(VecModel::from(items)))
+}
+
+/// Apply is on only while online; `note` is its tooltip otherwise.
+fn set_link(s: &HotkeyState<'_>, link: Link) {
+    s.set_online(link == Link::Online);
+    s.set_note(link.off_reason(strings::HOTKEY_NEEDS_DAEMON).into());
 }
 
 /// Show `names` as the saved chord: the text for screen readers and the keycaps.

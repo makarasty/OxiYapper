@@ -139,35 +139,41 @@ export component AudioPage inherits VerticalLayout {
     }
     Group {
         title: @tr("Processing");
-        ToggleRow {
-            title: @tr("Normalise level");
-            description: @tr("Evens out quiet and loud speech.");
-            checked <=> AudioState.normalize;
-            toggled(on) => {
-                AudioState.edited(AudioKey.normalize, on ? 1 : 0);
+        Card {
+            ToggleRow {
+                flat: true;
+                title: @tr("Normalise level");
+                description: @tr("Evens out quiet and loud speech.");
+                checked <=> AudioState.normalize;
+                toggled(on) => {
+                    AudioState.edited(AudioKey.normalize, on ? 1 : 0);
+                }
             }
-        }
-        ToggleRow {
-            title: @tr("Trim silence");
-            description: @tr("Cuts silence at the start and end.");
-            checked <=> AudioState.trim;
-            toggled(on) => {
-                AudioState.edited(AudioKey.trim, on ? 1 : 0);
+            Divider { }
+            ToggleRow {
+                flat: true;
+                title: @tr("Trim silence");
+                description: @tr("Cuts silence at the start and end.");
+                checked <=> AudioState.trim;
+                toggled(on) => {
+                    AudioState.edited(AudioKey.trim, on ? 1 : 0);
+                }
             }
-        }
-        ToggleRow {
-            title: @tr("Noise suppression");
-            // While on, the warning below says it: no second copy here.
-            description: AudioState.denoise ? "" : @tr("Can make Whisper worse; off by default.");
-            checked <=> AudioState.denoise;
-            toggled(on) => {
-                AudioState.edited(AudioKey.denoise, on ? 1 : 0);
+            Divider { }
+            ToggleRow {
+                flat: true;
+                title: @tr("Noise suppression");
+                // While on, the warning below says it: no second copy here.
+                description: AudioState.denoise ? "" : @tr("Can make Whisper worse; off by default.");
+                checked <=> AudioState.denoise;
+                toggled(on) => {
+                    AudioState.edited(AudioKey.denoise, on ? 1 : 0);
+                }
             }
-        }
-        if AudioState.denoise: Note {
-            inset: true;
-            text: @tr("Noise suppression can make Whisper worse.");
-            severity: Severity.warning;
+            if AudioState.denoise: Note {
+                text: @tr("Noise suppression can make Whisper worse.");
+                severity: Severity.warning;
+            }
         }
     }
     Group {

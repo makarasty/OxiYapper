@@ -828,3 +828,54 @@ fn tile_icon_renders_inside_its_card() {
         .count();
     assert!(dark > 60, "{dark} dark pixels in the Dark card");
 }
+
+/// At 960 the Words per minute label wraps to two lines; the four values must still start on
+/// one pixel row (before, the wrapped card's value sat 6 px higher than the others).
+#[test]
+fn stat_values_share_a_baseline_where_a_label_wraps() {
+    let size = (960.0, 720.0);
+    SIZE.set(size);
+    let _ = slint::platform::set_platform(Box::new(Shots));
+    let (ipc, _sent) = Ipc::fake();
+    let window = oxi_settings::open_with(common::layout("baseline", None), ipc.clone()).unwrap();
+    window.set_theme(ThemeChoice::Light);
+    window.show().unwrap();
+    push(
+        &ipc,
+        Push::Stats(Summary {
+            dictations: 11_300,
+            words: 299_900,
+            wpm: 146,
+            streak: 6,
+            longest_streak: 40,
+            heat_start: Date::from_ymd(2026, 11, 2).unwrap(),
+            heat: vec![0, 1, 4],
+        }),
+    );
+    let pixmap = render(&window, size, 1.0);
+    // The value is the only text in text-primary (26); labels and captions are lighter. The
+    // streak card is left out: "days" has a descender and "d" an ascender.
+    let ink_top = |label: &str| {
+        let card = common::one(&window, label);
+        let (at, size) = (card.absolute_position(), card.size());
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // whole positive px
+        let (x0, y0, x1, y1) = (
+            at.x as u32,
+            at.y as u32,
+            (at.x + size.width) as u32,
+            (at.y + size.height) as u32,
+        );
+        (y0..y1)
+            .find(|&y| (x0..x1).any(|x| pixmap.pixel(x, y).is_some_and(|p| p.red() < 60)))
+            .unwrap_or_else(|| panic!("no value ink in {label}"))
+    };
+    let tops = [
+        ink_top("Words spoken: 299.9K, All time"),
+        ink_top("Words per minute: 146, Based on recorded speech"),
+        ink_top("Dictations: 11.3K, All time"),
+    ];
+    assert!(
+        tops.iter().all(|t| t.abs_diff(tops[0]) <= 1),
+        "value tops {tops:?}"
+    );
+}

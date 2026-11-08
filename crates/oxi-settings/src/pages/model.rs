@@ -442,14 +442,7 @@ fn row(entry: &ModelEntry, dir: &Path) -> ModelRow {
 
 /// Why Download is off on `link`; empty while it is on.
 fn download_off(link: Link) -> &'static str {
-    match link {
-        Link::Online => "",
-        Link::Connecting | Link::Offline | Link::Stuck => strings::DOWNLOAD_NEEDS_DAEMON,
-        Link::Mismatch { .. } => strings::PREVIEW_MISMATCH,
-        Link::Busy => strings::DAEMON_BUSY,
-        Link::Untrusted => strings::PIPE_UNTRUSTED,
-        Link::Foreign => strings::PIPE_FOREIGN,
-    }
+    link.off_reason(strings::DOWNLOAD_NEEDS_DAEMON)
 }
 
 fn fraction(done: u64, total: u64) -> f32 {

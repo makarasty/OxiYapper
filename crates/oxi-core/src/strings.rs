@@ -156,6 +156,8 @@ pub fn mic_test_failed(kind: &str) -> String {
 pub const SYSTEM_DEFAULT_MIC: &str = "System default";
 
 pub const DOWNLOAD_NEEDS_DAEMON: &str = "Start OxiYapper to download.";
+/// Apply's tooltip on the hotkey page while there is no daemon to report the pressed keys.
+pub const HOTKEY_NEEDS_DAEMON: &str = "Pressed keys are seen only while OxiYapper runs";
 
 /// The daemon's reason for a failed model download, under the model's row.
 #[must_use]

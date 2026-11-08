@@ -233,8 +233,6 @@ export component ModelPage inherits VerticalLayout {
             Row {
                 icon: Icons.desktop;
                 title: @tr("GPU");
-                // The long device names need the widest column.
-                control-min: Theme.control-column-max;
                 fill-controls: true;
                 Combo {
                     model: ModelState.gpus;

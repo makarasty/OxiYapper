@@ -47,7 +47,7 @@ pub const MODELS: &[ModelEntry] = &[
     },
     ModelEntry {
         id: "podlodka",
-        display_name: "Whisper large-v3 Russian (podlodka v1.2, f16)",
+        display_name: "Whisper large-v3 Russian",
         file_name: "ggml-large-v3-russian-ties-podlodka-v1.2-f16.bin",
         url: "https://huggingface.co/Pomni/whisper-large-v3-russian-ties-podlodka-v1.2-ggml-allquants/resolve/c3a2a8054130089588bd1982bf728f4507699b49/ggml-large-v3-russian-ties-podlodka-v1.2-f16.bin",
         size: 3_095_033_483,

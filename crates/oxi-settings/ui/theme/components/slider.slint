@@ -1,7 +1,7 @@
 // Slider and its paired number field (PowerToys pattern: both bound to one value). Our own,
 // because std `Slider` and `SpinBox` paint the system accent.
 import { Theme, Shell } from "../tokens.slint";
-import { FocusRing, KeyFocus } from "base.slint";
+import { FocusRing, KeyFocus, Caption } from "base.slint";
 
 // Rail 4 px, accent fill from the minimum (or from 0 when `bipolar`), 20 px thumb with an accent
 // dot. Left/Right step, PgUp/PgDn ten steps, Home/End the ends; a double click on the thumb
@@ -304,10 +304,8 @@ export component NumberField {
                 background: root.invalid ? Theme.error-text : Theme.accent;
             }
         }
-        if root.zero-text != "" && root.value == 0: Text {
+        if root.zero-text != "" && root.value == 0: Caption {
             text: root.zero-text;
-            font-size: Theme.caption-size;
-            color: Theme.text-secondary;
             horizontal-alignment: right;
         }
     }

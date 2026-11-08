@@ -1,6 +1,7 @@
 // Keycaps: the on-screen keyboard style the owner likes (bright caps, crisp 1 px stroke, small
 // radius, solid accent fill when picked) and the inline chord keycaps.
 import { Theme, Shell } from "../tokens.slint";
+import { Tip } from "base.slint";
 
 // One cap of the board. It fills the size it is given; `unit` (the board's key unit) sets the
 // radius and the label size (12..15 px). States: rest, hover, picked, held (physically down:
@@ -14,6 +15,8 @@ export component Keycap {
     in property <bool> enabled: true;
     in property <bool> locked: Shell.locked;
     in property <bool> force-hover;
+    // The full name of the cap ("Left Ctrl"): its tooltip when the label is shorter ("LCtrl").
+    in property <string> spoken;
     callback clicked;
     property <bool> live: root.enabled && !root.locked;
     property <bool> hover: root.live && (touch.has-hover || root.force-hover);
@@ -54,6 +57,10 @@ export component Keycap {
             root.clicked();
         }
     }
+    Tip {
+        text: root.spoken != root.label ? root.spoken : "";
+        hovered: touch.has-hover;
+    }
 }
 
 // A chord as inline keycaps (PowerToys KeyVisual): accent caps, min width 36, padding 8, gap 4.
@@ -73,6 +80,7 @@ export component KeycapRow inherits HorizontalLayout {
         height: root.cap-height;
         min-width: max(36px, t.preferred-width + 16px);
         border-radius: Theme.radius-control;
+        opacity: Shell.locked ? 0.4 : 1;
         background: root.warning ? Theme.warning-fill : Theme.accent;
         border-width: root.warning ? 1px : 0;
         border-color: Theme.warning-text.transparentize(0.7);

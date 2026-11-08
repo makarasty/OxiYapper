@@ -1,6 +1,6 @@
 // Text page (SPEC Text): dictionary.txt with its prompt token budget, replace.txt with the lines
 // it ignores, and how text is pasted (mode, trailing space, restore delay, per-app rules).
-import { Theme, Shell, Icons, Group, Card, Row, ToggleRow, SliderRow, Combo, TextField, TextArea, TilePicker, Button, ButtonKind, ProgressBar, Note, Severity } from "../theme/index.slint";
+import { Theme, Shell, Icons, Caption, Group, Card, Row, ToggleRow, SliderRow, Combo, TextField, TextArea, TilePicker, Button, ButtonKind, ProgressBar, Note, Severity } from "../theme/index.slint";
 
 export enum TextFile { dictionary, replacements }
 
@@ -77,10 +77,8 @@ component FileEditor inherits Card {
     property <bool> readable: root.info.state != FileState.not-text && root.info.state != FileState.unreadable;
     // A converted file has no edit yet, but Save is what rewrites it as UTF-8.
     property <bool> can-save: root.readable && (root.info.dirty || root.info.state == FileState.converted);
-    Text {
+    Caption {
         text: root.description;
-        font-size: Theme.caption-size;
-        color: Theme.text-secondary;
         wrap: word-wrap;
     }
     FocusScope {

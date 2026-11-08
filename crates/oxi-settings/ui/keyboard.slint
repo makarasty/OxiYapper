@@ -48,6 +48,7 @@ export component Keyboard inherits Rectangle {
         picked: cap.picked && !cap.invalid;
         held: cap.held && !cap.invalid;
         invalid: cap.invalid;
+        spoken: cap.spoken;
         accessible-label: cap.spoken;
         accessible-checked: cap.picked;
         accessible-description: cap.held ? "held" : "";

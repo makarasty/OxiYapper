@@ -1,7 +1,7 @@
 // Settings window (redesign spec sections 2 and 3): a nav rail with icons on the left (icons only
 // under 960 px), the page on the right in a scrolling column of at most 880 px, banners above it.
 import { Palette, ScrollView } from "std-widgets.slint";
-import { Theme, Shell, Icons, KeyFocus, Tip, Button, Banner, Severity, PageHeader, MonthLabel } from "theme/index.slint";
+import { Theme, Shell, Icons, Caption, KeyFocus, Tip, Button, Banner, Severity, PageHeader, MonthLabel } from "theme/index.slint";
 import { HomePage, HomeState } from "pages/home.slint";
 import { HotkeyPage, HotkeyState } from "pages/hotkey.slint";
 import { KeyCap } from "keyboard.slint";
@@ -49,10 +49,10 @@ component NavItem inherits Rectangle {
         visible: root.selected;
     }
     Image {
-        x: root.compact ? (root.width - 20px) / 2 : 12px;
-        y: (root.height - 20px) / 2;
-        width: 20px;
-        height: 20px;
+        x: root.compact ? (root.width - Theme.icon-size) / 2 : 12px;
+        y: (root.height - Theme.icon-size) / 2;
+        width: Theme.icon-size;
+        height: Theme.icon-size;
         source: root.selected ? root.icon-selected : root.icon;
         colorize: root.selected ? Theme.accent-text : Theme.text-primary;
         accessible-role: none;
@@ -106,11 +106,9 @@ component StatusChip inherits Rectangle {
         border-radius: 4px;
         background: root.status == DaemonStatus.running ? Theme.success-text : root.status == DaemonStatus.stopped ? Theme.warning-text : Theme.error-text;
     }
-    if !root.compact: Text {
+    if !root.compact: Caption {
         x: 38px;
         text: root.text;
-        font-size: Theme.caption-size;
-        color: Theme.text-secondary;
         vertical-alignment: center;
         accessible-role: none;
     }

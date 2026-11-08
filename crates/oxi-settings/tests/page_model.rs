@@ -71,7 +71,7 @@ fn picking_a_row_writes_model_id() {
     );
     for (label, id) in [
         ("Whisper large-v3", "large-v3"),
-        ("Whisper large-v3 Russian (podlodka v1.2, f16)", "podlodka"),
+        ("Whisper large-v3 Russian", "podlodka"),
         ("Use my own .bin", "custom"),
         ("Whisper large-v3 turbo", "turbo"),
     ] {

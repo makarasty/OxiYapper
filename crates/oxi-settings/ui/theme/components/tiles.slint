@@ -2,7 +2,7 @@
 // (accent tint, accent icon and title, check badge); borders never change colour.
 import { Theme, Shell } from "../tokens.slint";
 import { Icons } from "../icons.slint";
-import { FocusRing, KeyFocus } from "base.slint";
+import { FocusRing, KeyFocus, Caption } from "base.slint";
 
 // 20 px accent circle with a white check; grey on a read-only picker.
 export component CheckBadge inherits Rectangle {
@@ -36,9 +36,8 @@ export component Tile inherits Rectangle {
     in property <bool> pressed;
     in property <bool> read-only;
     in property <bool> focused;
-    in property <bool> tall;
     min-width: 160px;
-    min-height: max(root.tall ? 128px : 104px, inner.min-height);
+    min-height: max(104px, inner.min-height);
     horizontal-stretch: 1;
     border-radius: Theme.radius-card;
     border-width: 1px;
@@ -68,10 +67,8 @@ export component Tile inherits Rectangle {
             wrap: word-wrap;
             accessible-role: none;
         }
-        if root.item.caption != "": Text {
+        if root.item.caption != "": Caption {
             text: root.item.caption;
-            font-size: Theme.caption-size;
-            color: Theme.text-secondary;
             horizontal-alignment: center;
             wrap: word-wrap;
             accessible-role: none;
@@ -95,7 +92,6 @@ export component TilePicker {
     in property <[TileItem]> tiles;
     in property <int> selected;
     in property <int> columns: root.tiles.length;
-    in property <bool> tall;
     in property <bool> locked: Shell.locked;
     in property <int> force-hover: -1;
     in property <int> force-pressed: -1;
@@ -154,7 +150,6 @@ export component TilePicker {
                     hover: touch.has-hover || root.force-hover == self.i;
                     pressed: touch.pressed || root.force-pressed == self.i;
                     read-only: root.locked;
-                    tall: root.tall;
                     focused: self.i == root.selected && (root.force-focus || (root.key-focus && fs.has-focus));
                     accessible-role: radio-button;
                     accessible-label: self.item.title;
@@ -286,10 +281,8 @@ export component ScreenPicker {
                 }
             }
         }
-        Text {
+        Caption {
             text: root.selected >= 0 && root.selected < root.names.length ? root.names[root.selected] : "";
-            font-size: Theme.caption-size;
-            color: Theme.text-secondary;
             horizontal-alignment: center;
         }
     }
