@@ -369,6 +369,34 @@ fn shot_keyboard_ready() {
 }
 
 #[test]
+fn shot_keyboard_large() {
+    // The board at the widest window it grows to: Ctrl + F13 picked, Space down.
+    for (theme, choice) in THEMES {
+        SIZE.set((1600.0, 1000.0));
+        let _ = slint::platform::set_platform(Box::new(Shots));
+        let (ipc, _sent) = Ipc::fake();
+        let layout = common::layout("keyboard-large", None);
+        let window = oxi_settings::open_with(layout, ipc.clone()).unwrap();
+        window.set_page(Page::Hotkey);
+        window.set_theme(choice);
+        window.show().unwrap();
+        ElementHandle::find_by_accessible_label(&window, "Change hotkey")
+            .next()
+            .unwrap()
+            .invoke_accessible_default_action();
+        for k in [Key::LCtrl, Key::F13] {
+            key(&ipc, k, true);
+        }
+        key(&ipc, Key::F13, false);
+        key(&ipc, Key::Space, true);
+        save(
+            &render(&window, (1600.0, 1000.0), 1.0),
+            &format!("keyboard-1600-{theme}"),
+        );
+    }
+}
+
+#[test]
 fn shot_keyboard_offline() {
     // The daemon goes away with the board open.
     shot_board("keyboard-offline", |ipc| {
