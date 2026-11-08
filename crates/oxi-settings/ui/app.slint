@@ -1,7 +1,8 @@
 // Settings window (redesign spec sections 2 and 3): a nav rail with icons on the left (icons only
 // under 960 px), the page on the right in a scrolling column of at most 880 px, banners above it.
 import { Palette, ScrollView } from "std-widgets.slint";
-import { Theme, Shell, Icons, KeyFocus, Tip, Button, Banner, Severity, PageHeader } from "theme/index.slint";
+import { Theme, Shell, Icons, KeyFocus, Tip, Button, Banner, Severity, PageHeader, MonthLabel } from "theme/index.slint";
+import { HomePage, HomeState } from "pages/home.slint";
 import { HotkeyPage, HotkeyState } from "pages/hotkey.slint";
 import { KeyCap } from "keyboard.slint";
 import { AudioPage, AudioState, AudioKey } from "pages/audio.slint";
@@ -11,9 +12,9 @@ import { OverlayPage, OverlayState } from "pages/overlay.slint";
 import { SystemPage, ThemeChoice, SystemState } from "pages/system.slint";
 import { AboutPage } from "pages/about.slint";
 
-export { Shell, Theme, ThemeChoice, HotkeyState, KeyCap, AudioState, AudioKey, ModelState, ModelRow, TextState, PasteRuleRow, FileState, FileInfo, TextFile, OverlayState, SystemState }
+export { Shell, Theme, ThemeChoice, HomeState, MonthLabel, HotkeyState, KeyCap, AudioState, AudioKey, ModelState, ModelRow, TextState, PasteRuleRow, FileState, FileInfo, TextFile, OverlayState, SystemState }
 
-export enum Page { hotkey, audio, model, text, overlay, system, about }
+export enum Page { home, hotkey, audio, model, text, overlay, system, about }
 
 // The daemon chip at the foot of the rail; `hidden` when the window follows no daemon.
 export enum DaemonStatus { hidden, running, stopped, stuck }
@@ -129,7 +130,7 @@ export component AppWindow inherits Window {
     in property <string> version;
     in property <string> licence;
     in property <string> repository;
-    in-out property <Page> page: Page.hotkey;
+    in-out property <Page> page: Page.home;
     in-out property <ThemeChoice> theme;
     // Empty hides the banner.
     in property <string> banner-text;
@@ -171,6 +172,7 @@ export component AppWindow inherits Window {
     property <length> pad: root.width < 900px ? Theme.page-padding-narrow : Theme.page-padding;
     property <length> content-max: root.page == Page.hotkey && HotkeyState.keyboard-open ? 1200px : 880px;
     property <[{page: Page, label: string, icon: image, filled: image}]> rail: [
+        { page: Page.home, label: @tr("Home"), icon: Icons.home, filled: Icons.home-filled },
         { page: Page.hotkey, label: @tr("Hotkey"), icon: Icons.keyboard, filled: Icons.keyboard-filled },
         { page: Page.audio, label: @tr("Audio"), icon: Icons.mic, filled: Icons.mic-filled },
         { page: Page.model, label: @tr("Model"), icon: Icons.brain-circuit, filled: Icons.brain-circuit-filled },
@@ -181,7 +183,7 @@ export component AppWindow inherits Window {
     ];
 
     pure function index-of(p: Page) -> int {
-        return p == Page.hotkey ? 0 : p == Page.audio ? 1 : p == Page.model ? 2 : p == Page.text ? 3 : p == Page.overlay ? 4 : p == Page.system ? 5 : 6;
+        return p == Page.home ? 0 : p == Page.hotkey ? 1 : p == Page.audio ? 2 : p == Page.model ? 3 : p == Page.text ? 4 : p == Page.overlay ? 5 : p == Page.system ? 6 : 7;
     }
 
     // System follows the OS: `unknown` makes the style read the OS scheme.
@@ -198,6 +200,9 @@ export component AppWindow inherits Window {
         // The rail follows a page opened by Ctrl+Tab; the page opens at its top.
         nav.cursor = root.index-of(root.page);
         scroll.content-y = 0;
+        if (root.page == Page.home) {
+            HomeState.shown();
+        }
         // The focused field may have left with the old page, and Ctrl+Tab needs a focus to reach
         // `keys`. The rail keeps its own focus.
         if (!nav.has-focus) {
@@ -364,6 +369,10 @@ export component AppWindow inherits Window {
                     alignment: start;
                     PageHeader {
                         title: root.rail[root.index-of(root.page)].label;
+                    }
+                    if root.page == Page.home: HomePage {
+                        window-width: root.width;
+                        content-width: min(root.content-max, root.width - nav.width - 2 * root.pad);
                     }
                     if root.page == Page.hotkey: HotkeyPage { }
                     if root.page == Page.audio: AudioPage { }

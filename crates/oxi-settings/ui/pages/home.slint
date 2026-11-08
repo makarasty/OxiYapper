@@ -1,0 +1,115 @@
+// Home page (SPEC, History): four usage numbers and the speaking-activity heatmap.
+import { Theme, Icons, Card, StatCard, ActivityHeatmap, MonthLabel } from "../theme/index.slint";
+
+// Filled by `pages::home`.
+export global HomeState {
+    in property <string> words: "0";
+    in property <string> wpm: "0";
+    in property <string> dictations: "0";
+    in property <int> streak;
+    in property <int> longest-streak;
+    in property <int> active-days;
+    // Nothing dictated yet: the heatmap card says how to start.
+    in property <bool> empty: true;
+    in property <string> chord;
+    // Recording mode is Toggle: the hint says press once, not hold.
+    in property <bool> toggle;
+    // One 0..4 per day from a Monday (index = week * 7 + weekday, Monday first) to today.
+    in property <[int]> levels;
+    in property <[MonthLabel]> months;
+    in property <int> today: -1;
+    callback shown();
+}
+
+struct Stat {
+    icon: image,
+    label: string,
+    value: string,
+    caption: string,
+}
+
+export component HomePage inherits VerticalLayout {
+    // The page column's width, from the window: the card rows are built from it, so it must not
+    // come from this layout's own size.
+    in property <length> content-width;
+    // The window's width, not the column's: the rail widens at 960 and takes 164 px from the
+    // column, which would flip the cards back to two rows on the way up.
+    in property <length> window-width;
+    // Under this the four cards stop fitting their labels.
+    property <bool> wide: root.window-width >= 900px;
+    property <length> card-width: root.wide ? (root.content-width - 3 * Theme.tile-gap) / 4 : (root.content-width - Theme.tile-gap) / 2;
+    property <int> weeks: max(1, ceil(HomeState.levels.length / 7));
+    // The grid fills the card: the day labels are 32 px, the gaps 3 px.
+    property <length> cell: floor((root.content-width - 2 * Theme.card-padding-h - 32px) / root.weeks / 1px - 3) * 1px;
+    property <[Stat]> stats: [
+        { icon: Icons.text-word-count, label: @tr("Words spoken"), value: HomeState.words, caption: @tr("All time") },
+        { icon: Icons.top-speed, label: @tr("Words per minute"), value: HomeState.wpm, caption: @tr("Based on recorded speech") },
+        { icon: Icons.mic, label: @tr("Dictations"), value: HomeState.dictations, caption: @tr("All time") },
+        {
+            icon: Icons.fire,
+            label: @tr("Current streak"),
+            value: @tr("{n} day" | "{n} days" % HomeState.streak),
+            caption: @tr("Longest: {n} day" | "Longest: {n} days" % HomeState.longest-streak),
+        },
+    ];
+    property <[[Stat]]> rows: root.wide ? [root.stats] : [[root.stats[0], root.stats[1]], [root.stats[2], root.stats[3]]];
+    alignment: start;
+    spacing: Theme.tile-gap;
+    for row in root.rows: HorizontalLayout {
+        spacing: Theme.tile-gap;
+        for stat in row: StatCard {
+            width: root.card-width;
+            icon: stat.icon;
+            label: stat.label;
+            value: stat.value;
+            caption: stat.caption;
+        }
+    }
+    Card {
+        HorizontalLayout {
+            spacing: Theme.space-2;
+            Image {
+                source: Icons.calendar;
+                width: 20px;
+                height: 20px;
+                colorize: Theme.text-primary;
+                accessible-role: none;
+            }
+            Text {
+                text: @tr("Speaking activity");
+                font-size: Theme.body-size;
+                font-weight: Theme.weight-strong;
+                color: Theme.text-primary;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+        }
+        if HomeState.empty: VerticalLayout {
+            spacing: Theme.title-gap;
+            padding-bottom: Theme.space-2;
+            Text {
+                text: HomeState.toggle ? @tr("Press {} once to start, again to stop", HomeState.chord) : @tr("Hold {} and speak", HomeState.chord);
+                font-size: Theme.body-size;
+                color: Theme.text-primary;
+                wrap: word-wrap;
+            }
+            Text {
+                text: @tr("Your words, pace and streak show up here after the first dictation.");
+                font-size: Theme.caption-size;
+                color: Theme.text-secondary;
+                wrap: word-wrap;
+            }
+        }
+        HorizontalLayout {
+            alignment: start;
+            ActivityHeatmap {
+                levels: HomeState.levels;
+                months: HomeState.months;
+                today: HomeState.today;
+                cell: root.cell;
+                day-labels: [@tr("Mon"), @tr("Tue"), @tr("Wed"), @tr("Thu"), @tr("Fri"), @tr("Sat"), @tr("Sun")];
+                summary: @tr("{n} active day in the last {} weeks" | "{n} active days in the last {} weeks" % HomeState.active-days, root.weeks);
+            }
+        }
+    }
+}

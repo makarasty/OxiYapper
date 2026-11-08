@@ -65,10 +65,10 @@ export struct MonthLabel {
     text: string,
 }
 
-// GitHub-style activity grid: weeks as columns, Sunday..Saturday as rows, month labels on top,
+// GitHub-style activity grid: weeks as columns, seven day rows, month labels on top,
 // five levels from empty to full accent, a Less..More legend, today's cell outlined.
-// `levels` is one 0..4 per day, week by week (index = week * 7 + weekday, Sunday first); the
-// last week may be partial. `today` is the index of today's cell (-1: none).
+// `levels` is one 0..4 per day, week by week (index = week * 7 + row, rows as in `day-labels`);
+// the last week may be partial. `today` is the index of today's cell (-1: none).
 export component ActivityHeatmap {
     in property <[int]> levels;
     in property <[MonthLabel]> months;
@@ -139,7 +139,7 @@ export component ActivityHeatmap {
         x: grid.width - self.preferred-width;
         y: grid.height + Theme.space-3;
         width: self.preferred-width;
-        height: Theme.caption-line;
+        height: max(root.cell, Theme.caption-line);
         spacing: root.gap;
         Text {
             text: root.less-text;

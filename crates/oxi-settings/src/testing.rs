@@ -33,6 +33,8 @@ pub fn linked(module: &str, name: &str, page: Page) -> (AppWindow, Ipc, Receiver
     let window = crate::open_with(layout.clone(), ipc.clone()).unwrap();
     window.show().unwrap();
     window.set_page(page);
+    // The page's change handler moves the focus: let it run now, not in the middle of the test.
+    slint::platform::update_timers_and_animations();
     (window, ipc, sent, layout)
 }
 

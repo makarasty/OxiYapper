@@ -25,7 +25,7 @@ fn card(window: &AppWindow, label: &str) -> ElementHandle {
 fn rail_switches_pages() {
     let l = layout("rail", None);
     let window = open_default(&l);
-    assert_eq!(window.get_page(), Page::Hotkey);
+    assert_eq!(window.get_page(), Page::Home);
     assert!(!has(&window, "Version"));
     tab(&window, "About").invoke_accessible_default_action();
     assert_eq!(window.get_page(), Page::About);
@@ -430,7 +430,7 @@ fn ctrl_tab_cycles_the_pages_both_ways() {
     chord(&window, false, Key::Tab);
     assert_eq!(window.get_page(), Page::About);
     chord(&window, false, Key::Tab);
-    assert_eq!(window.get_page(), Page::Hotkey, "wraps to the first page");
+    assert_eq!(window.get_page(), Page::Home, "wraps to the first page");
     chord(&window, true, Key::Tab);
     assert_eq!(window.get_page(), Page::About, "Ctrl+Shift+Tab goes back");
     chord(&window, true, Key::Backtab);
@@ -507,11 +507,11 @@ fn rail_takes_up_down_and_enter() {
     );
     press(&window, Key::Return);
     assert_eq!(window.get_page(), Page::Model);
-    press(&window, Key::UpArrow);
-    press(&window, Key::UpArrow);
-    press(&window, Key::UpArrow);
+    for _ in 0..4 {
+        press(&window, Key::UpArrow);
+    }
     press(&window, " ");
-    assert_eq!(window.get_page(), Page::Hotkey, "stops at the first page");
+    assert_eq!(window.get_page(), Page::Home, "stops at the first page");
 }
 
 #[test]

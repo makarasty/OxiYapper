@@ -432,12 +432,12 @@ mod tests {
     #[test]
     fn resets_leave_one_subscriber_per_page() {
         let (window, ipc, _sent, _) = crate::testing::linked("lib", "resets", super::Page::Hotkey);
-        // The banner, Hotkey, Model and Overlay.
-        assert_eq!(ipc.subscribers(), 4);
+        // The banner, Home, Hotkey, Model and Overlay.
+        assert_eq!(ipc.subscribers(), 5);
         for _ in 0..3 {
             window.invoke_reset_config();
         }
-        assert_eq!(ipc.subscribers(), 4);
+        assert_eq!(ipc.subscribers(), 5);
     }
 
     #[cfg(windows)]
