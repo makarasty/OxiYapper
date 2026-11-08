@@ -28,7 +28,7 @@ use ipc::{Action, Event, Link, Options};
 mod generated {
     slint::include_modules!();
 }
-pub use generated::{AppWindow, DaemonStatus, Page, Shell, ThemeChoice};
+pub use generated::{AppWindow, DaemonStatus, Page, Shell, Theme as Tokens, ThemeChoice};
 
 /// How often the window looks for an edit of `config.toml` from outside (an editor, "Open
 /// file"): a fixed file clears the banner and refreshes the pages without reopening.
@@ -346,6 +346,7 @@ fn on_daemon_event(window: &AppWindow, event: &Event) {
         window.set_daemon_status(status(*link));
     }
     let action = notice.as_ref().and_then(|n| n.action);
+    window.set_daemon_config_error(matches!(event, Event::Push(Push::ConfigError { .. })));
     window.set_daemon_text(notice.map(|n| n.text).unwrap_or_default().into());
     window.set_daemon_start(action == Some(Action::Start));
     window.set_daemon_restart(action == Some(Action::Restart));

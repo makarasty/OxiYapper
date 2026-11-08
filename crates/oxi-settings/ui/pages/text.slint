@@ -1,7 +1,6 @@
 // Text page (SPEC Text): dictionary.txt with its prompt token budget, replace.txt with the lines
 // it ignores, and how text is pasted (mode, trailing space, restore delay, per-app rules).
-import { Palette, Button, ComboBox, LineEdit, ListView, ScrollView, TextEdit } from "std-widgets.slint";
-import { Shell, Group, Row, ToggleRow, SliderRow, ThumbPicker, InlineNote } from "../widgets.slint";
+import { Theme, Shell, Icons, Group, Card, Row, ToggleRow, SliderRow, Combo, TextField, TextArea, TilePicker, Button, ButtonKind, ProgressBar, Note, Severity } from "../theme/index.slint";
 
 export enum TextFile { dictionary, replacements }
 
@@ -40,12 +39,13 @@ export global TextState {
     in property <int> dropped-from;
     in-out property <string> replacements;
     in property <FileInfo> replacements-info;
-    // Numbers of the lines without "=>", comma separated; empty when every line parses.
+    // Which lines have no "=>" and are ignored; empty when every line parses.
     in property <string> bad-lines;
     // 0 clipboard, 1 type.
     in-out property <int> paste-mode;
     in-out property <bool> trailing-space;
     in-out property <float> restore-delay-ms;
+    in property <float> default-restore-delay-ms;
     in property <[PasteRuleRow]> rules;
     // The app of a refused duplicate rule; empty hides the note.
     in property <string> duplicate-app;
@@ -64,58 +64,94 @@ export global TextState {
     callback rule-added(string);
 }
 
-// An editor for one text file: the text, a status line (the children) with Open file and Save,
-// and the notes about how the file was read.
-component FileEditor inherits VerticalLayout {
+// An editor for one text file on its card: the text, a status line (the children) with Open file
+// and Save, and the notes about how the file was read.
+component FileEditor inherits Card {
     in property <TextFile> file;
     in property <string> name;
     in property <string> label;
+    in property <string> description;
     in property <FileInfo> info;
     in property <length> editor-height;
     in-out property <string> text;
     property <bool> readable: root.info.state != FileState.not-text && root.info.state != FileState.unreadable;
-    TextEdit {
+    // A converted file has no edit yet, but Save is what rewrites it as UTF-8.
+    property <bool> can-save: root.readable && (root.info.dirty || root.info.state == FileState.converted);
+    Text {
+        text: root.description;
+        font-size: Theme.caption-size;
+        color: Theme.text-secondary;
+        wrap: word-wrap;
+    }
+    FocusScope {
         height: root.editor-height;
-        text <=> root.text;
-        enabled: root.readable;
-        accessible-label: root.label;
-        edited(text) => {
-            TextState.edited(root.file, text);
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
+        capture-key-pressed(event) => {
+            // Ctrl+S on an English or a Russian layout.
+            if (event.modifiers.control && (event.text == "s" || event.text == "S" || event.text == "ы" || event.text == "Ы")) {
+                if (root.can-save) {
+                    TextState.save(root.file);
+                }
+                return accept;
+            }
+            reject
+        }
+        TextArea {
+            width: 100%;
+            height: 100%;
+            text <=> root.text;
+            // A read-only config locks the config only: this file is written on its own.
+            locked: false;
+            enabled: root.readable;
+            accessible-label: root.label;
+            edited(text) => {
+                TextState.edited(root.file, text);
+            }
         }
     }
     HorizontalLayout {
-        spacing: 6px;
-        padding-top: 2px;
-        padding-bottom: 2px;
+        spacing: Theme.control-gap;
         VerticalLayout {
             horizontal-stretch: 1;
             alignment: center;
+            spacing: Theme.space-1;
             @children
-            if root.info.dirty: Text {
+            if root.info.dirty: Note {
                 text: @tr("Unsaved changes");
-                font-size: 11px;
-                color: Palette.foreground;
-                opacity: 0.7;
+                severity: Severity.warning;
             }
         }
-        Button {
-            text: @tr("Open file");
-            accessible-label: @tr("Open {}", root.name);
-            clicked => {
-                TextState.open(root.file);
+        VerticalLayout {
+            alignment: center;
+            Button {
+                text: @tr("Open file");
+                icon: Icons.open-folder-16;
+                kind: ButtonKind.subtle;
+                accessible-label: @tr("Open {}", root.name);
+                clicked => {
+                    TextState.open(root.file);
+                }
             }
         }
-        Button {
-            text: @tr("Save");
-            accessible-label: @tr("Save {}", root.name);
-            enabled: root.readable;
-            clicked => {
-                TextState.save(root.file);
+        VerticalLayout {
+            alignment: center;
+            Button {
+                text: @tr("Save");
+                icon: Icons.save-16;
+                kind: root.info.dirty ? ButtonKind.primary : ButtonKind.secondary;
+                enabled: root.can-save;
+                tooltip: root.readable ? @tr("No changes to save") : @tr("The file could not be read");
+                accessible-label: @tr("Save {}", root.name);
+                clicked => {
+                    TextState.save(root.file);
+                }
             }
         }
     }
-    if root.info.conflict: InlineNote {
+    if root.info.conflict: Note {
         text: root.info.error != "" ? @tr("Could not read {} on disk: {}.", root.name, root.info.error) : @tr("{} changed on disk since it was loaded.", root.name);
+        severity: Severity.error;
         Button {
             text: @tr("Reload");
             accessible-label: @tr("Reload {}", root.name);
@@ -125,14 +161,16 @@ component FileEditor inherits VerticalLayout {
         }
         Button {
             text: @tr("Overwrite");
+            kind: ButtonKind.danger;
             accessible-label: @tr("Overwrite {}", root.name);
             clicked => {
                 TextState.overwrite(root.file);
             }
         }
     }
-    if !root.readable: InlineNote {
+    if !root.readable: Note {
         text: root.info.state == FileState.unreadable ? @tr("Could not read {}: {}.", root.name, root.info.error) : @tr("{} is not UTF-8 or UTF-16 text: fix it in a text editor.", root.name);
+        severity: Severity.error;
         Button {
             text: @tr("Reload");
             accessible-label: @tr("Reload {}", root.name);
@@ -141,144 +179,152 @@ component FileEditor inherits VerticalLayout {
             }
         }
     }
-    if root.info.state == FileState.converted: Text {
+    if root.info.state == FileState.converted: Note {
         text: @tr("Saved as UTF-16 or with a BOM: Save rewrites it as UTF-8.");
-        wrap: word-wrap;
-        font-size: 11px;
-        color: Palette.foreground;
     }
 }
 
-// No scrolling in the normal states (SPEC Settings UI): the editors are short and the rules list
-// is capped, so the page fits the window with the banner and the notes of the files showing.
-// The ScrollView is only the fallback when banner, notes and rules together outgrow it.
-export component TextPage inherits ScrollView {
+// The window's page column scrolls; nothing here has a scroll area but the editors themselves.
+export component TextPage inherits VerticalLayout {
+    in property <length> window-height;
+    // Six lines at least, more as the window grows.
+    property <length> editor-height: clamp(root.window-height * 0.28, 120px, 360px);
+    alignment: start;
+    spacing: Theme.group-gap;
     init => {
         TextState.shown();
     }
-    preferred-height: content.preferred-height;
-    max-height: content.preferred-height;
-    min-height: 0;
-    content-width: self.visible-width;
-    content-height: content.preferred-height;
-    content := VerticalLayout {
-        width: root.visible-width;
-        alignment: start;
-        spacing: 8px;
-        Group {
-            title: @tr("Dictionary: words that help whisper, one per line");
-            FileEditor {
-                file: TextFile.dictionary;
-                name: "dictionary.txt";
-                label: @tr("Dictionary");
-                info: TextState.dictionary-info;
-                editor-height: 56px;
-                text <=> TextState.dictionary;
-                Text {
-                    text: @tr("{} / {} tokens", TextState.tokens, TextState.budget);
-                    color: TextState.dropped-from > 0 ? Shell.error-text : Palette.foreground;
-                }
-                if TextState.dropped-from > 0: Text {
-                    text: @tr("Over the limit: line {} and after are not sent.", TextState.dropped-from);
-                    wrap: word-wrap;
-                    font-size: 11px;
-                    color: Shell.error-text;
-                }
+    Group {
+        title: @tr("Dictionary");
+        icon: Icons.book-letter;
+        FileEditor {
+            file: TextFile.dictionary;
+            name: "dictionary.txt";
+            label: @tr("Dictionary");
+            description: @tr("Words that help Whisper spell names and terms, one per line.");
+            info: TextState.dictionary-info;
+            editor-height: root.editor-height;
+            text <=> TextState.dictionary;
+            ProgressBar {
+                value: TextState.tokens / max(TextState.budget, 1);
+                error: TextState.dropped-from > 0;
+                label: @tr("{} / {} tokens", TextState.tokens, TextState.budget);
+                accessible-label: self.label;
+            }
+            if TextState.dropped-from > 0: Note {
+                text: @tr("Over the limit: line {} and after are not sent.", TextState.dropped-from);
+                severity: Severity.error;
             }
         }
-        Group {
-            title: @tr("Replacements: heard => wanted, one per line");
-            FileEditor {
-                file: TextFile.replacements;
-                name: "replace.txt";
-                label: @tr("Replacements");
-                info: TextState.replacements-info;
-                editor-height: 56px;
-                text <=> TextState.replacements;
-                Text {
-                    text: TextState.bad-lines == "" ? @tr("Every line has =>.") : @tr("Ignored, no =>: line {}", TextState.bad-lines);
-                    wrap: word-wrap;
-                    color: TextState.bad-lines == "" ? Palette.foreground : Shell.error-text;
-                }
+    }
+    Group {
+        title: @tr("Replacements");
+        icon: Icons.text-t;
+        FileEditor {
+            file: TextFile.replacements;
+            name: "replace.txt";
+            label: @tr("Replacements");
+            description: @tr("heard => wanted, one per line. Applied after transcription.");
+            info: TextState.replacements-info;
+            editor-height: root.editor-height;
+            text <=> TextState.replacements;
+            Note {
+                text: TextState.bad-lines == "" ? @tr("All lines valid") : TextState.bad-lines;
+                severity: TextState.bad-lines == "" ? Severity.success : Severity.error;
             }
         }
-        Group {
-            title: @tr("Paste");
-            ThumbPicker {
-                accessible-label: @tr("Paste mode");
-                thumbs: [
-                    { image: @image-url("../img/text-clipboard.svg"), caption: @tr("Clipboard") },
-                    { image: @image-url("../img/text-type.svg"), caption: @tr("Type") },
-                ];
-                selected: TextState.paste-mode;
-                picked(i) => {
-                    TextState.paste-mode = i;
-                    TextState.paste-mode-picked(i);
-                }
+    }
+    Group {
+        title: @tr("Paste");
+        TilePicker {
+            accessible-label: @tr("Paste mode");
+            columns: 2;
+            tiles: [
+                { icon: Icons.clipboard-paste-24, icon-selected: Icons.clipboard-paste-24-filled, title: @tr("Clipboard"), caption: @tr("Pastes with Ctrl+V and restores your clipboard") },
+                { icon: Icons.keyboard-24, icon-selected: Icons.keyboard-24-filled, title: @tr("Type"), caption: @tr("Types character by character, for games and remote desktops") },
+            ];
+            selected: TextState.paste-mode;
+            picked(i) => {
+                TextState.paste-mode = i;
+                TextState.paste-mode-picked(i);
             }
-            ToggleRow {
-                label: @tr("Trailing space");
-                checked <=> TextState.trailing-space;
-                toggled(on) => {
-                    TextState.trailing-space-toggled(on);
-                }
+        }
+        ToggleRow {
+            title: @tr("Trailing space");
+            description: @tr("Adds a space after the pasted text.");
+            checked <=> TextState.trailing-space;
+            toggled(on) => {
+                TextState.trailing-space-toggled(on);
             }
+        }
+        Card {
             SliderRow {
-                label: @tr("Restore clipboard after");
+                icon: Icons.timer;
+                title: @tr("Restore clipboard after");
+                description: @tr("How long the dictated text stays on the clipboard.");
                 minimum: 0;
                 maximum: 1000;
                 step: 25;
+                unit: "ms";
+                default-value: TextState.default-restore-delay-ms;
                 value <=> TextState.restore-delay-ms;
-                value-text: @tr("{} ms", round(TextState.restore-delay-ms));
                 changed(v) => {
                     TextState.restore-delay-changed(v);
                 }
             }
-            ListView {
-                // One row per rule, two at most; more rules scroll inside the list.
-                height: min(TextState.rules.length, 2) * 32px;
-                for rule[i] in TextState.rules: Row {
-                    label: rule.app;
-                    ComboBox {
-                        width: 110px;
-                        model: [@tr("Default"), @tr("Clipboard"), @tr("Type")];
-                        current-index: rule.mode;
-                        enabled: !Shell.locked;
-                        accessible-label: @tr("Mode for {}", rule.app);
-                        selected => {
-                            TextState.rule-mode-picked(i, self.current-index);
-                        }
+        }
+    }
+    Group {
+        title: @tr("Per-app rules");
+        for rule[i] in TextState.rules: Card {
+            Row {
+                icon: Icons.app-generic;
+                title: rule.app;
+                Combo {
+                    min-width: 160px;
+                    max-width: 160px;
+                    model: [@tr("Default"), @tr("Clipboard"), @tr("Type")];
+                    current-index: rule.mode;
+                    accessible-label: @tr("Mode for {}", rule.app);
+                    selected => {
+                        TextState.rule-mode-picked(i, self.current-index);
                     }
-                    Button {
-                        text: @tr("Remove");
-                        accessible-label: @tr("Remove {}", rule.app);
-                        enabled: !Shell.locked;
-                        clicked => {
-                            TextState.rule-removed(i);
-                        }
+                }
+                Button {
+                    kind: ButtonKind.icon;
+                    icon: Icons.delete-16;
+                    text: @tr("Remove {}", rule.app);
+                    enabled: !Shell.locked;
+                    tooltip: @tr("The config is read-only");
+                    clicked => {
+                        TextState.rule-removed(i);
                     }
                 }
             }
-            Row {
-                label: @tr("Per-app rule");
-                new-app := LineEdit {
-                    width: 150px;
+        }
+        Card {
+            HorizontalLayout {
+                spacing: Theme.control-gap;
+                new-app := TextField {
                     placeholder-text: @tr("app.exe");
                     enabled: !Shell.locked;
                     accessible-label: @tr("New rule app");
                 }
                 Button {
                     text: @tr("Add");
+                    icon: Icons.add-16;
                     accessible-label: @tr("Add rule");
                     enabled: !Shell.locked && new-app.text != "";
+                    tooltip: Shell.locked ? @tr("The config is read-only") : @tr("Type an app name first");
                     clicked => {
                         TextState.rule-added(new-app.text);
                         new-app.text = "";
                     }
                 }
             }
-            if TextState.duplicate-app != "": InlineNote {
+            if TextState.duplicate-app != "": Note {
                 text: @tr("{} already has a rule: change its mode in the list above.", TextState.duplicate-app);
+                severity: Severity.warning;
             }
         }
     }

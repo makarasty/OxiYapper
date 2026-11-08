@@ -9,6 +9,7 @@ use std::{fs, io};
 use oxi_core::config::{Paste, PasteMode, PasteRule};
 use oxi_core::dictionary::{BUDGET, build_prompt, token_count};
 use oxi_core::paths::Layout;
+use oxi_core::strings;
 use oxi_core::text::{ReplaceRules, decode_text_file};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel, Weak};
 
@@ -73,6 +74,11 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
     )]
     let ms = paste.restore_delay_ms as f32;
     s.set_restore_delay_ms(ms);
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a delay in ms is far below 2^24"
+    )]
+    s.set_default_restore_delay_ms(Paste::default().restore_delay_ms as f32);
     s.set_rules(rows(&paste.rules));
     s.set_duplicate_app(SharedString::new());
     drop(file);
@@ -192,12 +198,7 @@ fn show_dictionary(s: &TextState<'_>, text: &str) {
 }
 
 fn show_replacements(s: &TextState<'_>, text: &str) {
-    let bad: Vec<String> = ReplaceRules::parse(text)
-        .bad_lines
-        .iter()
-        .map(ToString::to_string)
-        .collect();
-    s.set_bad_lines(bad.join(", ").into());
+    s.set_bad_lines(strings::replace_bad_lines(&ReplaceRules::parse(text).bad_lines).into());
 }
 
 /// Read the file into the editor unless it has unsaved edits; then only flag a change on disk.

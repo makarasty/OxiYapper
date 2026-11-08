@@ -49,11 +49,13 @@ fn rows_show_size_and_status_from_the_files() {
     // A cut-off download: the right name, far from the right size.
     fs::write(l.models_dir().join("ggml-large-v3.bin"), b"synthetic").unwrap();
     let window = open(&l, Page::Model);
-    assert!(has(&window, "1.6 GB · Not downloaded"));
+    assert!(has(&window, "1.6 GB · fast, good for most"));
+    assert!(has(&window, "Whisper large-v3 turbo: Not downloaded"));
     assert!(has(
         &window,
         "3.1 GB · Damaged or incomplete, download it again"
     ));
+    assert!(has(&window, "Whisper large-v3: Damaged"));
     for name in ["Whisper large-v3 turbo", "Whisper large-v3"] {
         with_role(&window, &format!("Download {name}"), AccessibleRole::Button);
     }
@@ -170,8 +172,8 @@ fn gpu_picker_shows_the_configured_choice() {
 fn idle_unload_slider_writes_minutes() {
     let l = layout("idle", None);
     let window = open(&l, Page::Model);
-    assert!(has(&window, "5 min"));
-    let slider = with_role(&window, "Unload after idle", AccessibleRole::Slider);
+    let slider = with_role(&window, "Unload after idle", AccessibleRole::Spinbox);
+    assert_eq!(slider.accessible_value().as_deref(), Some("5"));
     let rest = || i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(350));
     slider.set_accessible_value("12");
     slider.set_accessible_value("20");
@@ -181,23 +183,35 @@ fn idle_unload_slider_writes_minutes() {
     slider.set_accessible_value("0");
     rest();
     assert_eq!(saved(&l).idle_unload_minutes, 0);
-    assert!(has(&window, "Never"));
+    assert_eq!(slider.accessible_value().as_deref(), Some("0"));
 }
 
 #[test]
 fn download_without_the_daemon_says_to_start_it() {
     let l = layout("offline", None);
     let window = open(&l, Page::Model);
-    with_role(&window, "Download Whisper large-v3", AccessibleRole::Button)
-        .invoke_accessible_default_action();
-    assert!(has(
-        &window,
-        "Whisper large-v3: Start OxiYapper to download models"
-    ));
+    let download = with_role(&window, "Download Whisper large-v3", AccessibleRole::Button);
+    assert_eq!(download.accessible_enabled(), Some(false));
+    assert_eq!(
+        download.accessible_description().as_deref(),
+        Some(oxi_core::strings::DOWNLOAD_NEEDS_DAEMON)
+    );
+    download.invoke_accessible_default_action();
     assert!(
         !ElementHandle::find_by_accessible_label(&window, "Whisper large-v3 download")
             .any(|e| e.accessible_role() == Some(AccessibleRole::ProgressIndicator))
     );
+}
+
+#[test]
+fn a_selected_model_not_on_disk_warns() {
+    let warning = "Not downloaded yet: download it or dictation will not start.";
+    let l = layout("not-on-disk", None);
+    let window = open(&l, Page::Model);
+    assert!(has(&window, warning));
+
+    radio(&window, "Use my own .bin").invoke_accessible_default_action();
+    assert!(!has(&window, warning));
 }
 
 #[test]

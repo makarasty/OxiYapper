@@ -1,27 +1,86 @@
-// About page: name, version, licence and the "Made with Slint" badge (SPEC Settings UI).
-import { AboutSlint, Palette } from "std-widgets.slint";
-import { Group, Row } from "../widgets.slint";
+// About page: logo, name, version and licence, the project links and the "Made with Slint" badge
+// (SPEC Settings UI).
+import { AboutSlint } from "std-widgets.slint";
+import { Theme, Icons, Group, Card, ClickCard, Row } from "../theme/index.slint";
 
 export component AboutPage inherits VerticalLayout {
     in property <string> app-name;
     in property <string> version;
     in property <string> licence;
+    in property <string> repository;
     alignment: start;
-    spacing: 10px;
+    spacing: Theme.group-gap;
     Group {
-        title: @tr("About");
-        Row {
-            label: @tr("Name");
-            Text { text: root.app-name; vertical-alignment: center; color: Palette.foreground; }
+        Card {
+            HorizontalLayout {
+                spacing: Theme.icon-gap;
+                Image {
+                    source: @image-url("../theme/logo.svg");
+                    width: 48px;
+                    height: 48px;
+                    accessible-role: none;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: Theme.title-gap;
+                    Text {
+                        text: root.app-name;
+                        font-size: Theme.subtitle-size;
+                        font-weight: Theme.weight-strong;
+                        color: Theme.text-primary;
+                    }
+                    HorizontalLayout {
+                        alignment: start;
+                        spacing: Theme.space-1;
+                        Text {
+                            text: @tr("Version");
+                            font-size: Theme.caption-size;
+                            color: Theme.text-secondary;
+                        }
+                        Text {
+                            text: root.version;
+                            font-size: Theme.caption-size;
+                            color: Theme.text-secondary;
+                        }
+                    }
+                    Text {
+                        text: root.licence;
+                        font-size: Theme.caption-size;
+                        color: Theme.text-secondary;
+                    }
+                }
+            }
         }
-        Row {
-            label: @tr("Version");
-            Text { text: root.version; vertical-alignment: center; color: Palette.foreground; }
+        // The browser opens them; the app itself makes no request.
+        ClickCard {
+            accessible-label: @tr("Project page");
+            clicked => {
+                Platform.open-url(root.repository);
+            }
+            Row {
+                icon: Icons.home;
+                title: @tr("Project page");
+                description: root.repository;
+                control-min: 0;
+            }
         }
-        Row {
-            label: @tr("Licence");
-            Text { text: root.licence; vertical-alignment: center; color: Palette.foreground; }
+        ClickCard {
+            accessible-label: @tr("Licence");
+            clicked => {
+                Platform.open-url(root.repository + "/blob/main/LICENSE-MIT");
+            }
+            Row {
+                icon: Icons.book-letter;
+                title: @tr("Licence");
+                control-min: 0;
+            }
         }
     }
-    AboutSlint { }
+    HorizontalLayout {
+        alignment: center;
+        AboutSlint {
+            width: 206px;
+            height: 90px;
+        }
+    }
 }

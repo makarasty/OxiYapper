@@ -10,6 +10,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use std::time::Duration;
 
+use oxi_core::config::Config;
 use oxi_core::device::{Device, DeviceChoice};
 use oxi_core::ipc::{DownloadResult, Push, Request};
 use oxi_core::models::{self, MODELS, ModelEntry, ModelStatus};
@@ -62,6 +63,9 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     s.set_rows(ModelRc::from(page.rows.clone()));
     s.set_can_browse(cfg!(windows));
     s.set_warning(SharedString::new());
+    s.set_download_off(download_off(ctx.ipc.link()).into());
+    #[expect(clippy::cast_precision_loss, reason = "minutes are far below 2^24")]
+    s.set_default_idle_minutes(Config::default().model.idle_unload_minutes as f32);
     page.push_config(&s);
 
     let p = Rc::clone(&page);
@@ -210,6 +214,7 @@ impl PageState {
             r.downloading = true;
             r.progress = 0.0;
             r.status = strings::DOWNLOAD_STARTING.into();
+            r.badge = strings::MODEL_BADGE_DOWNLOADING.into();
             r.error = SharedString::new();
         });
     }
@@ -343,6 +348,9 @@ impl PageState {
     }
 
     fn event(&self, event: &Event) {
+        if let Event::Link(link) = event {
+            self.state(|s| s.set_download_off(download_off(*link).into()));
+        }
         match event {
             Event::Link(Link::Online) => self.ask(),
             // A lost daemon takes its downloads with it.
@@ -365,6 +373,7 @@ impl PageState {
                         r.downloading = true;
                         r.progress = fraction(*done, *total);
                         r.status = strings::downloading(*done, *total).into();
+                        r.badge = strings::MODEL_BADGE_DOWNLOADING.into();
                     });
                 }
             }
@@ -394,6 +403,8 @@ impl PageState {
                 if !r.downloading {
                     let fresh = row(entry, &dir);
                     r.status = fresh.status;
+                    r.badge = fresh.badge;
+                    r.ready = fresh.ready;
                     r.can_download = fresh.can_download;
                 }
             });
@@ -407,7 +418,16 @@ fn row(entry: &ModelEntry, dir: &Path) -> ModelRow {
         id: entry.id.into(),
         name: entry.display_name.into(),
         size: gb(entry.size).into(),
-        status: strings::model_status(status).into(),
+        // A state that needs explaining takes the place of the hint.
+        status: match status {
+            ModelStatus::Missing | ModelStatus::Ready => strings::model_hint(entry.id),
+            ModelStatus::Partial | ModelStatus::NeedsHash | ModelStatus::Bad => {
+                strings::model_status(status)
+            }
+        }
+        .into(),
+        badge: strings::model_badge(status).into(),
+        ready: matches!(status, ModelStatus::Ready | ModelStatus::NeedsHash),
         can_download: matches!(
             status,
             ModelStatus::Missing | ModelStatus::Partial | ModelStatus::Bad
@@ -415,6 +435,15 @@ fn row(entry: &ModelEntry, dir: &Path) -> ModelRow {
         downloading: false,
         progress: 0.0,
         error: SharedString::new(),
+    }
+}
+
+/// Why Download is off on `link`; empty while it is on.
+fn download_off(link: Link) -> &'static str {
+    if link == Link::Online {
+        ""
+    } else {
+        strings::DOWNLOAD_NEEDS_DAEMON
     }
 }
 
@@ -620,7 +649,7 @@ mod tests {
             &format!("Whisper large-v3: Download failed: {message}")
         ));
         assert_eq!(bar(&window), None);
-        assert!(has(&window, "3.1 GB · Not downloaded"));
+        assert!(has(&window, "Whisper large-v3: Not downloaded"));
         // Trying again clears the old error.
         download_large(&window);
         assert!(!has(
@@ -650,7 +679,7 @@ mod tests {
         push(&ipc, done("large-v3", DownloadResult::Cancelled));
         assert!(has(&window, "3.1 GB · Paused, Download resumes"));
         // A model with no `.part` stays "Not downloaded".
-        assert!(has(&window, "1.6 GB · Not downloaded"));
+        assert!(has(&window, "Whisper large-v3 turbo: Not downloaded"));
         with_role(&window, "Download Whisper large-v3", AccessibleRole::Button);
     }
 
@@ -718,7 +747,7 @@ mod tests {
         push(&ipc, progress("large-v3", 5, 10));
         ipc.deliver(&Event::Link(Link::Offline));
         assert_eq!(bar(&window), None);
-        assert!(has(&window, "3.1 GB · Not downloaded"));
+        assert!(has(&window, "Whisper large-v3: Not downloaded"));
     }
 
     #[test]

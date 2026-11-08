@@ -9,9 +9,8 @@ use std::time::Duration;
 use common::{config, has, layout, open, with_role};
 use i_slint_backend_testing::{AccessibleRole, ElementHandle};
 use oxi_core::config::{OverlayPosition, Theme};
-use oxi_core::overlay::{Rgba, palette};
 use oxi_core::paths::Layout;
-use oxi_settings::{AppWindow, Page, Shell, ThemeChoice};
+use oxi_settings::{AppWindow, Page, ThemeChoice, Tokens};
 use slint::platform::{Key, PointerEventButton, WindowEvent};
 use slint::{Color, ComponentHandle};
 
@@ -152,8 +151,8 @@ fn log_text_on_in_the_file_shows_the_warning() {
 fn dark_thumb_sets_the_scheme() {
     let l = layout("dark", None);
     let window = open(&l, Page::System);
-    let dark_error = Color::from_rgb_u8(0xff, 0x8a, 0x80);
-    assert_ne!(window.global::<Shell>().get_error_text(), dark_error);
+    let dark_error = Color::from_rgb_u8(0xFF, 0x99, 0xA4);
+    assert_ne!(window.global::<Tokens>().get_error_text(), dark_error);
     card(&window, "Dark").invoke_accessible_default_action();
     assert_eq!(window.get_theme(), ThemeChoice::Dark);
     assert_eq!(card(&window, "Dark").accessible_checked(), Some(true));
@@ -161,7 +160,7 @@ fn dark_thumb_sets_the_scheme() {
     // `changed theme` handlers run from the event loop's timer pass.
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
     // The error colour follows the style's scheme: its dark value means the scheme flipped.
-    assert_eq!(window.global::<Shell>().get_error_text(), dark_error);
+    assert_eq!(window.global::<Tokens>().get_error_text(), dark_error);
 }
 
 #[test]
@@ -247,25 +246,6 @@ fn positions_are_one_group_with_one_checked_and_arrows_cross_rows() {
 }
 
 #[test]
-fn position_svgs_use_the_overlay_palette() {
-    let hex = |Rgba(r, g, b, _): Rgba| format!("#{r:02x}{g:02x}{b:02x}");
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/img");
-    for spot in [
-        "top-left",
-        "top-centre",
-        "top-right",
-        "bottom-left",
-        "bottom-centre",
-        "bottom-right",
-    ] {
-        let svg = fs::read_to_string(dir.join(format!("overlay-{spot}.svg"))).unwrap();
-        for colour in [hex(palette::SURFACE), hex(palette::RECORDING)] {
-            assert!(svg.contains(&colour), "overlay-{spot}.svg lacks {colour}");
-        }
-    }
-}
-
-#[test]
 fn preview_is_off_without_the_daemon() {
     let l = layout("preview-offline", None);
     let window = open(&l, Page::Overlay);
@@ -281,8 +261,5 @@ fn preview_is_off_without_the_daemon() {
 fn autostart_says_it_takes_effect_later() {
     let l = layout("autostart-note", None);
     let window = open(&l, Page::System);
-    assert!(has(
-        &window,
-        "Takes effect in a later version: OxiYapper does not add itself to sign-in yet."
-    ));
+    assert!(has(&window, "Takes effect in a later version."));
 }

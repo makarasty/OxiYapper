@@ -128,6 +128,7 @@ export component AppWindow inherits Window {
     in property <string> app-name;
     in property <string> version;
     in property <string> licence;
+    in property <string> repository;
     in-out property <Page> page: Page.hotkey;
     in-out property <ThemeChoice> theme;
     // Empty hides the banner.
@@ -139,6 +140,8 @@ export component AppWindow inherits Window {
     // The daemon link's notice (not running, restart to update, a daemon-side config error);
     // empty hides it. Start and Restart are the buttons it may carry.
     in property <string> daemon-text;
+    // `daemon-text` is the daemon's report of the config file this window reads too.
+    in property <bool> daemon-config-error;
     in property <bool> daemon-start;
     in property <bool> daemon-restart;
     in property <DaemonStatus> daemon-status;
@@ -162,6 +165,8 @@ export component AppWindow inherits Window {
     background: Theme.bg-page;
     forward-focus: keys;
 
+    // A broken config is said once: the window's own banner has the buttons to fix it.
+    property <bool> daemon-shown: root.daemon-text != "" && !(root.daemon-config-error && root.banner-text != "");
     property <bool> compact: root.width < 960px;
     property <length> pad: root.width < 900px ? Theme.page-padding-narrow : Theme.page-padding;
     property <length> content-max: root.page == Page.hotkey && HotkeyState.keyboard-open ? 1200px : 880px;
@@ -297,7 +302,7 @@ export component AppWindow inherits Window {
             y: 0;
             width: parent.width - nav.width;
             height: parent.height;
-            if root.banner-text != "" || root.daemon-text != "" || root.action-error != "": HorizontalLayout {
+            if root.banner-text != "" || root.daemon-shown || root.action-error != "": HorizontalLayout {
                 padding-left: root.pad;
                 padding-top: Theme.space-4;
                 alignment: start;
@@ -320,7 +325,7 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    if root.daemon-text != "": Banner {
+                    if root.daemon-shown: Banner {
                         text: root.spawn-error == "" ? root.daemon-text : root.daemon-text + " " + root.spawn-error;
                         severity: root.spawn-error != "" ? Severity.error : Severity.warning;
                         if root.daemon-start: Button {
@@ -363,7 +368,9 @@ export component AppWindow inherits Window {
                     if root.page == Page.hotkey: HotkeyPage { }
                     if root.page == Page.audio: AudioPage { }
                     if root.page == Page.model: ModelPage { }
-                    if root.page == Page.text: TextPage { }
+                    if root.page == Page.text: TextPage {
+                        window-height: root.height;
+                    }
                     if root.page == Page.overlay: OverlayPage { }
                     if root.page == Page.system: SystemPage {
                         theme: root.theme;
@@ -376,6 +383,7 @@ export component AppWindow inherits Window {
                         app-name: root.app-name;
                         version: root.version;
                         licence: root.licence;
+                        repository: root.repository;
                     }
                 }
             }

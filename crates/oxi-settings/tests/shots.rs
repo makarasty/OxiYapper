@@ -271,12 +271,22 @@ fn no_system_accent_on_any_page() {
 
 #[test]
 fn a_later_accent_change_is_undone_by_the_poll() {
-    // The System page's old picker paints the std accent, so a purple accent shows there until
-    // the next file poll puts the teal back.
+    // A focused std field draws the context accent, so a purple accent shows on it until the next
+    // file poll puts the teal back. Tab twice: the rail, then the first editor.
+    use slint::platform::Key as K;
     let window = open("purple-later", None);
-    window.set_page(Page::System);
+    window.set_page(Page::Text);
     window.set_theme(ThemeChoice::Light);
     let _ = render(&window, DEFAULT, 1.0);
+    let surface = LAST.with_borrow(Clone::clone).unwrap();
+    for _ in 0..2 {
+        surface.dispatch_event(WindowEvent::KeyPressed {
+            text: K::Tab.into(),
+        });
+        surface.dispatch_event(WindowEvent::KeyReleased {
+            text: K::Tab.into(),
+        });
+    }
     i_slint_backend_testing::set_system_accent_color(PURPLE);
     assert!(
         purple_pixels(&render(&window, DEFAULT, 1.0)) > 0,
@@ -606,6 +616,27 @@ fn shot_text_unreadable() {
 }
 
 #[test]
+fn shot_text_conflict() {
+    // Unsaved edits against a file changed on disk: the conflict note with Reload and Overwrite.
+    matrix("text-conflict", |choice| {
+        let _ = slint::platform::set_platform(Box::new(Shots));
+        let layout = common::layout("text-conflict", None);
+        fs::write(layout.dictionary_file(), "synthalpha").unwrap();
+        let window = oxi_settings::open(layout.clone()).unwrap();
+        window.set_page(Page::Text);
+        window.set_theme(choice);
+        window.show().unwrap();
+        ElementHandle::find_by_accessible_label(&window, "Dictionary")
+            .find(|e| e.accessible_role() == Some(AccessibleRole::TextInput))
+            .unwrap()
+            .set_accessible_value("synthbeta");
+        fs::write(layout.dictionary_file(), "synthgamma").unwrap();
+        common::one(&window, "Save dictionary.txt").invoke_accessible_default_action();
+        window
+    });
+}
+
+#[test]
 fn shot_text_worst_case() {
     // Daemon banner, both files unreadable (a note each), three rules and the duplicate note: more
     // than the window holds, so the page scrolls; Add must be reachable by wheel and by Tab.
@@ -645,6 +676,7 @@ fn shot_text_worst_case() {
         wheel(-2000.0);
         assert!(add_in_view(), "Add not reachable by wheel");
         for app in ["a.exe", "b.exe", "A.EXE"] {
+            wheel(-2000.0);
             common::one(&window, "New rule app").set_accessible_value(app);
             common::one(&window, "Add rule").invoke_accessible_default_action();
         }
@@ -743,7 +775,7 @@ fn shot_overlay_mismatch() {
 }
 
 #[test]
-fn svg_thumbnail_renders_inside_its_card() {
+fn tile_icon_renders_inside_its_card() {
     let window = open("thumb", None);
     window.set_page(Page::System);
     window.set_theme(ThemeChoice::Light);
@@ -752,12 +784,12 @@ fn svg_thumbnail_renders_inside_its_card() {
         .find(|e| e.accessible_role() == Some(AccessibleRole::RadioButton))
         .unwrap();
     let (pos, size) = (card.absolute_position(), card.size());
-    // The dark mini-window fill (#1c1c1c) inside the card, on a light page with no other dark fill.
+    // The ink of the icon and title inside the card, on a light page with no other dark fill.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // logical px at scale 1
     let dark = (pos.y as u32..(pos.y + size.height) as u32)
         .flat_map(|y| (pos.x as u32..(pos.x + size.width) as u32).map(move |x| (x, y)))
         .filter_map(|(x, y)| pixmap.pixel(x, y))
-        .filter(|p| p.red() < 0x30 && p.green() < 0x30 && p.blue() < 0x30)
+        .filter(|p| p.red() < 0x40 && p.green() < 0x40 && p.blue() < 0x40)
         .count();
-    assert!(dark > 500, "{dark} dark pixels in the Dark card");
+    assert!(dark > 60, "{dark} dark pixels in the Dark card");
 }
