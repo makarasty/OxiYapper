@@ -14,6 +14,7 @@ use oxi_core::device::Device;
 use oxi_core::hotkey::Key;
 use oxi_core::ipc::{DownloadResult, Push};
 use oxi_core::paths::Layout;
+use oxi_core::stats::{Date, Stats, Summary};
 use oxi_settings::ipc::{Event, Link};
 use oxi_settings::{AppWindow, Ipc, Page, ThemeChoice};
 use slint::platform::software_renderer::{
@@ -29,7 +30,8 @@ const MIN: (f32, f32) = (720.0, 520.0);
 const SIZES: [(f32, f32); 2] = [DEFAULT, MIN];
 const THEMES: [(&str, ThemeChoice); 2] =
     [("light", ThemeChoice::Light), ("dark", ThemeChoice::Dark)];
-const PAGES: [(&str, Page); 7] = [
+const PAGES: [(&str, Page); 8] = [
+    ("home", Page::Home),
     ("hotkey", Page::Hotkey),
     ("audio", Page::Audio),
     ("model", Page::Model),
@@ -205,6 +207,7 @@ fn shot_focused_nav() {
     for (theme, choice) in THEMES {
         for size in SIZES {
             let window = open("focused-nav", None);
+            window.set_page(Page::Hotkey);
             window.set_theme(choice);
             let _ = render(&window, size, 1.0);
             let surface = LAST.with_borrow(Clone::clone).unwrap();
@@ -295,6 +298,52 @@ fn a_later_accent_change_is_undone_by_the_poll() {
     std::thread::sleep(oxi_settings::FILE_POLL + std::time::Duration::from_millis(100));
     slint::platform::update_timers_and_animations();
     assert_eq!(purple_pixels(&render(&window, DEFAULT, 1.0)), 0);
+}
+
+/// Home with `summary` from a fake daemon, at the narrowest, default and widest sizes.
+fn shot_home(screen: &str, summary: &Summary) {
+    for size in [(720.0, 720.0), DEFAULT, (1600.0, 1000.0)] {
+        for (theme, choice) in THEMES {
+            SIZE.set(size);
+            let _ = slint::platform::set_platform(Box::new(Shots));
+            let (ipc, _sent) = Ipc::fake();
+            let layout = common::layout(screen, None);
+            let window = oxi_settings::open_with(layout, ipc.clone()).unwrap();
+            window.set_theme(choice);
+            window.show().unwrap();
+            push(&ipc, Push::Stats(summary.clone()));
+            save(
+                &render(&window, size, 1.0),
+                &format!("{screen}-{}-{theme}", size.0),
+            );
+        }
+    }
+}
+
+#[test]
+fn shot_home_sample() {
+    // Big numbers, a long streak, every level, a partial last week.
+    let heat = (0..178_u32)
+        .map(|i| u8::try_from((i * i + i / 3) % 5).unwrap())
+        .collect();
+    shot_home(
+        "home",
+        &Summary {
+            dictations: 11_300,
+            words: 299_900,
+            wpm: 146,
+            streak: 123,
+            longest_streak: 1040,
+            heat_start: Date::from_ymd(2026, 5, 11).unwrap(),
+            heat,
+        },
+    );
+}
+
+#[test]
+fn shot_home_empty() {
+    let today = Date::from_ymd(2026, 11, 4).unwrap();
+    shot_home("home-empty", &Stats::default().summary(today, 26));
 }
 
 #[test]
