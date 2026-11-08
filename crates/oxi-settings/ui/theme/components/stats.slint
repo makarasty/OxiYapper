@@ -28,7 +28,7 @@ export component StatCard inherits Rectangle {
                     source: root.icon;
                     width: 20px;
                     height: 20px;
-                    colorize: Theme.accent-text;
+                    colorize: Theme.text-secondary;
                     accessible-role: none;
                 }
             }
@@ -38,7 +38,7 @@ export component StatCard inherits Rectangle {
                 color: Theme.text-secondary;
                 vertical-alignment: center;
                 horizontal-stretch: 1;
-                overflow: elide;
+                wrap: word-wrap;
                 accessible-role: none;
             }
         }
@@ -53,7 +53,7 @@ export component StatCard inherits Rectangle {
             text: root.caption;
             font-size: Theme.caption-size;
             color: Theme.text-secondary;
-            overflow: elide;
+            wrap: word-wrap;
             accessible-role: none;
         }
     }
@@ -80,6 +80,8 @@ export component ActivityHeatmap {
     in property <string> more-text: @tr("More");
     in property <length> cell: 12px;
     in property <length> gap: 3px;
+    // The Less..More legend swatches; the grid cells can be larger.
+    in property <length> legend-cell: 12px;
     property <length> pitch: root.cell + root.gap;
     property <int> weeks: ceil(root.levels.length / 7);
     property <length> label-w: 32px;
@@ -154,8 +156,8 @@ export component ActivityHeatmap {
         for level in 5: VerticalLayout {
             alignment: center;
             Rectangle {
-                width: root.cell;
-                height: root.cell;
+                width: root.legend-cell;
+                height: root.legend-cell;
                 border-radius: 2px;
                 background: root.level-color(level);
             }

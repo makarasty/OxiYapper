@@ -2,6 +2,8 @@
 // icon paths. Names: `<icon>` is the 20 px regular master, `-16`/`-24`/`-12` other masters,
 // `-filled` the filled style. Icons keep their original fill; users set `colorize`.
 export global Icons {
+    // The app mark, drawn by `oxi-platform` (`logo.svg` is regenerated, not edited).
+    out property <image> logo: @image-url("logo.svg");
     out property <image> add-16: @image-url("../icons/ic_fluent_add_16_regular.svg");
     out property <image> add: @image-url("../icons/ic_fluent_add_20_regular.svg");
     out property <image> app-generic: @image-url("../icons/ic_fluent_app_generic_20_regular.svg");

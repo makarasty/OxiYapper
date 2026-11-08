@@ -144,6 +144,8 @@ export component TilePicker {
             // Every row has `cols` cells, so a short last row keeps the column width.
             for col in root.cols: VerticalLayout {
                 horizontal-stretch: 1;
+                // Equal columns: share the whole width, not what is left after each caption.
+                preferred-width: 0;
                 min-width: 160px;
                 if row * root.cols + col < root.tiles.length: Tile {
                     property <int> i: row * root.cols + col;

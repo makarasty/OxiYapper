@@ -1,6 +1,6 @@
 // Overlay page (SPEC Feedback): the pill on or off, its spot on screen, hiding it over
 // fullscreen apps, and a preview the daemon shows at the picked spot.
-import { Theme, Icons, Group, Card, ToggleRow, ScreenPicker, Button, Note, Severity } from "../theme/index.slint";
+import { Theme, Icons, Group, Card, ToggleRow, ScreenPicker, Button } from "../theme/index.slint";
 
 // Filled and read by `pages::overlay`.
 export global OverlayState {
@@ -12,34 +12,28 @@ export global OverlayState {
     in property <bool> online;
     // Why Preview is off; empty while online or connecting.
     in property <string> note;
-    // The daemon is not running: the page tells how to fix that instead of `note`.
-    in property <bool> offline;
     callback enabled-toggled(bool);
     callback position-picked(int);
     callback hide-over-fullscreen-toggled(bool);
     callback preview();
 }
 
-// The Preview button and why it is off, beside the picker or under it.
+// The Preview button; why it is off is its tooltip (the banner above already says the daemon is
+// off).
 component PreviewAction inherits VerticalLayout {
-    property <string> reason: OverlayState.offline ? @tr("Start OxiYapper to preview.") : OverlayState.note;
     alignment: center;
-    spacing: Theme.control-gap;
     HorizontalLayout {
         alignment: start;
         Button {
             text: @tr("Preview");
             icon: Icons.eye-16;
             enabled: OverlayState.online;
+            tooltip: OverlayState.note;
             accessible-description: OverlayState.note;
             clicked => {
                 OverlayState.preview();
             }
         }
-    }
-    if root.reason != "": Note {
-        text: root.reason;
-        severity: Severity.warning;
     }
 }
 

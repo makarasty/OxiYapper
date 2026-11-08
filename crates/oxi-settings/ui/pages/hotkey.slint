@@ -46,7 +46,7 @@ export component HotkeyPage inherits VerticalLayout {
         Card {
             Row {
                 icon: Icons.keyboard;
-                title: @tr("Hotkey");
+                title: @tr("Keys");
                 description: @tr("Hold these keys to talk. Esc cancels a recording.");
                 Rectangle {
                     min-width: chord.min-width;
@@ -67,7 +67,7 @@ export component HotkeyPage inherits VerticalLayout {
                     icon: Icons.edit-16;
                     text: @tr("Change hotkey");
                     enabled: !Shell.locked && !HotkeyState.keyboard-open;
-                    tooltip: HotkeyState.keyboard-open ? @tr("The keyboard is open below") : @tr("Settings are read-only");
+                    tooltip: HotkeyState.keyboard-open ? @tr("The keyboard is open below") : Shell.locked-tip;
                     clicked => {
                         HotkeyState.change();
                     }
@@ -107,7 +107,7 @@ export component HotkeyPage inherits VerticalLayout {
                     color: Theme.text-primary;
                 }
                 Text {
-                    text: HotkeyState.online ? @tr("Click keys or press them. Left and right modifiers both count.") : @tr("Not connected to OxiYapper: pressed keys are not seen. Start OxiYapper to pick a hotkey.");
+                    text: @tr("Click keys or press them. Left and right modifiers both count.");
                     wrap: word-wrap;
                     font-size: Theme.caption-size;
                     color: Theme.text-secondary;
@@ -147,6 +147,8 @@ export component HotkeyPage inherits VerticalLayout {
                         accessible-label: @tr("Apply hotkey");
                         kind: ButtonKind.primary;
                         enabled: !Shell.locked && HotkeyState.online && HotkeyState.error == "";
+                        // The reason sits on the button; the banner already says OxiYapper is off.
+                        tooltip: Shell.locked ? Shell.locked-tip : !HotkeyState.online ? @tr("Pressed keys are seen only while OxiYapper runs") : "";
                         clicked => {
                             HotkeyState.apply();
                         }

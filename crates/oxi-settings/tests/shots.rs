@@ -223,31 +223,12 @@ fn shot_focused_nav() {
     }
 }
 
-/// A pixel of the purple system accent family: HSV hue 260..300 with chroma over 0.08 (the
-/// same test as `gallery.rs`).
-fn purple(r: u8, g: u8, b: u8) -> bool {
-    let (r, g, b) = (f32::from(r), f32::from(g), f32::from(b));
-    let max = r.max(g).max(b);
-    let d = max - r.min(g).min(b);
-    if d / 255.0 <= 0.08 {
-        return false;
-    }
-    let hue = if (max - r).abs() < f32::EPSILON {
-        60.0 * ((g - b) / d).rem_euclid(6.0)
-    } else if (max - g).abs() < f32::EPSILON {
-        60.0 * ((b - r) / d + 2.0)
-    } else {
-        60.0 * ((r - g) / d + 4.0)
-    };
-    (260.0..=300.0).contains(&hue)
-}
-
 fn purple_pixels(pixmap: &Pixmap) -> usize {
     pixmap
         .pixels()
         .iter()
         .map(tiny_skia::PremultipliedColorU8::demultiply)
-        .filter(|p| purple(p.red(), p.green(), p.blue()))
+        .filter(|p| common::purple(p.red(), p.green(), p.blue()))
         .count()
 }
 
@@ -300,9 +281,10 @@ fn a_later_accent_change_is_undone_by_the_poll() {
     assert_eq!(purple_pixels(&render(&window, DEFAULT, 1.0)), 0);
 }
 
-/// Home with `summary` from a fake daemon, at the narrowest, default and widest sizes.
+/// Home with `summary` from a fake daemon, at the narrowest, default and widest sizes, and 960:
+/// the first width with the four stat cards in one row, where their texts are tightest.
 fn shot_home(screen: &str, summary: &Summary) {
-    for size in [(720.0, 720.0), DEFAULT, (1600.0, 1000.0)] {
+    for size in [(720.0, 720.0), (960.0, 720.0), DEFAULT, (1600.0, 1000.0)] {
         for (theme, choice) in THEMES {
             SIZE.set(size);
             let _ = slint::platform::set_platform(Box::new(Shots));

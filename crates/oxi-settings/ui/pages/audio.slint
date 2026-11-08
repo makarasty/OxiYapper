@@ -1,6 +1,6 @@
 // Audio page (SPEC Recording, Audio before whisper): microphone, live meter, the DSP switches,
 // tail, recording cap and dictation language.
-import { Theme, Icons, Group, Card, Row, ToggleRow, SliderRow, Combo, Segmented, Button, Meter, Note, Severity } from "../theme/index.slint";
+import { Theme, Group, Card, Row, Divider, ToggleRow, SliderRow, Combo, Segmented, Button, Meter, Note, Severity } from "../theme/index.slint";
 
 // Which control changed; `value` of `AudioState.edited` carries its new value.
 export enum AudioKey { device, gain, sensitivity, normalize, trim, denoise, tail, max-minutes, language }
@@ -55,7 +55,6 @@ export component AudioPage inherits VerticalLayout {
         title: @tr("Microphone");
         Card {
             Row {
-                icon: Icons.mic;
                 title: @tr("Device");
                 Combo {
                     model: AudioState.devices;
@@ -74,8 +73,8 @@ export component AudioPage inherits VerticalLayout {
                 text: AudioState.fallback;
                 severity: Severity.warning;
             }
+            Divider { }
             Row {
-                icon: Icons.data-usage;
                 title: @tr("Level");
                 fill-controls: true;
                 Meter {
@@ -90,8 +89,8 @@ export component AudioPage inherits VerticalLayout {
                 text: AudioState.silence;
                 severity: Severity.warning;
             }
+            Divider { }
             Row {
-                icon: Icons.play;
                 title: @tr("Mic test");
                 description: @tr("Records 3 seconds and plays them back.");
                 Button {
@@ -106,8 +105,8 @@ export component AudioPage inherits VerticalLayout {
             if AudioState.test-status != "": Note {
                 text: AudioState.test-status;
             }
+            Divider { }
             SliderRow {
-                icon: Icons.speaker-2;
                 title: @tr("Gain");
                 description: @tr("Boosts or cuts what Whisper hears.");
                 minimum: -20;
@@ -121,8 +120,8 @@ export component AudioPage inherits VerticalLayout {
                     AudioState.edited(AudioKey.gain, v);
                 }
             }
+            Divider { }
             SliderRow {
-                icon: Icons.gauge;
                 title: @tr("Meter sensitivity");
                 description: @tr("Only changes how the meter looks.");
                 minimum: -20;
@@ -165,20 +164,16 @@ export component AudioPage inherits VerticalLayout {
                 AudioState.edited(AudioKey.denoise, on ? 1 : 0);
             }
         }
-        if AudioState.denoise: HorizontalLayout {
-            padding-left: Theme.card-padding-h;
-            padding-top: Theme.space-1;
-            Note {
-                text: @tr("Noise suppression can make Whisper worse.");
-                severity: Severity.warning;
-            }
+        if AudioState.denoise: Note {
+            inset: true;
+            text: @tr("Noise suppression can make Whisper worse.");
+            severity: Severity.warning;
         }
     }
     Group {
         title: @tr("Recording");
         Card {
             SliderRow {
-                icon: Icons.timer;
                 title: @tr("Tail after release");
                 description: @tr("Keeps recording a moment after you let go.");
                 minimum: 0;
@@ -191,8 +186,8 @@ export component AudioPage inherits VerticalLayout {
                     AudioState.edited(AudioKey.tail, v);
                 }
             }
+            Divider { }
             SliderRow {
-                icon: Icons.timer;
                 title: @tr("Max length");
                 description: @tr("Recording stops at this length.");
                 minimum: 1;
@@ -204,8 +199,8 @@ export component AudioPage inherits VerticalLayout {
                     AudioState.edited(AudioKey.max-minutes, v);
                 }
             }
+            Divider { }
             Row {
-                icon: Icons.local-language;
                 title: @tr("Language");
                 Segmented {
                     accessible-label: @tr("Language");

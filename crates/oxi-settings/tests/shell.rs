@@ -78,6 +78,12 @@ fn newer_config_is_read_only() {
     let window = open(&l, Page::Hotkey);
     assert!(window.global::<Shell>().get_locked());
     assert!(window.get_banner_text().contains("newer version"));
+    assert!(
+        window
+            .get_banner_text()
+            .ends_with("Update OxiYapper to change settings here.")
+    );
+    assert!(has(&window, "Open file"), "the banner gives a way out");
     assert!(!has(&window, "Reset to defaults"));
     assert_eq!(window.get_theme(), ThemeChoice::Light);
 
@@ -283,7 +289,7 @@ fn daemon_config_error_uses_the_same_banner() {
         line: 7,
         message: "bad value".into(),
     }));
-    assert_eq!(banners(&window), ["config.toml, line 7: bad value"]);
+    assert_eq!(banners(&window), ["config.toml line 7: bad value"]);
     assert!(!has(&window, "Start") && !has(&window, "Restart"));
     // Other pushes leave the banner alone.
     ipc.deliver(&Event::Push(Push::Raise));

@@ -134,7 +134,7 @@ export component AppWindow inherits Window {
     in-out property <ThemeChoice> theme;
     // Empty hides the banner.
     in property <string> banner-text;
-    // The banner is for a broken file: offer "Open file" and "Reset to defaults".
+    // The banner is for a broken file: offer "Reset to defaults" too (a newer file only gets "Open file").
     in property <bool> banner-fixable;
     // The last failed save or file action; empty hides it. Shown under the config banner.
     in property <string> action-error;
@@ -157,7 +157,7 @@ export component AppWindow inherits Window {
     callback reset-config();
 
     title: @tr("{} settings", root.app-name);
-    icon: @image-url("theme/logo.svg");
+    icon: Icons.logo;
     default-font-family: Theme.font-family;
     preferred-width: 1280px;
     preferred-height: 800px;
@@ -170,6 +170,7 @@ export component AppWindow inherits Window {
     property <bool> daemon-shown: root.daemon-text != "" && !(root.daemon-config-error && root.banner-text != "");
     property <bool> compact: root.width < 960px;
     property <length> pad: root.width < 900px ? Theme.page-padding-narrow : Theme.page-padding;
+    property <length> page-width: min(root.content-max, root.width - nav.width - 2 * root.pad);
     property <length> content-max: root.page == Page.hotkey && HotkeyState.keyboard-open ? 1200px : 880px;
     property <[{page: Page, label: string, icon: image, filled: image}]> rail: [
         { page: Page.home, label: @tr("Home"), icon: Icons.home, filled: Icons.home-filled },
@@ -192,9 +193,13 @@ export component AppWindow inherits Window {
     }
     init => {
         root.apply-theme();
+        Shell.page-width = root.page-width;
     }
     changed theme => {
         root.apply-theme();
+    }
+    changed page-width => {
+        Shell.page-width = root.page-width;
     }
     changed page => {
         // The rail follows a page opened by Ctrl+Tab; the page opens at its top.
@@ -260,7 +265,7 @@ export component AppWindow inherits Window {
                     padding-left: 12px;
                     spacing: Theme.space-3;
                     Image {
-                        source: @image-url("theme/logo.svg");
+                        source: Icons.logo;
                         width: 24px;
                         height: 24px;
                         y: 12px;
@@ -317,7 +322,7 @@ export component AppWindow inherits Window {
                     if root.banner-text != "": Banner {
                         text: root.banner-text;
                         severity: root.banner-fixable ? Severity.error : Severity.warning;
-                        if root.banner-fixable: Button {
+                        Button {
                             text: @tr("Open file");
                             clicked => {
                                 root.open-file();
@@ -372,7 +377,7 @@ export component AppWindow inherits Window {
                     }
                     if root.page == Page.home: HomePage {
                         window-width: root.width;
-                        content-width: min(root.content-max, root.width - nav.width - 2 * root.pad);
+                        content-width: root.page-width;
                     }
                     if root.page == Page.hotkey: HotkeyPage { }
                     if root.page == Page.audio: AudioPage { }

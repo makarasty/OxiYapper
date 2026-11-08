@@ -72,10 +72,15 @@ export component Banner inherits Rectangle {
 }
 
 // Inline note under a control inside a Card: no border, icon 16 and caption text in the severity
-// colour, optional buttons (children) on the right.
+// colour, optional buttons (children) on the right. `inset`: the note sits between cards, not
+// inside one; it takes a card's side padding and a small gap above.
 export component Note inherits HorizontalLayout {
     in property <string> text;
     in property <Severity> severity: Severity.info;
+    in property <bool> inset;
+    padding-left: root.inset ? Theme.card-padding-h : 0;
+    padding-right: root.inset ? Theme.card-padding-h : 0;
+    padding-top: root.inset ? Theme.space-1 : 0;
     spacing: Theme.space-2;
     accessible-role: AccessibleRole.text;
     accessible-label: root.text;
@@ -168,7 +173,6 @@ export component ProgressBar inherits HorizontalLayout {
         font-size: Theme.caption-size;
         color: root.error ? Theme.error-text : Theme.text-secondary;
         vertical-alignment: center;
-        accessible-role: none;
     }
 }
 
@@ -180,7 +184,7 @@ export component Badge inherits Rectangle {
     in property <BadgeKind> kind: BadgeKind.neutral;
     property <color> ink: root.kind == BadgeKind.success ? Theme.success-text : root.kind == BadgeKind.accent ? Theme.accent-text : Theme.text-secondary;
     border-radius: self.height / 2;
-    background: root.kind == BadgeKind.neutral ? Theme.bg-inset : root.ink.transparentize(0.86);
+    background: root.kind == BadgeKind.success ? Theme.success-tint : root.kind == BadgeKind.accent ? Theme.accent-badge : Theme.bg-inset;
     accessible-role: AccessibleRole.text;
     accessible-label: root.text;
     min-width: t.preferred-width + 16px;

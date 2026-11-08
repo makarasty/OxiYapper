@@ -131,7 +131,8 @@ export component ClickCard inherits Rectangle {
 }
 
 // `[icon 20?] [title + description, both wrap] .... [control column]` inside a Card. The control
-// column (children, right-aligned) takes about 36 % of the row, 240 to 360 px.
+// column (children, right-aligned) is 36 % of the card, 240 to 360 px, the same in every row of a
+// page (the wrapping of the text on the left must not move it).
 export component Row inherits HorizontalLayout {
     in property <image> icon;
     in property <string> title;
@@ -155,7 +156,7 @@ export component Row inherits HorizontalLayout {
     VerticalLayout {
         alignment: center;
         spacing: Theme.title-gap;
-        horizontal-stretch: 64;
+        horizontal-stretch: 1;
         preferred-width: 0;
         Text {
             text: root.title;
@@ -171,14 +172,21 @@ export component Row inherits HorizontalLayout {
         }
     }
     HorizontalLayout {
-        horizontal-stretch: 36;
-        preferred-width: 0;
-        min-width: root.control-min;
-        max-width: Theme.control-column-max;
+        horizontal-stretch: 0;
+        preferred-width: clamp(root.control-min, (Shell.page-width - 2 * Theme.card-padding-h) * 0.36, Theme.control-column-max);
+        min-width: self.preferred-width;
+        max-width: self.preferred-width;
         alignment: root.fill-controls ? LayoutAlignment.stretch : LayoutAlignment.end;
         spacing: Theme.control-gap;
         @children
     }
+}
+
+// 1 px line between two Rows of one Card (a card with a single Row has none).
+export component Divider inherits Rectangle {
+    height: 1px;
+    background: Theme.divider;
+    accessible-role: none;
 }
 
 // A Card with one Row and a Switch; a click anywhere on the card toggles it (Windows 11). The

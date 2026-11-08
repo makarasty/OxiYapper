@@ -1,6 +1,6 @@
 // System page (SPEC System). The shell owns the theme picker (config `ui.theme`); the rest is
 // `[system]` and `debug.log_text`, filled and read by `pages::system`.
-import { Theme, Icons, Group, Card, Row, ToggleRow, TilePicker, Button, ButtonKind, Note, Severity } from "../theme/index.slint";
+import { Theme, Icons, Group, Card, Row, Divider, ToggleRow, TilePicker, Button, ButtonKind, Note, Severity } from "../theme/index.slint";
 
 export enum ThemeChoice { system, dark, light }
 
@@ -65,8 +65,7 @@ export component SystemPage inherits VerticalLayout {
             }
         }
         if root.confirm-update-off: Note {
-            padding-left: Theme.card-padding-h;
-            padding-top: Theme.space-1;
+            inset: true;
             text: @tr("Update checks tell you when a fix is out.");
             severity: Severity.warning;
             Button {
@@ -98,8 +97,7 @@ export component SystemPage inherits VerticalLayout {
             }
         }
         if SystemState.log-text: Note {
-            padding-left: Theme.card-padding-h;
-            padding-top: Theme.space-1;
+            inset: true;
             text: @tr("Dictated text is written to the log files while this is on. Turn it off when you are done.");
             severity: Severity.warning;
         }
@@ -108,7 +106,6 @@ export component SystemPage inherits VerticalLayout {
         title: @tr("Files");
         Card {
             Row {
-                icon: Icons.folder-open;
                 title: @tr("Settings folder");
                 Button {
                     text: @tr("Open");
@@ -120,8 +117,8 @@ export component SystemPage inherits VerticalLayout {
                     }
                 }
             }
+            Divider { }
             Row {
-                icon: Icons.folder-open;
                 title: @tr("Logs");
                 Button {
                     text: @tr("Open");

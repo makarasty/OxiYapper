@@ -155,11 +155,15 @@ component GallerySheet inherits VerticalLayout {
         { name: "on-accent", c: Theme.on-accent, bg: Theme.accent, bg-name: "accent", ratio: true },
         { name: "accent-text", c: Theme.accent-text, bg: Contrast.over(Theme.accent-tint, Theme.bg-card), bg-name: "accent-tint", ratio: true },
         { name: "accent-tint", c: Theme.accent-tint, bg: Theme.bg-card, bg-name: "", ratio: false },
+        { name: "accent-text", c: Theme.accent-text, bg: Theme.accent-badge, bg-name: "accent-badge", ratio: true },
+        { name: "accent-badge", c: Theme.accent-badge, bg: Theme.bg-card, bg-name: "", ratio: false },
         { name: "pill-teal", c: Theme.pill-teal, bg: Theme.bg-page, bg-name: "", ratio: false },
         { name: "error-text", c: Theme.error-text, bg: Theme.bg-card, bg-name: "bg-card", ratio: true },
         { name: "error-text", c: Theme.error-text, bg: Theme.error-fill, bg-name: "error-fill", ratio: true },
         { name: "warning-text", c: Theme.warning-text, bg: Theme.warning-fill, bg-name: "warning-fill", ratio: true },
         { name: "success-text", c: Theme.success-text, bg: Theme.bg-card, bg-name: "bg-card", ratio: true },
+        { name: "success-text", c: Theme.success-text, bg: Theme.success-tint, bg-name: "success-tint", ratio: true },
+        { name: "success-tint", c: Theme.success-tint, bg: Theme.bg-card, bg-name: "", ratio: false },
         { name: "info-fill", c: Theme.info-fill, bg: Theme.bg-card, bg-name: "", ratio: false },
     ];
     property <[IconEntry]> icon-list: [

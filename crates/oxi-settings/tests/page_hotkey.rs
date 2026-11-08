@@ -138,3 +138,27 @@ fn locked_config_keeps_change_off() {
     assert!(!has(&window, "Left Ctrl"));
     assert_eq!(fs::read_to_string(l.config_file()).unwrap(), original);
 }
+
+#[test]
+fn offline_keeps_the_help_line_and_leaves_the_reason_to_the_banner() {
+    let l = layout("offline-help", None);
+    let (ipc, _rx) = Ipc::fake();
+    let window = open_linked(&l, Page::Hotkey, ipc.clone());
+    ipc.deliver(&oxi_settings::ipc::Event::Link(
+        oxi_settings::ipc::Link::Offline,
+    ));
+    click(&window, "Change hotkey");
+    assert!(has(
+        &window,
+        "Click keys or press them. Left and right modifiers both count."
+    ));
+    // The third mention of "not running" is gone: the banner and the rail chip say it.
+    assert!(!has(
+        &window,
+        "Not connected to OxiYapper: pressed keys are not seen. Start OxiYapper to pick a hotkey."
+    ));
+    assert_eq!(
+        one(&window, "Apply hotkey").accessible_enabled(),
+        Some(false)
+    );
+}

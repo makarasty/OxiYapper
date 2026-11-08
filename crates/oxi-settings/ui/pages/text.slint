@@ -259,7 +259,6 @@ export component TextPage inherits VerticalLayout {
         }
         Card {
             SliderRow {
-                icon: Icons.timer;
                 title: @tr("Restore clipboard after");
                 description: @tr("How long the dictated text stays on the clipboard.");
                 minimum: 0;
@@ -278,7 +277,6 @@ export component TextPage inherits VerticalLayout {
         title: @tr("Per-app rules");
         for rule[i] in TextState.rules: Card {
             Row {
-                icon: Icons.app-generic;
                 title: rule.app;
                 Combo {
                     min-width: 160px;
@@ -295,7 +293,7 @@ export component TextPage inherits VerticalLayout {
                     icon: Icons.delete-16;
                     text: @tr("Remove {}", rule.app);
                     enabled: !Shell.locked;
-                    tooltip: @tr("The config is read-only");
+                    tooltip: Shell.locked-tip;
                     clicked => {
                         TextState.rule-removed(i);
                     }
@@ -315,7 +313,7 @@ export component TextPage inherits VerticalLayout {
                     icon: Icons.add-16;
                     accessible-label: @tr("Add rule");
                     enabled: !Shell.locked && new-app.text != "";
-                    tooltip: Shell.locked ? @tr("The config is read-only") : @tr("Type an app name first");
+                    tooltip: Shell.locked ? Shell.locked-tip : @tr("Type an app name first");
                     clicked => {
                         TextState.rule-added(new-app.text);
                         new-app.text = "";

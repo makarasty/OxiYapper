@@ -23,6 +23,10 @@ fn saved(layout: &Layout) -> Config {
 fn every_control_writes_its_key() {
     let l = layout("controls", Some("version = 1\n# mine\n"));
     let window = open(&l, Page::Audio);
+    // Tall enough for the whole page: the search skips what is scrolled away.
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(1120.0, 1600.0));
     let defaults = Config::default();
 
     // The NumberField beside each slider: typing writes the same key as dragging.
@@ -163,4 +167,22 @@ fn mic_meter_closes_when_the_page_is_left() {
         !live(),
         "the microphone stayed open after the page was left"
     );
+}
+
+/// At the minimum width the control columns of all rows start at one x: before, the column
+/// followed the wrapping of the text on its left, so equal sliders sat 3 to 11 px apart.
+#[test]
+fn control_columns_start_at_one_x_at_the_minimum_width() {
+    let l = layout("columns", None);
+    let window = open(&l, Page::Audio);
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(720.0, 1600.0));
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(50));
+    let x = |label: &str, role| with_role(&window, label, role).absolute_position().x;
+    let gain = x("Gain", AccessibleRole::Slider);
+    for label in ["Meter sensitivity", "Tail after release", "Max length"] {
+        let at = x(label, AccessibleRole::Slider);
+        assert!((at - gain).abs() < 0.5, "{label}: {at}, Gain {gain}");
+    }
 }

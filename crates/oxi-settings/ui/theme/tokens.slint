@@ -7,6 +7,11 @@ import { Palette } from "std-widgets.slint";
 export global Shell {
     // The config cannot be written (newer version, or a parse error until Reset): controls go grey.
     in-out property <bool> locked;
+    // Width of the page column (cards included), set by the window: a Row sizes its control
+    // column from it, not from its own text, so controls start at one x in every card.
+    in-out property <length> page-width: 880px;
+    // The one tooltip of a control that is off because of `locked`.
+    out property <string> locked-tip: @tr("The config is read-only");
 }
 
 export global Theme {
@@ -45,7 +50,6 @@ export global Theme {
     // 1.2 Radii.
     out property <length> radius-control: 4px;
     out property <length> radius-card: 8px;
-    out property <length> radius-pill: 999px;
     public pure function radius-keycap(unit: length) -> length {
         return max(4px, unit * 0.12);
     }
@@ -56,18 +60,14 @@ export global Theme {
         return clamp(unit * 0.30, 12px, 15px);
     }
 
-    // 1.3 Type: Fluent ramp, Regular 400 and Semibold 600 only. Slint 1.18 has no line height:
-    // the `*-line` values are for fixed text boxes.
+    // 1.3 Type: Fluent ramp, Regular 400 (the default weight, no token) and Semibold 600 only.
+    // Slint 1.18 has no line height: `caption-line` is for fixed text boxes.
     out property <string> font-family: "Segoe UI Variable Text";
     out property <length> caption-size: 12px;
     out property <length> caption-line: 16px;
     out property <length> body-size: 14px;
-    out property <length> body-line: 20px;
     out property <length> subtitle-size: 20px;
-    out property <length> subtitle-line: 28px;
     out property <length> title-size: 28px;
-    out property <length> title-line: 36px;
-    out property <int> weight-regular: 400;
     out property <int> weight-strong: 600;
 
     // 1.4 Neutrals and roles.
@@ -101,6 +101,9 @@ export global Theme {
     // Opaque: the spec's on-card results. #0F766E1F over bg-card is #DEEBEA, 4.44:1 under
     // accent-text (fails AA); #E2EFEE gives the 4.64:1 the spec states. Tiles sit only on cards.
     out property <color> accent-tint: dark ? #314644 : #E2EFEE;
+    // Badge fills, opaque so the pair holds on bg-card and on a hovered card (bg-control-hover):
+    // the old 14 % alpha tints gave 4.31:1 (success) and 4.35:1 (accent) in light.
+    out property <color> accent-badge: dark ? #304441 : #E4F0EF;
     // The overlay pill's own teal, used only where the pill itself is drawn (ScreenPicker).
     out property <color> pill-teal: #2BB5A0;
 
@@ -110,6 +113,7 @@ export global Theme {
     out property <color> warning-text: dark ? #FCE100 : #9D5D00;
     out property <color> warning-fill: dark ? #433519 : #FFF4CE;
     out property <color> success-text: dark ? #6CCB5F : #0F7B0F;
+    out property <color> success-tint: dark ? #2F3F2F : #E5F1E5;
     out property <color> info-fill: dark ? #323232 : #F0F0F0;
 }
 
