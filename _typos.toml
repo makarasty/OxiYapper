@@ -5,3 +5,9 @@ extend-exclude = ["Cargo.lock", "LICENSE-*", "*.svg"]
 [default.extend-words]
 hel = "hel"
 whis = "whis"
+
+# Win32 NIN_* tray notification constants, "PNGs" in slint comments, and the
+# deliberate misspelling "teh" used as replacement-rule test input in pipeline.rs.
+teh = "teh"
+NIN = "NIN"
+PN = "PN"
