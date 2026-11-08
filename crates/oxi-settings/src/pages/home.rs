@@ -3,10 +3,13 @@
 
 use std::cell::Cell;
 use std::fs;
+use std::io;
+use std::path::Path;
 use std::rc::Rc;
 use std::time::SystemTime;
 
 use oxi_core::ipc::{Push, Request};
+use oxi_core::machine::Mode;
 use oxi_core::stats::{self, Date, HEAT_WEEKS, Summary, format_count};
 use oxi_platform::stats_store;
 use slint::{ComponentHandle, ModelRc, Timer, TimerMode, VecModel};
@@ -19,14 +22,23 @@ const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
-/// When the stats file last changed, as of the last refresh.
-type Seen = Rc<Cell<Option<SystemTime>>>;
+/// What the page showed last: the stats file's time and the day the heatmap was cut for. A new
+/// day changes the window and the streak with no file change.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct Stamp {
+    modified: Option<SystemTime>,
+    day: Date,
+}
+
+type Seen = Rc<Cell<Stamp>>;
 
 pub fn bind(window: &AppWindow, ctx: &Ctx) {
     let seen = Seen::default();
     // The file first: numbers on screen before the link is up. Asking the daemon waits for it.
-    seen.set(modified(ctx));
-    load(window, ctx);
+    let now = stamp(ctx);
+    if load(window, ctx) {
+        seen.set(now);
+    }
 
     let (w, c, s) = (window.as_weak(), ctx.clone(), seen.clone());
     let events = ctx.ipc.subscribe(move |event| {
@@ -47,7 +59,7 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         move || {
             if let Some(window) = w.upgrade()
                 && window.get_page() == Page::Home
-                && modified(&c) != s.get()
+                && stamp(&c) != s.get()
             {
                 refresh(&window, &c, &s);
             }
@@ -66,33 +78,47 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
 
 /// New numbers: from the daemon while it answers, else from the file.
 fn refresh(window: &AppWindow, ctx: &Ctx, seen: &Seen) {
-    seen.set(modified(ctx));
+    let now = stamp(ctx);
     if ctx.ipc.link() == Link::Online {
+        seen.set(now);
         set_chord(window, ctx);
         ctx.ipc.send(Request::Stats);
-    } else {
-        load(window, ctx);
+    } else if load(window, ctx) {
+        seen.set(now);
     }
 }
 
-/// The page from the stats file. A corrupt one reads as empty, as the daemon's own summary does;
-/// only the daemon may reset it.
-fn load(window: &AppWindow, ctx: &Ctx) {
+/// The page from the stats file; false when the file could not be read (briefly locked): the
+/// numbers on screen stay and the next poll tries again. A corrupt file reads as empty, as the
+/// daemon's own summary does; only the daemon may reset it.
+fn load(window: &AppWindow, ctx: &Ctx) -> bool {
     set_chord(window, ctx);
-    let stats = stats_store::read(&ctx.layout.data_dir.join(stats::FILE)).unwrap_or_default();
+    let stats = match stats_store::read(&ctx.layout.data_dir.join(stats::FILE)) {
+        Ok(stats) => stats,
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => stats::Stats::default(),
+        Err(_) => return false,
+    };
     show(window, &stats.summary(stats_store::today(), HEAT_WEEKS));
+    true
 }
 
-fn modified(ctx: &Ctx) -> Option<SystemTime> {
-    fs::metadata(ctx.layout.data_dir.join(stats::FILE))
-        .and_then(|m| m.modified())
-        .ok()
+fn stamp(ctx: &Ctx) -> Stamp {
+    stamp_of(&ctx.layout.data_dir.join(stats::FILE), stats_store::today())
 }
 
-/// The empty state names the hotkey, which the Hotkey page may have just changed.
+fn stamp_of(file: &Path, day: Date) -> Stamp {
+    Stamp {
+        modified: fs::metadata(file).and_then(|m| m.modified()).ok(),
+        day,
+    }
+}
+
+/// The empty state names the hotkey and how to use it, which the Hotkey page may have just changed.
 fn set_chord(window: &AppWindow, ctx: &Ctx) {
-    let chord = ctx.config.borrow().config.hotkey.chord.join(" + ");
-    window.global::<HomeState>().set_chord(chord.into());
+    let config = ctx.config.borrow();
+    let s = window.global::<HomeState>();
+    s.set_chord(config.config.hotkey.chord.join(" + ").into());
+    s.set_toggle(config.config.hotkey.mode == Mode::Toggle);
 }
 
 fn show(window: &AppWindow, summary: &Summary) {
@@ -111,7 +137,12 @@ fn show(window: &AppWindow, summary: &Summary) {
     let weeks = int(summary.heat.len().div_ceil(7));
     let months = month_labels(summary.heat_start, weeks);
     s.set_months(ModelRc::from(Rc::new(VecModel::from(months))));
-    s.set_today(int(summary.heat.len()) - 1);
+    s.set_today(today_cell(summary));
+}
+
+/// Today is the last cell: the window ends on it.
+fn today_cell(summary: &Summary) -> i32 {
+    i32::try_from(summary.heat.len()).map_or(i32::MAX, |n| n - 1)
 }
 
 /// A label over each week column whose Monday starts a new month. The first column keeps its
@@ -135,7 +166,10 @@ fn month_labels(start: Date, weeks: i32) -> Vec<MonthLabel> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Date, month_labels};
+    use oxi_core::stats::{HEAT_WEEKS, Stats};
+    use oxi_core::types::Millis;
+
+    use super::{Date, month_labels, stamp_of, today_cell};
 
     fn labels(start: (i32, u32, u32), weeks: i32) -> Vec<(i32, String)> {
         month_labels(Date::from_ymd(start.0, start.1, start.2).unwrap(), weeks)
@@ -166,5 +200,31 @@ mod tests {
     #[test]
     fn a_year_end_counts_as_a_new_month() {
         assert_eq!(labels((2026, 12, 7), 5), pairs(&[(0, "Dec"), (4, "Jan")]));
+    }
+
+    #[test]
+    fn today_sits_in_its_weekday_row_of_the_last_week() {
+        // Monday-first rows: index % 7 is the weekday, index / 7 the week column.
+        for (day, row) in [(2, 0), (4, 2), (8, 6)] {
+            let today = Date::from_ymd(2026, 11, day).unwrap();
+            let mut stats = Stats::default();
+            stats.record(today, 5, Millis(1000));
+            let summary = stats.summary(today, HEAT_WEEKS);
+            let cell = usize::try_from(today_cell(&summary)).unwrap();
+            assert_eq!(cell % 7, row, "Nov {day}");
+            assert_eq!(cell / 7, usize::from(HEAT_WEEKS) - 1, "Nov {day}");
+            assert!(
+                summary.heat[cell] > 0,
+                "the dictation lands on today's cell"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_day_is_a_change_with_the_file_untouched() {
+        let file = std::path::Path::new("no such stats file");
+        let day = Date::from_ymd(2026, 11, 4).unwrap();
+        assert!(stamp_of(file, day) == stamp_of(file, day));
+        assert!(stamp_of(file, day) != stamp_of(file, day.add_days(1)));
     }
 }

@@ -371,6 +371,7 @@ export component AppWindow inherits Window {
                         title: root.rail[root.index-of(root.page)].label;
                     }
                     if root.page == Page.home: HomePage {
+                        window-width: root.width;
                         content-width: min(root.content-max, root.width - nav.width - 2 * root.pad);
                     }
                     if root.page == Page.hotkey: HotkeyPage { }

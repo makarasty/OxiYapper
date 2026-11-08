@@ -17,6 +17,11 @@ use oxi_settings::{AppWindow, FILE_POLL, Ipc, Page};
 use slint::ComponentHandle;
 
 const CHORD: &str = "version = 1\n[hotkey]\nchord = [\"LCtrl\", \"F13\"]\n";
+const TOGGLE: &str = "version = 1
+[hotkey]
+chord = [\"LCtrl\", \"F13\"]
+mode = \"toggle\"
+";
 const CARDS: [&str; 4] = [
     "Words spoken: 299.9K, All time",
     "Words per minute: 146, Based on recorded speech",
@@ -188,6 +193,16 @@ fn no_data_says_to_hold_the_current_chord() {
     ));
 }
 
+#[test]
+fn toggle_mode_says_press_not_hold() {
+    let window = open(&layout("empty-toggle", Some(TOGGLE)), Page::Home);
+    assert!(has(
+        &window,
+        "Press LCtrl + F13 once to start, again to stop"
+    ));
+    assert!(!has(&window, "Hold LCtrl + F13 and speak"));
+}
+
 /// The four cards' (left, top) at `width` wide.
 fn card_spots(window: &AppWindow, width: f32) -> Vec<(f32, f32)> {
     window
@@ -220,6 +235,60 @@ fn four_cards_in_a_row_reflow_to_two_by_two() {
     assert!((grid[2].1 - grid[3].1).abs() < 0.5, "{grid:?}");
     assert!(grid[2].1 > grid[0].1, "{grid:?}");
     assert!((grid[0].0 - grid[2].0).abs() < 0.5, "{grid:?}");
+}
+
+/// Whether the four cards share a row at window width `width`.
+fn four_in_a_row(window: &AppWindow, width: f32) -> bool {
+    let spots = card_spots(window, width);
+    spots.iter().all(|c| (c.1 - spots[0].1).abs() < 0.5)
+}
+
+#[test]
+fn the_row_choice_follows_the_window_width_alone() {
+    let (ipc, _rx) = Ipc::fake();
+    let window = open_linked(&layout("monotonic", None), Page::Home, ipc.clone());
+    stats_push(&ipc, sample());
+    // The rail widens at 960 and the page column narrows with it: no flip back to two rows.
+    let widths = [
+        720.0, 848.0, 899.0, 900.0, 959.0, 960.0, 1043.0, 1044.0, 1280.0,
+    ];
+    let rows: Vec<bool> = widths.iter().map(|&w| four_in_a_row(&window, w)).collect();
+    assert_eq!(
+        rows,
+        [false, false, false, true, true, true, true, true, true],
+        "{widths:?}"
+    );
+}
+
+#[test]
+fn an_unreadable_stats_file_keeps_the_numbers_and_is_retried() {
+    let l = layout("locked", None);
+    let file = l.data_dir.join(FILE);
+    write_stats(&l, 42);
+    let window = open(&l, Page::Home);
+    assert!(has(&window, "Words spoken: 42, All time"));
+
+    // A directory in the file's place: reading it fails with something other than NotFound.
+    fs::remove_file(&file).unwrap();
+    fs::create_dir(&file).unwrap();
+    let locked = fs::metadata(&file).unwrap().modified().unwrap();
+    poll();
+    assert!(
+        has(&window, "Words spoken: 42, All time"),
+        "kept, not zeroed"
+    );
+
+    // Back to a readable file with the very time the failed read saw: only a retry shows it.
+    fs::remove_dir(&file).unwrap();
+    write_stats(&l, 43);
+    fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(locked)
+        .unwrap();
+    poll();
+    assert!(has(&window, "Words spoken: 43, All time"));
 }
 
 #[test]

@@ -12,6 +12,8 @@ export global HomeState {
     // Nothing dictated yet: the heatmap card says how to start.
     in property <bool> empty: true;
     in property <string> chord;
+    // Recording mode is Toggle: the hint says press once, not hold.
+    in property <bool> toggle;
     // One 0..4 per day from a Monday (index = week * 7 + weekday, Monday first) to today.
     in property <[int]> levels;
     in property <[MonthLabel]> months;
@@ -30,8 +32,11 @@ export component HomePage inherits VerticalLayout {
     // The page column's width, from the window: the card rows are built from it, so it must not
     // come from this layout's own size.
     in property <length> content-width;
-    // Under this the four cards stop fitting their labels (four 184 px cards at 760).
-    property <bool> wide: root.content-width >= 760px;
+    // The window's width, not the column's: the rail widens at 960 and takes 164 px from the
+    // column, which would flip the cards back to two rows on the way up.
+    in property <length> window-width;
+    // Under this the four cards stop fitting their labels.
+    property <bool> wide: root.window-width >= 900px;
     property <length> card-width: root.wide ? (root.content-width - 3 * Theme.tile-gap) / 4 : (root.content-width - Theme.tile-gap) / 2;
     property <int> weeks: max(1, ceil(HomeState.levels.length / 7));
     // The grid fills the card: the day labels are 32 px, the gaps 3 px.
@@ -83,7 +88,7 @@ export component HomePage inherits VerticalLayout {
             spacing: Theme.title-gap;
             padding-bottom: Theme.space-2;
             Text {
-                text: @tr("Hold {} and speak", HomeState.chord);
+                text: HomeState.toggle ? @tr("Press {} once to start, again to stop", HomeState.chord) : @tr("Hold {} and speak", HomeState.chord);
                 font-size: Theme.body-size;
                 color: Theme.text-primary;
                 wrap: word-wrap;
@@ -97,8 +102,6 @@ export component HomePage inherits VerticalLayout {
         }
         HorizontalLayout {
             alignment: start;
-            // The legend's cells are as tall as the grid's and hang below its 16 px row.
-            padding-bottom: max(0px, root.cell - Theme.caption-line);
             ActivityHeatmap {
                 levels: HomeState.levels;
                 months: HomeState.months;
