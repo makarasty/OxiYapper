@@ -242,7 +242,9 @@ impl<C: Capture + 'static> PageState<C> {
             state.set_test_status(SharedString::new());
         }
         state.set_live(live.is_open());
-        let bars: Vec<f32> = live.meter.bars().collect();
+        // Leading silence is drawn as nothing, not a row of 2 px dots (audit M9); the Meter keeps
+        // the newest bar at the right edge.
+        let bars: Vec<f32> = live.meter.bars().skip_while(|&b| b <= 0.0).collect();
         state.set_bars(ModelRc::from(Rc::new(VecModel::from(bars))));
     }
 
@@ -408,6 +410,21 @@ fn push_config(state: &AudioState<'_>, config: &Config, devices: &Devices) {
         state.set_max_minutes(audio.max_seconds as f32 / 60.0);
     }
     state.set_language(language_row(config.model.language));
+    let defaults = Config::default();
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the default gain is a few dB"
+    )]
+    state.set_default_gain_db(defaults.audio.gain_db as f32);
+    state.set_default_sensitivity_db(defaults.audio.meter_sensitivity_db);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "ms and s values are far below 2^24"
+    )]
+    {
+        state.set_default_tail_ms(defaults.audio.tail_ms as f32);
+        state.set_default_max_minutes(defaults.audio.max_seconds as f32 / 60.0);
+    }
 }
 
 fn language_row(lang: Language) -> i32 {
@@ -995,10 +1012,27 @@ mod tests {
         std::thread::spawn(draw_audio).join().unwrap();
     }
 
+    /// The window's next frame, `w` x `h` physical pixels, as a pixmap.
+    fn frame_pixels(
+        surface: &Rc<slint::platform::software_renderer::MinimalSoftwareWindow>,
+        w: u32,
+        h: u32,
+    ) -> tiny_skia::Pixmap {
+        use slint::platform::software_renderer::PremultipliedRgbaColor;
+
+        let mut buffer = vec![PremultipliedRgbaColor::default(); (w * h) as usize];
+        assert!(surface.draw_if_needed(|r| {
+            r.render(&mut buffer, w as usize);
+        }));
+        let bytes = buffer
+            .iter()
+            .flat_map(|p| [p.red, p.green, p.blue, p.alpha])
+            .collect();
+        tiny_skia::Pixmap::from_vec(bytes, tiny_skia::IntSize::from_wh(w, h).unwrap()).unwrap()
+    }
+
     fn draw_audio() {
-        use slint::platform::software_renderer::{
-            MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
-        };
+        use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
         use slint::platform::{Platform, WindowAdapter};
 
         thread_local! {
@@ -1017,7 +1051,7 @@ mod tests {
         if let Some(dir) = &dir {
             std::fs::create_dir_all(dir).unwrap();
         }
-        let (w, h) = (560_u32, 600_u32);
+        let (w, h) = (1280_u32, 800_u32);
         slint::platform::set_platform(Box::new(Shots)).unwrap();
         let bars = |f: fn(usize) -> f32| -> Vec<f32> { (0..40).map(f).collect() };
         let screens: [(&str, Option<&str>, Vec<f32>, bool); 4] = [
@@ -1052,9 +1086,11 @@ device = \"USB Mic\"
             let surface = LAST.with_borrow(Clone::clone).unwrap();
             surface.set_size(slint::PhysicalSize::new(w, h));
             window.show().unwrap();
-            window.set_page(Page::Audio);
-            page.shown();
+            // Builds the page, whose `init` starts the meter; so stop it only after that.
+            show_audio(&window);
             page.tick();
+            // Its next frame would overwrite the bars and hints set below.
+            page.timer.stop();
             if !bars.is_empty() {
                 let state = window.global::<AudioState>();
                 state.set_bars(ModelRc::from(Rc::new(VecModel::from(bars))));
@@ -1072,16 +1108,7 @@ device = \"USB Mic\"
                 window.set_theme(choice);
                 slint::platform::update_timers_and_animations();
                 surface.request_redraw();
-                let mut buffer = vec![PremultipliedRgbaColor::default(); (w * h) as usize];
-                assert!(surface.draw_if_needed(|r| {
-                    r.render(&mut buffer, w as usize);
-                }));
-                let bytes = buffer
-                    .iter()
-                    .flat_map(|p| [p.red, p.green, p.blue, p.alpha])
-                    .collect();
-                let size = tiny_skia::IntSize::from_wh(w, h).unwrap();
-                let pixmap = tiny_skia::Pixmap::from_vec(bytes, size).unwrap();
+                let pixmap = frame_pixels(&surface, w, h);
                 let first = pixmap.pixels()[0];
                 assert!(
                     pixmap.pixels().iter().any(|p| p.alpha() > 0),
@@ -1196,6 +1223,120 @@ device = \"USB Mic\"
         assert_eq!(d.row_of(""), 0);
         assert_eq!(Devices::new(names(&["A"]), "A").missing, None);
         assert_eq!(Devices::new(Vec::new(), "").rows(), ["System default"]);
+    }
+
+    fn field(window: &AppWindow, label: &str) -> ElementHandle {
+        crate::testing::with_role(
+            window,
+            label,
+            i_slint_backend_testing::AccessibleRole::Spinbox,
+        )
+    }
+
+    /// A typed value takes the same path as a dragged slider: clamped, snapped to the step, saved.
+    #[test]
+    fn typed_values_are_clamped_and_snapped_before_saving() {
+        use slint::platform::{Key as K, PointerEventButton, WindowEvent};
+
+        i_slint_backend_testing::init_no_event_loop();
+        let (window, page) = window_on("number-field", None, fake);
+        window.show().unwrap();
+        show_audio(&window);
+        let saved = || page.ctx.config.borrow().config.audio.clone();
+        field(&window, "Gain").set_accessible_value("-50");
+        assert!((saved().gain_db - -20.0).abs() < f64::EPSILON, "clamped");
+        field(&window, "Gain").set_accessible_value("12.6");
+        assert!((saved().gain_db - 13.0).abs() < f64::EPSILON, "rounded");
+        field(&window, "Tail after release").set_accessible_value("333");
+        assert_eq!(saved().tail_ms, 350, "snapped to the 50 ms step");
+        // Not a number: nothing changes.
+        field(&window, "Gain").set_accessible_value("loud");
+        assert!((saved().gain_db - 13.0).abs() < f64::EPSILON);
+        // L1: a positive gain shows its sign.
+        assert_eq!(
+            field(&window, "Gain").accessible_value().as_deref(),
+            Some("+13")
+        );
+        // Real typing: click, go to the end, one more digit, Enter commits and clamps.
+        field(&window, "Max length").mock_single_click(PointerEventButton::Left);
+        let w = window.window();
+        for text in [SharedString::from(K::End), "5".into(), K::Return.into()] {
+            w.dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+            w.dispatch_event(WindowEvent::KeyReleased { text });
+        }
+        assert_eq!(saved().max_seconds, 1800, "105 min clamps to 30 min");
+    }
+
+    fn press(window: &AppWindow, key: impl Into<SharedString>) {
+        let text: SharedString = key.into();
+        let w = window.window();
+        w.dispatch_event(slint::platform::WindowEvent::KeyPressed { text: text.clone() });
+        w.dispatch_event(slint::platform::WindowEvent::KeyReleased { text });
+    }
+
+    fn select_all(window: &AppWindow) {
+        use slint::platform::{Key as K, WindowEvent};
+        let w = window.window();
+        let ctrl: SharedString = K::Control.into();
+        w.dispatch_event(WindowEvent::KeyPressed { text: ctrl.clone() });
+        press(window, "a");
+        w.dispatch_event(WindowEvent::KeyReleased { text: ctrl });
+    }
+
+    #[test]
+    fn leaving_a_field_untouched_keeps_a_value_off_the_step() {
+        use slint::platform::{Key as K, PointerEventButton};
+
+        i_slint_backend_testing::init_no_event_loop();
+        let config = "version = 1\n[audio]\ntail_ms = 125\n";
+        let (window, page) = window_on("untouched", Some(config), fake);
+        window.show().unwrap();
+        show_audio(&window);
+        let tail = || page.ctx.config.borrow().config.audio.tail_ms;
+        for leave in [K::Return, K::Tab] {
+            field(&window, "Tail after release").mock_single_click(PointerEventButton::Left);
+            press(&window, leave);
+            assert_eq!(tail(), 125, "the 50 ms step snapped an unedited value");
+        }
+        assert_eq!(
+            field(&window, "Tail after release")
+                .accessible_value()
+                .as_deref(),
+            Some("125")
+        );
+    }
+
+    #[test]
+    fn nan_inf_and_empty_are_refused_and_the_old_value_stays() {
+        use slint::platform::{Key as K, PointerEventButton};
+
+        i_slint_backend_testing::init_no_event_loop();
+        let (window, page) = window_on("refused", None, fake);
+        window.show().unwrap();
+        show_audio(&window);
+        let seconds = || page.ctx.config.borrow().config.audio.max_seconds;
+        let type_over = |text: &str| {
+            select_all(&window);
+            press(&window, K::Delete);
+            for c in text.chars() {
+                press(&window, c.to_string());
+            }
+            press(&window, K::Return);
+        };
+        field(&window, "Max length").mock_single_click(PointerEventButton::Left);
+        // Selecting works, or the refusals below would prove nothing.
+        type_over("25");
+        assert_eq!(seconds(), 1500);
+        for text in ["nan", "inf", "infinity", ""] {
+            type_over(text);
+            assert_eq!(seconds(), 1500, "{text:?} was accepted");
+        }
+        assert_eq!(
+            field(&window, "Max length").accessible_value().as_deref(),
+            Some("25")
+        );
+        field(&window, "Max length").set_accessible_value("nan");
+        assert_eq!(seconds(), 1500, "set-value took nan");
     }
 
     #[test]

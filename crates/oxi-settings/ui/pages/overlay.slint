@@ -1,7 +1,6 @@
 // Overlay page (SPEC Feedback): the pill on or off, its spot on screen, hiding it over
 // fullscreen apps, and a preview the daemon shows at the picked spot.
-import { Button, Palette } from "std-widgets.slint";
-import { Group, ToggleRow, ThumbPicker } from "../widgets.slint";
+import { Theme, Icons, Group, Card, ToggleRow, ScreenPicker, Button, Note, Severity } from "../theme/index.slint";
 
 // Filled and read by `pages::overlay`.
 export global OverlayState {
@@ -13,26 +12,53 @@ export global OverlayState {
     in property <bool> online;
     // Why Preview is off; empty while online or connecting.
     in property <string> note;
+    // The daemon is not running: the page tells how to fix that instead of `note`.
+    in property <bool> offline;
     callback enabled-toggled(bool);
     callback position-picked(int);
     callback hide-over-fullscreen-toggled(bool);
     callback preview();
 }
 
+// The Preview button and why it is off, beside the picker or under it.
+component PreviewAction inherits VerticalLayout {
+    property <string> reason: OverlayState.offline ? @tr("Start OxiYapper to preview.") : OverlayState.note;
+    alignment: center;
+    spacing: Theme.control-gap;
+    HorizontalLayout {
+        alignment: start;
+        Button {
+            text: @tr("Preview");
+            icon: Icons.eye-16;
+            enabled: OverlayState.online;
+            accessible-description: OverlayState.note;
+            clicked => {
+                OverlayState.preview();
+            }
+        }
+    }
+    if root.reason != "": Note {
+        text: root.reason;
+        severity: Severity.warning;
+    }
+}
+
 export component OverlayPage inherits VerticalLayout {
+    property <bool> narrow: root.width < 640px;
     alignment: start;
-    spacing: 10px;
+    spacing: Theme.group-gap;
     Group {
-        title: @tr("Overlay");
         ToggleRow {
-            label: @tr("Show the overlay");
+            title: @tr("Show the overlay");
+            description: @tr("A small pill shows recording and transcription.");
             checked <=> OverlayState.enabled;
             toggled(on) => {
                 OverlayState.enabled-toggled(on);
             }
         }
         ToggleRow {
-            label: @tr("Hide over fullscreen apps");
+            title: @tr("Hide over fullscreen apps");
+            description: @tr("Keeps games and videos clear.");
             checked <=> OverlayState.hide-over-fullscreen;
             toggled(on) => {
                 OverlayState.hide-over-fullscreen-toggled(on);
@@ -41,45 +67,23 @@ export component OverlayPage inherits VerticalLayout {
     }
     Group {
         title: @tr("Position");
-        VerticalLayout {
-            padding-top: 4px;
-            padding-bottom: 4px;
-            spacing: 4px;
-            // Two rows of three, laid out like the screen.
-            ThumbPicker {
-                accessible-label: @tr("Position");
-                columns: 3;
-                thumbs: [
-                    { image: @image-url("../img/overlay-top-left.svg"), caption: @tr("Top left") },
-                    { image: @image-url("../img/overlay-top-centre.svg"), caption: @tr("Top centre") },
-                    { image: @image-url("../img/overlay-top-right.svg"), caption: @tr("Top right") },
-                    { image: @image-url("../img/overlay-bottom-left.svg"), caption: @tr("Bottom left") },
-                    { image: @image-url("../img/overlay-bottom-centre.svg"), caption: @tr("Bottom centre") },
-                    { image: @image-url("../img/overlay-bottom-right.svg"), caption: @tr("Bottom right") },
-                ];
-                selected: OverlayState.position;
-                picked(i) => {
-                    OverlayState.position-picked(i);
-                }
-            }
+        Card {
             HorizontalLayout {
-                alignment: start;
-                spacing: 8px;
-                Button {
-                    text: @tr("Preview");
-                    enabled: OverlayState.online;
-                    accessible-description: OverlayState.note;
-                    clicked => {
-                        OverlayState.preview();
+                alignment: root.narrow ? LayoutAlignment.start : LayoutAlignment.stretch;
+                spacing: Theme.space-6;
+                ScreenPicker {
+                    accessible-label: @tr("Position");
+                    names: [@tr("Top left"), @tr("Top centre"), @tr("Top right"), @tr("Bottom left"), @tr("Bottom centre"), @tr("Bottom right")];
+                    selected: OverlayState.position;
+                    picked(i) => {
+                        OverlayState.position-picked(i);
                     }
                 }
-                if OverlayState.note != "": Text {
-                    text: OverlayState.note;
-                    vertical-alignment: center;
-                    color: Palette.foreground;
-                    opacity: 0.7;
+                if !root.narrow: PreviewAction {
+                    horizontal-stretch: 1;
                 }
             }
+            if root.narrow: PreviewAction { }
         }
     }
 }

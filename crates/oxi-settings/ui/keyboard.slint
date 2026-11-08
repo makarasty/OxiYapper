@@ -1,17 +1,16 @@
-// The full visual keyboard of the hotkey picker. `pages::keyboard_layout` places the keys;
-// this file only draws them, scaled so the board fills its width.
-import { Palette } from "std-widgets.slint";
-import { Shell } from "widgets.slint";
+// The full visual keyboard of the hotkey picker: bright caps, crisp 1 px stroke, a solid fill when
+// picked. `pages::keyboard_layout` places the keys; this file scales them with the window.
+import { Theme, Keycap } from "theme/index.slint";
 
 export struct KeyCap {
     // `Key::as_str` ("LCtrl"), sent back on a click.
     name: string,
-    // The text on the cap, `keyboard_layout::cap_label`.
+    // The text on the cap: `label` from a key unit of `full-from` px, `short` below it.
     label: string,
+    short: string,
+    full-from: float,
     // The accessible label, `keyboard_layout::spoken` ("Left Ctrl"): unique on the board.
     spoken: string,
-    // Characters in the longest word of `label`: the cap shrinks its font to fit that word.
-    word: int,
     // Position and size in key units.
     x: float,
     y: float,
@@ -21,18 +20,8 @@ export struct KeyCap {
     held: bool,
     // In the pending chord.
     picked: bool,
-}
-
-// The font of a cap label. `fit` is the size at which the longest word fills `room` (8 px at most);
-// `size` never goes under 7 px (the layout keeps 1-unit labels to 3 characters, which fit at 7 px).
-// A global so the unit test reads the very numbers the caps use.
-export global CapFont {
-    pure public function fit(room: length, word: int) -> length {
-        return min(8px, room / max(1, word) * 1.5);
-    }
-    pure public function size(room: length, word: int) -> length {
-        return max(7px, CapFont.fit(room, word));
-    }
+    // In the pending chord but not allowed there (Esc).
+    invalid: bool,
 }
 
 export component Keyboard inherits Rectangle {
@@ -41,47 +30,29 @@ export component Keyboard inherits Rectangle {
     in property <float> columns: 1;
     in property <float> rows: 1;
     callback clicked(string);
-    property <length> unit: self.width / root.columns;
+    // Spec 5.1: 28..52 px. The first and last caps line up with the heading and the buttons (the
+    // 3 px are the half gaps outside them); the 28 px board of the smallest window takes the card's
+    // padding, and the board is centred when it stops growing at 52.
+    property <length> unit: clamp((root.width + 3px) / root.columns, 28px, 52px);
+    property <length> gap: Theme.keycap-gap-for(root.unit);
+    property <length> left: (root.width - root.unit * root.columns) / 2;
     height: root.unit * root.rows;
-    for cap in root.caps: Rectangle {
-        x: cap.x * root.unit + 1px;
-        y: cap.y * root.unit + 1px;
-        width: cap.w * root.unit - 2px;
-        height: cap.h * root.unit - 2px;
-        border-radius: 3px;
-        border-width: cap.picked ? 2px : 1px;
-        border-color: cap.picked ? Palette.accent-background : Palette.border;
-        background: cap.held ? Palette.accent-background : cap.picked ? Palette.selection-background.transparentize(0.5) : touch.has-hover && !Shell.locked ? Palette.alternate-background : Palette.control-background;
-        opacity: Shell.locked ? 0.5 : 1;
-        accessible-role: button;
+    for cap in root.caps: Keycap {
+        x: root.left + cap.x * root.unit + root.gap / 2;
+        y: cap.y * root.unit + root.gap / 2;
+        width: cap.w * root.unit - root.gap;
+        height: cap.h * root.unit - root.gap;
+        unit: root.unit;
+        label: root.unit >= cap.full-from * 1px ? cap.label : cap.short;
+        // Keycap draws picked and held over invalid; Esc must stay red while pressed.
+        picked: cap.picked && !cap.invalid;
+        held: cap.held && !cap.invalid;
+        invalid: cap.invalid;
         accessible-label: cap.spoken;
-        accessible-checkable: true;
         accessible-checked: cap.picked;
         accessible-description: cap.held ? "held" : "";
-        accessible-enabled: !Shell.locked;
-        accessible-action-default => {
-            if (!Shell.locked) {
-                root.clicked(cap.name);
-            }
-        }
-        Text {
-            x: 1px;
-            width: parent.width - 2px;
-            accessible-role: none;
-            text: cap.label;
-            // Sized so the longest word fits the cap without breaking inside it.
-            font-size: CapFont.size(self.width, cap.word);
-            wrap: word-wrap;
-            overflow: elide;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-            color: cap.held ? Palette.accent-foreground : Palette.foreground;
-        }
-        touch := TouchArea {
-            enabled: !Shell.locked;
-            clicked => {
-                root.clicked(cap.name);
-            }
+        clicked => {
+            root.clicked(cap.name);
         }
     }
 }

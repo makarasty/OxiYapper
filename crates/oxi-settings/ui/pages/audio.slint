@@ -1,7 +1,6 @@
 // Audio page (SPEC Recording, Audio before whisper): microphone, live meter, the DSP switches,
 // tail, recording cap and dictation language.
-import { Palette, ComboBox, Button } from "std-widgets.slint";
-import { Shell, Group, Row, ToggleRow, SliderRow, InlineNote } from "../widgets.slint";
+import { Theme, Icons, Group, Card, Row, ToggleRow, SliderRow, Combo, Segmented, Button, Meter, Note, Severity } from "../theme/index.slint";
 
 // Which control changed; `value` of `AudioState.edited` carries its new value.
 export enum AudioKey { device, gain, sensitivity, normalize, trim, denoise, tail, max-minutes, language }
@@ -18,6 +17,11 @@ export global AudioState {
     in-out property <bool> denoise;
     in-out property <float> tail-ms;
     in-out property <float> max-minutes;
+    // The defaults of `Config::default()`: a double click on a slider's thumb returns to them.
+    in property <float> default-gain-db;
+    in property <float> default-sensitivity-db;
+    in property <float> default-tail-ms;
+    in property <float> default-max-minutes;
     // 0 ru, 1 en, 2 auto.
     in property <int> language;
     // Live meter: bar heights 0..1, oldest first.
@@ -43,173 +47,173 @@ export global AudioState {
 
 export component AudioPage inherits VerticalLayout {
     alignment: start;
-    spacing: 10px;
+    spacing: Theme.group-gap;
     init => {
         AudioState.shown();
     }
     Group {
         title: @tr("Microphone");
-        Row {
-            label: @tr("Device");
-            ComboBox {
-                horizontal-stretch: 2;
-                model: AudioState.devices;
-                current-index <=> AudioState.device;
-                enabled: !Shell.locked;
-                accessible-label: @tr("Device");
-                selected => {
-                    AudioState.edited(AudioKey.device, self.current-index);
-                }
-            }
-        }
-        if AudioState.list-error != "": InlineNote {
-            text: AudioState.list-error;
-        }
-        if AudioState.fallback != "": InlineNote {
-            text: AudioState.fallback;
-        }
-        Row {
-            label: @tr("Level");
-            // The track is always there: empty while there is no meter, with the reason on it.
-            Rectangle {
-                horizontal-stretch: 2;
-                height: 22px;
-                border-radius: 3px;
-                background: Palette.foreground.transparentize(0.88);
-                accessible-role: progress-indicator;
-                accessible-label: AudioState.clipping ? @tr("Level, clipping") : @tr("Level");
-                if !AudioState.live: Text {
-                    x: 6px;
-                    text: AudioState.note;
-                    vertical-alignment: center;
-                    overflow: elide;
-                    width: parent.width - 12px;
-                    color: Palette.foreground;
-                    opacity: 0.7;
-                }
-                if AudioState.live: HorizontalLayout {
-                    padding: 2px;
-                    spacing: 2px;
-                    for bar in AudioState.bars: Rectangle {
-                        Rectangle {
-                            y: parent.height - self.height;
-                            height: max(1px, parent.height * bar);
-                            border-radius: 1px;
-                            background: AudioState.clipping ? Shell.error-text : Palette.accent-background;
-                        }
+        Card {
+            Row {
+                icon: Icons.mic;
+                title: @tr("Device");
+                Combo {
+                    model: AudioState.devices;
+                    current-index <=> AudioState.device;
+                    accessible-label: @tr("Device");
+                    selected => {
+                        AudioState.edited(AudioKey.device, self.current-index);
                     }
                 }
             }
-        }
-        if AudioState.silence != "": InlineNote {
-            text: AudioState.silence;
-        }
-        Row {
-            label: @tr("Mic test");
-            Button {
-                text: @tr("Test");
-                enabled: !AudioState.testing;
-                clicked => {
-                    AudioState.test();
+            if AudioState.list-error != "": Note {
+                text: AudioState.list-error;
+                severity: Severity.error;
+            }
+            if AudioState.fallback != "": Note {
+                text: AudioState.fallback;
+                severity: Severity.warning;
+            }
+            Row {
+                icon: Icons.data-usage;
+                title: @tr("Level");
+                fill-controls: true;
+                Meter {
+                    bars: AudioState.bars;
+                    live: AudioState.live;
+                    clipping: AudioState.clipping;
+                    empty-text: AudioState.note;
+                    accessible-label: !AudioState.live ? AudioState.note : AudioState.clipping ? @tr("Level, clipping") : @tr("Level");
                 }
             }
-            Text {
+            if AudioState.silence != "": Note {
+                text: AudioState.silence;
+                severity: Severity.warning;
+            }
+            Row {
+                icon: Icons.play;
+                title: @tr("Mic test");
+                description: @tr("Records 3 seconds and plays them back.");
+                Button {
+                    text: @tr("Test");
+                    enabled: !AudioState.testing;
+                    tooltip: @tr("A test is running");
+                    clicked => {
+                        AudioState.test();
+                    }
+                }
+            }
+            if AudioState.test-status != "": Note {
                 text: AudioState.test-status;
-                horizontal-stretch: 1;
-                vertical-alignment: center;
-                overflow: elide;
-                color: Palette.foreground;
             }
-        }
-        SliderRow {
-            label: @tr("Gain");
-            minimum: -20;
-            maximum: 20;
-            value <=> AudioState.gain-db;
-            value-text: "\{round(self.value)} dB";
-            changed(v) => {
-                AudioState.edited(AudioKey.gain, v);
+            SliderRow {
+                icon: Icons.speaker-2;
+                title: @tr("Gain");
+                description: @tr("Boosts or cuts what Whisper hears.");
+                minimum: -20;
+                maximum: 20;
+                bipolar: true;
+                signed: true;
+                unit: "dB";
+                default-value: AudioState.default-gain-db;
+                value <=> AudioState.gain-db;
+                changed(v) => {
+                    AudioState.edited(AudioKey.gain, v);
+                }
             }
-        }
-        SliderRow {
-            label: @tr("Meter sensitivity");
-            minimum: -20;
-            maximum: 20;
-            value <=> AudioState.sensitivity-db;
-            value-text: "\{round(self.value)} dB";
-            changed(v) => {
-                AudioState.edited(AudioKey.sensitivity, v);
+            SliderRow {
+                icon: Icons.gauge;
+                title: @tr("Meter sensitivity");
+                description: @tr("Only changes how the meter looks.");
+                minimum: -20;
+                maximum: 20;
+                bipolar: true;
+                signed: true;
+                unit: "dB";
+                default-value: AudioState.default-sensitivity-db;
+                value <=> AudioState.sensitivity-db;
+                changed(v) => {
+                    AudioState.edited(AudioKey.sensitivity, v);
+                }
             }
         }
     }
     Group {
         title: @tr("Processing");
         ToggleRow {
-            label: @tr("Normalise level");
+            title: @tr("Normalise level");
+            description: @tr("Evens out quiet and loud speech.");
             checked <=> AudioState.normalize;
             toggled(on) => {
                 AudioState.edited(AudioKey.normalize, on ? 1 : 0);
             }
         }
         ToggleRow {
-            label: @tr("Trim silence");
+            title: @tr("Trim silence");
+            description: @tr("Cuts silence at the start and end.");
             checked <=> AudioState.trim;
             toggled(on) => {
                 AudioState.edited(AudioKey.trim, on ? 1 : 0);
             }
         }
         ToggleRow {
-            label: @tr("Noise suppression");
+            title: @tr("Noise suppression");
+            // While on, the warning below says it: no second copy here.
+            description: AudioState.denoise ? "" : @tr("Can make Whisper worse; off by default.");
             checked <=> AudioState.denoise;
             toggled(on) => {
                 AudioState.edited(AudioKey.denoise, on ? 1 : 0);
             }
         }
-        if AudioState.denoise: InlineNote {
-            text: @tr("Noise suppression can make Whisper worse.");
+        if AudioState.denoise: HorizontalLayout {
+            padding-left: Theme.card-padding-h;
+            padding-top: Theme.space-1;
+            Note {
+                text: @tr("Noise suppression can make Whisper worse.");
+                severity: Severity.warning;
+            }
         }
     }
     Group {
         title: @tr("Recording");
-        SliderRow {
-            label: @tr("Tail after release");
-            minimum: 0;
-            maximum: 1000;
-            step: 50;
-            value <=> AudioState.tail-ms;
-            value-text: "\{round(self.value)} ms";
-            changed(v) => {
-                AudioState.edited(AudioKey.tail, v);
+        Card {
+            SliderRow {
+                icon: Icons.timer;
+                title: @tr("Tail after release");
+                description: @tr("Keeps recording a moment after you let go.");
+                minimum: 0;
+                maximum: 1000;
+                step: 50;
+                unit: "ms";
+                default-value: AudioState.default-tail-ms;
+                value <=> AudioState.tail-ms;
+                changed(v) => {
+                    AudioState.edited(AudioKey.tail, v);
+                }
             }
-        }
-        SliderRow {
-            label: @tr("Max length");
-            minimum: 1;
-            maximum: 30;
-            value <=> AudioState.max-minutes;
-            value-text: "\{round(self.value)} min";
-            changed(v) => {
-                AudioState.edited(AudioKey.max-minutes, v);
+            SliderRow {
+                icon: Icons.timer;
+                title: @tr("Max length");
+                description: @tr("Recording stops at this length.");
+                minimum: 1;
+                maximum: 30;
+                unit: "min";
+                default-value: AudioState.default-max-minutes;
+                value <=> AudioState.max-minutes;
+                changed(v) => {
+                    AudioState.edited(AudioKey.max-minutes, v);
+                }
             }
-        }
-        Row {
-            label: @tr("Language");
-            // shortcut: buttons as a segmented control; a shared one belongs in widgets.slint.
-            Rectangle {
-                accessible-role: radio-group;
-                accessible-label: @tr("Language");
-                HorizontalLayout {
-                    spacing: 4px;
-                    for code[i] in [@tr("RU"), @tr("EN"), @tr("Auto")]: Button {
-                        text: code;
-                        primary: AudioState.language == i;
-                        enabled: !Shell.locked;
-                        accessible-role: radio-button;
-                        accessible-checkable: true;
-                        accessible-checked: AudioState.language == i;
-                        clicked => {
-                            AudioState.edited(AudioKey.language, i);
-                        }
+            Row {
+                icon: Icons.local-language;
+                title: @tr("Language");
+                Segmented {
+                    accessible-label: @tr("Language");
+                    min-width: Theme.segmented-min-width;
+                    items: [@tr("RU"), @tr("EN"), @tr("Auto")];
+                    selected: AudioState.language;
+                    picked(i) => {
+                        AudioState.edited(AudioKey.language, i);
                     }
                 }
             }

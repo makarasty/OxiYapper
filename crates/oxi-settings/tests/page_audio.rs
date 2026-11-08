@@ -25,8 +25,9 @@ fn every_control_writes_its_key() {
     let window = open(&l, Page::Audio);
     let defaults = Config::default();
 
+    // The NumberField beside each slider: typing writes the same key as dragging.
     let slider = |label: &str, value: &str| {
-        with_role(&window, label, AccessibleRole::Slider).set_accessible_value(value);
+        with_role(&window, label, AccessibleRole::Spinbox).set_accessible_value(value);
     };
     slider("Gain", "-6");
     assert!((saved(&l).audio.gain_db - -6.0).abs() < f64::EPSILON);
@@ -86,8 +87,10 @@ fn config_values_show_on_the_page() {
     let window = open(&l, Page::Audio);
     let gain = with_role(&window, "Gain", AccessibleRole::Slider);
     assert_eq!(gain.accessible_value().as_deref(), Some("4"));
-    assert!(has(&window, "250 ms"));
-    assert!(has(&window, "10 min"));
+    let field = |label: &str| with_role(&window, label, AccessibleRole::Spinbox).accessible_value();
+    assert_eq!(field("Gain").as_deref(), Some("+4"));
+    assert_eq!(field("Tail after release").as_deref(), Some("250"));
+    assert_eq!(field("Max length").as_deref(), Some("10"));
 }
 
 /// A configured microphone that is not plugged in stays picked; choosing the first row writes
@@ -121,6 +124,10 @@ fn locked_config_disables_the_controls() {
     let original = "version = 99\n[audio]\ngain_db = 3.0\n";
     let l = layout("locked", Some(original));
     let window = open(&l, Page::Audio);
+    // Tall enough for the whole page under the read-only banner: the search skips what is scrolled away.
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(1120.0, 1400.0));
     for (label, role) in [
         ("Gain", AccessibleRole::Slider),
         ("Trim silence", AccessibleRole::Switch),

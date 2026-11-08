@@ -85,7 +85,7 @@ fn empty_chord_is_refused() {
     let l = layout("empty", None);
     let window = open(&l);
     click(&window, "Change hotkey");
-    assert!(has(&window, "No keys picked"));
+    assert!(has(&window, "No keys yet"));
     click(&window, "Apply hotkey");
     assert!(has(&window, "the hotkey has no keys"));
     assert!(!l.config_file().exists());

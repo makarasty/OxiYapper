@@ -59,6 +59,7 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
 /// shell banner's text for the rest.
 fn set_link(s: &OverlayState, link: Link) {
     s.set_online(link == Link::Online);
+    s.set_offline(link == Link::Offline);
     let note = match link {
         Link::Offline => Some(strings::PREVIEW_OFFLINE.to_owned()),
         Link::Mismatch { .. } => Some(strings::PREVIEW_MISMATCH.to_owned()),

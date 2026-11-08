@@ -26,7 +26,7 @@ const WATCH: Duration = Duration::from_millis(100);
 pub fn bind(window: &AppWindow, ctx: &Ctx) {
     let s = window.global::<HotkeyState>();
     let file = ctx.config.borrow();
-    s.set_chord(chord_text(&file.config.hotkey.chord));
+    set_saved_chord(&s, &file.config.hotkey.chord);
     s.set_mode(i32::from(file.config.hotkey.mode == Mode::Toggle));
     drop(file);
     s.set_columns(keyboard_layout::WIDTH);
@@ -38,15 +38,17 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         .iter()
         .map(|c| KeyCap {
             name: c.key.as_str().into(),
-            label: c.key.label().into(),
+            label: keyboard_layout::cap_label(c.key, true).into(),
+            short: keyboard_layout::cap_label(c.key, false).into(),
+            full_from: keyboard_layout::full_from(c.key),
             spoken: c.key.spoken().into(),
-            word: longest_word(c.key.label()),
             x: c.x,
             y: c.y,
             w: c.w,
             h: c.h,
             held: false,
             picked: false,
+            invalid: false,
         })
         .collect();
     let picker = Rc::new_cyclic(|me: &RcWeak<Picker>| Picker {
@@ -262,7 +264,7 @@ impl Picker {
         match chord {
             Ok(chord) => {
                 let names = chord.to_names();
-                self.with(|s| s.set_chord(chord_text(&names)));
+                self.with(|s| set_saved_chord(&s, &names));
                 self.ctx.config.borrow_mut().config.hotkey.chord = names;
                 let saved = self.ctx.save();
                 if saved.is_ok() {
@@ -281,19 +283,28 @@ impl Picker {
         for (i, key) in self.keys.iter().enumerate() {
             if let Some(mut cap) = self.caps.row_data(i) {
                 let (h, p) = (held.contains(key), pending.contains(key));
-                if (cap.held, cap.picked) != (h, p) {
-                    (cap.held, cap.picked) = (h, p);
+                // Esc is the one key a chord refuses (`ChordError::Esc`).
+                let bad = p && *key == Key::Esc;
+                if (cap.held, cap.picked, cap.invalid) != (h, p, bad) {
+                    (cap.held, cap.picked, cap.invalid) = (h, p, bad);
                     self.caps.set_row_data(i, cap);
                 }
             }
         }
-        let (text, error) = match Chord::from_keys(&pending) {
+        let chord = Chord::from_keys(&pending);
+        // A refused chord still shows what was pressed; a valid one shows as it would be saved.
+        let keys = match &chord {
+            Ok(chord) => chord.to_names(),
+            Err(_) => pending.iter().map(|k| k.label().to_owned()).collect(),
+        };
+        let (text, error) = match chord {
             Ok(chord) => (chord_text(&chord.to_names()), SharedString::new()),
             Err(ChordError::Empty) => (SharedString::new(), SharedString::new()),
             Err(e) => (SharedString::new(), e.to_string().into()),
         };
         self.with(|s| {
             s.set_pending(text);
+            s.set_pending_keys(string_model(&keys));
             s.set_error(error);
         });
     }
@@ -314,15 +325,20 @@ impl Drop for Picker {
     }
 }
 
-/// Characters in the longest word of a keycap label.
-fn longest_word(label: &str) -> i32 {
-    let n = label.split(' ').map(|w| w.chars().count()).max();
-    i32::try_from(n.unwrap_or(0)).unwrap_or(i32::MAX)
-}
-
 /// "Ctrl + Win".
 fn chord_text(names: &[String]) -> SharedString {
     names.join(" + ").into()
+}
+
+fn string_model(items: &[String]) -> ModelRc<SharedString> {
+    let items: Vec<SharedString> = items.iter().map(SharedString::from).collect();
+    ModelRc::from(Rc::new(VecModel::from(items)))
+}
+
+/// Show `names` as the saved chord: the text for screen readers and the keycaps.
+fn set_saved_chord(s: &HotkeyState<'_>, names: &[String]) {
+    s.set_chord(chord_text(names));
+    s.set_chord_keys(string_model(names));
 }
 
 #[cfg(test)]
@@ -337,7 +353,9 @@ mod tests {
     use slint::ComponentHandle;
     use slint::platform::WindowEvent;
 
-    use crate::generated::HotkeyState;
+    use std::rc::Rc;
+
+    use crate::generated::{HotkeyState, Theme};
     use crate::ipc::{Cmd, Event, Ipc, Link};
     use crate::testing::{linked, one};
     use crate::{AppWindow, Page};
@@ -499,32 +517,113 @@ mod tests {
         assert_eq!(captures(&sent), Vec::<bool>::new());
     }
 
-    /// Smallest font on any cap at the smallest window, 1x.
-    const CAP_FONT_FLOOR: f32 = 7.0;
+    #[test]
+    fn the_board_grows_with_the_window_and_stops_at_52() {
+        let (window, _ipc, _sent) = open("scale");
+        one(&window, "Change hotkey").invoke_accessible_default_action();
+        let cap = |w: f32| {
+            window.window().set_size(slint::LogicalSize::new(w, 900.0));
+            one(&window, "F1").size().width
+        };
+        let small = cap(720.0);
+        let default_size = cap(1280.0);
+        let middle = cap(1120.0);
+        let large = cap(1600.0);
+        let huge = cap(2400.0);
+        // A cap is the unit less its gap: 28 px units give 25 px caps, 43 give 39.6, 52 give 47.8.
+        assert!((small - 25.0).abs() < 0.01, "720: {small}");
+        assert!(
+            (default_size - 43.0 * 0.92).abs() < 0.5,
+            "1280: {default_size}"
+        );
+        assert!((32.0..36.0).contains(&middle), "1120: {middle}");
+        assert!((large - 52.0 * 0.92).abs() < 0.5, "1600: {large}");
+        assert!((huge - large).abs() < 0.01, "stopped growing: {huge}");
+    }
 
     #[test]
-    fn no_cap_text_falls_below_the_floor_at_the_smallest_window() {
-        let (window, _ipc, _sent) = open("labels");
-        window
-            .window()
-            .set_size(slint::LogicalSize::new(560.0, 600.0));
-        one(&window, "Change hotkey").invoke_accessible_default_action();
-        // The font comes from the component's own `CapFont`, the one every cap uses. The floor
-        // must only absorb rounding: a word that needs a smaller font would not fit its cap.
-        let font = window.global::<crate::generated::CapFont>();
-        let mut smallest = f32::MAX;
-        for cap in super::keyboard_layout::caps() {
-            let label = cap.key.label();
-            let room = one(&window, &cap.key.spoken()).size().width - 2.0;
-            let word = super::longest_word(label);
-            let fitted = font.invoke_fit(room, word);
-            assert!(fitted >= CAP_FONT_FLOOR - 0.1, "{label}: {fitted} px");
-            smallest = smallest.min(font.invoke_size(room, word));
-        }
+    fn the_cap_label_size_stays_readable_at_every_unit() {
+        let (window, _ipc, _sent) = open("label-size");
+        let theme = window.global::<Theme>();
         assert!(
-            smallest >= CAP_FONT_FLOOR,
-            "smallest cap font: {smallest} px"
+            (theme.invoke_keycap_label_size(28.0) - 12.0).abs() < 0.01,
+            "floor"
         );
+        assert!(
+            (theme.invoke_keycap_label_size(52.0) - 15.0).abs() < 0.01,
+            "ceiling"
+        );
+    }
+
+    /// In the real font (the testing backend's text metrics are fake), so Windows only.
+    #[cfg(windows)]
+    #[test]
+    fn every_label_fits_its_cap_on_one_line() {
+        std::thread::spawn(measure_labels).join().unwrap();
+    }
+
+    #[cfg(windows)]
+    fn measure_labels() {
+        use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
+        use slint::platform::{Platform, WindowAdapter};
+
+        slint::slint! {
+            export component Measure inherits Window {
+                in property <string> family;
+                in property <string> label;
+                in property <length> size;
+                out property <length> needed: t.preferred-width;
+                default-font-family: root.family;
+                t := Text {
+                    text: root.label;
+                    font-size: root.size;
+                    wrap: no-wrap;
+                }
+            }
+        }
+        struct Real;
+        impl Platform for Real {
+            fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
+                Ok(MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer))
+            }
+        }
+        slint::platform::set_platform(Box::new(Real)).unwrap();
+        let window = crate::open(crate::testing::layout("hotkey", "measure")).unwrap();
+        let theme = window.global::<Theme>();
+        let measure = Measure::new().unwrap();
+        measure.set_family(theme.get_font_family());
+        for cap in super::keyboard_layout::caps() {
+            let from = super::keyboard_layout::full_from(cap.key);
+            for unit in [28.0, 30.0, 35.9, 36.0, 40.9, 41.0, 43.0, 52.0] {
+                let label = super::keyboard_layout::cap_label(cap.key, unit >= from);
+                measure.set_label(label.into());
+                measure.set_size(theme.invoke_keycap_label_size(unit));
+                // The cap less its gap and the 2 px Keycap keeps on each side of the label.
+                let room = cap.w * unit - theme.invoke_keycap_gap_for(unit) - 4.0;
+                assert!(
+                    measure.get_needed() <= room,
+                    "{label} needs {} px, has {room} at unit {unit}",
+                    measure.get_needed()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn esc_in_a_chord_is_marked_invalid_on_its_cap() {
+        let (window, ipc, _sent) = open("invalid-cap");
+        one(&window, "Change hotkey").invoke_accessible_default_action();
+        key(&ipc, Key::LCtrl, true);
+        key(&ipc, Key::Esc, true);
+        let caps = window.global::<HotkeyState>().get_caps();
+        let esc = slint::Model::iter(&caps)
+            .find(|c| c.name == Key::Esc.as_str())
+            .unwrap();
+        assert!(esc.invalid);
+        let ctrl = slint::Model::iter(&caps)
+            .find(|c| c.name == Key::LCtrl.as_str())
+            .unwrap();
+        assert!(!ctrl.invalid);
     }
 
     #[test]

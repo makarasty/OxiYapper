@@ -43,6 +43,7 @@ export global Theme {
     out property <length> control-height: 32px;
     out property <length> control-column-min: 240px;
     out property <length> control-column-max: 360px;
+    out property <length> segmented-min-width: 180px;
 
     // 1.2 Radii.
     out property <length> radius-control: 4px;
@@ -53,6 +54,9 @@ export global Theme {
     }
     public pure function keycap-gap-for(unit: length) -> length {
         return max(3px, unit * 0.08);
+    }
+    public pure function keycap-label-size(unit: length) -> length {
+        return clamp(unit * 0.30, 12px, 15px);
     }
 
     // 1.3 Type: Fluent ramp, Regular 400 and Semibold 600 only. Slint 1.18 has no line height:

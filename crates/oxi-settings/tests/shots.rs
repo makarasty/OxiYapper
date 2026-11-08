@@ -24,7 +24,7 @@ use slint::{Color, ComponentHandle, PhysicalSize, PlatformError};
 use tiny_skia::{IntSize, Pixmap};
 
 /// The default window size (spec section 2 on a large screen) and the minimum.
-const DEFAULT: (f32, f32) = (1120.0, 780.0);
+const DEFAULT: (f32, f32) = (1280.0, 800.0);
 const MIN: (f32, f32) = (720.0, 520.0);
 const SIZES: [(f32, f32); 2] = [DEFAULT, MIN];
 const THEMES: [(&str, ThemeChoice); 2] =
@@ -165,7 +165,7 @@ fn shot_main() {
 fn shot_main_scaled() {
     let window = open("main-1.5x", None);
     let pixmap = render(&window, DEFAULT, 1.5);
-    assert_eq!((pixmap.width(), pixmap.height()), (1680, 1170));
+    assert_eq!((pixmap.width(), pixmap.height()), (1920, 1200));
     save(&pixmap, "main-1.5x-system");
 }
 
@@ -366,6 +366,34 @@ fn shot_keyboard_ready() {
             key(ipc, k, false);
         }
     });
+}
+
+#[test]
+fn shot_keyboard_large() {
+    // The board at the widest window it grows to: Ctrl + F13 picked, Space down.
+    for (theme, choice) in THEMES {
+        SIZE.set((1600.0, 1000.0));
+        let _ = slint::platform::set_platform(Box::new(Shots));
+        let (ipc, _sent) = Ipc::fake();
+        let layout = common::layout("keyboard-large", None);
+        let window = oxi_settings::open_with(layout, ipc.clone()).unwrap();
+        window.set_page(Page::Hotkey);
+        window.set_theme(choice);
+        window.show().unwrap();
+        ElementHandle::find_by_accessible_label(&window, "Change hotkey")
+            .next()
+            .unwrap()
+            .invoke_accessible_default_action();
+        for k in [Key::LCtrl, Key::F13] {
+            key(&ipc, k, true);
+        }
+        key(&ipc, Key::F13, false);
+        key(&ipc, Key::Space, true);
+        save(
+            &render(&window, (1600.0, 1000.0), 1.0),
+            &format!("keyboard-1600-{theme}"),
+        );
+    }
 }
 
 #[test]
@@ -661,6 +689,20 @@ fn shot_text_worst_case() {
 #[test]
 fn shot_overlay() {
     shot("overlay", Page::Overlay, None);
+}
+
+#[test]
+fn shot_overlay_narrow() {
+    // Under 640 px of content the Preview goes below the picker; tall enough to show it.
+    for (theme, choice) in THEMES {
+        let window = open("overlay-narrow", None);
+        window.set_page(Page::Overlay);
+        window.set_theme(choice);
+        save(
+            &render(&window, (720.0, 900.0), 1.0),
+            &format!("overlay-narrow-{theme}"),
+        );
+    }
 }
 
 #[test]
