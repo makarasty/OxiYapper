@@ -56,6 +56,7 @@ pub enum Error {
 pub fn run() -> Result<(), Error> {
     let layout = oxi_platform::dirs::layout()?;
     oxi_platform::dirs::ensure(&layout)?;
+    use_skia();
     // The window comes first: it sets up the Slint platform, and the worker's events need that
     // to reach the UI thread.
     let window = open_inner(layout, |window| {
@@ -85,6 +86,17 @@ pub fn run() -> Result<(), Error> {
     });
     window.run()?;
     Ok(())
+}
+
+/// Picks Skia's CPU raster surface. Its text is the same as on Skia's GPU surface (real-window
+/// captures), with gamma and hinting the software renderer lacks, and it needs no GPU, so it also
+/// runs over RDP; measured with the window open, 69 MB private bytes against 272 MB on D3D.
+fn use_skia() {
+    // Skia is built on Windows only. On failure Slint picks its default renderer at the first window.
+    #[cfg(windows)]
+    let _ = slint::BackendSelector::new()
+        .renderer_name("skia-software".into())
+        .select();
 }
 
 /// `spawn` that also shows why it failed (the error kind only) in the window.
