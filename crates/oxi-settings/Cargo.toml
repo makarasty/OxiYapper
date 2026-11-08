@@ -16,8 +16,11 @@ slint = { workspace = true, features = ["std", "compat-1-18", "backend-winit", "
 thiserror.workspace = true
 
 # Native file dialog for "use my own .bin"; Windows only, so Linux CI pulls no GTK or portal.
+# Skia's CPU surface draws sharper text than the software renderer (numbers at `use_skia`); the
+# software renderer is the fallback (`OXI_RENDERER=software`, or when Skia fails to start).
 [target.'cfg(windows)'.dependencies]
 rfd.workspace = true
+slint = { workspace = true, features = ["renderer-skia", "accessibility"] }
 
 [build-dependencies]
 slint-build.workspace = true

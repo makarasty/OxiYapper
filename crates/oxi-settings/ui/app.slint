@@ -1,7 +1,7 @@
-// Settings window (ARCHITECTURE section 4): one compact panel, a slim page rail on the left,
-// the page on the right, no scrolling (SPEC Settings UI).
-import { Palette, Button } from "std-widgets.slint";
-import { Shell, Banner } from "widgets.slint";
+// Settings window (redesign spec sections 2 and 3): a nav rail with icons on the left (icons only
+// under 960 px), the page on the right in a scrolling column of at most 880 px, banners above it.
+import { Palette, ScrollView } from "std-widgets.slint";
+import { Theme, Shell, Icons, KeyFocus, Tip, Button, Banner, Severity, PageHeader } from "theme/index.slint";
 import { HotkeyPage, HotkeyState } from "pages/hotkey.slint";
 import { KeyCap, CapFont } from "keyboard.slint";
 import { AudioPage, AudioState, AudioKey } from "pages/audio.slint";
@@ -15,12 +15,22 @@ export { Shell, ThemeChoice, HotkeyState, KeyCap, CapFont, AudioState, AudioKey,
 
 export enum Page { hotkey, audio, model, text, overlay, system, about }
 
-// One page tab of the rail; Tab focuses it, Enter or Space opens it.
-component RailItem inherits FocusScope {
+// The daemon chip at the foot of the rail; `hidden` when the window follows no daemon.
+export enum DaemonStatus { hidden, running, stopped, stuck }
+
+// One page of the rail. Selected: neutral fill, 3x16 accent pill, filled icon in accent; the label
+// keeps its weight so nothing moves. The rail owns focus; `focused` draws the ring inside.
+component NavItem inherits Rectangle {
     in property <string> label;
+    in property <image> icon;
+    in property <image> icon-selected;
     in property <bool> selected;
+    in property <bool> compact;
+    in property <bool> focused;
     callback activated();
-    height: 30px;
+    height: 40px;
+    border-radius: Theme.radius-control;
+    background: root.selected ? Theme.bg-subtle-selected : touch.has-hover ? Theme.bg-subtle-hover : transparent;
     accessible-role: tab;
     accessible-label: root.label;
     accessible-item-selectable: true;
@@ -28,38 +38,89 @@ component RailItem inherits FocusScope {
     accessible-action-default => {
         root.activated();
     }
-    key-pressed(event) => {
-        if (event.text == Key.Return || event.text == " ") {
+    Rectangle {
+        x: 0;
+        y: (root.height - 16px) / 2;
+        width: 3px;
+        height: 16px;
+        border-radius: 1.5px;
+        background: Theme.accent;
+        visible: root.selected;
+    }
+    Image {
+        x: root.compact ? (root.width - 20px) / 2 : 12px;
+        y: (root.height - 20px) / 2;
+        width: 20px;
+        height: 20px;
+        source: root.selected ? root.icon-selected : root.icon;
+        colorize: root.selected ? Theme.accent-text : Theme.text-primary;
+        accessible-role: none;
+    }
+    if !root.compact: Text {
+        x: 44px;
+        width: root.width - 52px;
+        text: root.label;
+        font-size: Theme.body-size;
+        color: Theme.text-primary;
+        vertical-alignment: center;
+        overflow: elide;
+        accessible-role: none;
+    }
+    touch := TouchArea {
+        clicked => {
             root.activated();
-            return accept;
         }
-        reject
+    }
+    Tip {
+        text: root.compact ? root.label : "";
+        hovered: touch.has-hover;
     }
     Rectangle {
+        visible: root.focused;
+        border-width: 2px;
+        border-color: Theme.focus-outer;
+        border-radius: Theme.radius-control;
+    }
+}
+
+// Daemon state: 8 px dot and a caption; a click starts or restarts it, as the banner's button does.
+component StatusChip inherits Rectangle {
+    in property <DaemonStatus> status;
+    in property <bool> compact;
+    callback clicked();
+    property <string> text: root.status == DaemonStatus.running ? @tr("Running") : root.status == DaemonStatus.stopped ? @tr("Not running") : @tr("Not answering");
+    height: 32px;
+    border-radius: Theme.radius-control;
+    background: touch.has-hover ? Theme.bg-subtle-hover : transparent;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => {
+        root.clicked();
+    }
+    Rectangle {
+        x: root.compact ? (root.width - 8px) / 2 : 18px;
+        y: (root.height - 8px) / 2;
+        width: 8px;
+        height: 8px;
         border-radius: 4px;
-        border-width: root.has-focus ? 1px : 0;
-        border-color: Palette.accent-background;
-        background: root.selected ? Palette.selection-background.transparentize(0.6) : touch.has-hover ? Palette.border.transparentize(0.6) : transparent;
-        Rectangle {
-            x: 0;
-            width: 3px;
-            height: 16px;
-            border-radius: 1.5px;
-            background: Palette.accent-background;
-            visible: root.selected;
+        background: root.status == DaemonStatus.running ? Theme.success-text : root.status == DaemonStatus.stopped ? Theme.warning-text : Theme.error-text;
+    }
+    if !root.compact: Text {
+        x: 38px;
+        text: root.text;
+        font-size: Theme.caption-size;
+        color: Theme.text-secondary;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
         }
-        Text {
-            x: 12px;
-            text: root.label;
-            vertical-alignment: center;
-            color: Palette.foreground;
-            font-weight: root.selected ? 600 : 400;
-        }
-        touch := TouchArea {
-            clicked => {
-                root.activated();
-            }
-        }
+    }
+    Tip {
+        text: root.compact ? root.text : "";
+        hovered: touch.has-hover;
     }
 }
 
@@ -80,30 +141,43 @@ export component AppWindow inherits Window {
     in property <string> daemon-text;
     in property <bool> daemon-start;
     in property <bool> daemon-restart;
+    in property <DaemonStatus> daemon-status;
     // Why the last daemon start failed; shown under the notice.
     in property <string> spawn-error;
+    // How far the open page is scrolled (0 at the top, negative below).
+    out property <length> scroll-y: scroll.content-y;
     callback theme-changed(ThemeChoice);
     callback start-daemon();
     callback restart-daemon();
     callback open-file();
     callback reset-config();
 
-    title: root.app-name;
-    preferred-width: 560px;
-    preferred-height: 600px;
-    min-width: 560px;
-    min-height: 600px;
-    background: Palette.background;
+    title: @tr("{} settings", root.app-name);
+    icon: @image-url("theme/logo.svg");
+    default-font-family: Theme.font-family;
+    preferred-width: 1120px;
+    preferred-height: 780px;
+    min-width: 720px;
+    min-height: 520px;
+    background: Theme.bg-page;
+    forward-focus: keys;
 
-    property <[{page: Page, label: string}]> rail: [
-        { page: Page.hotkey, label: @tr("Hotkey") },
-        { page: Page.audio, label: @tr("Audio") },
-        { page: Page.model, label: @tr("Model") },
-        { page: Page.text, label: @tr("Text") },
-        { page: Page.overlay, label: @tr("Overlay") },
-        { page: Page.system, label: @tr("System") },
-        { page: Page.about, label: @tr("About") },
+    property <bool> compact: root.width < 960px;
+    property <length> pad: root.width < 900px ? Theme.page-padding-narrow : Theme.page-padding;
+    property <length> content-max: root.page == Page.hotkey && HotkeyState.keyboard-open ? 1200px : 880px;
+    property <[{page: Page, label: string, icon: image, filled: image}]> rail: [
+        { page: Page.hotkey, label: @tr("Hotkey"), icon: Icons.keyboard, filled: Icons.keyboard-filled },
+        { page: Page.audio, label: @tr("Audio"), icon: Icons.mic, filled: Icons.mic-filled },
+        { page: Page.model, label: @tr("Model"), icon: Icons.brain-circuit, filled: Icons.brain-circuit-filled },
+        { page: Page.text, label: @tr("Text"), icon: Icons.text-t, filled: Icons.text-t-filled },
+        { page: Page.overlay, label: @tr("Overlay"), icon: Icons.slide-text, filled: Icons.slide-text-filled },
+        { page: Page.system, label: @tr("System"), icon: Icons.settings, filled: Icons.settings-filled },
+        { page: Page.about, label: @tr("About"), icon: Icons.info, filled: Icons.info-filled },
     ];
+
+    pure function index-of(p: Page) -> int {
+        return p == Page.hotkey ? 0 : p == Page.audio ? 1 : p == Page.model ? 2 : p == Page.text ? 3 : p == Page.overlay ? 4 : p == Page.system ? 5 : 6;
+    }
 
     // System follows the OS: `unknown` makes the style read the OS scheme.
     function apply-theme() {
@@ -115,82 +189,194 @@ export component AppWindow inherits Window {
     changed theme => {
         root.apply-theme();
     }
+    changed page => {
+        // The rail follows a page opened by Ctrl+Tab; the page opens at its top.
+        nav.cursor = root.index-of(root.page);
+        scroll.content-y = 0;
+        // The focused field may have left with the old page, and Ctrl+Tab needs a focus to reach
+        // `keys`. The rail keeps its own focus.
+        if (!nav.has-focus) {
+            keys.focus();
+        }
+    }
 
-    HorizontalLayout {
-        Rectangle {
-            width: 112px;
-            background: Palette.alternate-background;
+    // Ctrl+Tab and Ctrl+Shift+Tab cycle the pages from anywhere, before a focused field sees them.
+    keys := FocusScope {
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
+        capture-key-pressed(event) => {
+            if (event.modifiers.control && (event.text == Key.Tab || event.text == Key.Backtab)) {
+                let step = event.modifiers.shift || event.text == Key.Backtab ? root.rail.length - 1 : 1;
+                root.page = root.rail[Math.mod(root.index-of(root.page) + step, root.rail.length)].page;
+                return accept;
+            }
+            reject
+        }
+
+        // Placed by hand, not in a layout: the rail width follows the window width, which a layout
+        // would feed back into the window's minimum size.
+        nav := FocusScope {
+            x: 0;
+            y: 0;
+            width: root.compact ? 56px : 220px;
+            height: parent.height;
+            accessible-role: tab-list;
+            property <int> cursor;
+            property <bool> key-focus;
+            focus-gained(reason) => {
+                self.cursor = root.index-of(root.page);
+                self.key-focus = KeyFocus.from-key(reason);
+            }
+            // Up and Down move the focus between pages; Enter or Space opens one.
+            key-pressed(event) => {
+                if (event.text == Key.UpArrow || event.text == Key.DownArrow) {
+                    self.cursor = clamp(self.cursor + (event.text == Key.UpArrow ? -1 : 1), 0, root.rail.length - 1);
+                    self.key-focus = true;
+                    return accept;
+                }
+                if (event.text == Key.Return || event.text == " ") {
+                    root.page = root.rail[self.cursor].page;
+                    return accept;
+                }
+                reject
+            }
             VerticalLayout {
-                padding: 8px;
-                spacing: 2px;
-                alignment: start;
-                for item in root.rail: RailItem {
+                padding-left: Theme.space-1;
+                padding-right: Theme.space-1;
+                padding-bottom: Theme.space-2;
+                spacing: Theme.space-1;
+                HorizontalLayout {
+                    height: 48px;
+                    padding-left: 12px;
+                    spacing: Theme.space-3;
+                    Image {
+                        source: @image-url("theme/logo.svg");
+                        width: 24px;
+                        height: 24px;
+                        y: 12px;
+                        accessible-role: none;
+                    }
+                    if !root.compact: Text {
+                        text: root.app-name;
+                        font-size: Theme.body-size;
+                        font-weight: Theme.weight-strong;
+                        color: Theme.text-primary;
+                        vertical-alignment: center;
+                        accessible-role: none;
+                    }
+                }
+                for item[i] in root.rail: NavItem {
                     label: item.label;
+                    icon: item.icon;
+                    icon-selected: item.filled;
                     selected: root.page == item.page;
+                    compact: root.compact;
+                    focused: nav.has-focus && nav.key-focus && nav.cursor == i;
                     activated => {
+                        nav.cursor = i;
                         root.page = item.page;
+                    }
+                }
+                Rectangle { }
+                if root.daemon-status != DaemonStatus.hidden: StatusChip {
+                    status: root.daemon-status;
+                    compact: root.compact;
+                    clicked => {
+                        if (root.daemon-start) {
+                            root.start-daemon();
+                        } else if (root.daemon-restart) {
+                            root.restart-daemon();
+                        }
                     }
                 }
             }
         }
 
         VerticalLayout {
-            padding: 12px;
-            spacing: 10px;
-            if root.banner-text != "": Banner {
-                text: root.banner-text;
-                error: root.banner-fixable;
-                if root.banner-fixable: Button {
-                    text: @tr("Open file");
-                    clicked => {
-                        root.open-file();
+            x: nav.width;
+            y: 0;
+            width: parent.width - nav.width;
+            height: parent.height;
+            if root.banner-text != "" || root.daemon-text != "" || root.action-error != "": HorizontalLayout {
+                padding-left: root.pad;
+                padding-top: Theme.space-4;
+                alignment: start;
+                VerticalLayout {
+                    width: min(root.content-max, parent.width - 2 * root.pad);
+                    spacing: Theme.space-2;
+                    if root.banner-text != "": Banner {
+                        text: root.banner-text;
+                        severity: root.banner-fixable ? Severity.error : Severity.warning;
+                        if root.banner-fixable: Button {
+                            text: @tr("Open file");
+                            clicked => {
+                                root.open-file();
+                            }
+                        }
+                        if root.banner-fixable: Button {
+                            text: @tr("Reset to defaults");
+                            clicked => {
+                                root.reset-config();
+                            }
+                        }
+                    }
+                    if root.daemon-text != "": Banner {
+                        text: root.spawn-error == "" ? root.daemon-text : root.daemon-text + " " + root.spawn-error;
+                        severity: root.spawn-error != "" ? Severity.error : Severity.warning;
+                        if root.daemon-start: Button {
+                            text: @tr("Start");
+                            clicked => {
+                                root.start-daemon();
+                            }
+                        }
+                        if root.daemon-restart: Button {
+                            text: @tr("Restart");
+                            clicked => {
+                                root.restart-daemon();
+                            }
+                        }
+                    }
+                    if root.action-error != "": Banner {
+                        text: root.action-error;
+                        severity: Severity.error;
                     }
                 }
-                if root.banner-fixable: Button {
-                    text: @tr("Reset to defaults");
-                    clicked => {
-                        root.reset-config();
+            }
+
+            // One scroll area for the open page (back at the top on a page change); the scrollbar sits at the window edge, right of the cards.
+            scroll := ScrollView {
+                vertical-stretch: 1;
+                content-width: self.visible-width;
+                content-height: max(self.visible-height, column.preferred-height);
+                column := VerticalLayout {
+                    x: 0;
+                    width: min(scroll.visible-width, root.content-max + 2 * root.pad);
+                    padding-left: root.pad;
+                    padding-right: root.pad;
+                    padding-bottom: Theme.space-8;
+                    alignment: start;
+                    PageHeader {
+                        title: root.rail[root.index-of(root.page)].label;
+                    }
+                    if root.page == Page.hotkey: HotkeyPage { }
+                    if root.page == Page.audio: AudioPage { }
+                    if root.page == Page.model: ModelPage { }
+                    if root.page == Page.text: TextPage { }
+                    if root.page == Page.overlay: OverlayPage { }
+                    if root.page == Page.system: SystemPage {
+                        theme: root.theme;
+                        theme-picked(choice) => {
+                            root.theme = choice;
+                            root.theme-changed(choice);
+                        }
+                    }
+                    if root.page == Page.about: AboutPage {
+                        app-name: root.app-name;
+                        version: root.version;
+                        licence: root.licence;
                     }
                 }
             }
-            if root.daemon-text != "": Banner {
-                text: root.spawn-error == "" ? root.daemon-text : root.daemon-text + " " + root.spawn-error;
-                error: root.spawn-error != "";
-                if root.daemon-start: Button {
-                    text: @tr("Start");
-                    clicked => {
-                        root.start-daemon();
-                    }
-                }
-                if root.daemon-restart: Button {
-                    text: @tr("Restart");
-                    clicked => {
-                        root.restart-daemon();
-                    }
-                }
-            }
-            if root.action-error != "": Banner {
-                text: root.action-error;
-                error: true;
-            }
-            if root.page == Page.hotkey: HotkeyPage { }
-            if root.page == Page.audio: AudioPage { }
-            if root.page == Page.model: ModelPage { }
-            if root.page == Page.text: TextPage { }
-            if root.page == Page.overlay: OverlayPage { }
-            if root.page == Page.system: SystemPage {
-                theme: root.theme;
-                theme-picked(choice) => {
-                    root.theme = choice;
-                    root.theme-changed(choice);
-                }
-            }
-            if root.page == Page.about: AboutPage {
-                app-name: root.app-name;
-                version: root.version;
-                licence: root.licence;
-            }
-            Rectangle { }
         }
     }
 }

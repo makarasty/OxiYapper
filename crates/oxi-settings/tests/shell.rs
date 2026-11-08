@@ -375,3 +375,162 @@ fn a_file_fixed_outside_drops_the_daemons_config_error() {
     poll();
     assert_eq!(banners(&window), Vec::<String>::new());
 }
+
+fn press(window: &AppWindow, key: impl Into<slint::SharedString> + Clone) {
+    window.window().dispatch_event(WindowEvent::KeyPressed {
+        text: key.clone().into(),
+    });
+    window
+        .window()
+        .dispatch_event(WindowEvent::KeyReleased { text: key.into() });
+}
+
+/// `key` with Ctrl (and Shift) held, as the platform delivers a chord.
+fn chord(window: &AppWindow, shift: bool, key: Key) {
+    let held: &[Key] = if shift {
+        &[Key::Control, Key::Shift]
+    } else {
+        &[Key::Control]
+    };
+    for k in held {
+        window
+            .window()
+            .dispatch_event(WindowEvent::KeyPressed { text: (*k).into() });
+    }
+    press(window, key);
+    for k in held.iter().rev() {
+        window
+            .window()
+            .dispatch_event(WindowEvent::KeyReleased { text: (*k).into() });
+    }
+}
+
+#[test]
+fn ctrl_tab_cycles_the_pages_both_ways() {
+    let window = open(&layout("ctrl-tab", None), Page::System);
+    chord(&window, false, Key::Tab);
+    assert_eq!(window.get_page(), Page::About);
+    chord(&window, false, Key::Tab);
+    assert_eq!(window.get_page(), Page::Hotkey, "wraps to the first page");
+    chord(&window, true, Key::Tab);
+    assert_eq!(window.get_page(), Page::About, "Ctrl+Shift+Tab goes back");
+    chord(&window, true, Key::Backtab);
+    assert_eq!(window.get_page(), Page::System);
+}
+
+#[test]
+fn ctrl_tab_keeps_working_after_the_focused_field_leaves_with_its_page() {
+    let window = open(&layout("ctrl-tab-focus", None), Page::Hotkey);
+    // The rail, then the first field of the page.
+    press(&window, Key::Tab);
+    press(&window, Key::Tab);
+    for want in [Page::Audio, Page::Model, Page::Text] {
+        chord(&window, false, Key::Tab);
+        assert_eq!(window.get_page(), want);
+    }
+}
+
+#[test]
+fn rail_cursor_follows_the_page_ctrl_tab_opened() {
+    let window = open(&layout("rail-cursor", None), Page::Hotkey);
+    press(&window, Key::Tab);
+    chord(&window, false, Key::Tab);
+    assert_eq!(window.get_page(), Page::Audio);
+    press(&window, Key::Return);
+    assert_eq!(
+        window.get_page(),
+        Page::Audio,
+        "Enter opens the page it is on"
+    );
+    press(&window, Key::DownArrow);
+    press(&window, Key::Return);
+    assert_eq!(
+        window.get_page(),
+        Page::Model,
+        "arrows start from the open page"
+    );
+}
+
+#[test]
+fn a_page_opens_at_its_top() {
+    let window = open(&layout("scroll-top", None), Page::Audio);
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(720.0, 520.0));
+    window
+        .window()
+        .dispatch_event(WindowEvent::PointerScrolled {
+            position: slint::LogicalPosition::new(500.0, 300.0),
+            delta_x: 0.0,
+            delta_y: -400.0,
+        });
+    assert!(window.get_scroll_y() < 0.0, "Audio scrolls at 720 x 520");
+    window.set_page(Page::About);
+    // The event loop runs the change handlers; the testing backend has none.
+    slint::platform::update_timers_and_animations();
+    assert_eq!(window.get_scroll_y(), 0.0, "About opens at its top");
+    window.set_page(Page::Audio);
+    slint::platform::update_timers_and_animations();
+    assert_eq!(window.get_scroll_y(), 0.0, "and so does Audio again");
+}
+
+#[test]
+fn rail_takes_up_down_and_enter() {
+    let window = open(&layout("rail-keys", None), Page::Hotkey);
+    // The first Tab stop is the rail; the focus starts on the open page.
+    press(&window, Key::Tab);
+    press(&window, Key::DownArrow);
+    press(&window, Key::DownArrow);
+    assert_eq!(
+        window.get_page(),
+        Page::Hotkey,
+        "arrows only move the focus"
+    );
+    press(&window, Key::Return);
+    assert_eq!(window.get_page(), Page::Model);
+    press(&window, Key::UpArrow);
+    press(&window, Key::UpArrow);
+    press(&window, Key::UpArrow);
+    press(&window, " ");
+    assert_eq!(window.get_page(), Page::Hotkey, "stops at the first page");
+}
+
+#[test]
+fn rail_turns_compact_under_960_px() {
+    let window = open(&layout("compact", None), Page::Hotkey);
+    let width = |w: f32| {
+        window.window().set_size(slint::LogicalSize::new(w, 780.0));
+        tab(&window, "Audio").size().width
+    };
+    assert!((width(1120.0) - 212.0).abs() < 0.5, "full rail");
+    assert!((width(959.0) - 48.0).abs() < 0.5, "icons only");
+    assert!((width(960.0) - 212.0).abs() < 0.5, "full again at 960");
+}
+
+#[test]
+fn daemon_chip_shows_the_state_and_starts_the_daemon() {
+    let (window, ipc, rx) = linked("chip");
+    assert_eq!(
+        window.get_daemon_status(),
+        oxi_settings::DaemonStatus::Running
+    );
+    assert!(has(&window, "Running"));
+    ipc.deliver(&Event::Link(Link::Offline));
+    with_role(&window, "Not running", AccessibleRole::Button).invoke_accessible_default_action();
+    assert_eq!(rx.try_recv(), Ok(Cmd::Start));
+    ipc.deliver(&Event::Link(Link::Mismatch { daemon_proto: 9 }));
+    with_role(&window, "Running", AccessibleRole::Button).invoke_accessible_default_action();
+    assert_eq!(rx.try_recv(), Ok(Cmd::Restart));
+    ipc.deliver(&Event::Link(Link::Stuck));
+    assert!(has(&window, "Not answering"));
+
+    let alone = common::open_again(&layout("chip-none", None), Page::Hotkey);
+    assert_eq!(
+        alone.get_daemon_status(),
+        oxi_settings::DaemonStatus::Hidden
+    );
+    assert!(
+        !has(&alone, "Running") && !has(&alone, "Not running"),
+        "no link, no chip"
+    );
+}

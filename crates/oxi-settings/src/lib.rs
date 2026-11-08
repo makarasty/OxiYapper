@@ -12,8 +12,12 @@ use std::time::Duration;
 
 use oxi_core::config::{ConfigError, Theme};
 use oxi_core::ipc::Push;
+#[cfg(windows)]
+use oxi_core::overlay::Rect;
 use oxi_core::paths::Layout;
-use slint::{ComponentHandle, Timer, TimerMode, Weak};
+use slint::{Color, ComponentHandle, Timer, TimerMode, Weak};
+#[cfg(windows)]
+use slint::{LogicalSize, PhysicalPosition};
 
 pub use ctx::Ctx;
 pub use ipc::Ipc;
@@ -24,13 +28,24 @@ use ipc::{Action, Event, Link, Options};
 mod generated {
     slint::include_modules!();
 }
-pub use generated::{AppWindow, Page, Shell, ThemeChoice};
+pub use generated::{AppWindow, DaemonStatus, Page, Shell, ThemeChoice};
 
 /// How often the window looks for an edit of `config.toml` from outside (an editor, "Open
 /// file"): a fixed file clears the banner and refreshes the pages without reopening.
 // shortcut: a metadata poll, not a file watcher (`notify` is not a dependency of this crate);
 // switch to a watcher if the second of delay matters.
 pub const FILE_POLL: Duration = Duration::from_secs(1);
+
+/// The accent the std widgets (`LineEdit`, `TextEdit`, `ComboBox`) derive their focus line and
+/// selection from: our teal (token `accent`), never the Windows accent (redesign spec 7.3).
+const ACCENT: Color = Color::from_rgb_u8(0x0F, 0x76, 0x6E);
+
+/// Default size: `min(1120, 85 %)` x `min(780, 88 %)` of the work area, at least the 720 x 520
+/// minimum (redesign spec section 2).
+#[cfg(windows)]
+const DEFAULT: (f32, f32) = (1120.0, 780.0);
+#[cfg(windows)]
+const MIN: (f32, f32) = (720.0, 520.0);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -46,6 +61,19 @@ pub enum Error {
 pub fn run() -> Result<(), Error> {
     let layout = oxi_platform::dirs::layout()?;
     oxi_platform::dirs::ensure(&layout)?;
+    let skia = use_skia();
+    match show(layout) {
+        // Skia is built into this process, but its surface can fail at the first show (no usable
+        // display driver); the platform cannot be re-selected after that, so run a fresh process.
+        Err(Error::Ui(e)) if skia => {
+            eprintln!("skia renderer failed ({e}); retrying with the software renderer");
+            rerun_with_software(e)
+        }
+        result => result,
+    }
+}
+
+fn show(layout: Layout) -> Result<(), Error> {
     // The window comes first: it sets up the Slint platform, and the worker's events need that
     // to reach the UI thread.
     let window = open_inner(layout, |window| {
@@ -53,15 +81,81 @@ pub fn run() -> Result<(), Error> {
         options.spawn = watch_spawn(options.spawn, window.as_weak());
         Ok(Some(Ipc::connect(options)?))
     })?;
+    #[cfg(windows)]
+    if let Ok((area, scale)) = oxi_platform::os::display::work_area() {
+        let (size, position) = placement(area, scale);
+        window.window().set_size(size);
+        window.window().set_position(position);
+    }
     // A window opened by a second launch must not show behind the app the user is in; the
     // daemon allowed this process to take the foreground. The callback runs once the event loop
     // has created and shown the window.
     #[cfg(windows)]
-    let _ = slint::invoke_from_event_loop(|| {
-        oxi_platform::os::foreground::raise_current_thread_window();
+    let _ = slint::invoke_from_event_loop({
+        let weak = window.as_weak();
+        move || {
+            // The backend wrote the system accent when it created the window.
+            if let Some(window) = weak.upgrade() {
+                own_accent(&window);
+            }
+            oxi_platform::os::foreground::raise_current_thread_window();
+        }
     });
     window.run()?;
     Ok(())
+}
+
+/// Env var that forces the software renderer; also how a failed Skia run restarts itself.
+#[cfg(windows)]
+const RENDERER_ENV: &str = "OXI_RENDERER";
+
+/// Slint's renderer name for the env var's value: Skia's CPU surface unless it says `software`.
+#[cfg(windows)]
+fn renderer_name(env: Option<&str>) -> &'static str {
+    if env == Some("software") {
+        "software"
+    } else {
+        "skia-software"
+    }
+}
+
+/// Picks Skia's CPU raster surface and says whether it did. Its text is the same as on Skia's GPU
+/// surface (real-window captures), with gamma and hinting the software renderer lacks, and it needs
+/// no GPU, so it also runs over RDP; measured with the window open, 69 MB private bytes against
+/// 272 MB on D3D. `OXI_RENDERER=software`, or a Skia that cannot be selected, picks the software
+/// renderer: never Slint's default, which would be Skia on D3D.
+fn use_skia() -> bool {
+    // Skia is built on Windows only; elsewhere Slint's only renderer is the software one.
+    #[cfg(windows)]
+    {
+        let name = renderer_name(std::env::var(RENDERER_ENV).ok().as_deref());
+        let select = |name: &str| {
+            slint::BackendSelector::new()
+                .renderer_name(name.into())
+                .select()
+        };
+        if select(name).is_ok() {
+            return name == "skia-software";
+        }
+        let _ = select("software");
+    }
+    false
+}
+
+/// Runs this program again with the software renderer and waits for it; `e` is what to report if
+/// that cannot start or fails too.
+fn rerun_with_software(e: slint::PlatformError) -> Result<(), Error> {
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(std::env::args_os().skip(1))
+            .env(RENDERER_ENV, "software")
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+    Err(Error::Ui(e))
 }
 
 /// `spawn` that also shows why it failed (the error kind only) in the window.
@@ -84,6 +178,34 @@ fn spawn_note(e: &io::Error) -> String {
     oxi_core::strings::spawn_failed(e.kind())
 }
 
+/// Logical size and physical top-left of a new window centred in `area` (physical pixels, at
+/// `scale`).
+#[cfg(windows)]
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)] // screen pixels
+fn placement(area: Rect, scale: f32) -> (LogicalSize, PhysicalPosition) {
+    let (w, h) = (area.w as f32 / scale, area.h as f32 / scale);
+    let size = LogicalSize::new(
+        DEFAULT.0.min(w * 0.85).max(MIN.0),
+        DEFAULT.1.min(h * 0.88).max(MIN.1),
+    );
+    let position = PhysicalPosition::new(
+        area.x + ((w - size.width) * scale / 2.0).round() as i32,
+        area.y + ((h - size.height) * scale / 2.0).round() as i32,
+    );
+    (size, position)
+}
+
+/// Puts our teal where Slint keeps the system accent, which the fluent std widgets tint from.
+// shortcut: private Slint API, safe only while `slint` is pinned `=1.18.1`; re-check it on every
+// Slint bump. The backend writes the system accent back when it creates the window and on a theme
+// change: `run` calls this once the window is up and the file poll repeats it (a no-op write when
+// nothing changed), so a new Windows accent can show for up to a second.
+fn own_accent(window: &AppWindow) {
+    slint::private_unstable_api::re_exports::WindowInner::from_pub(window.window())
+        .context()
+        .set_accent_color(ACCENT);
+}
+
 /// The settings window on `layout`'s config with no daemon link (it stays offline and shows no
 /// daemon banner); the caller shows it.
 pub fn open(layout: Layout) -> Result<AppWindow, Error> {
@@ -101,6 +223,7 @@ fn open_inner(
     link: impl FnOnce(&AppWindow) -> Result<Option<Ipc>, Error>,
 ) -> Result<AppWindow, Error> {
     let window = AppWindow::new()?;
+    own_accent(&window);
     let (mut ctx, problem) = Ctx::load(layout)?;
     let followed = link(&window)?;
     if let Some(ipc) = &followed {
@@ -149,6 +272,7 @@ fn open_inner(
         let (weak, c) = (window.as_weak(), ctx.clone());
         move || {
             if let Some(window) = weak.upgrade() {
+                own_accent(&window);
                 reload(&window, &c, linked);
             }
         }
@@ -218,6 +342,9 @@ fn on_daemon_event(window: &AppWindow, event: &Event) {
     if notice.is_none() && !matches!(event, Event::Link(_)) {
         return;
     }
+    if let Event::Link(link) = event {
+        window.set_daemon_status(status(*link));
+    }
     let action = notice.as_ref().and_then(|n| n.action);
     window.set_daemon_text(notice.map(|n| n.text).unwrap_or_default().into());
     window.set_daemon_start(action == Some(Action::Start));
@@ -225,6 +352,15 @@ fn on_daemon_event(window: &AppWindow, event: &Event) {
     // Connecting and Offline keep it: the failure is reported just before them.
     if matches!(event, Event::Link(link) if !matches!(link, Link::Connecting | Link::Offline)) {
         window.set_spawn_error("".into());
+    }
+}
+
+/// The rail's daemon chip for `link`.
+const fn status(link: Link) -> DaemonStatus {
+    match link {
+        Link::Online | Link::Mismatch { .. } => DaemonStatus::Running,
+        Link::Connecting | Link::Offline => DaemonStatus::Stopped,
+        Link::Busy | Link::Stuck | Link::Untrusted | Link::Foreign => DaemonStatus::Stuck,
     }
 }
 
@@ -264,10 +400,12 @@ const fn theme(choice: ThemeChoice) -> Theme {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppWindow, ThemeChoice, choice, spawn_note, theme};
+    use super::{AppWindow, DaemonStatus, Link, ThemeChoice, choice, spawn_note, status, theme};
     use oxi_core::config::Theme;
     use slint::ComponentHandle;
     use std::io::{Error, ErrorKind};
+    #[cfg(windows)]
+    use {super::placement, oxi_core::overlay::Rect};
 
     #[test]
     fn window_builds_under_the_testing_backend() {
@@ -294,6 +432,56 @@ mod tests {
             window.invoke_reset_config();
         }
         assert_eq!(ipc.subscribers(), 4);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn placement_fits_the_work_area_and_centres() {
+        let rect = |x, y, w, h| Rect { x, y, w, h };
+        // (work area, scale, logical size, physical top-left)
+        let cases = [
+            // 1920x1080 at 100 %, taskbar 48: the full default size.
+            (rect(0, 0, 1920, 1032), 1.0, (1120.0, 780.0), (400, 126)),
+            // 1366x768 laptop: 85 % of 1366 is 1161, 88 % of 720 is 633.6.
+            (rect(0, 0, 1366, 720), 1.0, (1120.0, 633.6), (123, 43)),
+            // 2560x1440 at 150 %: 1706x928 logical, the default size again.
+            (rect(0, 0, 2560, 1392), 1.5, (1120.0, 780.0), (440, 111)),
+            // A tiny screen still gets the minimum; a monitor left of the primary keeps its origin.
+            (rect(-800, 0, 800, 600), 1.0, (720.0, 528.0), (-760, 36)),
+        ];
+        for (area, scale, (w, h), (x, y)) in cases {
+            let (size, pos) = placement(area, scale);
+            assert!(
+                (size.width - w).abs() < 0.01 && (size.height - h).abs() < 0.01,
+                "{area:?}: {size:?}"
+            );
+            assert_eq!((pos.x, pos.y), (x, y), "{area:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_env_var_picks_the_software_renderer() {
+        use super::renderer_name;
+        assert_eq!(renderer_name(Some("software")), "software");
+        assert_eq!(renderer_name(None), "skia-software");
+        assert_eq!(renderer_name(Some("skia")), "skia-software");
+    }
+
+    #[test]
+    fn daemon_chip_follows_the_link() {
+        for (link, want) in [
+            (Link::Online, DaemonStatus::Running),
+            (Link::Mismatch { daemon_proto: 9 }, DaemonStatus::Running),
+            (Link::Connecting, DaemonStatus::Stopped),
+            (Link::Offline, DaemonStatus::Stopped),
+            (Link::Busy, DaemonStatus::Stuck),
+            (Link::Stuck, DaemonStatus::Stuck),
+            (Link::Untrusted, DaemonStatus::Stuck),
+            (Link::Foreign, DaemonStatus::Stuck),
+        ] {
+            assert_eq!(status(link), want, "{link:?}");
+        }
     }
 
     #[test]

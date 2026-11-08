@@ -1,7 +1,7 @@
 # cargo-deny: licences, advisories, bans, sources. Run: cargo deny check
 [graph]
 all-features = false
-# iOS-only i-slint-renderer-skia (GPL option) is not in these targets, so it is not checked.
+# i-slint-renderer-skia (Windows settings window) has the Slint licence exception below.
 targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "x86_64-apple-darwin", "aarch64-apple-darwin"]
 
 [advisories]
@@ -39,6 +39,7 @@ exceptions = [
     { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "i-slint-compiler" },
     { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "i-slint-core" },
     { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "i-slint-core-macros" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "i-slint-renderer-skia" },
     { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "i-slint-renderer-software" },
     { allow = ["MPL-2.0"], crate = "option-ext" }, # directories -> dirs-sys; file-level copyleft, unmodified
 ]

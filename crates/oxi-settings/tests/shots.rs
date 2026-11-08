@@ -1,5 +1,6 @@
-//! Every settings screen drawn by the software renderer, the one the app ships with. With
-//! `OXI_SHOTS_DIR` set, each lands in `settings-<screen>-<theme>.png` for visual review.
+//! Every settings screen drawn by the software renderer, at the default size and at the minimum
+//! size, light and dark. With `OXI_SHOTS_DIR` set, each lands in
+//! `settings-<screen>-<width>-<theme>.png` for visual review.
 
 mod common;
 
@@ -19,11 +20,24 @@ use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
 };
 use slint::platform::{Platform, WindowAdapter, WindowEvent};
-use slint::{ComponentHandle, PhysicalSize, PlatformError};
+use slint::{Color, ComponentHandle, PhysicalSize, PlatformError};
 use tiny_skia::{IntSize, Pixmap};
 
-const WIDTH: f32 = 560.0;
-const HEIGHT: f32 = 600.0;
+/// The default window size (spec section 2 on a large screen) and the minimum.
+const DEFAULT: (f32, f32) = (1120.0, 780.0);
+const MIN: (f32, f32) = (720.0, 520.0);
+const SIZES: [(f32, f32); 2] = [DEFAULT, MIN];
+const THEMES: [(&str, ThemeChoice); 2] =
+    [("light", ThemeChoice::Light), ("dark", ThemeChoice::Dark)];
+const PAGES: [(&str, Page); 7] = [
+    ("hotkey", Page::Hotkey),
+    ("audio", Page::Audio),
+    ("model", Page::Model),
+    ("text", Page::Text),
+    ("overlay", Page::Overlay),
+    ("system", Page::System),
+    ("about", Page::About),
+];
 
 thread_local! {
     /// The window of the component created last on this thread.
@@ -32,9 +46,18 @@ thread_local! {
 
 struct Shots;
 
+thread_local! {
+    /// The size `matrix` renders next; the window takes it when created, because the element
+    /// search finds only what is in view.
+    static SIZE: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new(DEFAULT) };
+}
+
 impl Platform for Shots {
     fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
         let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+        let (w, h) = SIZE.get();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // whole positive pixels
+        window.set_size(PhysicalSize::new(w as u32, h as u32));
         LAST.with_borrow_mut(|last| *last = Some(window.clone()));
         Ok(window)
     }
@@ -59,10 +82,11 @@ fn open_with(screen: &str, config: Option<&str>, prepare: fn(&Layout)) -> AppWin
     oxi_settings::open(layout).unwrap()
 }
 
-fn render(window: &AppWindow, scale: f32) -> Pixmap {
+/// `window` at `size` logical px and `scale`.
+fn render(window: &AppWindow, size: (f32, f32), scale: f32) -> Pixmap {
     let surface = LAST.with_borrow(Clone::clone).unwrap();
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // whole positive pixels
-    let (w, h) = ((WIDTH * scale) as u32, (HEIGHT * scale) as u32);
+    let (w, h) = ((size.0 * scale) as u32, (size.1 * scale) as u32);
     surface.dispatch_event(WindowEvent::ScaleFactorChanged {
         scale_factor: scale,
     });
@@ -82,37 +106,47 @@ fn render(window: &AppWindow, scale: f32) -> Pixmap {
     Pixmap::from_vec(bytes, IntSize::from_wh(w, h).unwrap()).unwrap()
 }
 
-fn save(pixmap: &Pixmap, screen: &str, theme: &str) {
+fn save(pixmap: &Pixmap, name: &str) {
     let pixels = pixmap.pixels();
-    assert!(
-        pixels.iter().any(|p| p.alpha() > 0),
-        "{screen} {theme} drew nothing"
-    );
+    assert!(pixels.iter().any(|p| p.alpha() > 0), "{name} drew nothing");
     assert!(
         pixels.iter().any(|p| *p != pixels[0]),
-        "{screen} {theme} is one flat colour"
+        "{name} is one flat colour"
     );
     if let Some(dir) = std::env::var_os("OXI_SHOTS_DIR") {
         let dir = PathBuf::from(dir);
         fs::create_dir_all(&dir).unwrap();
         pixmap
-            .save_png(dir.join(format!("settings-{screen}-{theme}.png")))
+            .save_png(dir.join(format!("settings-{name}.png")))
             .unwrap();
     }
 }
 
-/// `screen` in light and in dark.
+/// `screen` at both sizes in both themes; `make` opens the window in the theme it gets.
+fn matrix(screen: &str, make: impl Fn(ThemeChoice) -> AppWindow) {
+    for size in SIZES {
+        for (theme, choice) in THEMES {
+            SIZE.set(size);
+            let window = make(choice);
+            save(
+                &render(&window, size, 1.0),
+                &format!("{screen}-{}-{theme}", size.0),
+            );
+        }
+    }
+}
+
 fn shot(screen: &str, page: Page, config: Option<&str>) {
     shot_with(screen, page, config, |_| {});
 }
 
 fn shot_with(screen: &str, page: Page, config: Option<&str>, prepare: fn(&Layout)) {
-    for (theme, choice) in [("light", ThemeChoice::Light), ("dark", ThemeChoice::Dark)] {
+    matrix(screen, |choice| {
         let window = open_with(screen, config, prepare);
         window.set_page(page);
         window.set_theme(choice);
-        save(&render(&window, 1.0), screen, theme);
-    }
+        window
+    });
 }
 
 const NEWER: &str = "version = 99\n";
@@ -130,9 +164,127 @@ fn shot_main() {
 #[test]
 fn shot_main_scaled() {
     let window = open("main-1.5x", None);
-    let pixmap = render(&window, 1.5);
-    assert_eq!((pixmap.width(), pixmap.height()), (840, 900));
-    save(&pixmap, "main-1.5x", "system");
+    let pixmap = render(&window, DEFAULT, 1.5);
+    assert_eq!((pixmap.width(), pixmap.height()), (1680, 1170));
+    save(&pixmap, "main-1.5x-system");
+}
+
+#[test]
+fn shot_pages_scaled() {
+    for (screen, page) in PAGES {
+        let window = open("pages-1.5x", None);
+        window.set_page(page);
+        window.set_theme(ThemeChoice::Light);
+        save(
+            &render(&window, DEFAULT, 1.5),
+            &format!("{screen}-1.5x-light"),
+        );
+    }
+}
+
+#[test]
+fn shot_large() {
+    // The column stops at 880 px and the extra width stays empty on the right.
+    for (theme, choice) in THEMES {
+        for (screen, page) in [("audio", Page::Audio), ("hotkey", Page::Hotkey)] {
+            let window = open("large", None);
+            window.set_page(page);
+            window.set_theme(choice);
+            save(
+                &render(&window, (1600.0, 1000.0), 1.0),
+                &format!("{screen}-1600-{theme}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn shot_focused_nav() {
+    // Tab, then Down twice: the keyboard focus ring sits on Model, Hotkey stays selected.
+    use slint::platform::Key as K;
+    for (theme, choice) in THEMES {
+        for size in SIZES {
+            let window = open("focused-nav", None);
+            window.set_theme(choice);
+            let _ = render(&window, size, 1.0);
+            let surface = LAST.with_borrow(Clone::clone).unwrap();
+            for key in [K::Tab, K::DownArrow, K::DownArrow] {
+                surface.dispatch_event(WindowEvent::KeyPressed { text: key.into() });
+                surface.dispatch_event(WindowEvent::KeyReleased { text: key.into() });
+            }
+            save(
+                &render(&window, size, 1.0),
+                &format!("focused-nav-{}-{theme}", size.0),
+            );
+        }
+    }
+}
+
+/// A pixel of the purple system accent family: HSV hue 260..300 with chroma over 0.08 (the
+/// same test as `gallery.rs`).
+fn purple(r: u8, g: u8, b: u8) -> bool {
+    let (r, g, b) = (f32::from(r), f32::from(g), f32::from(b));
+    let max = r.max(g).max(b);
+    let d = max - r.min(g).min(b);
+    if d / 255.0 <= 0.08 {
+        return false;
+    }
+    let hue = if (max - r).abs() < f32::EPSILON {
+        60.0 * ((g - b) / d).rem_euclid(6.0)
+    } else if (max - g).abs() < f32::EPSILON {
+        60.0 * ((b - r) / d + 2.0)
+    } else {
+        60.0 * ((r - g) / d + 4.0)
+    };
+    (260.0..=300.0).contains(&hue)
+}
+
+fn purple_pixels(pixmap: &Pixmap) -> usize {
+    pixmap
+        .pixels()
+        .iter()
+        .map(tiny_skia::PremultipliedColorU8::demultiply)
+        .filter(|p| purple(p.red(), p.green(), p.blue()))
+        .count()
+}
+
+const PURPLE: Color = Color::from_rgb_u8(0x87, 0x64, 0xB8);
+
+#[test]
+fn no_system_accent_on_any_page() {
+    // Windows reports a purple accent before the window opens: the window puts its teal over it.
+    // The first window sets up Slint, which the accent call needs.
+    drop(open("purple-setup", None));
+    for (theme, choice) in THEMES {
+        for (screen, page) in PAGES {
+            i_slint_backend_testing::set_system_accent_color(PURPLE);
+            let window = open("purple", None);
+            window.set_page(page);
+            window.set_theme(choice);
+            let pixmap = render(&window, DEFAULT, 1.0);
+            save(&pixmap, &format!("purple-{screen}-{theme}"));
+            let leaks = purple_pixels(&pixmap);
+            assert_eq!(leaks, 0, "{leaks} purple pixels on {screen} ({theme})");
+        }
+    }
+}
+
+#[test]
+fn a_later_accent_change_is_undone_by_the_poll() {
+    // The System page's old picker paints the std accent, so a purple accent shows there until
+    // the next file poll puts the teal back.
+    let window = open("purple-later", None);
+    window.set_page(Page::System);
+    window.set_theme(ThemeChoice::Light);
+    let _ = render(&window, DEFAULT, 1.0);
+    i_slint_backend_testing::set_system_accent_color(PURPLE);
+    assert!(
+        purple_pixels(&render(&window, DEFAULT, 1.0)) > 0,
+        "the check sees the system accent"
+    );
+    std::thread::sleep(oxi_settings::FILE_POLL + std::time::Duration::from_millis(100));
+    slint::platform::update_timers_and_animations();
+    assert_eq!(purple_pixels(&render(&window, DEFAULT, 1.0)), 0);
 }
 
 #[test]
@@ -158,7 +310,7 @@ fn shot_hotkey() {
 /// The hotkey page with its keyboard open on a fake daemon link; `drive` presses keys or drops the
 /// link before the shot.
 fn shot_board(screen: &str, drive: fn(&Ipc)) {
-    for (theme, choice) in [("light", ThemeChoice::Light), ("dark", ThemeChoice::Dark)] {
+    matrix(screen, |choice| {
         let _ = slint::platform::set_platform(Box::new(Shots));
         let (ipc, _sent) = Ipc::fake();
         let window = oxi_settings::open_with(common::layout(screen, None), ipc.clone()).unwrap();
@@ -170,8 +322,8 @@ fn shot_board(screen: &str, drive: fn(&Ipc)) {
             .unwrap()
             .invoke_accessible_default_action();
         drive(&ipc);
-        save(&render(&window, 1.0), screen, theme);
-    }
+        window
+    });
 }
 
 fn key(ipc: &Ipc, code: Key, down: bool) {
@@ -246,7 +398,7 @@ fn shot_model() {
 /// A model page on a fake daemon link: `prepare` fills the layout, `drive` pushes what the daemon
 /// would send once the page is up.
 fn shot_model_linked(screen: &str, config: &str, prepare: fn(&Layout), drive: fn(&Ipc)) {
-    for (theme, choice) in [("light", ThemeChoice::Light), ("dark", ThemeChoice::Dark)] {
+    matrix(screen, |choice| {
         let _ = slint::platform::set_platform(Box::new(Shots));
         let layout = common::layout(screen, Some(config));
         prepare(&layout);
@@ -262,8 +414,8 @@ fn shot_model_linked(screen: &str, config: &str, prepare: fn(&Layout), drive: fn
             std::thread::sleep(std::time::Duration::from_millis(10));
             slint::platform::update_timers_and_animations();
         }
-        save(&render(&window, 1.0), screen, theme);
-    }
+        window
+    });
 }
 
 fn push(ipc: &Ipc, push: Push) {
@@ -431,7 +583,7 @@ fn shot_text_worst_case() {
     // than the window holds, so the page scrolls; Add must be reachable by wheel and by Tab.
     // Items outside the viewport are not in the element search, so "found" means "in view".
     use slint::platform::Key as Tab;
-    for (theme, choice) in [("light", ThemeChoice::Light), ("dark", ThemeChoice::Dark)] {
+    for (theme, choice) in THEMES {
         let _ = slint::platform::set_platform(Box::new(Shots));
         let layout = common::layout("text-worst", None);
         fs::create_dir(layout.dictionary_file()).unwrap();
@@ -443,7 +595,7 @@ fn shot_text_worst_case() {
         window.show().unwrap();
         ipc.deliver(&Event::Link(Link::Offline));
         let surface = LAST.with_borrow(Clone::clone).unwrap();
-        let _ = render(&window, 1.0);
+        let _ = render(&window, MIN, 1.0);
         let wheel = |dy: f32| {
             surface.dispatch_event(WindowEvent::PointerScrolled {
                 position: slint::LogicalPosition::new(280.0, 300.0),
@@ -456,7 +608,7 @@ fn shot_text_worst_case() {
         let add_in_view = || {
             ElementHandle::find_by_accessible_label(&window, "Add rule")
                 .next()
-                .is_some_and(|e| e.absolute_position().y + e.size().height <= HEIGHT)
+                .is_some_and(|e| e.absolute_position().y + e.size().height <= MIN.1)
         };
         assert!(
             !add_in_view(),
@@ -473,9 +625,15 @@ fn shot_text_worst_case() {
             &window,
             "A.EXE already has a rule: change its mode in the list above."
         ));
-        save(&render(&window, 1.0), "text-worst-bottom", theme);
+        save(
+            &render(&window, MIN, 1.0),
+            &format!("text-worst-bottom-720-{theme}"),
+        );
         wheel(2000.0);
-        save(&render(&window, 1.0), "text-worst-top", theme);
+        save(
+            &render(&window, MIN, 1.0),
+            &format!("text-worst-top-720-{theme}"),
+        );
         // Keyboard only: from the top, Tab until Add is on screen.
         wheel(-2000.0);
         common::one(&window, "New rule app").set_accessible_value("c.exe");
@@ -493,7 +651,10 @@ fn shot_text_worst_case() {
             tabs += 1;
         }
         assert!(add_in_view(), "Tab never brought Add into view");
-        save(&render(&window, 1.0), "text-worst-tabbed", theme);
+        save(
+            &render(&window, MIN, 1.0),
+            &format!("text-worst-tabbed-720-{theme}"),
+        );
     }
 }
 
@@ -510,7 +671,7 @@ fn shot_system() {
 #[test]
 fn shot_system_update_off() {
     // Turning the update check off asks for a confirmation first.
-    for (theme, choice) in [("light", ThemeChoice::Light), ("dark", ThemeChoice::Dark)] {
+    matrix("system-update-off", |choice| {
         let window = open("system-update-off", None);
         window.set_page(Page::System);
         window.set_theme(choice);
@@ -519,14 +680,14 @@ fn shot_system_update_off() {
             .find(|e| e.accessible_checkable() == Some(true))
             .unwrap()
             .invoke_accessible_default_action();
-        save(&render(&window, 1.0), "system-update-off", theme);
-    }
+        window
+    });
 }
 
 #[test]
 fn shot_overlay_mismatch() {
     // An old daemon still runs after an update: Preview is off and says to restart.
-    for (theme, choice) in [("light", ThemeChoice::Light), ("dark", ThemeChoice::Dark)] {
+    matrix("overlay-mismatch", |choice| {
         let _ = slint::platform::set_platform(Box::new(Shots));
         let (ipc, _sent) = Ipc::fake();
         let layout = common::layout("overlay-mismatch", None);
@@ -535,8 +696,8 @@ fn shot_overlay_mismatch() {
         window.set_theme(choice);
         window.show().unwrap();
         ipc.deliver(&Event::Link(Link::Mismatch { daemon_proto: 9 }));
-        save(&render(&window, 1.0), "overlay-mismatch", theme);
-    }
+        window
+    });
 }
 
 #[test]
@@ -544,7 +705,7 @@ fn svg_thumbnail_renders_inside_its_card() {
     let window = open("thumb", None);
     window.set_page(Page::System);
     window.set_theme(ThemeChoice::Light);
-    let pixmap = render(&window, 1.0);
+    let pixmap = render(&window, DEFAULT, 1.0);
     let card = ElementHandle::find_by_accessible_label(&window, "Dark")
         .find(|e| e.accessible_role() == Some(AccessibleRole::RadioButton))
         .unwrap();
