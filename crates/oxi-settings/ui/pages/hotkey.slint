@@ -1,13 +1,13 @@
-// Hotkey page (SPEC Recording, Settings UI): the chord in a compact field and "Change…", which
-// opens the full keyboard (click keys or press them, held keys light up); then the mode.
-import { Palette, Button } from "std-widgets.slint";
-import { Shell, Group, Row, ThumbPicker } from "../widgets.slint";
+// Hotkey page (SPEC Recording, Settings UI): the chord as keycaps and an edit button, which opens
+// the full keyboard (click keys or press them, held keys light up); then the mode.
+import { Theme, Shell, Icons, Group, Card, Row, KeycapRow, TilePicker, Note, Severity, Button, ButtonKind } from "../theme/index.slint";
 import { Keyboard, KeyCap } from "../keyboard.slint";
 
 // Filled and read by `pages::hotkey`.
 export global HotkeyState {
-    // The saved chord, "Ctrl + Win".
+    // The saved chord, "Ctrl + Win", and its keys one by one.
     in property <string> chord;
+    in property <[string]> chord-keys;
     // 0 push-to-talk, 1 toggle.
     in property <int> mode;
     in property <bool> keyboard-open;
@@ -18,6 +18,8 @@ export global HotkeyState {
     in property <float> rows;
     // The pending chord as it would be saved; empty while it has no keys.
     in property <string> pending;
+    // The pending keys one by one (also while the chord is refused, to show what was pressed).
+    in property <[string]> pending-keys;
     // Why the pending chord cannot be saved; empty when it can.
     in property <string> error;
     // Set when a pressed chord ends the capture: 1 moves the focus to Apply, 2 to Cancel, 0 stays.
@@ -33,39 +35,73 @@ export global HotkeyState {
     callback mode-picked(int);
 }
 
+// A Button the board can send the keyboard focus to: the theme's Button keeps its FocusScope private.
+component FocusButton inherits FocusScope {
+    in property <string> text;
+    in property <string> spoken;
+    in property <string> tooltip;
+    in property <ButtonKind> kind: ButtonKind.secondary;
+    callback activated();
+    focus-on-click: false;
+    focus-on-tab-navigation: false;
+    min-width: button.min-width;
+    height: Theme.control-height;
+    key-pressed(event) => {
+        if (event.text == " " || event.text == Key.Return) {
+            root.activated();
+            return accept;
+        }
+        reject
+    }
+    button := Button {
+        text: root.text;
+        kind: root.kind;
+        tooltip: root.tooltip;
+        enabled: root.enabled;
+        force-focus: root.has-focus;
+        accessible-label: root.spoken;
+        clicked => {
+            root.activated();
+        }
+    }
+}
+
 export component HotkeyPage inherits VerticalLayout {
     init => {
         HotkeyState.shown();
     }
     alignment: start;
-    spacing: 10px;
+    spacing: Theme.group-gap;
     Group {
-        title: @tr("Hotkey");
-        Row {
-            label: @tr("Keys");
-            Rectangle {
-                horizontal-stretch: 1;
-                height: 32px;
-                opacity: Shell.locked ? 0.5 : 1;
-                border-radius: 4px;
-                border-width: 1px;
-                border-color: Palette.border;
-                background: Palette.control-background;
-                accessible-role: AccessibleRole.text;
-                accessible-label: HotkeyState.chord;
-                Text {
-                    x: 8px;
-                    text: HotkeyState.chord;
-                    vertical-alignment: center;
-                    color: Palette.foreground;
+        title: @tr("Shortcut");
+        Card {
+            Row {
+                icon: Icons.keyboard;
+                title: @tr("Hotkey");
+                description: @tr("Hold these keys to talk. Esc cancels a recording.");
+                Rectangle {
+                    min-width: chord.min-width;
+                    preferred-width: chord.preferred-width;
+                    chord := KeycapRow {
+                        keys: HotkeyState.chord-keys;
+                        label: HotkeyState.chord;
+                    }
+                    TouchArea {
+                        enabled: !Shell.locked && !HotkeyState.keyboard-open;
+                        clicked => {
+                            HotkeyState.change();
+                        }
+                    }
                 }
-            }
-            Button {
-                text: @tr("Change…");
-                accessible-label: @tr("Change hotkey");
-                enabled: !Shell.locked && !HotkeyState.keyboard-open;
-                clicked => {
-                    HotkeyState.change();
+                Button {
+                    kind: ButtonKind.icon;
+                    icon: Icons.edit-16;
+                    text: @tr("Change hotkey");
+                    enabled: !Shell.locked && !HotkeyState.keyboard-open;
+                    tooltip: HotkeyState.keyboard-open ? @tr("The keyboard is open below") : @tr("Settings are read-only");
+                    clicked => {
+                        HotkeyState.change();
+                    }
                 }
             }
         }
@@ -91,19 +127,28 @@ export component HotkeyPage inherits VerticalLayout {
             focus-lost => {
                 HotkeyState.focused(false);
             }
-            // A FocusScope does not take its child layout's height: the card ends above the buttons.
-            min-height: inner.min-height;
-            preferred-height: inner.preferred-height;
-            inner := VerticalLayout {
-                spacing: 6px;
-                padding-top: 4px;
-                padding-bottom: 6px;
+            // A FocusScope does not take its child's height: the panel would end above the buttons.
+            min-height: panel.min-height;
+            preferred-height: panel.preferred-height;
+            panel := Card {
                 Text {
-                    text: HotkeyState.online ? @tr("Click keys or press them; modifiers match either side. Releasing the keys goes to Apply, Esc to Cancel; click the keyboard to press again.") : @tr("Not connected to OxiYapper: pressed keys are not seen and Apply is off. Start OxiYapper to pick a hotkey.");
+                    text: @tr("Press the new hotkey");
+                    font-size: Theme.subtitle-size;
+                    font-weight: Theme.weight-strong;
+                    color: Theme.text-primary;
+                }
+                Text {
+                    text: HotkeyState.online ? @tr("Click keys or press them. Left and right modifiers both count.") : @tr("Not connected to OxiYapper: pressed keys are not seen. Start OxiYapper to pick a hotkey.");
                     wrap: word-wrap;
-                    font-size: 11px;
-                    color: Palette.foreground;
-                    opacity: 0.7;
+                    font-size: Theme.caption-size;
+                    color: Theme.text-secondary;
+                }
+                KeycapRow {
+                    keys: HotkeyState.pending-keys;
+                    cap-height: 40px;
+                    warning: HotkeyState.error != "";
+                    empty-text: @tr("No keys yet");
+                    label: HotkeyState.pending != "" ? @tr("New hotkey: {}", HotkeyState.pending) : @tr("No keys yet");
                 }
                 Keyboard {
                     caps: HotkeyState.caps;
@@ -114,28 +159,27 @@ export component HotkeyPage inherits VerticalLayout {
                         HotkeyState.key-clicked(name);
                     }
                 }
-                // The status line has the whole width (the long error wraps); the buttons get their own row.
-                Text {
-                    text: HotkeyState.error != "" ? HotkeyState.error : HotkeyState.pending != "" ? @tr("New hotkey: {}", HotkeyState.pending) : @tr("No keys picked");
-                    wrap: word-wrap;
-                    color: HotkeyState.error != "" ? Shell.error-text : Palette.foreground;
+                if HotkeyState.error != "": Note {
+                    text: HotkeyState.error;
+                    severity: Severity.error;
                 }
                 HorizontalLayout {
-                    spacing: 6px;
+                    spacing: Theme.control-gap;
                     alignment: end;
-                    cancel := Button {
+                    cancel := FocusButton {
                         text: @tr("Cancel");
-                        accessible-label: @tr("Cancel hotkey change");
-                        clicked => {
+                        spoken: @tr("Cancel hotkey change");
+                        activated => {
                             HotkeyState.cancel();
                         }
                     }
-                    apply := Button {
+                    apply := FocusButton {
                         text: @tr("Apply");
-                        accessible-label: @tr("Apply hotkey");
+                        spoken: @tr("Apply hotkey");
+                        kind: ButtonKind.primary;
                         enabled: !Shell.locked && HotkeyState.online && HotkeyState.error == "";
-                        primary: true;
-                        clicked => {
+                        tooltip: !HotkeyState.online ? @tr("Start OxiYapper to apply") : HotkeyState.error;
+                        activated => {
                             HotkeyState.apply();
                         }
                     }
@@ -145,11 +189,12 @@ export component HotkeyPage inherits VerticalLayout {
     }
     Group {
         title: @tr("Recording mode");
-        ThumbPicker {
+        TilePicker {
             accessible-label: @tr("Recording mode");
-            thumbs: [
-                { image: @image-url("../img/hotkey-push.svg"), caption: @tr("Push to talk") },
-                { image: @image-url("../img/hotkey-toggle.svg"), caption: @tr("Toggle") },
+            columns: 2;
+            tiles: [
+                { icon: Icons.hand-left-24, icon-selected: Icons.hand-left-24-filled, title: @tr("Push to talk"), caption: @tr("Hold the keys while you speak. Double-tap to lock.") },
+                { icon: Icons.toggle-right-24, icon-selected: Icons.toggle-right-24-filled, title: @tr("Toggle"), caption: @tr("Press once to start, again to stop.") },
             ];
             selected: HotkeyState.mode;
             picked(i) => {

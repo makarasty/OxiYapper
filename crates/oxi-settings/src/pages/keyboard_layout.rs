@@ -5,8 +5,8 @@ use oxi_core::hotkey::Key;
 
 /// Width of the whole board in key units: main block 15, gap, nav 3, gap, numpad 4.
 pub const WIDTH: f32 = 22.5;
-/// Height in key units: the F-row, a quarter gap, five rows, a quarter gap, the F13-F24 row.
-pub const HEIGHT: f32 = 7.5;
+/// Height in key units: the F-row, a quarter gap, five rows, a half gap, the F13-F24 row.
+pub const HEIGHT: f32 = 7.75;
 
 type Row = (f32, &'static [(Option<Key>, f32)]);
 
@@ -60,7 +60,7 @@ const ROWS: [Row; 7] = {
             (Some(Num0), 2.0), (Some(NumDecimal), 1.0),
         ]),
         // Not on most boards, but a chord may use them: under F1-F12.
-        (6.5, &[
+        (6.75, &[
             (None, 2.0),
             (Some(F13), 1.0), (Some(F14), 1.0), (Some(F15), 1.0), (Some(F16), 1.0), (None, 0.5),
             (Some(F17), 1.0), (Some(F18), 1.0), (Some(F19), 1.0), (Some(F20), 1.0), (None, 0.5),
@@ -77,6 +77,34 @@ pub struct Cap {
     pub y: f32,
     pub w: f32,
     pub h: f32,
+}
+
+/// The key unit, in px, from which `cap_label(key, true)` fits its cap on one line at 12 px. Spec
+/// 5.1 says 36 for all; measured, the 35.8 of the default window fits all but the two wide words.
+pub fn full_from(key: Key) -> f32 {
+    if matches!(key, Key::Home | Key::Pause) {
+        40.0
+    } else {
+        35.0
+    }
+}
+
+/// The label of `key`: the full one when the cap has room, or else the short one `Key::label`
+/// gives (Menu shorter still, so it stays on one line on the smallest board).
+pub fn cap_label(key: Key, full: bool) -> &'static str {
+    match key {
+        Key::Menu if !full => "Mnu",
+        Key::Backspace if full => "Backspace",
+        Key::PrintScreen if full => "PrtSc",
+        Key::ScrollLock if full => "ScrLk",
+        Key::Pause if full => "Pause",
+        Key::Home if full => "Home",
+        Key::PageUp if full => "PgUp",
+        Key::PageDown if full => "PgDn",
+        Key::NumLock if full => "Num",
+        Key::NumEnter if full => "Enter",
+        _ => key.label(),
+    }
 }
 
 /// Every key of the board, row by row, left to right.
@@ -132,6 +160,20 @@ mod tests {
                 assert!(apart, "{a:?} overlaps {b:?}");
             }
         }
+    }
+
+    #[test]
+    fn full_labels_replace_only_the_abbreviations() {
+        for cap in caps() {
+            let (full, short) = (cap_label(cap.key, true), cap_label(cap.key, false));
+            assert!(
+                full.chars().count() >= short.chars().count(),
+                "{:?}",
+                cap.key
+            );
+        }
+        assert_eq!(cap_label(Key::Home, true), "Home");
+        assert_eq!(cap_label(Key::Home, false), "Hm");
     }
 
     #[test]
