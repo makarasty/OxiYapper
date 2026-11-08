@@ -144,6 +144,8 @@ export component AppWindow inherits Window {
     in property <DaemonStatus> daemon-status;
     // Why the last daemon start failed; shown under the notice.
     in property <string> spawn-error;
+    // How far the open page is scrolled (0 at the top, negative below).
+    out property <length> scroll-y: scroll.content-y;
     callback theme-changed(ThemeChoice);
     callback start-daemon();
     callback restart-daemon();
@@ -186,6 +188,16 @@ export component AppWindow inherits Window {
     }
     changed theme => {
         root.apply-theme();
+    }
+    changed page => {
+        // The rail follows a page opened by Ctrl+Tab; the page opens at its top.
+        nav.cursor = root.index-of(root.page);
+        scroll.content-y = 0;
+        // The focused field may have left with the old page, and Ctrl+Tab needs a focus to reach
+        // `keys`. The rail keeps its own focus.
+        if (!nav.has-focus) {
+            keys.focus();
+        }
     }
 
     // Ctrl+Tab and Ctrl+Shift+Tab cycle the pages from anywhere, before a focused field sees them.
@@ -331,7 +343,7 @@ export component AppWindow inherits Window {
                 }
             }
 
-            // One scroll area per page; the scrollbar sits at the window edge, right of the cards.
+            // One scroll area for the open page (back at the top on a page change); the scrollbar sits at the window edge, right of the cards.
             scroll := ScrollView {
                 vertical-stretch: 1;
                 content-width: self.visible-width;

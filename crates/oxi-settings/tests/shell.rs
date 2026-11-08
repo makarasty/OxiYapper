@@ -419,6 +419,62 @@ fn ctrl_tab_cycles_the_pages_both_ways() {
 }
 
 #[test]
+fn ctrl_tab_keeps_working_after_the_focused_field_leaves_with_its_page() {
+    let window = open(&layout("ctrl-tab-focus", None), Page::Hotkey);
+    // The rail, then the first field of the page.
+    press(&window, Key::Tab);
+    press(&window, Key::Tab);
+    for want in [Page::Audio, Page::Model, Page::Text] {
+        chord(&window, false, Key::Tab);
+        assert_eq!(window.get_page(), want);
+    }
+}
+
+#[test]
+fn rail_cursor_follows_the_page_ctrl_tab_opened() {
+    let window = open(&layout("rail-cursor", None), Page::Hotkey);
+    press(&window, Key::Tab);
+    chord(&window, false, Key::Tab);
+    assert_eq!(window.get_page(), Page::Audio);
+    press(&window, Key::Return);
+    assert_eq!(
+        window.get_page(),
+        Page::Audio,
+        "Enter opens the page it is on"
+    );
+    press(&window, Key::DownArrow);
+    press(&window, Key::Return);
+    assert_eq!(
+        window.get_page(),
+        Page::Model,
+        "arrows start from the open page"
+    );
+}
+
+#[test]
+fn a_page_opens_at_its_top() {
+    let window = open(&layout("scroll-top", None), Page::Audio);
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(720.0, 520.0));
+    window
+        .window()
+        .dispatch_event(WindowEvent::PointerScrolled {
+            position: slint::LogicalPosition::new(500.0, 300.0),
+            delta_x: 0.0,
+            delta_y: -400.0,
+        });
+    assert!(window.get_scroll_y() < 0.0, "Audio scrolls at 720 x 520");
+    window.set_page(Page::About);
+    // The event loop runs the change handlers; the testing backend has none.
+    slint::platform::update_timers_and_animations();
+    assert_eq!(window.get_scroll_y(), 0.0, "About opens at its top");
+    window.set_page(Page::Audio);
+    slint::platform::update_timers_and_animations();
+    assert_eq!(window.get_scroll_y(), 0.0, "and so does Audio again");
+}
+
+#[test]
 fn rail_takes_up_down_and_enter() {
     let window = open(&layout("rail-keys", None), Page::Hotkey);
     // The first Tab stop is the rail; the focus starts on the open page.

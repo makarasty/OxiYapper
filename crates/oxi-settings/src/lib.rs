@@ -12,9 +12,12 @@ use std::time::Duration;
 
 use oxi_core::config::{ConfigError, Theme};
 use oxi_core::ipc::Push;
+#[cfg(windows)]
 use oxi_core::overlay::Rect;
 use oxi_core::paths::Layout;
-use slint::{Color, ComponentHandle, LogicalSize, PhysicalPosition, Timer, TimerMode, Weak};
+use slint::{Color, ComponentHandle, Timer, TimerMode, Weak};
+#[cfg(windows)]
+use slint::{LogicalSize, PhysicalPosition};
 
 pub use ctx::Ctx;
 pub use ipc::Ipc;
@@ -39,7 +42,9 @@ const ACCENT: Color = Color::from_rgb_u8(0x0F, 0x76, 0x6E);
 
 /// Default size: `min(1120, 85 %)` x `min(780, 88 %)` of the work area, at least the 720 x 520
 /// minimum (redesign spec section 2).
+#[cfg(windows)]
 const DEFAULT: (f32, f32) = (1120.0, 780.0);
+#[cfg(windows)]
 const MIN: (f32, f32) = (720.0, 520.0);
 
 #[derive(Debug, thiserror::Error)]
@@ -56,7 +61,19 @@ pub enum Error {
 pub fn run() -> Result<(), Error> {
     let layout = oxi_platform::dirs::layout()?;
     oxi_platform::dirs::ensure(&layout)?;
-    use_skia();
+    let skia = use_skia();
+    match show(layout) {
+        // Skia is built into this process, but its surface can fail at the first show (no usable
+        // display driver); the platform cannot be re-selected after that, so run a fresh process.
+        Err(Error::Ui(e)) if skia => {
+            eprintln!("skia renderer failed ({e}); retrying with the software renderer");
+            rerun_with_software(e)
+        }
+        result => result,
+    }
+}
+
+fn show(layout: Layout) -> Result<(), Error> {
     // The window comes first: it sets up the Slint platform, and the worker's events need that
     // to reach the UI thread.
     let window = open_inner(layout, |window| {
@@ -88,15 +105,57 @@ pub fn run() -> Result<(), Error> {
     Ok(())
 }
 
-/// Picks Skia's CPU raster surface. Its text is the same as on Skia's GPU surface (real-window
-/// captures), with gamma and hinting the software renderer lacks, and it needs no GPU, so it also
-/// runs over RDP; measured with the window open, 69 MB private bytes against 272 MB on D3D.
-fn use_skia() {
-    // Skia is built on Windows only. On failure Slint picks its default renderer at the first window.
+/// Env var that forces the software renderer; also how a failed Skia run restarts itself.
+#[cfg(windows)]
+const RENDERER_ENV: &str = "OXI_RENDERER";
+
+/// Slint's renderer name for the env var's value: Skia's CPU surface unless it says `software`.
+#[cfg(windows)]
+fn renderer_name(env: Option<&str>) -> &'static str {
+    if env == Some("software") {
+        "software"
+    } else {
+        "skia-software"
+    }
+}
+
+/// Picks Skia's CPU raster surface and says whether it did. Its text is the same as on Skia's GPU
+/// surface (real-window captures), with gamma and hinting the software renderer lacks, and it needs
+/// no GPU, so it also runs over RDP; measured with the window open, 69 MB private bytes against
+/// 272 MB on D3D. `OXI_RENDERER=software`, or a Skia that cannot be selected, picks the software
+/// renderer: never Slint's default, which would be Skia on D3D.
+fn use_skia() -> bool {
+    // Skia is built on Windows only; elsewhere Slint's only renderer is the software one.
     #[cfg(windows)]
-    let _ = slint::BackendSelector::new()
-        .renderer_name("skia-software".into())
-        .select();
+    {
+        let name = renderer_name(std::env::var(RENDERER_ENV).ok().as_deref());
+        let select = |name: &str| {
+            slint::BackendSelector::new()
+                .renderer_name(name.into())
+                .select()
+        };
+        if select(name).is_ok() {
+            return name == "skia-software";
+        }
+        let _ = select("software");
+    }
+    false
+}
+
+/// Runs this program again with the software renderer and waits for it; `e` is what to report if
+/// that cannot start or fails too.
+fn rerun_with_software(e: slint::PlatformError) -> Result<(), Error> {
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(std::env::args_os().skip(1))
+            .env(RENDERER_ENV, "software")
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+    Err(Error::Ui(e))
 }
 
 /// `spawn` that also shows why it failed (the error kind only) in the window.
@@ -121,6 +180,7 @@ fn spawn_note(e: &io::Error) -> String {
 
 /// Logical size and physical top-left of a new window centred in `area` (physical pixels, at
 /// `scale`).
+#[cfg(windows)]
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)] // screen pixels
 fn placement(area: Rect, scale: f32) -> (LogicalSize, PhysicalPosition) {
     let (w, h) = (area.w as f32 / scale, area.h as f32 / scale);
@@ -340,13 +400,12 @@ const fn theme(choice: ThemeChoice) -> Theme {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AppWindow, DaemonStatus, Link, ThemeChoice, choice, placement, spawn_note, status, theme,
-    };
+    use super::{AppWindow, DaemonStatus, Link, ThemeChoice, choice, spawn_note, status, theme};
     use oxi_core::config::Theme;
-    use oxi_core::overlay::Rect;
     use slint::ComponentHandle;
     use std::io::{Error, ErrorKind};
+    #[cfg(windows)]
+    use {super::placement, oxi_core::overlay::Rect};
 
     #[test]
     fn window_builds_under_the_testing_backend() {
@@ -375,6 +434,7 @@ mod tests {
         assert_eq!(ipc.subscribers(), 4);
     }
 
+    #[cfg(windows)]
     #[test]
     fn placement_fits_the_work_area_and_centres() {
         let rect = |x, y, w, h| Rect { x, y, w, h };
@@ -397,6 +457,15 @@ mod tests {
             );
             assert_eq!((pos.x, pos.y), (x, y), "{area:?}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_env_var_picks_the_software_renderer() {
+        use super::renderer_name;
+        assert_eq!(renderer_name(Some("software")), "software");
+        assert_eq!(renderer_name(None), "skia-software");
+        assert_eq!(renderer_name(Some("skia")), "skia-software");
     }
 
     #[test]

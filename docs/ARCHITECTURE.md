@@ -7,7 +7,7 @@ How the app is built. `docs/SPEC.md` holds the owner's decisions and wins any co
 One executable, three modes:
 
 - `OxiYapper` - the **daemon**. Resident, autostarted. Owns the tray, the global hotkey, the mic, whisper, paste, the overlay, model downloads and the update check. It is the only process that touches the network.
-- `OxiYapper settings` - the **settings** window (Slint, software renderer). Spawned by the daemon from the tray, exits on close. The only writer of `config.toml`, `dictionary.txt` and `replace.txt`.
+- `OxiYapper settings` - the **settings** window (Slint, Skia CPU surface with the software renderer as fallback). Spawned by the daemon from the tray, exits on close. The only writer of `config.toml`, `dictionary.txt` and `replace.txt`.
 - `OxiYapper bench <dir>` - hidden developer mode: runs the audio and text pipeline plus whisper on a folder of wav files and prints text and timings. Used for the reference phrases and the GPU measurement. Never touches the hotkey or the clipboard.
 
 The overlay lives inside the daemon. It is a raw OS window (layered window on Windows, `NSPanel` on macOS, X11 override-redirect or wlr-layer-shell on Linux), not Slint, because Slint cannot do no-activate, click-through and no-taskbar.
