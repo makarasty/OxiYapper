@@ -186,6 +186,46 @@ pub const fn model_status(status: ModelStatus) -> &'static str {
     }
 }
 
+/// Short state of a registry model, for its badge; [`model_status`] explains it.
+#[must_use]
+pub const fn model_badge(status: ModelStatus) -> &'static str {
+    match status {
+        ModelStatus::Missing => "Not downloaded",
+        ModelStatus::Partial => "Paused",
+        ModelStatus::Ready => "Ready",
+        ModelStatus::NeedsHash => "Downloaded",
+        ModelStatus::Bad => "Damaged",
+    }
+}
+
+pub const MODEL_BADGE_DOWNLOADING: &str = "Downloading";
+
+/// Which curated model to pick, in a few words; empty for one with no advice.
+#[must_use]
+pub fn model_hint(id: &str) -> &'static str {
+    match id {
+        "turbo" => "fast, good for most",
+        "large-v3" => "slower, more accurate",
+        "podlodka" => "tuned for Russian",
+        _ => "",
+    }
+}
+
+/// Status under the replacements editor; `lines` are 1-based. Empty when every line parses.
+#[must_use]
+pub fn replace_bad_lines(lines: &[usize]) -> String {
+    let numbers = lines
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match lines {
+        [] => String::new(),
+        [_] => format!("Line {numbers} has no =>: ignored"),
+        _ => format!("Lines {numbers} have no =>: ignored"),
+    }
+}
+
 // Why a path cannot be a custom model.
 pub const MODEL_PATH_EMPTY: &str = "Choose a .bin model file";
 pub const MODEL_PATH_NOT_BIN: &str = "The model file must end in .bin";
@@ -223,5 +263,12 @@ mod tests {
             "Test failed: no output device"
         );
         assert_eq!(download_failed("reset"), "Download failed: reset");
+    }
+
+    #[test]
+    fn replace_bad_lines_counts_its_lines() {
+        assert_eq!(replace_bad_lines(&[]), "");
+        assert_eq!(replace_bad_lines(&[2]), "Line 2 has no =>: ignored");
+        assert_eq!(replace_bad_lines(&[2, 5]), "Lines 2, 5 have no =>: ignored");
     }
 }
