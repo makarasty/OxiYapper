@@ -3,6 +3,7 @@
 
 mod about;
 mod audio;
+mod home;
 mod hotkey;
 mod model;
 mod overlay;
@@ -17,6 +18,7 @@ pub fn poll(window: &AppWindow, ctx: &Ctx) {
 }
 
 pub fn bind(window: &AppWindow, ctx: &Ctx) {
+    home::bind(window, ctx);
     hotkey::bind(window, ctx);
     audio::bind(window, ctx);
     model::bind(window, ctx);
