@@ -568,6 +568,8 @@ fn shot_model_downloaded() {
         },
         |_| {},
     );
+    // The sparse model files are GBs in size: layout() recreates this shot's dir, then drop it.
+    fs::remove_dir_all(common::layout("model-downloaded", None).config_dir).unwrap();
 }
 
 #[test]
