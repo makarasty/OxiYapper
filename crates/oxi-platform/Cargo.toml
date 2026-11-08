@@ -35,6 +35,7 @@ features = [
     "Win32_System_Memory",             # GlobalAlloc, GlobalLock, GlobalSize
     "Win32_System_Ole",                # CF_UNICODETEXT
     "Win32_System_Pipes",              # CreateNamedPipeW
+    "Win32_System_Registry",           # RegGetValueW (light or dark taskbar)
     "Win32_System_RemoteDesktop",      # WTSRegisterSessionNotification
     "Win32_System_SystemInformation",  # GetLocalTime
     "Win32_System_Threading",          # OpenProcess, QueryFullProcessImageNameW, OpenProcessToken

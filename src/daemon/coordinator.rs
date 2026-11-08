@@ -10,9 +10,10 @@ use std::time::Duration;
 
 use oxi_core::config::Config;
 use oxi_core::machine::{
-    self, Effect, EngineWarning, Event, JobId, MachineConfig, Phase, PhaseCell, State,
+    self, Effect, EngineWarning, Event, JobId, MachineConfig, Notice, Phase, PhaseCell, State,
 };
 use oxi_core::paste::PasteOutcome;
+use oxi_core::tray::{self, TrayBadge};
 use oxi_core::types::Millis;
 use oxi_core::{stats, strings};
 
@@ -26,6 +27,11 @@ pub struct Coordinator<H> {
     phase: PhaseCell,
     /// Last phase sent as `UiCmd::Tray`.
     tray: Phase,
+    /// Error notices whose cause is still there, each with the capture session it was raised in.
+    /// A cause that goes away clears its notice (`clear_failed`); a landed dictation clears all.
+    failed: Vec<(Notice, u64)>,
+    /// Last badge sent as `UiCmd::Badge`.
+    badge: TrayBadge,
     active: Config,
     warnings: Vec<String>,
     /// The whisper worker's latest `EngineWarning`.
@@ -68,6 +74,8 @@ impl<H: ChordHook> Coordinator<H> {
             state: State::new(MachineConfig::from(&config)),
             phase,
             tray: Phase::Idle,
+            failed: Vec::new(),
+            badge: TrayBadge::None,
             active: config,
             warnings,
             engine_warning: None,
@@ -108,6 +116,7 @@ impl<H: ChordHook> Coordinator<H> {
     pub fn handle(&mut self, msg: Inbox, now: Millis) {
         self.dispatch(msg, now);
         self.sync_warnings();
+        self.sync_badge();
     }
 
     fn dispatch(&mut self, msg: Inbox, now: Millis) {
@@ -116,6 +125,11 @@ impl<H: ChordHook> Coordinator<H> {
                 if let Event::PasteDone { job, outcome } = event {
                     self.count(job, outcome);
                     self.keep_last_text(job);
+                    // A failed paste raises its notice again in `feed`.
+                    self.failed.clear();
+                }
+                if event == Event::ModelLoaded {
+                    self.clear_failed(|n, _| matches!(n, Notice::NoModel | Notice::ModelBad));
                 }
                 self.feed(event, now);
             }
@@ -125,6 +139,12 @@ impl<H: ChordHook> Coordinator<H> {
                 }
             }
             Inbox::JobAudio { job, samples } => {
+                // Sound from a recording started after the failure; the one that lost its
+                // device delivers its own tail first.
+                let capture = self.capture;
+                self.clear_failed(|n, session| {
+                    matches!(n, Notice::DeviceLost | Notice::CaptureFailed) && session < capture
+                });
                 self.spoken.insert(job, stats::audio_length(samples.len()));
                 self.audio.insert(job, samples);
                 self.feed(Event::JobAudioReady(job), now);
@@ -137,6 +157,7 @@ impl<H: ChordHook> Coordinator<H> {
                 job,
                 text: Some(text),
             } => {
+                self.clear_failed(|n, _| n == Notice::TranscriptionFailed);
                 let empty = text.trim().is_empty();
                 if empty {
                     self.spoken.remove(&job);
@@ -255,7 +276,13 @@ impl<H: ChordHook> Coordinator<H> {
             // shortcut: sounds land in M10; until then a played sound is only logged.
             Effect::Play(sound) => tracing::debug!(?sound, "sound"),
             Effect::Overlay(state) => self.ui(UiCmd::Overlay(state)),
-            Effect::Notify(notice) => self.ui(UiCmd::Notify(notice)),
+            Effect::Notify(notice) => {
+                if tray::is_error(notice) {
+                    self.failed.retain(|&(n, _)| n != notice);
+                    self.failed.push((notice, self.capture));
+                }
+                self.ui(UiCmd::Notify(notice));
+            }
         }
         None
     }
@@ -324,6 +351,25 @@ impl<H: ChordHook> Coordinator<H> {
         }
     }
 
+    /// Drops the error notices whose cause `gone` reports (notice, session it was raised in).
+    fn clear_failed(&mut self, gone: impl Fn(Notice, u64) -> bool) {
+        self.failed.retain(|&(n, session)| !gone(n, session));
+    }
+
+    /// The error badge while a failure's cause remains or the config file is invalid; tells
+    /// the tray when it changed.
+    fn sync_badge(&mut self) {
+        let badge = if !self.failed.is_empty() || self.config_error.is_some() {
+            TrayBadge::Error
+        } else {
+            TrayBadge::None
+        };
+        if badge != self.badge {
+            self.badge = badge;
+            self.ui(UiCmd::Badge(badge));
+        }
+    }
+
     fn ui(&self, cmd: UiCmd) {
         send(&self.workers.ui, cmd);
         (self.workers.wake_ui)();
@@ -353,7 +399,7 @@ mod tests {
     use std::sync::mpsc::channel;
 
     use oxi_core::config::{ConfigError, Hotkey};
-    use oxi_core::machine::{EmptyAudio, Notice, OverlayState};
+    use oxi_core::machine::{EmptyAudio, ModelFailure, Notice, OverlayState};
 
     use super::*;
 
@@ -773,6 +819,131 @@ mod tests {
                 vec![error],
             ]
         );
+    }
+
+    #[test]
+    fn errors_raise_the_tray_badge_until_a_dictation_lands_or_the_config_is_fixed() {
+        let badges = |rig: &Rig| -> Vec<TrayBadge> {
+            drain(&rig.ui)
+                .into_iter()
+                .filter_map(|c| match c {
+                    UiCmd::Badge(b) => Some(b),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut rig = Rig::new();
+        let job = rig.transcribed("one");
+        rig.event(
+            Event::PasteDone {
+                job,
+                outcome: PasteOutcome::Failed,
+            },
+            3000,
+        );
+        assert_eq!(badges(&rig), [TrayBadge::Error], "a failed paste");
+        let job = rig.transcribed("two");
+        rig.event(
+            Event::PasteDone {
+                job,
+                outcome: PasteOutcome::Pasted,
+            },
+            4000,
+        );
+        assert_eq!(badges(&rig), [TrayBadge::None], "the next one landed");
+
+        let job = rig.record();
+        rig.event(
+            Event::JobAudioEmpty {
+                job,
+                why: EmptyAudio::MicSilence,
+            },
+            2100,
+        );
+        assert!(badges(&rig).is_empty(), "a hint is no error");
+
+        rig.c
+            .handle(Inbox::ConfigError(ConfigError::ReadOnly), Millis(5000));
+        assert_eq!(badges(&rig), [TrayBadge::Error], "an invalid config");
+        rig.c.handle(
+            Inbox::Config {
+                config: Box::new(Config::default()),
+                warnings: Vec::new(),
+            },
+            Millis(5100),
+        );
+        assert_eq!(badges(&rig), [TrayBadge::None], "the config was fixed");
+    }
+
+    #[test]
+    fn a_failure_badge_clears_when_its_cause_is_gone() {
+        let badges = |rig: &Rig| -> Vec<TrayBadge> {
+            drain(&rig.ui)
+                .into_iter()
+                .filter_map(|c| match c {
+                    UiCmd::Badge(b) => Some(b),
+                    _ => None,
+                })
+                .collect()
+        };
+        let audio = |rig: &mut Rig, job, at| {
+            let samples = vec![0.5; 4];
+            rig.c.handle(Inbox::JobAudio { job, samples }, Millis(at));
+        };
+        let mut rig = Rig::new();
+
+        // No model: the load that follows clears it.
+        rig.event(Event::ModelFailed(ModelFailure::Missing), 0);
+        assert_eq!(badges(&rig), [TrayBadge::Error], "no model");
+        rig.event(Event::ModelLoaded, 100);
+        assert_eq!(badges(&rig), [TrayBadge::None], "a model loaded");
+
+        // Lost mic: its own tail does not clear it, sound from the next recording does.
+        rig.event(Event::ChordDown, 200);
+        drain(&rig.audio);
+        let lost = Inbox::Capture {
+            session: 1,
+            event: Event::DeviceLost,
+        };
+        rig.c.handle(lost, Millis(1200));
+        assert_eq!(badges(&rig), [TrayBadge::Error], "the mic is lost");
+        rig.event(Event::ChordUp, 1300);
+        let job = drain(&rig.audio)
+            .into_iter()
+            .find_map(|c| match c {
+                AudioCmd::Stop(job) => Some(job),
+                _ => None,
+            })
+            .expect("the lost recording stops");
+        audio(&mut rig, job, 400);
+        assert!(badges(&rig).is_empty(), "the tail of the lost recording");
+        // Jobs run in order: answer each with silence so the next one can be asked.
+        let silence = |rig: &mut Rig, job, at| {
+            let text = Some(String::new());
+            rig.c.handle(Inbox::Transcribed { job, text }, Millis(at));
+        };
+        silence(&mut rig, job, 450);
+        let job = rig.record();
+        audio(&mut rig, job, 2100);
+        silence(&mut rig, job, 2150);
+        assert_eq!(
+            badges(&rig),
+            [TrayBadge::None],
+            "the next recording had sound"
+        );
+
+        // Failed transcription: the next one that works clears it, before any paste.
+        let job = rig.record();
+        audio(&mut rig, job, 2100);
+        let failed = Inbox::Transcribed { job, text: None };
+        rig.c.handle(failed, Millis(2200));
+        assert_eq!(badges(&rig), [TrayBadge::Error], "transcription failed");
+        let job = rig.record();
+        audio(&mut rig, job, 2100);
+        assert!(badges(&rig).is_empty(), "sound alone does not fix it");
+        let text = Some("three".to_owned());
+        rig.c.handle(Inbox::Transcribed { job, text }, Millis(2300));
+        assert_eq!(badges(&rig), [TrayBadge::None], "a transcription worked");
     }
 
     #[test]

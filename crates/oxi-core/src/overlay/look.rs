@@ -12,7 +12,9 @@ pub mod palette {
     pub const NONE: Rgba = Rgba(0, 0, 0, 0);
     /// Recording and its meter: calm teal, so [`CLIP`] stands out.
     pub const RECORDING: Rgba = Rgba(0x2B, 0xB5, 0xA0, 0xFF);
-    pub const BUSY: Rgba = Rgba(0x3E, 0x8E, 0xF7, 0xFF);
+    /// Loading and transcribing: calm grey (10.2:1 on [`SURFACE`]); the hourglass carries the
+    /// meaning, so teal stays the one recording signal.
+    pub const BUSY: Rgba = Rgba(0xC8, 0xCC, 0xD4, 0xFF);
     pub const OK: Rgba = Rgba(0x30, 0xA4, 0x6C, 0xFF);
     pub const INFO: Rgba = Rgba(0x8B, 0x8D, 0x98, 0xFF);
     pub const WARN: Rgba = Rgba(0xF7, 0xB0, 0x1B, 0xFF);
@@ -25,6 +27,16 @@ pub mod palette {
     pub const TEXT: Rgba = Rgba(0xEE, 0xEF, 0xF2, 0xFF);
     /// Hairline pill rim that keeps the outline visible on a dark desktop (3:1 over #202020).
     pub const EDGE: Rgba = Rgba(0xFF, 0xFF, 0xFF, 0x66);
+    /// Brand teal: the app icon tile, the settings accent (light theme).
+    pub const BRAND: Rgba = Rgba(0x0F, 0x76, 0x6E, 0xFF);
+    /// Top of the app icon tile's gradient at 48 px and larger.
+    pub const BRAND_LIGHT: Rgba = Rgba(0x14, 0xA3, 0x94, 0xFF);
+    /// Dark teal rim of the app icon and the recording tray icon, for light backgrounds.
+    pub const BRAND_RIM: Rgba = Rgba(0x0B, 0x5F, 0x55, 0xFF);
+    /// Tray glyphs on a light taskbar.
+    pub const INK: Rgba = Rgba(0x1A, 0x1A, 0x1A, 0xFF);
+    /// Tray glyphs on a dark or accent taskbar; the mark in the app icon.
+    pub const WHITE: Rgba = Rgba(0xFF, 0xFF, 0xFF, 0xFF);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

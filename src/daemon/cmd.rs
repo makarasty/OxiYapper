@@ -27,6 +27,7 @@ use std::sync::mpsc::Sender;
 use oxi_core::config::{Audio, Config, ConfigError, Hotkey, Overlay, OverlayPosition, Paste};
 use oxi_core::device::DeviceChoice;
 use oxi_core::machine::{EngineWarning, Event, JobId, Notice, OverlayState, Phase};
+use oxi_core::tray::TrayBadge;
 
 /// Everything the coordinator hears, on one channel with many senders.
 pub enum Inbox {
@@ -146,6 +147,8 @@ pub enum UiCmd {
     Overlay(OverlayState),
     /// Tray icon and tooltip for this phase; sent when the phase changes.
     Tray(Phase),
+    /// The badge on the tray icon; sent when it changes.
+    Badge(TrayBadge),
     /// OS notification (tray balloon).
     Notify(Notice),
     /// Show the pill at this position for 2 s (settings preview).

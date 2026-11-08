@@ -18,6 +18,7 @@ use oxi_core::machine::{Event, Notice, Phase};
 use oxi_core::strings;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows_sys::Win32::System::RemoteDesktop::{
     NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
 };
@@ -33,8 +34,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW, RegisterClassExW, RegisterWindowMessageW,
     SM_CXSMICON, SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
     TranslateMessage, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_NULL, WM_POWERBROADCAST,
-    WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP, WTS_SESSION_LOCK,
-    WTS_SESSION_UNLOCK,
+    WM_SETTINGCHANGE, WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+    WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
 use super::wide;
@@ -52,7 +53,7 @@ const NIN_SELECT: i32 = 0x400;
 /// `WM_USER + 1`: the same by keyboard (Enter or Space on the focused icon).
 const NIN_KEYSELECT: i32 = 0x401;
 
-pub use oxi_core::tray::MenuItem;
+pub use oxi_core::tray::{MenuItem, TrayBadge};
 
 /// Wakes or ends [`MainLoop::run`] from any thread.
 #[derive(Debug, Clone)]
@@ -93,6 +94,8 @@ enum Incoming {
     /// A left click on the icon: the same as the menu's Settings.
     Click,
     TaskbarCreated,
+    /// Light or dark taskbar may have changed (`WM_SETTINGCHANGE` with `ImmersiveColorSet`).
+    Theme,
     Exit,
 }
 
@@ -151,6 +154,9 @@ static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
 pub struct MainLoop {
     hwnd: HWND,
     phase: Phase,
+    badge: TrayBadge,
+    /// The taskbar is light: the icon draws dark glyphs.
+    light: bool,
     icon: HICON,
     copy_last: bool,
     /// Status warnings, one tooltip line each under the phase.
@@ -212,6 +218,8 @@ impl MainLoop {
         let mut this = Self {
             hwnd,
             phase: Phase::Idle,
+            badge: TrayBadge::None,
+            light: light_taskbar(),
             icon: ptr::null_mut(),
             copy_last: false,
             warnings: Vec::new(),
@@ -238,9 +246,20 @@ impl MainLoop {
 
     /// Shows the icon and tooltip of `phase`.
     pub fn set_phase(&mut self, phase: Phase) -> io::Result<()> {
-        let icon = self.render(phase)?;
-        let old = std::mem::replace(&mut self.icon, icon);
         self.phase = phase;
+        self.refresh()
+    }
+
+    /// Shows `badge` on the icon.
+    pub fn set_badge(&mut self, badge: TrayBadge) -> io::Result<()> {
+        self.badge = badge;
+        self.refresh()
+    }
+
+    /// Redraws the icon of the current phase, badge and taskbar theme.
+    fn refresh(&mut self) -> io::Result<()> {
+        let icon = self.render()?;
+        let old = std::mem::replace(&mut self.icon, icon);
         let shown = shell(NIM_MODIFY, &self.data(NIF_ICON | NIF_TIP | NIF_SHOWTIP));
         destroy_icon(old);
         shown
@@ -329,6 +348,15 @@ impl MainLoop {
                             tracing::warn!("tray icon re-add failed: {e}");
                         }
                     }
+                    Incoming::Theme => {
+                        let light = light_taskbar();
+                        if light != self.light {
+                            self.light = light;
+                            if let Err(e) = self.refresh() {
+                                tracing::warn!("tray icon not redrawn: {e}");
+                            }
+                        }
+                    }
                 }
                 // A callback's modal loop may have caught a panic or queued session events.
                 settle();
@@ -338,7 +366,7 @@ impl MainLoop {
 
     /// Adds the icon of the current phase; Explorer forgets it when it restarts.
     fn add(&mut self) -> io::Result<()> {
-        let icon = self.render(self.phase)?;
+        let icon = self.render()?;
         destroy_icon(std::mem::replace(&mut self.icon, icon));
         let mut data = self.data(NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP);
         data.uCallbackMessage = WM_TRAY;
@@ -350,14 +378,14 @@ impl MainLoop {
         shell(NIM_SETVERSION, &data)
     }
 
-    /// The icon of `phase` at the small-icon size of the window's DPI.
+    /// The icon of the phase and badge at the small-icon size of the window's DPI.
     // shortcut: the size is read when the icon is drawn, so a DPI change shows at the next phase.
-    fn render(&self, phase: Phase) -> io::Result<HICON> {
+    fn render(&self) -> io::Result<HICON> {
         // SAFETY: `hwnd` is our live window; both calls only read.
         let side = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForWindow(self.hwnd)) };
         let pixmap = u32::try_from(side)
             .ok()
-            .and_then(|s| tray_icon(phase, s))
+            .and_then(|s| tray_icon(self.phase, s, self.light, self.badge))
             .ok_or_else(|| io::Error::other("tray icon size"))?;
         // Icons take straight (not premultiplied) alpha, BGRA, top row first.
         let colour: Vec<u8> = pixmap
@@ -518,6 +546,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             None
         }
+        // SAFETY: for this message `lparam` is null or a NUL-terminated string (the changed area).
+        WM_SETTINGCHANGE if unsafe { names(lparam, "ImmersiveColorSet") } => Some(Incoming::Theme),
         m if TASKBAR_CREATED.get() == Some(&m) => Some(Incoming::TaskbarCreated),
         _ => None,
     };
@@ -536,6 +566,51 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 fn nudge(hwnd: HWND) {
     // SAFETY: `hwnd` is the window the procedure runs for.
     unsafe { PostMessageW(hwnd, WM_NULL, 0, 0) };
+}
+
+/// Is `lparam` the NUL-terminated UTF-16 string `want`?
+///
+/// # Safety
+/// `lparam` is null or points to a NUL-terminated UTF-16 string.
+unsafe fn names(lparam: LPARAM, want: &str) -> bool {
+    let mut at: *const u16 = ptr::with_exposed_provenance(lparam.cast_unsigned());
+    if at.is_null() {
+        return false;
+    }
+    for unit in want.encode_utf16().chain([0]) {
+        // SAFETY: every unit read so far matched a non-zero unit of `want`, so the string has
+        // not ended before `at` (the caller's NUL-terminated string).
+        let got = unsafe { at.read() };
+        if got != unit {
+            return false;
+        }
+        // SAFETY: as above; the next read happens only after a non-NUL match.
+        at = unsafe { at.add(1) };
+    }
+    true
+}
+
+/// `SystemUsesLightTheme` of the current user: 1 when the taskbar and tray are light. Missing
+/// (Windows 10 before 1903) means the dark taskbar of that time.
+fn light_taskbar() -> bool {
+    let key = wide(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+    let value = wide("SystemUsesLightTheme");
+    let mut data = 0u32;
+    let mut len = u32::try_from(size_of::<u32>()).unwrap_or(4);
+    // SAFETY: both names are NUL-terminated and outlive the call; `data` holds the DWORD the
+    // flag restricts the value to, and `len` its size.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_DWORD,
+            ptr::null_mut(),
+            (&raw mut data).cast(),
+            &raw mut len,
+        )
+    };
+    status == 0 && data == 1
 }
 
 fn shell(message: NOTIFY_ICON_MESSAGE, data: &NOTIFYICONDATAW) -> io::Result<()> {
@@ -598,6 +673,26 @@ mod tests {
             ));
         }
         assert!(tray_event(0x200, 0, 0).is_none()); // WM_MOUSEMOVE
+    }
+
+    #[test]
+    fn setting_change_names_only_the_exact_area() {
+        let name = |s: &str| {
+            let w = wide(s);
+            // SAFETY: a NUL-terminated string that outlives the call.
+            unsafe {
+                names(
+                    w.as_ptr().expose_provenance().cast_signed(),
+                    "ImmersiveColorSet",
+                )
+            }
+        };
+        assert!(name("ImmersiveColorSet"));
+        assert!(!name("ImmersiveColorSetX"));
+        assert!(!name("Immersive"));
+        assert!(!name(""));
+        // SAFETY: null is allowed.
+        assert!(!unsafe { names(0, "ImmersiveColorSet") });
     }
 
     #[test]
