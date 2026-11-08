@@ -1,6 +1,6 @@
 // System page (SPEC System). The shell owns the theme picker (config `ui.theme`); the rest is
 // `[system]` and `debug.log_text`, filled and read by `pages::system`.
-import { Theme, Icons, Group, Card, Row, ToggleRow, TilePicker, Button, ButtonKind, Note, Severity } from "../theme/index.slint";
+import { Theme, Icons, Group, Card, Row, Divider, ToggleRow, TilePicker, Button, ButtonKind, Note, Severity } from "../theme/index.slint";
 
 export enum ThemeChoice { system, dark, light }
 
@@ -41,74 +41,77 @@ export component SystemPage inherits VerticalLayout {
     }
     Group {
         title: @tr("Startup and updates");
-        ToggleRow {
-            title: @tr("Start at sign-in");
-            // Until the OS registration lands (ROADMAP M10) the switch only saves the setting.
-            description: @tr("Takes effect in a later version.");
-            checked <=> SystemState.autostart;
-            toggled(on) => {
-                SystemState.autostart-toggled(on);
-            }
-        }
-        ToggleRow {
-            title: @tr("Check for updates");
-            description: @tr("Once a day OxiYapper asks GitHub for the latest version. Nothing installs on its own.");
-            checked <=> SystemState.update-check;
-            toggled(on) => {
-                if (on) {
-                    root.confirm-update-off = false;
-                    SystemState.update-check-toggled(true);
-                } else {
-                    self.checked = true;
-                    root.confirm-update-off = true;
+        Card {
+            ToggleRow {
+                flat: true;
+                title: @tr("Start at sign-in");
+                // Until the OS registration lands (ROADMAP M10) the switch only saves the setting.
+                description: @tr("Takes effect in a later version.");
+                checked <=> SystemState.autostart;
+                toggled(on) => {
+                    SystemState.autostart-toggled(on);
                 }
             }
-        }
-        if root.confirm-update-off: Note {
-            padding-left: Theme.card-padding-h;
-            padding-top: Theme.space-1;
-            text: @tr("Update checks tell you when a fix is out.");
-            severity: Severity.warning;
-            Button {
-                text: @tr("Turn off");
-                kind: ButtonKind.subtle;
-                accessible-label: @tr("Turn off update checks");
-                clicked => {
-                    root.confirm-update-off = false;
-                    SystemState.update-check = false;
-                    SystemState.update-check-toggled(false);
+            Divider { }
+            ToggleRow {
+                flat: true;
+                title: @tr("Check for updates");
+                description: @tr("Once a day OxiYapper asks GitHub for the latest version. Nothing installs on its own.");
+                checked <=> SystemState.update-check;
+                toggled(on) => {
+                    if (on) {
+                        root.confirm-update-off = false;
+                        SystemState.update-check-toggled(true);
+                    } else {
+                        self.checked = true;
+                        root.confirm-update-off = true;
+                    }
                 }
             }
-            Button {
-                text: @tr("Keep checking");
-                kind: ButtonKind.primary;
-                clicked => {
-                    root.confirm-update-off = false;
+            if root.confirm-update-off: Note {
+                text: @tr("Update checks tell you when a fix is out.");
+                severity: Severity.warning;
+                Button {
+                    text: @tr("Turn off");
+                    kind: ButtonKind.subtle;
+                    accessible-label: @tr("Turn off update checks");
+                    clicked => {
+                        root.confirm-update-off = false;
+                        SystemState.update-check = false;
+                        SystemState.update-check-toggled(false);
+                    }
+                }
+                Button {
+                    text: @tr("Keep checking");
+                    kind: ButtonKind.primary;
+                    clicked => {
+                        root.confirm-update-off = false;
+                    }
                 }
             }
         }
     }
     Group {
         title: @tr("Debug");
-        ToggleRow {
-            title: @tr("Log dictated text");
-            checked <=> SystemState.log-text;
-            toggled(on) => {
-                SystemState.log-text-toggled(on);
+        Card {
+            ToggleRow {
+                flat: true;
+                title: @tr("Log dictated text");
+                checked <=> SystemState.log-text;
+                toggled(on) => {
+                    SystemState.log-text-toggled(on);
+                }
             }
-        }
-        if SystemState.log-text: Note {
-            padding-left: Theme.card-padding-h;
-            padding-top: Theme.space-1;
-            text: @tr("Dictated text is written to the log files while this is on. Turn it off when you are done.");
-            severity: Severity.warning;
+            if SystemState.log-text: Note {
+                text: @tr("Dictated text is written to the log files while this is on. Turn it off when you are done.");
+                severity: Severity.warning;
+            }
         }
     }
     Group {
         title: @tr("Files");
         Card {
             Row {
-                icon: Icons.folder-open;
                 title: @tr("Settings folder");
                 Button {
                     text: @tr("Open");
@@ -120,8 +123,8 @@ export component SystemPage inherits VerticalLayout {
                     }
                 }
             }
+            Divider { }
             Row {
-                icon: Icons.folder-open;
                 title: @tr("Logs");
                 Button {
                     text: @tr("Open");

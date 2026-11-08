@@ -255,6 +255,9 @@ fn preview_is_off_without_the_daemon() {
         preview.accessible_description().as_deref(),
         Some(oxi_core::strings::PREVIEW_OFFLINE)
     );
+    // The reason is the button's tooltip; no second sentence beside it (the banner has one).
+    assert!(!has(&window, "Start OxiYapper to preview."));
+    assert!(!has(&window, oxi_core::strings::PREVIEW_OFFLINE));
 }
 
 #[test]

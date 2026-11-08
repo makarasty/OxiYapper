@@ -223,31 +223,12 @@ fn shot_focused_nav() {
     }
 }
 
-/// A pixel of the purple system accent family: HSV hue 260..300 with chroma over 0.08 (the
-/// same test as `gallery.rs`).
-fn purple(r: u8, g: u8, b: u8) -> bool {
-    let (r, g, b) = (f32::from(r), f32::from(g), f32::from(b));
-    let max = r.max(g).max(b);
-    let d = max - r.min(g).min(b);
-    if d / 255.0 <= 0.08 {
-        return false;
-    }
-    let hue = if (max - r).abs() < f32::EPSILON {
-        60.0 * ((g - b) / d).rem_euclid(6.0)
-    } else if (max - g).abs() < f32::EPSILON {
-        60.0 * ((b - r) / d + 2.0)
-    } else {
-        60.0 * ((r - g) / d + 4.0)
-    };
-    (260.0..=300.0).contains(&hue)
-}
-
 fn purple_pixels(pixmap: &Pixmap) -> usize {
     pixmap
         .pixels()
         .iter()
         .map(tiny_skia::PremultipliedColorU8::demultiply)
-        .filter(|p| purple(p.red(), p.green(), p.blue()))
+        .filter(|p| common::purple(p.red(), p.green(), p.blue()))
         .count()
 }
 
@@ -300,9 +281,10 @@ fn a_later_accent_change_is_undone_by_the_poll() {
     assert_eq!(purple_pixels(&render(&window, DEFAULT, 1.0)), 0);
 }
 
-/// Home with `summary` from a fake daemon, at the narrowest, default and widest sizes.
+/// Home with `summary` from a fake daemon, at the narrowest, default and widest sizes, and 960:
+/// the first width with the four stat cards in one row, where their texts are tightest.
 fn shot_home(screen: &str, summary: &Summary) {
-    for size in [(720.0, 720.0), DEFAULT, (1600.0, 1000.0)] {
+    for size in [(720.0, 720.0), (960.0, 720.0), DEFAULT, (1600.0, 1000.0)] {
         for (theme, choice) in THEMES {
             SIZE.set(size);
             let _ = slint::platform::set_platform(Box::new(Shots));
@@ -845,4 +827,55 @@ fn tile_icon_renders_inside_its_card() {
         .filter(|p| p.red() < 0x40 && p.green() < 0x40 && p.blue() < 0x40)
         .count();
     assert!(dark > 60, "{dark} dark pixels in the Dark card");
+}
+
+/// At 960 the Words per minute label wraps to two lines; the four values must still start on
+/// one pixel row (before, the wrapped card's value sat 6 px higher than the others).
+#[test]
+fn stat_values_share_a_baseline_where_a_label_wraps() {
+    let size = (960.0, 720.0);
+    SIZE.set(size);
+    let _ = slint::platform::set_platform(Box::new(Shots));
+    let (ipc, _sent) = Ipc::fake();
+    let window = oxi_settings::open_with(common::layout("baseline", None), ipc.clone()).unwrap();
+    window.set_theme(ThemeChoice::Light);
+    window.show().unwrap();
+    push(
+        &ipc,
+        Push::Stats(Summary {
+            dictations: 11_300,
+            words: 299_900,
+            wpm: 146,
+            streak: 6,
+            longest_streak: 40,
+            heat_start: Date::from_ymd(2026, 11, 2).unwrap(),
+            heat: vec![0, 1, 4],
+        }),
+    );
+    let pixmap = render(&window, size, 1.0);
+    // The value is the only text in text-primary (26); labels and captions are lighter. The
+    // streak card is left out: "days" has a descender and "d" an ascender.
+    let ink_top = |label: &str| {
+        let card = common::one(&window, label);
+        let (at, size) = (card.absolute_position(), card.size());
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // whole positive px
+        let (x0, y0, x1, y1) = (
+            at.x as u32,
+            at.y as u32,
+            (at.x + size.width) as u32,
+            (at.y + size.height) as u32,
+        );
+        (y0..y1)
+            .find(|&y| (x0..x1).any(|x| pixmap.pixel(x, y).is_some_and(|p| p.red() < 60)))
+            .unwrap_or_else(|| panic!("no value ink in {label}"))
+    };
+    let tops = [
+        ink_top("Words spoken: 299.9K, All time"),
+        ink_top("Words per minute: 146, Based on recorded speech"),
+        ink_top("Dictations: 11.3K, All time"),
+    ];
+    assert!(
+        tops.iter().all(|t| t.abs_diff(tops[0]) <= 1),
+        "value tops {tops:?}"
+    );
 }

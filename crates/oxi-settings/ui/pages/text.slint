@@ -1,6 +1,6 @@
 // Text page (SPEC Text): dictionary.txt with its prompt token budget, replace.txt with the lines
 // it ignores, and how text is pasted (mode, trailing space, restore delay, per-app rules).
-import { Theme, Shell, Icons, Group, Card, Row, ToggleRow, SliderRow, Combo, TextField, TextArea, TilePicker, Button, ButtonKind, ProgressBar, Note, Severity } from "../theme/index.slint";
+import { Theme, Shell, Icons, Caption, Group, Card, Row, ToggleRow, SliderRow, Combo, TextField, TextArea, TilePicker, Button, ButtonKind, ProgressBar, Note, Severity } from "../theme/index.slint";
 
 export enum TextFile { dictionary, replacements }
 
@@ -77,10 +77,8 @@ component FileEditor inherits Card {
     property <bool> readable: root.info.state != FileState.not-text && root.info.state != FileState.unreadable;
     // A converted file has no edit yet, but Save is what rewrites it as UTF-8.
     property <bool> can-save: root.readable && (root.info.dirty || root.info.state == FileState.converted);
-    Text {
+    Caption {
         text: root.description;
-        font-size: Theme.caption-size;
-        color: Theme.text-secondary;
         wrap: word-wrap;
     }
     FocusScope {
@@ -259,7 +257,6 @@ export component TextPage inherits VerticalLayout {
         }
         Card {
             SliderRow {
-                icon: Icons.timer;
                 title: @tr("Restore clipboard after");
                 description: @tr("How long the dictated text stays on the clipboard.");
                 minimum: 0;
@@ -278,7 +275,6 @@ export component TextPage inherits VerticalLayout {
         title: @tr("Per-app rules");
         for rule[i] in TextState.rules: Card {
             Row {
-                icon: Icons.app-generic;
                 title: rule.app;
                 Combo {
                     min-width: 160px;
@@ -295,7 +291,7 @@ export component TextPage inherits VerticalLayout {
                     icon: Icons.delete-16;
                     text: @tr("Remove {}", rule.app);
                     enabled: !Shell.locked;
-                    tooltip: @tr("The config is read-only");
+                    tooltip: Shell.locked-tip;
                     clicked => {
                         TextState.rule-removed(i);
                     }
@@ -315,7 +311,7 @@ export component TextPage inherits VerticalLayout {
                     icon: Icons.add-16;
                     accessible-label: @tr("Add rule");
                     enabled: !Shell.locked && new-app.text != "";
-                    tooltip: Shell.locked ? @tr("The config is read-only") : @tr("Type an app name first");
+                    tooltip: Shell.locked ? Shell.locked-tip : @tr("Type an app name first");
                     clicked => {
                         TextState.rule-added(new-app.text);
                         new-app.text = "";

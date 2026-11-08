@@ -180,7 +180,7 @@ pub fn tray_icon(phase: Phase, size: u32, light_taskbar: bool, badge: TrayBadge)
                 (k * 2.0).floor() / 2.0
             };
             stroke(&mut pm, m.bubble(line / 2.0).as_ref(), ink, line, id);
-            for bar in m.bars(true) {
+            for bar in m.bars(true, true) {
                 fill(&mut pm, bar.as_ref(), ink, id);
             }
         }
@@ -194,7 +194,7 @@ pub fn tray_icon(phase: Phase, size: u32, light_taskbar: bool, badge: TrayBadge)
                 palette::WHITE
             };
             stroke(&mut pm, m.bubble(0.5).as_ref(), rim, 1.0, id);
-            for bar in m.bars(false) {
+            for bar in m.bars(false, true) {
                 fill(&mut pm, bar.as_ref(), palette::WHITE, id);
             }
         }
@@ -308,7 +308,7 @@ impl Logo {
                 None
             },
             bubble: mark.bubble(0.0),
-            bars: mark.bars(false),
+            bars: mark.bars(false, false),
         }
     }
 }
@@ -407,8 +407,8 @@ impl Mark {
     }
 
     /// The voice bars; `thin` (inside an outline) rounds their width down, so they keep clear of
-    /// the line.
-    fn bars(&self, thin: bool) -> [Option<Path>; 3] {
+    /// the line. `centred` also makes the gaps to both sides of the body equal.
+    fn bars(&self, thin: bool, centred: bool) -> [Option<Path>; 3] {
         let k = self.k;
         let w = if thin {
             (2.0 * k).floor()
@@ -417,6 +417,14 @@ impl Mark {
         };
         // Five bar widths with a pixel to spare each side, or the bars merge into the edge.
         let w = w.min(((self.x1 - self.x0 - 2.0) / 5.0).floor()).max(1.0);
+        // An odd rest of the body splits 2 and 1 px: the side with the gap reads, the other merges
+        // into the rim (20 px tray icon, 18 px body, bars 3). Step down to an even rest. Not for
+        // the app icon: its committed `assets/oxi.ico` is drawn with the old widths.
+        let w = if centred && w > 1.0 && (self.x1 - self.x0 - 5.0 * w).rem_euclid(2.0) > 0.5 {
+            w - 1.0
+        } else {
+            w
+        };
         let h = [4.0, 8.0, 4.0].map(|u: f32| (u * k).round().max(1.0));
         // Round ends once a bar is wide enough to show them.
         let r = if w >= 4.0 { w / 2.0 } else { 0.0 };

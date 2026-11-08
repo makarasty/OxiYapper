@@ -1,13 +1,20 @@
 //! Helpers shared by the settings test binaries.
-#![allow(dead_code, reason = "each test binary uses only some of the helpers")]
+#![allow(
+    dead_code,
+    unused_imports,
+    reason = "each test binary uses only some of the helpers"
+)]
 
 use std::fs;
 
-use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+use i_slint_backend_testing::ElementHandle;
 use oxi_core::config::ConfigFile;
 use oxi_core::paths::Layout;
 use oxi_settings::{AppWindow, Ipc, Page};
 use slint::ComponentHandle;
+
+mod elements;
+pub use elements::{has, with_role};
 
 /// A fresh directory per test and test binary; `config` is written as `config.toml` when given.
 pub fn layout(name: &str, config: Option<&str>) -> Layout {
@@ -70,20 +77,27 @@ pub fn one(window: &AppWindow, label: &str) -> ElementHandle {
     first
 }
 
-/// The element labelled `label` with `role`: a row's text and its control can share a label.
-pub fn with_role(window: &AppWindow, label: &str, role: AccessibleRole) -> ElementHandle {
-    ElementHandle::find_by_accessible_label(window, label)
-        .find(|e| e.accessible_role() == Some(role))
-        .unwrap_or_else(|| panic!("no {role:?} labelled {label}"))
-}
-
-pub fn has(window: &AppWindow, label: &str) -> bool {
-    ElementHandle::find_by_accessible_label(window, label)
-        .next()
-        .is_some()
-}
-
 /// The saved `config.toml`.
 pub fn config(l: &Layout) -> ConfigFile {
     ConfigFile::parse(&fs::read_to_string(l.config_file()).unwrap_or_default()).unwrap()
+}
+
+/// A pixel of the purple system accent family: HSV hue 260..300 with chroma over 0.08.
+pub fn purple(r: u8, g: u8, b: u8) -> bool {
+    let (r, g, b) = (f32::from(r), f32::from(g), f32::from(b));
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let chroma = (max - min) / 255.0;
+    if chroma <= 0.08 {
+        return false;
+    }
+    let d = max - min;
+    let hue = if (max - r).abs() < f32::EPSILON {
+        60.0 * ((g - b) / d).rem_euclid(6.0)
+    } else if (max - g).abs() < f32::EPSILON {
+        60.0 * ((b - r) / d + 2.0)
+    } else {
+        60.0 * ((r - g) / d + 4.0)
+    };
+    (260.0..=300.0).contains(&hue)
 }

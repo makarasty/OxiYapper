@@ -1,6 +1,6 @@
 // Audio page (SPEC Recording, Audio before whisper): microphone, live meter, the DSP switches,
 // tail, recording cap and dictation language.
-import { Theme, Icons, Group, Card, Row, ToggleRow, SliderRow, Combo, Segmented, Button, Meter, Note, Severity } from "../theme/index.slint";
+import { Theme, Group, Card, Row, Divider, ToggleRow, SliderRow, Combo, Segmented, Button, Meter, Note, Severity } from "../theme/index.slint";
 
 // Which control changed; `value` of `AudioState.edited` carries its new value.
 export enum AudioKey { device, gain, sensitivity, normalize, trim, denoise, tail, max-minutes, language }
@@ -55,7 +55,6 @@ export component AudioPage inherits VerticalLayout {
         title: @tr("Microphone");
         Card {
             Row {
-                icon: Icons.mic;
                 title: @tr("Device");
                 Combo {
                     model: AudioState.devices;
@@ -74,8 +73,8 @@ export component AudioPage inherits VerticalLayout {
                 text: AudioState.fallback;
                 severity: Severity.warning;
             }
+            Divider { }
             Row {
-                icon: Icons.data-usage;
                 title: @tr("Level");
                 fill-controls: true;
                 Meter {
@@ -90,8 +89,8 @@ export component AudioPage inherits VerticalLayout {
                 text: AudioState.silence;
                 severity: Severity.warning;
             }
+            Divider { }
             Row {
-                icon: Icons.play;
                 title: @tr("Mic test");
                 description: @tr("Records 3 seconds and plays them back.");
                 Button {
@@ -106,8 +105,8 @@ export component AudioPage inherits VerticalLayout {
             if AudioState.test-status != "": Note {
                 text: AudioState.test-status;
             }
+            Divider { }
             SliderRow {
-                icon: Icons.speaker-2;
                 title: @tr("Gain");
                 description: @tr("Boosts or cuts what Whisper hears.");
                 minimum: -20;
@@ -121,8 +120,8 @@ export component AudioPage inherits VerticalLayout {
                     AudioState.edited(AudioKey.gain, v);
                 }
             }
+            Divider { }
             SliderRow {
-                icon: Icons.gauge;
                 title: @tr("Meter sensitivity");
                 description: @tr("Only changes how the meter looks.");
                 minimum: -20;
@@ -140,35 +139,38 @@ export component AudioPage inherits VerticalLayout {
     }
     Group {
         title: @tr("Processing");
-        ToggleRow {
-            title: @tr("Normalise level");
-            description: @tr("Evens out quiet and loud speech.");
-            checked <=> AudioState.normalize;
-            toggled(on) => {
-                AudioState.edited(AudioKey.normalize, on ? 1 : 0);
+        Card {
+            ToggleRow {
+                flat: true;
+                title: @tr("Normalise level");
+                description: @tr("Evens out quiet and loud speech.");
+                checked <=> AudioState.normalize;
+                toggled(on) => {
+                    AudioState.edited(AudioKey.normalize, on ? 1 : 0);
+                }
             }
-        }
-        ToggleRow {
-            title: @tr("Trim silence");
-            description: @tr("Cuts silence at the start and end.");
-            checked <=> AudioState.trim;
-            toggled(on) => {
-                AudioState.edited(AudioKey.trim, on ? 1 : 0);
+            Divider { }
+            ToggleRow {
+                flat: true;
+                title: @tr("Trim silence");
+                description: @tr("Cuts silence at the start and end.");
+                checked <=> AudioState.trim;
+                toggled(on) => {
+                    AudioState.edited(AudioKey.trim, on ? 1 : 0);
+                }
             }
-        }
-        ToggleRow {
-            title: @tr("Noise suppression");
-            // While on, the warning below says it: no second copy here.
-            description: AudioState.denoise ? "" : @tr("Can make Whisper worse; off by default.");
-            checked <=> AudioState.denoise;
-            toggled(on) => {
-                AudioState.edited(AudioKey.denoise, on ? 1 : 0);
+            Divider { }
+            ToggleRow {
+                flat: true;
+                title: @tr("Noise suppression");
+                // While on, the warning below says it: no second copy here.
+                description: AudioState.denoise ? "" : @tr("Can make Whisper worse; off by default.");
+                checked <=> AudioState.denoise;
+                toggled(on) => {
+                    AudioState.edited(AudioKey.denoise, on ? 1 : 0);
+                }
             }
-        }
-        if AudioState.denoise: HorizontalLayout {
-            padding-left: Theme.card-padding-h;
-            padding-top: Theme.space-1;
-            Note {
+            if AudioState.denoise: Note {
                 text: @tr("Noise suppression can make Whisper worse.");
                 severity: Severity.warning;
             }
@@ -178,7 +180,6 @@ export component AudioPage inherits VerticalLayout {
         title: @tr("Recording");
         Card {
             SliderRow {
-                icon: Icons.timer;
                 title: @tr("Tail after release");
                 description: @tr("Keeps recording a moment after you let go.");
                 minimum: 0;
@@ -191,8 +192,8 @@ export component AudioPage inherits VerticalLayout {
                     AudioState.edited(AudioKey.tail, v);
                 }
             }
+            Divider { }
             SliderRow {
-                icon: Icons.timer;
                 title: @tr("Max length");
                 description: @tr("Recording stops at this length.");
                 minimum: 1;
@@ -204,8 +205,8 @@ export component AudioPage inherits VerticalLayout {
                     AudioState.edited(AudioKey.max-minutes, v);
                 }
             }
+            Divider { }
             Row {
-                icon: Icons.local-language;
                 title: @tr("Language");
                 Segmented {
                     accessible-label: @tr("Language");

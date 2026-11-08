@@ -3,7 +3,7 @@
 // it, `tests/gallery.rs` renders it to PNGs. Hover/pressed/focused come from the `force-*`
 // properties, since a static shot has no mouse.
 import { ScrollView, Palette } from "std-widgets.slint";
-import { Theme, Shell, Contrast, Icons, Tooltip, Button, ButtonKind, Switch, Radio, Slider, NumberField, Segmented, Combo, TextField, TextArea, PageHeader, Group, Card, ClickCard, Row, ToggleRow, SliderRow, TileItem, Tile, TilePicker, ScreenPicker, Keycap, KeycapRow, Severity, Banner, Note, Meter, ProgressBar, BadgeKind, Badge, StatCard, MonthLabel, ActivityHeatmap } from "theme/index.slint";
+import { Theme, Shell, Contrast, Icons, Caption, Tooltip, Button, ButtonKind, Switch, Radio, Slider, NumberField, Segmented, Combo, TextField, TextArea, PageHeader, Group, Card, ClickCard, Row, ToggleRow, SliderRow, TileItem, Tile, TilePicker, ScreenPicker, Keycap, KeycapRow, Severity, Banner, Note, Meter, ProgressBar, BadgeKind, Badge, StatCard, MonthLabel, ActivityHeatmap } from "theme/index.slint";
 
 // The test reads token values and the contrast function through these.
 export { Theme, Contrast }
@@ -34,9 +34,7 @@ global Hex {
     }
 }
 
-component Caption inherits Text {
-    font-size: Theme.caption-size;
-    color: Theme.text-secondary;
+component Remark inherits Caption {
     wrap: word-wrap;
 }
 
@@ -50,7 +48,7 @@ component Section inherits VerticalLayout {
         font-weight: Theme.weight-strong;
         color: Theme.text-primary;
     }
-    if root.note != "": Caption {
+    if root.note != "": Remark {
         text: root.note;
     }
     @children
@@ -63,7 +61,7 @@ component Cell inherits VerticalLayout {
     spacing: Theme.space-1;
     padding: 4px;
     alignment: start;
-    Caption {
+    Remark {
         text: root.label;
     }
     @children
@@ -121,7 +119,7 @@ component SwatchView inherits VerticalLayout {
         font-weight: Theme.weight-strong;
         color: Theme.text-primary;
     }
-    Caption {
+    Remark {
         text: Hex.of(root.s.c) + (root.s.ratio ? "  " + Contrast.ratio(root.s.c, root.s.bg).to-fixed(2) + ":1 on " + root.s.bg-name : "");
     }
 }
@@ -155,60 +153,45 @@ component GallerySheet inherits VerticalLayout {
         { name: "on-accent", c: Theme.on-accent, bg: Theme.accent, bg-name: "accent", ratio: true },
         { name: "accent-text", c: Theme.accent-text, bg: Contrast.over(Theme.accent-tint, Theme.bg-card), bg-name: "accent-tint", ratio: true },
         { name: "accent-tint", c: Theme.accent-tint, bg: Theme.bg-card, bg-name: "", ratio: false },
+        { name: "accent-text", c: Theme.accent-text, bg: Theme.accent-badge, bg-name: "accent-badge", ratio: true },
+        { name: "accent-badge", c: Theme.accent-badge, bg: Theme.bg-card, bg-name: "", ratio: false },
         { name: "pill-teal", c: Theme.pill-teal, bg: Theme.bg-page, bg-name: "", ratio: false },
         { name: "error-text", c: Theme.error-text, bg: Theme.bg-card, bg-name: "bg-card", ratio: true },
         { name: "error-text", c: Theme.error-text, bg: Theme.error-fill, bg-name: "error-fill", ratio: true },
         { name: "warning-text", c: Theme.warning-text, bg: Theme.warning-fill, bg-name: "warning-fill", ratio: true },
         { name: "success-text", c: Theme.success-text, bg: Theme.bg-card, bg-name: "bg-card", ratio: true },
+        { name: "success-text", c: Theme.success-text, bg: Theme.success-tint, bg-name: "success-tint", ratio: true },
+        { name: "success-tint", c: Theme.success-tint, bg: Theme.bg-card, bg-name: "", ratio: false },
         { name: "info-fill", c: Theme.info-fill, bg: Theme.bg-card, bg-name: "", ratio: false },
     ];
     property <[IconEntry]> icon-list: [
         { name: "add-16", image: Icons.add-16 },
         { name: "add", image: Icons.add },
-        { name: "app-generic", image: Icons.app-generic },
         { name: "arrow-download-16", image: Icons.arrow-download-16 },
         { name: "arrow-download", image: Icons.arrow-download },
-        { name: "arrow-sync-16", image: Icons.arrow-sync-16 },
-        { name: "arrow-sync", image: Icons.arrow-sync },
         { name: "book-letter", image: Icons.book-letter },
         { name: "brain-circuit-filled", image: Icons.brain-circuit-filled },
         { name: "brain-circuit", image: Icons.brain-circuit },
-        { name: "bug", image: Icons.bug },
         { name: "calendar", image: Icons.calendar },
         { name: "checkmark-12", image: Icons.checkmark-12 },
-        { name: "checkmark-16", image: Icons.checkmark-16 },
         { name: "checkmark-circle-16", image: Icons.checkmark-circle-16 },
         { name: "checkmark-circle", image: Icons.checkmark-circle },
-        { name: "clipboard-paste-filled", image: Icons.clipboard-paste-filled },
-        { name: "clipboard-paste", image: Icons.clipboard-paste },
         { name: "clipboard-paste-24-filled", image: Icons.clipboard-paste-24-filled },
         { name: "clipboard-paste-24", image: Icons.clipboard-paste-24 },
-        { name: "cube", image: Icons.cube },
-        { name: "dark-theme-filled", image: Icons.dark-theme-filled },
-        { name: "dark-theme", image: Icons.dark-theme },
         { name: "dark-theme-24-filled", image: Icons.dark-theme-24-filled },
         { name: "dark-theme-24", image: Icons.dark-theme-24 },
-        { name: "data-usage", image: Icons.data-usage },
         { name: "delete-16", image: Icons.delete-16 },
         { name: "delete", image: Icons.delete },
         { name: "desktop", image: Icons.desktop },
         { name: "dismiss-16", image: Icons.dismiss-16 },
-        { name: "dismiss", image: Icons.dismiss },
         { name: "edit-16", image: Icons.edit-16 },
-        { name: "edit", image: Icons.edit },
         { name: "error-circle-16", image: Icons.error-circle-16 },
         { name: "error-circle", image: Icons.error-circle },
         { name: "eye-16", image: Icons.eye-16 },
-        { name: "eye", image: Icons.eye },
         { name: "fire", image: Icons.fire },
         { name: "folder-open-16", image: Icons.folder-open-16 },
-        { name: "folder-open", image: Icons.folder-open },
-        { name: "gauge", image: Icons.gauge },
-        { name: "hand-left-filled", image: Icons.hand-left-filled },
-        { name: "hand-left", image: Icons.hand-left },
         { name: "hand-left-24-filled", image: Icons.hand-left-24-filled },
         { name: "hand-left-24", image: Icons.hand-left-24 },
-        { name: "history-filled", image: Icons.history-filled },
         { name: "history", image: Icons.history },
         { name: "home-filled", image: Icons.home-filled },
         { name: "home", image: Icons.home },
@@ -219,41 +202,29 @@ component GallerySheet inherits VerticalLayout {
         { name: "keyboard", image: Icons.keyboard },
         { name: "keyboard-24-filled", image: Icons.keyboard-24-filled },
         { name: "keyboard-24", image: Icons.keyboard-24 },
-        { name: "local-language", image: Icons.local-language },
         { name: "mic-filled", image: Icons.mic-filled },
         { name: "mic", image: Icons.mic },
         { name: "open-folder-16", image: Icons.open-folder-16 },
-        { name: "open-folder", image: Icons.open-folder },
-        { name: "play-16", image: Icons.play-16 },
         { name: "play", image: Icons.play },
         { name: "save-16", image: Icons.save-16 },
-        { name: "save", image: Icons.save },
         { name: "settings-filled", image: Icons.settings-filled },
         { name: "settings", image: Icons.settings },
         { name: "slide-text-filled", image: Icons.slide-text-filled },
         { name: "slide-text", image: Icons.slide-text },
-        { name: "speaker-2-filled", image: Icons.speaker-2-filled },
         { name: "speaker-2", image: Icons.speaker-2 },
         { name: "text-t-filled", image: Icons.text-t-filled },
         { name: "text-t", image: Icons.text-t },
         { name: "text-word-count", image: Icons.text-word-count },
         { name: "timer", image: Icons.timer },
-        { name: "toggle-right-filled", image: Icons.toggle-right-filled },
-        { name: "toggle-right", image: Icons.toggle-right },
         { name: "toggle-right-24-filled", image: Icons.toggle-right-24-filled },
         { name: "toggle-right-24", image: Icons.toggle-right-24 },
         { name: "top-speed", image: Icons.top-speed },
         { name: "warning-16", image: Icons.warning-16 },
         { name: "warning", image: Icons.warning },
-        { name: "weather-moon-filled", image: Icons.weather-moon-filled },
-        { name: "weather-moon", image: Icons.weather-moon },
         { name: "weather-moon-24-filled", image: Icons.weather-moon-24-filled },
         { name: "weather-moon-24", image: Icons.weather-moon-24 },
-        { name: "weather-sunny-filled", image: Icons.weather-sunny-filled },
-        { name: "weather-sunny", image: Icons.weather-sunny },
         { name: "weather-sunny-24-filled", image: Icons.weather-sunny-24-filled },
         { name: "weather-sunny-24", image: Icons.weather-sunny-24 },
-        { name: "window", image: Icons.window },
     ];
     property <[TileItem]> mode-tiles: [
         { icon: Icons.hand-left-24, icon-selected: Icons.hand-left-24-filled, title: "Push to talk", caption: "Hold the keys while you speak. Double-tap to lock." },
@@ -358,7 +329,7 @@ component GallerySheet inherits VerticalLayout {
         HorizontalLayout {
             spacing: Theme.space-4;
             alignment: start;
-            for s in [Theme.space-1, Theme.space-2, Theme.space-3, Theme.space-4, Theme.space-5, Theme.space-6, Theme.space-8, Theme.space-10, Theme.space-12]: VerticalLayout {
+            for s in [Theme.space-1, Theme.space-2, Theme.space-3, Theme.space-4, Theme.space-6, Theme.space-8]: VerticalLayout {
                 spacing: Theme.space-1;
                 alignment: end;
                 HorizontalLayout {
@@ -369,7 +340,7 @@ component GallerySheet inherits VerticalLayout {
                         background: Theme.accent;
                     }
                 }
-                Caption {
+                Remark {
                     text: round(s / 1px);
                 }
             }
@@ -392,7 +363,7 @@ component GallerySheet inherits VerticalLayout {
                     border-width: 1px;
                     border-color: Theme.stroke-keycap;
                 }
-                Caption {
+                Remark {
                     text: r.name;
                 }
             }
@@ -420,7 +391,7 @@ component GallerySheet inherits VerticalLayout {
                         colorize: Theme.text-primary;
                     }
                 }
-                Caption {
+                Remark {
                     text: root.icon-list[i].name;
                     vertical-alignment: center;
                     wrap: no-wrap;
@@ -452,10 +423,10 @@ component GallerySheet inherits VerticalLayout {
             }
         }
         for k in [
-            { name: "primary", kind: ButtonKind.primary, text: "Apply", icon: Icons.checkmark-16 },
+            { name: "primary", kind: ButtonKind.primary, text: "Apply", icon: Icons.add-16 },
             { name: "secondary", kind: ButtonKind.secondary, text: "Download", icon: Icons.arrow-download-16 },
             { name: "subtle", kind: ButtonKind.subtle, text: "Open file", icon: Icons.open-folder-16 },
-            { name: "danger", kind: ButtonKind.danger, text: "Turn off", icon: Icons.dismiss-16 },
+            { name: "danger", kind: ButtonKind.danger, text: "Turn off", icon: Icons.delete-16 },
             { name: "icon", kind: ButtonKind.icon, text: "Change hotkey", icon: Icons.edit-16 },
         ]: VerticalLayout {
             spacing: Theme.space-2;
@@ -998,7 +969,7 @@ component GallerySheet inherits VerticalLayout {
             VerticalLayout {
                 width: 520px;
                 spacing: Theme.space-2;
-                Caption {
+                Remark {
                     text: "TilePicker, 2 columns, captions (Recording mode), hover on Toggle";
                 }
                 TilePicker {
@@ -1011,7 +982,7 @@ component GallerySheet inherits VerticalLayout {
             VerticalLayout {
                 width: 520px;
                 spacing: Theme.space-2;
-                Caption {
+                Remark {
                     text: "TilePicker, 3 columns (Appearance), keyboard focus";
                 }
                 TilePicker {
@@ -1027,7 +998,7 @@ component GallerySheet inherits VerticalLayout {
             alignment: start;
             VerticalLayout {
                 spacing: Theme.space-2;
-                Caption {
+                Remark {
                     text: "ScreenPicker: Bottom centre picked, hover Top left";
                 }
                 ScreenPicker {
@@ -1039,7 +1010,7 @@ component GallerySheet inherits VerticalLayout {
             }
             VerticalLayout {
                 spacing: Theme.space-2;
-                Caption {
+                Remark {
                     text: "ScreenPicker focused";
                 }
                 ScreenPicker {
@@ -1051,7 +1022,7 @@ component GallerySheet inherits VerticalLayout {
             }
             VerticalLayout {
                 spacing: Theme.space-2;
-                Caption {
+                Remark {
                     text: "ScreenPicker locked";
                 }
                 ScreenPicker {
@@ -1162,7 +1133,7 @@ component GallerySheet inherits VerticalLayout {
                         }
                         Card {
                             Row {
-                                icon: Icons.data-usage;
+                                icon: Icons.mic;
                                 title: "Level";
                                 fill-controls: true;
                                 Meter {
@@ -1265,7 +1236,7 @@ component GallerySheet inherits VerticalLayout {
                                             kind: m.kind;
                                         }
                                     }
-                                    Caption {
+                                    Remark {
                                         text: m.caption;
                                     }
                                     if m.progress >= 0: ProgressBar {
@@ -1300,28 +1271,27 @@ component GallerySheet inherits VerticalLayout {
         title: "Banner";
         note: "Window level: severity fill, 30 % stroke of the same hue, icon 20, actions right; under 560 px the text goes above the buttons.";
         Banner {
-            severity: Severity.info;
-            text: "OxiYapper is not running. Settings are saved and apply when it starts.";
+            severity: Severity.warning;
+            text: "OxiYapper is not running. Settings are saved to the config file.";
             Button {
-                kind: ButtonKind.primary;
                 text: "Start";
-                icon: Icons.play-16;
             }
         }
         Banner {
             severity: Severity.warning;
-            text: "This config was written by a newer OxiYapper (version 99). Settings are read-only.";
+            text: "config.toml is from a newer version and is read-only. Update OxiYapper to change settings here.";
+            Button {
+                text: "Open file";
+            }
         }
         Banner {
             severity: Severity.error;
-            text: "config.toml has an error on line 3, column 11: expected a value. Settings are read-only until it is fixed or reset.";
+            text: "config.toml line 3, column 11: expected a value";
             Button {
                 text: "Open file";
-                icon: Icons.open-folder-16;
             }
             Button {
-                kind: ButtonKind.danger;
-                text: "Reset";
+                text: "Reset to defaults";
             }
         }
         HorizontalLayout {
@@ -1334,8 +1304,7 @@ component GallerySheet inherits VerticalLayout {
                     text: "Open file";
                 }
                 Button {
-                    kind: ButtonKind.danger;
-                    text: "Reset";
+                    text: "Reset to defaults";
                 }
             }
         }
@@ -1381,7 +1350,7 @@ component GallerySheet inherits VerticalLayout {
             VerticalLayout {
                 width: 420px;
                 spacing: Theme.space-3;
-                Caption {
+                Remark {
                     text: "Meter live (one clipping bar) / no meter";
                 }
                 Meter {
@@ -1391,7 +1360,7 @@ component GallerySheet inherits VerticalLayout {
                     live: false;
                     empty-text: "No microphone";
                 }
-                Caption {
+                Remark {
                     text: "ProgressBar 44 % / over budget / 0 / done";
                 }
                 ProgressBar {
@@ -1409,7 +1378,7 @@ component GallerySheet inherits VerticalLayout {
                 ProgressBar {
                     value: 1;
                 }
-                Caption {
+                Remark {
                     text: "Badge success / neutral / accent";
                 }
                 HorizontalLayout {
@@ -1433,7 +1402,7 @@ component GallerySheet inherits VerticalLayout {
 
     Section {
         title: "Home: stat cards and activity";
-        note: "StatCard: icon + label, big value, caption. ActivityHeatmap: weeks as columns, Sun..Sat rows, five levels of the accent, today outlined.";
+        note: "StatCard: icon + label, big value, caption. ActivityHeatmap: weeks as columns, Mon..Sun rows, five levels of the accent, today outlined.";
         HorizontalLayout {
             alignment: start;
             VerticalLayout {
@@ -1443,25 +1412,25 @@ component GallerySheet inherits VerticalLayout {
                     spacing: Theme.space-3;
                     StatCard {
                         icon: Icons.text-word-count;
-                        label: "Words dictated";
+                        label: "Words spoken";
                         value: "299.9K";
                         caption: "All time";
                     }
                     StatCard {
                         icon: Icons.top-speed;
-                        label: "Speaking speed";
+                        label: "Words per minute";
                         value: "142";
-                        caption: "Words per minute";
+                        caption: "Based on recorded speech";
                     }
                     StatCard {
                         icon: Icons.mic;
                         label: "Dictations";
                         value: "8,214";
-                        caption: "This year";
+                        caption: "All time";
                     }
                     StatCard {
                         icon: Icons.fire;
-                        label: "Streak";
+                        label: "Current streak";
                         value: "12 days";
                         caption: "Longest: 40 days";
                     }

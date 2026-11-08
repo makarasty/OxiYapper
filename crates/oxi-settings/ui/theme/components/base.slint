@@ -1,5 +1,21 @@
-// Small pieces every control shares: the focus visual and the hover tooltip.
+// Small pieces every control shares: the focus visual, the hover tooltip, the card frame and the
+// caption text.
 import { Theme } from "../tokens.slint";
+
+// The frame of every card-shaped surface (Card, ClickCard, ToggleRow, StatCard): fill, 1 px stroke,
+// radius 8. The shell sets its own height from the layout inside it.
+export component CardFrame inherits Rectangle {
+    background: Theme.bg-card;
+    border-color: Theme.stroke-card;
+    border-width: 1px;
+    border-radius: Theme.radius-card;
+}
+
+// 12 px secondary text: descriptions, captions, status lines.
+export component Caption inherits Text {
+    font-size: Theme.caption-size;
+    color: Theme.text-secondary;
+}
 
 // Fluent focus visual: a 2 px focus-outer ring 2 px outside the parent plus a 1 px focus-inner
 // ring between them. Fills its parent; shown only on keyboard focus (see `KeyFocus`).

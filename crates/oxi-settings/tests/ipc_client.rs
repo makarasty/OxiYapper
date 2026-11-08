@@ -208,7 +208,7 @@ fn config_error_push_names_the_line() {
     assert_eq!(
         notice(&shown),
         Some(Notice {
-            text: "config.toml, line 7: expected `=`".into(),
+            text: "config.toml line 7: expected `=`".into(),
             action: None,
         })
     );

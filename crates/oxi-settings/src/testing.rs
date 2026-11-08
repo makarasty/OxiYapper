@@ -2,12 +2,16 @@
 
 use std::sync::mpsc::Receiver;
 
-use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+use i_slint_backend_testing::ElementHandle;
 use oxi_core::paths::Layout;
 use slint::ComponentHandle;
 
 use crate::ipc::{Cmd, Ipc};
 use crate::{AppWindow, Page};
+
+#[path = "../tests/common/elements.rs"]
+mod elements;
+pub use elements::{has, with_role};
 
 /// A fresh config directory per `module` and test `name`.
 pub fn layout(module: &str, name: &str) -> Layout {
@@ -43,17 +47,4 @@ pub fn one(window: &AppWindow, label: &str) -> ElementHandle {
     ElementHandle::find_by_accessible_label(window, label)
         .next()
         .unwrap_or_else(|| panic!("no element labelled {label}"))
-}
-
-/// The element labelled `label` with `role`: a row's text and its control can share a label.
-pub fn with_role(window: &AppWindow, label: &str, role: AccessibleRole) -> ElementHandle {
-    ElementHandle::find_by_accessible_label(window, label)
-        .find(|e| e.accessible_role() == Some(role))
-        .unwrap_or_else(|| panic!("no {role:?} labelled {label}"))
-}
-
-pub fn has(window: &AppWindow, label: &str) -> bool {
-    ElementHandle::find_by_accessible_label(window, label)
-        .next()
-        .is_some()
 }

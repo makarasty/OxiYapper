@@ -51,10 +51,8 @@ fn rows_show_size_and_status_from_the_files() {
     let window = open(&l, Page::Model);
     assert!(has(&window, "1.6 GB · fast, good for most"));
     assert!(has(&window, "Whisper large-v3 turbo: Not downloaded"));
-    assert!(has(
-        &window,
-        "3.1 GB · Damaged or incomplete, download it again"
-    ));
+    // The badge says "Damaged"; the caption only says what to do.
+    assert!(has(&window, "3.1 GB · download it again"));
     assert!(has(&window, "Whisper large-v3: Damaged"));
     for name in ["Whisper large-v3 turbo", "Whisper large-v3"] {
         with_role(&window, &format!("Download {name}"), AccessibleRole::Button);
@@ -73,7 +71,7 @@ fn picking_a_row_writes_model_id() {
     );
     for (label, id) in [
         ("Whisper large-v3", "large-v3"),
-        ("Whisper large-v3 Russian (podlodka v1.2, f16)", "podlodka"),
+        ("Whisper large-v3 Russian", "podlodka"),
         ("Use my own .bin", "custom"),
         ("Whisper large-v3 turbo", "turbo"),
     ] {
@@ -206,7 +204,7 @@ fn download_without_the_daemon_says_to_start_it() {
 
 #[test]
 fn a_selected_model_not_on_disk_warns() {
-    let warning = "Not downloaded yet: download it or dictation will not start.";
+    let warning = "Dictation will not start until this is downloaded.";
     let l = layout("not-on-disk", None);
     let window = open(&l, Page::Model);
     assert!(has(&window, warning));

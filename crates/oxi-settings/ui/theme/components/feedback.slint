@@ -1,6 +1,7 @@
 // Messages and status: window banner, inline note, level meter, progress bar, badge.
 import { Theme } from "../tokens.slint";
 import { Icons } from "../icons.slint";
+import { Caption } from "base.slint";
 
 export enum Severity { info, success, warning, error }
 
@@ -29,10 +30,10 @@ export component Banner inherits Rectangle {
     property <bool> narrow: root.width < 560px;
     property <length> pad-h: Theme.space-4;
     property <length> pad-v: Theme.space-3;
-    property <length> text-x: root.pad-h + 20px + Theme.space-3;
+    property <length> text-x: root.pad-h + Theme.icon-size + Theme.space-3;
     property <bool> has-actions: actions.preferred-width > 0;
     property <length> text-w: root.narrow || !root.has-actions ? root.width - root.text-x - root.pad-h : root.width - root.text-x - root.pad-h - actions.preferred-width - Theme.space-4;
-    property <length> body-h: root.narrow && root.has-actions ? message.preferred-height + Theme.space-2 + actions.preferred-height : max(message.preferred-height, actions.preferred-height, 20px);
+    property <length> body-h: root.narrow && root.has-actions ? message.preferred-height + Theme.space-2 + actions.preferred-height : max(message.preferred-height, actions.preferred-height, Theme.icon-size);
     background: Look.fill(root.severity);
     border-width: 1px;
     border-color: Look.ink(root.severity).transparentize(0.7);
@@ -43,9 +44,9 @@ export component Banner inherits Rectangle {
     height: root.body-h + 2 * root.pad-v;
     Image {
         x: root.pad-h;
-        y: root.pad-v + (root.narrow && root.has-actions ? 0 : (root.body-h - 20px) / 2);
-        width: 20px;
-        height: 20px;
+        y: root.pad-v + (root.narrow && root.has-actions ? 0 : (root.body-h - Theme.icon-size) / 2);
+        width: Theme.icon-size;
+        height: Theme.icon-size;
         source: Look.icon(root.severity);
         colorize: Look.ink(root.severity);
         accessible-role: none;
@@ -83,8 +84,8 @@ export component Note inherits HorizontalLayout {
         alignment: center;
         Image {
             source: Look.icon-16(root.severity);
-            width: 16px;
-            height: 16px;
+            width: Theme.icon-size-small;
+            height: Theme.icon-size-small;
             colorize: Look.ink(root.severity);
             accessible-role: none;
         }
@@ -128,10 +129,8 @@ export component Meter inherits Rectangle {
             visible: self.x >= 2px;
         }
     }
-    if !root.live: Text {
+    if !root.live: Caption {
         text: root.empty-text;
-        font-size: Theme.caption-size;
-        color: Theme.text-secondary;
         horizontal-alignment: center;
         vertical-alignment: center;
         accessible-role: none;
@@ -168,7 +167,6 @@ export component ProgressBar inherits HorizontalLayout {
         font-size: Theme.caption-size;
         color: root.error ? Theme.error-text : Theme.text-secondary;
         vertical-alignment: center;
-        accessible-role: none;
     }
 }
 
@@ -180,7 +178,7 @@ export component Badge inherits Rectangle {
     in property <BadgeKind> kind: BadgeKind.neutral;
     property <color> ink: root.kind == BadgeKind.success ? Theme.success-text : root.kind == BadgeKind.accent ? Theme.accent-text : Theme.text-secondary;
     border-radius: self.height / 2;
-    background: root.kind == BadgeKind.neutral ? Theme.bg-inset : root.ink.transparentize(0.86);
+    background: root.kind == BadgeKind.success ? Theme.success-tint : root.kind == BadgeKind.accent ? Theme.accent-badge : Theme.bg-inset;
     accessible-role: AccessibleRole.text;
     accessible-label: root.text;
     min-width: t.preferred-width + 16px;

@@ -15,6 +15,7 @@ use oxi_core::ipc::Push;
 #[cfg(windows)]
 use oxi_core::overlay::Rect;
 use oxi_core::paths::Layout;
+use oxi_core::strings::CONFIG_READ_ONLY_NEXT;
 use slint::{Color, ComponentHandle, Timer, TimerMode, Weak};
 #[cfg(windows)]
 use slint::{LogicalSize, PhysicalPosition};
@@ -311,8 +312,15 @@ fn open_inner(
 
 /// The config banner for `problem`; `None` clears it.
 fn show_problem(window: &AppWindow, problem: Option<&ConfigError>) {
-    window.set_banner_text(problem.map(ToString::to_string).unwrap_or_default().into());
-    // A broken file gets "Open file" and "Reset to defaults"; a newer one only the message.
+    let text = match problem {
+        Some(ConfigError::ReadOnly) => {
+            format!("{}. {CONFIG_READ_ONLY_NEXT}", ConfigError::ReadOnly)
+        }
+        Some(other) => other.to_string(),
+        None => String::new(),
+    };
+    window.set_banner_text(text.into());
+    // Both get "Open file"; only a broken file gets "Reset to defaults", the newer one stays safe.
     window.set_banner_fixable(!matches!(problem, Some(ConfigError::ReadOnly)));
 }
 

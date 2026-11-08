@@ -1,14 +1,16 @@
 // Model page (SPEC Models, ARCHITECTURE section 8): the curated models with their state on disk,
 // download and cancel through the daemon, "use my own .bin", the GPU and the idle unload.
-import { Theme, Shell, Icons, Group, Card, ClickCard, Row, SliderRow, Combo, TextField, Button, ButtonKind, Radio, Badge, BadgeKind, ProgressBar, Note, Severity } from "../theme/index.slint";
+import { Theme, Shell, Icons, Group, Card, ClickCard, Row, Divider, SliderRow, Combo, TextField, Button, ButtonKind, Radio, Badge, BadgeKind, ProgressBar, Note, Severity } from "../theme/index.slint";
 
 export struct ModelRow {
     id: string,
     name: string,
     // "1.6 GB".
     size: string,
-    // What follows the size: a hint, a state to explain, or "Downloading 0.4 GB of 1.6 GB".
+    // What follows the size: a hint, or what to do about a state the badge names.
     status: string,
+    // Beside the progress bar while downloading: "0.7 of 1.6 GB".
+    progress-text: string,
     // "Ready", "Not downloaded", "Downloading".
     badge: string,
     // On disk and usable: the badge is green.
@@ -165,6 +167,7 @@ export component ModelPage inherits VerticalLayout {
             if row.downloading: ProgressBar {
                 padding-left: root.under-radio;
                 value: row.progress;
+                label: row.progress-text;
                 accessible-label: @tr("{} download", row.name);
                 accessible-value: row.progress;
             }
@@ -176,7 +179,7 @@ export component ModelPage inherits VerticalLayout {
             }
             if ModelState.selected == i && row.can-download && !row.downloading: Note {
                 padding-left: root.under-radio;
-                text: @tr("Not downloaded yet: download it or dictation will not start.");
+                text: @tr("Dictation will not start until this is downloaded.");
                 severity: Severity.warning;
             }
         }
@@ -211,7 +214,7 @@ export component ModelPage inherits VerticalLayout {
                     text: @tr("Browse…");
                     icon: Icons.folder-open-16;
                     enabled: !Shell.locked;
-                    tooltip: @tr("The config is read-only");
+                    tooltip: Shell.locked-tip;
                     clicked => {
                         ModelState.browse();
                     }
@@ -230,8 +233,6 @@ export component ModelPage inherits VerticalLayout {
             Row {
                 icon: Icons.desktop;
                 title: @tr("GPU");
-                // The long device names need the widest column.
-                control-min: Theme.control-column-max;
                 fill-controls: true;
                 Combo {
                     model: ModelState.gpus;
@@ -242,6 +243,7 @@ export component ModelPage inherits VerticalLayout {
                     }
                 }
             }
+            Divider { }
             SliderRow {
                 icon: Icons.timer;
                 title: @tr("Unload after idle");

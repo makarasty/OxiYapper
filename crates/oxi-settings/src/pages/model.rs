@@ -214,7 +214,8 @@ impl PageState {
         self.update(i, |r| {
             r.downloading = true;
             r.progress = 0.0;
-            r.status = strings::DOWNLOAD_STARTING.into();
+            r.status = strings::model_hint(entry.id).into();
+            r.progress_text = strings::download_progress(0, entry.size).into();
             r.badge = strings::MODEL_BADGE_DOWNLOADING.into();
             r.error = SharedString::new();
         });
@@ -373,7 +374,8 @@ impl PageState {
                     self.update(i, |r| {
                         r.downloading = true;
                         r.progress = fraction(*done, *total);
-                        r.status = strings::downloading(*done, *total).into();
+                        r.status = strings::model_hint(id).into();
+                        r.progress_text = strings::download_progress(*done, *total).into();
                         r.badge = strings::MODEL_BADGE_DOWNLOADING.into();
                     });
                 }
@@ -419,14 +421,13 @@ fn row(entry: &ModelEntry, dir: &Path) -> ModelRow {
         id: entry.id.into(),
         name: entry.display_name.into(),
         size: gb(entry.size).into(),
-        // A state that needs explaining takes the place of the hint.
-        status: match status {
-            ModelStatus::Missing | ModelStatus::Ready => strings::model_hint(entry.id),
-            ModelStatus::Partial | ModelStatus::NeedsHash | ModelStatus::Bad => {
-                strings::model_status(status)
-            }
+        // What to do about a state the badge only names takes the place of the hint.
+        status: match strings::model_status(status) {
+            "" => strings::model_hint(entry.id),
+            todo => todo,
         }
         .into(),
+        progress_text: SharedString::new(),
         badge: strings::model_badge(status).into(),
         ready: matches!(status, ModelStatus::Ready | ModelStatus::NeedsHash),
         can_download: matches!(
@@ -441,14 +442,7 @@ fn row(entry: &ModelEntry, dir: &Path) -> ModelRow {
 
 /// Why Download is off on `link`; empty while it is on.
 fn download_off(link: Link) -> &'static str {
-    match link {
-        Link::Online => "",
-        Link::Connecting | Link::Offline | Link::Stuck => strings::DOWNLOAD_NEEDS_DAEMON,
-        Link::Mismatch { .. } => strings::PREVIEW_MISMATCH,
-        Link::Busy => strings::DAEMON_BUSY,
-        Link::Untrusted => strings::PIPE_UNTRUSTED,
-        Link::Foreign => strings::PIPE_FOREIGN,
-    }
+    link.off_reason(strings::DOWNLOAD_NEEDS_DAEMON)
 }
 
 fn fraction(done: u64, total: u64) -> f32 {
@@ -643,7 +637,9 @@ mod tests {
 
         push(&ipc, progress("large-v3", 1_000_000_000, 4_000_000_000));
         assert_eq!(bar(&window).as_deref(), Some("0.25"));
-        assert!(has(&window, "3.1 GB · Downloading 1.0 GB of 4.0 GB"));
+        assert!(has(&window, "1.0 of 4.0 GB"), "progress beside the bar");
+        // The badge says "Downloading"; the caption keeps size and hint, nothing of the progress.
+        assert!(has(&window, "3.1 GB · slower, more accurate"));
         push(&ipc, progress("large-v3", 3_000_000_000, 4_000_000_000));
         assert_eq!(bar(&window).as_deref(), Some("0.75"));
         // Another model's progress leaves this bar alone.
@@ -695,7 +691,7 @@ mod tests {
         fs::create_dir_all(layout.models_dir()).unwrap();
         fs::write(layout.models_dir().join("ggml-large-v3.bin.part"), b"half").unwrap();
         push(&ipc, done("large-v3", DownloadResult::Cancelled));
-        assert!(has(&window, "3.1 GB · Paused, Download resumes"));
+        assert!(has(&window, "3.1 GB · resumes where it stopped"));
         // A model with no `.part` stays "Not downloaded".
         assert!(has(&window, "Whisper large-v3 turbo: Not downloaded"));
         with_role(&window, "Download Whisper large-v3", AccessibleRole::Button);

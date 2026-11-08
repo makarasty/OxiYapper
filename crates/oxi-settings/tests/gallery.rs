@@ -9,10 +9,13 @@ mod gallery {
     include!(concat!(env!("OUT_DIR"), "/gallery.rs"));
 }
 
+mod common;
+
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use common::purple;
 use gallery::{Contrast, GalleryShot, Theme};
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
@@ -103,26 +106,6 @@ fn save(pixmap: &Pixmap, name: &str) {
             .save_png(dir.join(format!("gallery-{name}-p{:02}.png", i + 1)))
             .unwrap();
     }
-}
-
-/// A pixel of the purple system accent family: HSV hue 260..300 with chroma over 0.08.
-fn purple(r: u8, g: u8, b: u8) -> bool {
-    let (r, g, b) = (f32::from(r), f32::from(g), f32::from(b));
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let chroma = (max - min) / 255.0;
-    if chroma <= 0.08 {
-        return false;
-    }
-    let d = max - min;
-    let hue = if (max - r).abs() < f32::EPSILON {
-        60.0 * ((g - b) / d).rem_euclid(6.0)
-    } else if (max - g).abs() < f32::EPSILON {
-        60.0 * ((b - r) / d + 2.0)
-    } else {
-        60.0 * ((r - g) / d + 4.0)
-    };
-    (260.0..=300.0).contains(&hue)
 }
 
 #[test]
@@ -243,6 +226,38 @@ fn contrast_matches_spec() {
                 (got - want).abs() < 0.06,
                 "{name} (dark: {dark}): {got:.2}, spec {want}"
             );
+        }
+        shot.hide().unwrap();
+    }
+}
+
+/// R-25: badge text is 12 px, so every badge pair must reach AA (4.5:1) on the card and on a
+/// hovered `ClickCard`. The tints are opaque, so the card under them cannot change the ratio;
+/// the neutral badge's alpha fill is composited over both.
+#[test]
+fn badge_pairs_reach_aa_on_card_and_hover() {
+    let shot = sheet(false);
+    for dark in [false, true] {
+        shot.set_dark(dark);
+        shot.show().unwrap();
+        slint::platform::update_timers_and_animations();
+        let t = shot.global::<Theme>();
+        let c = shot.global::<Contrast>();
+        for (name, fg, fill) in [
+            ("success", t.get_success_text(), t.get_success_tint()),
+            ("accent", t.get_accent_text(), t.get_accent_badge()),
+            ("neutral", t.get_text_secondary(), t.get_bg_inset()),
+        ] {
+            for (under_name, under) in [
+                ("bg-card", t.get_bg_card()),
+                ("bg-control-hover", t.get_bg_control_hover()),
+            ] {
+                let got = c.invoke_ratio(fg, c.invoke_over(fill, under));
+                assert!(
+                    got >= 4.5,
+                    "{name} badge on {under_name} (dark: {dark}): {got:.2}:1"
+                );
+            }
         }
         shot.hide().unwrap();
     }

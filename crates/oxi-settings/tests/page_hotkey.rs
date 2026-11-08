@@ -9,6 +9,7 @@ use common::{config, has, layout, one, open_linked};
 use i_slint_backend_testing::{AccessibleRole, ElementHandle};
 use oxi_core::machine::Mode;
 use oxi_core::paths::Layout;
+use oxi_settings::ipc::{Event, Link};
 use oxi_settings::{AppWindow, Ipc, Page};
 
 fn open(layout: &Layout) -> AppWindow {
@@ -137,4 +138,68 @@ fn locked_config_keeps_change_off() {
     change.invoke_accessible_default_action();
     assert!(!has(&window, "Left Ctrl"));
     assert_eq!(fs::read_to_string(l.config_file()).unwrap(), original);
+}
+
+#[test]
+fn offline_keeps_the_help_line_and_leaves_the_reason_to_the_banner() {
+    let l = layout("offline-help", None);
+    let (ipc, _rx) = Ipc::fake();
+    let window = open_linked(&l, Page::Hotkey, ipc.clone());
+    ipc.deliver(&Event::Link(Link::Offline));
+    click(&window, "Change hotkey");
+    assert!(has(
+        &window,
+        "Click keys or press them. Left and right modifiers both count."
+    ));
+    // The third mention of "not running" is gone: the banner and the rail chip say it.
+    assert!(!has(
+        &window,
+        "Not connected to OxiYapper: pressed keys are not seen. Start OxiYapper to pick a hotkey."
+    ));
+    assert_eq!(
+        one(&window, "Apply hotkey").accessible_enabled(),
+        Some(false)
+    );
+}
+
+/// Apply's tooltip names why it is off on each link; it must not claim the daemon is not
+/// running when it is the pipe that is the problem.
+#[test]
+fn apply_tooltip_follows_the_link() {
+    let l = layout("apply-tip", None);
+    let (ipc, _rx) = Ipc::fake();
+    let window = open_linked(&l, Page::Hotkey, ipc.clone());
+    click(&window, "Change hotkey");
+    let tip = || {
+        one(&window, "Apply hotkey")
+            .accessible_description()
+            .map(|d| d.to_string())
+    };
+    // Online and nothing wrong with the chord: on, so nothing to explain.
+    click(&window, "Left Ctrl");
+    assert_eq!(tip().as_deref(), Some(""));
+    for (link, text) in [
+        (
+            Link::Offline,
+            "Pressed keys are seen only while OxiYapper runs",
+        ),
+        (
+            Link::Mismatch { daemon_proto: 9 },
+            "Restart OxiYapper first",
+        ),
+        (Link::Busy, "OxiYapper is running but not answering"),
+        (
+            Link::Untrusted,
+            "The OxiYapper pipe is held by an untrusted program. Not connecting.",
+        ),
+        (
+            Link::Foreign,
+            "The OxiYapper pipe is held by another account. Not connecting.",
+        ),
+    ] {
+        ipc.deliver(&Event::Link(link));
+        assert_eq!(tip().as_deref(), Some(text), "{link:?}");
+    }
+    ipc.deliver(&Event::Link(Link::Online));
+    assert_eq!(tip().as_deref(), Some(""));
 }

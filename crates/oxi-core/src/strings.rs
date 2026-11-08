@@ -114,11 +114,15 @@ pub const PIPE_FOREIGN: &str = "The OxiYapper pipe is held by another account. N
 pub const PREVIEW_OFFLINE: &str = "OxiYapper is not running";
 pub const PREVIEW_MISMATCH: &str = "Restart OxiYapper first";
 
-/// Banner of a config reload that failed; `line` is 1-based.
+/// Banner of a config reload that failed; `line` is 1-based. Reads like the parser's own
+/// `ConfigError::Syntax` ("config.toml line 3, column 11: ..."), which has the column too.
 #[must_use]
 pub fn config_error(file: &str, line: usize, message: &str) -> String {
-    format!("{file}, line {line}: {message}")
+    format!("{file} line {line}: {message}")
 }
+
+/// What follows the "newer version, read-only" banner: the way out.
+pub const CONFIG_READ_ONLY_NEXT: &str = "Update OxiYapper to change settings here.";
 
 /// The daemon could not be started; only the error kind, never the path.
 #[must_use]
@@ -152,7 +156,8 @@ pub fn mic_test_failed(kind: &str) -> String {
 pub const SYSTEM_DEFAULT_MIC: &str = "System default";
 
 pub const DOWNLOAD_NEEDS_DAEMON: &str = "Start OxiYapper to download.";
-pub const DOWNLOAD_STARTING: &str = "Starting the download";
+/// Apply's tooltip on the hotkey page while there is no daemon to report the pressed keys.
+pub const HOTKEY_NEEDS_DAEMON: &str = "Pressed keys are seen only while OxiYapper runs";
 
 /// The daemon's reason for a failed model download, under the model's row.
 #[must_use]
@@ -163,30 +168,34 @@ pub fn download_failed(message: &str) -> String {
 /// Decimal gigabytes with one digit, the unit Hugging Face shows.
 #[must_use]
 pub fn gb(bytes: u64) -> String {
+    format!("{} GB", gb_digits(bytes))
+}
+
+fn gb_digits(bytes: u64) -> String {
     #[expect(clippy::cast_precision_loss, reason = "one decimal digit is shown")]
     let gb = bytes as f64 / 1e9;
-    format!("{gb:.1} GB")
+    format!("{gb:.1}")
 }
 
-/// Progress line of a model download.
+/// Progress label beside a model's download bar: "0.7 of 1.6 GB".
 #[must_use]
-pub fn downloading(done: u64, total: u64) -> String {
-    format!("Downloading {} of {}", gb(done), gb(total))
+pub fn download_progress(done: u64, total: u64) -> String {
+    format!("{} of {}", gb_digits(done), gb(total))
 }
 
-/// Status line of a registry model from its files.
+/// What to do about a registry model in a state its badge only names; empty when the badge says
+/// it all (the row then shows the model's hint).
 #[must_use]
 pub const fn model_status(status: ModelStatus) -> &'static str {
     match status {
-        ModelStatus::Missing => "Not downloaded",
-        ModelStatus::Partial => "Paused, Download resumes",
-        ModelStatus::Ready => "Ready",
-        ModelStatus::NeedsHash => "Downloaded, checked before first use",
-        ModelStatus::Bad => "Damaged or incomplete, download it again",
+        ModelStatus::Missing | ModelStatus::Ready => "",
+        ModelStatus::Partial => "resumes where it stopped",
+        ModelStatus::NeedsHash => "checked before first use",
+        ModelStatus::Bad => "download it again",
     }
 }
 
-/// Short state of a registry model, for its badge; [`model_status`] explains it.
+/// Short state of a registry model, for its badge; [`model_status`] says what to do.
 #[must_use]
 pub const fn model_badge(status: ModelStatus) -> &'static str {
     match status {
@@ -242,16 +251,17 @@ mod tests {
         assert_eq!(gb(1_624_555_275), "1.6 GB");
         assert_eq!(gb(0), "0.0 GB");
         assert_eq!(
-            downloading(1_000_000_000, 4_000_000_000),
-            "Downloading 1.0 GB of 4.0 GB"
+            download_progress(650_000_000, 1_624_555_275),
+            "0.7 of 1.6 GB"
         );
+        assert_eq!(download_progress(0, 1_624_555_275), "0.0 of 1.6 GB");
         assert_eq!(
             spawn_failed(std::io::ErrorKind::NotFound),
             "Could not start OxiYapper: entity not found."
         );
         assert_eq!(
             config_error("config.toml", 3, "bad"),
-            "config.toml, line 3: bad"
+            "config.toml line 3: bad"
         );
         assert_eq!(not_connected("USB Mic"), "Not connected: USB Mic");
         assert_eq!(
@@ -263,6 +273,27 @@ mod tests {
             "Test failed: no output device"
         );
         assert_eq!(download_failed("reset"), "Download failed: reset");
+    }
+
+    #[test]
+    fn a_model_badge_and_its_caption_never_say_the_same_thing() {
+        for status in [
+            ModelStatus::Missing,
+            ModelStatus::Partial,
+            ModelStatus::Ready,
+            ModelStatus::NeedsHash,
+            ModelStatus::Bad,
+        ] {
+            let badge = model_badge(status).to_lowercase();
+            let caption = model_status(status).to_lowercase();
+            let first = badge.split(' ').next().unwrap();
+            assert!(!caption.contains(first), "{status:?}: {badge} / {caption}");
+            assert!(!caption.contains(&badge), "{status:?}: {badge} / {caption}");
+        }
+        assert_eq!(
+            model_status(ModelStatus::Partial),
+            "resumes where it stopped"
+        );
     }
 
     #[test]
