@@ -81,6 +81,7 @@ export component AudioPage inherits VerticalLayout {
                 Meter {
                     bars: AudioState.bars;
                     live: AudioState.live;
+                    clipping: AudioState.clipping;
                     empty-text: AudioState.note;
                     accessible-label: !AudioState.live ? AudioState.note : AudioState.clipping ? @tr("Level, clipping") : @tr("Level");
                 }
@@ -208,7 +209,7 @@ export component AudioPage inherits VerticalLayout {
                 title: @tr("Language");
                 Segmented {
                     accessible-label: @tr("Language");
-                    min-width: 180px;
+                    min-width: Theme.segmented-min-width;
                     items: [@tr("RU"), @tr("EN"), @tr("Auto")];
                     selected: AudioState.language;
                     picked(i) => {

@@ -353,7 +353,9 @@ mod tests {
     use slint::ComponentHandle;
     use slint::platform::WindowEvent;
 
-    use crate::generated::HotkeyState;
+    use std::rc::Rc;
+
+    use crate::generated::{HotkeyState, Theme};
     use crate::ipc::{Cmd, Event, Ipc, Link};
     use crate::testing::{linked, one};
     use crate::{AppWindow, Page};
@@ -524,23 +526,87 @@ mod tests {
             one(&window, "F1").size().width
         };
         let small = cap(720.0);
+        let default_size = cap(1280.0);
         let middle = cap(1120.0);
         let large = cap(1600.0);
         let huge = cap(2400.0);
-        // A cap is the unit less its gap: 28 px units give 25 px caps, 36 give 33, 52 give 47.8.
-        assert!((24.0..=25.5).contains(&small), "720: {small}");
+        // A cap is the unit less its gap: 28 px units give 25 px caps, 43 give 39.6, 52 give 47.8.
+        assert!((small - 25.0).abs() < 0.01, "720: {small}");
+        assert!(
+            (default_size - 43.0 * 0.92).abs() < 0.5,
+            "1280: {default_size}"
+        );
         assert!((32.0..36.0).contains(&middle), "1120: {middle}");
         assert!((large - 52.0 * 0.92).abs() < 0.5, "1600: {large}");
         assert!((huge - large).abs() < 0.01, "stopped growing: {huge}");
     }
 
     #[test]
-    fn cap_labels_stay_readable_at_every_unit() {
-        let (window, _ipc, _sent) = open("labels");
-        let font = window.global::<crate::generated::CapFont>();
-        assert!((font.invoke_size(26.0) - 12.0).abs() < 0.01, "floor");
-        assert!((font.invoke_size(40.0) - 12.0).abs() < 0.01);
-        assert!((font.invoke_size(52.0) - 15.0).abs() < 0.01, "ceiling");
+    fn the_cap_label_size_stays_readable_at_every_unit() {
+        let (window, _ipc, _sent) = open("label-size");
+        let theme = window.global::<Theme>();
+        assert!(
+            (theme.invoke_keycap_label_size(28.0) - 12.0).abs() < 0.01,
+            "floor"
+        );
+        assert!(
+            (theme.invoke_keycap_label_size(52.0) - 15.0).abs() < 0.01,
+            "ceiling"
+        );
+    }
+
+    /// In the real font (the testing backend's text metrics are fake), so Windows only.
+    #[cfg(windows)]
+    #[test]
+    fn every_label_fits_its_cap_on_one_line() {
+        std::thread::spawn(measure_labels).join().unwrap();
+    }
+
+    #[cfg(windows)]
+    fn measure_labels() {
+        use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
+        use slint::platform::{Platform, WindowAdapter};
+
+        slint::slint! {
+            export component Measure inherits Window {
+                in property <string> family;
+                in property <string> label;
+                in property <length> size;
+                out property <length> needed: t.preferred-width;
+                default-font-family: root.family;
+                t := Text {
+                    text: root.label;
+                    font-size: root.size;
+                    wrap: no-wrap;
+                }
+            }
+        }
+        struct Real;
+        impl Platform for Real {
+            fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
+                Ok(MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer))
+            }
+        }
+        slint::platform::set_platform(Box::new(Real)).unwrap();
+        let window = crate::open(crate::testing::layout("hotkey", "measure")).unwrap();
+        let theme = window.global::<Theme>();
+        let measure = Measure::new().unwrap();
+        measure.set_family(theme.get_font_family());
+        for cap in super::keyboard_layout::caps() {
+            let from = super::keyboard_layout::full_from(cap.key);
+            for unit in [28.0, 30.0, 35.9, 36.0, 40.9, 41.0, 43.0, 52.0] {
+                let label = super::keyboard_layout::cap_label(cap.key, unit >= from);
+                measure.set_label(label.into());
+                measure.set_size(theme.invoke_keycap_label_size(unit));
+                // The cap less its gap and the 2 px Keycap keeps on each side of the label.
+                let room = cap.w * unit - theme.invoke_keycap_gap_for(unit) - 4.0;
+                assert!(
+                    measure.get_needed() <= room,
+                    "{label} needs {} px, has {room} at unit {unit}",
+                    measure.get_needed()
+                );
+            }
+        }
     }
 
     #[test]

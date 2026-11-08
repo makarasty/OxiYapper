@@ -142,7 +142,8 @@ export component Slider {
 // A typed value: right-aligned digits with the unit as a suffix inside the field, 72 px. Up/Down
 // step (Shift: ten steps), the wheel steps while focused. Enter or leaving the field commits:
 // parse, round to the step, clamp, then `changed` (the slider's callback). Text that is not a
-// number gets a red stroke and reverts when the field loses focus. `signed` shows "+3".
+// number (empty, nan, inf included) gets a red stroke and reverts. Only text the user changed is
+// committed, so a config value off the step survives a pass through the field. `signed` shows "+3".
 // `zero-text` ("never") is written under the field while the value is 0.
 // Our own frame around a `TextInput` (not `LineEdit`): the suffix needs room inside the frame,
 // and the focus underline must be our teal, not the system accent.
@@ -165,9 +166,15 @@ export component NumberField {
 
     property <bool> live: root.enabled && !root.locked;
     property <string> shown: (root.signed && root.value > 0 ? "+" : "") + root.value.to-fixed(root.decimals);
-    property <bool> invalid: input.text != "" && !input.text.is-float();
+    property <bool> invalid: !root.parses(input.text);
+    // The text differs from `shown` because the user typed.
+    property <bool> dirty;
     property <bool> focused: root.force-focus || input.has-focus;
 
+    // `is-float` takes "nan" and "inf"; both fail the comparison.
+    pure function parses(text: string) -> bool {
+        return text.is-float() && abs(text.to-float()) < 1000000;
+    }
     public function set(v: float) {
         let c = clamp(root.minimum + round((v - root.minimum) / root.step) * root.step, root.minimum, root.maximum);
         if (c != root.value) {
@@ -176,9 +183,10 @@ export component NumberField {
         }
     }
     function commit() {
-        if (root.live && input.text.is-float()) {
+        if (root.live && root.dirty && root.parses(input.text)) {
             root.set(input.text.to-float());
         }
+        root.dirty = false;
         input.text = root.shown;
     }
 
@@ -186,6 +194,7 @@ export component NumberField {
         input.text = root.force-text != "" ? root.force-text : root.shown;
     }
     changed shown => {
+        root.dirty = false;
         input.text = self.shown;
     }
 
@@ -207,7 +216,7 @@ export component NumberField {
         }
     }
     accessible-action-set-value(v) => {
-        if (root.live && v.is-float()) {
+        if (root.live && root.parses(v)) {
             root.set(v.to-float());
         }
     }
@@ -239,9 +248,10 @@ export component NumberField {
                 enabled: false;
                 capture-key-pressed(event) => {
                     if (event.text == Key.UpArrow || event.text == Key.DownArrow) {
-                        if (input.text.is-float()) {
+                        if (root.dirty && root.parses(input.text)) {
                             root.set(input.text.to-float());
                         }
+                        root.dirty = false;
                         root.set(root.value + (event.text == Key.UpArrow ? 1 : -1) * (event.modifiers.shift ? 10 : 1) * root.step);
                         input.text = root.shown;
                         return accept;
@@ -263,6 +273,9 @@ export component NumberField {
                         selection-background-color: Theme.accent;
                         selection-foreground-color: Theme.on-accent;
                         accessible-role: none;
+                        edited => {
+                            root.dirty = true;
+                        }
                         accepted => {
                             root.commit();
                         }

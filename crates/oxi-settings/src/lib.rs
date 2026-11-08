@@ -40,10 +40,10 @@ pub const FILE_POLL: Duration = Duration::from_secs(1);
 /// selection from: our teal (token `accent`), never the Windows accent (redesign spec 7.3).
 const ACCENT: Color = Color::from_rgb_u8(0x0F, 0x76, 0x6E);
 
-/// Default size: `min(1120, 85 %)` x `min(780, 88 %)` of the work area, at least the 720 x 520
+/// Default size: `min(1280, 85 %)` x `min(800, 88 %)` of the work area, at least the 720 x 520
 /// minimum (redesign spec section 2).
 #[cfg(windows)]
-const DEFAULT: (f32, f32) = (1120.0, 780.0);
+const DEFAULT: (f32, f32) = (1280.0, 800.0);
 #[cfg(windows)]
 const MIN: (f32, f32) = (720.0, 520.0);
 
@@ -441,11 +441,11 @@ mod tests {
         // (work area, scale, logical size, physical top-left)
         let cases = [
             // 1920x1080 at 100 %, taskbar 48: the full default size.
-            (rect(0, 0, 1920, 1032), 1.0, (1120.0, 780.0), (400, 126)),
+            (rect(0, 0, 1920, 1032), 1.0, (1280.0, 800.0), (320, 116)),
             // 1366x768 laptop: 85 % of 1366 is 1161, 88 % of 720 is 633.6.
-            (rect(0, 0, 1366, 720), 1.0, (1120.0, 633.6), (123, 43)),
+            (rect(0, 0, 1366, 720), 1.0, (1161.1, 633.6), (102, 43)),
             // 2560x1440 at 150 %: 1706x928 logical, the default size again.
-            (rect(0, 0, 2560, 1392), 1.5, (1120.0, 780.0), (440, 111)),
+            (rect(0, 0, 2560, 1392), 1.5, (1280.0, 800.0), (320, 96)),
             // A tiny screen still gets the minimum; a monitor left of the primary keeps its origin.
             (rect(-800, 0, 800, 600), 1.0, (720.0, 528.0), (-760, 36)),
         ];

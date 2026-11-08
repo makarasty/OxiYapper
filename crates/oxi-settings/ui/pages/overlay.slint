@@ -12,13 +12,39 @@ export global OverlayState {
     in property <bool> online;
     // Why Preview is off; empty while online or connecting.
     in property <string> note;
+    // The daemon is not running: the page tells how to fix that instead of `note`.
+    in property <bool> offline;
     callback enabled-toggled(bool);
     callback position-picked(int);
     callback hide-over-fullscreen-toggled(bool);
     callback preview();
 }
 
+// The Preview button and why it is off, beside the picker or under it.
+component PreviewAction inherits VerticalLayout {
+    property <string> reason: OverlayState.offline ? @tr("Start OxiYapper to preview.") : OverlayState.note;
+    alignment: center;
+    spacing: Theme.control-gap;
+    HorizontalLayout {
+        alignment: start;
+        Button {
+            text: @tr("Preview");
+            icon: Icons.eye-16;
+            enabled: OverlayState.online;
+            accessible-description: OverlayState.note;
+            clicked => {
+                OverlayState.preview();
+            }
+        }
+    }
+    if root.reason != "": Note {
+        text: root.reason;
+        severity: Severity.warning;
+    }
+}
+
 export component OverlayPage inherits VerticalLayout {
+    property <bool> narrow: root.width < 640px;
     alignment: start;
     spacing: Theme.group-gap;
     Group {
@@ -43,6 +69,7 @@ export component OverlayPage inherits VerticalLayout {
         title: @tr("Position");
         Card {
             HorizontalLayout {
+                alignment: root.narrow ? LayoutAlignment.start : LayoutAlignment.stretch;
                 spacing: Theme.space-6;
                 ScreenPicker {
                     accessible-label: @tr("Position");
@@ -52,28 +79,11 @@ export component OverlayPage inherits VerticalLayout {
                         OverlayState.position-picked(i);
                     }
                 }
-                VerticalLayout {
-                    alignment: center;
+                if !root.narrow: PreviewAction {
                     horizontal-stretch: 1;
-                    spacing: Theme.control-gap;
-                    HorizontalLayout {
-                        alignment: start;
-                        Button {
-                            text: @tr("Preview");
-                            icon: Icons.eye-16;
-                            enabled: OverlayState.online;
-                            tooltip: OverlayState.note;
-                            clicked => {
-                                OverlayState.preview();
-                            }
-                        }
-                    }
-                    if OverlayState.note != "": Note {
-                        text: OverlayState.note;
-                        severity: Severity.warning;
-                    }
                 }
             }
+            if root.narrow: PreviewAction { }
         }
     }
 }

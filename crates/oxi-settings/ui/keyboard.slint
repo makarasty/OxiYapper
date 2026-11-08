@@ -24,23 +24,16 @@ export struct KeyCap {
     invalid: bool,
 }
 
-// How a cap's label looks at a key unit. A global so the unit test reads the numbers the caps use.
-export global CapFont {
-    // shortcut: repeats the label size formula of `Keycap`, which has no output for it.
-    pure public function size(unit: length) -> length {
-        return clamp(unit * 0.30, 12px, 15px);
-    }
-}
-
 export component Keyboard inherits Rectangle {
     in property <[KeyCap]> caps;
     // Board size in key units.
     in property <float> columns: 1;
     in property <float> rows: 1;
     callback clicked(string);
-    // Spec 5.1: 28..52 px. The board may borrow 8 px of the card's padding on each side (all but
-    // 1 px of it at the smallest window) and is centred when it stops growing at 52.
-    property <length> unit: min((root.width + 2 * Theme.card-padding-h - 2px) / root.columns, clamp((root.width + 2 * Theme.space-2) / root.columns, 28px, 52px));
+    // Spec 5.1: 28..52 px. The first and last caps line up with the heading and the buttons (the
+    // 3 px are the half gaps outside them); the 28 px board of the smallest window takes the card's
+    // padding, and the board is centred when it stops growing at 52.
+    property <length> unit: clamp((root.width + 3px) / root.columns, 28px, 52px);
     property <length> gap: Theme.keycap-gap-for(root.unit);
     property <length> left: (root.width - root.unit * root.columns) / 2;
     height: root.unit * root.rows;

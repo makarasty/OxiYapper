@@ -102,12 +102,13 @@ export component Note inherits HorizontalLayout {
 }
 
 // Live level: 24 px inset track with 3 px accent bars 2 px apart, newest at the right and centred
-// on the track; bars at 1.0 (clipping) are error red. With `live` off the track shows
+// on the track; `clipping` turns them all error red, bars at 1.0 go red on their own. With `live` off the track shows
 // `empty-text` ("No microphone") instead.
 export component Meter inherits Rectangle {
     // Bar heights 0..1, oldest first.
     in property <[float]> bars;
     in property <bool> live: true;
+    in property <bool> clipping;
     in property <string> empty-text;
     height: 24px;
     min-width: 120px;
@@ -123,7 +124,7 @@ export component Meter inherits Rectangle {
             width: 3px;
             height: max(2px, clamp(level, 0, 1) * (root.height - 6px));
             border-radius: 1.5px;
-            background: level >= 1 ? Theme.error-text : Theme.accent;
+            background: root.clipping || level >= 1 ? Theme.error-text : Theme.accent;
             visible: self.x >= 2px;
         }
     }

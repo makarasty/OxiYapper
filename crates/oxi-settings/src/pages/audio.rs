@@ -244,14 +244,7 @@ impl<C: Capture + 'static> PageState<C> {
         state.set_live(live.is_open());
         // Leading silence is drawn as nothing, not a row of 2 px dots (audit M9); the Meter keeps
         // the newest bar at the right edge.
-        let mut bars: Vec<f32> = live.meter.bars().skip_while(|&b| b <= 0.0).collect();
-        // shortcut: the theme Meter paints only bars at 1.0 red, so clipping marks the newest
-        // bar; pass `clipping` into Meter when it grows an input for it.
-        if state.get_clipping()
-            && let Some(newest) = bars.last_mut()
-        {
-            *newest = 1.0;
-        }
+        let bars: Vec<f32> = live.meter.bars().skip_while(|&b| b <= 0.0).collect();
         state.set_bars(ModelRc::from(Rc::new(VecModel::from(bars))));
     }
 
@@ -1058,7 +1051,7 @@ mod tests {
         if let Some(dir) = &dir {
             std::fs::create_dir_all(dir).unwrap();
         }
-        let (w, h) = (1120_u32, 780_u32);
+        let (w, h) = (1280_u32, 800_u32);
         slint::platform::set_platform(Box::new(Shots)).unwrap();
         let bars = |f: fn(usize) -> f32| -> Vec<f32> { (0..40).map(f).collect() };
         let screens: [(&str, Option<&str>, Vec<f32>, bool); 4] = [
@@ -1093,12 +1086,12 @@ device = \"USB Mic\"
             let surface = LAST.with_borrow(Clone::clone).unwrap();
             surface.set_size(slint::PhysicalSize::new(w, h));
             window.show().unwrap();
-            window.set_page(Page::Audio);
-            page.shown();
+            // Builds the page, whose `init` starts the meter; so stop it only after that.
+            show_audio(&window);
             page.tick();
+            // Its next frame would overwrite the bars and hints set below.
+            page.timer.stop();
             if !bars.is_empty() {
-                // The meter would overwrite the drawn bars on its next frame.
-                page.timer.stop();
                 let state = window.global::<AudioState>();
                 state.set_bars(ModelRc::from(Rc::new(VecModel::from(bars))));
                 state.set_clipping(clipping);
@@ -1272,6 +1265,78 @@ device = \"USB Mic\"
             w.dispatch_event(WindowEvent::KeyReleased { text });
         }
         assert_eq!(saved().max_seconds, 1800, "105 min clamps to 30 min");
+    }
+
+    fn press(window: &AppWindow, key: impl Into<SharedString>) {
+        let text: SharedString = key.into();
+        let w = window.window();
+        w.dispatch_event(slint::platform::WindowEvent::KeyPressed { text: text.clone() });
+        w.dispatch_event(slint::platform::WindowEvent::KeyReleased { text });
+    }
+
+    fn select_all(window: &AppWindow) {
+        use slint::platform::{Key as K, WindowEvent};
+        let w = window.window();
+        let ctrl: SharedString = K::Control.into();
+        w.dispatch_event(WindowEvent::KeyPressed { text: ctrl.clone() });
+        press(window, "a");
+        w.dispatch_event(WindowEvent::KeyReleased { text: ctrl });
+    }
+
+    #[test]
+    fn leaving_a_field_untouched_keeps_a_value_off_the_step() {
+        use slint::platform::{Key as K, PointerEventButton};
+
+        i_slint_backend_testing::init_no_event_loop();
+        let config = "version = 1\n[audio]\ntail_ms = 125\n";
+        let (window, page) = window_on("untouched", Some(config), fake);
+        window.show().unwrap();
+        show_audio(&window);
+        let tail = || page.ctx.config.borrow().config.audio.tail_ms;
+        for leave in [K::Return, K::Tab] {
+            field(&window, "Tail after release").mock_single_click(PointerEventButton::Left);
+            press(&window, leave);
+            assert_eq!(tail(), 125, "the 50 ms step snapped an unedited value");
+        }
+        assert_eq!(
+            field(&window, "Tail after release")
+                .accessible_value()
+                .as_deref(),
+            Some("125")
+        );
+    }
+
+    #[test]
+    fn nan_inf_and_empty_are_refused_and_the_old_value_stays() {
+        use slint::platform::{Key as K, PointerEventButton};
+
+        i_slint_backend_testing::init_no_event_loop();
+        let (window, page) = window_on("refused", None, fake);
+        window.show().unwrap();
+        show_audio(&window);
+        let seconds = || page.ctx.config.borrow().config.audio.max_seconds;
+        let type_over = |text: &str| {
+            select_all(&window);
+            press(&window, K::Delete);
+            for c in text.chars() {
+                press(&window, c.to_string());
+            }
+            press(&window, K::Return);
+        };
+        field(&window, "Max length").mock_single_click(PointerEventButton::Left);
+        // Selecting works, or the refusals below would prove nothing.
+        type_over("25");
+        assert_eq!(seconds(), 1500);
+        for text in ["nan", "inf", "infinity", ""] {
+            type_over(text);
+            assert_eq!(seconds(), 1500, "{text:?} was accepted");
+        }
+        assert_eq!(
+            field(&window, "Max length").accessible_value().as_deref(),
+            Some("25")
+        );
+        field(&window, "Max length").set_accessible_value("nan");
+        assert_eq!(seconds(), 1500, "set-value took nan");
     }
 
     #[test]

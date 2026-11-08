@@ -79,21 +79,23 @@ pub struct Cap {
     pub h: f32,
 }
 
-/// The key unit, in px, from which `cap_label(key, true)` fits its cap on one line at 12 px. Spec
-/// 5.1 says 36 for all; measured, the 35.8 of the default window fits all but the two wide words.
+/// The key unit, in px, from which `cap_label(key, true)` fits its cap on one line; the test in
+/// `hotkey.rs` measures it in the real font.
 pub fn full_from(key: Key) -> f32 {
     if matches!(key, Key::Home | Key::Pause) {
-        40.0
+        41.0
     } else {
-        35.0
+        36.0
     }
 }
 
 /// The label of `key`: the full one when the cap has room, or else the short one `Key::label`
-/// gives (Menu shorter still, so it stays on one line on the smallest board).
+/// gives (shorter still where that would not fit a cap of the smallest board).
 pub fn cap_label(key: Key, full: bool) -> &'static str {
     match key {
         Key::Menu if !full => "Mnu",
+        Key::PageUp if !full => "P\u{2191}",
+        Key::PageDown if !full => "P\u{2193}",
         Key::Backspace if full => "Backspace",
         Key::PrintScreen if full => "PrtSc",
         Key::ScrollLock if full => "ScrLk",

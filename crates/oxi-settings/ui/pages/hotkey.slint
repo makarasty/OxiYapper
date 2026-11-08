@@ -35,37 +35,6 @@ export global HotkeyState {
     callback mode-picked(int);
 }
 
-// A Button the board can send the keyboard focus to: the theme's Button keeps its FocusScope private.
-component FocusButton inherits FocusScope {
-    in property <string> text;
-    in property <string> spoken;
-    in property <string> tooltip;
-    in property <ButtonKind> kind: ButtonKind.secondary;
-    callback activated();
-    focus-on-click: false;
-    focus-on-tab-navigation: false;
-    min-width: button.min-width;
-    height: Theme.control-height;
-    key-pressed(event) => {
-        if (event.text == " " || event.text == Key.Return) {
-            root.activated();
-            return accept;
-        }
-        reject
-    }
-    button := Button {
-        text: root.text;
-        kind: root.kind;
-        tooltip: root.tooltip;
-        enabled: root.enabled;
-        force-focus: root.has-focus;
-        accessible-label: root.spoken;
-        clicked => {
-            root.activated();
-        }
-    }
-}
-
 export component HotkeyPage inherits VerticalLayout {
     init => {
         HotkeyState.shown();
@@ -166,20 +135,19 @@ export component HotkeyPage inherits VerticalLayout {
                 HorizontalLayout {
                     spacing: Theme.control-gap;
                     alignment: end;
-                    cancel := FocusButton {
+                    cancel := Button {
                         text: @tr("Cancel");
-                        spoken: @tr("Cancel hotkey change");
-                        activated => {
+                        accessible-label: @tr("Cancel hotkey change");
+                        clicked => {
                             HotkeyState.cancel();
                         }
                     }
-                    apply := FocusButton {
+                    apply := Button {
                         text: @tr("Apply");
-                        spoken: @tr("Apply hotkey");
+                        accessible-label: @tr("Apply hotkey");
                         kind: ButtonKind.primary;
                         enabled: !Shell.locked && HotkeyState.online && HotkeyState.error == "";
-                        tooltip: !HotkeyState.online ? @tr("Start OxiYapper to apply") : HotkeyState.error;
-                        activated => {
+                        clicked => {
                             HotkeyState.apply();
                         }
                     }

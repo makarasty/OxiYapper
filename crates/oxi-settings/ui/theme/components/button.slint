@@ -27,6 +27,7 @@ export component Button {
     property <color> ink: !root.enabled && root.kind == ButtonKind.primary ? Theme.bg-card : !root.enabled ? Theme.text-disabled : root.kind == ButtonKind.primary ? Theme.on-accent : root.kind == ButtonKind.danger ? Theme.error-text : Theme.text-primary;
     property <bool> has-label: root.kind != ButtonKind.icon && root.text != "";
 
+    forward-focus: fs;
     height: Theme.control-height;
     min-width: root.kind == ButtonKind.icon ? Theme.control-height : max(88px, row.min-width);
     max-width: root.kind == ButtonKind.icon ? Theme.control-height : 100000px;

@@ -39,8 +39,8 @@ export component Keycap {
             x: 2px;
             width: parent.width - 4px;
             text: root.label;
-            font-size: clamp(root.unit * 0.30, 12px, 15px);
-            wrap: word-wrap;
+            font-size: Theme.keycap-label-size(root.unit);
+            wrap: no-wrap;
             overflow: elide;
             horizontal-alignment: center;
             vertical-alignment: center;

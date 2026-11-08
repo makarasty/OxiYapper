@@ -243,11 +243,7 @@ fn positions_are_one_group_with_one_checked_and_arrows_cross_rows() {
     assert_eq!(checked(), ["Top centre"]);
     key(Key::RightArrow);
     key(Key::RightArrow);
-    assert_eq!(
-        checked(),
-        ["Bottom left"],
-        "Right runs on into the next row"
-    );
+    assert_eq!(checked(), ["Top right"], "Right stops at the row edge");
 }
 
 #[test]
