@@ -251,6 +251,28 @@ fn glyphs_are_dark_on_a_light_taskbar_and_white_on_a_dark_one() {
     }
 }
 
+/// The recording bars sit centred in the body: the same gap to the rim on both sides, at every
+/// tray size (at 20 px the right bar was flush with the rim, the left had a gap).
+#[test]
+fn the_recording_bars_are_centred_in_the_body() {
+    for size in TRAY_SIZES {
+        let pm = tray_icon(Phase::Recording, size, true, TrayBadge::None).unwrap();
+        let y = size * 7 / 16;
+        let row: Vec<_> = (0..size).map(|x| pm.pixel(x, y).unwrap()).collect();
+        let first =
+            |f: &dyn Fn(&tiny_skia::PremultipliedColorU8) -> bool| row.iter().position(f).unwrap();
+        let last =
+            |f: &dyn Fn(&tiny_skia::PremultipliedColorU8) -> bool| row.iter().rposition(f).unwrap();
+        let white = |c: &tiny_skia::PremultipliedColorU8| {
+            (c.red(), c.green(), c.blue(), c.alpha()) == (255, 255, 255, 255)
+        };
+        let any = |c: &tiny_skia::PremultipliedColorU8| c.alpha() > 0;
+        let (left, right) = (first(&white) - first(&any), last(&any) - last(&white));
+        assert_eq!(left, right, "{size} px: gap left {left}, right {right}");
+        assert!(left >= 2, "{size} px: the bars touch the rim");
+    }
+}
+
 #[test]
 fn the_error_badge_sits_bottom_right_in_a_clear_ring() {
     for size in TRAY_SIZES {
