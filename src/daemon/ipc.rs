@@ -23,10 +23,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use oxi_core::hotkey::Key;
-use oxi_core::ipc::{PROTO, Push, Request};
+use oxi_core::ipc::{PROTO, Push, Request, TestFailure, TestOutcome};
+use oxi_core::tuning::append_pcm;
 use oxi_platform::ipc::{Conn, Error, Server, default_name, forward_open_settings};
 
-use super::cmd::{Inbox, IoCmd, IpcAsk, StatusReport};
+use super::cmd::{Inbox, IoCmd, IpcAsk, StatusReport, TestJob};
 use super::lock;
 
 /// Concurrent connections; more are closed unanswered.
@@ -259,6 +260,12 @@ struct Session {
     capture: Option<FocusGuard>,
     /// `Status` asks the coordinator has not answered yet, oldest first.
     asks: VecDeque<(Receiver<StatusReport>, Instant)>,
+    /// The recognition test's recording: in memory only, dropped with this connection.
+    test_audio: Option<Vec<f32>>,
+    /// The `id` of the run waiting for its `TestResult`; each run holds a copy of the recording.
+    test_running: Option<u32>,
+    /// A `TestTranscribe` was sent, so the worker may hold a model for it.
+    tested: bool,
 }
 
 /// Turns capture off the moment the settings window loses the foreground.
@@ -306,6 +313,9 @@ impl Ctx {
             self.serve(&mut conn, &mut session);
         }
         self.end_capture(&mut session);
+        if session.tested {
+            let _ = self.inbox.send(Inbox::Ipc(IpcAsk::TestDone));
+        }
         if let Some((id, _)) = session.settings {
             self.pushes.release(id);
         }
@@ -395,6 +405,40 @@ impl Ctx {
                 .inbox
                 .send(Inbox::Ipc(IpcAsk::PreviewOverlay(position)))
                 .is_ok(),
+            Request::PreviewSound {
+                choice,
+                volume_percent,
+            } => self
+                .inbox
+                .send(Inbox::Ipc(IpcAsk::PreviewSound {
+                    choice,
+                    volume_percent,
+                }))
+                .is_ok(),
+            Request::TestAudio { reset, pcm } => {
+                if !append_pcm(&mut session.test_audio, reset, &pcm) {
+                    tracing::warn!("recognition test audio refused");
+                }
+                true
+            }
+            Request::TestTranscribe { id, set, language } => {
+                if session.test_running.is_some() {
+                    let outcome = TestOutcome::Failed {
+                        why: TestFailure::Busy,
+                    };
+                    return conn.send(&Push::TestResult { id, outcome }).is_ok();
+                }
+                session.test_running = Some(id);
+                session.tested = true;
+                let job = TestJob {
+                    id,
+                    set,
+                    language,
+                    samples: session.test_audio.clone().unwrap_or_default(),
+                    reply: self.pushes.clone(),
+                };
+                self.inbox.send(Inbox::Ipc(IpcAsk::Test(job))).is_ok()
+            }
             Request::Shutdown => {
                 let _ = self.inbox.send(Inbox::Shutdown);
                 false
@@ -465,13 +509,16 @@ fn answer_status(conn: &mut Conn, session: &mut Session) -> bool {
 }
 
 /// Writes what other threads queued; `false` when the connection is over.
-fn flush(conn: &mut Conn, session: &Session) -> bool {
+fn flush(conn: &mut Conn, session: &mut Session) -> bool {
     let Some((_, queue)) = &session.settings else {
         return true;
     };
     loop {
         match queue.try_recv() {
             Ok(push) => {
+                if matches!(push, Push::TestResult { id, .. } if session.test_running == Some(id)) {
+                    session.test_running = None;
+                }
                 if conn.send(&push).is_err() {
                     return false;
                 }
@@ -940,6 +987,88 @@ mod tests {
         // The window may take the focus: allowed for the client's own pid (here this process).
         assert_eq!(rig.calls.try_recv(), Ok(Call::Allow(std::process::id())));
         assert!(rig.calls.try_recv().is_err(), "no second window");
+    }
+
+    #[test]
+    fn preview_sound_goes_to_the_coordinator() {
+        let rig = rig("preview-sound");
+        let mut conn = settings(&rig);
+        conn.send(&Request::PreviewSound {
+            choice: "pop".into(),
+            volume_percent: 40,
+        })
+        .unwrap();
+        assert!(matches!(
+            rig.inbox.recv_timeout(WAIT),
+            Ok(Inbox::Ipc(IpcAsk::PreviewSound { choice, volume_percent: 40 })) if choice == "pop"
+        ));
+    }
+
+    #[test]
+    fn test_audio_stays_with_the_connection_and_goes_out_with_each_run() {
+        let rig = rig("test-audio");
+        let mut conn = settings(&rig);
+        for (reset, samples) in [(true, &[0.9f32][..]), (true, &[0.1, 0.2]), (false, &[0.3])] {
+            conn.send(&Request::TestAudio {
+                reset,
+                pcm: oxi_core::tuning::encode_pcm(samples),
+            })
+            .unwrap();
+        }
+        conn.send(&Request::TestTranscribe {
+            id: 3,
+            set: oxi_core::tuning::SettingsSet::defaults(),
+            language: oxi_core::types::Language::EN,
+        })
+        .unwrap();
+        assert!(matches!(
+            rig.inbox.recv_timeout(WAIT),
+            Ok(Inbox::Ipc(IpcAsk::Test(job))) if job.id == 3 && job.samples == [0.1, 0.2, 0.3]
+        ));
+        drop(conn);
+        assert!(matches!(
+            rig.inbox.recv_timeout(WAIT),
+            Ok(Inbox::Ipc(IpcAsk::TestDone))
+        ));
+    }
+
+    #[test]
+    fn one_test_run_per_connection_the_rest_are_busy() {
+        let rig = rig("test-one");
+        let mut conn = settings(&rig);
+        let run = |id| Request::TestTranscribe {
+            id,
+            set: oxi_core::tuning::SettingsSet::defaults(),
+            language: oxi_core::types::Language::EN,
+        };
+        conn.send(&run(1)).unwrap();
+        let Ok(Inbox::Ipc(IpcAsk::Test(job))) = rig.inbox.recv_timeout(WAIT) else {
+            panic!("no first run");
+        };
+        conn.send(&run(2)).unwrap();
+        let busy = Push::TestResult {
+            id: 2,
+            outcome: TestOutcome::Failed {
+                why: TestFailure::Busy,
+            },
+        };
+        assert_eq!(conn.recv::<Push>().unwrap(), Some(busy));
+        assert!(matches!(rig.inbox.try_recv(), Err(TryRecvError::Empty)));
+
+        // The answer frees the slot before the client can see it.
+        let done = Push::TestResult {
+            id: 1,
+            outcome: TestOutcome::Failed {
+                why: TestFailure::NoAudio,
+            },
+        };
+        assert!(job.reply.send(done.clone()));
+        assert_eq!(conn.recv::<Push>().unwrap(), Some(done));
+        conn.send(&run(3)).unwrap();
+        assert!(matches!(
+            rig.inbox.recv_timeout(WAIT),
+            Ok(Inbox::Ipc(IpcAsk::Test(job))) if job.id == 3
+        ));
     }
 
     #[test]

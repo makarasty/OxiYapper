@@ -1,7 +1,7 @@
 // Messages and status: window banner, inline note, level meter, progress bar, badge.
 import { Theme } from "../tokens.slint";
 import { Icons } from "../icons.slint";
-import { Caption } from "base.slint";
+import { Caption, FocusRing, HoverTip, Tip, TipBubble } from "base.slint";
 
 export enum Severity { info, success, warning, error }
 
@@ -102,15 +102,172 @@ export component Note inherits HorizontalLayout {
     @children
 }
 
-// Live level: 24 px inset track with 3 px accent bars 2 px apart, newest at the right and centred
-// on the track; `clipping` turns them all error red, bars at 1.0 go red on their own. With `live` off the track shows
-// `empty-text` ("No microphone") instead.
+// Two warnings for one "!": the worse first, each on its own line of the tooltip.
+export global Warnings {
+    public pure function both(worse: string, other: string) -> string {
+        return worse == "" ? other : other == "" ? worse : worse + "\n" + other;
+    }
+}
+
+// What the focused "!" says and where, in window coordinates, for `KeyTipHost`.
+export global KeyTip {
+    in-out property <string> text;
+    in-out property <length> x;
+    in-out property <length> y;
+}
+
+// Lies over the whole window like the toast: takes no input, pushes nothing.
+export component KeyTipHost {
+    property <int> seen;
+    if KeyTip.text != "": TipBubble {
+        x: min(KeyTip.x, root.width - self.width - Theme.space-2);
+        y: min(KeyTip.y, root.height - self.height - Theme.space-2);
+        width: self.preferred-width;
+        height: self.preferred-height;
+        text: KeyTip.text;
+    }
+    if HoverTip.text != "": TipBubble {
+        x: min(HoverTip.x, root.width - self.width - Theme.space-2);
+        y: min(HoverTip.y, root.height - self.height - Theme.space-2);
+        width: self.preferred-width;
+        height: self.preferred-height;
+        text: HoverTip.text;
+    }
+    // A Tip removed while open never closes itself: its heartbeat stops, the bubble goes.
+    Timer {
+        interval: 450ms;
+        running: HoverTip.text != "";
+        triggered => {
+            if (root.seen == HoverTip.beat) {
+                HoverTip.text = "";
+            }
+            root.seen = HoverTip.beat;
+        }
+    }
+}
+
+// The "!" of a row (UI rule 2): its space is kept while `text` is empty, the text is its tooltip on
+// hover and on keyboard focus, so a warning never changes the row. A Tab stop only while it warns.
+export component WarningSlot inherits Rectangle {
+    in property <string> text;
+    width: Theme.icon-size;
+    accessible-role: AccessibleRole.text;
+    accessible-label: root.text;
+    property <bool> tell-key-tip: fs.has-focus && root.text != "";
+    // Tracked, because Tab scrolls the row into view after the focus lands.
+    property <length> key-tip-y: root.absolute-position.y + root.height + Theme.space-1;
+    function update-key-tip() {
+        KeyTip.text = root.tell-key-tip ? root.text : "";
+        KeyTip.x = root.absolute-position.x;
+        KeyTip.y = root.key-tip-y;
+    }
+    changed tell-key-tip => {
+        root.update-key-tip();
+    }
+    changed key-tip-y => {
+        if (root.tell-key-tip) {
+            root.update-key-tip();
+        }
+    }
+    changed text => {
+        if (root.tell-key-tip) {
+            root.update-key-tip();
+        }
+    }
+    if root.text != "": Image {
+        y: (root.height - self.height) / 2;
+        width: Theme.icon-size;
+        height: Theme.icon-size;
+        source: Look.icon(Severity.warning);
+        colorize: Look.ink(Severity.warning);
+        accessible-role: none;
+    }
+    touch := TouchArea {
+        enabled: root.text != "";
+    }
+    // Only Tab reaches it, so the ring never shows for the mouse (UI rule 17).
+    fs := FocusScope {
+        enabled: root.text != "";
+        focus-on-click: false;
+    }
+    FocusRing {
+        y: (root.height - self.height) / 2;
+        height: Theme.icon-size;
+        shown: fs.has-focus;
+    }
+    Tip {
+        text: root.text;
+        hovered: touch.has-hover;
+    }
+}
+
+// The one toast of the window (UI rule 3): the newest replaces the current one, no queue. For
+// short events; callable from Rust and from pages.
+export global Toast {
+    out property <string> text;
+    // Bumped by every `show`, so the host restarts its clock for a repeated message too.
+    out property <int> shown;
+    public function show(message: string) {
+        root.text = message;
+        root.shown += 1;
+    }
+    public function clear() {
+        root.text = "";
+    }
+}
+
+// Lies over the bottom of the window: takes no input, pushes nothing, leaves after 3 s.
+export component ToastHost {
+    property <int> shown: Toast.shown;
+    // The `shown` the clock runs for: a `show` in the same tick as the expiry must not be cleared.
+    property <int> armed;
+    changed shown => {
+        self.armed = self.shown;
+        clock.restart();
+    }
+    clock := Timer {
+        interval: 3s;
+        running: Toast.text != "";
+        triggered => {
+            if (root.armed == root.shown) {
+                Toast.clear();
+            }
+        }
+    }
+    if Toast.text != "": VerticalLayout {
+        alignment: end;
+        padding-bottom: Theme.space-4;
+        HorizontalLayout {
+            alignment: center;
+            // Fades in and reads at body size, so it is not taken for a stray hover tip.
+            // shortcut: it leaves in one frame (the `if` drops it), fade it out if owners miss it.
+            TipBubble {
+                text: Toast.text;
+                font-size: Theme.body-size;
+            }
+        }
+    }
+}
+
+// Live level: 24 px inset track with 3 px accent bars 2 px apart, newest at the right; the bars
+// that fit are centred on the track, so both ends keep the same inset. A bar marked in `clipped`
+// goes error red, as does one at 1.0. With `live` off the track shows `empty-text` ("No
+// microphone"); live with no bar yet (silence so far) it shows `idle-text`, so an open, quiet
+// mic does not look like a dead meter.
 export component Meter inherits Rectangle {
     // Bar heights 0..1, oldest first.
     in property <[float]> bars;
+    // Parallel to `bars`: the ones that clipped.
+    in property <[bool]> clipped;
     in property <bool> live: true;
-    in property <bool> clipping;
     in property <string> empty-text;
+    in property <string> idle-text;
+    property <length> inset: 4px;
+    property <length> pitch: 5px;
+    property <length> bar-width: 3px;
+    // Bars that fit between the insets, and where the first of them starts.
+    property <int> fit: floor((root.width - 2 * root.inset + root.pitch - root.bar-width) / root.pitch);
+    property <length> start: (root.width - (root.fit * root.pitch - (root.pitch - root.bar-width))) / 2;
     height: 24px;
     min-width: 120px;
     horizontal-stretch: 1;
@@ -121,16 +278,16 @@ export component Meter inherits Rectangle {
     accessible-label: root.live ? "" : root.empty-text;
     if root.live: Rectangle {
         for level[i] in root.bars: Rectangle {
-            x: root.width - 4px - (root.bars.length - i) * 5px;
-            width: 3px;
+            x: root.start + (root.fit - (root.bars.length - i)) * root.pitch;
+            width: root.bar-width;
             height: max(2px, clamp(level, 0, 1) * (root.height - 6px));
-            border-radius: 1.5px;
-            background: root.clipping || level >= 1 ? Theme.error-text : Theme.accent;
-            visible: self.x >= 2px;
+            border-radius: Theme.radius-round;
+            background: root.clipped[i] || level >= 1 ? Theme.error-text : Theme.accent;
+            visible: root.bars.length - i <= root.fit;
         }
     }
-    if !root.live: Caption {
-        text: root.empty-text;
+    if !root.live || root.bars.length == 0: Caption {
+        text: root.live ? root.idle-text : root.empty-text;
         horizontal-alignment: center;
         vertical-alignment: center;
         accessible-role: none;
@@ -152,12 +309,12 @@ export component ProgressBar inherits HorizontalLayout {
         Rectangle {
             height: 4px;
             min-width: 80px;
-            border-radius: 2px;
+            border-radius: Theme.radius-round;
             background: Theme.bg-inset;
             Rectangle {
                 x: 0;
                 width: parent.width * clamp(root.value, 0, 1);
-                border-radius: 2px;
+                border-radius: Theme.radius-round;
                 background: root.error ? Theme.error-text : Theme.accent;
             }
         }
@@ -172,12 +329,13 @@ export component ProgressBar inherits HorizontalLayout {
 
 export enum BadgeKind { success, neutral, accent }
 
-// Small pill label: "Ready" (success), "Not downloaded" (neutral), "Recommended" (accent).
+// Small nearly square label (UI rule 13, no pill): "Ready" (success), "Not downloaded" (neutral),
+// "Recommended" (accent).
 export component Badge inherits Rectangle {
     in property <string> text;
     in property <BadgeKind> kind: BadgeKind.neutral;
     property <color> ink: root.kind == BadgeKind.success ? Theme.success-text : root.kind == BadgeKind.accent ? Theme.accent-text : Theme.text-secondary;
-    border-radius: self.height / 2;
+    border-radius: Theme.radius-control;
     background: root.kind == BadgeKind.success ? Theme.success-tint : root.kind == BadgeKind.accent ? Theme.accent-badge : Theme.bg-inset;
     accessible-role: AccessibleRole.text;
     accessible-label: root.text;

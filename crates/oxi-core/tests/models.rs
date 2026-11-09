@@ -1,8 +1,11 @@
 use std::collections::HashSet;
 
+use std::time::{Duration, SystemTime};
+
+use oxi_core::constants::HOUR;
 use oxi_core::models::{
-    MODELS, ModelStatus, Stamp, find, find_by_file_name, sha256_file, stamp_file_name,
-    stamp_trusted, status, write_stamp,
+    MODELS, ModelStatus, PART_KEEP, Stamp, find, find_by_file_name, part_expired, sha256_file,
+    stamp_file_name, stamp_trusted, status, write_stamp,
 };
 
 fn is_hex(s: &str, len: usize) -> bool {
@@ -212,4 +215,18 @@ fn write_stamp_needs_an_existing_file() {
     let dir = scratch("nostamp");
     assert!(write_stamp(&dir.join("absent.bin")).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn part_age_rule() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_hours(100 * 24);
+    let table = [
+        ("6d23h", now - PART_KEEP.checked_sub(HOUR).unwrap(), false),
+        ("7d", now - PART_KEEP, true),
+        ("8d", now - PART_KEEP - Duration::from_hours(24), true),
+        ("future", now + HOUR, false),
+    ];
+    for (case, modified, want) in table {
+        assert_eq!(part_expired(modified, now), want, "{case}");
+    }
 }

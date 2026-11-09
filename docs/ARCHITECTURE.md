@@ -26,7 +26,8 @@ The daemon runs these threads. Each owns its data; they talk only through channe
 | audio | cpal stream (callback runs on the OS audio thread) plus a drain loop | Callback copies samples into a preallocated `rtrb` ring and updates the level atomic. No allocation, no lock in the callback. The drain loop downmixes and resamples in 20 ms chunks while recording. |
 | whisper | `WhisperContext`, the loaded model | Takes one job at a time. Loads on `Preload`, unloads on `Unload`. |
 | paste | clipboard and synthetic input | Waits for modifiers, snapshots and restores the clipboard. Kept off the coordinator because it sleeps (restore delay). |
-| io | history writes, model download, update check | One worker with a job channel; downloads report progress over IPC. |
+| io | model download, update check | One worker with a job channel; downloads report progress over IPC. |
+| history | history writes and retention (`src/daemon/history.rs`) | One worker with a job channel; a failed write comes back as a status warning. |
 | ipc | local socket server | One connection at a time is the settings window; other connections only send `OpenSettings`. |
 
 Shared atomics, read lock-free by the UI thread at 30 Hz: `LEVEL` (peak and RMS of the last 20 ms, for the overlay meter) and `PHASE` (current phase as `u8`, read by the hook callback to decide whether Esc is ours).
@@ -121,10 +122,13 @@ Framing: one JSON object per line (`serde_json`), max 1 MiB per line, tagged enu
 | `CaptureHotkey { on }` | `Key { code, down }` while on |
 | `PreviewOverlay { position }` | overlay shows for 2 s |
 | `Stats` | `Stats { dictations, words, wpm, streak, longest_streak, heat_start, heat }`, read from `stats.json` |
+| `PreviewSound { choice, volume_percent }` | the daemon plays `choice` once; a sound that cannot be used shows as a `sounds.preview: ...` line in `Status.warnings` |
+| `TestAudio { reset, pcm }` | no reply; the connection holds the raw 16 kHz mono recording in memory until it closes, never on disk |
+| `TestTranscribe { id, set, language }` | `TestResult { id, outcome }`: `Heard { text, ms }` or `Failed { why }` for one settings set on the held recording; one run in flight per connection, the rest and any run a dictation overtakes answer `Busy`. A model only a test loaded is dropped after 60 s with no test request |
 | `Shutdown` | daemon exits |
 | | `ConfigError { file, line, message }` pushed on a bad reload |
 
-Versioning: `proto` is an integer, starting at 1. Adding an optional field (serde default) does not bump it; renaming or removing a field or changing meaning does, and so does a new request (an older daemon drops a connection that sends one). Proto 2 added `Stats`. `Hello`, `HelloAck` and `Shutdown` never change shape. On a mismatch (exe updated while the old daemon runs) settings shows "Restart OxiYapper to finish the update" and a button that sends `Shutdown` and relaunches the daemon.
+Versioning: `proto` is an integer, starting at 1. Adding an optional field (serde default) does not bump it; renaming or removing a field or changing meaning does, and so does a new request (an older daemon drops a connection that sends one). Proto 2 added `Stats`. Proto 3 added `PreviewSound`. Proto 4 added `TestAudio` and `TestTranscribe`. `Hello`, `HelloAck` and `Shutdown` never change shape. On a mismatch (exe updated while the old daemon runs) settings shows "Restart OxiYapper to finish the update" and a button that sends `Shutdown` and relaunches the daemon.
 
 Live meter: the settings Audio page does not read `LEVEL` over IPC. While the page is shown, settings opens its own capture (`CpalCapture`) and polls its `LevelMeter` at 30 Hz; the capture closes when the page goes away. The daemon's mic is still opened only on key-down. Settings reopens the stream every 60 s to bound the memory the capture keeps.
 
@@ -154,12 +158,14 @@ meter_sensitivity_db = 0.0     # level meter display only (overlay, settings); -
 id = "turbo"                   # registry id, or "custom"
 custom_path = ""
 gpu = "auto"                   # auto | cpu | device name (names survive index changes)
-language = "ru"                # ru | en | auto
+language = "ru"                # any whisper language code, or auto
 idle_unload_minutes = 5        # 0 = never unload
+unload_immediately = false    # unload as soon as a dictation ends; wins over idle_unload_minutes
 [paste]
 mode = "clipboard"             # clipboard | type
 restore_delay_ms = 300
 trailing_space = true
+keep_in_clipboard_history = true   # dictation stays in Win+V history; false excludes it (cloud is always excluded)
 rules = [{ app = "mstsc.exe", mode = "type" }]   # per-app overrides: mode, chord, delay
 [overlay]
 enabled = true
@@ -167,10 +173,14 @@ position = "bottom-right"      # bottom-centre, top-left, ...
 hide_over_fullscreen = false
 [sounds]
 enabled = true
-volume = 0.5
+volume = 0.5                  # 0 to 1
+start = "rise"                 # rise, fall, pop, tick, or the path of a .wav file
+stop = "fall"
 [history]
 enabled = false                # owner turns it on; off for everyone else
-max_bytes = 2_147_483_648
+max_bytes = 2_147_483_648      # size cap, oldest entries go first; 0 = no cap
+max_days = 30                  # keep the last N days, today included; 0 = no age limit
+folder = ""                    # absolute path, may be another drive, gets an "OxiYapper history" subfolder; empty = history/ in the data dir
 [system]
 autostart = true
 update_check = true
@@ -220,7 +230,7 @@ Order, and where each step can fail:
 
 Steps 3-7 are pure functions in `oxi-core::audio`, tested on synthetic signals. Defaults (normalise on, trim on, denoise off, tail 100 ms) are confirmed against the 8 reference phrases in M5 before they ship.
 
-History (when on): the 16 kHz audio after step 7 goes to `<name>.wav.part` through hound, `finalize()`, then rename. Startup deletes leftover `.part` files.
+History (when on): the 16 kHz audio after step 7 goes to `<name>.wav.part` through hound, `finalize()`, then rename. The coordinator hands the samples and the final text to the history thread (`src/daemon/history.rs`) once the text is known; it writes the `.wav`, then the `.txt`, then applies `oxi-core::history::expired` (age, then size, oldest first) to the day folders. Everything lives in one app-owned folder: `OxiYapper history` inside `[history] folder`, or `history/` in the data dir when that is empty or relative. It is created with a `.oxiyapper-history` marker; a folder without the marker is never listed or changed, and a non-empty one of that name is refused. Inside it, only `YYYY-MM-DD/HHMMSS-mmm.wav|txt` names with a real date and time are ever listed or deleted, and at start (and on every config change) the leftovers of a killed write, `HHMMSS-mmm.wav.part` and `HHMMSS-mmm.txt.tmp` directly in a day folder, are swept. The age limit sits out a pass with an entry dated after today, or with today more than 31 days past every earlier entry (a clock jump); the size limit always applies. A clean-up failure is logged per entry, the pass goes on, and it shows as its own "Old history not removed" warning. A write error becomes a status warning and never stops the paste; the text is never logged.
 
 ## 10. Paste pipeline
 
@@ -231,10 +241,10 @@ Then, in the paste worker (Windows shown; other OSes below):
 1. **Pick the mode**: per-app rule for the foreground app, else `paste.mode`.
 2. **Wait for modifiers**: poll the physical state of Ctrl, Shift, Alt, Win (both sides) every 5 ms. A pending Ctrl+V with Win still held would open Win+V. If they are still down after 1.5 s: put the text on the clipboard, do not restore, notify "Text is on the clipboard, press Ctrl+V".
 3. **Elevated target (UIPI)**: compare the foreground process integrity level with ours. Higher: same as above ("Admin window: press Ctrl+V"). SendInput into it fails silently, so we never try.
-4. **Snapshot the clipboard**: open with 10 retries 20 ms apart. Copy every HGLOBAL format up to 32 MiB total; skip GDI-handle formats (CF_BITMAP has CF_DIB beside it), synthesised formats and delayed-render formats the owner fails to render in 500 ms. Locked after retries: switch to type mode. Snapshot incomplete: type mode if the text has 300 characters or fewer, else paste and skip the restore, with a one-time note.
-5. **Set** the text as CF_UNICODETEXT plus `ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory = 0`, `CanUploadToCloudClipboard = 0`. Remember `GetClipboardSequenceNumber`.
+4. **Snapshot the clipboard**: open with 10 retries 20 ms apart. Copy every HGLOBAL format up to 32 MiB total; skip GDI-handle formats (CF_BITMAP has CF_DIB beside it), synthesised formats and delayed-render formats the owner fails to render in 500 ms. Locked after retries: switch to type mode. Snapshot incomplete: paste anyway and skip the restore, with a one-time note (no automatic typing of short texts; owner 2026-11-08).
+5. **Set** the text as CF_UNICODETEXT plus `CanUploadToCloudClipboard = 0` always, and `CanIncludeInClipboardHistory = 0` and `ExcludeClipboardContentFromMonitorProcessing` only when the setting "keep dictation in Win+V history" is off (default on). Remember `GetClipboardSequenceNumber`.
 6. **Send** Ctrl down, V down, V up, Ctrl up with SendInput (VK codes, which are layout-independent on Windows; the per-app chord may be Shift+Insert or Ctrl+Shift+V).
-7. **Restore** after `restore_delay_ms` (default 300; RDP and some Electron apps read late), only if the sequence number is unchanged (someone else wrote the clipboard: leave theirs). The restored data also carries the history-exclusion formats: it is already in the history from the user's own copy.
+7. **Restore** after `restore_delay_ms` (default 300; RDP and some Electron apps read late), only if the sequence number is unchanged (someone else wrote the clipboard: leave theirs). With the setting on, the restored data enters history too (`CanIncludeInClipboardHistory = 1`, `CanUploadToCloudClipboard = 0`), so the earlier copy is on top and the dictation second, unless the snapshot carried `ExcludeClipboardContentFromMonitorProcessing` or `CanIncludeInClipboardHistory = 0` (a password manager's copy): that data, and all restored data with the setting off, carries the three exclusion formats.
 
 **Type mode**: SendInput with `KEYEVENTF_UNICODE`, one event pair per UTF-16 unit (surrogate pairs as two), 5 ms between characters by default (games drop faster input), clipboard untouched. It bypasses the IME composition. Games that read raw input or DirectInput ignore it; nothing can be done there, and the QA checklist records which games work.
 
@@ -296,7 +306,7 @@ Paste and clipboard
 37. Clipboard locked by another app: type mode.
 38. Huge or delayed-render clipboard: section 10 step 4.
 39. Clipboard changed between paste and restore: no restore.
-40. Clipboard history and cloud clipboard: excluded for both our text and the restored data.
+40. Clipboard history and cloud clipboard: our text stays in Win+V history by default (setting, owner 2026-11-08) and is excluded when the setting is off; the cloud clipboard is always excluded, for both our text and the restored data.
 41. Focus moved between key-up and paste: the text goes where focus is at paste time; we do not chase windows.
 42. Paste lands nowhere (no text field): the last text stays in memory (never on disk unless history is on); tray item "Copy last text".
 43. Non-Latin layout (Russian): VK_V works on Windows; macOS looks the key code up per layout.
@@ -310,7 +320,7 @@ System
 49. Hand-edited config with an error: daemon keeps the last good config; settings shows the line and offers "Open file" or "Reset to defaults" (old file kept as `config.toml.bak`).
 50. Config from a newer build (downgrade): read-only, never written.
 51. Crash during a wav write: `.part` removed at next start; the text was already pasted.
-52. History over its cap: oldest entries removed after each save and at start; only files matching the history naming inside `history/` are ever deleted.
+52. History over its cap: oldest entries removed after each save and at start; only files matching the history naming inside the app-owned folder that holds the marker are ever deleted.
 53. Update check offline or rate-limited: silent, try again the next day. Asset for this build variant missing: the badge opens the release page instead of Install.
 54. Autostart path moved (portable zip moved): each start re-registers autostart if it points elsewhere.
 55. Installer and portable copy both present: same per-user socket, the second opens the first one's settings.
@@ -351,7 +361,7 @@ Live tests need a real desktop and are off unless their env var is `1` (list in 
 
 Owner acceptance (local, never in CI): `OxiYapper bench "$OXI_BENCH_DIR"` on the 8 reference phrases; text must equal the bench text for all 8.
 
-Manual QA checklist per OS, run before each release, results kept in the release PR: hotkey in a normal app, an elevated app and a fullscreen game; double tap; Esc; paste in Notepad, a browser, Windows Terminal, an RDP window, a game chat (type mode), with an IME on; clipboard restored and absent from Win+V; overlay never takes focus in the game (open chat, dictate, Enter); two monitors with different DPI; sleep and lock during recording; first-run wizard; macOS permissions; Linux X11 and one Wayland compositor.
+Manual QA checklist per OS, run before each release, results kept in the release PR: hotkey in a normal app, an elevated app and a fullscreen game; double tap; Esc; paste in Notepad, a browser, Windows Terminal, an RDP window, a game chat (type mode), with an IME on; clipboard restored (the dictation is in Win+V with the default on, absent with the setting off); overlay never takes focus in the game (open chat, dictate, Enter); two monitors with different DPI; sleep and lock during recording; first-run wizard; macOS permissions; Linux X11 and one Wayland compositor.
 
 Coverage: `cargo llvm-cov` report on `oxi-core`, expected above 85% lines; reported, not a gate. Platform crates are not measured.
 

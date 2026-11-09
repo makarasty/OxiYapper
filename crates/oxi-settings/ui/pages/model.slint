@@ -1,30 +1,37 @@
-// Model page (SPEC Models, ARCHITECTURE section 8): the curated models with their state on disk,
-// download and cancel through the daemon, "use my own .bin", the GPU and the idle unload.
-import { Theme, Shell, Icons, Group, Card, ClickCard, Row, Divider, SliderRow, Combo, TextField, Button, ButtonKind, Radio, Badge, BadgeKind, ProgressBar, Note, Severity } from "../theme/index.slint";
+// Model page (SPEC Models, ARCHITECTURE section 8), in three sub-tabs. Models: the dictation
+// language, the curated models with their state on disk, download and cancel through the daemon,
+// "use my own .bin". Settings: the GPU, the unload, the models folder and its partial downloads.
+// Advanced: what the engine does on its own.
+import { Theme, Shell, Icons, Group, Card, ClickCard, Row, Divider, Combo, Segmented, TextField, Button, ButtonKind, Radio, Badge, BadgeKind, ProgressBar, WarningSlot, SubTabs, SubTabPane } from "../theme/index.slint";
+import { SearchPopup } from "../theme/components/search_popup.slint";
 
 export struct ModelRow {
     id: string,
     name: string,
-    // "1.6 GB".
-    size: string,
-    // What follows the size: a hint, or what to do about a state the badge names.
-    status: string,
-    // Beside the progress bar while downloading: "0.7 of 1.6 GB".
+    // Under the name: "1.6 GB · fast, good for most"; paused: "0.4 of 3.1 GB · kept 7 more days".
+    detail: string,
+    // In place of `detail` while downloading: "0.7 of 1.6 GB".
     progress-text: string,
-    // "Ready", "Not downloaded", "Downloading".
+    // "Ready", "Not downloaded", "Paused", "Downloading".
     badge: string,
     // On disk and usable: the badge is green.
     ready: bool,
     can-download: bool,
+    // A `.part` is there: the download resumes from it.
+    paused: bool,
     downloading: bool,
     // 0..1 while downloading.
     progress: float,
     // Why the last download failed; empty otherwise.
     error: string,
+    // Likely slow on the GPU picked (`models::too_heavy`); a warning, never a block.
+    heavy: bool,
 }
 
 // Filled and read by `pages::model`.
 export global ModelState {
+    // The open sub-tab: 0 Models, 1 Settings, 2 Advanced.
+    in-out property <int> tab;
     in property <[ModelRow]> rows;
     // Index in `rows`; `rows.length` is "use my own .bin", -1 is none.
     in property <int> selected;
@@ -32,32 +39,56 @@ export global ModelState {
     in property <string> custom-error;
     // The native file dialog exists on this OS.
     in property <bool> can-browse;
+    // Why "Delete partial downloads" is off; empty while it is on.
+    in property <string> partials-off;
+    // Its tooltip while on: "0.4 GB in 1 file".
+    in property <string> partials;
     // "Auto", "CPU", then the GPUs the daemon lists.
     in property <[string]> gpus;
     in-out property <int> gpu;
-    in-out property <float> idle-minutes;
-    in property <float> default-idle-minutes;
-    // The daemon's Status warnings ("running on CPU: ..."); empty hides the note.
+    // "Right away", the minutes, "Never".
+    in property <[string]> unload-options;
+    in-out property <int> unload;
+    // The daemon's Status warnings ("running on CPU: ..."); empty hides the "!" of the GPU row.
     in property <string> warning;
     // Why Download is off; empty while the daemon is online.
     in property <string> download-off;
+    // The two last used dictation languages: "RU", and "Russian" for a screen reader.
+    in property <[string]> language-codes;
+    in property <[string]> language-names;
+    // 0 and 1 those two, 2 Auto.
+    in property <int> language;
+    // The rows of the "..." popup: what the search matches, the native names beside them.
+    in property <[string]> language-rows;
+    in property <[string]> language-native;
+    // The row of the language in use, -1 when the search hides it or it is Auto.
+    in property <int> language-row;
+    callback language-picked(int);
+    callback language-search(string);
+    callback language-chosen(int);
     callback shown();
     callback picked(int);
     callback download(int);
     callback cancel(int);
     callback custom-edited(string);
     callback browse();
+    callback open-folder();
+    callback delete-partials();
     callback gpu-picked(int);
-    callback idle-changed(float);
+    callback unload-picked(int);
 }
 
 // Radio dot, name and caption: the choice inside a model card. Its own accessible element, so a
-// button beside it in the card is not part of the radio.
+// button beside it in the card is not part of the radio. While `downloading` a progress bar takes
+// the caption's place and its room, so the card keeps its height.
 component Choice inherits Rectangle {
     in property <string> label;
     in property <string> detail;
     in property <bool> checked;
     in property <bool> hover;
+    in property <bool> downloading;
+    in property <float> progress;
+    in property <string> progress-text;
     callback picked();
     horizontal-stretch: 1;
     min-height: inner.min-height;
@@ -72,9 +103,12 @@ component Choice inherits Rectangle {
             root.picked();
         }
     }
+    // The radio in an icon-wide column: the title starts where a `Row` title after its icon does
+    // (UI rule 9).
     inner := HorizontalLayout {
-        spacing: Theme.space-3;
+        spacing: Theme.icon-gap;
         VerticalLayout {
+            width: Theme.icon-size;
             alignment: center;
             Radio {
                 checked: root.checked;
@@ -92,175 +126,340 @@ component Choice inherits Rectangle {
                 color: Shell.locked ? Theme.text-disabled : Theme.text-primary;
                 wrap: word-wrap;
             }
-            Text {
-                text: root.detail;
-                font-size: Theme.caption-size;
-                color: Shell.locked ? Theme.text-disabled : Theme.text-secondary;
-                wrap: word-wrap;
+            Rectangle {
+                VerticalLayout {
+                    Text {
+                        text: root.detail;
+                        visible: !root.downloading;
+                        font-size: Theme.caption-size;
+                        color: Shell.locked ? Theme.text-disabled : Theme.text-secondary;
+                        wrap: word-wrap;
+                    }
+                }
+                if root.downloading: ProgressBar {
+                    y: (parent.height - self.height) / 2;
+                    width: parent.width;
+                    height: self.preferred-height;
+                    value: root.progress;
+                    label: root.progress-text;
+                    accessible-label: @tr("{} download", root.label);
+                    accessible-value: root.progress;
+                }
             }
         }
     }
 }
 
 export component ModelPage inherits VerticalLayout {
-    // Lines under the name start past the radio dot.
-    property <length> under-radio: 16px + Theme.space-3;
     alignment: start;
-    spacing: Theme.group-gap;
+    spacing: Theme.space-4;
     init => {
         ModelState.shown();
     }
-    Group {
-        title: @tr("Speech model");
-        for row[i] in ModelState.rows: card := ClickCard {
-            enabled: !Shell.locked;
-            accessible-role: none;
-            clicked => {
-                ModelState.picked(i);
-            }
-            HorizontalLayout {
-                spacing: Theme.control-gap;
-                Choice {
-                    label: row.name;
-                    detail: row.size + " · " + row.status;
-                    checked: ModelState.selected == i;
-                    hover: card.hover;
-                    picked => {
-                        ModelState.picked(i);
-                    }
-                }
-                VerticalLayout {
-                    alignment: center;
-                    Badge {
-                        text: row.badge;
-                        kind: row.downloading ? BadgeKind.accent : row.ready ? BadgeKind.success : BadgeKind.neutral;
-                        accessible-label: @tr("{}: {}", row.name, row.badge);
-                    }
-                }
-                // Downloading writes no config, so it stays on while the config is locked.
-                if row.can-download && !row.downloading: VerticalLayout {
-                    alignment: center;
-                    Button {
-                        text: @tr("Download");
-                        icon: Icons.arrow-download-16;
-                        enabled: ModelState.download-off == "";
-                        tooltip: ModelState.download-off;
-                        accessible-label: @tr("Download {}", row.name);
-                        clicked => {
-                            ModelState.download(i);
-                        }
-                    }
-                }
-                if row.downloading: VerticalLayout {
-                    alignment: center;
-                    Button {
-                        text: @tr("Cancel");
-                        icon: Icons.dismiss-16;
-                        kind: ButtonKind.subtle;
-                        accessible-label: @tr("Cancel {}", row.name);
-                        clicked => {
-                            ModelState.cancel(i);
-                        }
-                    }
-                }
-            }
-            if row.downloading: ProgressBar {
-                padding-left: root.under-radio;
-                value: row.progress;
-                label: row.progress-text;
-                accessible-label: @tr("{} download", row.name);
-                accessible-value: row.progress;
-            }
-            if row.error != "": Note {
-                padding-left: root.under-radio;
-                text: row.error;
-                severity: Severity.error;
-                accessible-label: @tr("{}: {}", row.name, row.error);
-            }
-            if ModelState.selected == i && row.can-download && !row.downloading: Note {
-                padding-left: root.under-radio;
-                text: @tr("Dictation will not start until this is downloaded.");
-                severity: Severity.warning;
-            }
-        }
-        custom := ClickCard {
-            enabled: !Shell.locked;
-            accessible-role: none;
-            clicked => {
-                ModelState.picked(ModelState.rows.length);
-            }
-            Choice {
-                label: @tr("Use my own .bin");
-                detail: @tr("Loaded as is, without a hash check");
-                checked: ModelState.selected == ModelState.rows.length;
-                hover: custom.hover;
-                picked => {
-                    ModelState.picked(ModelState.rows.length);
-                }
-            }
-            HorizontalLayout {
-                padding-left: root.under-radio;
-                spacing: Theme.control-gap;
-                TextField {
-                    text <=> ModelState.custom-path;
-                    placeholder-text: @tr("Path to a .bin file");
-                    enabled: !Shell.locked;
-                    accessible-label: @tr("Model file");
-                    edited(text) => {
-                        ModelState.custom-edited(text);
-                    }
-                }
-                if ModelState.can-browse: Button {
-                    text: @tr("Browse…");
-                    icon: Icons.folder-open-16;
-                    enabled: !Shell.locked;
-                    tooltip: Shell.locked-tip;
-                    clicked => {
-                        ModelState.browse();
-                    }
-                }
-            }
-            if ModelState.custom-error != "": Note {
-                padding-left: root.under-radio;
-                text: ModelState.custom-error;
-                severity: Severity.error;
-            }
+    SubTabs {
+        items: [@tr("Models"), @tr("Settings"), @tr("Advanced")];
+        selected: ModelState.tab;
+        picked(i) => {
+            ModelState.tab = i;
         }
     }
-    Group {
-        title: @tr("Engine");
-        Card {
-            Row {
-                icon: Icons.desktop;
-                title: @tr("GPU");
-                fill-controls: true;
-                Combo {
-                    model: ModelState.gpus;
-                    current-index <=> ModelState.gpu;
-                    accessible-label: @tr("GPU");
-                    selected => {
-                        ModelState.gpu-picked(self.current-index);
+    Rectangle {
+        SubTabPane {
+            shown: ModelState.tab == 0;
+            VerticalLayout {
+                alignment: start;
+                spacing: Theme.space-3;
+                // No title: the sub-tab says it (UI rule 29), and the room keeps the page unscrolled.
+                Group {
+                    Card {
+                        Row {
+                            icon: Icons.mic;
+                            title: @tr("Dictation language");
+                            description: @tr("The language the model listens for. Auto detects it.");
+                            // The column's least width at every size: four short segments stretched
+                            // over a wide column read as one bar (UI rule 24).
+                            Rectangle {
+                                width: Theme.control-column-min;
+                                min-height: languages.min-height;
+                                preferred-height: languages.preferred-height;
+                                languages := Segmented {
+                                    width: parent.width;
+                                    accessible-label: @tr("Dictation language");
+                                    items: [ModelState.language-codes[0], ModelState.language-codes[1], @tr("Auto"), "…"];
+                                    spoken: [ModelState.language-names[0], ModelState.language-names[1], @tr("Auto"), @tr("More languages")];
+                                    // The code ("HAW", "JW") says little: the English name on hover and keyboard focus.
+                                    tips: [ModelState.language-names[0], ModelState.language-names[1]];
+                                    action: 3;
+                                    selected: ModelState.language;
+                                    picked(i) => {
+                                        if (i == 3) {
+                                            ModelState.language-search("");
+                                            all-languages.show();
+                                        } else {
+                                            ModelState.language-picked(i);
+                                        }
+                                    }
+                                }
+                                all-languages := SearchPopup {
+                                    x: parent.width - self.width;
+                                    y: parent.height + Theme.space-1;
+                                    items: ModelState.language-rows;
+                                    notes: ModelState.language-native;
+                                    current: ModelState.language-row;
+                                    placeholder: @tr("Search languages");
+                                    empty-text: @tr("No language matches");
+                                    search(text) => {
+                                        ModelState.language-search(text);
+                                    }
+                                    picked(i) => {
+                                        ModelState.language-chosen(i);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for row[i] in ModelState.rows: card := ClickCard {
+                        // The card's "!": a failed download, a picked model not on disk, a model
+                        // too heavy for the GPU. Its slot is kept, so none of them grows the card.
+                        property <string> missing: ModelState.selected == i && row.can-download && !row.downloading ? @tr("Dictation will not start until this is downloaded.") : "";
+                        property <string> slow: row.heavy ? @tr("Likely slow without a dedicated graphics card. Whisper large-v3 turbo is faster.") : "";
+                        property <string> first: row.error != "" ? row.error : self.missing;
+                        property <string> second: row.error != "" && self.missing != "" ? self.missing : self.slow;
+                        enabled: !Shell.locked;
+                        accessible-role: none;
+                        clicked => {
+                            ModelState.picked(i);
+                        }
+                        HorizontalLayout {
+                            spacing: Theme.control-gap;
+                            Choice {
+                                label: row.name;
+                                detail: row.detail;
+                                checked: ModelState.selected == i;
+                                hover: card.hover;
+                                downloading: row.downloading;
+                                progress: row.progress;
+                                progress-text: row.progress-text;
+                                picked => {
+                                    ModelState.picked(i);
+                                }
+                            }
+                            WarningSlot {
+                                text: card.first != "" && card.second != "" ? card.first + "\n" + card.second : card.first + card.second;
+                            }
+                            // Fixed columns: a state change moves neither the "!", the badge nor the
+                            // button, across states and across the stacked cards (UI rules 1, 2).
+                            HorizontalLayout {
+                                width: Theme.model-badge-column;
+                                alignment: end;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Badge {
+                                        text: row.badge;
+                                        kind: row.downloading ? BadgeKind.accent : row.ready ? BadgeKind.success : BadgeKind.neutral;
+                                        accessible-label: @tr("{}: {}", row.name, row.badge);
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                width: Theme.model-action-column;
+                                // Downloading writes no config, so it stays on while the config is locked.
+                                if row.can-download && !row.downloading: VerticalLayout {
+                                    width: parent.width;
+                                    alignment: center;
+                                    Button {
+                                        text: row.paused ? @tr("Resume") : @tr("Download");
+                                        icon: Icons.arrow-download-16;
+                                        enabled: ModelState.download-off == "";
+                                        tooltip: ModelState.download-off;
+                                        accessible-label: row.paused ? @tr("Resume {}", row.name) : @tr("Download {}", row.name);
+                                        clicked => {
+                                            ModelState.download(i);
+                                        }
+                                    }
+                                }
+                                if row.downloading: VerticalLayout {
+                                    width: parent.width;
+                                    alignment: center;
+                                    Button {
+                                        text: @tr("Cancel");
+                                        icon: Icons.dismiss-16;
+                                        kind: ButtonKind.danger;
+                                        accessible-label: @tr("Cancel {}", row.name);
+                                        clicked => {
+                                            ModelState.cancel(i);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // One line, as tall as a model card: the page has to fit unscrolled (UI rule 25).
+                    custom := ClickCard {
+                        enabled: !Shell.locked;
+                        accessible-role: none;
+                        clicked => {
+                            ModelState.picked(ModelState.rows.length);
+                        }
+                        HorizontalLayout {
+                            spacing: Theme.control-gap;
+                            Choice {
+                                horizontal-stretch: 0;
+                                label: @tr("Use my own .bin");
+                                detail: @tr("Loaded as is, without a hash check");
+                                checked: ModelState.selected == ModelState.rows.length;
+                                hover: custom.hover;
+                                picked => {
+                                    ModelState.picked(ModelState.rows.length);
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                horizontal-stretch: 1;
+                                TextField {
+                                    text <=> ModelState.custom-path;
+                                    placeholder-text: @tr("Path to a .bin file");
+                                    enabled: !Shell.locked;
+                                    accessible-label: @tr("Model file");
+                                    edited(text) => {
+                                        ModelState.custom-edited(text);
+                                    }
+                                }
+                            }
+                            WarningSlot {
+                                text: ModelState.custom-error;
+                            }
+                            if ModelState.can-browse: VerticalLayout {
+                                alignment: center;
+                                Button {
+                                    text: @tr("Browse…");
+                                    icon: Icons.folder-open-16;
+                                    enabled: !Shell.locked;
+                                    tooltip: Shell.locked-tip;
+                                    clicked => {
+                                        ModelState.browse();
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
-            Divider { }
-            SliderRow {
-                icon: Icons.timer;
-                title: @tr("Unload after idle");
-                description: @tr("Frees the memory while you are not dictating.");
-                minimum: 0;
-                maximum: 60;
-                unit: "min";
-                zero-text: @tr("Never");
-                default-value: ModelState.default-idle-minutes;
-                value <=> ModelState.idle-minutes;
-                changed(v) => {
-                    ModelState.idle-changed(v);
+        }
+        SubTabPane {
+            shown: ModelState.tab == 1;
+            VerticalLayout {
+                alignment: start;
+                spacing: Theme.space-4;
+                Group {
+                    title: @tr("Engine");
+                    Card {
+                        Row {
+                            icon: Icons.desktop;
+                            title: @tr("GPU");
+                            warning: ModelState.warning;
+                            fill-controls: true;
+                            full-text: ModelState.gpus[ModelState.gpu];
+                            Combo {
+                                model: ModelState.gpus;
+                                current-index <=> ModelState.gpu;
+                                accessible-label: @tr("GPU");
+                                selected => {
+                                    ModelState.gpu-picked(self.current-index);
+                                }
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.timer;
+                            title: @tr("Unload after idle");
+                            description: @tr("Frees the memory while you are not dictating.");
+                            fill-controls: true;
+                            Combo {
+                                model: ModelState.unload-options;
+                                current-index <=> ModelState.unload;
+                                accessible-label: @tr("Unload after idle");
+                                selected => {
+                                    ModelState.unload-picked(self.current-index);
+                                }
+                            }
+                        }
+                    }
+                }
+                // They change files, not the config, so a locked config keeps them.
+                Group {
+                    title: @tr("Files");
+                    Card {
+                        Row {
+                            icon: Icons.folder-open-16;
+                            title: @tr("Models folder");
+                            description: @tr("Where the downloaded models are kept.");
+                            Button {
+                                text: @tr("Open");
+                                accessible-label: @tr("Open models folder");
+                                clicked => {
+                                    ModelState.open-folder();
+                                }
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.delete;
+                            title: @tr("Partial downloads");
+                            description: @tr("Unfinished downloads, kept so they can resume.");
+                            Button {
+                                text: @tr("Delete");
+                                accessible-label: @tr("Delete partial downloads");
+                                kind: ButtonKind.danger;
+                                enabled: ModelState.partials-off == "";
+                                tooltip: ModelState.partials-off != "" ? ModelState.partials-off : ModelState.partials;
+                                clicked => {
+                                    ModelState.delete-partials();
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            if ModelState.warning != "": Note {
-                text: ModelState.warning;
-                severity: Severity.warning;
+        }
+        // shortcut: read-only, it says what oxi-whisper fixes in code (thread_count, open,
+        // transcribe); these rows become controls once the config has keys for them.
+        SubTabPane {
+            shown: ModelState.tab == 2;
+            VerticalLayout {
+                alignment: start;
+                Group {
+                    title: @tr("Chosen by the engine");
+                    Card {
+                        Row {
+                            icon: Icons.top-speed;
+                            title: @tr("Processor threads");
+                            text-only: true;
+                            description: @tr("4 with a GPU; without one, half the processor's threads, at most 8.");
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.fire;
+                            title: @tr("Flash attention");
+                            text-only: true;
+                            description: @tr("On with a GPU that supports it, off on the processor.");
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.code;
+                            title: @tr("Decoding");
+                            text-only: true;
+                            description: @tr("Greedy, no beam search. A segment Whisper doubts is retried at a higher temperature.");
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.book-letter;
+                            title: @tr("Prompt");
+                            text-only: true;
+                            description: @tr("Your dictionary on the Text page, so names come out spelled your way.");
+                        }
+                    }
+                }
             }
         }
     }

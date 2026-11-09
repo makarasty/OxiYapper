@@ -5,19 +5,25 @@
 //! never reach a log: only lengths, kinds and model names do.
 
 use std::path::Path;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
-use oxi_core::config::Config;
+use oxi_core::audio::{self, AudioError};
+use oxi_core::config::{Audio, Config};
 use oxi_core::device::DeviceChoice;
-use oxi_core::machine::{EngineWarning, Event, MachineConfig, ModelFailure};
+use oxi_core::ipc::{Push, TestFailure, TestOutcome};
+use oxi_core::machine::{
+    EngineWarning, Event, MachineConfig, ModelFailure, ModelIdentity, Phase, PhaseCell,
+};
 use oxi_core::paths::Layout;
 use oxi_core::strings;
 use oxi_core::text::Outcome;
+use oxi_core::tuning::SettingsSet;
 use oxi_core::types::Language;
 use oxi_whisper::{Engine, LoadInfo, Transcript};
 
-use super::cmd::{Inbox, WhisperCmd};
+use super::cmd::{Inbox, TestJob, WhisperCmd};
 use crate::pipeline::{self, TextAssets};
 
 /// One loaded model; [`Engine`] in the daemon, a fake in the tests.
@@ -52,6 +58,7 @@ pub fn spawn(
     rx: Receiver<WhisperCmd>,
     inbox: Sender<Inbox>,
     layout: Layout,
+    phase: PhaseCell,
 ) -> std::io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("whisper".into())
@@ -59,8 +66,8 @@ pub fn spawn(
             let load = |path: &Path, choice: &DeviceChoice| -> anyhow::Result<Engine> {
                 Ok(Engine::load(path, choice)?)
             };
-            let mut worker = Worker::new(load, inbox, layout);
-            for cmd in rx {
+            let mut worker = Worker::new(load, inbox, layout, phase);
+            while let Some(cmd) = worker.next_cmd(&rx) {
                 worker.handle(cmd);
             }
         })
@@ -68,14 +75,27 @@ pub fn spawn(
 
 /// `Status.backend` while no model is loaded (the coordinator's value before the first load).
 const NO_BACKEND: &str = "none";
+/// How long a model only a test asked for stays with no further test request.
+const TEST_MODEL_IDLE: Duration = Duration::from_secs(60);
 
 struct Worker<R, L> {
     load: L,
     inbox: Sender<Inbox>,
     layout: Layout,
+    /// The machine's phase: a queued test must not run in front of a dictation.
+    phase: PhaseCell,
     cfg: Config,
     assets: TextAssets,
     loaded: Option<R>,
+    /// The settings of the last load, which are `loaded`'s while it is there.
+    loaded_for: Option<ModelIdentity>,
+    /// `loaded` came from a recognition test.
+    test_loaded: bool,
+    /// When the last recognition test ended.
+    last_test: Instant,
+    /// A test of a model that is not the configured one is running: what its load says about
+    /// the device must not reach `Status`, which describes the configured model.
+    quiet: bool,
     /// Why the GPU is off: set once a CPU load after a GPU failure succeeded, cleared when the
     /// model or device setting changes. Loads go to CPU while set.
     cpu_reason: Option<String>,
@@ -84,36 +104,75 @@ struct Worker<R, L> {
 }
 
 impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<R, L> {
-    fn new(load: L, inbox: Sender<Inbox>, layout: Layout) -> Self {
+    fn new(load: L, inbox: Sender<Inbox>, layout: Layout, phase: PhaseCell) -> Self {
         let assets = TextAssets::load(&layout);
         Self {
             load,
             inbox,
             layout,
+            phase,
             cfg: Config::default(),
             assets,
             loaded: None,
+            loaded_for: None,
+            test_loaded: false,
+            last_test: Instant::now(),
+            quiet: false,
             cpu_reason: None,
             reported: None,
+        }
+    }
+
+    /// When a model only a test asked for is due to go; `None` while there is none.
+    fn test_deadline(&self) -> Option<Instant> {
+        (self.test_loaded && self.loaded.is_some()).then(|| self.last_test + TEST_MODEL_IDLE)
+    }
+
+    /// The next command, or `TestDone` once a test-only model has sat idle for too long. `None`
+    /// when `rx` closed.
+    fn next_cmd(&self, rx: &Receiver<WhisperCmd>) -> Option<WhisperCmd> {
+        let Some(deadline) = self.test_deadline() else {
+            return rx.recv().ok();
+        };
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(cmd) => Some(cmd),
+            Err(RecvTimeoutError::Timeout) => Some(WhisperCmd::TestDone),
+            Err(RecvTimeoutError::Disconnected) => None,
         }
     }
 
     fn handle(&mut self, cmd: WhisperCmd) {
         match cmd {
             WhisperCmd::Preload => {
+                self.adopt_test_model();
                 let event = match self.ensure_loaded(None) {
                     Ok(()) => Event::ModelLoaded,
                     Err(failure) => Event::ModelFailed(failure),
                 };
                 let _ = self.inbox.send(Inbox::Event(event));
             }
-            WhisperCmd::Unload => {
-                self.loaded = None;
-                let _ = self.inbox.send(Inbox::Backend(NO_BACKEND.into()));
-                // A pinned CPU fallback still holds for the next load: keep saying so (no
-                // tray flicker around each idle unload).
-                if self.cpu_reason.is_none() {
-                    self.report(None);
+            WhisperCmd::Unload => self.unload(),
+            WhisperCmd::Test(job) => {
+                let TestJob {
+                    id,
+                    set,
+                    language,
+                    samples,
+                    reply,
+                } = job;
+                let outcome = if self.phase.load() == Phase::Idle {
+                    self.test(&samples, &set, language)
+                } else {
+                    TestOutcome::Failed {
+                        why: TestFailure::Busy,
+                    }
+                };
+                self.last_test = Instant::now();
+                reply.send(Push::TestResult { id, outcome });
+            }
+            WhisperCmd::TestDone => {
+                if self.test_loaded {
+                    self.unload();
                 }
             }
             WhisperCmd::Transcribe { job, samples } => {
@@ -126,7 +185,7 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
                 let _ = self.inbox.send(Inbox::Transcribed { job, text });
             }
             WhisperCmd::Config(cfg) => {
-                if MachineConfig::from(&*cfg).model != MachineConfig::from(&self.cfg).model {
+                if MachineConfig::from(&*cfg).model != self.identity() {
                     self.cpu_reason = None;
                     if self.loaded.is_none() {
                         self.report(None);
@@ -136,6 +195,107 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
                 self.assets = TextAssets::load(&self.layout);
             }
             WhisperCmd::ReloadAssets => self.assets = TextAssets::load(&self.layout),
+        }
+    }
+
+    fn unload(&mut self) {
+        self.loaded = None;
+        // The pages the model touched stay resident (about 100 MB) until the system needs them.
+        oxi_platform::os::trim_working_set();
+        self.test_loaded = false;
+        self.send_backend(NO_BACKEND.into());
+        // A pinned CPU fallback still holds for the next load: keep saying so (no
+        // tray flicker around each idle unload).
+        if self.cpu_reason.is_none() {
+            self.report(None);
+        }
+    }
+
+    /// The settings a load would use now.
+    fn identity(&self) -> ModelIdentity {
+        MachineConfig::from(&self.cfg).model
+    }
+
+    /// A dictation keeps what a test left loaded only when that is the configured model, on the
+    /// configured device.
+    fn adopt_test_model(&mut self) {
+        if std::mem::take(&mut self.test_loaded) && self.loaded_for != Some(self.identity()) {
+            self.loaded = None;
+        }
+    }
+
+    /// One recognition test run on `samples`. The audio stays in memory all the way: it is
+    /// handed to whisper as a slice (`Recognizer::transcribe`), no temp file exists.
+    fn test(&mut self, samples: &[f32], set: &SettingsSet, language: Language) -> TestOutcome {
+        if samples.is_empty() {
+            return TestOutcome::Failed {
+                why: TestFailure::NoAudio,
+            };
+        }
+        let opts = Audio {
+            normalize: set.normalize,
+            denoise: set.denoise,
+            trim: set.trim,
+            ..self.cfg.audio.clone()
+        };
+        let clip = match audio::process(samples, audio::SAMPLE_RATE, &opts) {
+            Ok(clip) => clip,
+            Err(AudioError::NothingHeard | AudioError::MicSilence) => {
+                return TestOutcome::Heard {
+                    text: String::new(),
+                    ms: 0,
+                };
+            }
+            Err(e) => {
+                tracing::warn!("recognition test audio failed: {e}");
+                return TestOutcome::Failed {
+                    why: TestFailure::Failed,
+                };
+            }
+        };
+        // The existing load and retry paths run on the set's model, then the config comes back.
+        // A GPU failure of another model says nothing about the configured one: no CPU pin.
+        let (active, pin) = (self.cfg.model.clone(), self.cpu_reason.clone());
+        self.cfg.model.id.clone_from(&set.model);
+        self.cfg.model.language = language;
+        if self.loaded_for != Some(self.identity()) {
+            self.loaded = None;
+        }
+        if self.loaded.is_none() {
+            self.test_loaded = true;
+        }
+        self.quiet = set.model != active.id;
+        let outcome = self.run_test(&clip);
+        self.quiet = false;
+        if set.model != active.id {
+            self.cpu_reason = pin;
+        }
+        self.cfg.model = active;
+        outcome
+    }
+
+    fn run_test(&mut self, clip: &[f32]) -> TestOutcome {
+        let model_failed = |failure| TestOutcome::Failed {
+            why: match failure {
+                ModelFailure::Missing => TestFailure::ModelMissing,
+                ModelFailure::Bad => TestFailure::ModelBad,
+            },
+        };
+        if let Err(failure) = self.ensure_loaded(None) {
+            return model_failed(failure);
+        }
+        let started = Instant::now();
+        let transcript = self.recognise(clip);
+        let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match transcript {
+            Ok(Some(transcript)) => TestOutcome::Heard {
+                text: self.final_text(&transcript, false),
+                ms,
+            },
+            Ok(None) => TestOutcome::Failed {
+                why: TestFailure::Failed,
+            },
+            Err(failure) => model_failed(failure),
         }
     }
 
@@ -149,7 +309,7 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
         let warning = self.load_model(gpu_failed);
         if warning.is_err() {
             // Nothing is loaded: do not leave the last model's device in Status.
-            let _ = self.inbox.send(Inbox::Backend(NO_BACKEND.into()));
+            self.send_backend(NO_BACKEND.into());
         }
         self.report(warning.clone().unwrap_or(None));
         warning.map(drop)
@@ -185,7 +345,7 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
         };
         let info = engine.info();
         let device = info.device.clone().unwrap_or_else(|| "cpu".into());
-        let _ = self.inbox.send(Inbox::Backend(device));
+        self.send_backend(device);
         // The engine's own GPU-to-CPU retry pins CPU too; CPU with no GPU to fail is no warning.
         if reason.is_none()
             && let Some(EngineWarning::CpuFallback { reason: why }) = &info.warning
@@ -203,12 +363,19 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
         }
         self.cpu_reason = reason;
         self.loaded = Some(engine);
+        self.loaded_for = Some(self.identity());
         Ok(warning)
+    }
+
+    fn send_backend(&self, device: String) {
+        if !self.quiet {
+            let _ = self.inbox.send(Inbox::Backend(device));
+        }
     }
 
     /// Sends `warning` when it differs from the last one sent.
     fn report(&mut self, warning: Option<EngineWarning>) {
-        if warning != self.reported {
+        if !self.quiet && warning != self.reported {
             self.reported.clone_from(&warning);
             let _ = self.inbox.send(Inbox::EngineWarning(warning));
         }
@@ -216,6 +383,15 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
 
     /// `Ok(Some(""))` is nothing heard, `Ok(None)` a whisper failure, `Err` no model to run.
     fn transcribe(&mut self, samples: &[f32]) -> Result<Option<String>, ModelFailure> {
+        self.adopt_test_model();
+        let trailing_space = self.cfg.paste.trailing_space;
+        Ok(self
+            .recognise(samples)?
+            .map(|t| self.final_text(&t, trailing_space)))
+    }
+
+    /// `Ok(None)` is a whisper failure, `Err` no model to run.
+    fn recognise(&mut self, samples: &[f32]) -> Result<Option<Transcript>, ModelFailure> {
         self.ensure_loaded(None)?;
         let transcript = match self.run(samples) {
             Ok(t) => t,
@@ -240,12 +416,15 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
                 }
             }
         };
-        Ok(
-            match pipeline::finish(&transcript, &self.assets, self.cfg.paste.trailing_space) {
-                Outcome::Text(text) => Some(text),
-                Outcome::NothingHeard => Some(String::new()),
-            },
-        )
+        Ok(Some(transcript))
+    }
+
+    /// Empty when nothing is left to paste.
+    fn final_text(&self, transcript: &Transcript, trailing_space: bool) -> String {
+        match pipeline::finish(transcript, &self.assets, trailing_space) {
+            Outcome::Text(text) => text,
+            Outcome::NothingHeard => String::new(),
+        }
     }
 
     fn run(&mut self, samples: &[f32]) -> anyhow::Result<Transcript> {
@@ -411,7 +590,8 @@ mod tests {
 
     fn worker(script: &Script, rig: &Rig) -> (TestWorker, Receiver<Inbox>) {
         let (tx, rx) = channel();
-        (Worker::new(script.loader(), tx, rig.layout()), rx)
+        let phase = PhaseCell::default();
+        (Worker::new(script.loader(), tx, rig.layout(), phase), rx)
     }
 
     /// The next message that is not an `EngineWarning` or a `Backend`.
@@ -734,6 +914,257 @@ mod tests {
         );
     }
 
+    /// An audible second of raw samples and a set that runs the rig's custom model.
+    fn test_job(reply: &super::super::ipc::Pushes, model: &str) -> WhisperCmd {
+        WhisperCmd::Test(TestJob {
+            id: 9,
+            set: SettingsSet {
+                normalize: true,
+                denoise: false,
+                trim: false,
+                model: model.into(),
+            },
+            language: Language::EN,
+            samples: (0..16_000u16).map(|i| f32::from(i % 40) / 80.0).collect(),
+            reply: reply.clone(),
+        })
+    }
+
+    fn outcome(rx: &Receiver<Push>) -> TestOutcome {
+        match rx.try_recv() {
+            Ok(Push::TestResult { id: 9, outcome }) => outcome,
+            _ => panic!("expected TestResult"),
+        }
+    }
+
+    #[test]
+    fn test_answers_final_text_and_done_drops_only_a_model_it_loaded() {
+        let (r, s) = (rig("testrun"), Script::new());
+        let (mut w, _inbox) = worker(&s, &r);
+        let pushes = super::super::ipc::Pushes::default();
+        let (_, rx) = pushes.claim(1);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        w.handle(test_job(&pushes, "custom"));
+        assert!(matches!(outcome(&rx), TestOutcome::Heard { text, .. } if text == "hello"));
+        w.handle(test_job(&pushes, "custom"));
+        let _ = outcome(&rx);
+        assert_eq!(s.calls().len(), 1, "same model stays loaded between sets");
+        w.handle(WhisperCmd::TestDone);
+        assert!(w.loaded.is_none(), "nothing asked for it but the test");
+
+        // A model the dictation path loaded stays.
+        w.handle(WhisperCmd::Preload);
+        w.handle(test_job(&pushes, "custom"));
+        w.handle(WhisperCmd::TestDone);
+        assert!(w.loaded.is_some());
+        assert_eq!(s.calls().len(), 2);
+    }
+
+    #[test]
+    fn test_with_a_missing_model_is_an_answer_not_a_machine_event() {
+        let (r, s) = (rig("testmissing"), Script::new());
+        let (mut w, inbox) = worker(&s, &r);
+        let pushes = super::super::ipc::Pushes::default();
+        let (_, rx) = pushes.claim(1);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        w.handle(test_job(&pushes, "tiny"));
+        assert_eq!(
+            outcome(&rx),
+            TestOutcome::Failed {
+                why: TestFailure::ModelMissing
+            }
+        );
+        assert!(next(&inbox).is_none(), "no ModelFailed for a test");
+        assert_eq!(w.cfg.model.id, "custom", "config restored");
+    }
+
+    #[test]
+    fn empty_recording_is_no_audio() {
+        let (r, s) = (rig("testempty"), Script::new());
+        let (mut w, _inbox) = worker(&s, &r);
+        let pushes = super::super::ipc::Pushes::default();
+        let (_, rx) = pushes.claim(1);
+        let WhisperCmd::Test(mut job) = test_job(&pushes, "custom") else {
+            unreachable!()
+        };
+        job.samples.clear();
+        w.handle(WhisperCmd::Test(job));
+        assert_eq!(
+            outcome(&rx),
+            TestOutcome::Failed {
+                why: TestFailure::NoAudio
+            }
+        );
+        assert_eq!(s.calls().len(), 0);
+    }
+
+    #[test]
+    fn another_models_gpu_failure_does_not_pin_the_configured_model_to_cpu() {
+        let (r, mut s) = (rig("testpin"), Script::new());
+        s.gpu_load_fails = true;
+        let (mut w, _inbox) = worker(&s, &r);
+        let pushes = super::super::ipc::Pushes::default();
+        let (_, rx) = pushes.claim(1);
+        let mut cfg = r.cfg(DeviceChoice::Auto);
+        cfg.model.id = "tiny".into();
+        w.handle(WhisperCmd::Config(cfg));
+        w.handle(test_job(&pushes, "custom"));
+        assert!(matches!(outcome(&rx), TestOutcome::Heard { .. }));
+        assert_eq!(s.calls(), [DeviceChoice::Auto, DeviceChoice::Cpu]);
+        assert_eq!(w.cpu_reason, None);
+        assert!(w.test_loaded);
+        assert_eq!(w.cfg.model.id, "tiny");
+        // The next dictation drops the test's model; "tiny" is not on disk, so it fails.
+        w.handle(WhisperCmd::Preload);
+        assert!(w.loaded.is_none() && !w.test_loaded);
+    }
+
+    #[test]
+    fn a_test_queued_before_a_dictation_answers_busy_and_loads_nothing() {
+        let (r, s) = (rig("testbusy"), Script::new());
+        let (mut w, _inbox) = worker(&s, &r);
+        let pushes = super::super::ipc::Pushes::default();
+        let (_, rx) = pushes.claim(1);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        w.phase.store(Phase::Recording);
+        w.handle(test_job(&pushes, "custom"));
+        assert_eq!(
+            outcome(&rx),
+            TestOutcome::Failed {
+                why: TestFailure::Busy
+            }
+        );
+        assert_eq!(s.calls(), Vec::<DeviceChoice>::new());
+    }
+
+    #[test]
+    fn a_dictation_reloads_a_test_model_whose_device_or_file_changed() {
+        let (r, s) = (rig("testadopt"), Script::new());
+        let (mut w, _inbox) = worker(&s, &r);
+        let pushes = super::super::ipc::Pushes::default();
+        let (_, rx) = pushes.claim(1);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Auto)));
+        w.handle(test_job(&pushes, "custom"));
+        let _ = outcome(&rx);
+        // Same id, other device: the test's model must not serve the dictation.
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(s.calls(), [DeviceChoice::Auto, DeviceChoice::Cpu]);
+
+        // Unchanged settings: the dictation keeps it.
+        w.handle(WhisperCmd::Unload);
+        w.handle(test_job(&pushes, "custom"));
+        let _ = outcome(&rx);
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(s.calls().len(), 3);
+
+        // Same id, other file: a test loads again, and so does a dictation.
+        let other = r.dir.join("other.bin");
+        fs::write(&other, b"y").unwrap();
+        let mut moved = r.cfg(DeviceChoice::Cpu);
+        moved.model.custom_path = other.to_str().unwrap().into();
+        w.handle(WhisperCmd::Config(moved));
+        w.handle(test_job(&pushes, "custom"));
+        let _ = outcome(&rx);
+        assert_eq!(s.calls().len(), 4, "the test ran on the old file");
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(s.calls().len(), 5, "the dictation ran on the old file");
+    }
+
+    /// What `Status` was told so far: backends and warnings; drains the inbox.
+    fn status_messages(rx: &Receiver<Inbox>) -> (Vec<String>, Vec<Option<EngineWarning>>) {
+        let (mut backends, mut warnings) = (vec![], vec![]);
+        for m in rx.try_iter() {
+            match m {
+                Inbox::Backend(b) => backends.push(b),
+                Inbox::EngineWarning(w) => warnings.push(w),
+                _ => {}
+            }
+        }
+        (backends, warnings)
+    }
+
+    #[test]
+    fn a_test_of_another_model_leaves_status_alone() {
+        // Its GPU falls back to CPU: not the configured model's warning or device.
+        let (r, mut s) = (rig("testquiet"), Script::new());
+        s.gpu_load_fails = true;
+        let (mut w, inbox) = worker(&s, &r);
+        let pushes = super::super::ipc::Pushes::default();
+        let (_, rx) = pushes.claim(1);
+        let mut cfg = r.cfg(DeviceChoice::Auto);
+        cfg.model.id = "tiny".into();
+        w.handle(WhisperCmd::Config(cfg));
+        w.handle(test_job(&pushes, "custom"));
+        assert!(matches!(outcome(&rx), TestOutcome::Heard { .. }));
+        assert_eq!(status_messages(&inbox), (vec![], vec![]));
+
+        // The configured model is pinned to CPU, and a test of a missing model must not wipe it.
+        let (r2, mut s2) = (rig("testquiet2"), Script::new());
+        s2.gpu_load_fails = true;
+        let (mut w2, inbox2) = worker(&s2, &r2);
+        let (_, rx2) = pushes.claim(1);
+        w2.handle(WhisperCmd::Config(r2.cfg(DeviceChoice::Auto)));
+        w2.handle(WhisperCmd::Preload);
+        assert_eq!(
+            status_messages(&inbox2),
+            (vec!["cpu".to_owned()], vec![Some(oom())])
+        );
+        w2.handle(test_job(&pushes, "tiny"));
+        assert_eq!(
+            outcome(&rx2),
+            TestOutcome::Failed {
+                why: TestFailure::ModelMissing
+            }
+        );
+        assert_eq!(status_messages(&inbox2), (vec![], vec![]));
+        assert_eq!(w2.reported, Some(oom()));
+    }
+
+    #[test]
+    fn a_test_of_the_configured_model_still_reports_its_device() {
+        let (r, s) = (rig("testloud"), Script::new());
+        let (mut w, inbox) = worker(&s, &r);
+        let pushes = super::super::ipc::Pushes::default();
+        let (_, rx) = pushes.claim(1);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Auto)));
+        w.handle(test_job(&pushes, "custom"));
+        let _ = outcome(&rx);
+        assert_eq!(status_messages(&inbox).0, ["Vulkan0"]);
+    }
+
+    #[test]
+    fn a_test_only_model_goes_after_the_idle_limit() {
+        let (r, s) = (rig("testidle"), Script::new());
+        let (mut w, _inbox) = worker(&s, &r);
+        let pushes = super::super::ipc::Pushes::default();
+        let (_, rx) = pushes.claim(1);
+        let (tx, cmds) = channel();
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        assert_eq!(w.test_deadline(), None, "nothing to drop yet");
+        w.handle(test_job(&pushes, "custom"));
+        let _ = outcome(&rx);
+        assert_eq!(w.test_deadline(), Some(w.last_test + TEST_MODEL_IDLE));
+        // A waiting command is taken first, and a recent test keeps the model.
+        tx.send(WhisperCmd::ReloadAssets).unwrap();
+        assert!(matches!(w.next_cmd(&cmds), Some(WhisperCmd::ReloadAssets)));
+
+        w.last_test -= TEST_MODEL_IDLE;
+        let cmd = w.next_cmd(&cmds).unwrap();
+        assert!(matches!(cmd, WhisperCmd::TestDone));
+        w.handle(cmd);
+        assert!(w.loaded.is_none());
+        assert_eq!(w.test_deadline(), None);
+
+        // A model the dictation path adopted has no limit.
+        w.handle(test_job(&pushes, "custom"));
+        let _ = outcome(&rx);
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(w.test_deadline(), None);
+        assert!(w.loaded.is_some());
+    }
+
     /// Real tiny model on CPU through the whole worker; skips loudly without the env vars.
     #[test]
     fn tiny_model_transcribes_jfk_through_the_worker() {
@@ -749,15 +1180,15 @@ mod tests {
             return;
         };
         let (samples, rate) = oxi_platform::wav::read_wav_mono_f32(Path::new(&wav)).unwrap();
-        assert_eq!(rate, oxi_core::audio::SAMPLE_RATE);
+        assert_eq!(rate, audio::SAMPLE_RATE);
         let r = rig("real");
         let (tx, rx) = channel();
         let load =
             |p: &Path, c: &DeviceChoice| -> anyhow::Result<Engine> { Ok(Engine::load(p, c)?) };
-        let mut w = Worker::new(load, tx, r.layout());
+        let mut w = Worker::new(load, tx, r.layout(), PhaseCell::default());
         let mut cfg = r.cfg(DeviceChoice::Cpu);
         cfg.model.custom_path = model.to_str().unwrap().into();
-        cfg.model.language = Language::En;
+        cfg.model.language = Language::EN;
         w.handle(WhisperCmd::Config(cfg));
         w.handle(WhisperCmd::Preload);
         assert_eq!(event(&rx), Event::ModelLoaded);

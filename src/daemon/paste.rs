@@ -39,8 +39,8 @@ fn run<C: Clipboard>(
                 // A send fails only when the coordinator is gone; nothing is left to tell then.
                 let _ = inbox.send(Inbox::Event(Event::PasteDone { job, outcome }));
             }
-            PasteCmd::CopyOnly(text) => {
-                if let Some(Err(e)) = clip.as_mut().map(|clip| copy_only(&text, clip)) {
+            PasteCmd::CopyOnly { text, in_history } => {
+                if let Some(Err(e)) = clip.as_mut().map(|clip| copy_only(&text, in_history, clip)) {
                     tracing::warn!("copy last text failed: {e}");
                 }
             }
@@ -65,6 +65,7 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     enum Call {
         Set(String),
+        InHistory(bool),
         Chord,
         Type,
     }
@@ -78,14 +79,19 @@ mod tests {
         fn snapshot(&mut self) -> Snap<()> {
             Snap::Complete(())
         }
-        fn set_text(&mut self, text: &str) -> Result<u32, ClipError> {
-            self.0.borrow_mut().push(Call::Set(text.to_owned()));
+        fn is_excluded(&self, (): &()) -> bool {
+            false
+        }
+        fn set_text(&mut self, text: &str, in_history: bool) -> Result<u32, ClipError> {
+            let mut log = self.0.borrow_mut();
+            log.push(Call::Set(text.to_owned()));
+            log.push(Call::InHistory(in_history));
             Ok(1)
         }
         fn sequence(&self) -> u32 {
             1
         }
-        fn restore(&mut self, (): ()) -> Result<(), ClipError> {
+        fn restore(&mut self, (): (), _in_history: bool) -> Result<(), ClipError> {
             Ok(())
         }
     }
@@ -147,6 +153,13 @@ mod tests {
         }
     }
 
+    fn copy(text: &str, in_history: bool) -> PasteCmd {
+        PasteCmd::CopyOnly {
+            text: text.into(),
+            in_history,
+        }
+    }
+
     #[test]
     fn two_queued_pastes_run_in_order() {
         let (calls, done) = drive(vec![job(1, "one"), job(2, "two")], true);
@@ -154,8 +167,10 @@ mod tests {
             calls,
             [
                 Call::Set("one".into()),
+                Call::InHistory(true),
                 Call::Chord,
                 Call::Set("two".into()),
+                Call::InHistory(true),
                 Call::Chord
             ]
         );
@@ -170,14 +185,31 @@ mod tests {
 
     #[test]
     fn copy_only_sets_the_clipboard_without_a_chord_or_answer() {
-        let (calls, done) = drive(vec![PasteCmd::CopyOnly("last".into())], true);
-        assert_eq!(calls, [Call::Set("last".into())]);
+        let (calls, done) = drive(vec![copy("last", true)], true);
+        assert_eq!(calls, [Call::Set("last".into()), Call::InHistory(true)]);
         assert_eq!(done.len(), 0);
     }
 
     #[test]
+    fn copy_only_uses_its_own_history_flag_not_the_last_paste() {
+        for keep in [true, false] {
+            let cfg = Paste {
+                keep_in_clipboard_history: keep,
+                ..Paste::default()
+            };
+            let paste = PasteCmd::Paste {
+                job: JobId(1),
+                text: "one".into(),
+                cfg,
+            };
+            let (calls, _) = drive(vec![paste, copy("last", !keep)], true);
+            assert_eq!(calls[calls.len() - 2..][1], Call::InHistory(!keep));
+        }
+    }
+
+    #[test]
     fn without_a_clipboard_a_paste_still_answers_failed() {
-        let (calls, done) = drive(vec![job(7, "x"), PasteCmd::CopyOnly("y".into())], false);
+        let (calls, done) = drive(vec![job(7, "x"), copy("y", true)], false);
         assert_eq!(calls.len(), 0);
         assert_eq!(done, [(JobId(7), PasteOutcome::Failed)]);
     }

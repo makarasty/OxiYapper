@@ -42,8 +42,6 @@ pub const OPEN_RETRY_GAP: Millis = Millis(20);
 pub const SNAPSHOT_CAP: usize = 32 << 20;
 /// Step 4: a delayed-render format its owner does not render in this time is skipped.
 pub const DELAYED_RENDER_TIMEOUT: Millis = Millis(500);
-/// Step 4: an incomplete snapshot types text up to this many characters, else pastes unrestored.
-pub const TYPE_FALLBACK_MAX_CHARS: usize = 300;
 /// Type mode: gap between characters (games drop faster input).
 pub const TYPE_GAP: Millis = Millis(5);
 
@@ -77,12 +75,17 @@ pub trait Clipboard {
     /// Saved clipboard contents, handed back to [`Clipboard::restore`].
     type Snapshot;
     fn snapshot(&mut self) -> Snap<Self::Snapshot>;
-    /// Puts `text` on the clipboard, excluded from history and cloud sync; returns the new
-    /// sequence number.
-    fn set_text(&mut self, text: &str) -> Result<u32, ClipError>;
+    /// Whether the saved data's owner kept it out of the OS clipboard history (a password
+    /// manager's copy, say).
+    fn is_excluded(&self, snapshot: &Self::Snapshot) -> bool;
+    /// Puts `text` on the clipboard, never uploaded to the cloud clipboard and in the OS
+    /// clipboard history (Win+V) only if `in_history`; returns the new sequence number.
+    fn set_text(&mut self, text: &str, in_history: bool) -> Result<u32, ClipError>;
     /// The current clipboard sequence number (`changeCount` on macOS).
     fn sequence(&self) -> u32;
-    fn restore(&mut self, snapshot: Self::Snapshot) -> Result<(), ClipError>;
+    /// Puts saved data back, never uploaded to the cloud clipboard and in history only if
+    /// `in_history`.
+    fn restore(&mut self, snapshot: Self::Snapshot, in_history: bool) -> Result<(), ClipError>;
 }
 
 /// The window that gets the text.
@@ -136,8 +139,8 @@ pub fn plan(paste: &Paste, fg: &Foreground) -> Plan {
 }
 
 /// Puts `text` on the clipboard and leaves it there (tray "Copy last text", item 42).
-pub fn copy_only(text: &str, clip: &mut impl Clipboard) -> Result<(), ClipError> {
-    clip.set_text(text).map(drop)
+pub fn copy_only(text: &str, in_history: bool, clip: &mut impl Clipboard) -> Result<(), ClipError> {
+    clip.set_text(text, in_history).map(drop)
 }
 
 /// Delivers `text` to the foreground app: ARCHITECTURE section 10, steps 1-7 and type mode.
@@ -147,10 +150,11 @@ pub fn paste<C: Clipboard>(
     clip: &mut C,
     input: &mut impl Input,
 ) -> PasteOutcome {
+    let keep = paste.keep_in_clipboard_history;
     let mut waited = Millis(0);
     while input.modifiers_held() {
         if waited >= MODIFIER_TIMEOUT {
-            return clipboard_only(text, clip, ClipboardOnlyWhy::ModifiersHeld);
+            return clipboard_only(text, keep, clip, ClipboardOnlyWhy::ModifiersHeld);
         }
         input.sleep(MODIFIER_POLL);
         waited = waited + MODIFIER_POLL;
@@ -158,7 +162,7 @@ pub fn paste<C: Clipboard>(
     // Read after the wait: the text goes where focus is at paste time (item 41).
     let fg = input.foreground();
     if fg.elevated {
-        return clipboard_only(text, clip, ClipboardOnlyWhy::Elevated);
+        return clipboard_only(text, keep, clip, ClipboardOnlyWhy::Elevated);
     }
     let plan = plan(paste, &fg);
     if plan.mode == PasteMode::Type {
@@ -166,17 +170,19 @@ pub fn paste<C: Clipboard>(
     }
     match clip.snapshot() {
         Snap::Locked => type_text(text, input),
-        Snap::Incomplete if text.chars().count() <= TYPE_FALLBACK_MAX_CHARS => {
-            type_text(text, input)
-        }
-        Snap::Incomplete => match clip.set_text(text) {
+        Snap::Incomplete => match clip.set_text(text, keep) {
+            // A delayed-render owner still holds it: same as a locked snapshot.
+            Err(ClipError::Locked) => type_text(text, input),
             Ok(_) if input.send_chord(&plan.chord).is_ok() => PasteOutcome::PastedNoRestore,
             _ => PasteOutcome::Failed,
         },
         Snap::Complete(saved) => {
-            let Ok(seq) = clip.set_text(text) else {
+            // Back into history above the dictation, so Win+V shows it second (item 13),
+            // unless its owner excluded it: a password never enters history through us.
+            let restore_in_history = keep && !clip.is_excluded(&saved);
+            let Ok(seq) = clip.set_text(text, keep) else {
                 // The set may have emptied the clipboard: put the user's data back.
-                let _ = clip.restore(saved);
+                let _ = clip.restore(saved, restore_in_history);
                 return PasteOutcome::Failed;
             };
             let sent = input.send_chord(&plan.chord);
@@ -186,7 +192,7 @@ pub fn paste<C: Clipboard>(
             // Someone else wrote the clipboard meanwhile: leave theirs (item 39).
             if clip.sequence() == seq {
                 // A failed restore loses only the user's old clipboard; the text has landed.
-                let _ = clip.restore(saved);
+                let _ = clip.restore(saved, restore_in_history);
             }
             if sent.is_ok() {
                 PasteOutcome::Pasted
@@ -197,8 +203,13 @@ pub fn paste<C: Clipboard>(
     }
 }
 
-fn clipboard_only(text: &str, clip: &mut impl Clipboard, why: ClipboardOnlyWhy) -> PasteOutcome {
-    match copy_only(text, clip) {
+fn clipboard_only(
+    text: &str,
+    in_history: bool,
+    clip: &mut impl Clipboard,
+    why: ClipboardOnlyWhy,
+) -> PasteOutcome {
+    match copy_only(text, in_history, clip) {
         Ok(()) => PasteOutcome::ClipboardOnly(why),
         Err(_) => PasteOutcome::Failed,
     }

@@ -1,7 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use oxi_platform::fs::write_atomic;
+use std::time::{Duration, SystemTime};
+
+use oxi_core::constants::HOUR;
+use oxi_core::models::PART_KEEP;
+use oxi_platform::fs::{list_partials, sweep_partials, write_atomic};
 
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("oxi-fs-{name}-{}", std::process::id()));
@@ -82,4 +86,42 @@ fn read_only_dir_keeps_the_old_file() {
         assert_eq!(fs::read(&path).unwrap(), b"old");
         assert_eq!(names(&dir), ["config.toml"]);
     }
+}
+
+fn part_aged(dir: &Path, name: &str, age: Duration, now: SystemTime) {
+    let f = fs::File::create(dir.join(name)).unwrap();
+    f.set_len(10).unwrap();
+    f.set_modified(now - age).unwrap();
+}
+
+#[test]
+fn sweep_removes_old_parts_only_and_lists_the_rest() {
+    let dir = scratch("sweep");
+    let now = SystemTime::now();
+    part_aged(&dir, "old.bin.part", PART_KEEP + HOUR, now);
+    part_aged(&dir, "resumed.bin.part", Duration::ZERO, now); // written just now by a resume
+    part_aged(
+        &dir,
+        "paused.bin.part",
+        PART_KEEP.checked_sub(HOUR).unwrap(),
+        now,
+    );
+    fs::write(dir.join("model.bin"), b"x").unwrap();
+
+    let before = list_partials(&dir).unwrap();
+    let names: Vec<_> = before.iter().map(|p| p.file_name.as_str()).collect();
+    assert_eq!(names, ["old.bin", "paused.bin", "resumed.bin"]);
+    assert_eq!(before[1].size, 10);
+    assert!(before[1].remove_at > now && before[1].remove_at <= now + HOUR * 2);
+
+    assert_eq!(sweep_partials(&dir, now).unwrap(), 1);
+    let names: Vec<_> = list_partials(&dir)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.file_name)
+        .collect();
+    assert_eq!(names, ["paused.bin", "resumed.bin"]);
+    assert!(dir.join("model.bin").exists());
+    assert_eq!(sweep_partials(&dir.join("missing"), now).unwrap(), 0);
+    fs::remove_dir_all(&dir).unwrap();
 }

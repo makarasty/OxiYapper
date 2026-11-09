@@ -109,6 +109,15 @@ pub fn cap_label(key: Key, full: bool) -> &'static str {
     }
 }
 
+/// The key as a chord's keycap names it: its full cap label, in the one width those keycaps have.
+pub fn chip_label(key: Key) -> &'static str {
+    if key == Key::Backspace {
+        key.label()
+    } else {
+        cap_label(key, true)
+    }
+}
+
 /// Every key of the board, row by row, left to right.
 pub fn caps() -> Vec<Cap> {
     let mut caps = Vec::new();

@@ -177,9 +177,13 @@ fn gb_digits(bytes: u64) -> String {
     format!("{gb:.1}")
 }
 
-/// Progress label beside a model's download bar: "0.7 of 1.6 GB".
+/// Progress label beside a model's download bar: "0.7 of 1.6 GB". Under 0.05 GB the GB digit
+/// reads 0.0, as if nothing were kept, so a started download says its MB: "12 MB of 3.1 GB".
 #[must_use]
 pub fn download_progress(done: u64, total: u64) -> String {
+    if done > 0 && done < 50_000_000 {
+        return format!("{} MB of {}", done.div_ceil(1_000_000), gb(total));
+    }
     format!("{} of {}", gb_digits(done), gb(total))
 }
 
@@ -255,6 +259,15 @@ mod tests {
             "0.7 of 1.6 GB"
         );
         assert_eq!(download_progress(0, 1_624_555_275), "0.0 of 1.6 GB");
+        assert_eq!(download_progress(1, 3_100_000_000), "1 MB of 3.1 GB");
+        assert_eq!(
+            download_progress(12_300_000, 3_100_000_000),
+            "13 MB of 3.1 GB"
+        );
+        assert_eq!(
+            download_progress(50_000_000, 3_100_000_000),
+            "0.1 of 3.1 GB"
+        );
         assert_eq!(
             spawn_failed(std::io::ErrorKind::NotFound),
             "Could not start OxiYapper: entity not found."

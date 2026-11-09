@@ -1,4 +1,5 @@
-//! Audio page: microphone, live meter, DSP switches, tail, recording cap and language.
+//! Audio page: microphone, live meter, DSP switches, tail, recording cap and the start
+//! and stop sounds.
 //!
 //! The meter opens its own capture while the page is shown (decision D3) and polls it at
 //! [`METER_HZ`] through the core [`Meter`]; leaving the page or closing the window closes it.
@@ -6,28 +7,32 @@
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use oxi_core::audio::{AudioError, Level, SAMPLE_RATE, db_to_linear};
-use oxi_core::config::{Audio, Config};
+use oxi_core::config::{Audio, Config, Sounds};
+use oxi_core::constants::PLAY_TAIL;
+use oxi_core::ipc::{Push, Request};
 use oxi_core::overlay::{METER_HZ, Meter};
+use oxi_core::sounds::{Builtin, Choice, is_plain_local_path};
 use oxi_core::strings::{self, NO_MIC};
-use oxi_core::types::{Language, Millis};
+use oxi_core::types::Millis;
 use oxi_platform::capture::{
     Capture, CaptureError, CaptureEvent, CpalCapture, LevelMeter, list_input_devices, play,
 };
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
-use crate::generated::{AudioKey, AudioState};
+use crate::generated::{AudioKey, AudioState, Toast};
+use crate::ipc::{Event, Link, Subscription};
 use crate::{AppWindow, Ctx, Page, report};
 
-/// Bars across the meter.
-const BARS: usize = 40;
-/// Picker order of the language buttons.
-const LANGUAGES: [Language; 3] = [Language::Ru, Language::En, Language::Auto];
+/// Bars kept for the meter: enough to fill the widest control column (`Theme.control-column-max`,
+/// 360 px, at the 5 px pitch of the `Meter`); a narrower track shows the newest ones that fit.
+const BARS: usize = 72;
 // shortcut: CpalCapture keeps the processed audio until it stops, so the meter reopens it this
 // often to bound memory (~4 MB); upgrade when capture gets a meter-only mode.
 const REOPEN: Millis = Millis(60_000);
@@ -39,10 +44,14 @@ const RELIST: Millis = Millis(2_000);
 /// An open mic that gave only exact zeros this long gets the no-signal note (a muted headset, or
 /// one behind a noise gate; a quiet room is never exactly zero).
 const NO_SIGNAL: Millis = Millis(3_000);
-/// The Test playback stays open this much longer than the clip, so wireless outputs are not cut.
-const PLAY_TAIL: Millis = Millis(300);
 /// Length of the Test button's recording.
 const TEST_LENGTH: Millis = Millis(3_000);
+/// Tile of the own file: after the built-in sounds.
+const OWN_FILE_TILE: usize = Builtin::PICKABLE.len();
+/// Tooltip of Preview while the daemon is not there to play it.
+const PREVIEW_NEEDS_DAEMON: &str = "Start OxiYapper to hear a preview.";
+/// Toast when the picked sound file is a network, device or stream path.
+const SOUND_PATH_REFUSED: &str = "Pick a WAV file on a local drive";
 
 /// Opens a capture feeding the meter; the flag is set when the stream stops on its own.
 type Opener<C> = fn(&Audio, LevelMeter, Arc<AtomicBool>) -> Result<Opened<C>, CaptureError>;
@@ -53,6 +62,8 @@ struct Io<C> {
     list: fn() -> Result<Vec<String>, CaptureError>,
     now: fn() -> Millis,
     play: Player,
+    /// The file dialog for an own sound; `None` when cancelled.
+    pick_wav: fn() -> Option<PathBuf>,
 }
 
 /// Plays a mono clip at the given rate; the handle keeps it playing.
@@ -87,6 +98,19 @@ fn play_cpal(clip: &[f32], rate: u32) -> Result<Box<dyn Any>, CaptureError> {
     Ok(Box::new(play(clip, rate)?))
 }
 
+#[cfg(windows)]
+fn pick_wav() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("WAV sound", &["wav"])
+        .pick_file()
+}
+
+/// No native dialog on this OS: `can-browse` turns the button and the tile off.
+#[cfg(not(windows))]
+fn pick_wav() -> Option<PathBuf> {
+    None
+}
+
 fn since_start() -> Millis {
     static START: OnceLock<Instant> = OnceLock::new();
     let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
@@ -99,6 +123,7 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         list: list_input_devices,
         now: since_start,
         play: play_cpal,
+        pick_wav,
     };
     bind_with(window, ctx, &io);
 }
@@ -107,8 +132,17 @@ fn bind_with<C: Capture + 'static>(window: &AppWindow, ctx: &Ctx, io: &Io<C>) ->
     let state = window.global::<AudioState>();
     push_config(&state, &ctx.config.borrow().config, &Devices::default());
 
-    // Shared by the callbacks; replacing them on a rebind drops the old meter with its capture.
-    let page = Rc::new(PageState {
+    // Shared by the callbacks; replacing them on a rebind drops the old meter with its capture
+    // and this subscription.
+    let page = Rc::new_cyclic(|me: &Weak<PageState<C>>| PageState {
+        _events: ctx.ipc.subscribe({
+            let me = me.clone();
+            move |event| {
+                if let Some(page) = me.upgrade() {
+                    page.event(event);
+                }
+            }
+        }),
         window: window.as_weak(),
         ctx: ctx.clone(),
         devices: RefCell::new(Devices::default()),
@@ -119,8 +153,11 @@ fn bind_with<C: Capture + 'static>(window: &AppWindow, ctx: &Ctx, io: &Io<C>) ->
         timer: Timer::default(),
         open: io.open,
         play: io.play,
+        pick_wav: io.pick_wav,
         test: RefCell::new(None),
     });
+    state.set_can_browse(cfg!(windows));
+    state.set_preview_off(ctx.ipc.link().off_reason(PREVIEW_NEEDS_DAEMON).into());
 
     let p = Rc::clone(&page);
     state.on_shown(move || p.shown());
@@ -128,6 +165,12 @@ fn bind_with<C: Capture + 'static>(window: &AppWindow, ctx: &Ctx, io: &Io<C>) ->
     state.on_edited(move |key, value| p.edited(key, value));
     let p = Rc::clone(&page);
     state.on_test(move || p.start_test());
+    let p = Rc::clone(&page);
+    state.on_sound_picked(move |tile| p.sound_picked(tile));
+    let p = Rc::clone(&page);
+    state.on_choose_file(move || p.choose_file());
+    let p = Rc::clone(&page);
+    state.on_preview(move || p.preview());
     // Reset to defaults rebinds while the page may be open: its meter must keep running.
     if window.get_page() == Page::Audio {
         page.shown();
@@ -136,6 +179,7 @@ fn bind_with<C: Capture + 'static>(window: &AppWindow, ctx: &Ctx, io: &Io<C>) ->
 }
 
 struct PageState<C> {
+    _events: Subscription,
     window: slint::Weak<AppWindow>,
     ctx: Ctx,
     devices: RefCell<Devices>,
@@ -146,6 +190,7 @@ struct PageState<C> {
     timer: Timer,
     open: Opener<C>,
     play: Player,
+    pick_wav: fn() -> Option<PathBuf>,
     test: RefCell<Option<MicTest<C>>>,
 }
 
@@ -186,8 +231,10 @@ impl<C: Capture + 'static> PageState<C> {
     }
 
     /// Read the device list; the picker is only rebuilt when it changed (keeps an open popup).
-    /// True when it changed.
+    /// True when it changed. Also asks for the daemon's warnings: it does not push them, and a
+    /// bad sound file is found on its worker thread after the preview request has returned.
     fn relist(&self, state: &AudioState<'_>, configured: &str) -> bool {
+        self.ctx.ipc.send(Request::Status);
         self.listed_at.set((self.now)());
         let listed = (self.list)();
         let error = listed.as_ref().err().map(note).unwrap_or_default();
@@ -219,11 +266,16 @@ impl<C: Capture + 'static> PageState<C> {
                 // A mic was plugged in: retry the failed open, or leave the default for it.
                 live.tried = None;
             }
-            live.tick(&opts, now);
+            // The mic is open for the meter on the Recording tab only.
+            if state.get_view() == 0 {
+                live.tick(&opts, now);
+            } else if live.is_open() || live.tried.is_some() {
+                live.stop();
+            }
             state.set_clipping(live.meter.clipping(now));
             state.set_note(live.note.clone().unwrap_or_default().into());
             state.set_silence(live.no_signal(now).unwrap_or_default().into());
-            self.advance_test(&state, now);
+            self.advance_test(&window, now);
             let fallback = live.fell_back.then(|| {
                 format!(
                     "{} is not connected, showing the system default",
@@ -239,13 +291,15 @@ impl<C: Capture + 'static> PageState<C> {
             state.set_silence(SharedString::new());
             *self.test.borrow_mut() = None;
             state.set_testing(false);
-            state.set_test_status(SharedString::new());
         }
         state.set_live(live.is_open());
         // Leading silence is drawn as nothing, not a row of 2 px dots (audit M9); the Meter keeps
         // the newest bar at the right edge.
-        let bars: Vec<f32> = live.meter.bars().skip_while(|&b| b <= 0.0).collect();
+        let quiet = live.meter.bars().take_while(|&b| b <= 0.0).count();
+        let bars: Vec<f32> = live.meter.bars().skip(quiet).collect();
+        let clipped: Vec<bool> = live.meter.clipped().skip(quiet).collect();
         state.set_bars(ModelRc::from(Rc::new(VecModel::from(bars))));
+        state.set_clipped(ModelRc::from(Rc::new(VecModel::from(clipped))));
     }
 
     /// The Test button: record from the configured mic through the dictation pipeline (trim and
@@ -271,15 +325,16 @@ impl<C: Capture + 'static> PageState<C> {
                     name: opened.name,
                     until: (self.now)() + TEST_LENGTH,
                 });
-                state.set_test_status(strings::MIC_TEST_RECORDING.into());
+                toast(&window, strings::MIC_TEST_RECORDING);
             }
-            Err(e) => state.set_test_status(strings::mic_test_failed(&note(&e)).into()),
+            Err(e) => toast(&window, &strings::mic_test_failed(&note(&e))),
         }
         state.set_testing(self.test.borrow().is_some());
     }
 
     /// Move the Test button's run on once its step is over.
-    fn advance_test(&self, state: &AudioState<'_>, now: Millis) {
+    fn advance_test(&self, window: &AppWindow, now: Millis) {
+        let state = window.global::<AudioState>();
         let mut test = self.test.borrow_mut();
         match test.take() {
             Some(MicTest::Recording {
@@ -297,20 +352,97 @@ impl<C: Capture + 'static> PageState<C> {
                             _sound: sound,
                             until: now + Millis(ms) + PLAY_TAIL,
                         });
-                        state.set_test_status(strings::MIC_TEST_PLAYING.into());
+                        toast(window, strings::MIC_TEST_PLAYING);
                     }
                     Err(CaptureError::Audio(AudioError::MicSilence)) => {
-                        state.set_test_status(strings::no_signal(&name).into());
+                        toast(window, &strings::no_signal(&name));
                     }
-                    Err(e) => state.set_test_status(strings::mic_test_failed(&note(&e)).into()),
+                    Err(e) => toast(window, &strings::mic_test_failed(&note(&e))),
                 }
             }
-            Some(MicTest::Playing { until, .. }) if now >= until => {
-                state.set_test_status(SharedString::new());
-            }
+            Some(MicTest::Playing { until, .. }) if now >= until => {}
             other => *test = other,
         }
         state.set_testing(test.is_some());
+    }
+
+    fn event(&self, event: &Event) {
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let state = window.global::<AudioState>();
+        match event {
+            Event::Link(link) => {
+                state.set_preview_off(link.off_reason(PREVIEW_NEEDS_DAEMON).into());
+                // The daemon's warnings are its own: with it gone they are stale.
+                if *link != Link::Online {
+                    state.set_sound_warning(SharedString::new());
+                }
+            }
+            Event::Push(Push::Status { warnings, .. }) => {
+                state.set_sound_warning(sound_warning(warnings).into());
+            }
+            Event::Push(_) => {}
+        }
+    }
+
+    /// Run `f` on the sound setting of the sub-tab shown.
+    fn with_sound<R>(&self, f: impl FnOnce(&mut String) -> R) -> Option<R> {
+        let window = self.window.upgrade()?;
+        let stop = window.global::<AudioState>().get_view() == 3;
+        let sounds = &mut self.ctx.config.borrow_mut().config.sounds;
+        Some(f(if stop {
+            &mut sounds.stop
+        } else {
+            &mut sounds.start
+        }))
+    }
+
+    fn sound_picked(&self, tile: i32) {
+        match usize::try_from(tile)
+            .ok()
+            .and_then(|i| Builtin::PICKABLE.get(i))
+        {
+            Some(builtin) => self.set_sound(builtin.id().to_owned()),
+            None => self.choose_file(),
+        }
+    }
+
+    fn choose_file(&self) {
+        let Some(path) = (self.pick_wav)() else {
+            return;
+        };
+        // The daemon refuses these at every load; saving one would leave a broken setting.
+        if !is_plain_local_path(&path) {
+            if let Some(window) = self.window.upgrade() {
+                toast(&window, SOUND_PATH_REFUSED);
+            }
+            return;
+        }
+        self.set_sound(path.to_string_lossy().into_owned());
+    }
+
+    /// Save a sound, show it and play it, so a bad file is found at once.
+    fn set_sound(&self, choice: String) {
+        self.with_sound(|sound| *sound = choice);
+        if let Some(window) = self.window.upgrade() {
+            push_sounds(
+                &window.global::<AudioState>(),
+                &self.ctx.config.borrow().config.sounds,
+            );
+        }
+        report(&self.window, self.ctx.save());
+        self.preview();
+    }
+
+    fn preview(&self) {
+        let volume_percent = percent(self.ctx.config.borrow().config.sounds.volume);
+        if let Some(choice) = self.with_sound(|sound| sound.clone()) {
+            self.ctx.ipc.send(Request::PreviewSound {
+                choice,
+                volume_percent,
+            });
+        }
     }
 
     fn edited(&self, key: AudioKey, value: f32) {
@@ -329,16 +461,7 @@ impl<C: Capture + 'static> PageState<C> {
             AudioKey::Denoise => audio.denoise = value != 0.0,
             AudioKey::Tail => audio.tail_ms = whole(value),
             AudioKey::MaxMinutes => audio.max_seconds = whole(value).max(1) * 60,
-            AudioKey::Language => {
-                if let Some(&lang) = LANGUAGES.get(whole(value) as usize) {
-                    config.model.language = lang;
-                    if let Some(window) = self.window.upgrade() {
-                        window
-                            .global::<AudioState>()
-                            .set_language(language_row(lang));
-                    }
-                }
-            }
+            AudioKey::Volume => config.sounds.volume = f64::from(whole(value).min(100)) / 100.0,
         }
         drop(file);
         report(&self.window, self.ctx.save());
@@ -409,7 +532,7 @@ fn push_config(state: &AudioState<'_>, config: &Config, devices: &Devices) {
         state.set_tail_ms(audio.tail_ms as f32);
         state.set_max_minutes(audio.max_seconds as f32 / 60.0);
     }
-    state.set_language(language_row(config.model.language));
+    push_sounds(state, &config.sounds);
     let defaults = Config::default();
     #[expect(
         clippy::cast_possible_truncation,
@@ -425,14 +548,68 @@ fn push_config(state: &AudioState<'_>, config: &Config, devices: &Devices) {
         state.set_default_tail_ms(defaults.audio.tail_ms as f32);
         state.set_default_max_minutes(defaults.audio.max_seconds as f32 / 60.0);
     }
+    state.set_default_volume(f32::from(percent(defaults.sounds.volume)));
 }
 
-fn language_row(lang: Language) -> i32 {
-    LANGUAGES
-        .iter()
-        .position(|l| *l == lang)
-        .and_then(|i| i32::try_from(i).ok())
-        .unwrap_or(0)
+/// Push the sound settings: the tiles, the own files' names and the volume.
+fn push_sounds(state: &AudioState<'_>, sounds: &Sounds) {
+    let (tile, name, path) = sound_row(&sounds.start);
+    state.set_start_tile(tile);
+    state.set_start_file(name.into());
+    state.set_start_path(path.into());
+    let (tile, name, path) = sound_row(&sounds.stop);
+    state.set_stop_tile(tile);
+    state.set_stop_file(name.into());
+    state.set_stop_path(path.into());
+    state.set_volume(f32::from(percent(sounds.volume)));
+}
+
+/// The tile, and for an own file its name and path, of the setting `text`.
+fn sound_row(text: &str) -> (i32, String, String) {
+    let tile = |i: usize| i32::try_from(i).unwrap_or(0);
+    match Choice::parse(text) {
+        Ok(Choice::Custom(path)) => {
+            let name = path.file_name().map_or_else(
+                || path.to_string_lossy().into_owned(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            (tile(OWN_FILE_TILE), name, text.to_owned())
+        }
+        Ok(Choice::Builtin(b)) => {
+            let row = Builtin::PICKABLE.iter().position(|p| *p == b).unwrap_or(0);
+            (tile(row), String::new(), String::new())
+        }
+        // `Sounds::normalise` already replaced anything else.
+        Err(_) => (0, String::new(), String::new()),
+    }
+}
+
+/// The volume as the whole percent the slider and `PreviewSound` use.
+fn percent(volume: f64) -> u8 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped to 0..=100 first"
+    )]
+    let percent = (volume.clamp(0.0, 1.0) * 100.0).round() as u8;
+    percent
+}
+
+/// The daemon's lines about the sounds, in words for the "!". The preview's line stands only when
+/// no setting has one: it plays the same file, so the fact would be said twice.
+fn sound_warning(lines: &[String]) -> String {
+    let said = |prefix: &str, name: &str| {
+        lines
+            .iter()
+            .find_map(|l| l.strip_prefix(prefix))
+            .map(|why| format!("{name}: {why}"))
+    };
+    let start = said("sounds.start: ", "Start sound");
+    let stop = said("sounds.stop: ", "Stop sound");
+    if start.is_none() && stop.is_none() {
+        return said("sounds.preview: ", "Preview").unwrap_or_default();
+    }
+    start.into_iter().chain(stop).collect::<Vec<_>>().join("\n")
 }
 
 /// A slider or picker value as a whole non-negative number.
@@ -443,6 +620,10 @@ fn language_row(lang: Language) -> i32 {
 )]
 fn whole(value: f32) -> u32 {
     value.round().max(0.0) as u32
+}
+
+fn toast(window: &AppWindow, text: &str) {
+    window.global::<Toast>().invoke_show(text.into());
 }
 
 fn note(e: &CaptureError) -> String {
@@ -617,6 +798,7 @@ mod tests {
         static LIST_FAILS: Cell<bool> = const { Cell::new(false) };
         static SILENT_CLIP: Cell<bool> = const { Cell::new(false) };
         static PLAYED: Cell<usize> = const { Cell::new(0) };
+        static PICKED: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
         /// `normalize` of the last open through `fake`.
         static NORMALIZE: Cell<Option<bool>> = const { Cell::new(None) };
     }
@@ -720,6 +902,10 @@ mod tests {
         NOW.get()
     }
 
+    fn fake_pick() -> Option<PathBuf> {
+        PICKED.with_borrow(Clone::clone)
+    }
+
     fn reset() {
         OPEN.set(0);
         OPENED.set(0);
@@ -728,6 +914,7 @@ mod tests {
         LIST_FAILS.set(false);
         SILENT_CLIP.set(false);
         PLAYED.set(0);
+        PICKED.set(None);
         NORMALIZE.set(None);
     }
 
@@ -757,6 +944,7 @@ mod tests {
             list: fake_list,
             now: fake_now,
             play: fake_play,
+            pick_wav: fake_pick,
         };
         let page = bind_with(&window, &ctx, &io);
         (window, page)
@@ -771,6 +959,69 @@ mod tests {
     fn frame(ms: u64) {
         NOW.set(NOW.get() + Millis(ms));
         mock_elapsed_time(Duration::from_millis(ms));
+    }
+
+    /// The bars cover the track end to end at the smallest and the largest window: 40 of them
+    /// drew 200 px, so the left part of a 240 to 360 px track stayed empty.
+    #[test]
+    fn meter_bars_reach_both_ends_of_the_track() {
+        // The widest gap the `Meter` leaves at an end: its inset plus one bar pitch.
+        const GAP: f32 = 7.0;
+        let window = window("meter-ends", None, fake);
+        show_audio(&window);
+        let widest = window.global::<crate::Tokens>().get_control_column_max();
+        let kept = f32::from(u16::try_from(BARS).unwrap());
+        assert!(kept * 5.0 + GAP >= widest, "{BARS} bars, column {widest}");
+        let state = window.global::<AudioState>();
+        state.set_live(true);
+        state.set_bars(ModelRc::from(Rc::new(VecModel::from(vec![0.5_f32; BARS]))));
+        // 1000: a 252 px track, where whole pitches from the right end left 3 px at the left.
+        for (width, height) in [(720.0, 520.0), (1000.0, 700.0), (1280.0, 860.0)] {
+            window
+                .window()
+                .set_size(slint::LogicalSize::new(width, height));
+            // Runs the shell's page-width handler; the 30 Hz meter timer stays asleep.
+            mock_elapsed_time(Duration::from_millis(1));
+            let meter = crate::testing::with_role(
+                &window,
+                "Level",
+                i_slint_backend_testing::AccessibleRole::ProgressIndicator,
+            );
+            let left = meter.absolute_position().x;
+            let right = left + meter.size().width;
+            let bars: Vec<f32> = meter
+                .query_descendants()
+                .find_all()
+                .iter()
+                .filter(|b| (b.size().width - 3.0).abs() < 0.1)
+                .map(|b| b.absolute_position().x)
+                .filter(|&x| x >= left + 2.0)
+                .collect();
+            let first = bars.iter().copied().fold(f32::MAX, f32::min);
+            let last = bars.iter().copied().fold(f32::MIN, f32::max);
+            assert!(first - left < GAP, "{width}: {first} from {left}");
+            assert!(right - (last + 3.0) < GAP, "{width}: {last} to {right}");
+            // Centred: the newest bar keeps the inset the oldest one does.
+            let (gap_left, gap_right) = (first - left, right - (last + 3.0));
+            assert!(
+                (gap_left - gap_right).abs() < 0.6,
+                "{width}: insets {gap_left} and {gap_right}"
+            );
+        }
+    }
+
+    /// An open mic with only silence so far draws no bar; the track says it listens, so it does
+    /// not look like a dead meter. The first bar takes the word away.
+    #[test]
+    fn a_quiet_open_mic_says_it_listens() {
+        let window = window("meter-idle", None, fake);
+        show_audio(&window);
+        let state = window.global::<AudioState>();
+        state.set_live(true);
+        state.set_bars(ModelRc::from(Rc::new(VecModel::from(Vec::<f32>::new()))));
+        assert!(crate::testing::has(&window, "Listening"));
+        state.set_bars(ModelRc::from(Rc::new(VecModel::from(vec![0.4_f32]))));
+        assert!(!crate::testing::has(&window, "Listening"));
     }
 
     #[test]
@@ -854,10 +1105,11 @@ mod tests {
         frame(40);
         let state = window.global::<AudioState>();
         state.invoke_test();
-        assert_eq!(state.get_test_status(), strings::MIC_TEST_RECORDING);
+        let toast = || window.global::<Toast>().get_text();
+        assert_eq!(toast(), strings::MIC_TEST_RECORDING);
         assert!(state.get_testing());
         frame(TEST_LENGTH.0);
-        assert_eq!(state.get_test_status(), strings::MIC_TEST_PLAYING);
+        assert_eq!(toast(), strings::MIC_TEST_PLAYING);
         assert_eq!(PLAYED.get(), SAMPLE_RATE as usize);
         assert_eq!(
             NORMALIZE.get(),
@@ -867,8 +1119,9 @@ mod tests {
         frame(1_000);
         assert!(state.get_testing(), "playback stays open for a tail");
         frame(PLAY_TAIL.0);
-        assert_eq!(state.get_test_status(), "");
         assert!(!state.get_testing());
+        frame(3_000);
+        assert_eq!(toast(), "", "a toast leaves by itself");
     }
 
     #[test]
@@ -880,11 +1133,44 @@ mod tests {
         state.invoke_test();
         frame(TEST_LENGTH.0);
         assert_eq!(
-            state.get_test_status(),
+            window.global::<Toast>().get_text(),
             "No sound from Fake Mic yet. Speak, check that it is not muted, or reconnect it."
         );
         assert_eq!(PLAYED.get(), 0);
         assert!(!state.get_testing());
+    }
+
+    #[test]
+    fn audio_states_move_no_row() {
+        let window = window("no-move", None, fake);
+        show_audio(&window);
+        window
+            .window()
+            .set_size(slint::LogicalSize::new(1280.0, 2400.0));
+        frame(40);
+        let before = crate::testing::spots(&window);
+        let state = window.global::<AudioState>();
+        // The mic test and the silent mic, as the page's own tick sets them.
+        state.invoke_test();
+        frame(NO_SIGNAL.0);
+        let silence = state.get_silence();
+        assert_ne!(silence, "");
+        assert!(
+            crate::testing::has(&window, &silence),
+            "the \"!\" holds the warning"
+        );
+        crate::testing::assert_nothing_moved(&before, &crate::testing::spots(&window));
+        // The saved device is gone and the list failed: the same slot of the Device row.
+        state.set_fallback("Synth Mic is not connected, showing the system default".into());
+        state.set_list_error("cannot list devices".into());
+        assert!(
+            crate::testing::has(
+                &window,
+                "cannot list devices\nSynth Mic is not connected, showing the system default"
+            ),
+            "the \"!\" says both, the worse first"
+        );
+        crate::testing::assert_nothing_moved(&before, &crate::testing::spots(&window));
     }
 
     #[test]
@@ -1031,6 +1317,27 @@ mod tests {
         tiny_skia::Pixmap::from_vec(bytes, tiny_skia::IntSize::from_wh(w, h).unwrap()).unwrap()
     }
 
+    thread_local! {
+        // The shot platform's animation clock, stepped by hand.
+        static SHOT_CLOCK: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    }
+
+    /// A frame with the fades done. A fade starts when a frame reads the new colour: draw one, then
+    /// step past them (one frame alone drew the Test button light on dark, as it faded in).
+    fn settled_frame(
+        surface: &Rc<slint::platform::software_renderer::MinimalSoftwareWindow>,
+        w: u32,
+        h: u32,
+    ) -> tiny_skia::Pixmap {
+        slint::platform::update_timers_and_animations();
+        surface.request_redraw();
+        frame_pixels(surface, w, h);
+        SHOT_CLOCK.set(SHOT_CLOCK.get() + Duration::from_millis(300));
+        slint::platform::update_timers_and_animations();
+        surface.request_redraw();
+        frame_pixels(surface, w, h)
+    }
+
     fn draw_audio() {
         use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
         use slint::platform::{Platform, WindowAdapter};
@@ -1045,15 +1352,18 @@ mod tests {
                 LAST.with_borrow_mut(|last| *last = Some(window.clone()));
                 Ok(window)
             }
+            fn duration_since_start(&self) -> Duration {
+                SHOT_CLOCK.get()
+            }
         }
 
-        let dir = std::env::var_os("OXI_SHOTS_DIR").map(std::path::PathBuf::from);
+        let dir = std::env::var_os("OXI_SHOTS_DIR").map(PathBuf::from);
         if let Some(dir) = &dir {
             std::fs::create_dir_all(dir).unwrap();
         }
         let (w, h) = (1280_u32, 800_u32);
         slint::platform::set_platform(Box::new(Shots)).unwrap();
-        let bars = |f: fn(usize) -> f32| -> Vec<f32> { (0..40).map(f).collect() };
+        let bars = |f: fn(usize) -> f32| -> Vec<f32> { (0..BARS).map(f).collect() };
         let screens: [(&str, Option<&str>, Vec<f32>, bool); 4] = [
             (
                 "not-connected",
@@ -1075,7 +1385,7 @@ device = \"USB Mic\"
             (
                 "clipping",
                 None,
-                bars(|i| if i > 32 { 1.0 } else { 0.3 }),
+                bars(|i| if i > BARS - 8 { 1.0 } else { 0.3 }),
                 true,
             ),
             ("no-signal", None, vec![], false),
@@ -1093,22 +1403,25 @@ device = \"USB Mic\"
             page.timer.stop();
             if !bars.is_empty() {
                 let state = window.global::<AudioState>();
+                // The loud bars at the right end clipped; the quiet ones stay accent.
+                let marks: Vec<bool> = bars.iter().map(|&b| clipping && b >= 1.0).collect();
                 state.set_bars(ModelRc::from(Rc::new(VecModel::from(bars))));
+                state.set_clipped(ModelRc::from(Rc::new(VecModel::from(marks))));
                 state.set_clipping(clipping);
             }
             if screen == "no-signal" {
                 let state = window.global::<AudioState>();
                 state.set_silence(strings::no_signal("Microphone (USB Headset)").into());
-                state.set_test_status(strings::MIC_TEST_RECORDING.into());
+                window
+                    .global::<Toast>()
+                    .invoke_show(strings::MIC_TEST_RECORDING.into());
             }
             for (theme, choice) in [
                 ("light", crate::ThemeChoice::Light),
                 ("dark", crate::ThemeChoice::Dark),
             ] {
                 window.set_theme(choice);
-                slint::platform::update_timers_and_animations();
-                surface.request_redraw();
-                let pixmap = frame_pixels(&surface, w, h);
+                let pixmap = settled_frame(&surface, w, h);
                 let first = pixmap.pixels()[0];
                 assert!(
                     pixmap.pixels().iter().any(|p| p.alpha() > 0),
@@ -1247,8 +1560,10 @@ device = \"USB Mic\"
         assert!((saved().gain_db - -20.0).abs() < f64::EPSILON, "clamped");
         field(&window, "Gain").set_accessible_value("12.6");
         assert!((saved().gain_db - 13.0).abs() < f64::EPSILON, "rounded");
+        window.global::<AudioState>().set_view(1);
         field(&window, "Tail after release").set_accessible_value("333");
         assert_eq!(saved().tail_ms, 350, "snapped to the 50 ms step");
+        window.global::<AudioState>().set_view(0);
         // Not a number: nothing changes.
         field(&window, "Gain").set_accessible_value("loud");
         assert!((saved().gain_db - 13.0).abs() < f64::EPSILON);
@@ -1258,6 +1573,7 @@ device = \"USB Mic\"
             Some("+13")
         );
         // Real typing: click, go to the end, one more digit, Enter commits and clamps.
+        window.global::<AudioState>().set_view(1);
         field(&window, "Max length").mock_single_click(PointerEventButton::Left);
         let w = window.window();
         for text in [SharedString::from(K::End), "5".into(), K::Return.into()] {
@@ -1292,6 +1608,7 @@ device = \"USB Mic\"
         let (window, page) = window_on("untouched", Some(config), fake);
         window.show().unwrap();
         show_audio(&window);
+        window.global::<AudioState>().set_view(1);
         let tail = || page.ctx.config.borrow().config.audio.tail_ms;
         for leave in [K::Return, K::Tab] {
             field(&window, "Tail after release").mock_single_click(PointerEventButton::Left);
@@ -1314,6 +1631,7 @@ device = \"USB Mic\"
         let (window, page) = window_on("refused", None, fake);
         window.show().unwrap();
         show_audio(&window);
+        window.global::<AudioState>().set_view(1);
         let seconds = || page.ctx.config.borrow().config.audio.max_seconds;
         let type_over = |text: &str| {
             select_all(&window);
@@ -1337,6 +1655,119 @@ device = \"USB Mic\"
         );
         field(&window, "Max length").set_accessible_value("nan");
         assert_eq!(seconds(), 1500, "set-value took nan");
+    }
+
+    /// The window on the Start sound sub-tab, with the fake file dialog.
+    fn sounds_page(name: &str, config: Option<&str>) -> (AppWindow, Rc<PageState<Fake>>) {
+        i_slint_backend_testing::init_no_event_loop();
+        let (window, page) = window_on(name, config, fake);
+        window.show().unwrap();
+        show_audio(&window);
+        window.global::<AudioState>().set_view(2);
+        (window, page)
+    }
+
+    #[test]
+    fn choosing_an_own_file_saves_its_path_and_cancelling_changes_nothing() {
+        let (window, page) = sounds_page("own-file", None);
+        let state = window.global::<AudioState>();
+        let start = || page.ctx.config.borrow().config.sounds.start.clone();
+        state.invoke_sound_picked(i32::try_from(OWN_FILE_TILE).unwrap());
+        assert_eq!(start(), "rise", "the dialog was cancelled");
+        PICKED.set(Some(r"C:\Sounds\my.wav".into()));
+        state.invoke_sound_picked(i32::try_from(OWN_FILE_TILE).unwrap());
+        assert_eq!(start(), r"C:\Sounds\my.wav");
+        assert_eq!(state.get_start_tile(), 4);
+        assert_eq!(state.get_start_file(), "my.wav");
+        assert_eq!(state.get_start_path(), r"C:\Sounds\my.wav");
+        // The stop sound's own file does not touch the start sound.
+        state.set_view(3);
+        PICKED.set(Some(r"C:\Sounds\end.wav".into()));
+        state.invoke_choose_file();
+        assert_eq!(
+            page.ctx.config.borrow().config.sounds.stop,
+            r"C:\Sounds\end.wav"
+        );
+        assert_eq!(start(), r"C:\Sounds\my.wav");
+    }
+
+    fn refused(name: &str, bad: &str) {
+        let (window, page) = sounds_page(name, None);
+        PICKED.set(Some(bad.into()));
+        window.global::<AudioState>().invoke_choose_file();
+        let start = page.ctx.config.borrow().config.sounds.start.clone();
+        assert_eq!(start, "rise", "{bad} was saved");
+        assert_eq!(window.global::<Toast>().get_text(), SOUND_PATH_REFUSED);
+    }
+
+    #[test]
+    fn a_network_file_is_refused_not_saved() {
+        refused("own-file-unc", r"\\nas\s\a.wav");
+    }
+
+    #[test]
+    fn a_device_name_file_is_refused_not_saved() {
+        refused("own-file-nul", r"C:\x\NUL.wav");
+    }
+
+    #[test]
+    fn the_microphone_is_open_on_the_recording_tab_only() {
+        let window = window("mic-tab", None, fake);
+        show_audio(&window);
+        frame(40);
+        let state = window.global::<AudioState>();
+        assert_eq!(OPEN.get(), 1);
+        for view in [1, 2, 3] {
+            state.set_view(view);
+            frame(40);
+            assert_eq!(OPEN.get(), 0, "view {view}");
+            assert!(!state.get_live());
+        }
+        state.set_view(0);
+        frame(40);
+        assert_eq!(OPEN.get(), 1);
+    }
+
+    #[test]
+    fn a_standing_sound_warning_goes_when_the_daemon_does() {
+        let (window, page) = sounds_page("warning-link", None);
+        let state = window.global::<AudioState>();
+        page.ctx.ipc.deliver(&Event::Push(Push::Status {
+            phase: oxi_core::machine::Phase::Idle,
+            model: String::new(),
+            device: oxi_core::device::DeviceChoice::default(),
+            backend: String::new(),
+            warnings: vec!["sounds.start: empty, using rise".into()],
+        }));
+        assert_ne!(state.get_sound_warning(), "");
+        page.ctx.ipc.deliver(&Event::Link(Link::Offline));
+        assert_eq!(state.get_sound_warning(), "");
+    }
+
+    #[test]
+    fn sound_warnings_say_which_sound_and_the_preview_only_when_alone() {
+        let lines = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(sound_warning(&lines(&["model: x"])), "");
+        assert_eq!(
+            sound_warning(&lines(&["sounds.preview: not a WAV file"])),
+            "Preview: not a WAV file"
+        );
+        assert_eq!(
+            sound_warning(&lines(&[
+                "sounds.start: empty, using rise",
+                "sounds.stop: empty, using fall",
+                "sounds.preview: empty",
+            ])),
+            "Start sound: empty, using rise\nStop sound: empty, using fall"
+        );
+    }
+
+    #[test]
+    fn volume_rounds_to_a_whole_percent() {
+        assert_eq!(percent(0.0), 0);
+        assert_eq!(percent(0.404), 40);
+        assert_eq!(percent(1.0), 100);
+        assert_eq!(percent(7.0), 100);
     }
 
     #[test]

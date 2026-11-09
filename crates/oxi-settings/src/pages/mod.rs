@@ -8,6 +8,7 @@ mod hotkey;
 mod model;
 mod overlay;
 mod system;
+pub mod test;
 mod text;
 
 use crate::{AppWindow, Ctx};

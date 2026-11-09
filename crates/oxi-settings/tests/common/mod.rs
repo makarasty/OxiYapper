@@ -14,7 +14,7 @@ use oxi_settings::{AppWindow, Ipc, Page};
 use slint::ComponentHandle;
 
 mod elements;
-pub use elements::{has, with_role};
+pub use elements::{assert_nothing_moved, has, spots, with_role};
 
 /// A fresh directory per test and test binary; `config` is written as `config.toml` when given.
 pub fn layout(name: &str, config: Option<&str>) -> Layout {

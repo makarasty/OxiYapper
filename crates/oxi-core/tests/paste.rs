@@ -7,17 +7,19 @@ use oxi_core::config::{Paste, PasteMode, PasteRule};
 use oxi_core::hotkey::Key;
 use oxi_core::paste::{
     ClipError, Clipboard, ClipboardOnlyWhy, Foreground, Input, InputBlocked, PasteOutcome, Plan,
-    Snap, TYPE_GAP, paste, plan,
+    Snap, TYPE_GAP, copy_only, paste, plan,
 };
 use oxi_core::types::Millis;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Call {
+    KeepInHistory(bool),
     Mods,
     Foreground,
     Snapshot,
     Set(String),
     Seq,
+    RestoreInHistory(bool),
     Restore,
     Chord(Vec<Key>),
     Type(Vec<u16>),
@@ -40,23 +42,32 @@ struct FakeClip {
     /// Another app writes the clipboard after our set.
     foreign_write: bool,
     /// `set_text` fails (nothing is written, the sequence stays).
-    set_fails: bool,
+    set_error: Option<ClipError>,
+    /// The saved data carries an exclusion marker (a password manager's copy).
+    excluded: bool,
 }
 
 impl Clipboard for FakeClip {
-    type Snapshot = ();
-    fn snapshot(&mut self) -> Snap<()> {
+    type Snapshot = bool;
+    fn snapshot(&mut self) -> Snap<bool> {
         self.log.borrow_mut().push(Call::Snapshot);
         match self.snap {
-            SnapKind::Complete => Snap::Complete(()),
+            SnapKind::Complete => Snap::Complete(self.excluded),
             SnapKind::Incomplete => Snap::Incomplete,
             SnapKind::Locked => Snap::Locked,
         }
     }
-    fn set_text(&mut self, text: &str) -> Result<u32, ClipError> {
-        self.log.borrow_mut().push(Call::Set(text.to_owned()));
-        if self.set_fails {
-            return Err(ClipError::Locked);
+    fn is_excluded(&self, snapshot: &bool) -> bool {
+        *snapshot
+    }
+    fn set_text(&mut self, text: &str, in_history: bool) -> Result<u32, ClipError> {
+        {
+            let mut log = self.log.borrow_mut();
+            log.push(Call::KeepInHistory(in_history));
+            log.push(Call::Set(text.to_owned()));
+        }
+        if let Some(err) = &self.set_error {
+            return Err(err.clone());
         }
         self.seq += 1;
         Ok(self.seq)
@@ -65,8 +76,10 @@ impl Clipboard for FakeClip {
         self.log.borrow_mut().push(Call::Seq);
         self.seq + u32::from(self.foreign_write)
     }
-    fn restore(&mut self, (): ()) -> Result<(), ClipError> {
-        self.log.borrow_mut().push(Call::Restore);
+    fn restore(&mut self, _snapshot: bool, in_history: bool) -> Result<(), ClipError> {
+        let mut log = self.log.borrow_mut();
+        log.push(Call::RestoreInHistory(in_history));
+        log.push(Call::Restore);
         Ok(())
     }
 }
@@ -122,6 +135,7 @@ impl Input for FakeInput {
 enum Fail {
     Nothing,
     SetText,
+    SetLocked,
     Chord,
     Typing,
 }
@@ -132,6 +146,7 @@ struct Case {
     held_ms: u64,
     snap: SnapKind,
     foreign_write: bool,
+    excluded: bool,
     fail: Fail,
     config: Paste,
 }
@@ -144,6 +159,7 @@ impl Default for Case {
             held_ms: 0,
             snap: SnapKind::Complete,
             foreign_write: false,
+            excluded: false,
             fail: Fail::Nothing,
             config: Paste::default(),
         }
@@ -157,7 +173,15 @@ fn run(case: &Case, text: &str) -> (PasteOutcome, Vec<Call>) {
         snap: case.snap,
         seq: 7,
         foreign_write: case.foreign_write,
-        set_fails: case.fail == Fail::SetText,
+        set_error: match case.fail {
+            Fail::SetText => Some(ClipError::Os {
+                call: "SetClipboardData",
+                code: 5,
+            }),
+            Fail::SetLocked => Some(ClipError::Locked),
+            _ => None,
+        },
+        excluded: case.excluded,
     };
     let mut input = FakeInput {
         log: log.clone(),
@@ -191,10 +215,12 @@ fn normal_paste_snapshots_sets_sends_waits_checks_and_restores() {
             Call::Mods,
             Call::Foreground,
             Call::Snapshot,
+            Call::KeepInHistory(true),
             Call::Set("hi ".into()),
             ctrl_v(),
             Call::Sleep(300),
             Call::Seq,
+            Call::RestoreInHistory(true),
             Call::Restore,
         ]
     );
@@ -269,33 +295,173 @@ fn locked_clipboard_types_and_leaves_the_clipboard_alone() {
 }
 
 #[test]
-fn incomplete_snapshot_types_up_to_300_characters() {
-    // Cyrillic: characters, not bytes, are counted.
-    let text = "я".repeat(300);
-    let (out, calls) = run(
-        &Case {
-            snap: SnapKind::Incomplete,
-            ..Case::default()
-        },
-        &text,
-    );
-    assert_eq!(out, PasteOutcome::Typed);
-    assert!(!has(&calls, |c| matches!(c, Call::Set(_))));
+fn incomplete_snapshot_pastes_without_restore_whatever_the_length() {
+    // Cyrillic: short and long texts both paste, none is typed.
+    for text in ["hi".to_owned(), "я".repeat(300), "я".repeat(301)] {
+        let (out, calls) = run(
+            &Case {
+                snap: SnapKind::Incomplete,
+                ..Case::default()
+            },
+            &text,
+        );
+        assert_eq!(out, PasteOutcome::PastedNoRestore);
+        assert!(has(&calls, |c| *c == Call::Set(text.clone())));
+        assert!(has(&calls, |c| *c == ctrl_v()));
+        assert!(!has(&calls, |c| matches!(c, Call::Restore | Call::Type(_))));
+    }
 }
 
 #[test]
-fn incomplete_snapshot_with_longer_text_pastes_without_restore() {
-    let text = "я".repeat(301);
+fn incomplete_snapshot_with_a_locked_set_types_the_text() {
     let (out, calls) = run(
         &Case {
             snap: SnapKind::Incomplete,
+            fail: Fail::SetLocked,
             ..Case::default()
         },
-        &text,
+        "hi",
     );
-    assert_eq!(out, PasteOutcome::PastedNoRestore);
-    assert!(has(&calls, |c| *c == ctrl_v()));
-    assert!(!has(&calls, |c| matches!(c, Call::Restore | Call::Type(_))));
+    assert_eq!(out, PasteOutcome::Typed);
+    assert!(has(&calls, |c| matches!(c, Call::Type(_))));
+    assert!(!has(&calls, |c| matches!(
+        c,
+        Call::Chord(_) | Call::Restore
+    )));
+}
+
+#[test]
+fn type_mode_types_and_never_touches_the_clipboard_text() {
+    let config = Paste {
+        mode: PasteMode::Type,
+        ..Paste::default()
+    };
+    let (out, calls) = run(
+        &Case {
+            snap: SnapKind::Incomplete,
+            config,
+            ..Case::default()
+        },
+        "hi",
+    );
+    assert_eq!(out, PasteOutcome::Typed);
+    assert!(!has(&calls, |c| matches!(
+        c,
+        Call::Snapshot | Call::Set(_) | Call::Chord(_)
+    )));
+}
+
+#[test]
+fn the_history_setting_reaches_the_clipboard_before_any_set() {
+    for keep in [true, false] {
+        let config = Paste {
+            keep_in_clipboard_history: keep,
+            ..Paste::default()
+        };
+        // A normal paste and a clipboard-only path (elevated target) both set text.
+        for elevated in [false, true] {
+            let (_, calls) = run(
+                &Case {
+                    config: config.clone(),
+                    elevated,
+                    ..Case::default()
+                },
+                "hi",
+            );
+            let set = calls
+                .iter()
+                .position(|c| matches!(c, Call::Set(_)))
+                .unwrap();
+            assert_eq!(calls[set - 1], Call::KeepInHistory(keep));
+        }
+    }
+}
+
+#[test]
+fn the_restored_copy_enters_history_only_with_the_setting_on_and_no_exclusion_marker() {
+    // setting, snapshot excluded, restored into history
+    let table = [
+        (true, false, true),
+        (true, true, false),
+        (false, false, false),
+        (false, true, false),
+    ];
+    for (keep, excluded, want) in table {
+        let (out, calls) = run(
+            &Case {
+                excluded,
+                config: Paste {
+                    keep_in_clipboard_history: keep,
+                    ..Paste::default()
+                },
+                ..Case::default()
+            },
+            "hi",
+        );
+        assert_eq!(out, PasteOutcome::Pasted);
+        assert!(
+            has(&calls, |c| *c == Call::KeepInHistory(keep)),
+            "the dictation follows the setting"
+        );
+        assert!(
+            has(&calls, |c| *c == Call::RestoreInHistory(want)),
+            "keep {keep} excluded {excluded}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_set_restores_an_excluded_copy_still_excluded() {
+    let (out, calls) = run(
+        &Case {
+            excluded: true,
+            fail: Fail::SetText,
+            ..Case::default()
+        },
+        "hi",
+    );
+    assert_eq!(out, PasteOutcome::Failed);
+    assert!(has(&calls, |c| *c == Call::RestoreInHistory(false)));
+}
+
+#[test]
+fn copy_only_follows_its_flag_after_a_paste_with_the_opposite_setting() {
+    for keep in [true, false] {
+        let log = Log::default();
+        let mut clip = FakeClip {
+            log: log.clone(),
+            snap: SnapKind::Complete,
+            seq: 7,
+            foreign_write: false,
+            set_error: None,
+            excluded: false,
+        };
+        let mut input = FakeInput {
+            log: log.clone(),
+            app: "notepad.exe",
+            elevated: false,
+            held_ms: 0,
+            clock: Cell::new(0),
+            chord_blocked: false,
+            type_blocked: false,
+        };
+        let config = Paste {
+            keep_in_clipboard_history: keep,
+            ..Paste::default()
+        };
+        paste("dictated", &config, &mut clip, &mut input);
+        copy_only("last", !keep, &mut clip).unwrap();
+        let calls = log.borrow();
+        assert_eq!(
+            calls[calls.len() - 2..],
+            [Call::KeepInHistory(!keep), Call::Set("last".into())]
+        );
+    }
+}
+
+#[test]
+fn history_is_kept_by_default() {
+    assert!(Paste::default().keep_in_clipboard_history);
 }
 
 #[test]
@@ -422,7 +588,7 @@ fn set_text_error_without_restore_fails_and_sends_nothing() {
             fail: Fail::SetText,
             ..Case::default()
         },
-        &"я".repeat(301),
+        "hi",
     );
     assert_eq!(out, PasteOutcome::Failed);
     assert!(!has(&calls, |c| matches!(c, Call::Restore)));
@@ -467,7 +633,7 @@ fn blocked_chord_without_snapshot_data_fails_and_does_not_restore() {
             fail: Fail::Chord,
             ..Case::default()
         },
-        &"я".repeat(301),
+        "hi",
     );
     assert_eq!(out, PasteOutcome::Failed);
     assert!(!has(&calls, |c| matches!(c, Call::Restore)));
@@ -482,10 +648,6 @@ fn blocked_typing_fails_in_every_typing_path() {
     for case in [
         Case {
             snap: SnapKind::Locked,
-            ..Case::default()
-        },
-        Case {
-            snap: SnapKind::Incomplete,
             ..Case::default()
         },
         Case {

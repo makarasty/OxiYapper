@@ -11,6 +11,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::audio::SAMPLE_RATE;
+use crate::constants::MAX_CLOCK_JUMP;
 use crate::types::Millis;
 
 /// The stats file in the data dir.
@@ -23,11 +24,10 @@ pub const BAD_FILE: &str = "stats.bad";
 pub const VERSION: u32 = 1;
 /// Rows older than this many days fold into [`Stats::before`], so the file stays small.
 pub const KEEP_DAYS: i32 = 3 * 366;
-/// A record dated further than this many days after the newest earlier row folds nothing: the
-/// clock is probably wrong, and folding is for good.
-const FOLD_MAX_JUMP: i32 = 31;
 /// Weeks the Home heatmap shows.
 pub const HEAT_WEEKS: u16 = 26;
+/// Days the Home trend chart reaches back, today included.
+pub const TREND_DAYS: i32 = 365;
 
 /// A local calendar day.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -226,7 +226,7 @@ impl Stats {
     /// One finished dictation on `today`, then rows older than [`KEEP_DAYS`] fold away.
     pub fn record(&mut self, today: Date, words: u64, speech: Millis) {
         let newest = self.days.iter().rev().map(|d| d.date).find(|&d| d <= today);
-        let jumped = newest.is_some_and(|n| today > n.add_days(FOLD_MAX_JUMP));
+        let jumped = newest.is_some_and(|n| today > n.add_days(MAX_CLOCK_JUMP));
         self.add(Day {
             date: today,
             n: Totals {
@@ -275,6 +275,79 @@ impl Stats {
             heat_start,
             heat,
         }
+    }
+
+    /// `metric` by day up to `today`, from the first day with a dictation, at most
+    /// [`TREND_DAYS`] back. The streak still counts days before the window.
+    pub fn trend(&self, today: Date, metric: Metric) -> Trend {
+        let days = self
+            .days
+            .iter()
+            .filter(|d| d.date <= today && d.n.dictations > 0);
+        let Some(first) = days.clone().next() else {
+            return Trend {
+                start: today,
+                values: Vec::new(),
+            };
+        };
+        let start = first.date.max(today.add_days(1 - TREND_DAYS));
+        let mut values = vec![0; usize::try_from(today.0 - start.0 + 1).unwrap_or(0)];
+        let (mut run, mut last) = (0, None);
+        for day in days {
+            run = if last.is_some_and(|l: Date| l.add_days(1) == day.date) {
+                run + 1
+            } else {
+                1
+            };
+            last = Some(day.date);
+            let Ok(i) = usize::try_from(day.date.0 - start.0) else {
+                continue;
+            };
+            values[i] = match metric {
+                Metric::Words => day.n.words,
+                Metric::Wpm => u64::from(wpm(day.n.words, day.n.speech_ms)),
+                Metric::Dictations => day.n.dictations,
+                Metric::Streak => run,
+            };
+        }
+        Trend { start, values }
+    }
+}
+
+/// What a Home stat card charts by day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metric {
+    Words,
+    Wpm,
+    Dictations,
+    /// The length of the run of days ending on that day.
+    Streak,
+}
+
+/// One value per day from `start` to today; no values before the first dictation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trend {
+    pub start: Date,
+    pub values: Vec<u64>,
+}
+
+impl Trend {
+    pub fn peak(&self) -> u64 {
+        self.values.iter().copied().max().unwrap_or(0)
+    }
+
+    /// Each value in thousandths of the peak: the bars' heights. A day with anything on it is at
+    /// least 1, so a tiny day beside a huge one does not look empty.
+    pub fn heights(&self) -> Vec<i32> {
+        let peak = u128::from(self.peak().max(1));
+        self.values
+            .iter()
+            .map(|&v| {
+                i32::try_from(u128::from(v) * 1000 / peak)
+                    .unwrap_or(1000)
+                    .max(i32::from(v > 0))
+            })
+            .collect()
     }
 }
 

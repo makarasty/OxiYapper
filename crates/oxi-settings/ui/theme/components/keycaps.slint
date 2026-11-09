@@ -1,7 +1,8 @@
 // Keycaps: the on-screen keyboard style the owner likes (bright caps, crisp 1 px stroke, small
 // radius, solid accent fill when picked) and the inline chord keycaps.
 import { Theme, Shell } from "../tokens.slint";
-import { Tip } from "base.slint";
+import { FocusRing, Tip } from "base.slint";
+import { KeyTip } from "feedback.slint";
 
 // One cap of the board. It fills the size it is given; `unit` (the board's key unit) sets the
 // radius and the label size (12..15 px). States: rest, hover, picked, held (physically down:
@@ -63,29 +64,77 @@ export component Keycap {
     }
 }
 
-// A chord as inline keycaps (PowerToys KeyVisual): accent caps, min width 36, padding 8, gap 4.
-// `warning` draws them on the warning fill; with no keys, `empty-text` shows instead. `label` is
-// the accessible text of the whole chord ("Ctrl + Win").
-export component KeycapRow inherits HorizontalLayout {
+// A chord as inline keycaps (PowerToys KeyVisual): accent caps of one width, gap 4. The row never
+// grows: caps past its width fold into a "+N" cap with the whole chord in its tooltip, on hover and
+// on keyboard focus (a Tab stop only while keys are folded). `warning`
+// draws them on the warning fill; with no keys, `empty-text` shows instead. `label` is the
+// accessible text of the whole chord ("Ctrl + Win").
+export component KeycapRow {
     in property <[string]> keys;
     in property <length> cap-height: Theme.control-height;
     in property <bool> warning;
     in property <string> empty-text;
     in property <string> label;
-    spacing: Theme.keycap-gap;
-    alignment: start;
+    // Pack the caps against the end of the row (the action after them), not its start.
+    in property <bool> pack-end;
+    // Set by a parent whose own TouchArea lies over the row: the "+N" tooltip follows it too.
+    in property <bool> hovered;
+    // The longest key label fits with room to spare (`every_label_fits_its_cap_on_one_line`).
+    property <length> cap-width: 44px;
+    property <length> pitch: root.cap-width + Theme.keycap-gap;
+    // Whole caps that fit; the last one becomes "+N" when some are left over.
+    property <int> slots: max(1, floor((root.width + Theme.keycap-gap) / root.pitch));
+    property <int> shown: root.keys.length <= root.slots ? root.keys.length : root.slots - 1;
+    property <int> folded: root.keys.length - root.shown;
+    property <length> start: root.pack-end ? root.width + Theme.keycap-gap - (root.shown + (root.folded > 0 ? 1 : 0)) * root.pitch : 0;
+    height: root.cap-height;
+    preferred-width: root.keys.length == 0 ? empty.preferred-width : root.keys.length * root.pitch - Theme.keycap-gap;
     accessible-role: AccessibleRole.text;
     accessible-label: root.label;
-    for key in root.keys: Rectangle {
+    // As `WarningSlot`. On the row, not the "+N" cap, so the tip closes when the chord stops folding.
+    property <bool> tell-key-tip: fs.has-focus && root.folded > 0;
+    // Tracked, because Tab scrolls the row into view after the focus lands.
+    property <length> key-tip-x: root.absolute-position.x + root.start + root.shown * root.pitch;
+    property <length> key-tip-y: root.absolute-position.y + root.height + Theme.space-1;
+    function update-key-tip() {
+        KeyTip.text = root.tell-key-tip ? root.label : "";
+        KeyTip.x = root.key-tip-x;
+        KeyTip.y = root.key-tip-y;
+    }
+    changed tell-key-tip => {
+        root.update-key-tip();
+    }
+    changed key-tip-x => {
+        if (root.tell-key-tip) {
+            root.update-key-tip();
+        }
+    }
+    changed key-tip-y => {
+        if (root.tell-key-tip) {
+            root.update-key-tip();
+        }
+    }
+    changed label => {
+        if (root.tell-key-tip) {
+            root.update-key-tip();
+        }
+    }
+    // Only Tab reaches it, so the ring never shows for the mouse (UI rule 17).
+    fs := FocusScope {
+        enabled: root.folded > 0;
+        focus-on-click: false;
+    }
+    for i in root.shown: chip := Rectangle {
+        x: root.start + i * root.pitch;
+        width: root.cap-width;
         height: root.cap-height;
-        min-width: max(36px, t.preferred-width + 16px);
         border-radius: Theme.radius-control;
         opacity: Shell.locked ? 0.4 : 1;
         background: root.warning ? Theme.warning-fill : Theme.accent;
         border-width: root.warning ? 1px : 0;
         border-color: Theme.warning-text.transparentize(0.7);
-        t := Text {
-            text: key;
+        Text {
+            text: root.keys[i];
             font-size: Theme.body-size;
             font-weight: Theme.weight-strong;
             color: root.warning ? Theme.warning-text : Theme.on-accent;
@@ -94,7 +143,37 @@ export component KeycapRow inherits HorizontalLayout {
             accessible-role: none;
         }
     }
-    if root.keys.length == 0: Text {
+    if root.folded > 0: more := Rectangle {
+        x: root.start + root.shown * root.pitch;
+        width: root.cap-width;
+        height: root.cap-height;
+        border-radius: Theme.radius-control;
+        opacity: Shell.locked ? 0.4 : 1;
+        background: root.warning ? Theme.warning-fill : Theme.bg-control;
+        border-width: 1px;
+        border-color: root.warning ? Theme.warning-text.transparentize(0.7) : Theme.stroke-keycap;
+        Text {
+            text: "+\{root.folded}";
+            font-size: Theme.body-size;
+            font-weight: Theme.weight-strong;
+            color: root.warning ? Theme.warning-text : Theme.text-primary;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+        touch := TouchArea { }
+        FocusRing {
+            shown: fs.has-focus;
+        }
+        Tip {
+            text: root.label;
+            hovered: touch.has-hover || root.hovered;
+        }
+    }
+    empty := Text {
+        visible: root.keys.length == 0;
+        x: 0;
+        width: root.width;
         height: root.cap-height;
         text: root.empty-text;
         font-size: Theme.body-size;

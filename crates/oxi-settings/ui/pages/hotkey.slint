@@ -1,11 +1,12 @@
 // Hotkey page (SPEC Recording, Settings UI): the chord as keycaps and an edit button, which opens
 // the full keyboard (click keys or press them, held keys light up); then the mode.
-import { Theme, Shell, Icons, Caption, Group, Card, Row, KeycapRow, TilePicker, Note, Severity, Button, ButtonKind } from "../theme/index.slint";
+import { Theme, Shell, Icons, Caption, Group, Card, Row, KeycapRow, TilePicker, Button, ButtonKind } from "../theme/index.slint";
+import { WarningSlot } from "../theme/components/feedback.slint";
 import { Keyboard, KeyCap } from "../keyboard.slint";
 
 // Filled and read by `pages::hotkey`.
 export global HotkeyState {
-    // The saved chord, "Ctrl + Win", and its keys one by one.
+    // The saved chord in words, "Ctrl + Numpad 1", and the caps of its keys one by one.
     in property <string> chord;
     in property <[string]> chord-keys;
     // 0 push-to-talk, 1 toggle.
@@ -18,7 +19,7 @@ export global HotkeyState {
     in property <[KeyCap]> caps;
     in property <float> columns;
     in property <float> rows;
-    // The pending chord as it would be saved; empty while it has no keys.
+    // The pending chord in words, the keys `pending-keys` shows; empty while it has no keys.
     in property <string> pending;
     // The pending keys one by one (also while the chord is refused, to show what was pressed).
     in property <[string]> pending-keys;
@@ -38,6 +39,13 @@ export global HotkeyState {
 }
 
 export component HotkeyPage inherits VerticalLayout {
+    // The room of the page in the window (without the title and the banners).
+    in property <length> free-height;
+    // With the keyboard open the page must not scroll (UI rule 25): the board is capped by height
+    // and Recording mode gives way; in a very low window the heading goes too, with the buttons
+    // beside the pending keys.
+    property <bool> tight: HotkeyState.keyboard-open && root.free-height < Theme.hotkey-tight-height;
+    property <bool> mode-hidden: HotkeyState.keyboard-open && root.free-height < Theme.hotkey-full-height;
     init => {
         HotkeyState.shown();
     }
@@ -51,13 +59,15 @@ export component HotkeyPage inherits VerticalLayout {
                 title: @tr("Keys");
                 description: @tr("Hold these keys to talk. Esc cancels a recording.");
                 Rectangle {
-                    min-width: chord.min-width;
                     preferred-width: chord.preferred-width;
                     chord := KeycapRow {
+                        width: parent.width;
+                        pack-end: true;
+                        hovered: chord-area.has-hover;
                         keys: HotkeyState.chord-keys;
                         label: HotkeyState.chord;
                     }
-                    TouchArea {
+                    chord-area := TouchArea {
                         enabled: !Shell.locked && !HotkeyState.keyboard-open;
                         clicked => {
                             HotkeyState.change();
@@ -102,19 +112,19 @@ export component HotkeyPage inherits VerticalLayout {
             min-height: panel.min-height;
             preferred-height: panel.preferred-height;
             panel := Card {
-                Text {
+                if !root.tight: Text {
                     text: @tr("Press the new hotkey");
                     font-size: Theme.subtitle-size;
                     font-weight: Theme.weight-strong;
                     color: Theme.text-primary;
                 }
-                Caption {
+                if !root.tight: Caption {
                     text: @tr("Click keys or press them. Left and right modifiers both count.");
                     wrap: word-wrap;
                 }
-                KeycapRow {
+                if !root.tight: KeycapRow {
                     keys: HotkeyState.pending-keys;
-                    cap-height: 40px;
+                    cap-height: Theme.capture-keycap-height;
                     warning: HotkeyState.error != "";
                     empty-text: @tr("No keys yet");
                     label: HotkeyState.pending != "" ? @tr("New hotkey: {}", HotkeyState.pending) : @tr("No keys yet");
@@ -123,18 +133,26 @@ export component HotkeyPage inherits VerticalLayout {
                     caps: HotkeyState.caps;
                     columns: HotkeyState.columns;
                     rows: HotkeyState.rows;
+                    room: root.free-height - (root.tight ? Theme.hotkey-tight-chrome : Theme.hotkey-open-chrome);
                     clicked(name) => {
                         board.focus();
                         HotkeyState.key-clicked(name);
                     }
                 }
-                if HotkeyState.error != "": Note {
-                    text: HotkeyState.error;
-                    severity: Severity.error;
-                }
                 HorizontalLayout {
                     spacing: Theme.control-gap;
                     alignment: end;
+                    if root.tight: KeycapRow {
+                        horizontal-stretch: 1;
+                        keys: HotkeyState.pending-keys;
+                        cap-height: Theme.capture-keycap-height;
+                        warning: HotkeyState.error != "";
+                        empty-text: @tr("Press the new hotkey");
+                        label: HotkeyState.pending != "" ? @tr("New hotkey: {}", HotkeyState.pending) : @tr("No keys yet");
+                    }
+                    WarningSlot {
+                        text: HotkeyState.error;
+                    }
                     cancel := Button {
                         text: @tr("Cancel");
                         accessible-label: @tr("Cancel hotkey change");
@@ -157,7 +175,7 @@ export component HotkeyPage inherits VerticalLayout {
             }
         }
     }
-    Group {
+    if !root.mode-hidden: Group {
         title: @tr("Recording mode");
         TilePicker {
             accessible-label: @tr("Recording mode");

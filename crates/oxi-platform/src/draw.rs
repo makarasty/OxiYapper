@@ -11,7 +11,7 @@ use oxi_core::overlay::palette::{EDGE, SURFACE, TEXT};
 use oxi_core::overlay::{
     Icon, Meter, PILL_BAR_GAP as BAR_GAP, PILL_BAR_MAX as BAR_MAX, PILL_BAR_W as BAR_W,
     PILL_EM as EM, PILL_EM_MIN as EM_MIN, PILL_GAP as GAP, PILL_ICON as ICON,
-    PILL_METER_MIN as METER_MIN, PILL_PAD as PAD, Rect, Rgba, look, palette,
+    PILL_METER_MIN as METER_MIN, PILL_PAD as PAD, Rect, Rgba, label_x, look, palette,
 };
 use oxi_core::tray::TrayBadge;
 use oxi_core::types::Millis;
@@ -125,12 +125,13 @@ fn surface(pm: &mut Pixmap, state: OverlayState, font: Option<&FontRef<'_>>) -> 
     let mut text = font
         .filter(|_| !look.label.is_empty())
         .map(|f| Label::new(f, look.label, EM * h));
-    // Icon and label start at the left padding in every state, so the icon never jumps.
+    // The icon starts at the left padding in every state, so it never jumps.
     let x0 = pad;
+    let text_x = x0 + icon + gap;
     if look.meter
         && let Some(t) = text.as_mut()
     {
-        t.fit(right - (pad + icon + gap) - gap - METER_MIN * h);
+        t.fit(right - text_x - gap - METER_MIN * h);
     }
     let cy = h / 2.0;
     draw_icon(
@@ -141,10 +142,16 @@ fn surface(pm: &mut Pixmap, state: OverlayState, font: Option<&FontRef<'_>>) -> 
         (cy - icon / 2.0).round(),
         icon,
     );
-    let mut x = x0 + icon + gap;
+    let mut x = text_x;
     if let Some(t) = &text {
-        t.draw(pm, x, cy, right);
-        x += t.width + gap;
+        // Beside a meter the label stays left; alone it is centred on the pill.
+        let at = if look.meter {
+            text_x
+        } else {
+            label_x(w, text_x, right, t.width)
+        };
+        t.draw(pm, at, cy, right);
+        x = at + t.width + gap;
     }
     if look.meter {
         Bars::new(look.accent, x.round(), right, cy, h)

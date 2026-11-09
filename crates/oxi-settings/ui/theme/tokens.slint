@@ -12,12 +12,26 @@ export global Shell {
     in-out property <length> page-width: 880px;
     // The one tooltip of a control that is off because of `locked`.
     out property <string> locked-tip: @tr("The config is read-only");
+    // Windows "Animation effects" is off (SPI_GETCLIENTAREAANIMATION): every `Theme.motion-*`
+    // duration reads 0 and lists, popups and knobs appear in place. The window keeps it current.
+    in-out property <bool> reduced-motion;
 }
 
 export global Theme {
-    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+    // The style's own result, not `Palette.color-scheme`: for System that holds the `unknown` the
+    // window wrote, and only the style resolves it against the OS scheme (and its changes).
+    out property <bool> dark: Palette.background == #1C1C1C;
 
-    // 1.1 Spacing, 4 px base.
+    // 1.1 Spacing, 4 px base. Which step goes where (UI rule 7; pages hold no px):
+    //   title-gap (2): title to caption
+    //   space-1 (4): inside a control (text to icon in a badge, keycap gap), tooltip padding down
+    //   space-2 (8): between siblings in one row (icon to text, button to button, segments),
+    //                tooltip padding across
+    //   space-3 (12): card padding on the vertical, control to its note
+    //   space-4 (16): card padding on the horizontal, icon to the row text, page padding narrow
+    //   space-6 (24): page padding, below the page title, between unrelated blocks in one card
+    //   space-8 (32): between groups
+    // The fixed uses below name those steps for one job each; a page reads the named one.
     out property <length> space-1: 4px;
     out property <length> space-2: 8px;
     out property <length> space-3: 12px;
@@ -25,7 +39,7 @@ export global Theme {
     out property <length> space-6: 24px;
     out property <length> space-8: 32px;
     // Fixed uses; no other gaps.
-    out property <length> page-padding: 32px;
+    out property <length> page-padding: 24px;
     out property <length> page-padding-narrow: 16px;
     out property <length> title-top: 28px;
     out property <length> title-bottom: 24px;
@@ -42,14 +56,78 @@ export global Theme {
     out property <length> control-height: 32px;
     out property <length> control-column-min: 240px;
     out property <length> control-column-max: 360px;
-    out property <length> segmented-min-width: 180px;
     // Icon boxes: the 20 px master (rows, banners, rail) and the 16 px one (notes, small buttons).
     out property <length> icon-size: 20px;
     out property <length> icon-size-small: 16px;
+    // Sizes and breakpoints with one job each (UI rule 7).
+    out property <length> narrow-window: 900px;
+    // The shell (app.slint): the window's least, first and largest size (SPEC Settings UI), the
+    // width under which the rail shows icons only, the rail in both widths and one rail item, the
+    // selected item's accent pill and its keyboard ring.
+    out property <length> window-min-width: 720px;
+    out property <length> window-min-height: 520px;
+    out property <length> window-first-width: 1280px;
+    out property <length> window-first-height: 800px;
+    out property <length> window-max-width: 1280px;
+    out property <length> window-max-height: 860px;
+    out property <length> compact-window: 960px;
+    out property <length> rail-width: 220px;
+    out property <length> rail-width-compact: 56px;
+    out property <length> rail-item-height: 40px;
+    out property <length> rail-pill-width: 3px;
+    out property <length> rail-pill-height: 16px;
+    out property <length> focus-ring-width: 2px;
+    out property <length> stat-card-one-line: 172px;
+    // A picker tile's height, and System's General tab in a low window (UI rule 25).
+    out property <length> tile-height: 104px;
+    out property <length> tile-height-short: 76px;
+    out property <length> system-tight-height: 480px;
+    // The Overlay position tiles: two steps under a control's height.
+    out property <length> position-tile-height: self.control-height - self.space-2;
+    // A model card's fixed columns: the widest badge ("Not downloaded") and button ("Download").
+    out property <length> model-badge-column: 108px;
+    out property <length> model-action-column: 112px;
+    // The narrowest Home stat card: four fit across a 720 px window.
+    out property <length> stat-card-min: 140px;
+    // Home's full heights: two rows of cards, one row. Under them the page goes tight (rule 25).
+    out property <length> home-full-height: 566px;
+    out property <length> home-wide-height: 450px;
+    // Hotkey page with the keyboard open: the room that shows it all (Recording mode too), the room
+    // under which it goes tight, and what each layout spends beside the board.
+    out property <length> hotkey-full-height: 914px;
+    out property <length> hotkey-tight-height: 480px;
+    out property <length> hotkey-open-chrome: 300px;
+    out property <length> hotkey-tight-chrome: 190px;
+    out property <length> heat-cell-max: 18px;
+    out property <length> heat-cell-tight: 14px;
+    out property <length> capture-keycap-height: 40px;
+    out property <length> editor-min-height: 120px;
+    out property <length> editor-max-height: 360px;
+    out property <length> rule-mode-width: 160px;
+    out property <length> about-logo-size: 48px;
+    out property <length> about-slint-width: 206px;
+    out property <length> about-slint-height: 90px;
+    // A length rounded to whole pixels, so a 1 px stroke at it stays crisp (UI rule 20).
+    public pure function whole(l: length) -> length {
+        return round(l / 1px) * 1px;
+    }
+    // The Home heatmap's cell in whole pixels: fills `room` up to 18 px (a taller grid outweighs the four numbers).
+    public pure function heat-cell(room: length, weeks: int, gap: length) -> length {
+        return min(self.heat-cell-max, floor(room / weeks / 1px - gap / 1px) * 1px);
+    }
 
-    // 1.2 Radii.
+    // 1.2 Radii (UI rules 12 to 14): low, from here only; no square corner but window edges,
+    // full-bleed panels and 1 px dividers.
+    //   radius-small (2): cells under 16 px (heatmap cells, legend swatches)
+    //   radius-control (4): controls, badges, chips, tooltips, inline tiles
+    //   radius-card (8): cards, banners, tiles, the screen diagram
+    //   radius-round: circles and pills (switch, radio, slider thumb and rail, progress rail,
+    //   meter bars, check badge);
+    //   both renderers cap it at half the shorter side, so one value fits every size.
+    out property <length> radius-small: 2px;
     out property <length> radius-control: 4px;
     out property <length> radius-card: 8px;
+    out property <length> radius-round: 999px;
     public pure function radius-keycap(unit: length) -> length {
         return max(4px, unit * 0.12);
     }
@@ -71,26 +149,29 @@ export global Theme {
     out property <int> weight-strong: 600;
 
     // 1.4 Neutrals and roles.
-    out property <color> bg-page: dark ? #202020 : #F3F3F3;
-    out property <color> bg-card: dark ? #2B2B2B : #FBFBFB;
-    out property <color> bg-control: dark ? #2F2F2F : #FFFFFF;
-    out property <color> bg-control-hover: dark ? #353535 : #F6F6F6;
-    out property <color> bg-control-pressed: dark ? #2A2A2A : #EDEDED;
+    // The light branch is the dawn palette (owner, 2026-11-08): the mockup's hues at 5/7 of their
+    // chroma, and fills and hairlines lifted toward white as far as #F4EDDF to #F6F1E7 is. Status
+    // and accent inks keep the mockup's values, so their hue still says what they mean.
+    out property <color> bg-page: dark ? #202020 : #F6F1E7;
+    out property <color> bg-card: dark ? #2B2B2B : #FCF8F1;
+    out property <color> bg-control: dark ? #2F2F2F : #FFFDF8;
+    out property <color> bg-control-hover: dark ? #353535 : #F8F3E9;
+    out property <color> bg-control-pressed: dark ? #2A2A2A : #F1EBDF;
     // Pressed fill for whole-card buttons: bg-control-pressed equals the dark card, so it needs its own step.
-    out property <color> bg-card-pressed: dark ? #222222 : #EDEDED;
-    out property <color> bg-subtle-hover: dark ? #FFFFFF0F : #0000000A;
-    out property <color> bg-subtle-selected: dark ? #FFFFFF14 : #0000000F;
-    out property <color> bg-inset: dark ? #FFFFFF1A : #00000014;
-    out property <color> stroke-card: dark ? #1D1D1D : #E5E5E5;
-    out property <color> stroke-control: dark ? #3A3A3A : #D1D1D1;
-    out property <color> stroke-control-bottom: dark ? #454545 : #B8B8B8;
-    out property <color> stroke-keycap: dark ? #5A5A5A : #8A8A8A;
-    out property <color> divider: dark ? #353535 : #EAEAEA;
-    out property <color> text-primary: dark ? #FFFFFF : #1A1A1A;
-    out property <color> text-secondary: dark ? #C5C5C5 : #5F5F5F;
-    out property <color> text-disabled: dark ? #787878 : #A3A3A3;
-    out property <color> focus-outer: dark ? #FFFFFF : #1A1A1A;
-    out property <color> focus-inner: dark ? #000000 : #FFFFFF;
+    out property <color> bg-card-pressed: dark ? #222222 : #F1EBDF;
+    out property <color> bg-subtle-hover: dark ? #FFFFFF0F : #3428120A;
+    out property <color> bg-subtle-selected: dark ? #FFFFFF14 : #3428120F;
+    out property <color> bg-inset: dark ? #FFFFFF1A : #34281214;
+    out property <color> stroke-card: dark ? #1D1D1D : #EBE5D9;
+    out property <color> stroke-control: dark ? #3A3A3A : #D2CBBB;
+    out property <color> stroke-control-bottom: dark ? #454545 : #B4AB98;
+    out property <color> stroke-keycap: dark ? #5A5A5A : #8A8275;
+    out property <color> divider: dark ? #353535 : #EEE8DC;
+    out property <color> text-primary: dark ? #FFFFFF : #211C13;
+    out property <color> text-secondary: dark ? #C5C5C5 : #5B5348;
+    out property <color> text-disabled: dark ? #787878 : #A0998C;
+    out property <color> focus-outer: dark ? #FFFFFF : #211C13;
+    out property <color> focus-inner: dark ? #000000 : #FFFDF8;
 
     // Accent: own teal, never the Windows accent.
     out property <color> accent: dark ? #4FD1C5 : #0F766E;
@@ -98,23 +179,30 @@ export global Theme {
     out property <color> accent-pressed: dark ? #3BBFB3 : #115E59;
     out property <color> on-accent: dark ? #0B1F1D : #FFFFFF;
     out property <color> accent-text: dark ? #4FD1C5 : #0F766E;
-    // Opaque: the spec's on-card results. #0F766E1F over bg-card is #DEEBEA, 4.44:1 under
-    // accent-text (fails AA); #E2EFEE gives the 4.64:1 the spec states. Tiles sit only on cards.
-    out property <color> accent-tint: dark ? #314644 : #E2EFEE;
+    // Opaque: a translucent #0F766E1F over the card fails AA under accent-text; #EAF2ED gives
+    // 4.80:1. Tiles sit only on cards.
+    out property <color> accent-tint: dark ? #314644 : #EAF2ED;
     // Badge fills, opaque so the pair holds on bg-card and on a hovered card (bg-control-hover):
     // the old 14 % alpha tints gave 4.31:1 (success) and 4.35:1 (accent) in light.
-    out property <color> accent-badge: dark ? #304441 : #E4F0EF;
-    // The overlay pill's own teal, used only where the pill itself is drawn (ScreenPicker).
-    out property <color> pill-teal: #2BB5A0;
+    out property <color> accent-badge: dark ? #304441 : #E9F1EC;
 
     // Status.
-    out property <color> error-text: dark ? #FF99A4 : #C42B1C;
-    out property <color> error-fill: dark ? #442726 : #FDE7E9;
-    out property <color> warning-text: dark ? #FCE100 : #9D5D00;
-    out property <color> warning-fill: dark ? #433519 : #FFF4CE;
+    out property <color> error-text: dark ? #FF99A4 : #B9291A;
+    out property <color> error-fill: dark ? #442726 : #FBEAE6;
+    // Pressed danger button: paler than hover, so error-text keeps AA on it.
+    out property <color> error-fill-pressed: dark ? #352020 : #FCF3EF;
+    out property <color> warning-text: dark ? #FCE100 : #8A5200;
+    out property <color> warning-fill: dark ? #433519 : #FAEFD5;
     out property <color> success-text: dark ? #6CCB5F : #0F7B0F;
-    out property <color> success-tint: dark ? #2F3F2F : #E5F1E5;
-    out property <color> info-fill: dark ? #323232 : #F0F0F0;
+    out property <color> success-tint: dark ? #2F3F2F : #EAF2E5;
+    out property <color> info-fill: dark ? #323232 : #F4EFE6;
+
+    // 1.5 Motion (UI rules 21 to 23): short and calm, never waited for, 0 under
+    // `Shell.reduced-motion`. `motion-quick` is a state change inside a control (knob, thumb,
+    // hover fill); `motion-open` is a list or popup appearing. Every `animate` reads one of them,
+    // with `easing: ease-out` (Slint 1.18 cannot expose an easing property, so it stays inline).
+    out property <duration> motion-quick: Shell.reduced-motion ? 0ms : 100ms;
+    out property <duration> motion-open: Shell.reduced-motion ? 0ms : 160ms;
 }
 
 // WCAG 2 contrast, so the gallery labels and the test read numbers computed from the tokens.

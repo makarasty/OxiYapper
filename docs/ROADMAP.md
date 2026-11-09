@@ -53,9 +53,9 @@ Done when: on the owner's PC, holding Ctrl+Win, speaking and releasing pastes te
 
 ## M7 - Windows paste, all edge cases
 
-Needs M6. Modifier wait, UIPI check, clipboard snapshot/restore with sequence number, history and cloud exclusion, type mode, per-app rules, "Copy last text" tray item.
+Needs M6. Modifier wait, UIPI check, clipboard snapshot/restore with sequence number, cloud exclusion always and Win+V history exclusion by setting (default: kept in history), type mode only when chosen or the clipboard is locked, per-app rules, "Copy last text" tray item.
 
-Done when: QA checklist paste rows pass on Windows (Notepad, browser, Windows Terminal, RDP, an elevated Notepad, a game chat in type mode); Win+V history shows neither the dictation nor the restored item; platform smoke test for clipboard round trip runs in CI on Windows.
+Done when: QA checklist paste rows pass on Windows (Notepad, browser, Windows Terminal, RDP, an elevated Notepad, a game chat in type mode); by default Win+V history shows the dictation second, under the earlier copy that Ctrl+V returns (an earlier copy excluded from history stays excluded), and neither when the setting is off; the cloud clipboard never gets the text; platform smoke test for clipboard round trip runs in CI on Windows.
 
 ## M8 - Windows overlay
 

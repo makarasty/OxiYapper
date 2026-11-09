@@ -2,7 +2,7 @@
 source: crates/oxi-core/tests/ipc.rs
 expression: lines(requests().iter().map(encode).collect())
 ---
-{"t":"Hello","proto":2,"version":"0.1.0"}
+{"t":"Hello","proto":4,"version":"0.1.0"}
 {"t":"OpenSettings"}
 {"t":"Status"}
 {"t":"ListDevices"}
@@ -11,4 +11,7 @@ expression: lines(requests().iter().map(encode).collect())
 {"t":"CaptureHotkey","on":true}
 {"t":"PreviewOverlay","position":"top-centre"}
 {"t":"Stats"}
+{"t":"PreviewSound","choice":"pop","volume_percent":40}
+{"t":"TestAudio","reset":true,"pcm":"3f000000"}
+{"t":"TestTranscribe","id":7,"set":{"normalize":true,"denoise":false,"trim":true,"model":"turbo"},"language":"ru"}
 {"t":"Shutdown"}

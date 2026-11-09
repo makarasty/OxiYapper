@@ -76,7 +76,7 @@ fn jfk_wer_under_0_2() {
     };
     let mut engine = Engine::load(&model, &DeviceChoice::Cpu).unwrap();
     assert_eq!(engine.info().device, None);
-    let t = engine.transcribe(&audio, Language::En, "").unwrap();
+    let t = engine.transcribe(&audio, Language::EN, "").unwrap();
     let text: String = t.segments.iter().map(|s| s.text.as_str()).collect();
     let w = wer(JFK, &text);
     eprintln!("WER {w:.3}: {text}");
@@ -101,7 +101,7 @@ fn auto_device_loads_and_prompt_is_accepted() {
     // Twice: the state made in load serves every job.
     for _ in 0..2 {
         let t = engine
-            .transcribe(&audio, Language::Auto, "Kennedy, Americans")
+            .transcribe(&audio, Language::AUTO, "Kennedy, Americans")
             .unwrap();
         assert!(
             t.segments

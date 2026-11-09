@@ -1,9 +1,10 @@
 // Page structure: header, groups, cards and the setting rows inside them (Windows 11 Settings
 // pattern: one card per setting, label and description left, control right).
 import { Theme, Shell } from "../tokens.slint";
-import { FocusRing, KeyFocus, CardFrame, Caption } from "base.slint";
+import { FocusRing, KeyFocus, CardFrame, Caption, Tip } from "base.slint";
 import { Switch } from "switch.slint";
 import { Slider, NumberField } from "slider.slint";
+import { WarningSlot } from "feedback.slint";
 
 export component PageHeader inherits VerticalLayout {
     in property <string> title;
@@ -11,7 +12,7 @@ export component PageHeader inherits VerticalLayout {
     padding-top: Theme.title-top;
     padding-bottom: Theme.title-bottom;
     spacing: Theme.space-1;
-    Text {
+    heading := Text {
         text: root.title;
         font-size: Theme.title-size;
         font-weight: Theme.weight-strong;
@@ -122,9 +123,10 @@ export component ClickCard inherits CardFrame {
     }
 }
 
-// `[icon 20?] [title + description, both wrap] .... [control column]` inside a Card. The control
+// `[icon 20?] [title + description, both wrap] .... [!] [control column]` inside a Card. The control
 // column (children, right-aligned) is 36 % of the card, 240 to 360 px, the same in every row of a
-// page (the wrapping of the text on the left must not move it).
+// page (the wrapping of the text on the left must not move it); the "!" sits just left of the
+// packed controls.
 export component Row inherits HorizontalLayout {
     in property <image> icon;
     in property <string> title;
@@ -132,6 +134,18 @@ export component Row inherits HorizontalLayout {
     in property <bool> enabled: true;
     // Stretch the controls over the column (slider, meter) instead of packing them right.
     in property <bool> fill-controls;
+    // A persistent warning: the "!" before the controls, this text on hover. Empty shows none.
+    in property <string> warning;
+    // A title from the user (an app name): one line, cut, the whole of it on hover (UI rules 1, 28).
+    in property <bool> elide;
+    // The whole of what the control shows (a device name in a Combo): on hover when it is cut
+    // (UI rule 28). shortcut: "cut" is measured against the column less the Combo's arrow and
+    // padding, not the Combo's own text box; fine while the Combo fills the column.
+    in property <string> full-text;
+    // No controls: the text takes the control column too, not wrapping beside an empty one.
+    in property <bool> text-only;
+    // Why the controls are off while `enabled` is false: their tooltip (UI rule 31).
+    in property <string> off-tip;
     spacing: Theme.icon-gap;
     min-height: root.description == "" ? 24px : 32px;
     if root.icon.width > 0: VerticalLayout {
@@ -149,11 +163,25 @@ export component Row inherits HorizontalLayout {
         spacing: Theme.title-gap;
         horizontal-stretch: 1;
         preferred-width: 0;
-        Text {
-            text: root.title;
-            font-size: Theme.body-size;
-            color: root.enabled ? Theme.text-primary : Theme.text-disabled;
-            wrap: word-wrap;
+        Rectangle {
+            min-height: title.min-height;
+            preferred-height: title.preferred-height;
+            title := Text {
+                width: 100%;
+                height: 100%;
+                text: root.title;
+                font-size: Theme.body-size;
+                color: root.enabled ? Theme.text-primary : Theme.text-disabled;
+                wrap: root.elide ? TextWrap.no-wrap : TextWrap.word-wrap;
+                overflow: root.elide ? TextOverflow.elide : TextOverflow.clip;
+                vertical-alignment: center;
+            }
+            if root.elide: TouchArea {
+                Tip {
+                    text: title.preferred-width > title.width ? root.title : "";
+                    hovered: parent.has-hover;
+                }
+            }
         }
         if root.description != "": Caption {
             text: root.description;
@@ -161,14 +189,55 @@ export component Row inherits HorizontalLayout {
             wrap: word-wrap;
         }
     }
-    HorizontalLayout {
+    // The "!" keeps this room so a warning never moves the text; it is drawn in the control column.
+    Rectangle {
+        width: Theme.icon-size;
+    }
+    Rectangle {
         horizontal-stretch: 0;
-        preferred-width: clamp(Theme.control-column-min, (Shell.page-width - 2 * Theme.card-padding-h) * 0.36, Theme.control-column-max);
+        preferred-width: root.text-only ? 0 : clamp(Theme.control-column-min, (Shell.page-width - 2 * Theme.card-padding-h) * 0.36, Theme.control-column-max);
         min-width: self.preferred-width;
         max-width: self.preferred-width;
-        alignment: root.fill-controls ? LayoutAlignment.stretch : LayoutAlignment.end;
-        spacing: Theme.control-gap;
-        @children
+        min-height: controls.min-height;
+        preferred-height: controls.preferred-height;
+        // Next to the controls it warns about (a switch, a button), not alone at the column's start;
+        // never left of its kept room.
+        WarningSlot {
+            x: root.fill-controls ? -(Theme.icon-gap + Theme.icon-size) : max(-(Theme.icon-gap + Theme.icon-size), parent.width - controls.preferred-width - Theme.control-gap - Theme.icon-size);
+            y: 0;
+            height: parent.height;
+            text: root.warning;
+        }
+        // Under the controls: a locked control lets the pointer through and this says why (UI rule
+        // 31); a control that stays live (Open folder) keeps the pointer and its own tooltip.
+        // Over the controls only, so the "!" beside them keeps its own tooltip.
+        if Shell.locked || (!root.enabled && root.off-tip != ""): TouchArea {
+            x: root.fill-controls ? 0 : max(0, parent.width - controls.preferred-width);
+            width: parent.width - self.x;
+            Tip {
+                text: Shell.locked ? Shell.locked-tip : root.off-tip;
+                hovered: parent.has-hover;
+            }
+        }
+        // A parent TouchArea sees the hover and still hands the pointer to the controls.
+        hover := TouchArea {
+            enabled: root.full-text != "" && !Shell.locked;
+            controls := HorizontalLayout {
+                alignment: root.fill-controls ? LayoutAlignment.stretch : LayoutAlignment.end;
+                spacing: Theme.control-gap;
+                @children
+            }
+            Tip {
+                text: measure.preferred-width > hover.width - Theme.control-height - Theme.space-3 ? root.full-text : "";
+                hovered: hover.has-hover;
+            }
+        }
+        measure := Text {
+            visible: false;
+            text: root.full-text;
+            font-size: Theme.body-size;
+            accessible-role: none;
+        }
     }
 }
 
@@ -187,12 +256,18 @@ export component ToggleRow inherits CardFrame {
     in property <image> icon;
     in property <string> title;
     in property <string> description;
+    in property <string> warning;
+    in property <string> off-tip;
     in-out property <bool> checked;
     in property <bool> enabled: true;
     in property <bool> locked: Shell.locked;
     in property <bool> force-hover;
     in property <bool> force-focus;
+    out property <bool> key-focused: switch.key-focused;
     callback toggled(bool);
+    public function take-focus(ring: bool) {
+        switch.take-focus(ring);
+    }
     property <bool> live: root.enabled && !root.locked;
     background: root.flat ? transparent : root.live && (touch.has-hover || root.force-hover) ? Theme.bg-control-hover : Theme.bg-card;
     border-width: root.flat ? 0 : 1px;
@@ -210,6 +285,8 @@ export component ToggleRow inherits CardFrame {
             icon: root.icon;
             title: root.title;
             description: root.description;
+            warning: root.warning;
+            off-tip: root.off-tip;
             enabled: root.live;
             switch := Switch {
                 checked <=> root.checked;

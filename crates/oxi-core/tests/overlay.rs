@@ -2,8 +2,8 @@ use oxi_core::audio::Level;
 use oxi_core::config::{Overlay, OverlayPosition as P};
 use oxi_core::machine::{Notice, OverlayState, Phase};
 use oxi_core::overlay::{
-    CLIP_HOLD, Icon, MARGIN_DIP, METER_HZ, Meter, PILL_H_DIP, PILL_W_DIP, Quns, Rect, look,
-    palette, place, visible,
+    CLIP_HOLD, Icon, MARGIN_DIP, METER_HZ, Meter, PILL_EM, PILL_GAP, PILL_H_DIP, PILL_ICON,
+    PILL_PAD, PILL_W_DIP, Quns, Rect, label_x, look, palette, place, visible,
 };
 use oxi_core::strings;
 use oxi_core::types::Millis;
@@ -294,4 +294,65 @@ fn every_state_has_a_look_and_every_phase_a_tooltip() {
         ],
         ["Settings", "Copy last text", "Quit"]
     );
+}
+
+/// Every status label of the pill that draw.rs centres (the states without a meter), plus
+/// Cyrillic ones of the same kind (the overlay is English today; the check is the layout's, which
+/// sees only a width). Widths are in em, narrow enough that centring applies.
+fn labels() -> Vec<(String, f32)> {
+    let em_share = |ch: char| if ch.is_ascii() { 0.4 } else { 0.45 };
+    let mut texts: Vec<String> = ALL_NOTICES
+        .iter()
+        .map(|n| strings::notice_short(*n).to_string())
+        .collect();
+    texts.extend(["Loading model", "Transcribing", "Pasting"].map(String::from));
+    texts.extend(["Транскрипция", "Вставка", "Нет модели"].map(String::from));
+    texts
+        .into_iter()
+        .map(|t| {
+            let w = t.chars().map(em_share).sum::<f32>();
+            (t, w)
+        })
+        .collect()
+}
+
+#[test]
+fn status_label_is_centred_in_the_pill_within_one_pixel() {
+    for scale in [1.0_f32, 1.5, 2.0] {
+        let r = place(
+            P::TopLeft,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 10_000,
+                h: 10_000,
+            },
+            scale,
+        );
+        let (w, h) = (r.w as f32, r.h as f32);
+        let (pad, icon, gap) = (
+            (PILL_PAD * h).round(),
+            (PILL_ICON * h).round(),
+            (PILL_GAP * h).round(),
+        );
+        let (min_x, right) = (pad + icon + gap, w - pad);
+        let mut centred = 0;
+        for (text, em_widths) in labels() {
+            let text_w = em_widths * PILL_EM * h;
+            let x = label_x(w, min_x, right, text_w);
+            if text_w <= w - 2.0 * min_x {
+                centred += 1;
+                let centre = x + text_w / 2.0;
+                assert!(
+                    (centre - w / 2.0).abs() <= 1.0,
+                    "{text} at {scale}: centre {centre}"
+                );
+            } else {
+                // Too wide to centre without touching the icon: starts right after it.
+                assert!((x - min_x).abs() <= 1.0, "{text} at {scale}: x {x}");
+            }
+        }
+        // The six status labels (three of them Cyrillic) all fit, so they are all asserted.
+        assert!(centred >= 6, "only {centred} labels centred at {scale}");
+    }
 }

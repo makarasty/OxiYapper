@@ -17,7 +17,14 @@ export component Switch {
     property <bool> hover: root.live && (touch.has-hover || root.force-hover);
     property <bool> down: root.live && (touch.pressed || root.force-pressed);
     property <bool> key-focus;
+    out property <bool> key-focused: root.key-focus && fs.has-focus;
     property <color> ink: !root.live ? Theme.text-disabled : root.checked ? Theme.accent : Theme.text-secondary;
+
+    // For a control that replaces the focused one: `ring` says if the keyboard did it (UI rule 17).
+    public function take-focus(ring: bool) {
+        fs.focus();
+        root.key-focus = ring;
+    }
 
     public function toggle() {
         if (root.live) {
@@ -51,7 +58,7 @@ export component Switch {
             track := Rectangle {
                 width: 40px;
                 height: 20px;
-                border-radius: self.height / 2;
+                border-radius: Theme.radius-round;
                 background: root.checked ? root.ink : transparent;
                 border-width: root.checked ? 0 : 1px;
                 border-color: root.ink;
@@ -59,15 +66,15 @@ export component Switch {
                 knob := Rectangle {
                     width: root.down ? 17px : root.hover ? 14px : 12px;
                     height: root.down || root.hover ? 14px : 12px;
-                    border-radius: self.height / 2;
+                    border-radius: Theme.radius-round;
                     x: root.checked ? parent.width - self.width - 4px : 4px;
                     y: (parent.height - self.height) / 2;
                     background: root.checked ? (root.live ? Theme.on-accent : Theme.bg-card) : root.ink;
-                    animate x, width { duration: 120ms; }
+                    animate x, width { duration: Theme.motion-quick; easing: ease-out; }
                 }
                 FocusRing {
-                    shown: root.force-focus || (root.key-focus && fs.has-focus);
-                    radius: 10px;
+                    shown: root.force-focus || root.key-focused;
+                    radius: Theme.radius-round;
                 }
             }
         }
@@ -104,7 +111,7 @@ export component Radio {
     height: 16px;
     accessible-role: none;
     Rectangle {
-        border-radius: self.width / 2;
+        border-radius: Theme.radius-round;
         background: root.checked ? (root.enabled ? Theme.accent : Theme.text-disabled) : root.hover && root.enabled ? Theme.bg-subtle-hover : transparent;
         border-width: root.checked ? 0 : 1px;
         border-color: root.enabled ? Theme.text-secondary : Theme.text-disabled;
@@ -112,7 +119,7 @@ export component Radio {
             visible: root.checked;
             width: root.hover && root.enabled ? 8px : 6px;
             height: self.width;
-            border-radius: self.width / 2;
+            border-radius: Theme.radius-round;
             background: Theme.on-accent;
         }
     }

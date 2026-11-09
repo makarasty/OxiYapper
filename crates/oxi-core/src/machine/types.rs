@@ -38,6 +38,8 @@ pub struct MachineConfig {
     pub watchdog_period: Millis,
     /// Idle time before the model is unloaded; zero means never.
     pub idle_unload: Millis,
+    /// Unload the model the moment the machine is idle again; wins over `idle_unload`.
+    pub unload_immediately: bool,
     /// How long a transient overlay text (cancelled, nothing heard) stays up.
     pub overlay_hide: Millis,
     /// Capture keeps running this long after the stopping key, so the last syllable is kept.
@@ -68,6 +70,7 @@ impl From<&Config> for MachineConfig {
             warn_before: Millis::from_secs(30),
             watchdog_period: Millis(100),
             idle_unload: Millis::from_secs(u64::from(cfg.model.idle_unload_minutes) * 60),
+            unload_immediately: cfg.model.unload_immediately,
             overlay_hide: Millis(1500),
             release_tail: Millis(cfg.audio.tail_ms.into()),
             model: ModelIdentity {

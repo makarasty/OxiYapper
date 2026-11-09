@@ -3,7 +3,8 @@
 // One module, so `cargo test -p oxi-core stats` selects every test here.
 mod stats {
     use oxi_core::stats::{
-        Date, Day, KEEP_DAYS, Stats, Totals, VERSION, audio_length, format_count, word_count,
+        Date, Day, KEEP_DAYS, Metric, Stats, TREND_DAYS, Totals, VERSION, audio_length,
+        format_count, word_count,
     };
     use oxi_core::types::Millis;
     use proptest::prelude::*;
@@ -24,6 +25,101 @@ mod stats {
     /// `len` consecutive days from `start`.
     fn run(start: Date, len: i32) -> Vec<Date> {
         (0..len).map(|i| start.add_days(i)).collect()
+    }
+
+    #[test]
+    fn trend_without_a_dictation_has_no_days() {
+        let t = Stats::default().trend(date(2026, 11, 8), Metric::Words);
+        assert_eq!(t.values, [] as [u64; 0]);
+        assert_eq!(t.peak(), 0);
+        assert_eq!(t.heights(), [] as [i32; 0]);
+    }
+
+    #[test]
+    fn trend_of_one_day_is_one_full_bar() {
+        let today = date(2026, 11, 8);
+        let t = used(&[today], 7).trend(today, Metric::Words);
+        assert_eq!((t.start, t.values.clone()), (today, vec![7]));
+        assert_eq!(t.heights(), [1000]);
+    }
+
+    #[test]
+    fn trend_keeps_the_days_without_a_dictation_up_to_today() {
+        let today = date(2026, 11, 8);
+        let s = used(&[today.add_days(-3), today.add_days(-1)], 10);
+        let t = s.trend(today, Metric::Dictations);
+        assert_eq!(t.start, today.add_days(-3));
+        assert_eq!(t.values, [1, 0, 1, 0]);
+    }
+
+    #[test]
+    fn trend_of_a_long_history_stops_at_a_year() {
+        let today = date(2026, 11, 8);
+        let s = used(&run(today.add_days(-500), 501), 3);
+        let t = s.trend(today, Metric::Words);
+        assert_eq!(t.values.len(), usize::try_from(TREND_DAYS).unwrap());
+        assert_eq!(t.start, today.add_days(1 - TREND_DAYS));
+    }
+
+    #[test]
+    fn trend_streak_counts_the_run_from_before_the_window() {
+        let today = date(2026, 11, 8);
+        let s = used(&run(today.add_days(-400), 401), 3);
+        let t = s.trend(today, Metric::Streak);
+        assert_eq!(t.values.last(), Some(&401));
+        assert_eq!(t.values[0], 401 - u64::try_from(TREND_DAYS - 1).unwrap());
+    }
+
+    #[test]
+    fn trend_streak_restarts_after_a_gap() {
+        let today = date(2026, 11, 8);
+        let days = [-4, -3, -1, 0].map(|d| today.add_days(d));
+        assert_eq!(
+            used(&days, 1).trend(today, Metric::Streak).values,
+            [1, 2, 0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn trend_wpm_is_that_days_pace_and_zero_without_audio() {
+        let today = date(2026, 11, 8);
+        let mut s = Stats::default();
+        s.record(today.add_days(-1), 100, Millis(0));
+        s.record(today, 150, Millis(60_000));
+        assert_eq!(s.trend(today, Metric::Wpm).values, [0, 150]);
+    }
+
+    #[test]
+    fn trend_ignores_days_after_today() {
+        let today = date(2026, 11, 8);
+        let s = used(&[today.add_days(5)], 9);
+        assert_eq!(s.trend(today, Metric::Words).values, [] as [u64; 0]);
+    }
+
+    #[test]
+    fn trend_heights_survive_a_huge_count() {
+        let today = date(2026, 11, 8);
+        let mut s = used(&[today.add_days(-1)], u64::MAX);
+        s.record(today, u64::MAX / 2, Millis(1000));
+        assert_eq!(s.trend(today, Metric::Words).heights(), [1000, 499]);
+    }
+
+    #[test]
+    fn trend_heights_keep_a_tiny_day_visible() {
+        let table: [(&[u64], &[i32]); 5] = [
+            (&[2000, 1], &[1000, 1]),
+            (&[3, 2000, 0], &[1, 1000, 0]),
+            (&[500, 1000], &[500, 1000]),
+            (&[0, 0], &[0, 0]),
+            (&[u64::MAX, 1], &[1000, 1]),
+        ];
+        for (values, want) in table {
+            let trend = oxi_core::stats::Trend {
+                start: date(2026, 11, 8),
+                values: values.to_vec(),
+            };
+            assert_eq!(trend.heights(), want, "{values:?}");
+        }
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crate::{AppWindow, Page};
 
 #[path = "../tests/common/elements.rs"]
 mod elements;
-pub use elements::{has, with_role};
+pub use elements::{assert_nothing_moved, has, spots, with_role};
 
 /// A fresh config directory per `module` and test `name`.
 pub fn layout(module: &str, name: &str) -> Layout {

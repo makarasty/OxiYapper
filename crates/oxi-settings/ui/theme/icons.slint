@@ -4,8 +4,33 @@
 export global Icons {
     // The app mark, drawn by `oxi-platform` (`logo.svg` is regenerated, not edited).
     out property <image> logo: @image-url("logo.svg");
+    // The title bar's copy of that mark at one small-icon size of Windows each: Slint hands an SVG
+    // to the OS at 64 px and the OS shrinks it badly. `scale` is the display scale.
+    // shortcut: these PNGs are rendered from logo.svg by hand, redo them when the mark changes.
+    out property <image> window-logo-16: @image-url("../assets/logo-window-16.png");
+    out property <image> window-logo-20: @image-url("../assets/logo-window-20.png");
+    out property <image> window-logo-24: @image-url("../assets/logo-window-24.png");
+    out property <image> window-logo-32: @image-url("../assets/logo-window-32.png");
+    public pure function window-logo(scale: float) -> image {
+        return scale > 1.5 ? root.window-logo-32 : scale > 1.25 ? root.window-logo-24 : scale > 1 ? root.window-logo-20 : root.window-logo-16;
+    }
+    // The author's public GitHub avatar (owner approved).
+    out property <image> avatar: @image-url("../assets/avatar-makarasty.png");
+    // Project marks of the About page, from simple-icons (monochrome, 24 px grid).
+    out property <image> github-mark: @image-url("../icons/si_github.svg");
+    out property <image> rust-mark: @image-url("../icons/si_rust.svg");
+    out property <image> slint-mark: @image-url("../icons/si_slint.svg");
+    // The About page's tiles and link arrow.
+    out property <image> code: @image-url("../icons/ic_fluent_code_20_regular.svg");
+    out property <image> icons: @image-url("../icons/ic_fluent_icons_20_regular.svg");
+    out property <image> open-16: @image-url("../icons/ic_fluent_open_16_regular.svg");
+    out property <image> paint-brush: @image-url("../icons/ic_fluent_paint_brush_20_regular.svg");
+    out property <image> person-voice: @image-url("../icons/ic_fluent_person_voice_20_regular.svg");
+    out property <image> plug-connected: @image-url("../icons/ic_fluent_plug_connected_20_regular.svg");
+    out property <image> sound-wave-circle: @image-url("../icons/ic_fluent_sound_wave_circle_20_regular.svg");
     out property <image> add-16: @image-url("../icons/ic_fluent_add_16_regular.svg");
     out property <image> add: @image-url("../icons/ic_fluent_add_20_regular.svg");
+    out property <image> app-generic: @image-url("../icons/ic_fluent_app_generic_20_regular.svg");
     out property <image> arrow-download-16: @image-url("../icons/ic_fluent_arrow_download_16_regular.svg");
     out property <image> arrow-download: @image-url("../icons/ic_fluent_arrow_download_20_regular.svg");
     out property <image> book-letter: @image-url("../icons/ic_fluent_book_letter_20_regular.svg");

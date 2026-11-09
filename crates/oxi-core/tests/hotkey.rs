@@ -62,6 +62,24 @@ fn run(steps: &[(KeyInput, Ctx, Verdict)]) {
 // ---- keys -------------------------------------------------------------------------------------
 
 #[test]
+fn key_labels_are_human_not_ids() {
+    for (key, label) in [
+        (Key::BracketLeft, "["),
+        (Key::BracketRight, "]"),
+        (Key::Quote, "'"),
+        (Key::Semicolon, ";"),
+        (Key::Backquote, "`"),
+        (Key::Backslash, "\\"),
+        (Key::Q, "Q"),
+        (Key::Digit1, "1"),
+    ] {
+        assert_eq!(key.label(), label, "{key:?}");
+        // The stored name is the id and does not change.
+        assert_eq!(Key::from_name(key.as_str()), Some(key));
+    }
+}
+
+#[test]
 fn every_key_round_trips_by_name_and_serde() {
     for (i, k) in Key::ALL.into_iter().enumerate() {
         assert_eq!(k as usize, i);

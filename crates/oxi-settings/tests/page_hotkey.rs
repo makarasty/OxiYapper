@@ -11,6 +11,8 @@ use oxi_core::machine::Mode;
 use oxi_core::paths::Layout;
 use oxi_settings::ipc::{Event, Link};
 use oxi_settings::{AppWindow, Ipc, Page};
+use slint::ComponentHandle;
+use slint::platform::WindowEvent;
 
 fn open(layout: &Layout) -> AppWindow {
     // Apply needs the daemon link; the receiver is dropped and sends are ignored.
@@ -202,4 +204,234 @@ fn apply_tooltip_follows_the_link() {
     }
     ipc.deliver(&Event::Link(Link::Online));
     assert_eq!(tip().as_deref(), Some(""));
+}
+
+/// The owner's chord plus one: 15 keys.
+const LONG: &str = "version = 1\n[hotkey]\nchord = [\"Shift\", \"W\", \"E\", \"R\", \"I\", \"O\", \"BracketLeft\", \"A\", \"S\", \"D\", \"F\", \"J\", \"K\", \"Quote\", \"Z\"]\n";
+const LONG_TEXT: &str =
+    "Shift + W + E + R + I + O + Bracket Left + A + S + D + F + J + K + Quote + Z";
+const SIZES: [(f32, f32); 3] = [(720.0, 520.0), (1000.0, 700.0), (1280.0, 860.0)];
+
+/// `[left, top, right, bottom]` of an element.
+fn rect(e: &ElementHandle) -> [f32; 4] {
+    let (at, size) = (e.absolute_position(), e.size());
+    [at.x, at.y, at.x + size.width, at.y + size.height]
+}
+
+fn resized(window: &AppWindow, (w, h): (f32, f32)) {
+    window.window().set_size(slint::LogicalSize::new(w, h));
+    // Runs the `changed` handlers that follow the window width.
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(1));
+}
+
+fn chips(window: &AppWindow, id: &str) -> Vec<ElementHandle> {
+    ElementHandle::find_by_element_id(window, &format!("KeycapRow::{id}")).collect()
+}
+
+#[test]
+fn a_long_chord_stays_inside_the_keys_row_at_every_size() {
+    let l = layout("long", Some(LONG));
+    let window = open(&l);
+    let short = layout(
+        "long-short",
+        Some("version = 1\n[hotkey]\nchord = [\"F13\"]\n"),
+    );
+    let single = common::open_again(&short, Page::Hotkey);
+    let tile = |win: &AppWindow| {
+        ElementHandle::find_by_accessible_label(win, "Push to talk")
+            .find(|e| e.accessible_role() == Some(AccessibleRole::RadioButton))
+            .map(|e| rect(&e))
+    };
+    for size in SIZES {
+        resized(&window, size);
+        resized(&single, size);
+        let row = rect(&one(&window, LONG_TEXT));
+        let button = rect(&one(&window, "Change hotkey"));
+        assert!(
+            row[2] <= button[0],
+            "{size:?}: row {row:?}, button {button:?}"
+        );
+        let (shown, more) = (chips(&window, "chip"), chips(&window, "more"));
+        assert!(!shown.is_empty(), "{size:?}: no key shown");
+        assert_eq!(more.len(), 1, "{size:?}: no +N cap");
+        for chip in shown.iter().chain(&more) {
+            let r = rect(chip);
+            assert!(
+                r[0] >= row[0] && r[2] <= row[2] && r[1] >= row[1] && r[3] <= row[3],
+                "{size:?}: chip {r:?} leaves the row {row:?}"
+            );
+        }
+        // The chord's length moves nothing.
+        assert_eq!(
+            button,
+            rect(&one(&single, "Change hotkey")),
+            "{size:?}: the row changed with the chord"
+        );
+        assert_eq!(tile(&window), tile(&single), "{size:?}: the next row moved");
+    }
+}
+
+#[test]
+fn a_short_chord_is_not_folded_and_reads_as_a_person_says_it() {
+    let l = layout(
+        "short",
+        Some("version = 1\n[hotkey]\nchord = [\"Ctrl\", \"BracketLeft\", \"Home\"]\n"),
+    );
+    let window = open(&l);
+    assert!(has(&window, "Ctrl + Bracket Left + Home"));
+    assert_eq!(chips(&window, "chip").len(), 3);
+    assert!(chips(&window, "more").is_empty());
+}
+
+#[test]
+fn twin_keys_of_a_saved_chord_read_apart() {
+    let saved = |keys: &str| {
+        format!(
+            "version = 1
+[hotkey]
+chord = [{keys}]
+"
+        )
+    };
+    let digit = layout("twin-digit", Some(&saved(r#""1", "Num1""#)));
+    assert!(has(&open(&digit), "1 + Numpad 1"));
+    let enter = layout("twin-enter", Some(&saved(r#""Enter", "NumEnter""#)));
+    assert!(has(
+        &common::open_again(&enter, Page::Hotkey),
+        "Enter + Numpad Enter"
+    ));
+}
+
+fn press(window: &AppWindow, text: slint::SharedString) {
+    let w = window.window();
+    w.dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+    w.dispatch_event(WindowEvent::KeyReleased { text });
+    // The tip is set in a `changed` handler.
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(1));
+}
+
+fn tab(window: &AppWindow) {
+    press(window, slint::platform::Key::Tab.into());
+}
+
+#[test]
+fn the_folded_keys_are_told_on_keyboard_focus() {
+    let window = open(&layout("fold-focus", Some(LONG)));
+    resized(&window, SIZES[0]);
+    let copies = || ElementHandle::find_by_accessible_label(&window, LONG_TEXT).count();
+    assert_eq!(copies(), 1);
+    // The rail, then the "+N" cap.
+    tab(&window);
+    tab(&window);
+    assert_eq!(copies(), 2, "focus on the +N cap shows the whole chord");
+    tab(&window);
+    assert_eq!(copies(), 1, "leaving it closes the tip");
+}
+
+#[test]
+fn leaving_the_page_closes_the_tip() {
+    let window = open(&layout("fold-leave", Some(LONG)));
+    resized(&window, SIZES[0]);
+    tab(&window);
+    tab(&window);
+    assert!(has(&window, LONG_TEXT));
+    window.set_page(Page::Audio);
+    resized(&window, SIZES[0]);
+    assert!(!has(&window, LONG_TEXT), "the tip outlived its page");
+}
+
+#[test]
+fn a_chord_that_is_not_folded_is_no_tab_stop() {
+    let window = open(&layout("fold-none", None));
+    // The rail, then Change hotkey at once.
+    tab(&window);
+    tab(&window);
+    press(&window, " ".into());
+    assert!(has(&window, "Left Ctrl"), "Change hotkey had no focus");
+}
+
+/// Esc plus 12 keys: refused, and the row folds, so the tooltip must name the chips on screen.
+#[test]
+fn a_refused_chord_tells_the_keys_shown() {
+    let window = open(&layout("refused-tip", None));
+    click(&window, "Change hotkey");
+    let keys = [
+        "Esc", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+    ];
+    for key in keys {
+        click(&window, key);
+    }
+    assert!(has(&window, &format!("New hotkey: {}", keys.join(" + "))));
+    assert!(!has(&window, "No keys yet"));
+}
+
+/// UI rule 25: Apply and Cancel are in view with the keyboard open at the small window sizes and
+/// the page does not scroll.
+#[test]
+fn the_open_keyboard_fits_the_small_sizes_without_scrolling() {
+    let l = layout("open-fit", None);
+    let window = open(&l);
+    click(&window, "Change hotkey");
+    for (w, h) in [(720.0, 520.0), (1000.0, 700.0), (1280.0, 860.0)] {
+        resized(&window, (w, h));
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(1));
+        let apply = rect(&one(&window, "Apply hotkey"));
+        let last = rect(&one(&window, "Cancel hotkey change"));
+        assert!(
+            apply[3] <= h && last[3] <= h,
+            "{w}x{h}: Apply {apply:?}, Cancel {last:?}"
+        );
+        assert_eq!(window.get_scroll_y(), 0.0, "{w}x{h} scrolled");
+    }
+}
+
+#[test]
+fn opening_the_keyboard_keeps_the_content_edges_at_every_size() {
+    let l = layout("edges", Some(LONG));
+    let window = open(&l);
+    let many = [
+        "Left Ctrl",
+        "F1",
+        "F2",
+        "F3",
+        "F4",
+        "F5",
+        "F6",
+        "F7",
+        "F8",
+        "F9",
+        "F10",
+        "F11",
+        "F12",
+        "Q",
+        "W",
+        "E",
+    ];
+    let pending = "New hotkey: Ctrl + F1 + F2 + F3 + F4 + F5 + F6 + F7 + F8 + F9 + F10 + F11 + F12 + Q + W + E";
+    for size in SIZES {
+        resized(&window, size);
+        let closed = rect(&one(&window, "Change hotkey"));
+        click(&window, "Change hotkey");
+        resized(&window, size);
+        assert_eq!(
+            closed,
+            rect(&one(&window, "Change hotkey")),
+            "{size:?}: the Keys row moved"
+        );
+        for key in many {
+            click(&window, key);
+        }
+        resized(&window, size);
+        let row = rect(&one(&window, pending));
+        let apply = rect(&one(&window, "Apply hotkey"));
+        assert!(
+            row[2] <= apply[2],
+            "{size:?}: pending row {row:?}, Apply {apply:?}"
+        );
+        for chip in chips(&window, "chip") {
+            let r = rect(&chip);
+            assert!(r[2] <= apply[2], "{size:?}: chip {r:?} past the card");
+        }
+        click(&window, "Cancel hotkey change");
+    }
 }

@@ -549,6 +549,8 @@ impl State {
                     self.unload(fx);
                 }
                 self.unload_when_idle = false;
+            } else if self.unloadable() && self.cfg.unload_immediately {
+                self.unload(fx);
             } else if self.unloadable()
                 && self.cfg.idle_unload != Millis(0)
                 && self.idle_unload_at.is_none()

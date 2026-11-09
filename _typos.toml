@@ -11,3 +11,10 @@ whis = "whis"
 teh = "teh"
 NIN = "NIN"
 PN = "PN"
+
+# Whisper language codes (Faroese, Bashkir) in languages.rs and German/Spanish
+# sample phrases in tuning.rs.
+fo = "fo"
+ba = "ba"
+ein = "ein"
+calle = "calle"

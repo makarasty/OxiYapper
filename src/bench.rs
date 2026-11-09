@@ -1,4 +1,4 @@
-//! Hidden `OxiYapper bench <dir> --model <path> [--gpu <name|cpu|auto>] [--lang ru|en|auto]
+//! Hidden `OxiYapper bench <dir> --model <path> [--gpu <name|cpu|auto>] [--lang auto|<code>]
 //! [--prompt-file <f>]`: every `*.wav` in `<dir>` through the audio pipeline, whisper and the
 //! text pipeline. Prints text and timings; never touches the hotkey or the clipboard.
 //!
@@ -36,7 +36,7 @@ impl std::fmt::Display for Usage {
         write!(
             f,
             "usage: {name} bench <dir> --model <path> [--gpu <name|cpu|auto>] \
-             [--lang ru|en|auto] [--prompt-file <file>]\n       \
+             [--lang auto|<code>] [--prompt-file <file>]\n       \
              {name} bench --record <seconds> <out.wav>  (raw 16 kHz mono: no trim, no normalise)"
         )
     }
@@ -56,7 +56,7 @@ struct Args {
 
 fn parse_args(args: &[String]) -> Result<Args> {
     let (mut dir, mut model, mut prompt_file) = (None, None, None);
-    let (mut gpu, mut lang) = (DeviceChoice::Auto, Language::Auto);
+    let (mut gpu, mut lang) = (DeviceChoice::Auto, Language::AUTO);
     let (mut audio, mut cut_end_ms, mut vram) = (Audio::default(), 0, false);
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -295,10 +295,10 @@ mod tests {
         assert_eq!(a.dir, PathBuf::from("dir"));
         assert_eq!(a.model, PathBuf::from("m.bin"));
         assert_eq!(a.gpu, DeviceChoice::Named("Vulkan0".into()));
-        assert_eq!(a.lang, Language::Ru);
+        assert_eq!(a.lang, Language::RU);
         assert_eq!(a.prompt_file, Some(PathBuf::from("p.txt")));
         let a = parse_args(&strs(&["d", "--model", "m", "--gpu", "cpu"])).unwrap();
-        assert_eq!((a.gpu, a.lang), (DeviceChoice::Cpu, Language::Auto));
+        assert_eq!((a.gpu, a.lang), (DeviceChoice::Cpu, Language::AUTO));
     }
 
     #[test]
@@ -331,7 +331,7 @@ mod tests {
             &["--model", "m"][..],
             &["d"],
             &["d", "--model"],
-            &["d", "--model", "m", "--lang", "de"],
+            &["d", "--model", "m", "--lang", "xx"],
             &["d", "--model", "m", "--bogus"],
             &["d", "e", "--model", "m"],
         ] {

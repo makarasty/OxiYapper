@@ -1,5 +1,6 @@
 //! Slint settings window and first-run wizard (ARCHITECTURE section 4).
 
+pub mod constants;
 mod ctx;
 mod debounce;
 pub mod ipc;
@@ -8,7 +9,6 @@ mod pages;
 mod testing;
 
 use std::io;
-use std::time::Duration;
 
 use oxi_core::config::{ConfigError, Theme};
 use oxi_core::ipc::Push;
@@ -29,24 +29,16 @@ use ipc::{Action, Event, Link, Options};
 mod generated {
     slint::include_modules!();
 }
-pub use generated::{AppWindow, DaemonStatus, Page, Shell, Theme as Tokens, ThemeChoice};
-
-/// How often the window looks for an edit of `config.toml` from outside (an editor, "Open
-/// file"): a fixed file clears the banner and refreshes the pages without reopening.
-// shortcut: a metadata poll, not a file watcher (`notify` is not a dependency of this crate);
-// switch to a watcher if the second of delay matters.
-pub const FILE_POLL: Duration = Duration::from_secs(1);
+pub use constants::FILE_POLL;
+pub use generated::{
+    AppWindow, AudioState, DaemonStatus, ModelState, Page, Shell, SystemState, TestRow, TestState,
+    TextState, Theme as Tokens, ThemeChoice, Toast,
+};
+pub use pages::test::{Finish, Mic, bind_with as bind_test_page};
 
 /// The accent the std widgets (`LineEdit`, `TextEdit`, `ComboBox`) derive their focus line and
 /// selection from: our teal (token `accent`), never the Windows accent (redesign spec 7.3).
 const ACCENT: Color = Color::from_rgb_u8(0x0F, 0x76, 0x6E);
-
-/// Default size: `min(1280, 85 %)` x `min(800, 88 %)` of the work area, at least the 720 x 520
-/// minimum (redesign spec section 2).
-#[cfg(windows)]
-const DEFAULT: (f32, f32) = (1280.0, 800.0);
-#[cfg(windows)]
-const MIN: (f32, f32) = (720.0, 520.0);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -83,10 +75,15 @@ fn show(layout: Layout) -> Result<(), Error> {
         Ok(Some(Ipc::connect(options)?))
     })?;
     #[cfg(windows)]
-    if let Ok((area, scale)) = oxi_platform::os::display::work_area() {
-        let (size, position) = placement(area, scale);
-        window.window().set_size(size);
-        window.window().set_position(position);
+    {
+        let size = if let Ok((area, scale)) = oxi_platform::os::display::work_area() {
+            let (size, position) = placement(area, scale);
+            window.window().set_position(position);
+            size
+        } else {
+            LogicalSize::new(constants::DEFAULT.0, constants::DEFAULT.1)
+        };
+        open_without_maximize(&window, size);
     }
     // A window opened by a second launch must not show behind the app the user is in; the
     // daemon allowed this process to take the foreground. The callback runs once the event loop
@@ -98,12 +95,34 @@ fn show(layout: Layout) -> Result<(), Error> {
             // The backend wrote the system accent when it created the window.
             if let Some(window) = weak.upgrade() {
                 own_accent(&window);
+                caption_theme(&window, window.get_theme());
             }
             oxi_platform::os::foreground::raise_current_thread_window();
         }
     });
     window.run()?;
     Ok(())
+}
+
+/// Sizes the window to `size` and has the OS create it with no maximize button (UI rule 24): the
+/// backend turns the button off only for a window that cannot resize when it is created, and
+/// never turns it back on, so minimum and maximum are `size` until the event loop has created it.
+// shortcut: depends on the winit backend of the pinned `slint =1.18.1`; re-check it on every Slint
+// bump (`real_window_has_no_maximize_box_and_stops_at_the_maximum`). A window style call behind
+// `oxi-platform` would not depend on this.
+#[cfg(windows)]
+pub fn open_without_maximize(window: &AppWindow, size: LogicalSize) {
+    window.set_frame_width(size.width);
+    window.set_frame_height(size.height);
+    window.window().set_size(size);
+    let weak = window.as_weak();
+    // Err means the event loop is gone: the window is closing.
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_frame_width(0.0);
+            window.set_frame_height(0.0);
+        }
+    });
 }
 
 /// Env var that forces the software renderer; also how a failed Skia run restarts itself.
@@ -125,7 +144,7 @@ fn renderer_name(env: Option<&str>) -> &'static str {
 /// no GPU, so it also runs over RDP; measured with the window open, 69 MB private bytes against
 /// 272 MB on D3D. `OXI_RENDERER=software`, or a Skia that cannot be selected, picks the software
 /// renderer: never Slint's default, which would be Skia on D3D.
-fn use_skia() -> bool {
+pub fn use_skia() -> bool {
     // Skia is built on Windows only; elsewhere Slint's only renderer is the software one.
     #[cfg(windows)]
     {
@@ -186,8 +205,8 @@ fn spawn_note(e: &io::Error) -> String {
 fn placement(area: Rect, scale: f32) -> (LogicalSize, PhysicalPosition) {
     let (w, h) = (area.w as f32 / scale, area.h as f32 / scale);
     let size = LogicalSize::new(
-        DEFAULT.0.min(w * 0.85).max(MIN.0),
-        DEFAULT.1.min(h * 0.88).max(MIN.1),
+        constants::DEFAULT.0.min(w * 0.85).max(constants::MIN.0),
+        constants::DEFAULT.1.min(h * 0.88).max(constants::MIN.1),
     );
     let position = PhysicalPosition::new(
         area.x + ((w - size.width) * scale / 2.0).round() as i32,
@@ -201,10 +220,42 @@ fn placement(area: Rect, scale: f32) -> (LogicalSize, PhysicalPosition) {
 // Slint bump. The backend writes the system accent back when it creates the window and on a theme
 // change: `run` calls this once the window is up and the file poll repeats it (a no-op write when
 // nothing changed), so a new Windows accent can show for up to a second.
-fn own_accent(window: &AppWindow) {
+pub fn own_accent(window: &AppWindow) {
     slint::private_unstable_api::re_exports::WindowInner::from_pub(window.window())
         .context()
         .set_accent_color(ACCENT);
+}
+
+/// The title bar follows an explicit Light or Dark pick: Slint sets only its own palette, and on
+/// Windows the OS keeps drawing the caption in the system theme. A no-op before the window exists
+/// and under the testing backend.
+// shortcut: winit's window behind the pinned `slint =1.18.1` (`unstable-winit-030`); re-check it on
+// every Slint bump. A DWM call behind `oxi-platform` would not depend on it.
+pub fn caption_theme(window: &AppWindow, choice: ThemeChoice) {
+    use slint::winit_030::WinitWindowAccessor as _;
+    use slint::winit_030::winit::window::Theme as Caption;
+    let theme = match choice {
+        ThemeChoice::System => None,
+        ThemeChoice::Dark => Some(Caption::Dark),
+        ThemeChoice::Light => Some(Caption::Light),
+    };
+    window.window().with_winit_window(|w| w.set_theme(theme));
+}
+
+/// Makes every frame repaint and present the whole window. Skia's CPU surface otherwise presents
+/// only what changed and treats a paint message as nothing to do, so pixels the OS dropped never
+/// come back: the window is created see-through (winit's blur-behind), the desktop shows where
+/// they were and only hovered rows are drawn again (`os_lost_pixels_are_repainted`).
+// shortcut: Slint turns partial rendering off for a window with a rendering notifier, and offers no
+// direct switch; re-check it on every Slint bump. The software renderer has no notifier (`Err`) and
+// keeps partial rendering; it runs only when Skia cannot start.
+fn draw_whole_frames(window: &AppWindow) {
+    let _ = window.window().set_rendering_notifier(|_, _| {});
+}
+
+/// The OS "Animation effects" is off (UI rule 22).
+fn os_reduced_motion() -> bool {
+    oxi_platform::reduced_motion()
 }
 
 /// The settings window on `layout`'s config with no daemon link (it stays offline and shows no
@@ -225,6 +276,10 @@ fn open_inner(
 ) -> Result<AppWindow, Error> {
     let window = AppWindow::new()?;
     own_accent(&window);
+    draw_whole_frames(&window);
+    window
+        .global::<Shell>()
+        .set_reduced_motion(os_reduced_motion());
     let (mut ctx, problem) = Ctx::load(layout)?;
     let followed = link(&window)?;
     if let Some(ipc) = &followed {
@@ -235,6 +290,9 @@ fn open_inner(
     let weak = window.as_weak();
     let c = ctx.clone();
     window.on_theme_changed(move |choice| {
+        if let Some(window) = weak.upgrade() {
+            caption_theme(&window, choice);
+        }
         c.config.borrow_mut().config.ui.theme = theme(choice);
         report(&weak, c.save());
     });
@@ -278,6 +336,11 @@ fn open_inner(
         move || {
             if let Some(window) = weak.upgrade() {
                 own_accent(&window);
+                // Puts back a frame the OS lost with no paint message (see `draw_whole_frames`).
+                window.window().request_redraw();
+                window
+                    .global::<Shell>()
+                    .set_reduced_motion(os_reduced_motion());
                 reload(&window, &c, linked);
                 pages::poll(&window, &c);
             }
@@ -306,6 +369,7 @@ fn open_inner(
         }
     });
 
+    pages::test::bind(&window, &ctx);
     bind(&window, &ctx);
     Ok(window)
 }
@@ -382,9 +446,12 @@ const fn status(link: Link) -> DaemonStatus {
 fn bind(window: &AppWindow, ctx: &Ctx) {
     let file = ctx.config.borrow();
     window.set_theme(choice(file.config.ui.theme));
+    caption_theme(window, choice(file.config.ui.theme));
     window.global::<Shell>().set_locked(file.read_only);
     drop(file);
     pages::bind(window, ctx);
+    // Bound once in `open_inner`: its recording and run outlive a reload.
+    window.global::<TestState>().invoke_shown();
 }
 
 /// Outcome of a save or file action: a failure shows under the config banner, which stays with
@@ -429,6 +496,15 @@ mod tests {
     }
 
     #[test]
+    fn window_takes_reduced_motion_from_the_os() {
+        let (window, _ipc, _sent, _) = crate::testing::linked("lib", "motion", super::Page::Home);
+        assert_eq!(
+            window.global::<super::Shell>().get_reduced_motion(),
+            super::os_reduced_motion()
+        );
+    }
+
+    #[test]
     fn spawn_note_gives_the_kind_and_nothing_else() {
         let e = Error::new(ErrorKind::NotFound, r"C:\Users\someone\oxi.exe");
         assert_eq!(
@@ -440,12 +516,12 @@ mod tests {
     #[test]
     fn resets_leave_one_subscriber_per_page() {
         let (window, ipc, _sent, _) = crate::testing::linked("lib", "resets", super::Page::Hotkey);
-        // The banner, Home, Hotkey, Model and Overlay.
-        assert_eq!(ipc.subscribers(), 5);
+        // The banner, Home, Hotkey, Audio, Model, Overlay and Test.
+        assert_eq!(ipc.subscribers(), 7);
         for _ in 0..3 {
             window.invoke_reset_config();
         }
-        assert_eq!(ipc.subscribers(), 5);
+        assert_eq!(ipc.subscribers(), 7);
     }
 
     #[cfg(windows)]

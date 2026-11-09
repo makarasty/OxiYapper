@@ -26,6 +26,14 @@ pub const PILL_BAR_MAX: f32 = 0.5;
 pub const PILL_BAR_W: f32 = 0.065;
 pub const PILL_BAR_GAP: f32 = 0.05;
 
+/// Left edge of a status label `text_w` wide in a pill `pill_w` wide: its box centred on the
+/// pill, kept inside `min_x..=right` (after the icon, before the right padding) when the label is
+/// too wide to centre. All values in pixels.
+#[must_use]
+pub fn label_x(pill_w: f32, min_x: f32, right: f32, text_w: f32) -> f32 {
+    ((pill_w - text_w) / 2.0).min(right - text_w).max(min_x)
+}
+
 /// A rectangle in physical pixels of the virtual desktop; the origin is negative on a monitor
 /// left of or above the primary one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

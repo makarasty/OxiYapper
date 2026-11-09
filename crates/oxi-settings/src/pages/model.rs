@@ -1,6 +1,6 @@
-//! Model page: the curated models with their status on disk, download and cancel through the
-//! daemon (the page itself never touches the network), "use my own .bin", the GPU and the idle
-//! unload.
+//! Model page: the dictation language, the curated models with their status on disk, download
+//! and cancel through the daemon (the page itself never touches the network), "use my own .bin",
+//! the models folder and its partial downloads, the GPU and the unload.
 
 use std::cell::{Cell, RefCell};
 use std::fs;
@@ -8,30 +8,47 @@ use std::path::Path;
 use std::rc::{Rc, Weak as RcWeak};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
-use std::time::Duration;
+use std::time::SystemTime;
 
-use oxi_core::config::Config;
 use oxi_core::device::{Device, DeviceChoice};
 use oxi_core::ipc::{DownloadResult, Push, Request};
-use oxi_core::models::{self, MODELS, ModelEntry, ModelStatus};
+use oxi_core::languages::{self, LanguageInfo};
+use oxi_core::models::{self, MODELS, ModelEntry, ModelStatus, PartialDownload};
+use oxi_core::paths::PART_SUFFIX;
 use oxi_core::strings::{self, gb};
+use oxi_core::types::Language;
+use oxi_platform::fs::list_partials;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
-use crate::debounce::SaveDebounce;
-use crate::generated::{ModelRow, ModelState};
+use crate::constants::FOLDER_POLL;
+use crate::generated::{ModelRow, ModelState, Toast};
 use crate::ipc::{Event, Link, Subscription};
-use crate::{AppWindow, Ctx, Page, report};
+use crate::{AppWindow, Ctx, Error, Page, report};
 
 /// `[model] id` of "use my own .bin".
 const CUSTOM: &str = "custom";
-/// How often the page looks for the answer of a path check running on its worker.
-const POLL: Duration = Duration::from_millis(25);
+/// "Unload after idle" choices in picker order: `None` is right after a dictation
+/// (`unload_immediately`), `Some(0)` never, the rest minutes.
+const UNLOAD: [Option<u32>; 8] = [
+    None,
+    Some(1),
+    Some(5),
+    Some(10),
+    Some(15),
+    Some(30),
+    Some(60),
+    Some(0),
+];
+/// Why "Delete partial downloads" is off.
+const PARTIALS_NONE: &str = "No partial downloads";
+const PARTIALS_BUSY: &str = "Wait until the download stops";
 
 pub fn bind(window: &AppWindow, ctx: &Ctx) {
     let s = window.global::<ModelState>();
     let entries: Vec<&'static ModelEntry> = MODELS.iter().filter(|m| m.id != "tiny").collect();
     let dir = ctx.layout.models_dir();
-    let rows: Vec<ModelRow> = entries.iter().map(|e| row(e, &dir)).collect();
+    let now = SystemTime::now();
+    let rows: Vec<ModelRow> = entries.iter().map(|e| row(e, &dir, None, now)).collect();
     let (tx, rx) = channel();
     let page = Rc::new_cyclic(|me: &RcWeak<PageState>| PageState {
         me: me.clone(),
@@ -49,9 +66,13 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         ctx: ctx.clone(),
         entries,
         rows: Rc::new(VecModel::from(rows)),
+        partials: RefCell::new(Vec::new()),
         listed: RefCell::new(None),
         choices: RefCell::new(Vec::new()),
-        idle_save: SaveDebounce::new(window.as_weak(), ctx.clone()),
+        unloads: RefCell::new(Vec::new()),
+        // Not a pair the config can hold: the first `push_language` takes the config's.
+        slots: Cell::new([Language::AUTO; 2]),
+        found: RefCell::new(Vec::new()),
         checks: Checks {
             latest: Cell::new(0),
             running: Cell::new(0),
@@ -64,10 +85,17 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     s.set_can_browse(cfg!(windows));
     s.set_warning(SharedString::new());
     s.set_download_off(download_off(ctx.ipc.link()).into());
-    #[expect(clippy::cast_precision_loss, reason = "minutes are far below 2^24")]
-    s.set_default_idle_minutes(Config::default().model.idle_unload_minutes as f32);
+    page.refresh_rows();
     page.push_config(&s);
 
+    page.language_search("");
+
+    let p = Rc::clone(&page);
+    s.on_language_picked(move |i| p.language_picked(i));
+    let p = Rc::clone(&page);
+    s.on_language_search(move |text| p.language_search(&text));
+    let p = Rc::clone(&page);
+    s.on_language_chosen(move |i| p.language_chosen(i));
     let p = Rc::clone(&page);
     s.on_shown(move || p.shown());
     let p = Rc::clone(&page);
@@ -81,9 +109,13 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     let p = Rc::clone(&page);
     s.on_browse(move || p.browse());
     let p = Rc::clone(&page);
+    s.on_open_folder(move || p.open_folder());
+    let p = Rc::clone(&page);
+    s.on_delete_partials(move || p.delete_partials());
+    let p = Rc::clone(&page);
     s.on_gpu_picked(move |i| p.gpu_picked(i));
     let p = Rc::clone(&page);
-    s.on_idle_changed(move |v| p.idle_changed(v));
+    s.on_unload_picked(move |i| p.unload_picked(i));
 
     // Reset to defaults rebinds while the page may be open; its `init` does not run again.
     if window.get_page() == Page::Model {
@@ -99,12 +131,18 @@ struct PageState {
     /// The registry models the page offers, in row order.
     entries: Vec<&'static ModelEntry>,
     rows: Rc<VecModel<ModelRow>>,
+    /// The `.part` files of the models folder as last read.
+    partials: RefCell<Vec<PartialDownload>>,
     /// The daemon's GPU list; `None` until it answers `ListDevices`.
     listed: RefCell<Option<Vec<Device>>>,
     /// What each GPU picker row writes.
     choices: RefCell<Vec<DeviceChoice>>,
-    /// The idle slider saves once it rests.
-    idle_save: SaveDebounce,
+    /// What each unload picker row writes, as in [`UNLOAD`].
+    unloads: RefCell<Vec<Option<u32>>>,
+    /// The two language segments as shown, see [`languages::slots`].
+    slots: Cell<[Language; 2]>,
+    /// The rows of the language popup: what the search matched.
+    found: RefCell<Vec<&'static LanguageInfo>>,
     checks: Checks,
 }
 
@@ -159,12 +197,94 @@ impl PageState {
         };
         s.set_selected(selected.map_or(-1, int));
         s.set_custom_path(model.custom_path.as_str().into());
-        #[expect(clippy::cast_precision_loss, reason = "minutes are far below 2^24")]
-        s.set_idle_minutes(model.idle_unload_minutes as f32);
+        let unload = (!model.unload_immediately).then_some(model.idle_unload_minutes);
         let path = model.custom_path.clone();
         drop(file);
+        let (labels, values) = unload_rows(unload);
+        s.set_unload_options(ModelRc::from(Rc::new(VecModel::from(labels))));
+        s.set_unload(values.iter().position(|v| *v == unload).map_or(0, int));
+        *self.unloads.borrow_mut() = values;
         self.check_custom(&path, false);
         self.push_gpus(s);
+        self.push_language(s);
+    }
+
+    /// The language segments and which of them is on.
+    fn push_language(&self, s: &ModelState<'_>) {
+        let (current, recent) = {
+            let file = self.ctx.config.borrow();
+            (
+                file.config.model.language,
+                file.config.model.recent_languages,
+            )
+        };
+        let slots = languages::slots(self.slots.get(), current, recent);
+        self.slots.set(slots);
+        let strings = |f: fn(Language) -> SharedString| {
+            ModelRc::from(Rc::new(VecModel::from(slots.map(f).to_vec())))
+        };
+        s.set_language_codes(strings(|l| l.as_str().to_uppercase().into()));
+        s.set_language_names(strings(|l| l.info().map_or("", |i| i.english).into()));
+        s.set_language(slots.iter().position(|l| *l == current).map_or(2, int));
+        s.set_language_row(self.language_row(current));
+    }
+
+    fn language_row(&self, current: Language) -> i32 {
+        let found = self.found.borrow();
+        found
+            .iter()
+            .position(|i| i.code == current.as_str())
+            .map_or(-1, int)
+    }
+
+    /// A segment: 0 and 1 the two languages shown, anything else Auto.
+    fn language_picked(&self, i: i32) {
+        let slot = usize::try_from(i)
+            .ok()
+            .and_then(|i| self.slots.get().get(i).copied());
+        self.use_language(slot.unwrap_or(Language::AUTO));
+    }
+
+    fn language_search(&self, query: &str) {
+        let found = languages::search(query);
+        let column = |f: fn(&LanguageInfo) -> &str| {
+            let rows: Vec<SharedString> = found.iter().map(|i| f(i).into()).collect();
+            ModelRc::from(Rc::new(VecModel::from(rows)))
+        };
+        let (rows, native) = (column(|i| i.english), column(|i| i.native));
+        *self.found.borrow_mut() = found;
+        let current = self.ctx.config.borrow().config.model.language;
+        self.state(|s| {
+            s.set_language_rows(rows);
+            s.set_language_native(native);
+            s.set_language_row(self.language_row(current));
+        });
+    }
+
+    /// A row of the popup.
+    fn language_chosen(&self, i: i32) {
+        let found = usize::try_from(i)
+            .ok()
+            .and_then(|i| self.found.borrow().get(i).copied());
+        if let Some(lang) = found.and_then(|info| info.code.parse().ok()) {
+            self.use_language(lang);
+        }
+    }
+
+    fn use_language(&self, lang: Language) {
+        {
+            let mut file = self.ctx.config.borrow_mut();
+            let model = &mut file.config.model;
+            // One set by hand is not in `recent_languages`: it enters now, as the one just used,
+            // so the pick that replaces it does not lose it.
+            let before = model.language;
+            if before != Language::AUTO && !model.recent_languages.contains(&before) {
+                model.use_language(before);
+            }
+            model.use_language(lang);
+        }
+        self.state(|s| self.push_language(s));
+        report(&self.window, self.ctx.save());
     }
 
     fn push_gpus(&self, s: &ModelState<'_>) {
@@ -185,6 +305,25 @@ impl PageState {
 
     fn index_of(&self, id: &str) -> Option<usize> {
         self.entries.iter().position(|e| e.id == id)
+    }
+
+    fn downloading(&self) -> bool {
+        self.rows.iter().any(|r| r.downloading)
+    }
+
+    /// Whether a `.part` may be written now: a download this page heard of, or a link that does
+    /// not say the daemon is gone (Connecting, Busy, Mismatch, Stuck and the rest may still be
+    /// writing). Only Online, where the daemon reports its downloads, and Offline, with no
+    /// daemon, are sure.
+    fn may_be_writing(&self) -> bool {
+        self.downloading() || !matches!(self.ctx.ipc.link(), Link::Online | Link::Offline)
+    }
+
+    fn stop_downloading(&self) {
+        for i in 0..self.rows.row_count() {
+            self.update(i, |r| r.downloading = false);
+        }
+        self.refresh_rows();
     }
 
     fn picked(&self, i: i32) {
@@ -214,11 +353,11 @@ impl PageState {
         self.update(i, |r| {
             r.downloading = true;
             r.progress = 0.0;
-            r.status = strings::model_hint(entry.id).into();
             r.progress_text = strings::download_progress(0, entry.size).into();
             r.badge = strings::MODEL_BADGE_DOWNLOADING.into();
             r.error = SharedString::new();
         });
+        self.push_partials();
     }
 
     /// The row stays in "downloading" until the daemon's `DownloadDone` says it stopped.
@@ -271,11 +410,13 @@ impl PageState {
             });
         });
         let me = self.me.clone();
-        self.checks.timer.start(TimerMode::Repeated, POLL, move || {
-            if let Some(page) = me.upgrade() {
-                page.poll();
-            }
-        });
+        self.checks
+            .timer
+            .start(TimerMode::Repeated, FOLDER_POLL, move || {
+                if let Some(page) = me.upgrade() {
+                    page.poll();
+                }
+            });
     }
 
     fn poll(&self) {
@@ -323,6 +464,38 @@ impl PageState {
     #[cfg(not(windows))]
     fn browse(&self) {}
 
+    /// Opens the models folder, made first when nothing was downloaded yet.
+    fn open_folder(&self) {
+        let dir = self.ctx.layout.models_dir();
+        let opened = fs::create_dir_all(&dir).and_then(|()| oxi_platform::open::open(&dir));
+        report(&self.window, opened.map_err(Error::from));
+    }
+
+    /// Removes every `.part` of the models folder; off while a download may write one.
+    /// shortcut: "downloading" is what this page has heard. The daemon replays every active
+    /// download when the link comes Online (even one with no bytes yet), so a reopen is exposed
+    /// only until that replay; ask the daemon if that gap ever matters.
+    fn delete_partials(&self) {
+        if self.may_be_writing() {
+            return;
+        }
+        let dir = self.ctx.layout.models_dir();
+        let (mut freed, mut failed) = (0, None);
+        for part in list_partials(&dir).unwrap_or_default() {
+            match fs::remove_file(dir.join(format!("{}{PART_SUFFIX}", part.file_name))) {
+                Ok(()) => freed += part.size,
+                Err(e) => failed = Some(e),
+            }
+        }
+        self.refresh_rows();
+        if let Some(e) = failed {
+            report(&self.window, Err(Error::from(e)));
+        } else if let Some(window) = self.window.upgrade() {
+            let note = format!("Deleted {} of partial downloads", size(freed));
+            window.global::<Toast>().invoke_show(note.into());
+        }
+    }
+
     fn gpu_picked(&self, i: i32) {
         let choice = usize::try_from(i)
             .ok()
@@ -330,23 +503,26 @@ impl PageState {
         if let Some(choice) = choice {
             self.ctx.config.borrow_mut().config.model.gpu = choice;
             report(&self.window, self.ctx.save());
+            self.refresh_rows();
         }
     }
 
-    fn idle_changed(&self, minutes: f32) {
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "the slider runs 0..60"
-        )]
-        let minutes = minutes.round().max(0.0) as u32;
-        self.ctx
-            .config
-            .borrow_mut()
-            .config
-            .model
-            .idle_unload_minutes = minutes;
-        self.idle_save.touch();
+    fn unload_picked(&self, i: i32) {
+        let Some(choice) = usize::try_from(i)
+            .ok()
+            .and_then(|i| self.unloads.borrow().get(i).copied())
+        else {
+            return;
+        };
+        let mut file = self.ctx.config.borrow_mut();
+        let model = &mut file.config.model;
+        model.unload_immediately = choice.is_none();
+        // "Right after dictation" keeps the minutes, so picking a time later starts from them.
+        if let Some(minutes) = choice {
+            model.idle_unload_minutes = minutes;
+        }
+        drop(file);
+        report(&self.window, self.ctx.save());
     }
 
     fn event(&self, event: &Event) {
@@ -354,30 +530,40 @@ impl PageState {
             self.state(|s| s.set_download_off(download_off(*link).into()));
         }
         match event {
-            Event::Link(Link::Online) => self.ask(),
-            // A lost daemon takes its downloads with it.
-            Event::Link(_) => {
-                for i in 0..self.rows.row_count() {
-                    self.update(i, |r| r.downloading = false);
-                }
-                self.refresh_rows();
+            // The daemon replays its active downloads right after this, so a flag left from an
+            // older daemon (one that died while the link was Stuck) goes now.
+            Event::Link(Link::Online) => {
+                self.stop_downloading();
+                self.ask();
             }
+            // No daemon: nothing downloads or writes.
+            Event::Link(Link::Offline) => self.stop_downloading(),
+            // Connecting, Busy, Mismatch, Stuck: the daemon may still be writing, so the flags
+            // stay and Delete goes off with the link.
+            Event::Link(_) => self.push_partials(),
             Event::Push(Push::Devices { gpus, .. }) => {
                 *self.listed.borrow_mut() = Some(gpus.clone());
                 self.state(|s| self.push_gpus(s));
+                self.refresh_rows();
             }
             Event::Push(Push::Status { warnings, .. }) => {
-                self.state(|s| s.set_warning(warnings.join("\n").into()));
+                // The sound lines are the Audio page's (audio::sound_warning).
+                let ours: Vec<&str> = warnings
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|l| !l.starts_with("sounds."))
+                    .collect();
+                self.state(|s| s.set_warning(ours.join("\n").into()));
             }
             Event::Push(Push::DownloadProgress { id, done, total }) => {
                 if let Some(i) = self.index_of(id) {
                     self.update(i, |r| {
                         r.downloading = true;
                         r.progress = fraction(*done, *total);
-                        r.status = strings::model_hint(id).into();
                         r.progress_text = strings::download_progress(*done, *total).into();
                         r.badge = strings::MODEL_BADGE_DOWNLOADING.into();
                     });
+                    self.push_partials();
                 }
             }
             Event::Push(Push::DownloadDone { id, result }) => {
@@ -398,35 +584,93 @@ impl PageState {
         }
     }
 
-    /// Status text of the rows not downloading, from the files.
+    /// Every row's state from the files (a downloading row keeps its own), its weight warning
+    /// for the GPU picked, and the partial downloads.
     fn refresh_rows(&self) {
         let dir = self.ctx.layout.models_dir();
+        // A folder that cannot be listed shows the rows without their partial details.
+        let partials = list_partials(&dir).unwrap_or_default();
+        let now = SystemTime::now();
+        let gpu = self.ctx.config.borrow().config.model.gpu.clone();
+        let listed = self.listed.borrow();
         for (i, entry) in self.entries.iter().enumerate() {
+            let part = partials.iter().find(|p| p.file_name == entry.file_name);
             self.update(i, |r| {
+                r.heavy = models::too_heavy(entry, listed.as_deref(), &gpu);
                 if !r.downloading {
-                    let fresh = row(entry, &dir);
-                    r.status = fresh.status;
+                    let fresh = row(entry, &dir, part, now);
+                    r.detail = fresh.detail;
                     r.badge = fresh.badge;
                     r.ready = fresh.ready;
                     r.can_download = fresh.can_download;
+                    r.paused = fresh.paused;
                 }
             });
         }
+        drop(listed);
+        *self.partials.borrow_mut() = partials;
+        self.push_partials();
+    }
+
+    /// The "Delete partial downloads" button: off with nothing to delete or while a download
+    /// writes its `.part`; its tooltip says how much it frees.
+    fn push_partials(&self) {
+        let partials = self.partials.borrow();
+        let off = if partials.is_empty() {
+            PARTIALS_NONE
+        } else if self.may_be_writing() {
+            PARTIALS_BUSY
+        } else {
+            ""
+        };
+        let bytes = partials.iter().map(|p| p.size).sum();
+        let files = match partials.len() {
+            1 => "1 file".to_owned(),
+            n => format!("{n} files"),
+        };
+        let tip = format!("{} in {files}", size(bytes));
+        self.state(|s| {
+            s.set_partials_off(off.into());
+            s.set_partials(tip.into());
+        });
     }
 }
 
-fn row(entry: &ModelEntry, dir: &Path) -> ModelRow {
+/// Decimal MB below a gigabyte, so a small `.part` is not "0.0 GB"; `gb` from there.
+fn size(bytes: u64) -> String {
+    if bytes < 1_000_000_000 {
+        format!("{} MB", bytes / 1_000_000)
+    } else {
+        gb(bytes)
+    }
+}
+
+/// A row from the files; `part` is the model's `.part` as listed, for the paused caption.
+fn row(
+    entry: &ModelEntry,
+    dir: &Path,
+    part: Option<&PartialDownload>,
+    now: SystemTime,
+) -> ModelRow {
     let status = models::status(entry, dir);
+    // What to do about a state the badge only names takes the place of the hint.
+    let note = match strings::model_status(status) {
+        "" => strings::model_hint(entry.id),
+        todo => todo,
+    };
+    let detail = match part.filter(|_| status == ModelStatus::Partial) {
+        Some(part) => format!(
+            "{} · {}",
+            strings::download_progress(part.size, entry.size),
+            kept(models::days_kept(part.remove_at, now))
+        ),
+        None if note.is_empty() => gb(entry.size),
+        None => format!("{} · {note}", gb(entry.size)),
+    };
     ModelRow {
         id: entry.id.into(),
         name: entry.display_name.into(),
-        size: gb(entry.size).into(),
-        // What to do about a state the badge only names takes the place of the hint.
-        status: match strings::model_status(status) {
-            "" => strings::model_hint(entry.id),
-            todo => todo,
-        }
-        .into(),
+        detail: detail.into(),
         progress_text: SharedString::new(),
         badge: strings::model_badge(status).into(),
         ready: matches!(status, ModelStatus::Ready | ModelStatus::NeedsHash),
@@ -434,10 +678,43 @@ fn row(entry: &ModelEntry, dir: &Path) -> ModelRow {
             status,
             ModelStatus::Missing | ModelStatus::Partial | ModelStatus::Bad
         ),
+        paused: status == ModelStatus::Partial,
         downloading: false,
         progress: 0.0,
         error: SharedString::new(),
+        heavy: false,
     }
+}
+
+/// How long a paused download stays: "kept 7 more days", or gone at the next start.
+fn kept(days: u64) -> String {
+    match days {
+        0 => "removed at the next start".to_owned(),
+        1 => "kept 1 more day".to_owned(),
+        n => format!("kept {n} more days"),
+    }
+}
+
+/// Unload picker labels and what each writes: [`UNLOAD`], with the configured minutes added in
+/// order when they are not one of them (an older slider value), so they stay picked.
+fn unload_rows(current: Option<u32>) -> (Vec<SharedString>, Vec<Option<u32>>) {
+    let mut values = UNLOAD.to_vec();
+    if !values.contains(&current) {
+        let at = values
+            .iter()
+            .position(|v| v.is_some_and(|m| m == 0 || current.is_some_and(|c| m > c)))
+            .unwrap_or(values.len());
+        values.insert(at, current);
+    }
+    let labels = values
+        .iter()
+        .map(|v| match v {
+            None => SharedString::from("Right after dictation"),
+            Some(0) => SharedString::from("Never"),
+            Some(m) => format!("After {m} min").into(),
+        })
+        .collect();
+    (labels, values)
 }
 
 /// Why Download is off on `link`; empty while it is on.
@@ -499,7 +776,7 @@ fn custom_problem(path: &str) -> Option<&'static str> {
     }
 }
 
-/// Picker labels and what each writes: Auto, CPU, the listed GPUs, then the configured GPU
+/// Picker labels and what each writes: Auto, CPU, the listed GPUs by their display name, then the configured GPU
 /// when it is not listed, so it stays picked. Before the daemon answers (`listed` is `None`) a
 /// configured name is not called missing.
 fn gpu_rows(
@@ -511,12 +788,10 @@ fn gpu_rows(
         ("CPU".to_owned(), DeviceChoice::Cpu),
     ];
     for d in listed.unwrap_or_default() {
-        let label = if d.description.is_empty() {
-            d.name.clone()
-        } else {
-            format!("{} · {}", d.name, d.description)
-        };
-        rows.push((label, DeviceChoice::Named(d.name.clone())));
+        rows.push((
+            d.display_name().to_owned(),
+            DeviceChoice::Named(d.name.clone()),
+        ));
     }
     if let DeviceChoice::Named(name) = current
         && !rows.iter().any(|(_, c)| c == current)
@@ -550,6 +825,7 @@ mod tests {
     }
 
     use std::sync::mpsc::Receiver;
+    use std::time::Duration;
 
     use i_slint_backend_testing::{AccessibleRole, ElementHandle, mock_elapsed_time};
     use oxi_core::config::ConfigFile;
@@ -559,7 +835,7 @@ mod tests {
 
     use super::*;
     use crate::ipc::{Cmd, Ipc};
-    use crate::testing::{has, linked, with_role};
+    use crate::testing::{has, linked, spots, with_role};
 
     /// The settings window on a fresh config dir and a fake daemon link, on the Model page.
     fn window(name: &str) -> (AppWindow, Ipc, Receiver<Cmd>, Layout) {
@@ -573,7 +849,7 @@ mod tests {
     /// `ready`.
     fn wait_for(ready: impl Fn() -> bool) {
         for _ in 0..400 {
-            mock_elapsed_time(POLL);
+            mock_elapsed_time(FOLDER_POLL);
             if ready() {
                 return;
             }
@@ -638,8 +914,6 @@ mod tests {
         push(&ipc, progress("large-v3", 1_000_000_000, 4_000_000_000));
         assert_eq!(bar(&window).as_deref(), Some("0.25"));
         assert!(has(&window, "1.0 of 4.0 GB"), "progress beside the bar");
-        // The badge says "Downloading"; the caption keeps size and hint, nothing of the progress.
-        assert!(has(&window, "3.1 GB · slower, more accurate"));
         push(&ipc, progress("large-v3", 3_000_000_000, 4_000_000_000));
         assert_eq!(bar(&window).as_deref(), Some("0.75"));
         // Another model's progress leaves this bar alone.
@@ -657,19 +931,156 @@ mod tests {
             message: message.into(),
         };
         push(&ipc, done("large-v3", failed));
-        // The text is labelled with the model it belongs to.
-        assert!(has(
-            &window,
-            &format!("Whisper large-v3: Download failed: {message}")
-        ));
+        // The text is the "!" of the card, so the card does not grow.
+        let text = strings::download_failed(message);
+        assert!(has(&window, &text));
         assert_eq!(bar(&window), None);
         assert!(has(&window, "Whisper large-v3: Not downloaded"));
         // Trying again clears the old error.
         download_large(&window);
-        assert!(!has(
-            &window,
-            &format!("Whisper large-v3: Download failed: {message}")
-        ));
+        assert!(!has(&window, &text));
+    }
+
+    /// UI rule 1's check: whatever both snapshots have keeps its y and height. Only widths may
+    /// change: a badge or button with another text is wider or narrower.
+    fn assert_rows_kept(
+        before: Vec<(String, Option<AccessibleRole>, [f32; 4])>,
+    ) -> impl Fn(&AppWindow) {
+        move |window| {
+            let after = spots(window);
+            let mut compared = 0;
+            for (label, role, [_, y, _, h]) in &before {
+                let same: Vec<_> = after
+                    .iter()
+                    .filter(|a| &a.0 == label && &a.1 == role)
+                    .map(|a| (a.2[1], a.2[3]))
+                    .collect();
+                if same.is_empty() {
+                    continue;
+                }
+                compared += 1;
+                assert!(
+                    same.contains(&(*y, *h)),
+                    "{label} moved: y, h {y}, {h} is now {same:?}"
+                );
+            }
+            assert!(compared > 3, "only {compared} elements compared");
+        }
+    }
+
+    /// UI rule 1: a card keeps its height and the cards after it keep their place in every state.
+    #[test]
+    fn a_card_keeps_its_place_in_every_state() {
+        let (window, ipc, _sent, layout) = window("states");
+        // Picked and not on disk: the "!" of the card warns, the card keeps its height.
+        radio(&window, "Whisper large-v3").invoke_accessible_default_action();
+        assert!(has(&window, NOT_ON_DISK));
+        let kept = assert_rows_kept(spots(&window));
+        push(&ipc, progress("large-v3", 5, 10));
+        assert!(bar(&window).is_some());
+        kept(&window);
+        let failed = DownloadResult::Failed {
+            message: "connection reset".into(),
+        };
+        push(&ipc, done("large-v3", failed));
+        kept(&window);
+        fs::create_dir_all(layout.models_dir()).unwrap();
+        fs::write(layout.models_dir().join("ggml-large-v3.bin.part"), b"half").unwrap();
+        push(&ipc, done("large-v3", DownloadResult::Cancelled));
+        assert!(has(&window, "Whisper large-v3: Paused"));
+        kept(&window);
+    }
+
+    fn radio(window: &AppWindow, label: &str) -> ElementHandle {
+        with_role(window, label, AccessibleRole::RadioButton)
+    }
+
+    const NOT_ON_DISK: &str = "Dictation will not start until this is downloaded.";
+    const SLOW: &str =
+        "Likely slow without a dedicated graphics card. Whisper large-v3 turbo is faster.";
+
+    fn gpus(ipc: &Ipc, gpus: &[(&str, bool)]) {
+        let gpus = gpus
+            .iter()
+            .map(|(name, uma)| Device {
+                name: (*name).into(),
+                description: String::new(),
+                uma: *uma,
+            })
+            .collect();
+        push(
+            ipc,
+            Push::Devices {
+                mics: Vec::new(),
+                gpus,
+            },
+        );
+    }
+
+    #[test]
+    fn heavy_models_warn_without_a_dedicated_gpu_and_still_download() {
+        let (window, ipc, sent, _) = window("heavy");
+        // No answer from the daemon yet: no warning.
+        assert!(!has(&window, SLOW));
+        gpus(&ipc, &[("Vulkan0", true)]);
+        // Both 3.1 GB models warn, turbo does not.
+        let warned = ElementHandle::find_by_accessible_label(&window, SLOW).count();
+        assert_eq!(warned, 2);
+        let _ = requests(&sent);
+        download_large(&window);
+        let want = Request::DownloadModel {
+            id: "large-v3".into(),
+        };
+        assert_eq!(requests(&sent), [want], "the warning blocked the download");
+        // A picked model not on disk says both.
+        radio(&window, "Whisper large-v3 Russian").invoke_accessible_default_action();
+        assert!(has(&window, &format!("{NOT_ON_DISK}\n{SLOW}")));
+        gpus(&ipc, &[("Vulkan0", false), ("Vulkan1", true)]);
+        assert!(!has(&window, SLOW) && !has(&window, &format!("{NOT_ON_DISK}\n{SLOW}")));
+        // The CPU picked: slow again.
+        window.global::<ModelState>().invoke_gpu_picked(1);
+        assert!(has(&window, &format!("{NOT_ON_DISK}\n{SLOW}")));
+    }
+
+    #[test]
+    fn partial_downloads_are_listed_and_deleted() {
+        let (window, ipc, _sent, layout) = window("partials");
+        let s = window.global::<ModelState>();
+        assert_eq!(s.get_partials_off(), PARTIALS_NONE);
+        let dir = layout.models_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("ggml-large-v3.bin.part");
+        let other = dir.join("old-model.bin.part");
+        fs::write(&part, vec![0; 1000]).unwrap();
+        fs::write(&other, b"x").unwrap();
+        s.invoke_shown();
+        assert_eq!(s.get_partials_off(), "");
+        assert_eq!(s.get_partials(), "0 MB in 2 files");
+        assert_eq!(size(3_000_000), "3 MB");
+        assert_eq!(size(1_600_000_000), "1.6 GB");
+        assert!(has(&window, "1 MB of 3.1 GB · kept 7 more days"));
+        // A running download writes its `.part`: the button waits.
+        push(&ipc, progress("turbo", 5, 10));
+        assert_eq!(s.get_partials_off(), PARTIALS_BUSY);
+        s.invoke_delete_partials();
+        assert!(part.exists(), "deleted during a download");
+        push(&ipc, done("turbo", DownloadResult::Cancelled));
+        assert_eq!(s.get_partials_off(), "");
+        s.invoke_delete_partials();
+        assert!(!part.exists() && !other.exists());
+        assert_eq!(s.get_partials_off(), PARTIALS_NONE);
+        assert!(has(&window, "Whisper large-v3: Not downloaded"));
+        assert_eq!(
+            window.global::<Toast>().get_text(),
+            "Deleted 0 MB of partial downloads"
+        );
+    }
+
+    #[test]
+    fn kept_days_read_as_words() {
+        assert_eq!(kept(7), "kept 7 more days");
+        assert_eq!(kept(1), "kept 1 more day");
+        assert_eq!(kept(0), "removed at the next start");
     }
 
     #[test]
@@ -691,10 +1102,11 @@ mod tests {
         fs::create_dir_all(layout.models_dir()).unwrap();
         fs::write(layout.models_dir().join("ggml-large-v3.bin.part"), b"half").unwrap();
         push(&ipc, done("large-v3", DownloadResult::Cancelled));
-        assert!(has(&window, "3.1 GB · resumes where it stopped"));
+        // How much is there and how long it stays.
+        assert!(has(&window, "1 MB of 3.1 GB · kept 7 more days"));
         // A model with no `.part` stays "Not downloaded".
         assert!(has(&window, "Whisper large-v3 turbo: Not downloaded"));
-        with_role(&window, "Download Whisper large-v3", AccessibleRole::Button);
+        with_role(&window, "Resume Whisper large-v3", AccessibleRole::Button);
     }
 
     #[test]
@@ -715,24 +1127,63 @@ mod tests {
         field.set_accessible_value(good.to_string_lossy().into_owned());
         field.set_accessible_value("notes.txt".to_owned());
         for _ in 0..20 {
-            mock_elapsed_time(POLL);
+            mock_elapsed_time(FOLDER_POLL);
             thread::sleep(Duration::from_millis(10));
         }
         assert!(has(&window, "The model file must end in .bin"));
         assert!(!layout.config_file().exists(), "the old answer was saved");
     }
 
-    #[test]
-    fn idle_slider_saves_once_it_rests() {
-        let (window, _ipc, _sent, layout) = window("idle");
-        let s = window.global::<ModelState>();
-        s.invoke_idle_changed(12.0);
-        s.invoke_idle_changed(30.0);
-        assert!(!layout.config_file().exists(), "saved during the drag");
-        mock_elapsed_time(Duration::from_millis(350));
+    fn saved_model(layout: &Layout) -> oxi_core::config::Model {
         let text = fs::read_to_string(layout.config_file()).unwrap();
-        let file = ConfigFile::parse(&text).unwrap();
-        assert_eq!(file.config.model.idle_unload_minutes, 30);
+        ConfigFile::parse(&text).unwrap().config.model
+    }
+
+    #[test]
+    fn unload_picker_saves_right_away_minutes_and_never() {
+        let (window, _ipc, _sent, layout) = window("unload");
+        let s = window.global::<ModelState>();
+        let labels: Vec<SharedString> = s.get_unload_options().iter().collect();
+        let want = [
+            "Right after dictation",
+            "After 1 min",
+            "After 5 min",
+            "After 10 min",
+            "After 15 min",
+            "After 30 min",
+            "After 60 min",
+            "Never",
+        ];
+        assert_eq!(labels, want);
+        assert_eq!(s.get_unload(), 2, "the default 5 min");
+        s.invoke_unload_picked(0);
+        let saved = saved_model(&layout);
+        assert!(saved.unload_immediately);
+        assert_eq!(saved.idle_unload_minutes, 5, "the minutes are kept");
+        s.invoke_unload_picked(5);
+        let saved = saved_model(&layout);
+        assert_eq!(
+            (saved.unload_immediately, saved.idle_unload_minutes),
+            (false, 30)
+        );
+        s.invoke_unload_picked(7);
+        let saved = saved_model(&layout);
+        assert_eq!(
+            (saved.unload_immediately, saved.idle_unload_minutes),
+            (false, 0)
+        );
+    }
+
+    #[test]
+    fn unload_rows_keep_an_older_value() {
+        let (labels, values) = unload_rows(Some(12));
+        assert_eq!(labels[4], "After 12 min");
+        assert_eq!(values[3..6], [Some(10), Some(12), Some(15)]);
+        let (labels, _) = unload_rows(Some(90));
+        assert_eq!(labels[7..], ["After 90 min", "Never"]);
+        for current in [None, Some(0), Some(5)] {
+            assert_eq!(unload_rows(current).1, UNLOAD, "{current:?}");
+        }
     }
 
     #[test]
@@ -785,11 +1236,12 @@ mod tests {
         );
         let s = window.global::<ModelState>();
         let rows: Vec<SharedString> = s.get_gpus().iter().collect();
+        // The marketing names (UI rule 30); the ggml name stays the config key.
         let want = [
             "Auto",
             "CPU",
-            "Vulkan0 · NVIDIA GeForce RTX 4070 SUPER",
-            "Vulkan1 · AMD Radeon(TM) Graphics",
+            "NVIDIA GeForce RTX 4070 SUPER",
+            "AMD Radeon(TM) Graphics",
         ];
         assert_eq!(rows, want);
         s.invoke_gpu_picked(3);
@@ -810,9 +1262,13 @@ mod tests {
             model: "turbo".into(),
             device: DeviceChoice::Auto,
             backend: "cpu".into(),
-            warnings: vec![note.clone()],
+            warnings: vec![note.clone(), "sounds.start: empty, using rise".into()],
         };
         push(&ipc, status);
+        // On the Settings sub-tab, beside the GPU; a hidden sub-tab shows nothing.
+        assert!(!has(&window, &note));
+        with_role(&window, "Settings", AccessibleRole::Tab).invoke_accessible_default_action();
+        // The note alone (an exact label): the sound line is the Audio page's.
         assert!(has(&window, &note));
     }
 

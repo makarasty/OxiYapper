@@ -1,85 +1,278 @@
-// About page: logo, name, version and licence, the project links and the "Made with Slint" badge
-// (SPEC Settings UI).
+// About page: the hero with the project links, what the app is built with, the author and the
+// "Made with Slint" badge (SPEC Settings UI). The browser opens every link; the app makes no request.
 import { AboutSlint } from "std-widgets.slint";
-import { Theme, Icons, Caption, Group, Card, ClickCard, Row } from "../theme/index.slint";
+import { Theme, Icons, Caption, Group, Card, ClickCard, Button } from "../theme/index.slint";
+
+struct Tech {
+    name: string,
+    note: string,
+    mark: image,
+    url: string,
+}
+
+// A project the app is built with: a whole-card link. `short` drops the note where it would be cut.
+component TechCard inherits ClickCard {
+    in property <string> name;
+    in property <string> note;
+    in property <image> mark;
+    in property <bool> short;
+    accessible-label: root.name;
+    accessible-description: root.note;
+    border-color: root.hover ? Theme.stroke-control : Theme.stroke-card;
+    HorizontalLayout {
+        spacing: Theme.space-3;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: root.short ? Theme.icon-size : Theme.control-height;
+                height: self.width;
+                border-radius: Theme.radius-control;
+                // The short tile's square is no bigger than the mark: no tint to crowd it.
+                background: root.short ? transparent : Theme.accent-tint;
+                Image {
+                    source: root.mark;
+                    width: Theme.icon-size;
+                    height: Theme.icon-size;
+                    colorize: Theme.accent-text;
+                    accessible-role: none;
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: Theme.title-gap;
+            horizontal-stretch: 1;
+            Text {
+                text: root.name;
+                font-size: Theme.body-size;
+                color: Theme.text-primary;
+                overflow: elide;
+                accessible-role: none;
+            }
+            if !root.short: Caption {
+                text: root.note;
+                overflow: elide;
+                accessible-role: none;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Image {
+                source: Icons.open-16;
+                width: Theme.icon-size-small;
+                height: Theme.icon-size-small;
+                colorize: root.hover ? Theme.accent-text : Theme.text-secondary;
+                accessible-role: none;
+            }
+        }
+    }
+}
+
+component AuthorCard inherits Card {
+    callback open(string);
+    HorizontalLayout {
+        spacing: Theme.icon-gap;
+        Rectangle {
+            width: Theme.about-logo-size;
+            height: Theme.about-logo-size;
+            border-radius: Theme.radius-round;
+            clip: true;
+            Image {
+                source: Icons.avatar;
+                width: 100%;
+                height: 100%;
+                image-fit: cover;
+                accessible-role: none;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: Theme.title-gap;
+            horizontal-stretch: 1;
+            preferred-width: 0;
+            Text {
+                text: "makarasty";
+                font-size: Theme.body-size;
+                font-weight: Theme.weight-strong;
+                color: Theme.text-primary;
+            }
+            Caption {
+                text: @tr("Issues and ideas welcome");
+                wrap: word-wrap;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Button {
+                text: "github.com/makarasty";
+                icon: Icons.github-mark;
+                clicked => {
+                    root.open("https://github.com/makarasty");
+                }
+            }
+        }
+    }
+}
 
 export component AboutPage inherits VerticalLayout {
     in property <string> app-name;
     in property <string> version;
     in property <string> licence;
     in property <string> repository;
+    // The column's height under the page title (banners already taken off).
+    in property <length> free-height;
+    function open(url: string) {
+        Platform.open-url(url);
+    }
+    property <[Tech]> techs: [
+        { name: "Rust", note: @tr("The whole app"), mark: Icons.rust-mark, url: "https://github.com/rust-lang/rust" },
+        { name: "Slint", note: @tr("This settings window"), mark: Icons.slint-mark, url: "https://github.com/slint-ui/slint" },
+        { name: "whisper.cpp", note: @tr("Speech recognition"), mark: Icons.person-voice, url: "https://github.com/ggml-org/whisper.cpp" },
+        { name: "whisper-rs", note: @tr("Rust bindings"), mark: Icons.plug-connected, url: "https://codeberg.org/tazz4843/whisper-rs" },
+        { name: "nnnoiseless", note: @tr("Noise suppression"), mark: Icons.sound-wave-circle, url: "https://github.com/jneem/nnnoiseless" },
+        { name: "cpal", note: @tr("Microphone capture"), mark: Icons.mic, url: "https://github.com/RustAudio/cpal" },
+        { name: "Fluent UI icons", note: @tr("Every icon in the app"), mark: Icons.icons, url: "https://github.com/microsoft/fluentui-system-icons" },
+        { name: "Claude Code", note: @tr("Pair programming"), mark: Icons.code, url: "https://github.com/anthropics/claude-code" },
+        { name: "tiny-skia", note: @tr("Draws the overlay pill"), mark: Icons.paint-brush, url: "https://github.com/RazrFalcon/tiny-skia" },
+    ];
+    property <int> columns: 3;
+    property <int> rows: ceil(root.techs.length / root.columns);
+    property <length> tile-width: (root.width - (root.columns - 1) * Theme.tile-gap) / root.columns;
+    // A column's left edge in whole pixels, so every 1 px tile stroke stays crisp (UI rule 20) and
+    // the gaps stay one tile gap.
+    pure function column-x(c: int) -> length {
+        return Theme.whole(c * (root.width + Theme.tile-gap) / root.columns);
+    }
+    // A tile's text column once its padding, mark and arrow are off; the longest note needs half a
+    // control column.
+    property <bool> notes-fit: root.tile-width - 2 * Theme.card-padding-h - Theme.control-height - 2 * Theme.space-3 - Theme.icon-size-small >= Theme.control-column-min / 2;
+    property <length> tall-tile: 2 * Theme.card-padding-v + Theme.control-height;
+    property <length> card-height: 2 * Theme.card-padding-v + Theme.about-logo-size;
+    property <length> group-head: Theme.icon-size + Theme.header-gap;
+    // The page as drawn: two cards, the tile grid, two group titles, the badge and the gaps.
+    property <length> drawn-height: 2 * root.card-height + root.rows * root.tall-tile + (root.rows - 1) * Theme.tile-gap + 2 * root.group-head + 3 * Theme.group-gap + Theme.about-slint-height;
+    // Too low for that (UI rule 25): no group titles, short tiles, the badge beside the author.
+    property <bool> tight: root.free-height < root.drawn-height;
+    property <bool> short: root.tight || !root.notes-fit;
+    property <length> tile-height: root.short ? 2 * Theme.card-padding-v + Theme.icon-size : root.tall-tile;
     alignment: start;
-    spacing: Theme.group-gap;
-    Group {
-        Card {
-            HorizontalLayout {
-                spacing: Theme.icon-gap;
-                Image {
-                    source: Icons.logo;
-                    width: 48px;
-                    height: 48px;
-                    accessible-role: none;
+    spacing: root.tight ? Theme.space-3 : Theme.group-gap;
+    Card {
+        HorizontalLayout {
+            spacing: Theme.icon-gap;
+            Image {
+                source: Icons.logo;
+                width: Theme.about-logo-size;
+                height: Theme.about-logo-size;
+                accessible-role: none;
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: Theme.title-gap;
+                horizontal-stretch: 1;
+                Text {
+                    text: root.app-name;
+                    font-size: Theme.subtitle-size;
+                    font-weight: Theme.weight-strong;
+                    color: Theme.text-primary;
                 }
-                VerticalLayout {
-                    alignment: center;
-                    spacing: Theme.title-gap;
-                    Text {
-                        text: root.app-name;
-                        font-size: Theme.subtitle-size;
-                        font-weight: Theme.weight-strong;
-                        color: Theme.text-primary;
-                    }
-                    HorizontalLayout {
-                        alignment: start;
-                        spacing: Theme.space-1;
-                        Caption {
-                            text: @tr("Version");
-                        }
-                        Caption {
-                            text: root.version;
-                        }
+                HorizontalLayout {
+                    alignment: start;
+                    spacing: Theme.space-1;
+                    Caption {
+                        text: @tr("Version");
                     }
                     Caption {
+                        text: root.version;
+                    }
+                    // Under this width the two licence buttons say it alone (UI rule 29).
+                    if root.notes-fit: Caption {
+                        text: "·";
+                        accessible-role: none;
+                    }
+                    if root.notes-fit: Caption {
                         text: root.licence;
                     }
                 }
             }
-        }
-        // The browser opens them; the app itself makes no request.
-        ClickCard {
-            accessible-label: @tr("Project page");
-            clicked => {
-                Platform.open-url(root.repository);
-            }
-            Row {
-                title: @tr("Project page");
-                description: root.repository;
-            }
-        }
-        ClickCard {
-            accessible-label: @tr("MIT licence");
-            clicked => {
-                Platform.open-url(root.repository + "/blob/main/LICENSE-MIT");
-            }
-            Row {
-                title: @tr("MIT licence");
-            }
-        }
-        ClickCard {
-            accessible-label: @tr("Apache-2.0 licence");
-            clicked => {
-                Platform.open-url(root.repository + "/blob/main/LICENSE-APACHE");
-            }
-            Row {
-                title: @tr("Apache-2.0 licence");
+            VerticalLayout {
+                alignment: center;
+                HorizontalLayout {
+                    spacing: Theme.control-gap;
+                    Button {
+                        text: @tr("Project page");
+                        icon: Icons.github-mark;
+                        clicked => {
+                            root.open(root.repository);
+                        }
+                    }
+                    Button {
+                        text: @tr("MIT licence");
+                        clicked => {
+                            root.open(root.repository + "/blob/main/LICENSE-MIT");
+                        }
+                    }
+                    Button {
+                        text: @tr("Apache-2.0 licence");
+                        clicked => {
+                            root.open(root.repository + "/blob/main/LICENSE-APACHE");
+                        }
+                    }
+                }
             }
         }
     }
-    HorizontalLayout {
+    Group {
+        title: root.tight ? "" : @tr("Built with");
+        Rectangle {
+            height: root.rows * root.tile-height + (root.rows - 1) * Theme.tile-gap;
+            for tech[i] in root.techs: TechCard {
+                x: root.column-x(mod(i, root.columns));
+                y: floor(i / root.columns) * (root.tile-height + Theme.tile-gap);
+                width: root.column-x(mod(i, root.columns) + 1) - Theme.tile-gap - self.x;
+                height: root.tile-height;
+                name: tech.name;
+                note: tech.note;
+                mark: tech.mark;
+                short: root.short;
+                clicked => {
+                    root.open(tech.url);
+                }
+            }
+        }
+    }
+    // The author card ends with the second tile column; the badge sits at the grid's right end.
+    if root.tight: HorizontalLayout {
+        VerticalLayout {
+            alignment: center;
+            width: root.column-x(root.columns - 1) - Theme.tile-gap;
+            AuthorCard {
+                open(url) => {
+                    root.open(url);
+                }
+            }
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+        }
+        AboutSlint {
+            width: Theme.about-slint-width;
+            height: Theme.about-slint-height;
+        }
+    }
+    if !root.tight: Group {
+        title: @tr("Author");
+        AuthorCard {
+            open(url) => {
+                root.open(url);
+            }
+        }
+    }
+    if !root.tight: HorizontalLayout {
         alignment: center;
         AboutSlint {
-            width: 206px;
-            height: 90px;
+            width: Theme.about-slint-width;
+            height: Theme.about-slint-height;
         }
     }
 }

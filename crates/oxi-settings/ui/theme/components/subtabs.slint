@@ -1,0 +1,185 @@
+// The horizontal sub-tabs under a page title (owner's variant A, 2026-11-08) and the pane that
+// holds one sub-tab's content. The mockup leaves 12 px above the bar and 24 px below it; the page
+// sets that with its own spacing.
+import { Theme } from "../tokens.slint";
+import { FocusRing, KeyFocus } from "base.slint";
+
+// Text tabs on one divider; the open one is semibold with a 3 px accent underline. Left/Right
+// and Home/End switch at once, Tab leaves the bar. One-way like the pickers: `picked` fires, the
+// owner updates `selected`. Navigation only, so a locked config does not lock it.
+export component SubTabs {
+    in property <[string]> items;
+    in property <int> selected;
+    // A number after the label, parallel to `items`; negative or missing: none. 0 shows, so the
+    // first item added or the last removed does not widen or narrow the tab.
+    in property <[int]> counts;
+    // Gallery: the tab drawn hovered and pressed (-1: none).
+    in property <int> force-hover: -1;
+    in property <int> force-pressed: -1;
+    in property <bool> force-focus;
+    // Test surface: the focus ring is drawn on the open tab.
+    out property <bool> ring: root.force-focus || (root.key-focus && fs.has-focus);
+    callback picked(int);
+
+    property <bool> key-focus;
+
+    function pick(i: int) {
+        if (i >= 0 && i < root.items.length && i != root.selected) {
+            root.picked(i);
+        }
+    }
+
+    vertical-stretch: 0;
+    accessible-role: tab-list;
+
+    // Before the tabs: the underline lies on top of it.
+    Rectangle {
+        y: root.height - self.height;
+        height: 1px;
+        background: Theme.divider;
+    }
+    HorizontalLayout {
+        padding-bottom: 1px;
+        spacing: Theme.space-1;
+        alignment: start;
+        for item[i] in root.items: item-box := Rectangle {
+            property <bool> on: i == root.selected;
+            property <bool> hover: touch.has-hover || root.force-hover == i;
+            property <bool> down: touch.pressed || root.force-pressed == i;
+            // Short of room, the side padding goes first; the labels stay whole.
+            min-width: content.preferred-width + 2 * Theme.space-1;
+            preferred-width: content.preferred-width + 2 * Theme.space-3;
+            border-top-left-radius: Theme.radius-control;
+            border-top-right-radius: Theme.radius-control;
+            background: self.down ? Theme.bg-subtle-selected : self.hover ? Theme.bg-subtle-hover : transparent;
+            accessible-role: tab;
+            accessible-label: item;
+            // The count, so a screen reader hears it too.
+            accessible-description: i < root.counts.length && root.counts[i] >= 0 ? "\{root.counts[i]}" : "";
+            accessible-item-selectable: true;
+            accessible-item-selected: self.on;
+            accessible-action-default => {
+                root.pick(i);
+            }
+            content := HorizontalLayout {
+                padding-top: 6px;
+                padding-bottom: 10px;
+                spacing: 6px;
+                alignment: center;
+                // Always as wide as the semibold label, so opening a tab moves nothing.
+                Rectangle {
+                    width: strong.preferred-width;
+                    strong := Text {
+                        text: item;
+                        font-size: Theme.body-size;
+                        font-weight: Theme.weight-strong;
+                        color: Theme.text-primary;
+                        opacity: item-box.on ? 1 : 0;
+                        accessible-role: none;
+                    }
+                    Text {
+                        width: 100%;
+                        text: item;
+                        font-size: Theme.body-size;
+                        color: item-box.hover ? Theme.text-primary : Theme.text-secondary;
+                        horizontal-alignment: center;
+                        opacity: item-box.on ? 0 : 1;
+                        accessible-role: none;
+                    }
+                }
+                if i < root.counts.length && root.counts[i] >= 0: Text {
+                    text: root.counts[i];
+                    // Digits are proportional: as wide as as many 0s, so 1 to 0 moves nothing.
+                    min-width: zero.preferred-width * self.text.character-count;
+                    font-size: Theme.caption-size;
+                    color: Theme.text-secondary;
+                    vertical-alignment: center;
+                    accessible-role: none;
+                }
+            }
+            Rectangle {
+                visible: parent.on;
+                x: (parent.width - self.width) / 2;
+                y: parent.height - 2px;
+                width: content.preferred-width;
+                height: 3px;
+                border-radius: Theme.radius-small;
+                background: Theme.accent;
+            }
+            FocusRing {
+                shown: parent.on && root.ring;
+            }
+            touch := TouchArea {
+                clicked => {
+                    fs.focus();
+                    // After `focus()`: its reason is not a pointer click, and this was one.
+                    root.key-focus = false;
+                    root.pick(i);
+                }
+            }
+        }
+    }
+    zero := Text {
+        visible: false;
+        text: "0";
+        font-size: Theme.caption-size;
+        accessible-role: none;
+    }
+    fs := FocusScope {
+        focus-on-click: false;
+        focus-gained(reason) => {
+            root.key-focus = KeyFocus.from-key(reason);
+        }
+        key-pressed(event) => {
+            if (event.text == Key.LeftArrow) {
+                root.pick(root.selected - 1);
+                return accept;
+            }
+            if (event.text == Key.RightArrow) {
+                root.pick(root.selected + 1);
+                return accept;
+            }
+            if (event.text == Key.Home) {
+                root.pick(0);
+                return accept;
+            }
+            if (event.text == Key.End) {
+                root.pick(root.items.length - 1);
+                return accept;
+            }
+            reject
+        }
+    }
+}
+
+// One sub-tab's content. A page stacks its panes in one plain `Rectangle` under the bar. A pane
+// stays built while hidden, so its scroll position, cursor and unsaved text survive (an `if` would
+// drop them), it leaves the Tab order, and it asks for no room, so the tallest hidden tab cannot
+// bring back the page scroll. Children stretch; nest a `VerticalLayout { alignment: start; }` for
+// cards that keep their height.
+// shortcut: focus inside a pane stays there if the owner switches `shown` from code (a click or the
+// bar's keys move it to the bar first), give the pane a focus target when a page does that.
+export component SubTabPane {
+    in property <bool> shown;
+    visible: self.shown;
+    width: 100%;
+    height: 100%;
+    accessible-role: tab-panel;
+    // The pane's size request: the content's while shown, none while hidden.
+    Rectangle {
+        min-width: root.shown ? body.min-width : 0;
+        min-height: root.shown ? body.min-height : 0;
+        preferred-width: root.shown ? body.preferred-width : 0;
+        preferred-height: root.shown ? body.preferred-height : 0;
+        max-width: root.shown ? body.max-width : 100000px;
+        max-height: root.shown ? body.max-height : 100000px;
+    }
+    // Placed by hand: a child the compiler sizes would add its own minimum back to the pane.
+    body := VerticalLayout {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        @children
+    }
+}

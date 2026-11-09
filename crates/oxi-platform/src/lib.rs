@@ -19,3 +19,15 @@ pub mod os;
 #[cfg(target_os = "windows")]
 #[path = "windows/mod.rs"]
 pub mod os;
+
+/// The OS asks for less animation; `false` on an OS with no such setting wired up.
+#[cfg(target_os = "windows")]
+pub fn reduced_motion() -> bool {
+    os::reduced_motion()
+}
+
+/// The OS asks for less animation; `false` on an OS with no such setting wired up.
+#[cfg(not(target_os = "windows"))]
+pub const fn reduced_motion() -> bool {
+    false
+}

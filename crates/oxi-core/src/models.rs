@@ -6,10 +6,11 @@
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::Path;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
+use crate::device::{Device, DeviceChoice, pick};
 use crate::paths::part_path;
 
 /// One curated model.
@@ -205,6 +206,46 @@ pub fn status(entry: &ModelEntry, models_dir: &Path) -> ModelStatus {
     }
 }
 
+/// A model `.part` is kept this long after its last write (a paused download), then removed.
+pub const PART_KEEP: Duration = Duration::from_hours(7 * 24);
+
+/// True when a `.part` last written at `modified` is old enough to remove at `now`. A resumed
+/// download writes again, so it is young; a time in the future (clock set back) is kept.
+pub fn part_expired(modified: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(modified)
+        .is_ok_and(|age| age >= PART_KEEP)
+}
+
+/// Whole days, rounded up, a `.part` due for removal at `remove_at` is still kept at `now`; 0
+/// once it is due (the next start removes it).
+pub fn days_kept(remove_at: SystemTime, now: SystemTime) -> u64 {
+    remove_at
+        .duration_since(now)
+        .map_or(0, |left| left.as_secs().div_ceil(86_400))
+}
+
+/// A registry model this large runs slowly without a dedicated GPU; turbo (1.6 GB) does not.
+const HEAVY_FROM: u64 = 2_000_000_000;
+
+/// True when `entry` will likely run badly on the device `choice` resolves to among `gpus`: a
+/// heavy model on the CPU or an integrated GPU. Unknown GPUs (`None`, the daemon has not listed
+/// them) never warn. Only a warning: the model can still be downloaded and used.
+pub fn too_heavy(entry: &ModelEntry, gpus: Option<&[Device]>, choice: &DeviceChoice) -> bool {
+    let Some(gpus) = gpus else { return false };
+    let weak = pick(gpus, choice).index.is_none_or(|i| gpus[i].uma);
+    weak && entry.size >= HEAVY_FROM
+}
+
+/// A partly downloaded model file, for the Model page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialDownload {
+    /// The model file it belongs to, without the `.part` suffix.
+    pub file_name: String,
+    pub size: u64,
+    /// When the startup sweep removes it unless the download goes on.
+    pub remove_at: SystemTime,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +268,53 @@ mod tests {
             "the file wins over its .part"
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn days_kept_rounds_up_and_stops_at_zero() {
+        let now = UNIX_EPOCH + Duration::from_hours(1000 * 24);
+        let hours = |h| Duration::from_hours(h);
+        for (remove_at, want) in [
+            (now + PART_KEEP, 7),
+            (now + hours(6 * 24 + 23), 7),
+            (now + hours(1), 1),
+            (now, 0),
+            (now - hours(1), 0),
+        ] {
+            assert_eq!(days_kept(remove_at, now), want, "{remove_at:?}");
+        }
+    }
+
+    #[test]
+    fn heavy_models_warn_only_without_a_dedicated_gpu() {
+        let gpu = |uma| Device {
+            name: if uma { "Vulkan1" } else { "Vulkan0" }.into(),
+            description: String::new(),
+            uma,
+        };
+        let (discrete, integrated) = ([gpu(false)], [gpu(true)]);
+        let (both, none) = ([gpu(false), gpu(true)], []);
+        let (turbo, large) = (find("turbo").unwrap(), find("large-v3").unwrap());
+        let named = |n: &str| DeviceChoice::Named(n.into());
+        let table: [(Option<&[Device]>, DeviceChoice, bool); 7] = [
+            (None, DeviceChoice::Cpu, false),
+            (Some(&discrete), DeviceChoice::Auto, false),
+            (Some(&both), named("Vulkan0"), false),
+            (Some(&discrete), DeviceChoice::Cpu, true),
+            (Some(&integrated), DeviceChoice::Auto, true),
+            (Some(&both), named("Vulkan1"), true),
+            (Some(&none), DeviceChoice::Auto, true),
+        ];
+        for (gpus, choice, heavy) in table {
+            assert_eq!(
+                too_heavy(large, gpus, &choice),
+                heavy,
+                "{gpus:?} {choice:?}"
+            );
+            assert!(
+                !too_heavy(turbo, gpus, &choice),
+                "turbo {gpus:?} {choice:?}"
+            );
+        }
     }
 }

@@ -1,5 +1,6 @@
 // Home page (SPEC, History): four usage numbers and the speaking-activity heatmap.
-import { Theme, Icons, Caption, Group, Card, StatCard, ActivityHeatmap, MonthLabel } from "../theme/index.slint";
+import { Theme, Icons, Caption, Group, Card, StatCard, ActivityHeatmap, MonthLabel, Button, ButtonKind, Tip } from "../theme/index.slint";
+import { TrendChart } from "../theme/components/stats.slint";
 
 // Filled by `pages::home`.
 export global HomeState {
@@ -14,11 +15,22 @@ export global HomeState {
     in property <string> chord;
     // Recording mode is Toggle: the hint says press once, not hold.
     in property <bool> toggle;
+    // History saving is on: the folder beside the disclaimer then holds text and audio.
+    in property <bool> history-on;
     // One 0..4 per day from a Monday (index = week * 7 + weekday, Monday first) to today.
     in property <[int]> levels;
     in property <[MonthLabel]> months;
     in property <int> today: -1;
+    // The open stat card (0..3 in the order of the cards), -1: none, the heatmap shows.
+    in property <int> selected: -1;
+    // The open card's chart: one bar per day in thousandths of the peak, oldest first.
+    in property <[int]> trend;
+    in property <string> trend-peak;
+    in property <string> trend-first;
+    in property <string> trend-last;
     callback shown();
+    callback pick(int);
+    callback open-history();
 }
 
 struct Stat {
@@ -26,6 +38,8 @@ struct Stat {
     label: string,
     value: string,
     caption: string,
+    // The chart's title.
+    trend: string,
 }
 
 export component HomePage inherits VerticalLayout {
@@ -35,44 +49,59 @@ export component HomePage inherits VerticalLayout {
     // The window's width, not the column's: the rail widens at 960 and takes 164 px from the
     // column, which would flip the cards back to two rows on the way up.
     in property <length> window-width;
+    // The page's own room in the window (without the title and the banners).
+    in property <length> free-height;
     // Under this the four cards stop fitting their labels.
-    property <bool> wide: root.window-width >= 900px;
-    property <length> card-width: root.wide ? (root.content-width - 3 * Theme.tile-gap) / 4 : (root.content-width - Theme.tile-gap) / 2;
+    property <bool> wide: root.window-width >= Theme.narrow-window;
+    // A window too low for the drawn layout (UI rule 25): one row of cards even when narrow, a smaller
+    // grid, a one-line hint and disclaimer.
+    property <bool> tight: root.free-height < (root.wide ? Theme.home-wide-height : Theme.home-full-height);
+    property <bool> one-row: root.wide || root.tight;
+    property <length> card-width: root.one-row ? (root.content-width - 3 * Theme.tile-gap) / 4 : (root.content-width - Theme.tile-gap) / 2;
     property <int> weeks: max(1, ceil(HomeState.levels.length / 7));
-    // The grid fills the card up to 18 px cells (a taller grid outweighs the four numbers).
-    property <length> cell: min(18px, floor((root.content-width - 2 * Theme.card-padding-h - heat.label-w) / root.weeks / 1px - heat.gap / 1px) * 1px);
+    property <length> cell: min(root.tight ? Theme.heat-cell-tight : Theme.heat-cell-max, Theme.heat-cell(root.content-width - 2 * Theme.card-padding-h - heat.label-w, root.weeks, heat.gap));
     // Under 172 px a card's longest label (Words per minute) wraps: reserve two lines in all four.
-    property <int> label-lines: root.card-width < 172px ? 2 : 1;
+    property <int> label-lines: root.card-width < Theme.stat-card-one-line ? 2 : 1;
     property <[Stat]> stats: [
-        { icon: Icons.text-word-count, label: @tr("Words spoken"), value: HomeState.words, caption: @tr("All time") },
-        { icon: Icons.top-speed, label: @tr("Words per minute"), value: HomeState.wpm, caption: @tr("Based on recorded speech") },
-        { icon: Icons.mic, label: @tr("Dictations"), value: HomeState.dictations, caption: @tr("All time") },
+        { icon: Icons.text-word-count, label: @tr("Words spoken"), value: HomeState.words, caption: @tr("All time"), trend: @tr("Words by day") },
+        { icon: Icons.top-speed, label: @tr("Words per minute"), value: HomeState.wpm, caption: @tr("Based on recorded speech"), trend: @tr("Words per minute by day") },
+        { icon: Icons.mic, label: @tr("Dictations"), value: HomeState.dictations, caption: @tr("All time"), trend: @tr("Dictations by day") },
         {
             icon: Icons.fire,
             label: @tr("Current streak"),
             value: @tr("{n} day" | "{n} days" % HomeState.streak),
             caption: @tr("Longest: {n} day" | "Longest: {n} days" % HomeState.longest-streak),
+            trend: @tr("Streak by day"),
         },
     ];
-    property <[[Stat]]> rows: root.wide ? [root.stats] : [[root.stats[0], root.stats[1]], [root.stats[2], root.stats[3]]];
+    property <bool> trend-open: HomeState.selected >= 0;
+    // Indexes into `stats`: a new number must update the cards, not rebuild them (focus and hover
+    // live in the instances).
+    property <[[int]]> rows: root.one-row ? [[0, 1, 2, 3]] : [[0, 1], [2, 3]];
     alignment: start;
     spacing: Theme.tile-gap;
     for row in root.rows: HorizontalLayout {
         spacing: Theme.tile-gap;
-        for stat in row: StatCard {
+        for i in row: StatCard {
             width: root.card-width;
             label-lines: root.label-lines;
-            icon: stat.icon;
-            label: stat.label;
-            value: stat.value;
-            caption: stat.caption;
+            icon: root.stats[i].icon;
+            label: root.stats[i].label;
+            value: root.stats[i].value;
+            caption: root.stats[i].caption;
+            selected: HomeState.selected == i;
+            clicked => {
+                HomeState.pick(i);
+            }
         }
     }
     Group {
-        title: @tr("Speaking activity");
-        icon: Icons.calendar;
+        title: root.trend-open ? root.stats[HomeState.selected].trend : @tr("Speaking activity");
+        icon: root.trend-open ? root.stats[HomeState.selected].icon : Icons.calendar;
         Card {
-            if HomeState.empty: VerticalLayout {
+            // Kept after the first dictation with a caption of no more lines, so the card does not
+            // shrink and the row under it does not jump (UI rules 1, 5).
+            VerticalLayout {
                 spacing: Theme.title-gap;
                 padding-bottom: Theme.space-2;
                 Text {
@@ -81,20 +110,60 @@ export component HomePage inherits VerticalLayout {
                     color: Theme.text-primary;
                     wrap: word-wrap;
                 }
-                Caption {
-                    text: @tr("Your words, pace and streak show up here after the first dictation.");
+                if !root.tight: Caption {
+                    text: HomeState.empty ? @tr("Your words, pace and streak show up here after the first dictation.") : @tr("Click a card above to see it day by day.");
                     wrap: word-wrap;
                 }
             }
-            HorizontalLayout {
-                alignment: center;
-                heat := ActivityHeatmap {
-                    levels: HomeState.levels;
-                    months: HomeState.months;
-                    today: HomeState.today;
-                    cell: root.cell;
-                    summary: @tr("{n} active day in the last {} weeks" | "{n} active days in the last {} weeks" % HomeState.active-days, root.weeks);
+            // The chart takes the heatmap's room, so opening it moves nothing.
+            Rectangle {
+                height: grid.min-height;
+                grid := HorizontalLayout {
+                    alignment: center;
+                    heat := ActivityHeatmap {
+                        visible: !root.trend-open;
+                        levels: HomeState.levels;
+                        months: HomeState.months;
+                        today: HomeState.today;
+                        cell: root.cell;
+                        legend-shown: !root.tight;
+                        summary: @tr("{n} active day in the last {} weeks" | "{n} active days in the last {} weeks" % HomeState.active-days, root.weeks);
+                    }
                 }
+                if root.trend-open: TrendChart {
+                    width: parent.width;
+                    height: parent.height;
+                    bars: HomeState.trend;
+                    peak: @tr("Highest: {}", HomeState.trend-peak);
+                    first-day: HomeState.trend-first;
+                    last-day: HomeState.trend-last;
+                    summary: @tr("{n} day, highest {}" | "{n} days, highest {}" % HomeState.trend.length, HomeState.trend-peak);
+                }
+            }
+        }
+    }
+    HorizontalLayout {
+        spacing: Theme.control-gap;
+        disclaimer := Caption {
+            text: HomeState.history-on ? @tr("Statistics keep only dates, word and dictation counts and speech time. History is on, so its folder also holds your dictated text and audio.") : @tr("Statistics keep only dates, word and dictation counts and speech time, never the text itself.");
+            wrap: root.tight ? no-wrap : word-wrap;
+            overflow: elide;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            preferred-width: 0;
+            hover := TouchArea { }
+            // Cut to one line in a low window: the full text stands here (rule 28).
+            Tip {
+                text: root.tight ? disclaimer.text : "";
+                hovered: hover.has-hover;
+            }
+        }
+        Button {
+            kind: ButtonKind.subtle;
+            icon: Icons.folder-open-16;
+            text: @tr("History folder");
+            clicked => {
+                HomeState.open-history();
             }
         }
     }

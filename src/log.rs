@@ -8,12 +8,15 @@ use std::panic;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
+use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard};
 use tracing_appender::rolling::{Builder, Rotation};
 
 const FILE_PREFIX: &str = "oxi";
 const FILE_SUFFIX: &str = "log";
 const FILES_KEPT: usize = 7;
+/// Lines waiting for the log thread. The library default of 128 000 keeps 4 MB resident for a
+/// daemon that writes a few lines a day; past the limit lines are dropped, as with the default.
+const QUEUED_LINES: usize = 1024;
 
 /// Keep it alive for the whole run: dropping it flushes the log. The panic hook shares it,
 /// because `panic = "abort"` skips every destructor.
@@ -42,16 +45,22 @@ pub fn init(logs_dir: &Path) -> Guard {
         .max_log_files(FILES_KEPT)
         .build(logs_dir)
     {
-        Ok(appender) => tracing_appender::non_blocking(appender),
+        Ok(appender) => queued(appender),
         Err(e) => {
             eprintln!("log files unavailable, logging to stderr: {e}");
-            tracing_appender::non_blocking(std::io::stderr())
+            queued(std::io::stderr())
         }
     };
     install(writer);
     let guard = Guard(Arc::new(Mutex::new(Some(worker))));
     install_panic_hook(&guard);
     guard
+}
+
+fn queued<W: std::io::Write + Send + 'static>(writer: W) -> (NonBlocking, WorkerGuard) {
+    NonBlockingBuilder::default()
+        .buffered_lines_limit(QUEUED_LINES)
+        .finish(writer)
 }
 
 fn install(writer: NonBlocking) {

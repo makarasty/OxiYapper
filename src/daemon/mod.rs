@@ -3,10 +3,12 @@
 mod audio;
 mod cmd;
 mod coordinator;
+mod history;
 mod io;
 mod ipc;
 mod paste;
 mod run;
+mod sound;
 mod stats;
 mod ui;
 mod watch;

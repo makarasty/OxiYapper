@@ -1,6 +1,6 @@
 //! Real Windows clipboard. Runs only with `OXI_CLIPBOARD_TEST=1`. Each test first saves the
-//! clipboard it found and puts it back on drop; its own data carries
-//! `ExcludeClipboardContentFromMonitorProcessing`, so it never reaches Win+V history.
+//! clipboard it found and puts it back on drop. Every write here carries the exclusion markers,
+//! so a run adds nothing to the user's Win+V history; the history-on markers are unit-tested.
 #![cfg(windows)]
 
 use std::ptr::{null, null_mut};
@@ -9,7 +9,7 @@ use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 use oxi_core::paste::{ClipError, Clipboard, Snap};
-use oxi_platform::os::clipboard::{Saved, WinClipboard};
+use oxi_platform::os::clipboard::{EXCLUDE, Saved, WinClipboard};
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Graphics::Gdi::{CloseEnhMetaFile, CreateEnhMetaFileW};
 use windows_sys::Win32::System::DataExchange::{
@@ -24,13 +24,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, DispatchMessageW, HWND_MESSAGE, MSG, PM_REMOVE, PeekMessageW,
 };
 use windows_sys::w;
-
-const EXCLUDE_MONITOR: &str = "ExcludeClipboardContentFromMonitorProcessing";
-const EXCLUDE: [&str; 3] = [
-    EXCLUDE_MONITOR,
-    "CanIncludeInClipboardHistory",
-    "CanUploadToCloudClipboard",
-];
 
 fn clipboard_test() -> bool {
     let on = std::env::var_os("OXI_CLIPBOARD_TEST").is_some_and(|v| v == "1");
@@ -57,7 +50,7 @@ impl UserClipboard {
 impl Drop for UserClipboard {
     fn drop(&mut self) {
         if let Some(saved) = self.0.take() {
-            let put_back = WinClipboard::new().and_then(|mut c| c.restore(saved));
+            let put_back = WinClipboard::new().and_then(|mut c| c.restore(saved, false));
             if let Err(err) = put_back {
                 eprintln!("could not put the user's clipboard back: {err}");
             }
@@ -114,6 +107,22 @@ fn open_as(owner: HWND) {
 fn close() {
     // SAFETY: this thread opened it.
     unsafe { CloseClipboard() };
+}
+
+/// Puts the exclusion markers on the clipboard this thread has open.
+fn put_markers() {
+    for name in EXCLUDE {
+        // SAFETY: a fresh four-byte block, filled while locked, then given to the clipboard.
+        unsafe {
+            let mem = GlobalAlloc(GMEM_MOVEABLE, 4);
+            assert!(!mem.is_null());
+            let ptr = GlobalLock(mem).cast::<u32>();
+            assert!(!ptr.is_null());
+            ptr.write_unaligned(0);
+            GlobalUnlock(mem);
+            assert!(!SetClipboardData(register(name), mem).is_null());
+        }
+    }
 }
 
 /// Replaces the clipboard with `formats` written by hand.
@@ -182,13 +191,15 @@ fn set_marks_exclusion_and_restore_brings_back_every_format_byte_for_byte() {
     let _user = UserClipboard::save();
     let text = u32::from(CF_UNICODETEXT);
     let custom = register("OxiYapper.ClipboardLiveTest");
-    let history = register("CanIncludeInClipboardHistory");
     let original_text = utf16z("oxi clipboard test: before");
     let original_custom: Vec<u8> = (0..=255).collect();
-    // The original allows history; ours must not (item 40). Cloud upload is not set at all.
+    let zero = 0u32.to_ne_bytes();
+    let one = 1u32.to_ne_bytes();
+    // A normal copy: history on. A restore that keeps this saved marker leaves history=1 and
+    // the `assert_excluded` after it fails.
     put_raw(&[
-        (register(EXCLUDE_MONITOR), &0u32.to_ne_bytes()),
-        (history, &1u32.to_ne_bytes()),
+        (register("CanIncludeInClipboardHistory"), &one),
+        (register("CanUploadToCloudClipboard"), &zero),
         (text, &original_text),
         (custom, &original_custom),
     ]);
@@ -197,8 +208,9 @@ fn set_marks_exclusion_and_restore_brings_back_every_format_byte_for_byte() {
     let Snap::Complete(saved) = clip.snapshot() else {
         panic!("snapshot of text plus custom formats is not complete");
     };
+    assert!(!clip.is_excluded(&saved), "history=1 was read as excluded");
     let before = clip.sequence();
-    let seq = clip.set_text("oxi clipboard test: after").unwrap();
+    let seq = clip.set_text("oxi clipboard test: after", false).unwrap();
     assert_ne!(seq, before, "set_text did not change the sequence number");
     assert_eq!(
         seq,
@@ -209,7 +221,7 @@ fn set_marks_exclusion_and_restore_brings_back_every_format_byte_for_byte() {
     assert_eq!(read_raw(custom), None);
     assert_excluded();
 
-    clip.restore(saved).unwrap();
+    clip.restore(saved, false).unwrap();
     assert_eq!(read_raw(text), Some(original_text));
     assert_eq!(read_raw(custom), Some(original_custom));
     assert_excluded();
@@ -239,7 +251,7 @@ fn locked_while_held(owner_window: bool) {
     opened_rx.recv().unwrap();
     let mut clip = WinClipboard::new().unwrap();
     let snap = clip.snapshot();
-    let set = clip.set_text("oxi clipboard test: locked");
+    let set = clip.set_text("oxi clipboard test: locked", false);
     release_tx.send(()).unwrap();
     holder.join().unwrap();
     assert!(matches!(snap, Snap::Locked), "snapshot gave {snap:?}");
@@ -274,6 +286,7 @@ fn a_lone_metafile_is_incomplete() {
         assert!(!emf.is_null());
         open();
         assert_ne!(EmptyClipboard(), 0);
+        put_markers();
         assert!(!SetClipboardData(u32::from(CF_ENHMETAFILE), emf).is_null());
         close();
     }
@@ -309,6 +322,7 @@ fn a_delayed_render_its_owner_does_not_answer_gives_up_as_incomplete() {
         // SAFETY: the clipboard is open by `window`; a null handle means delayed render.
         unsafe {
             assert_ne!(EmptyClipboard(), 0);
+            put_markers();
             SetClipboardData(delayed, null_mut());
         }
         close();

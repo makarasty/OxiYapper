@@ -1,7 +1,8 @@
 // Settings window (redesign spec sections 2 and 3): a nav rail with icons on the left (icons only
-// under 960 px), the page on the right in a scrolling column of at most 880 px, banners above it.
+// under 960 px), the page on the right in a scrolling column as wide as the window allows, banners above it.
 import { Palette, ScrollView } from "std-widgets.slint";
 import { Theme, Shell, Icons, Caption, KeyFocus, Tip, Button, Banner, Severity, PageHeader, MonthLabel } from "theme/index.slint";
+import { KeyTipHost, Toast, ToastHost } from "theme/components/feedback.slint";
 import { HomePage, HomeState } from "pages/home.slint";
 import { HotkeyPage, HotkeyState } from "pages/hotkey.slint";
 import { KeyCap } from "keyboard.slint";
@@ -10,11 +11,13 @@ import { ModelPage, ModelState, ModelRow } from "pages/model.slint";
 import { TextPage, TextState, PasteRuleRow, FileState, FileInfo, TextFile } from "pages/text.slint";
 import { OverlayPage, OverlayState } from "pages/overlay.slint";
 import { SystemPage, ThemeChoice, SystemState } from "pages/system.slint";
+import { TestPage, TestState, TestRow } from "pages/test.slint";
 import { AboutPage } from "pages/about.slint";
 
-export { Shell, Theme, ThemeChoice, HomeState, MonthLabel, HotkeyState, KeyCap, AudioState, AudioKey, ModelState, ModelRow, TextState, PasteRuleRow, FileState, FileInfo, TextFile, OverlayState, SystemState }
+export { GalleryTile } from "theme/index.slint";
+export { Shell, Theme, Toast, ThemeChoice, HomeState, MonthLabel, HotkeyState, KeyCap, AudioState, AudioKey, ModelState, ModelRow, TextState, PasteRuleRow, FileState, FileInfo, TextFile, OverlayState, SystemState, TestState, TestRow }
 
-export enum Page { home, hotkey, audio, model, text, overlay, system, about }
+export enum Page { home, hotkey, audio, model, text, overlay, test, system, about }
 
 // The daemon chip at the foot of the rail; `hidden` when the window follows no daemon.
 export enum DaemonStatus { hidden, running, stopped, stuck }
@@ -29,7 +32,8 @@ component NavItem inherits Rectangle {
     in property <bool> compact;
     in property <bool> focused;
     callback activated();
-    height: 40px;
+    // The label starts past the icon: the rail inset, the icon, one sibling gap.
+    property <length> text-x: Theme.space-3 + Theme.icon-size + Theme.space-2;
     border-radius: Theme.radius-control;
     background: root.selected ? Theme.bg-subtle-selected : touch.has-hover ? Theme.bg-subtle-hover : transparent;
     accessible-role: tab;
@@ -41,15 +45,15 @@ component NavItem inherits Rectangle {
     }
     Rectangle {
         x: 0;
-        y: (root.height - 16px) / 2;
-        width: 3px;
-        height: 16px;
-        border-radius: 1.5px;
+        y: (root.height - Theme.rail-pill-height) / 2;
+        width: Theme.rail-pill-width;
+        height: Theme.rail-pill-height;
+        border-radius: Theme.radius-round;
         background: Theme.accent;
         visible: root.selected;
     }
     Image {
-        x: root.compact ? (root.width - Theme.icon-size) / 2 : 12px;
+        x: root.compact ? (root.width - Theme.icon-size) / 2 : Theme.space-3;
         y: (root.height - Theme.icon-size) / 2;
         width: Theme.icon-size;
         height: Theme.icon-size;
@@ -58,8 +62,8 @@ component NavItem inherits Rectangle {
         accessible-role: none;
     }
     if !root.compact: Text {
-        x: 44px;
-        width: root.width - 52px;
+        x: root.text-x;
+        width: root.width - root.text-x - Theme.space-2;
         text: root.label;
         font-size: Theme.body-size;
         color: Theme.text-primary;
@@ -78,7 +82,7 @@ component NavItem inherits Rectangle {
     }
     Rectangle {
         visible: root.focused;
-        border-width: 2px;
+        border-width: Theme.focus-ring-width;
         border-color: Theme.focus-outer;
         border-radius: Theme.radius-control;
     }
@@ -90,7 +94,10 @@ component StatusChip inherits Rectangle {
     in property <bool> compact;
     callback clicked();
     property <string> text: root.status == DaemonStatus.running ? @tr("Running") : root.status == DaemonStatus.stopped ? @tr("Not running") : @tr("Not answering");
-    height: 32px;
+    property <length> dot: Theme.space-2;
+    // Centred under the rail icons.
+    property <length> dot-x: Theme.space-3 + (Theme.icon-size - root.dot) / 2;
+    height: Theme.control-height;
     border-radius: Theme.radius-control;
     background: touch.has-hover ? Theme.bg-subtle-hover : transparent;
     accessible-role: button;
@@ -99,15 +106,15 @@ component StatusChip inherits Rectangle {
         root.clicked();
     }
     Rectangle {
-        x: root.compact ? (root.width - 8px) / 2 : 18px;
-        y: (root.height - 8px) / 2;
-        width: 8px;
-        height: 8px;
-        border-radius: 4px;
+        x: root.compact ? (root.width - root.dot) / 2 : root.dot-x;
+        y: (root.height - root.dot) / 2;
+        width: root.dot;
+        height: root.dot;
+        border-radius: Theme.radius-round;
         background: root.status == DaemonStatus.running ? Theme.success-text : root.status == DaemonStatus.stopped ? Theme.warning-text : Theme.error-text;
     }
     if !root.compact: Caption {
-        x: 38px;
+        x: root.dot-x + root.dot + Theme.space-2;
         text: root.text;
         vertical-alignment: center;
         accessible-role: none;
@@ -146,8 +153,19 @@ export component AppWindow inherits Window {
     in property <DaemonStatus> daemon-status;
     // Why the last daemon start failed; shown under the notice.
     in property <string> spawn-error;
+    // Above 0: minimum and maximum size are both this, so the OS window is created with no
+    // maximize button (`open_without_maximize`).
+    in property <length> frame-width;
+    in property <length> frame-height;
+    // The window stops here (SPEC Settings UI): fullscreen is only empty space for this app.
+    out property <length> largest-width: Theme.window-max-width;
+    out property <length> largest-height: Theme.window-max-height;
     // How far the open page is scrolled (0 at the top, negative below).
     out property <length> scroll-y: scroll.content-y;
+    // The display scale the window opens at, set once before the OS window exists. Slint gives
+    // every later icon change to the taskbar too, as ICON_BIG, in place of the exe's oxi.ico; so a
+    // window moved to another display keeps this size.
+    in property <float> icon-scale: 1;
     callback theme-changed(ThemeChoice);
     callback start-daemon();
     callback restart-daemon();
@@ -155,34 +173,46 @@ export component AppWindow inherits Window {
     callback reset-config();
 
     title: @tr("{} settings", root.app-name);
-    icon: Icons.logo;
+    icon: Icons.window-logo(root.icon-scale);
     default-font-family: Theme.font-family;
-    preferred-width: 1280px;
-    preferred-height: 800px;
-    min-width: 720px;
-    min-height: 520px;
+    // Text that sets no size (the std ComboBox and its list) reads body size, as every control does.
+    default-font-size: Theme.body-size;
+    // Test surface: `tests/shell.rs` reads the size the std widgets fall back to.
+    out property <length> text-size: root.default-font-size;
+    preferred-width: Theme.window-first-width;
+    preferred-height: Theme.window-first-height;
+    min-width: root.frame-width > 0px ? root.frame-width : Theme.window-min-width;
+    min-height: root.frame-height > 0px ? root.frame-height : Theme.window-min-height;
+    max-width: root.frame-width > 0px ? root.frame-width : root.largest-width;
+    max-height: root.frame-height > 0px ? root.frame-height : root.largest-height;
     background: Theme.bg-page;
     forward-focus: keys;
 
     // A broken config is said once: the window's own banner has the buttons to fix it.
     property <bool> daemon-shown: root.daemon-text != "" && !(root.daemon-config-error && root.banner-text != "");
-    property <bool> compact: root.width < 960px;
-    property <length> pad: root.width < 900px ? Theme.page-padding-narrow : Theme.page-padding;
-    property <length> page-width: min(root.content-max, root.width - nav.width - 2 * root.pad);
-    property <length> content-max: root.page == Page.hotkey && HotkeyState.keyboard-open ? 1200px : 880px;
+    property <bool> compact: root.width < Theme.compact-window;
+    property <length> rail-head: Theme.space-6;
+    property <length> rail-item: Theme.rail-item-height;
+    // The page title centres on the first rail item (UI rule 8), whatever the font's line height.
+    property <length> title-height: header.preferred-height - Theme.title-top - Theme.title-bottom;
+    property <length> title-centre: root.rail-head + Theme.space-1 + root.rail-item / 2;
+    property <length> pad: root.width < Theme.narrow-window ? Theme.page-padding-narrow : Theme.page-padding;
+    // One rule for every page and state (UI rule 6); the window's maximum is the only cap.
+    property <length> page-width: root.width - nav.width - 2 * root.pad;
     property <[{page: Page, label: string, icon: image, filled: image}]> rail: [
         { page: Page.home, label: @tr("Home"), icon: Icons.home, filled: Icons.home-filled },
+        { page: Page.model, label: @tr("Model"), icon: Icons.brain-circuit, filled: Icons.brain-circuit-filled },
         { page: Page.hotkey, label: @tr("Hotkey"), icon: Icons.keyboard, filled: Icons.keyboard-filled },
         { page: Page.audio, label: @tr("Audio"), icon: Icons.mic, filled: Icons.mic-filled },
-        { page: Page.model, label: @tr("Model"), icon: Icons.brain-circuit, filled: Icons.brain-circuit-filled },
         { page: Page.text, label: @tr("Text"), icon: Icons.text-t, filled: Icons.text-t-filled },
         { page: Page.overlay, label: @tr("Overlay"), icon: Icons.slide-text, filled: Icons.slide-text-filled },
+        { page: Page.test, label: @tr("Test"), icon: Icons.checkmark-circle, filled: Icons.checkmark-circle },
         { page: Page.system, label: @tr("System"), icon: Icons.settings, filled: Icons.settings-filled },
         { page: Page.about, label: @tr("About"), icon: Icons.info, filled: Icons.info-filled },
     ];
 
     pure function index-of(p: Page) -> int {
-        return p == Page.home ? 0 : p == Page.hotkey ? 1 : p == Page.audio ? 2 : p == Page.model ? 3 : p == Page.text ? 4 : p == Page.overlay ? 5 : p == Page.system ? 6 : 7;
+        return p == Page.home ? 0 : p == Page.model ? 1 : p == Page.hotkey ? 2 : p == Page.audio ? 3 : p == Page.text ? 4 : p == Page.overlay ? 5 : p == Page.test ? 6 : p == Page.system ? 7 : 8;
     }
 
     // System follows the OS: `unknown` makes the style read the OS scheme.
@@ -231,7 +261,7 @@ export component AppWindow inherits Window {
         nav := FocusScope {
             x: 0;
             y: 0;
-            width: root.compact ? 56px : 220px;
+            width: root.compact ? Theme.rail-width-compact : Theme.rail-width;
             height: parent.height;
             accessible-role: tab-list;
             property <int> cursor;
@@ -259,15 +289,22 @@ export component AppWindow inherits Window {
                 padding-bottom: Theme.space-2;
                 spacing: Theme.space-1;
                 HorizontalLayout {
-                    height: 48px;
-                    padding-left: 12px;
-                    spacing: Theme.space-3;
-                    Image {
-                        source: Icons.logo;
-                        width: 24px;
-                        height: 24px;
-                        y: 12px;
-                        accessible-role: none;
+                    height: root.rail-head;
+                    // The logo at the head's foot: centred it kept 2 px to the window's top edge and
+                    // looked cut. shortcut: 4 px, a taller head costs the 720x520 fit of About, Home
+                    // and Paste (UI rule 25); grow it if those pages get room.
+                    padding-top: Theme.space-1;
+                    // Over the rail icons in both widths.
+                    padding-left: root.compact ? (nav.width - 2 * Theme.space-1 - Theme.icon-size) / 2 : Theme.space-3;
+                    spacing: Theme.space-2;
+                    VerticalLayout {
+                        alignment: center;
+                        logo := Image {
+                            source: Icons.logo;
+                            width: Theme.icon-size;
+                            height: Theme.icon-size;
+                            accessible-role: none;
+                        }
                     }
                     if !root.compact: Text {
                         text: root.app-name;
@@ -279,6 +316,7 @@ export component AppWindow inherits Window {
                     }
                 }
                 for item[i] in root.rail: NavItem {
+                    height: root.rail-item;
                     label: item.label;
                     icon: item.icon;
                     icon-selected: item.filled;
@@ -315,7 +353,7 @@ export component AppWindow inherits Window {
                 padding-top: Theme.space-4;
                 alignment: start;
                 VerticalLayout {
-                    width: min(root.content-max, parent.width - 2 * root.pad);
+                    width: parent.width - 2 * root.pad;
                     spacing: Theme.space-2;
                     if root.banner-text != "": Banner {
                         text: root.banner-text;
@@ -365,26 +403,34 @@ export component AppWindow inherits Window {
                     x: 0;
                     // Not `visible-width`: the 14 px scrollbar sits in the page padding, so the
                     // cards keep their width whether or not it shows.
-                    width: min(scroll.width, root.content-max + 2 * root.pad);
+                    width: scroll.width;
                     padding-left: root.pad;
                     padding-right: root.pad;
-                    padding-bottom: Theme.space-8;
+                    padding-top: root.title-centre - Theme.title-top - root.title-height / 2;
+                    padding-bottom: root.pad;
                     alignment: start;
-                    PageHeader {
+                    header := PageHeader {
                         title: root.rail[root.index-of(root.page)].label;
                     }
                     if root.page == Page.home: HomePage {
                         window-width: root.width;
                         content-width: root.page-width;
+                        free-height: scroll.visible-height - column.padding-top - column.padding-bottom - header.preferred-height;
                     }
-                    if root.page == Page.hotkey: HotkeyPage { }
-                    if root.page == Page.audio: AudioPage { }
+                    if root.page == Page.hotkey: HotkeyPage {
+                        free-height: scroll.visible-height - column.padding-top - column.padding-bottom - header.preferred-height;
+                    }
+                    if root.page == Page.audio: AudioPage {
+                        free-height: scroll.visible-height - column.padding-top - column.padding-bottom - header.preferred-height;
+                    }
                     if root.page == Page.model: ModelPage { }
                     if root.page == Page.text: TextPage {
-                        window-height: root.height;
+                        free-height: scroll.visible-height - column.padding-top - column.padding-bottom - header.preferred-height;
                     }
                     if root.page == Page.overlay: OverlayPage { }
+                    if root.page == Page.test: TestPage { }
                     if root.page == Page.system: SystemPage {
+                        free-height: scroll.visible-height - column.padding-top - column.padding-bottom - header.preferred-height;
                         theme: root.theme;
                         theme-picked(choice) => {
                             root.theme = choice;
@@ -392,6 +438,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     if root.page == Page.about: AboutPage {
+                        free-height: scroll.visible-height - column.padding-top - column.padding-bottom - header.preferred-height;
                         app-name: root.app-name;
                         version: root.version;
                         licence: root.licence;
@@ -399,6 +446,20 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+        }
+
+        ToastHost {
+            x: nav.width;
+            y: 0;
+            width: parent.width - nav.width;
+            height: parent.height;
+        }
+
+        KeyTipHost {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
         }
     }
 }

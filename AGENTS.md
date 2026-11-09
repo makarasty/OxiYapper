@@ -16,3 +16,4 @@
 6. Every GitHub Action is pinned to a full commit SHA with a version comment; no `pull_request_target`; `permissions: contents: read` unless a job needs more.
 7. New dependencies: add the version to `[workspace.dependencies]` in the root `Cargo.toml`; licence must pass `deny.toml`.
 8. Pedantic clippy is on. Fix the lint; an `#[allow]` needs a one-line reason.
+9. UI work obeys `docs/UI-RULES.md`.

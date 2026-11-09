@@ -14,17 +14,28 @@ export component Button {
     in property <ButtonKind> kind: ButtonKind.secondary;
     in property <bool> enabled: true;
     in property <string> tooltip;
+    // A Remove that is an `icon` button turns red under the pointer as `danger` does (UI rule 16).
+    in property <bool> destructive;
     // Static shots have no mouse: the gallery forces the states.
     in property <bool> force-hover;
     in property <bool> force-pressed;
     in property <bool> force-focus;
     callback clicked;
 
+    // For a control that replaces the focused one: `ring` says if the keyboard did it (UI rule 17).
+    public function take-focus(ring: bool) {
+        fs.focus();
+        root.key-focus = ring;
+    }
+
     property <bool> framed: root.kind == ButtonKind.secondary || root.kind == ButtonKind.danger;
     property <bool> hover: root.enabled && (touch.has-hover || root.force-hover);
     property <bool> down: root.enabled && (touch.pressed || root.force-pressed);
+    // `danger` (Cancel, Remove, Stop) rests as a secondary button and turns red under the pointer.
+    out property <bool> red: (root.kind == ButtonKind.danger || root.destructive) && (root.hover || root.down);
     property <bool> key-focus;
-    property <color> ink: !root.enabled && root.kind == ButtonKind.primary ? Theme.bg-card : !root.enabled ? Theme.text-disabled : root.kind == ButtonKind.primary ? Theme.on-accent : root.kind == ButtonKind.danger ? Theme.error-text : Theme.text-primary;
+    out property <bool> key-focused: root.key-focus && fs.has-focus;
+    property <color> ink: !root.enabled && root.kind == ButtonKind.primary ? Theme.bg-card : !root.enabled ? Theme.text-disabled : root.kind == ButtonKind.primary ? Theme.on-accent : root.red ? Theme.error-text : Theme.text-primary;
     property <bool> has-label: root.kind != ButtonKind.icon && root.text != "";
 
     forward-focus: fs;
@@ -46,9 +57,10 @@ export component Button {
         border-radius: Theme.radius-control;
         // Disabled: fills at 50 %; primary turns neutral (Fluent), a faded teal with grey text is unreadable.
         opacity: root.enabled || root.kind == ButtonKind.primary ? 1 : 0.5;
-        background: root.kind == ButtonKind.primary ? (!root.enabled ? Theme.text-disabled : root.down ? Theme.accent-pressed : root.hover ? Theme.accent-hover : Theme.accent) : root.framed ? (root.down ? Theme.bg-control-pressed : root.hover ? Theme.bg-control-hover : Theme.bg-control) : (root.down ? Theme.bg-subtle-selected : root.hover ? Theme.bg-subtle-hover : transparent);
+        background: root.kind == ButtonKind.primary ? (!root.enabled ? Theme.text-disabled : root.down ? Theme.accent-pressed : root.hover ? Theme.accent-hover : Theme.accent) : root.red ? (root.down ? Theme.error-fill-pressed : Theme.error-fill) : root.framed ? (root.down ? Theme.bg-control-pressed : root.hover ? Theme.bg-control-hover : Theme.bg-control) : (root.down ? Theme.bg-subtle-selected : root.hover ? Theme.bg-subtle-hover : transparent);
         border-width: root.framed ? 1px : 0;
-        border-color: Theme.stroke-control;
+        border-color: root.red ? Theme.error-text.transparentize(0.7) : Theme.stroke-control;
+        animate background { duration: Theme.motion-quick; easing: ease-out; }
         // Fluent's darker bottom edge on framed controls.
         Rectangle {
             visible: root.framed;
@@ -56,7 +68,7 @@ export component Button {
             y: parent.height - 1px;
             width: parent.width - 2 * Theme.radius-control;
             height: 1px;
-            background: Theme.stroke-control-bottom;
+            background: root.red ? Theme.error-text.transparentize(0.5) : Theme.stroke-control-bottom;
         }
     }
     row := HorizontalLayout {
@@ -105,7 +117,7 @@ export component Button {
         }
     }
     FocusRing {
-        shown: root.force-focus || (root.key-focus && fs.has-focus);
+        shown: root.force-focus || root.key-focused;
     }
     Tip {
         text: root.kind == ButtonKind.icon && root.enabled ? root.text : root.enabled ? "" : root.tooltip;

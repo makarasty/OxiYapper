@@ -17,6 +17,8 @@
 
 use std::sync::OnceLock;
 
+use crate::constants::VOCAB_FILE;
+
 /// Prompt tokens whisper.cpp keeps: half of the 448-token text context, less one
 /// for the PREV marker it puts first. Vendored whisper.cpp (whisper-rs-sys 0.15,
 /// `src/whisper.cpp`) keeps `max_prompt_ctx - n_take0 - 1` tokens of the prompt
@@ -24,7 +26,6 @@ use std::sync::OnceLock;
 /// from the front.
 pub const BUDGET: usize = 223;
 
-const VOCAB_FILE: &[u8] = include_bytes!("../../data/vocab/multilingual.vocab");
 const CONTRACTIONS: [&[u8]; 7] = [b"'s", b"'t", b"'re", b"'ve", b"'m", b"'ll", b"'d"];
 
 struct Vocab {

@@ -339,6 +339,8 @@ fn drain_once(
 
 #[cfg(test)]
 mod tests {
+    use oxi_core::audio::SAMPLE_RATE as RATE;
+
     use super::*;
 
     fn run<T: Sample>(data: &[T], channels: usize, ring: usize) -> (Vec<f32>, Shared)
@@ -400,7 +402,6 @@ mod tests {
 
     #[test]
     fn meter_shows_post_gain_level_of_the_last_whole_window() {
-        const RATE: u32 = 16_000;
         let window = samples_for(CHUNK, RATE);
         let opts = Audio {
             gain_db: 20.0 * 2.0_f64.log10(),
@@ -433,7 +434,6 @@ mod tests {
 
     /// All-zero input: `Pipeline::finish` answers `MicSilence`, so an `Ok` shows it did not run.
     fn stopped_drain(cancel: bool) -> Result<Vec<f32>, AudioError> {
-        const RATE: u32 = 16_000;
         let opts = Audio {
             denoise: false,
             ..Audio::default()

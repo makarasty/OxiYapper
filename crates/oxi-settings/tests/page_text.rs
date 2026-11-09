@@ -2,6 +2,7 @@
 
 mod common;
 
+use std::fmt::Write as _;
 use std::fs;
 use std::time::Duration;
 
@@ -24,7 +25,12 @@ fn open_tall(l: &Layout) -> AppWindow {
     window
 }
 
-/// The editor labelled `label`; the group title above it shares the label.
+/// Opens the sub-tab `label` (Dictionary is open at first).
+fn sub_tab(window: &AppWindow, label: &str) {
+    with_role(window, label, AccessibleRole::Tab).invoke_accessible_default_action();
+}
+
+/// The editor labelled `label`; the sub-tab above it shares the label.
 fn editor(window: &AppWindow, label: &str) -> i_slint_backend_testing::ElementHandle {
     with_role(window, label, AccessibleRole::TextInput)
 }
@@ -75,6 +81,7 @@ fn over_budget_dictionary_marks_the_tail() {
 fn replacement_line_without_arrow_reports_its_line() {
     let l = layout("replace", None);
     let window = open_tall(&l);
+    sub_tab(&window, "Replacements");
     assert!(has(&window, "All lines valid"));
     editor(&window, "Replacements")
         .set_accessible_value("alpha => beta\nfoo bar\n\ngamma => delta");
@@ -131,19 +138,65 @@ fn utf16_file_is_rewritten_as_utf8_with_a_note_until_saved() {
 }
 
 #[test]
+fn utf16_file_with_a_bad_line_says_both_the_worse_first() {
+    let l = layout("utf16-bad", None);
+    let mut bytes = vec![0xFF, 0xFE];
+    bytes.extend("synth line".encode_utf16().flat_map(u16::to_le_bytes));
+    fs::write(l.replace_file(), bytes).unwrap();
+    let window = open_tall(&l);
+    sub_tab(&window, "Replacements");
+    assert!(
+        has(
+            &window,
+            "Line 1 has no =>: ignored\nSaved as UTF-16 or with a BOM: Save rewrites it as UTF-8."
+        ),
+        "{:?}",
+        labels(&window, "Line")
+    );
+}
+
+#[test]
 fn unreadable_file_is_never_overwritten() {
     let l = layout("unreadable", None);
     let bytes = [b's', 0xFF, b'x'];
     fs::write(l.replace_file(), bytes).unwrap();
     let window = open_tall(&l);
+    sub_tab(&window, "Replacements");
     assert!(has(
         &window,
         "replace.txt is not UTF-8 or UTF-16 text: fix it in a text editor."
     ));
+    // The empty editor says it too, so it does not pass for an empty file.
+    assert_eq!(
+        editor(&window, "Replacements")
+            .accessible_placeholder_text()
+            .as_deref(),
+        Some("replace.txt is not UTF-8 or UTF-16 text: fix it in a text editor.")
+    );
     let save = one(&window, "Save replace.txt");
     assert_eq!(save.accessible_enabled(), Some(false));
     save.invoke_accessible_default_action();
     assert_eq!(fs::read(l.replace_file()).unwrap(), bytes);
+}
+
+/// UI rule 24: at the window maximum the editor takes the room under the sub-tabs, no empty band
+/// under its card; an empty editor shows the file's format.
+#[test]
+fn editor_fills_the_maximum_window_and_hints_the_format() {
+    let window = open(&layout("editor-max", None), Page::Text);
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(1280.0, 860.0));
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    let dictionary = editor(&window, "Dictionary");
+    assert_eq!(
+        dictionary.accessible_placeholder_text().as_deref(),
+        Some("One word or name per line")
+    );
+    let save = one(&window, "Save dictionary.txt");
+    let bottom = save.absolute_position().y + save.size().height;
+    assert!(bottom > 860.0 - 80.0, "the card ends at {bottom} of 860");
+    assert!(dictionary.size().height > 360.0, "{:?}", dictionary.size());
 }
 
 #[test]
@@ -184,6 +237,7 @@ fn clean_editor_takes_a_file_changed_on_disk_instead_of_saving() {
     fs::write(l.replace_file(), b"\xEF\xBB\xBFa => b").unwrap();
     let window = open_tall(&l);
     fs::write(l.replace_file(), "c => d").unwrap();
+    sub_tab(&window, "Replacements");
     one(&window, "Save replace.txt").invoke_accessible_default_action();
     assert_eq!(fs::read_to_string(l.replace_file()).unwrap(), "c => d");
     assert_eq!(
@@ -205,6 +259,7 @@ fn fixed_file_is_read_again_when_the_page_is_shown_or_on_reload() {
     fs::write(l.dictionary_file(), "synthalpha").unwrap();
     fs::write(l.replace_file(), "a => b").unwrap();
 
+    sub_tab(&window, "Replacements");
     one(&window, "Reload replace.txt").invoke_accessible_default_action();
     assert_eq!(
         editor(&window, "Replacements").accessible_value().unwrap(),
@@ -219,6 +274,7 @@ fn fixed_file_is_read_again_when_the_page_is_shown_or_on_reload() {
     // The query builds the About page, so the Text page is really left.
     assert!(has(&window, "Version"));
     window.set_page(Page::Text);
+    sub_tab(&window, "Dictionary");
     assert_eq!(
         editor(&window, "Dictionary").accessible_value().unwrap(),
         "synthalpha"
@@ -245,6 +301,7 @@ fn reset_keeps_unsaved_text_and_reloads_clean_files() {
         "synthbeta"
     );
     assert!(has(&window, "Unsaved changes"));
+    sub_tab(&window, "Replacements");
     assert_eq!(
         editor(&window, "Replacements").accessible_value().unwrap(),
         "c => d"
@@ -354,6 +411,7 @@ fn a_clean_editor_follows_the_file_and_a_dirty_one_keeps_its_text() {
 fn restore_delay_is_saved_once_the_slider_rests() {
     let l = layout("delay", None);
     let window = open_tall(&l);
+    sub_tab(&window, "Paste");
     let slider = with_role(&window, "Restore clipboard after", AccessibleRole::Spinbox);
     slider.set_accessible_value("400");
     slider.set_accessible_value("500");
@@ -364,33 +422,29 @@ fn restore_delay_is_saved_once_the_slider_rests() {
 }
 
 #[test]
-fn duplicate_rule_shows_a_note() {
+fn duplicate_rule_is_a_toast() {
     let l = layout("duplicate", None);
     let window = open_tall(&l);
+    sub_tab(&window, "Per-app rules");
     one(&window, "New rule app").set_accessible_value("synth.exe");
     one(&window, "Add rule").invoke_accessible_default_action();
     one(&window, "New rule app").set_accessible_value("SYNTH.EXE");
     one(&window, "Add rule").invoke_accessible_default_action();
-    let note = "SYNTH.EXE already has a rule: change its mode in the list above.";
+    let note = "SYNTH.EXE already has a rule: change its mode in the list below.";
     assert!(has(&window, note), "{:?}", labels(&window, "SYNTH"));
     assert_eq!(config(&l).config.paste.rules.len(), 2);
 
-    one(&window, "New rule app").set_accessible_value("other.exe");
-    one(&window, "Add rule").invoke_accessible_default_action();
-    assert!(!has(&window, note));
-
-    // Removing the original rule takes the note about it away too.
-    one(&window, "New rule app").set_accessible_value("SYNTH.EXE");
-    one(&window, "Add rule").invoke_accessible_default_action();
-    assert!(has(&window, note));
-    one(&window, "Remove synth.exe").invoke_accessible_default_action();
-    assert!(!has(&window, note));
+    // The first step only lets the toast's clock start.
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_secs(4));
+    assert!(!has(&window, note), "a toast leaves by itself");
 }
 
 #[test]
 fn closing_within_the_debounce_still_saves_the_delay() {
     let l = layout("delay-close", None);
     let window = open_tall(&l);
+    sub_tab(&window, "Paste");
     with_role(&window, "Restore clipboard after", AccessibleRole::Spinbox)
         .set_accessible_value("700");
     assert!(!l.config_file().exists(), "saved during the drag");
@@ -431,11 +485,28 @@ fn dirty_editor_names_the_read_error_of_its_file() {
 fn mode_thumb_and_rules_write_the_config() {
     let l = layout("paste", Some("version = 1\n# mine\n"));
     let window = open_tall(&l);
+    sub_tab(&window, "Paste");
     with_role(&window, "Paste mode", AccessibleRole::RadioGroup);
     let card = |label: &str| with_role(&window, label, AccessibleRole::RadioButton);
     assert_eq!(card("Clipboard").accessible_checked(), Some(true));
     card("Type").invoke_accessible_default_action();
     assert_eq!(card("Type").accessible_checked(), Some(true));
+    // Per-app Clipboard rules and "Copy last text" still use both rows in Type mode: they stay live.
+    let clipboard_rows = || {
+        [
+            with_role(
+                &window,
+                "Keep dictation in Win+V history",
+                AccessibleRole::Switch,
+            ),
+            with_role(&window, "Restore clipboard after", AccessibleRole::Slider),
+        ]
+        .map(|e| e.accessible_enabled())
+    };
+    assert_eq!(clipboard_rows(), [Some(true), Some(true)]);
+    card("Clipboard").invoke_accessible_default_action();
+    assert_eq!(clipboard_rows(), [Some(true), Some(true)]);
+    card("Type").invoke_accessible_default_action();
     let file = config(&l);
     assert_eq!(file.config.paste.mode, PasteMode::Type);
     assert!(
@@ -448,11 +519,18 @@ fn mode_thumb_and_rules_write_the_config() {
     assert!(!config(&l).config.paste.trailing_space);
 
     // The default rule is mstsc.exe; add one, refuse its case-insensitive twin, remove the first.
+    sub_tab(&window, "Per-app rules");
     assert!(has(&window, "Remove mstsc.exe"));
     one(&window, "New rule app").set_accessible_value("synth.exe");
     one(&window, "Add rule").invoke_accessible_default_action();
     one(&window, "New rule app").set_accessible_value("SYNTH.EXE");
     one(&window, "Add rule").invoke_accessible_default_action();
+    // Typed without ".exe" it is the same app (the daemon matches the whole file name); only
+    // Windows adds the ".exe", so elsewhere "Synth" is another app.
+    if cfg!(windows) {
+        one(&window, "New rule app").set_accessible_value("Synth");
+        one(&window, "Add rule").invoke_accessible_default_action();
+    }
     one(&window, "Remove mstsc.exe").invoke_accessible_default_action();
     let rules = config(&l).config.paste.rules;
     assert_eq!(rules.len(), 1, "{rules:?}");
@@ -462,11 +540,32 @@ fn mode_thumb_and_rules_write_the_config() {
     assert!(has(&window, "Remove synth.exe"));
 }
 
+/// The rule count shows at 0 too, so removing the last rule does not narrow the tab and move its
+/// underline; a screen reader hears the count.
+#[test]
+fn rule_count_keeps_the_tab_width_at_zero() {
+    let l = layout("rule-count", None);
+    let window = open_tall(&l);
+    sub_tab(&window, "Per-app rules");
+    let tab = || with_role(&window, "Per-app rules", AccessibleRole::Tab);
+    assert_eq!(tab().accessible_description().as_deref(), Some("1"));
+    let wide = tab().size().width;
+    one(&window, "Remove mstsc.exe").invoke_accessible_default_action();
+    assert_eq!(config(&l).config.paste.rules, []);
+    assert_eq!(tab().accessible_description().as_deref(), Some("0"));
+    assert!(
+        (tab().size().width - wide).abs() < 0.5,
+        "{wide} -> {}",
+        tab().size().width
+    );
+}
+
 #[test]
 fn locked_config_keeps_paste_controls_off() {
     let original = "version = 99\n";
     let l = layout("locked", Some(original));
     let window = open_tall(&l);
+    sub_tab(&window, "Per-app rules");
     let add = one(&window, "Add rule");
     assert_eq!(add.accessible_enabled(), Some(false));
     assert_eq!(
@@ -474,4 +573,236 @@ fn locked_config_keeps_paste_controls_off() {
         Some(false)
     );
     assert_eq!(fs::read_to_string(l.config_file()).unwrap(), original);
+}
+
+#[test]
+fn sub_tabs_show_one_part_of_the_page() {
+    let l = layout("tabs", None);
+    let window = open_tall(&l);
+    let tab = |label| with_role(&window, label, AccessibleRole::Tab);
+    let shown = || {
+        [
+            "Save dictionary.txt",
+            "Save replace.txt",
+            "Paste mode",
+            "Add rule",
+        ]
+        .map(|label| has(&window, label))
+    };
+    assert_eq!(tab("Dictionary").accessible_item_selected(), Some(true));
+    assert_eq!(shown(), [true, false, false, false]);
+    sub_tab(&window, "Replacements");
+    assert_eq!(tab("Replacements").accessible_item_selected(), Some(true));
+    assert_eq!(shown(), [false, true, false, false]);
+    sub_tab(&window, "Paste");
+    assert_eq!(shown(), [false, false, true, false]);
+    sub_tab(&window, "Per-app rules");
+    assert_eq!(shown(), [false, false, false, true]);
+}
+
+#[test]
+fn win_v_history_is_on_by_default_and_saved_off() {
+    let l = layout("win-v", None);
+    let window = open_tall(&l);
+    sub_tab(&window, "Paste");
+    let switch = || {
+        with_role(
+            &window,
+            "Keep dictation in Win+V history",
+            AccessibleRole::Switch,
+        )
+    };
+    assert_eq!(switch().accessible_checked(), Some(true));
+    switch().invoke_accessible_default_action();
+    assert_eq!(switch().accessible_checked(), Some(false));
+    assert!(!config(&l).config.paste.keep_in_clipboard_history);
+}
+
+/// A config with `n` synthetic per-app rules.
+fn many_rules(n: usize) -> String {
+    let mut text = String::from("version = 1\n");
+    for i in 0..n {
+        let _ = write!(
+            text,
+            "[[paste.rules]]\napp = \"synthapp{i}.exe\"\nmode = \"type\"\n"
+        );
+    }
+    text
+}
+
+/// The Text page at the minimum window size, the first tick laid out.
+fn open_min(l: &Layout) -> AppWindow {
+    let window = open(l, Page::Text);
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(720.0, 520.0));
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    window
+}
+
+/// Whether the element labelled `label` is whole inside the 520 px tall window.
+fn whole_in_view(window: &AppWindow, label: &str) -> bool {
+    i_slint_backend_testing::ElementHandle::find_by_accessible_label(window, label)
+        .next()
+        .is_some_and(|e| {
+            let y = e.absolute_position().y;
+            y >= 0.0 && y + e.size().height <= 520.0
+        })
+}
+
+/// Whether the page itself scrolls: a wheel over the sub-tab bar moves it only if its content is
+/// taller than the room it has (the list and the editors keep the wheel over themselves).
+fn page_scrolls(window: &AppWindow) -> bool {
+    let at = with_role(window, "Dictionary", AccessibleRole::Tab).absolute_position();
+    window
+        .window()
+        .dispatch_event(WindowEvent::PointerScrolled {
+            position: slint::LogicalPosition::new(at.x + 4.0, at.y + 4.0),
+            delta_x: 0.0,
+            delta_y: -100_000.0,
+        });
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(500));
+    window.get_scroll_y() != 0.0
+}
+
+/// UI rule 30: a rule keeps its app's name between windows, and the default rule has one.
+#[test]
+fn rule_rows_are_named_without_a_scan() {
+    let original = "version = 1
+[ui.app_names]
+\"synthapp.exe\" = \"Synth App\"
+[[paste.rules]]
+app = \"SynthApp.exe\"
+";
+    let window = open(&layout("rule-names", Some(original)), Page::Text);
+    sub_tab(&window, "Per-app rules");
+    assert!(has(&window, "Synth App"));
+    assert!(!has(&window, "SynthApp.exe"), "the exe is not the title");
+    let window = common::open_again(&layout("rule-names-default", None), Page::Text);
+    sub_tab(&window, "Per-app rules");
+    assert!(has(&window, "Remote Desktop Connection"));
+}
+
+/// UI rules 1 and 28: a long app name keeps its rule row one line tall (cut, whole on hover).
+#[test]
+fn long_app_name_keeps_its_rule_row_one_line() {
+    let long = "Synth Application With A Very Long Name That Goes On And On Past The Column";
+    let original = format!(
+        "version = 1\n[ui.app_names]\n\"synthlong.exe\" = \"{long}\"\n\
+         [[paste.rules]]\napp = \"synthlong.exe\"\n[[paste.rules]]\napp = \"synthshort.exe\"\n"
+    );
+    let window = open_min(&layout("rule-long-name", Some(&original)));
+    sub_tab(&window, "Per-app rules");
+    let height = |label: &str| one(&window, label).size().height;
+    let (long_h, short_h) = (height(long), height("synthshort.exe"));
+    assert!(
+        (long_h - short_h).abs() < 0.5,
+        "long {long_h} vs short {short_h}"
+    );
+}
+
+/// UI rule 25, worst case: a 500-word dictionary, a long replace.txt and 150 rules, and every
+/// sub-tab has its last control in view at 720 x 520 and the page cannot scroll, with no banner,
+/// the offline daemon's and a broken config's.
+#[test]
+fn every_tab_fits_the_minimum_size_with_long_lists() {
+    let l = layout("fit", Some(&many_rules(150)));
+    let words: Vec<String> = (0..500).map(|i| format!("synthword{i}")).collect();
+    fs::write(l.dictionary_file(), words.join("\n")).unwrap();
+    let lines: Vec<String> = (0..300).map(|i| format!("synth{i} => s{i}")).collect();
+    fs::write(l.replace_file(), lines.join("\n")).unwrap();
+    let window = open_min(&l);
+    // Nothing, the offline daemon's banner, and a broken config's: each takes room off the page.
+    for (banner, daemon) in [
+        ("", ""),
+        ("", oxi_core::strings::DAEMON_OFFLINE),
+        ("Synthetic config trouble.", ""),
+    ] {
+        window.set_banner_text(banner.into());
+        window.set_daemon_text(daemon.into());
+        window.set_daemon_start(!daemon.is_empty());
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+        for (tab, last) in [
+            ("Dictionary", "Save dictionary.txt"),
+            ("Replacements", "Save replace.txt"),
+            ("Paste", "Restore clipboard after"),
+            ("Per-app rules", "Add rule"),
+        ] {
+            sub_tab(&window, tab);
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+            assert!(
+                whole_in_view(&window, last),
+                "{last} is cut on {tab} (banner {banner:?}, daemon {daemon:?})"
+            );
+            assert!(
+                !page_scrolls(&window),
+                "{tab} scrolls at 720 x 520 (banner {banner:?}, daemon {daemon:?})"
+            );
+        }
+    }
+}
+
+/// UI rule 26: the wheel over the rule list moves the list, never the page.
+#[test]
+fn a_long_rule_list_scrolls_by_itself() {
+    let l = layout("rules-scroll", Some(&many_rules(150)));
+    let window = open_min(&l);
+    sub_tab(&window, "Per-app rules");
+    let at = one(&window, "Remove synthapp0.exe").absolute_position();
+    assert!(!has(&window, "Remove synthapp149.exe"));
+    window
+        .window()
+        .dispatch_event(WindowEvent::PointerScrolled {
+            position: slint::LogicalPosition::new(at.x, at.y),
+            delta_x: 0.0,
+            delta_y: -100_000.0,
+        });
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(500));
+    assert!(
+        has(&window, "Remove synthapp149.exe"),
+        "the list did not scroll"
+    );
+    assert_eq!(window.get_scroll_y(), 0.0, "the page scrolled");
+    assert!(whole_in_view(&window, "Add rule"));
+    // Scan sits beside Add; the scan itself is tested in `pages::text`, which can point it at
+    // synthetic shortcuts (this binary would read the real Start menu).
+    assert!(whole_in_view(&window, "Scan for apps"));
+}
+
+/// The worst-case list still lets the keyboard reach Add: it sits above the list.
+#[test]
+fn add_is_reached_by_keyboard_past_a_long_rule_list() {
+    let l = layout("rules-keys", Some(&many_rules(150)));
+    let window = open_min(&l);
+    sub_tab(&window, "Per-app rules");
+    let press = |text: slint::SharedString| {
+        window
+            .window()
+            .dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+        window
+            .window()
+            .dispatch_event(WindowEvent::KeyReleased { text });
+    };
+    let field = || one(&window, "New rule app").accessible_value();
+    // Tab on; the first letter that lands in the field shows the focus is there.
+    for _ in 0..12 {
+        press(Key::Tab.into());
+        press("q".into());
+        if field().as_deref() == Some("q") {
+            break;
+        }
+    }
+    assert_eq!(
+        field().as_deref(),
+        Some("q"),
+        "Tab never reached the app field"
+    );
+    for c in ".exe".chars() {
+        press(c.to_string().into());
+    }
+    press(Key::Tab.into());
+    press(" ".into());
+    let rules = config(&l).config.paste.rules;
+    assert_eq!(rules.len(), 151);
+    assert_eq!(rules[150].app, "q.exe");
 }

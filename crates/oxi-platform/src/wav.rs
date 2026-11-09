@@ -4,13 +4,13 @@
 //! written as `<name>.wav.part`, finalized and synced, then renamed, so a crash never leaves a
 //! half-written `.wav` (ARCHITECTURE section 9, History).
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use oxi_core::audio::{SAMPLE_RATE, downmix};
-use oxi_core::paths::{PART_SUFFIX, part_path};
+use oxi_core::paths::part_path;
 use thiserror::Error;
 
 use crate::fs::write_via;
@@ -50,35 +50,6 @@ fn write_into(file: &mut File, samples: &[f32]) -> Result<(), WavError> {
     }
     writer.finalize()?;
     Ok(())
-}
-
-/// Delete leftover `*.wav.part` files in `dir` and its subdirectories (startup, after a crash).
-/// Nothing else is touched. Returns how many were removed; a missing `dir` is zero.
-pub fn remove_leftover_parts(dir: &Path) -> Result<usize, WavError> {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e.into()),
-    };
-    let mut removed = 0;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let kind = entry.file_type()?;
-        if kind.is_dir() {
-            removed += remove_leftover_parts(&path)?;
-        } else if kind.is_file()
-            && entry
-                .file_name()
-                .to_string_lossy()
-                .strip_suffix(PART_SUFFIX)
-                .is_some_and(|name| Path::new(name).extension().is_some_and(|e| e == "wav"))
-        {
-            fs::remove_file(&path)?;
-            removed += 1;
-        }
-    }
-    Ok(removed)
 }
 
 /// Read any int (8-32 bit) or f32 wav as mono f32 in `[-1, 1]` (channels averaged) plus its rate.

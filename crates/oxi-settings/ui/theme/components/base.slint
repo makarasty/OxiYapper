@@ -53,23 +53,24 @@ export global KeyFocus {
     }
 }
 
-// The tooltip bubble: caption text on a control-coloured card.
+// The tooltip bubble: caption text on a control-coloured card (the toast sets body text).
 export component Tooltip inherits Rectangle {
     in property <string> text;
+    in property <length> font-size: Theme.caption-size;
     background: Theme.bg-control;
     border-color: Theme.stroke-control;
     border-width: 1px;
     border-radius: Theme.radius-control;
     accessible-role: none;
     HorizontalLayout {
-        padding-left: 8px;
-        padding-right: 8px;
-        padding-top: 4px;
-        padding-bottom: 4px;
+        padding-left: Theme.space-2;
+        padding-right: Theme.space-2;
+        padding-top: Theme.space-1;
+        padding-bottom: Theme.space-1;
         Text {
             max-width: 320px;
             text: root.text;
-            font-size: Theme.caption-size;
+            font-size: root.font-size;
             color: Theme.text-primary;
             wrap: word-wrap;
             vertical-alignment: center;
@@ -77,8 +78,31 @@ export component Tooltip inherits Rectangle {
     }
 }
 
+// The tooltip of `Tip`, fading in over `Theme.motion-open` from the moment it is built.
+export component TipBubble inherits Tooltip {
+    property <bool> shown;
+    opacity: self.shown ? 1 : 0;
+    animate opacity { duration: Theme.motion-open; easing: ease-out; }
+    init => {
+        // An animated binding only animates a change it has seen: read it at 0 before the flip.
+        let start = self.opacity;
+        self.shown = start >= 0;
+    }
+}
+
 // A tooltip that opens after 600 ms of hover and closes when the pointer leaves (Slint 1.18 has
-// no tooltip widget). Place it inside the hovered element; it fills it and takes no input.
+// no tooltip widget). Place it inside the hovered element; it fills it and takes no input. The
+// bubble (in `KeyTipHost`, as a popup would take the focus) is built on each show, so it fades in.
+// What an open hover `Tip` says and where, for `KeyTipHost`. Not a PopupWindow: that takes the focus
+// from the control under the pointer, and the next Tab starts over at the sidebar. `beat` counts
+// while the Tip lives: a Tip removed under the pointer stops it, and the host drops the bubble.
+export global HoverTip {
+    in-out property <string> text;
+    in-out property <length> x;
+    in-out property <length> y;
+    in-out property <int> beat;
+}
+
 export component Tip {
     in property <string> text;
     in property <bool> hovered;
@@ -88,20 +112,27 @@ export component Tip {
         running: root.hovered && root.text != "" && !root.open;
         triggered => {
             root.open = true;
-            popup.show();
+            HoverTip.text = root.text;
+            HoverTip.x = root.absolute-position.x;
+            HoverTip.y = root.absolute-position.y + root.height + Theme.space-1;
+        }
+    }
+    Timer {
+        interval: 150ms;
+        running: root.open;
+        triggered => {
+            HoverTip.beat += 1;
         }
     }
     changed hovered => {
         if (!self.hovered && self.open) {
             self.open = false;
-            popup.close();
+            HoverTip.text = "";
         }
     }
-    popup := PopupWindow {
-        close-policy: no-auto-close;
-        y: root.height + 4px;
-        Tooltip {
-            text: root.text;
+    changed text => {
+        if (self.open) {
+            HoverTip.text = self.text;
         }
     }
 }

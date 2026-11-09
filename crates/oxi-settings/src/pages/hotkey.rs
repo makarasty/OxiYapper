@@ -293,18 +293,17 @@ impl Picker {
         }
         let chord = Chord::from_keys(&pending);
         // A refused chord still shows what was pressed; a valid one shows as it would be saved.
-        let keys = match &chord {
-            Ok(chord) => chord.to_names(),
-            Err(_) => pending.iter().map(|k| k.label().to_owned()).collect(),
-        };
-        let (text, error) = match chord {
-            Ok(chord) => (chord_text(&chord.to_names()), SharedString::new()),
-            Err(ChordError::Empty) => (SharedString::new(), SharedString::new()),
-            Err(e) => (SharedString::new(), e.to_string().into()),
+        let names = chord.as_ref().map_or_else(
+            |_| pending.iter().map(|k| k.as_str().to_owned()).collect(),
+            Chord::to_names,
+        );
+        let error = match chord {
+            Ok(_) | Err(ChordError::Empty) => SharedString::new(),
+            Err(e) => e.to_string().into(),
         };
         self.with(|s| {
-            s.set_pending(text);
-            s.set_pending_keys(string_model(&keys));
+            s.set_pending(chord_text(&names));
+            s.set_pending_keys(string_model(&labels(&names)));
             s.set_error(error);
         });
     }
@@ -325,9 +324,26 @@ impl Drop for Picker {
     }
 }
 
-/// "Ctrl + Win".
+/// What a person reads for config key names: "[" for `BracketLeft`. Modifiers ("Ctrl") are no
+/// `Key` and read as they are.
+pub(crate) fn labels(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .map(|n| {
+            Key::from_name(n)
+                .map_or_else(|| n.clone(), |k| keyboard_layout::chip_label(k).to_owned())
+        })
+        .collect()
+}
+
+/// The chord in words for a screen reader and the "+N" tooltip: "Ctrl + Numpad 1", where the
+/// caps of "1" and "Num1" read the same.
 fn chord_text(names: &[String]) -> SharedString {
-    names.join(" + ").into()
+    let words: Vec<String> = names
+        .iter()
+        .map(|n| Key::from_name(n).map_or_else(|| n.clone(), Key::spoken))
+        .collect();
+    words.join(" + ").into()
 }
 
 fn string_model(items: &[String]) -> ModelRc<SharedString> {
@@ -341,10 +357,10 @@ fn set_link(s: &HotkeyState<'_>, link: Link) {
     s.set_note(link.off_reason(strings::HOTKEY_NEEDS_DAEMON).into());
 }
 
-/// Show `names` as the saved chord: the text for screen readers and the keycaps.
+/// Show the config `names` as the saved chord: the text for screen readers and the keycaps.
 fn set_saved_chord(s: &HotkeyState<'_>, names: &[String]) {
     s.set_chord(chord_text(names));
-    s.set_chord_keys(string_model(names));
+    s.set_chord_keys(string_model(&labels(names)));
 }
 
 #[cfg(test)]
@@ -536,10 +552,11 @@ mod tests {
         let middle = cap(1120.0);
         let large = cap(1600.0);
         let huge = cap(2400.0);
-        // A cap is the unit less its gap: 28 px units give 25 px caps, 43 give 39.6, 52 give 47.8.
+        // A cap is the unit less its gap: 28 px units give 25 px caps, 43.7 (the widest window,
+        // 1280) give 40.2, 52 give 47.8.
         assert!((small - 25.0).abs() < 0.01, "720: {small}");
         assert!(
-            (default_size - 43.0 * 0.92).abs() < 0.5,
+            (default_size - 43.7 * 0.92).abs() < 0.5,
             "1280: {default_size}"
         );
         assert!((32.0..36.0).contains(&middle), "1120: {middle}");
@@ -578,11 +595,13 @@ mod tests {
                 in property <string> family;
                 in property <string> label;
                 in property <length> size;
+                in property <int> weight: 400;
                 out property <length> needed: t.preferred-width;
                 default-font-family: root.family;
                 t := Text {
                     text: root.label;
                     font-size: root.size;
+                    font-weight: root.weight;
                     wrap: no-wrap;
                 }
             }
@@ -599,6 +618,17 @@ mod tests {
         let measure = Measure::new().unwrap();
         measure.set_family(theme.get_font_family());
         for cap in super::keyboard_layout::caps() {
+            // A chord's keycap (`KeycapRow`) is 44 px wide; keep 2 px on each side.
+            measure.set_label(super::keyboard_layout::chip_label(cap.key).into());
+            measure.set_size(theme.get_body_size());
+            measure.set_weight(theme.get_weight_strong());
+            assert!(
+                measure.get_needed() <= 40.0,
+                "{} needs {} px on a chord keycap",
+                measure.get_label(),
+                measure.get_needed()
+            );
+            measure.set_weight(400);
             let from = super::keyboard_layout::full_from(cap.key);
             for unit in [28.0, 30.0, 35.9, 36.0, 40.9, 41.0, 43.0, 52.0] {
                 let label = super::keyboard_layout::cap_label(cap.key, unit >= from);
@@ -613,6 +643,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn twin_keys_read_apart_but_keep_their_caps() {
+        let (window, ipc, _sent) = open("twins");
+        let state = window.global::<HotkeyState>();
+        let caps =
+            |m: slint::ModelRc<slint::SharedString>| slint::Model::iter(&m).collect::<Vec<_>>();
+        one(&window, "Change hotkey").invoke_accessible_default_action();
+        key(&ipc, Key::Digit1, true);
+        key(&ipc, Key::Num1, true);
+        assert!(one(&window, "New hotkey: 1 + Numpad 1").is_valid());
+        assert_eq!(caps(state.get_pending_keys()), ["1", "1"]);
+        one(&window, "Apply hotkey").invoke_accessible_default_action();
+        assert!(one(&window, "1 + Numpad 1").is_valid());
+        assert_eq!(caps(state.get_chord_keys()), ["1", "1"]);
     }
 
     #[test]

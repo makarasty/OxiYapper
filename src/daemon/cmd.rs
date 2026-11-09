@@ -7,8 +7,8 @@
 //! - A worker module exposes `pub fn spawn(rx: Receiver<XCmd>, inbox: Sender<Inbox>, ..) ->
 //!   std::io::Result<JoinHandle<()>>` (a named `thread::Builder`). It handles commands in order
 //!   and returns when `rx` closes, which happens when the coordinator ends. Extra arguments are
-//!   the worker's own: audio the shared `LevelMeter`, whisper the `Layout`, io a sender for IPC
-//!   pushes.
+//!   the worker's own: audio the shared `LevelMeter`, whisper the `Layout` and the `PhaseCell`,
+//!   io a sender for IPC pushes.
 //! - What each worker answers: audio `Inbox::JobAudio`, or `Event::JobAudioEmpty`, for
 //!   `Stop(job)`, plus `Inbox::Capture` with `Event::DeviceLost`, `CaptureFailed` or
 //!   `MicFellBack`; whisper `Event::ModelLoaded` or `ModelFailed` for
@@ -24,10 +24,16 @@
 
 use std::sync::mpsc::Sender;
 
-use oxi_core::config::{Audio, Config, ConfigError, Hotkey, Overlay, OverlayPosition, Paste};
+use oxi_core::config::{
+    Audio, Config, ConfigError, History, Hotkey, Overlay, OverlayPosition, Paste, Sounds,
+};
 use oxi_core::device::DeviceChoice;
-use oxi_core::machine::{EngineWarning, Event, JobId, Notice, OverlayState, Phase};
+use oxi_core::machine::{EngineWarning, Event, JobId, Notice, OverlayState, Phase, Sound};
 use oxi_core::tray::TrayBadge;
+use oxi_core::tuning::SettingsSet;
+use oxi_core::types::Language;
+
+use super::ipc::Pushes;
 
 /// Everything the coordinator hears, on one channel with many senders.
 pub enum Inbox {
@@ -47,6 +53,12 @@ pub enum Inbox {
     EngineWarning(Option<EngineWarning>),
     /// Whisper worker: the device a model load ended up on (`LoadInfo.device`, `cpu` for none).
     Backend(String),
+    /// Sound worker: why a configured sound is not used (a custom file that cannot be read), one
+    /// line each; empty once every sound plays as configured. Dictation goes on with the default.
+    SoundWarnings(Vec<String>),
+    /// History worker: why dictations are not saved (a write or clean-up error); `None` once a
+    /// save or clean-up worked again. Never carries the text.
+    HistoryWarning(Option<String>),
     /// Watcher: a good `config.toml`, with the values the load corrected (`ConfigFile::warnings`).
     /// Held until the machine is Idle, then sent to the workers.
     Config {
@@ -71,6 +83,23 @@ pub enum IpcAsk {
     Status(Sender<StatusReport>),
     /// `PreviewOverlay { position }`: show the pill at `position` for 2 s.
     PreviewOverlay(OverlayPosition),
+    /// `PreviewSound`: play `choice` once at `volume_percent`.
+    PreviewSound { choice: String, volume_percent: u8 },
+    /// `TestTranscribe`: refused while a dictation runs, else handed to the whisper worker.
+    Test(TestJob),
+    /// The settings connection that ran tests closed.
+    TestDone,
+}
+
+/// One recognition test run. `samples` live in memory only. No `Debug`, like every type that
+/// carries speech.
+pub struct TestJob {
+    pub id: u32,
+    pub set: SettingsSet,
+    pub language: Language,
+    pub samples: Vec<f32>,
+    /// The worker queues its `TestResult` here and never waits for the window.
+    pub reply: Pushes,
 }
 
 /// What the IPC `Status` push carries.
@@ -110,11 +139,28 @@ pub enum WhisperCmd {
     Unload,
     /// Transcribe and answer `Inbox::Transcribed`.
     Transcribe { job: JobId, samples: Vec<f32> },
+    /// Recognition test: run one set, answer `Push::TestResult`, write nothing to disk. A run
+    /// that a dictation overtook in the queue answers `Busy` when its turn comes.
+    Test(TestJob),
+    /// Tests are over: drop a model only a test loaded.
+    TestDone,
     /// New active config: model, language, paste trailing space. A changed model reloads on the
     /// next `Preload`.
     Config(Box<Config>),
     /// Re-read `dictionary.txt` and `replace.txt`.
     ReloadAssets,
+}
+
+/// Commands for the sound worker. It answers `Inbox::SoundWarnings` for each `Config`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SoundCmd {
+    /// The active `[sounds]`: loads the start and stop clips now, so a custom file is read once.
+    Config(Sounds),
+    /// A machine effect: plays the configured clip, or the fixed one for cancel and error. Silent
+    /// while `enabled` is false.
+    Play(Sound),
+    /// Settings preview: plays `choice` at once, also when sounds are disabled.
+    Preview { choice: String, volume_percent: u8 },
 }
 
 /// Commands for the paste worker.
@@ -126,7 +172,21 @@ pub enum PasteCmd {
         cfg: Paste,
     },
     /// "Copy last text": set the clipboard only, never send a chord, no answer.
-    CopyOnly(String),
+    CopyOnly { text: String, in_history: bool },
+}
+
+/// Commands for the history worker. It answers `Inbox::HistoryWarning` when the outcome changes.
+/// No `Debug`: `Save` carries the dictated text.
+pub enum HistoryCmd {
+    /// The active `[history]`: applies the retention limits to the folder now (only when on).
+    Config(History),
+    /// Save one dictation as `<stem>.wav` and `<stem>.txt` in the configured folder, then apply
+    /// the retention limits. Nothing is written when `cfg.enabled` is false.
+    Save {
+        samples: Vec<f32>,
+        text: String,
+        cfg: History,
+    },
 }
 
 /// Commands for the io worker, sent by the IPC server; progress goes back over IPC.
@@ -180,6 +240,8 @@ pub struct Workers {
     pub audio: Sender<AudioCmd>,
     pub whisper: Sender<WhisperCmd>,
     pub paste: Sender<PasteCmd>,
+    pub sound: Sender<SoundCmd>,
+    pub history: Sender<HistoryCmd>,
     pub ui: Sender<UiCmd>,
     /// Wakes the UI loop after each `UiCmd` (Windows: `PostMessage(WM_APP)`).
     pub wake_ui: Box<dyn Fn() + Send>,

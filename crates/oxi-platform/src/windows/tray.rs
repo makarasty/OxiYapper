@@ -17,7 +17,10 @@ use oxi_core::APP_NAME;
 use oxi_core::machine::{Event, Notice, Phase};
 use oxi_core::strings;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::Graphics::Gdi::{
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, DeleteObject, HBITMAP,
+};
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows_sys::Win32::System::RemoteDesktop::{
     NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
@@ -30,16 +33,19 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
-    DestroyMenu, DestroyWindow, DispatchMessageW, GetMessageW, HICON, MF_GRAYED, MF_STRING, MSG,
-    PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW, RegisterClassExW, RegisterWindowMessageW,
-    SM_CXSMICON, SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-    TranslateMessage, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_NULL, WM_POWERBROADCAST,
-    WM_SETTINGCHANGE, WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
-    WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    DestroyMenu, DestroyWindow, DispatchMessageW, GetMessageW, HICON, MENUITEMINFOW, MF_GRAYED,
+    MF_STRING, MIIM_BITMAP, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW,
+    RegisterClassExW, RegisterWindowMessageW, SM_CXSMICON, SetForegroundWindow, SetMenuItemInfoW,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP,
+    WM_CONTEXTMENU, WM_LBUTTONUP, WM_NULL, WM_POWERBROADCAST, WM_SETTINGCHANGE,
+    WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP, WTS_SESSION_LOCK,
+    WTS_SESSION_UNLOCK,
 };
 
 use super::wide;
-use crate::draw::tray_icon;
+use tiny_skia::{LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
+
+use crate::draw::{bgra, tray_icon};
 
 /// The [`Waker::wake`] message.
 const WM_WAKE: u32 = WM_APP;
@@ -425,6 +431,8 @@ impl MainLoop {
         if menu.is_null() {
             return Err(io::Error::last_os_error());
         }
+        // Dark menus when the OS call exists; the mark ink follows what the menu really is.
+        let dark = dark_menus();
         let entries = [
             (MenuItem::Settings, strings::MENU_SETTINGS, true),
             (MenuItem::CopyLast, strings::MENU_COPY_LAST, self.copy_last),
@@ -438,6 +446,23 @@ impl MainLoop {
             };
             // SAFETY: `menu` is live and the text outlives the call (Windows copies it).
             unsafe { AppendMenuW(menu, flags, item as usize, wide(text).as_ptr()) };
+        }
+        // The marks beside the items, at the small-icon size of the window's DPI.
+        let marks = self.menu_marks(dark);
+        for (item, bitmap) in [MenuItem::Settings, MenuItem::CopyLast, MenuItem::Quit]
+            .into_iter()
+            .zip(&marks)
+        {
+            let Some(bitmap) = *bitmap else { continue };
+            let info = MENUITEMINFOW {
+                cbSize: size_of::<MENUITEMINFOW>().try_into().unwrap_or(u32::MAX),
+                fMask: MIIM_BITMAP,
+                hbmpItem: bitmap,
+                ..Default::default()
+            };
+            // SAFETY: `menu` is live and `info` outlives the call; the bitmaps are deleted after
+            // the menu is destroyed.
+            unsafe { SetMenuItemInfoW(menu, item as u32, 0, &raw const info) };
         }
         // SAFETY: `hwnd` and `menu` are live. The window must be foreground or the menu does
         // not close on a click outside it; WM_NULL afterwards is the documented companion.
@@ -456,9 +481,30 @@ impl MainLoop {
             DestroyMenu(menu);
             id
         };
+        for bitmap in marks.into_iter().flatten() {
+            // SAFETY: our bitmap, no longer used by the destroyed menu.
+            unsafe { DeleteObject(bitmap) };
+        }
         Ok([MenuItem::Settings, MenuItem::CopyLast, MenuItem::Quit]
             .into_iter()
             .find(|&item| item as i32 == chosen))
+    }
+
+    /// The menu bitmaps of Settings (the Idle yap mark), Copy last text and Quit; a `None` is an
+    /// item without an icon. `dark` is the menu's real theme, so the ink never vanishes.
+    fn menu_marks(&self, dark: bool) -> [Option<HBITMAP>; 3] {
+        // SAFETY: `hwnd` is our live window; both calls only read.
+        let side = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForWindow(self.hwnd)) };
+        let Ok(side) = u32::try_from(side) else {
+            return [None; 3];
+        };
+        let alpha = if self.copy_last { 255 } else { 110 };
+        [
+            tray_icon(Phase::Idle, side, !dark, TrayBadge::None),
+            glyph(Glyph::Copy, side, dark, alpha),
+            glyph(Glyph::Quit, side, dark, 255),
+        ]
+        .map(|pixmap| pixmap.as_ref().and_then(menu_bitmap))
     }
 
     /// The icon's identity plus `flags`, with the current icon and tooltip filled in.
@@ -613,6 +659,151 @@ fn light_taskbar() -> bool {
     status == 0 && data == 1
 }
 
+/// uxtheme ordinal 135: `SetPreferredAppMode` (1903 and later; 2 is `ForceDark`) or
+/// `AllowDarkModeForApp` (1809; takes a BOOL, so 2 reads as "allow").
+type SetAppMode = unsafe extern "system" fn(i32) -> i32;
+/// `FlushMenuThemes` (uxtheme ordinal 136).
+type FlushMenus = unsafe extern "system" fn();
+
+/// Forces dark menus for this process through the undocumented uxtheme calls (SPEC: dark at
+/// least, light only when the calls are missing). `false` when either is missing: the menu
+/// stays light and works as before.
+fn apply_menu_mode(set: Option<SetAppMode>, flush: Option<FlushMenus>) -> bool {
+    let (Some(set), Some(flush)) = (set, flush) else {
+        return false;
+    };
+    // SAFETY: both have the signatures above on every Windows 10 1809 and later; the argument 2
+    // is ForceDark on 1903+ and a nonzero "allow" on 1809.
+    unsafe {
+        set(2);
+        flush();
+    }
+    true
+}
+
+/// A menu bitmap of a [`Glyph`].
+#[derive(Clone, Copy)]
+enum Glyph {
+    Copy,
+    Quit,
+}
+
+/// Draws the outline of `kind` (a 16 unit grid after the Fluent copy and dismiss icons, 1 unit
+/// stroke) in near-white ink for a dark menu or near-black for a light one; `alpha` dims a
+/// disabled item.
+fn glyph(kind: Glyph, side: u32, dark: bool, alpha: u8) -> Option<Pixmap> {
+    let mut pixmap = Pixmap::new(side, side)?;
+    let mut paint = Paint::default();
+    let v = if dark { 245 } else { 32 };
+    paint.set_color_rgba8(v, v, v, alpha);
+    paint.anti_alias = true;
+    let stroke = Stroke {
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        ..Default::default()
+    };
+    let mut pb = PathBuilder::new();
+    match kind {
+        Glyph::Copy => {
+            // The sheet behind, open where the front sheet covers it, then the front sheet.
+            pb.move_to(5.5, 11.5);
+            pb.line_to(4.0, 11.5);
+            pb.quad_to(3.0, 11.5, 3.0, 10.5);
+            pb.line_to(3.0, 3.5);
+            pb.quad_to(3.0, 2.5, 4.0, 2.5);
+            pb.line_to(9.0, 2.5);
+            pb.quad_to(10.0, 2.5, 10.0, 3.5);
+            pb.line_to(10.0, 4.5);
+            pb.move_to(7.5, 5.0);
+            pb.line_to(12.0, 5.0);
+            pb.quad_to(13.0, 5.0, 13.0, 6.0);
+            pb.line_to(13.0, 12.5);
+            pb.quad_to(13.0, 13.5, 12.0, 13.5);
+            pb.line_to(7.5, 13.5);
+            pb.quad_to(6.5, 13.5, 6.5, 12.5);
+            pb.line_to(6.5, 6.0);
+            pb.quad_to(6.5, 5.0, 7.5, 5.0);
+            pb.close();
+        }
+        Glyph::Quit => {
+            pb.move_to(3.5, 3.5);
+            pb.line_to(12.5, 12.5);
+            pb.move_to(12.5, 3.5);
+            pb.line_to(3.5, 12.5);
+        }
+    }
+    let scale = f32::from(u16::try_from(side).ok()?) / 16.0;
+    pixmap.stroke_path(
+        &pb.finish()?,
+        &paint,
+        &stroke,
+        Transform::from_scale(scale, scale),
+        None,
+    );
+    Some(pixmap)
+}
+
+/// A 32-bit menu bitmap (premultiplied BGRA) of `pixmap`; `None` when it cannot be made.
+fn menu_bitmap(pixmap: &Pixmap) -> Option<HBITMAP> {
+    let side = i32::try_from(pixmap.width()).ok()?;
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>().try_into().ok()?,
+            biWidth: side,
+            biHeight: -side,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits = ptr::null_mut();
+    // SAFETY: `info` and `bits` are live locals; a null DC with DIB_RGB_COLORS is allowed.
+    let bitmap = unsafe {
+        CreateDIBSection(
+            ptr::null_mut(),
+            &raw const info,
+            DIB_RGB_COLORS,
+            &raw mut bits,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if bitmap.is_null() || bits.is_null() {
+        return None;
+    }
+    let pixels = bgra(pixmap);
+    // SAFETY: a `side` x `side` 32-bit DIB holds exactly `pixels.len()` bytes at `bits`.
+    unsafe { ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast(), pixels.len()) };
+    Some(bitmap)
+}
+
+/// `true` when the menus of this process are now dark.
+fn dark_menus() -> bool {
+    // SAFETY: a NUL-terminated name that outlives the call; uxtheme is already loaded by the
+    // shell controls, and the module stays loaded.
+    let module = unsafe { LoadLibraryW(wide("uxtheme.dll").as_ptr()) };
+    if module.is_null() {
+        return false;
+    }
+    // SAFETY: an ordinal is passed as a pointer-sized integer (MAKEINTRESOURCE); the transmutes
+    // only change the function type of an address that is `None` when the export is missing.
+    let (set, flush) = unsafe {
+        (
+            GetProcAddress(module, ptr::without_provenance(135)),
+            GetProcAddress(module, ptr::without_provenance(136)),
+        )
+    };
+    // SAFETY: see above.
+    unsafe {
+        apply_menu_mode(
+            set.map(|f| std::mem::transmute::<_, SetAppMode>(f)),
+            flush.map(|f| std::mem::transmute::<_, FlushMenus>(f)),
+        )
+    }
+}
+
 fn shell(message: NOTIFY_ICON_MESSAGE, data: &NOTIFYICONDATAW) -> io::Result<()> {
     // SAFETY: `data` is a fully initialised NOTIFYICONDATAW with its own cbSize.
     if unsafe { Shell_NotifyIconW(message, data) } == 0 {
@@ -658,6 +849,8 @@ fn copy_wide(dst: &mut [u16], s: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicI32, Ordering};
+
     use super::*;
 
     #[test]
@@ -693,6 +886,49 @@ mod tests {
         assert!(!name(""));
         // SAFETY: null is allowed.
         assert!(!unsafe { names(0, "ImmersiveColorSet") });
+    }
+
+    static MODE: AtomicI32 = AtomicI32::new(-1);
+    unsafe extern "system" fn fake_set(mode: i32) -> i32 {
+        MODE.store(mode, Ordering::SeqCst);
+        0
+    }
+    unsafe extern "system" fn fake_flush() {}
+
+    #[test]
+    fn menu_mode_is_always_dark_and_a_missing_export_leaves_it_light() {
+        assert!(apply_menu_mode(Some(fake_set), Some(fake_flush)));
+        assert_eq!(MODE.load(Ordering::SeqCst), 2);
+        MODE.store(-1, Ordering::SeqCst);
+        assert!(!apply_menu_mode(None, Some(fake_flush)));
+        assert!(!apply_menu_mode(Some(fake_set), None));
+        assert_eq!(MODE.load(Ordering::SeqCst), -1);
+    }
+
+    #[test]
+    fn glyph_ink_is_light_on_a_dark_menu_dark_on_a_light_one_and_dims_when_disabled() {
+        for kind in [Glyph::Copy, Glyph::Quit] {
+            let peak = |dark, alpha| {
+                let p = glyph(kind, 16, dark, alpha).unwrap();
+                p.pixels().iter().map(|c| c.alpha()).max().unwrap_or(0)
+            };
+            assert_eq!(peak(true, 255), 255);
+            assert!((1..200).contains(&peak(true, 110)));
+            let on_dark = glyph(kind, 16, true, 255).unwrap();
+            assert!(
+                on_dark
+                    .pixels()
+                    .iter()
+                    .any(|c| c.alpha() > 0 && c.red() > 200)
+            );
+            let on_light = glyph(kind, 16, false, 255).unwrap();
+            assert!(
+                on_light
+                    .pixels()
+                    .iter()
+                    .any(|c| c.alpha() > 0 && c.red() < 64)
+            );
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 // Slider and its paired number field (PowerToys pattern: both bound to one value). Our own,
 // because std `Slider` and `SpinBox` paint the system accent.
 import { Theme, Shell } from "../tokens.slint";
-import { FocusRing, KeyFocus, Caption } from "base.slint";
+import { FocusRing, KeyFocus } from "base.slint";
 
 // Rail 4 px, accent fill from the minimum (or from 0 when `bipolar`), 20 px thumb with an accent
 // dot. Left/Right step, PgUp/PgDn ten steps, Home/End the ends; a double click on the thumb
@@ -24,6 +24,8 @@ export component Slider {
     property <bool> hover: root.live && (touch.has-hover || root.force-hover);
     property <bool> down: root.live && (touch.pressed || root.force-pressed);
     property <bool> key-focus;
+    // Whether the keyboard focus ring is drawn (tests: a click draws none).
+    out property <bool> ring: root.key-focus && fs.has-focus;
     property <length> travel: root.width - 20px;
     property <float> span: max(root.maximum - root.minimum, 0.000001);
     property <length> thumb-x: (clamp(root.value, root.minimum, root.maximum) - root.minimum) / root.span * root.travel;
@@ -63,34 +65,34 @@ export component Slider {
         x: 10px;
         width: root.travel;
         height: 4px;
-        border-radius: 2px;
+        border-radius: Theme.radius-round;
         background: Theme.bg-inset;
     }
     Rectangle {
         x: 10px + min(root.origin-x, root.thumb-x);
         width: abs(root.thumb-x - root.origin-x);
         height: 4px;
-        border-radius: 2px;
+        border-radius: Theme.radius-round;
         background: root.live ? Theme.accent : Theme.text-disabled;
     }
     thumb := Rectangle {
         x: root.thumb-x;
         width: 20px;
         height: 20px;
-        border-radius: 10px;
+        border-radius: Theme.radius-round;
         background: Theme.bg-control;
         border-width: 1px;
         border-color: Theme.stroke-control;
         Rectangle {
             width: root.down ? 10px : root.hover ? 14px : 12px;
             height: self.width;
-            border-radius: self.width / 2;
+            border-radius: Theme.radius-round;
             background: root.live ? (root.down ? Theme.accent-pressed : Theme.accent) : Theme.text-disabled;
-            animate width { duration: 100ms; }
+            animate width { duration: Theme.motion-quick; easing: ease-out; }
         }
         FocusRing {
             shown: root.force-focus || (root.key-focus && fs.has-focus);
-            radius: 10px;
+            radius: Theme.radius-round;
         }
     }
     touch := TouchArea {
@@ -98,6 +100,8 @@ export component Slider {
         pointer-event(event) => {
             if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
                 fs.focus();
+                // After `focus()`: its reason is not a pointer click, and this was one.
+                root.key-focus = false;
                 root.set-x(self.mouse-x);
             }
         }
@@ -144,7 +148,7 @@ export component Slider {
 // parse, round to the step, clamp, then `changed` (the slider's callback). Text that is not a
 // number (empty, nan, inf included) gets a red stroke and reverts. Only text the user changed is
 // committed, so a config value off the step survives a pass through the field. `signed` shows "+3".
-// `zero-text` ("never") is written under the field while the value is 0.
+// `zero-text` ("never") stands in the field for a 0 and its unit, until the field is focused.
 // Our own frame around a `TextInput` (not `LineEdit`): the suffix needs room inside the frame,
 // and the focus underline must be our teal, not the system accent.
 export component NumberField {
@@ -170,13 +174,16 @@ export component NumberField {
     // The text differs from `shown` because the user typed.
     property <bool> dirty;
     property <bool> focused: root.force-focus || input.has-focus;
+    property <bool> zero-shown: root.zero-text != "" && root.value == 0 && !root.focused;
 
     // `is-float` takes "nan" and "inf"; both fail the comparison.
     pure function parses(text: string) -> bool {
         return text.is-float() && abs(text.to-float()) < 1000000;
     }
     public function set(v: float) {
-        let c = clamp(root.minimum + round((v - root.minimum) / root.step) * root.step, root.minimum, root.maximum);
+        // A stored value outside the range (a hand-edited config) is a bound itself: a step or a
+        // typed value never moves it the wrong way, so it is lowered only by the user's choice.
+        let c = clamp(root.minimum + round((v - root.minimum) / root.step) * root.step, min(root.minimum, root.value), max(root.maximum, root.value));
         if (c != root.value) {
             root.value = c;
             root.changed(c);
@@ -269,7 +276,8 @@ export component NumberField {
                         horizontal-alignment: right;
                         vertical-alignment: center;
                         font-size: Theme.body-size;
-                        color: root.live ? Theme.text-primary : Theme.text-disabled;
+                        // The 0 stays in the input, so a click on "never" edits it as usual.
+                        color: root.zero-shown ? transparent : root.live ? Theme.text-primary : Theme.text-disabled;
                         selection-background-color: Theme.accent;
                         selection-foreground-color: Theme.on-accent;
                         accessible-role: none;
@@ -285,7 +293,7 @@ export component NumberField {
                             }
                         }
                     }
-                    if root.unit != "": Text {
+                    if root.unit != "" && !root.zero-shown: Text {
                         text: root.unit;
                         font-size: Theme.caption-size;
                         color: root.live ? Theme.text-secondary : Theme.text-disabled;
@@ -297,16 +305,22 @@ export component NumberField {
             // Fluent focus underline, in our accent.
             Rectangle {
                 visible: root.focused && root.live;
-                x: 1px;
+                x: Theme.radius-control;
                 y: parent.height - 2px;
-                width: parent.width - 2px;
+                width: parent.width - 2 * Theme.radius-control;
                 height: 2px;
+                border-radius: Theme.radius-round;
                 background: root.invalid ? Theme.error-text : Theme.accent;
             }
-        }
-        if root.zero-text != "" && root.value == 0: Caption {
-            text: root.zero-text;
-            horizontal-alignment: right;
+            if root.zero-shown: Text {
+                x: Theme.space-2;
+                width: parent.width - 2 * Theme.space-2;
+                text: root.zero-text;
+                font-size: Theme.body-size;
+                color: root.live ? Theme.text-primary : Theme.text-disabled;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
         }
     }
 }

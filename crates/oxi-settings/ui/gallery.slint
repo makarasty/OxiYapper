@@ -3,10 +3,10 @@
 // it, `tests/gallery.rs` renders it to PNGs. Hover/pressed/focused come from the `force-*`
 // properties, since a static shot has no mouse.
 import { ScrollView, Palette } from "std-widgets.slint";
-import { Theme, Shell, Contrast, Icons, Caption, Tooltip, Button, ButtonKind, Switch, Radio, Slider, NumberField, Segmented, Combo, TextField, TextArea, PageHeader, Group, Card, ClickCard, Row, ToggleRow, SliderRow, TileItem, Tile, TilePicker, ScreenPicker, Keycap, KeycapRow, Severity, Banner, Note, Meter, ProgressBar, BadgeKind, Badge, StatCard, MonthLabel, ActivityHeatmap } from "theme/index.slint";
+import { Theme, Shell, Contrast, Icons, Caption, Tooltip, TipBubble, Button, ButtonKind, Switch, Radio, Slider, NumberField, Segmented, SubTabs, SubTabPane, Combo, TextField, TextArea, PageHeader, Group, Card, ClickCard, Row, ToggleRow, SliderRow, TileItem, Tile, TilePicker, PositionTiles, GalleryTile, TileGallery, Keycap, KeycapRow, Severity, Banner, Note, WarningSlot, Toast, ToastHost, Meter, ProgressBar, BadgeKind, Badge, StatCard, MonthLabel, ActivityHeatmap } from "theme/index.slint";
 
 // The test reads token values and the contrast function through these.
-export { Theme, Contrast }
+export { Theme, Contrast, GalleryTile }
 
 struct IconEntry {
     name: string,
@@ -67,6 +67,21 @@ component Cell inherits VerticalLayout {
     @children
 }
 
+// One state of a boxed component, all at one size (UI rule 5).
+component StateBox inherits VerticalLayout {
+    in property <string> label;
+    in property <length> box-height: 240px;
+    width: 640px;
+    spacing: Theme.space-1;
+    Remark {
+        text: root.label;
+    }
+    Rectangle {
+        height: root.box-height;
+        @children
+    }
+}
+
 // The variant name at the left of a grid row.
 component RowLabel inherits Text {
     width: 110px;
@@ -101,7 +116,7 @@ component SwatchView inherits VerticalLayout {
             spacing: 8px;
             Rectangle {
                 width: 28px;
-                border-radius: 3px;
+                border-radius: Theme.radius-control;
                 background: root.s.c;
             }
             Text {
@@ -155,7 +170,6 @@ component GallerySheet inherits VerticalLayout {
         { name: "accent-tint", c: Theme.accent-tint, bg: Theme.bg-card, bg-name: "", ratio: false },
         { name: "accent-text", c: Theme.accent-text, bg: Theme.accent-badge, bg-name: "accent-badge", ratio: true },
         { name: "accent-badge", c: Theme.accent-badge, bg: Theme.bg-card, bg-name: "", ratio: false },
-        { name: "pill-teal", c: Theme.pill-teal, bg: Theme.bg-page, bg-name: "", ratio: false },
         { name: "error-text", c: Theme.error-text, bg: Theme.bg-card, bg-name: "bg-card", ratio: true },
         { name: "error-text", c: Theme.error-text, bg: Theme.error-fill, bg-name: "error-fill", ratio: true },
         { name: "warning-text", c: Theme.warning-text, bg: Theme.warning-fill, bg-name: "warning-fill", ratio: true },
@@ -234,6 +248,78 @@ component GallerySheet inherits VerticalLayout {
         { icon: Icons.dark-theme-24, icon-selected: Icons.dark-theme-24-filled, title: "System", caption: "" },
         { icon: Icons.weather-sunny-24, icon-selected: Icons.weather-sunny-24-filled, title: "Light", caption: "" },
         { icon: Icons.weather-moon-24, icon-selected: Icons.weather-moon-24-filled, title: "Dark", caption: "" },
+    ];
+    property <[GalleryTile]> sound-tiles: [
+        { icon: Icons.speaker-2, title: "Soft click", caption: "Built in" },
+        { icon: Icons.speaker-2, title: "Bell", caption: "Built in", hint: "A short bell." },
+        { picture: Icons.logo, title: "OxiYapper", caption: "Full-colour picture" },
+    ];
+    property <[GalleryTile]> disabled-tiles: [
+        { icon: Icons.speaker-2, title: "Soft click", caption: "Disabled, selected", hint: "Start OxiYapper to preview.", disabled: true },
+        { icon: Icons.speaker-2, title: "Bell", caption: "Disabled", hint: "Start OxiYapper to preview.", disabled: true },
+        { icon: Icons.speaker-2, title: "Own file", caption: "Enabled" },
+    ];
+    property <[GalleryTile]> many-tiles: [
+        { icon: Icons.desktop, title: "Discord 1", caption: "Push to talk" },
+        { icon: Icons.desktop, title: "Discord (modded) 1", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Firefox 1", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Chrome 1", caption: "Push to talk" },
+        { icon: Icons.desktop, title: "A very long application name that needs an ellipsis", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Obsidian 1", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Notepad 1", caption: "Push to talk" },
+        { icon: Icons.desktop, title: "Word 1", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Excel 1", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Outlook 1", caption: "Push to talk" },
+        { icon: Icons.desktop, title: "Discord 2", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Discord (modded) 2", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Firefox 2", caption: "Push to talk" },
+        { icon: Icons.desktop, title: "Chrome 2", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Telegram 2", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Obsidian 2", caption: "Push to talk" },
+        { icon: Icons.desktop, title: "Notepad 2", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Word 2", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Excel 2", caption: "Push to talk" },
+        { icon: Icons.desktop, title: "Outlook 2", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Discord 3", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Discord (modded) 3", caption: "Push to talk" },
+        { icon: Icons.desktop, title: "Firefox 3", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Chrome 3", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Telegram 3", caption: "Push to talk" },
+        { icon: Icons.desktop, title: "Obsidian 3", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Notepad 3", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Word 3", caption: "Push to talk" },
+        { icon: Icons.desktop, title: "Excel 3", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Outlook 3", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Discord 4", caption: "Push to talk" },
+        { icon: Icons.desktop, title: "Discord (modded) 4", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Firefox 4", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Chrome 4", caption: "Push to talk" },
+        { icon: Icons.desktop, title: "Telegram 4", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Obsidian 4", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Notepad 4", caption: "Push to talk" },
+        { icon: Icons.desktop, title: "Word 4", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Excel 4", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Outlook 4", caption: "Push to talk" },
+        { icon: Icons.desktop, title: "Discord 5", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Discord (modded) 5", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Firefox 5", caption: "Push to talk" },
+        { icon: Icons.desktop, title: "Chrome 5", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Telegram 5", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Obsidian 5", caption: "Push to talk" },
+        { icon: Icons.desktop, title: "Notepad 5", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Word 5", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Excel 5", caption: "Push to talk" },
+        { icon: Icons.desktop, title: "Outlook 5", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Discord 6", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Discord (modded) 6", caption: "Push to talk" },
+        { icon: Icons.desktop, title: "Firefox 6", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Chrome 6", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Telegram 6", caption: "Push to talk" },
+        { icon: Icons.desktop, title: "Obsidian 6", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Notepad 6", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Word 6", caption: "Push to talk" },
+        { icon: Icons.desktop, title: "Excel 6", caption: "Toggle" },
+        { icon: Icons.desktop, title: "Outlook 6", caption: "Toggle" },
     ];
     property <[string]> positions: ["Top left", "Top centre", "Top right", "Bottom left", "Bottom centre", "Bottom right"];
     property <[float]> bars: [0.1, 0.2, 0.15, 0.3, 0.5, 0.42, 0.6, 0.35, 0.2, 0.7, 0.85, 1.0, 0.9, 0.55, 0.4, 0.3, 0.45, 0.62, 0.5, 0.33, 0.2, 0.12, 0.25, 0.4, 0.58, 0.72, 0.5, 0.3, 0.2, 0.1, 0.18, 0.3, 0.52, 0.66, 0.48, 0.3];
@@ -324,8 +410,8 @@ component GallerySheet inherits VerticalLayout {
     }
 
     Section {
-        title: "Spacing and radii";
-        note: "4 px base. Fixed uses: page 32 (16 under 900 px), title 28/24, groups 32, header 8, cards 4, card padding 16/12, icon gap 16, controls 8, tiles 8, keycaps 4.";
+        title: "Spacing, radii, motion";
+        note: "4 px base: 4 inside a control, 8 between siblings in a row, 12 card padding vertical, 16 card padding horizontal and icon gap, 24 under the title, 32 page padding and between groups. Radii: 2 cells, 4 controls and badges, 8 cards, round for circles and pills.";
         HorizontalLayout {
             spacing: Theme.space-4;
             alignment: start;
@@ -348,11 +434,12 @@ component GallerySheet inherits VerticalLayout {
                 width: Theme.space-8;
             }
             for r in [
+                { name: "small 2", radius: Theme.radius-small },
                 { name: "control 4", radius: Theme.radius-control },
                 { name: "keycap @28", radius: Theme.radius-keycap(28px) },
                 { name: "keycap @52", radius: Theme.radius-keycap(52px) },
                 { name: "card 8", radius: Theme.radius-card },
-                { name: "pill", radius: 24px },
+                { name: "round", radius: Theme.radius-round },
             ]: VerticalLayout {
                 spacing: Theme.space-1;
                 Rectangle {
@@ -367,6 +454,9 @@ component GallerySheet inherits VerticalLayout {
                     text: r.name;
                 }
             }
+        }
+        Remark {
+            text: "Motion, read from the tokens: quick " + round(Theme.motion-quick / 1ms) + " ms (knob, thumb, hover fill), open " + round(Theme.motion-open / 1ms) + " ms (popups), ease-out; Shell.reduced-motion " + (Shell.reduced-motion ? "on: both 0." : "off.");
         }
     }
 
@@ -403,7 +493,7 @@ component GallerySheet inherits VerticalLayout {
 
     Section {
         title: "Button";
-        note: "Disabled: text-disabled, fill at 50 %, reason in the tooltip. Locked config: buttons take enabled: false. Tooltip: hover 600 ms.";
+        note: "Disabled: text-disabled, fill at 50 %, reason in the tooltip. Locked config: buttons take enabled: false. Tooltip: hover 600 ms. Danger (Cancel, Remove, Stop) rests grey and turns error-fill / error-text under the pointer, error-fill-pressed while held.";
         GridRow {
             label: "";
             Cell {
@@ -426,7 +516,7 @@ component GallerySheet inherits VerticalLayout {
             { name: "primary", kind: ButtonKind.primary, text: "Apply", icon: Icons.add-16 },
             { name: "secondary", kind: ButtonKind.secondary, text: "Download", icon: Icons.arrow-download-16 },
             { name: "subtle", kind: ButtonKind.subtle, text: "Open file", icon: Icons.open-folder-16 },
-            { name: "danger", kind: ButtonKind.danger, text: "Turn off", icon: Icons.delete-16 },
+            { name: "danger", kind: ButtonKind.danger, text: "Cancel", icon: Icons.dismiss-16 },
             { name: "icon", kind: ButtonKind.icon, text: "Change hotkey", icon: Icons.edit-16 },
         ]: VerticalLayout {
             spacing: Theme.space-2;
@@ -664,6 +754,65 @@ component GallerySheet inherits VerticalLayout {
                     items: ["RU", "EN", "Auto"];
                     selected: 1;
                     locked: true;
+                }
+            }
+        }
+    }
+
+    Section {
+        title: "Sub-tabs";
+        note: "Under the page title. The open tab: semibold, 3 px accent underline. Left/Right/Home/End switch, Tab leaves the bar. Short of room, the side padding goes first; labels stay whole.";
+        GridRow {
+            label: "states";
+            for s[i] in ["rest, Model open", "hover Settings", "pressed Settings", "focused (keyboard)"]: Cell {
+                width: 280px;
+                label: s;
+                SubTabs {
+                    items: ["Model", "Settings", "Advanced"];
+                    selected: 0;
+                    force-hover: i == 1 ? 1 : -1;
+                    force-pressed: i == 2 ? 1 : -1;
+                    force-focus: i == 3;
+                }
+            }
+        }
+        GridRow {
+            label: "2, 3 tabs";
+            Cell {
+                width: 280px;
+                label: "2 tabs";
+                SubTabs {
+                    items: ["Dictionary", "Replacements"];
+                    selected: 1;
+                }
+            }
+            Cell {
+                width: 400px;
+                label: "3 tabs, a count, hover on the open one";
+                SubTabs {
+                    items: ["Dictionary", "Replacements", "Per-app rules"];
+                    counts: [-1, -1, 3];
+                    selected: 2;
+                    force-hover: 2;
+                }
+            }
+        }
+        GridRow {
+            label: "5 tabs";
+            Cell {
+                width: 560px;
+                label: "room to spare";
+                SubTabs {
+                    items: ["Microphone", "Recording", "Start sound", "Stop sound", "Advanced"];
+                    selected: 3;
+                }
+            }
+            Cell {
+                width: 430px;
+                label: "narrow window: 430 px";
+                SubTabs {
+                    items: ["Microphone", "Recording", "Start sound", "Stop sound", "Advanced"];
+                    selected: 3;
                 }
             }
         }
@@ -999,37 +1148,164 @@ component GallerySheet inherits VerticalLayout {
             VerticalLayout {
                 spacing: Theme.space-2;
                 Remark {
-                    text: "ScreenPicker: Bottom centre picked, hover Top left";
+                    text: "PositionTiles: Bottom centre picked";
                 }
-                ScreenPicker {
-                    width: 320px;
+                PositionTiles {
                     names: root.positions;
                     selected: 4;
-                    force-hover: 0;
                 }
             }
-            VerticalLayout {
-                spacing: Theme.space-2;
-                Remark {
-                    text: "ScreenPicker focused";
+        }
+    }
+
+    Section {
+        title: "Tile gallery";
+        note: "TileGallery: the grid scrolls inside its box, the page does not. Arrows move the focus ring, Enter or Space picks. A long title is cut and stands in full in the tooltip. Disabled tiles keep their tooltip.";
+        HorizontalLayout {
+            spacing: Theme.space-8;
+            alignment: start;
+            StateBox {
+                label: "Empty";
+                TileGallery {
+                    empty-text: "Nothing found on this computer.";
                 }
-                ScreenPicker {
-                    width: 320px;
-                    names: root.positions;
-                    selected: 2;
+            }
+            StateBox {
+                label: "Found apps, nothing selected; one with no icon";
+                TileGallery {
+                    tiles: [
+                        { picture: Icons.logo, title: "OxiYapper", caption: "oxiyapper.exe" },
+                        { title: "Synth App", caption: "synthapp.exe" },
+                    ];
+                    fallback-icon: Icons.app-generic;
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-8;
+            alignment: start;
+            StateBox {
+                label: "Selected Soft click, hover Bell, keyboard focus";
+                TileGallery {
+                    tiles: root.sound-tiles;
+                    selected: 0;
+                    force-hover: 1;
                     force-focus: true;
                 }
             }
+            StateBox {
+                label: "Disabled tiles, one of them selected";
+                TileGallery {
+                    tiles: root.disabled-tiles;
+                    selected: 0;
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-8;
+            alignment: start;
+            StateBox {
+                label: "Locked (read-only config)";
+                TileGallery {
+                    tiles: root.sound-tiles;
+                    selected: 1;
+                    locked: true;
+                }
+            }
+            StateBox {
+                label: "60 tiles, tile 32 selected and scrolled into view";
+                TileGallery {
+                    tiles: root.many-tiles;
+                    selected: 31;
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-8;
+            alignment: start;
+            StateBox {
+                label: "60 tiles from the top, keyboard focus on tile 5 (long name)";
+                TileGallery {
+                    tiles: root.many-tiles;
+                    selected: 4;
+                    force-focus: true;
+                }
+            }
+        }
+    }
+
+    Section {
+        title: "Warning slot and toast";
+        note: "WarningSlot: the '!' keeps its width while empty, the text is its tooltip on hover and keyboard focus. Toast: lies over the bottom of the window, pushes nothing, leaves after 3 s; the newest replaces the current one.";
+        HorizontalLayout {
+            spacing: Theme.space-8;
+            alignment: start;
             VerticalLayout {
+                width: 640px;
                 spacing: Theme.space-2;
                 Remark {
-                    text: "ScreenPicker locked";
+                    text: "No warning: the slot stays, the control does not move";
                 }
-                ScreenPicker {
-                    width: 320px;
-                    names: root.positions;
-                    selected: 4;
-                    locked: true;
+                Card {
+                    Row {
+                        icon: Icons.mic;
+                        title: "Device";
+                        Combo {
+                            model: root.devices;
+                        }
+                    }
+                }
+                Remark {
+                    text: "Warning: the icon in the same slot; the tooltip below shows its text on hover";
+                }
+                Card {
+                    Row {
+                        icon: Icons.mic;
+                        title: "Device";
+                        warning: "Not connected: Headset (Bluetooth). Using the system default.";
+                        Combo {
+                            model: root.devices;
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    Tooltip {
+                        text: "Not connected: Headset (Bluetooth). Using the system default.";
+                    }
+                }
+            }
+            VerticalLayout {
+                width: 640px;
+                spacing: Theme.space-2;
+                StateBox {
+                    box-height: 96px;
+                    label: "ToastHost over content (real, gone 3 s after the sheet opens)";
+                    ToastHost {
+                        width: 100%;
+                        height: 100%;
+                        init => {
+                            Toast.show("Copied to the clipboard.");
+                        }
+                    }
+                }
+                Remark {
+                    text: "A long toast wraps inside its 320 px bubble";
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    Tooltip {
+                        text: "Could not read the sound file. OxiYapper keeps using the built-in sound until you pick another one.";
+                    }
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    Button {
+                        text: "Show toast";
+                        clicked => {
+                            Toast.show("Copied to the clipboard.");
+                        }
+                    }
                 }
             }
         }
@@ -1471,10 +1747,134 @@ component GallerySheet inherits VerticalLayout {
 }
 
 // The interactive gallery (`cargo run -p oxi-settings --example gallery`): theme switch on top.
+// Test surface: `tests/gallery.rs` reads the bubble's fade under the mock clock.
+export component TipFadeProbe inherits Window {
+    out property <float> bubble-opacity: bubble.opacity;
+    bubble := TipBubble {
+        text: "Tip";
+    }
+}
+
+// Test surface: `tests/gallery.rs` walks a gallery by keyboard; the owner side keeps `selected`.
+export component TileGalleryProbe inherits Window {
+    in property <[GalleryTile]> tiles;
+    in-out property <int> selected: -1;
+    in-out property <bool> locked;
+    out property <int> picks: self.count;
+    out property <int> cursor: g.cursor;
+    out property <int> columns: g.columns;
+    out property <length> scrolled: g.scrolled;
+    property <int> count;
+    width: 560px;
+    height: 360px;
+    g := TileGallery {
+        tiles: root.tiles;
+        selected: root.selected;
+        locked: root.locked;
+        picked(i) => {
+            root.selected = i;
+            root.count += 1;
+        }
+    }
+}
+
+// Test surface: `tests/gallery.rs` walks the bar by keyboard; pane 0 has a field with unsaved text,
+// pane 1 is taller than the window's share of it.
+export component SubTabsProbe inherits Window {
+    in-out property <int> selected;
+    out property <int> picks: self.count;
+    out property <bool> ring: bar.ring;
+    out property <string> draft: field.text;
+    out property <bool> draft-focused: field.has-focus;
+    out property <bool> other-focused: other.has-focus;
+    out property <length> panes-min: panes.min-height;
+    // The pane fills the host: the field is as wide as the window.
+    out property <length> draft-width: field.width;
+    property <int> count;
+    width: 480px;
+    height: 300px;
+    VerticalLayout {
+        bar := SubTabs {
+            items: ["One", "Two", "Three"];
+            selected: root.selected;
+            picked(i) => {
+                root.selected = i;
+                root.count += 1;
+            }
+        }
+        panes := Rectangle {
+            vertical-stretch: 1;
+            SubTabPane {
+                shown: root.selected == 0;
+                field := TextField { }
+            }
+            SubTabPane {
+                shown: root.selected == 1;
+                Rectangle {
+                    min-height: 200px;
+                    other := FocusScope { }
+                }
+            }
+        }
+    }
+}
+
+// Test surface: `tests/gallery.rs` clicks each control that takes the focus in its click handler
+// (UI rule 17: a click draws no ring). Stacked from y 0: Segmented, TilePicker, Slider.
+export component ClickRingProbe inherits Window {
+    out property <bool> segmented-ring: seg.ring;
+    out property <bool> tiles-ring: tiles.ring;
+    out property <bool> slider-ring: slider.ring;
+    out property <length> tiles-y: tiles.y;
+    out property <length> slider-y: slider.y + slider.height / 2;
+    in-out property <int> picked;
+    width: 480px;
+    height: 200px;
+    VerticalLayout {
+        alignment: start;
+        seg := Segmented {
+            items: ["One", "Two"];
+            selected: root.picked;
+            locked: false;
+            picked(i) => {
+                root.picked = i;
+            }
+        }
+        tiles := TilePicker {
+            tiles: [{ title: "One" }, { title: "Two" }];
+            selected: root.picked;
+            locked: false;
+            tile-height: 40px;
+            picked(i) => {
+                root.picked = i;
+            }
+        }
+        slider := Slider {
+            locked: false;
+        }
+    }
+}
+
+// Test surface: a destructive icon button (a rule's Remove) at 0,0 turns red under the pointer.
+export component IconDangerProbe inherits Window {
+    out property <bool> red: remove.red;
+    width: 100px;
+    height: 100px;
+    remove := Button {
+        x: 0;
+        y: 0;
+        kind: ButtonKind.icon;
+        destructive: true;
+        icon: Icons.delete-16;
+        text: "Remove";
+    }
+}
+
 export component GalleryWindow inherits Window {
     in-out property <bool> dark;
     title: "OxiYapper design system";
     default-font-family: Theme.font-family;
+    default-font-size: Theme.body-size;
     preferred-width: 1400px;
     preferred-height: 900px;
     background: Theme.bg-page;
@@ -1524,6 +1924,7 @@ export component GalleryShot inherits Window {
     in-out property <bool> dark;
     out property <length> sheet-height: sheet.preferred-height;
     default-font-family: Theme.font-family;
+    default-font-size: Theme.body-size;
     background: Theme.bg-page;
     function apply-theme() {
         Palette.color-scheme = root.dark ? ColorScheme.dark : ColorScheme.light;

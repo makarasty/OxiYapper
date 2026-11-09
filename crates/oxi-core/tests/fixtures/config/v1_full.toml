@@ -14,7 +14,9 @@ log_text = true
 
 [history]
 enabled = true
+folder = 'D:\Dictations'
 max_bytes = 1048576
+max_days = 7
 
 [hotkey]
 chord = ["Ctrl", "Alt", "Space"]
@@ -49,6 +51,8 @@ chord = ["Ctrl", "Shift", "V"]
 [sounds]
 enabled = false
 volume = 0.25
+start = "pop"
+stop = 'C:\Sounds\stop.wav'
 
 [system]
 autostart = false

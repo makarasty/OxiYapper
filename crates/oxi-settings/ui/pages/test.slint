@@ -1,0 +1,265 @@
+// Test page (SPEC Settings UI, Test tab): record a phrase, try the settings sets of a scenario
+// through the daemon, read the error percent of each and apply the best. Two views, so neither
+// scrolls at the minimum window; more tools can join them.
+import { Theme, Shell, Card, Row, Divider, Combo, TextField, Button, ButtonKind, SubTabs } from "../theme/index.slint";
+
+// One line of the results table, ready to show.
+export struct TestRow {
+    model: string,
+    normalize: string,
+    denoise: string,
+    trim: string,
+    // "12.5 %", or how the run of this set went.
+    errors: string,
+    time: string,
+    best: bool,
+}
+
+// Filled and read by `pages::test`.
+export global TestState {
+    // "Phrase 1" .. and last "My own phrase".
+    in property <[string]> phrases;
+    in-out property <int> phrase;
+    // What to read aloud; empty while `own`.
+    in property <string> phrase-text;
+    in property <bool> own;
+    in-out property <string> own-text;
+    // The caption of the Phrase row.
+    in property <string> phrase-note;
+    // The caption of the Recording row.
+    in property <string> take;
+    in property <bool> recording;
+    // Why Record is off; empty while it is on.
+    in property <string> record-off;
+    in property <[string]> profiles;
+    in-out property <int> profile;
+    // The caption of the Run row.
+    in property <string> run-note;
+    // Why Run is off; empty while it is on.
+    in property <string> run-off;
+    // 0 Record, 1 Results.
+    in-out property <int> view;
+    in property <[TestRow]> rows;
+    in property <string> best-text;
+    // Why Apply best is off; empty while it is on.
+    in property <string> apply-off;
+    callback shown();
+    callback phrase-picked(int);
+    callback own-edited(string);
+    callback record();
+    callback run();
+    callback apply();
+}
+
+// One line of the table: the columns come from the stretches alone, so they line up in every line.
+component Line inherits Rectangle {
+    in property <TestRow> data;
+    in property <bool> head;
+    property <color> ink: root.head ? Theme.text-secondary : Theme.text-primary;
+    property <length> size: root.head ? Theme.caption-size : Theme.body-size;
+    height: Theme.control-height;
+    border-radius: Theme.radius-control;
+    background: root.data.best ? Theme.accent-tint : transparent;
+    HorizontalLayout {
+        padding-left: Theme.space-2;
+        padding-right: Theme.space-2;
+        spacing: Theme.space-2;
+        Text {
+            text: root.data.model;
+            color: root.ink;
+            font-size: root.size;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 32;
+            preferred-width: 0;
+            min-width: 0;
+        }
+        Text {
+            text: root.data.normalize;
+            color: root.ink;
+            font-size: root.size;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 12;
+            preferred-width: 0;
+            min-width: 0;
+        }
+        Text {
+            text: root.data.denoise;
+            color: root.ink;
+            font-size: root.size;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 12;
+            preferred-width: 0;
+            min-width: 0;
+        }
+        Text {
+            text: root.data.trim;
+            color: root.ink;
+            font-size: root.size;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 12;
+            preferred-width: 0;
+            min-width: 0;
+        }
+        Text {
+            text: root.data.errors;
+            color: root.ink;
+            font-size: root.size;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 20;
+            preferred-width: 0;
+            min-width: 0;
+        }
+        Text {
+            text: root.data.time;
+            color: root.ink;
+            font-size: root.size;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 12;
+            preferred-width: 0;
+            min-width: 0;
+        }
+    }
+}
+
+export component TestPage inherits VerticalLayout {
+    alignment: start;
+    spacing: Theme.space-4;
+    init => {
+        TestState.shown();
+    }
+    HorizontalLayout {
+        alignment: start;
+        SubTabs {
+            items: [@tr("Record"), @tr("Results")];
+            selected: TestState.view;
+            picked(i) => {
+                TestState.view = i;
+            }
+        }
+        // Holds the focus when Run swaps the views under it, so Ctrl+Tab still reaches the window
+        // and the next Tab goes on into the results. Outside the `if`s below: it must outlive them.
+        results-focus := FocusScope {
+            width: 0;
+            focus-on-click: false;
+            focus-on-tab-navigation: false;
+        }
+    }
+    if TestState.view == 0: Card {
+        Row {
+            title: @tr("Phrase");
+            description: TestState.phrase-note;
+            fill-controls: true;
+            Combo {
+                locked: false;
+                model: TestState.phrases;
+                current-index <=> TestState.phrase;
+                accessible-label: @tr("Phrase");
+                selected => {
+                    TestState.phrase-picked(self.current-index);
+                }
+            }
+        }
+        // Both lines are one control high, so picking "My own phrase" moves nothing.
+        if !TestState.own: Text {
+            height: Theme.control-height;
+            text: TestState.phrase-text;
+            font-size: Theme.body-size;
+            color: Theme.text-primary;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        if TestState.own: Row {
+            title: @tr("Your phrase");
+            fill-controls: true;
+            TextField {
+                locked: false;
+                text <=> TestState.own-text;
+                placeholder-text: @tr("What you will read aloud");
+                accessible-label: @tr("Your phrase");
+                edited(text) => {
+                    TestState.own-edited(text);
+                }
+            }
+        }
+        Divider { }
+        Row {
+            title: @tr("Recording");
+            description: TestState.take;
+            Button {
+                text: TestState.recording ? @tr("Stop") : @tr("Record");
+                kind: TestState.recording ? ButtonKind.danger : ButtonKind.secondary;
+                enabled: TestState.record-off == "";
+                tooltip: TestState.record-off;
+                clicked => {
+                    TestState.record();
+                }
+            }
+        }
+        Divider { }
+        Row {
+            title: @tr("Scenario");
+            description: @tr("Picks which settings are tried.");
+            fill-controls: true;
+            Combo {
+                locked: false;
+                model: TestState.profiles;
+                current-index <=> TestState.profile;
+                accessible-label: @tr("Scenario");
+            }
+        }
+        Divider { }
+        Row {
+            title: @tr("Test");
+            description: TestState.run-note;
+            Button {
+                text: @tr("Run");
+                kind: ButtonKind.primary;
+                enabled: TestState.run-off == "";
+                tooltip: TestState.run-off;
+                clicked => {
+                    TestState.run();
+                    // A refused Run stays on this view, and on this button.
+                    if (TestState.view == 1) {
+                        results-focus.focus();
+                    }
+                }
+            }
+        }
+    }
+    if TestState.view == 1: Card {
+        Row {
+            title: @tr("Best set");
+            description: TestState.best-text;
+            Button {
+                text: @tr("Apply best");
+                kind: ButtonKind.primary;
+                enabled: !Shell.locked && TestState.apply-off == "";
+                tooltip: Shell.locked ? Shell.locked-tip : TestState.apply-off;
+                clicked => {
+                    TestState.apply();
+                }
+            }
+        }
+        if TestState.rows.length > 0: Divider { }
+        if TestState.rows.length > 0: Line {
+            head: true;
+            data: {
+                model: @tr("Model"),
+                normalize: @tr("Normalise"),
+                denoise: @tr("Denoise"),
+                trim: @tr("Trim"),
+                errors: @tr("Errors"),
+                time: @tr("Time"),
+            };
+        }
+        for row in TestState.rows: Line {
+            data: row;
+        }
+    }
+}

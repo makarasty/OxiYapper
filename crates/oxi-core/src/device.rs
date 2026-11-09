@@ -14,6 +14,18 @@ pub struct Device {
     pub uma: bool,
 }
 
+impl Device {
+    /// What the UI shows: the marketing name; `name` is the config key and stays out of sight
+    /// unless the driver gave no description.
+    pub fn display_name(&self) -> &str {
+        if self.description.is_empty() {
+            &self.name
+        } else {
+            &self.description
+        }
+    }
+}
+
 /// What the user picked: `[model] gpu = "auto" | "cpu" | "<device name>"`, or `--gpu`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "String", into = "String")]
@@ -129,6 +141,15 @@ mod tests {
             assert_eq!(got.index, index, "{devices:?} {choice:?}");
             assert_eq!(got.missing, warns, "{devices:?} {choice:?}");
         }
+    }
+
+    #[test]
+    fn display_name_prefers_the_description() {
+        let mut d = dev("Vulkan0", false);
+        assert_eq!(d.display_name(), "Vulkan0");
+        d.description = "NVIDIA GeForce RTX 4070 SUPER".into();
+        assert_eq!(d.display_name(), "NVIDIA GeForce RTX 4070 SUPER");
+        assert_eq!(d.name, "Vulkan0");
     }
 
     #[test]

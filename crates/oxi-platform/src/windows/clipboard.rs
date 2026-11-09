@@ -31,7 +31,8 @@ use windows_sys::w;
 use super::wide;
 
 /// Registered formats that keep data out of clipboard managers, Win+V history and cloud sync.
-const EXCLUDE: [&str; 3] = [
+/// Indexes into `WinClipboard::exclude`: monitor processing, history, cloud.
+pub const EXCLUDE: [&str; 3] = [
     "ExcludeClipboardContentFromMonitorProcessing",
     "CanIncludeInClipboardHistory",
     "CanUploadToCloudClipboard",
@@ -75,8 +76,10 @@ impl WinClipboard {
         Ok(Self { exclude })
     }
 
-    /// Empties the clipboard, writes the exclusion formats first (a later failure never
-    /// leaves data on it unexcluded), then `formats` minus any saved exclusion values.
+    /// Empties the clipboard, writes the marker formats first (a later failure never leaves
+    /// data on it unmarked), then `formats` minus any saved marker values. With `history` the
+    /// markers say "include in history, never upload to the cloud"; without, everything is
+    /// excluded. The cloud upload flag is always 0.
     /// Returns the sequence number after the close: the close itself bumps it (by 2 to 3 in
     /// the live test, likely the formats synthesised then), so a number read inside never
     /// matches a later `sequence()`. Another app writing between the close and that read
@@ -85,6 +88,7 @@ impl WinClipboard {
     /// their data (item 39).
     fn replace<'a>(
         &self,
+        history: bool,
         formats: impl IntoIterator<Item = (u32, &'a [u8])>,
     ) -> Result<u32, ClipError> {
         let window = Window::new()?;
@@ -93,8 +97,8 @@ impl WinClipboard {
         if unsafe { EmptyClipboard() } == 0 {
             return Err(os_error("EmptyClipboard"));
         }
-        for id in self.exclude {
-            put(id, &0u32.to_ne_bytes())?;
+        for (format, value) in markers(self.exclude, history) {
+            put(format, &value.to_ne_bytes())?;
         }
         for (format, bytes) in formats {
             if !self.exclude.contains(&format) {
@@ -123,10 +127,11 @@ impl Clipboard for WinClipboard {
             return Snap::Incomplete;
         }
         let (tx, rx) = mpsc::channel();
+        let exclude = self.exclude;
         let spawned = thread::Builder::new()
             .name("clipboard-snapshot".into())
             .spawn(move || {
-                let snap = read_all(&tx);
+                let snap = read_all(&tx, exclude);
                 let _ = tx.send(Step::Done(snap));
             });
         if spawned.is_err() {
@@ -148,13 +153,17 @@ impl Clipboard for WinClipboard {
         }
     }
 
-    fn set_text(&mut self, text: &str) -> Result<u32, ClipError> {
+    fn is_excluded(&self, snapshot: &Saved) -> bool {
+        carries_exclusion(&snapshot.0, self.exclude)
+    }
+
+    fn set_text(&mut self, text: &str, in_history: bool) -> Result<u32, ClipError> {
         let bytes: Vec<u8> = text
             .encode_utf16()
             .chain([0])
             .flat_map(u16::to_ne_bytes)
             .collect();
-        self.replace([(u32::from(CF_UNICODETEXT), bytes.as_slice())])
+        self.replace(in_history, [(u32::from(CF_UNICODETEXT), bytes.as_slice())])
     }
 
     fn sequence(&self) -> u32 {
@@ -162,10 +171,31 @@ impl Clipboard for WinClipboard {
         unsafe { GetClipboardSequenceNumber() }
     }
 
-    fn restore(&mut self, snapshot: Saved) -> Result<(), ClipError> {
-        self.replace(snapshot.0.iter().map(|(f, b)| (*f, b.as_slice())))
-            .map(drop)
+    fn restore(&mut self, snapshot: Saved, in_history: bool) -> Result<(), ClipError> {
+        self.replace(
+            in_history,
+            snapshot.0.iter().map(|(f, b)| (*f, b.as_slice())),
+        )
+        .map(drop)
     }
+}
+
+/// The marker formats and DWORD values a write puts on the clipboard.
+fn markers([monitor, in_history, cloud]: [u32; 3], history: bool) -> Vec<(u32, u32)> {
+    if history {
+        vec![(in_history, 1), (cloud, 0)]
+    } else {
+        vec![(monitor, 0), (in_history, 0), (cloud, 0)]
+    }
+}
+
+/// Saved data its owner kept out of history. Any history marker other than 1 counts: an
+/// unreadable marker must not let a password into Win+V.
+fn carries_exclusion(saved: &[(u32, Vec<u8>)], [monitor, in_history, _]: [u32; 3]) -> bool {
+    saved.iter().any(|(format, bytes)| {
+        *format == monitor
+            || (*format == in_history && bytes.get(..4) != Some(&1u32.to_ne_bytes()[..]))
+    })
 }
 
 /// What the snapshot thread reports: about to block on the clipboard, or finished (closed).
@@ -176,7 +206,7 @@ enum Step {
 
 /// Copies every copyable format, sending `Reading` before each call that can block on an owner.
 /// The clipboard is closed when this returns.
-fn read_all(tx: &Sender<Step>) -> Snap<Saved> {
+fn read_all(tx: &Sender<Step>, exclude: [u32; 3]) -> Snap<Saved> {
     let Ok(window) = Window::new() else {
         return Snap::Incomplete;
     };
@@ -195,10 +225,11 @@ fn read_all(tx: &Sender<Step>) -> Snap<Saved> {
         format = unsafe { EnumClipboardFormats(format) };
         if format == 0 {
             // Zero is the end with ERROR_SUCCESS, or a failure with its code. A clipboard
-            // of handle formats only (a lone metafile) would restore as nothing.
+            // of handle formats only (a lone metafile, markers aside) would restore as nothing.
             // SAFETY: reads this thread's last-error value, no arguments.
             let failed = unsafe { GetLastError() } != 0;
-            return if failed || (saved.is_empty() && skipped_handle) {
+            let only_markers = saved.iter().all(|(f, _)| exclude.contains(f));
+            return if failed || (only_markers && skipped_handle) {
                 Snap::Incomplete
             } else {
                 Snap::Complete(Saved(saved))
@@ -406,6 +437,42 @@ fn duration(ms: Millis) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const IDS: [u32; 3] = [0xC001, 0xC002, 0xC003];
+    /// A clipboard format id and its bytes.
+    type Format = (u32, Vec<u8>);
+
+    #[test]
+    fn markers_put_history_on_or_exclude_everything_and_never_allow_the_cloud() {
+        assert_eq!(markers(IDS, true), [(0xC002, 1), (0xC003, 0)]);
+        assert_eq!(markers(IDS, false), [(0xC001, 0), (0xC002, 0), (0xC003, 0)]);
+    }
+
+    #[test]
+    fn exclusion_is_read_from_the_saved_markers() {
+        let d = |v: u32| v.to_ne_bytes().to_vec();
+        let text = (u32::from(CF_UNICODETEXT), vec![104, 0, 0, 0]);
+        let cases: [(&str, Vec<Format>, bool); 7] = [
+            ("no markers", vec![text.clone()], false),
+            ("history 1", vec![(0xC002, d(1)), text.clone()], false),
+            ("cloud 0 only", vec![(0xC003, d(0)), text.clone()], false),
+            ("history 0", vec![(0xC002, d(0)), text.clone()], true),
+            (
+                "monitor, any value",
+                vec![(0xC001, d(1)), text.clone()],
+                true,
+            ),
+            (
+                "monitor, no data",
+                vec![(0xC001, Vec::new()), text.clone()],
+                true,
+            ),
+            ("history unreadable", vec![(0xC002, vec![1]), text], true),
+        ];
+        for (name, saved, want) in cases {
+            assert_eq!(carries_exclusion(&saved, IDS), want, "{name}");
+        }
+    }
 
     #[test]
     fn copies_owner_hglobal_formats_only() {

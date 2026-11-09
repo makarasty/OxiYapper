@@ -16,9 +16,12 @@ use crate::device::{Device, DeviceChoice};
 use crate::hotkey::Key;
 use crate::machine::Phase;
 use crate::stats::Summary;
+use crate::tuning::SettingsSet;
+use crate::types::Language;
 
-/// Protocol version. `Hello`, `HelloAck` and `Shutdown` never change shape. 2: `Stats`.
-pub const PROTO: u32 = 2;
+/// Protocol version. `Hello`, `HelloAck` and `Shutdown` never change shape. 2: `Stats`. 3: `PreviewSound`.
+/// 4: `TestAudio`, `TestTranscribe`.
+pub const PROTO: u32 = 4;
 
 /// Longest accepted line, newline excluded.
 pub const MAX_LINE: usize = 1024 * 1024;
@@ -50,6 +53,28 @@ pub enum Request {
     },
     /// The Home page numbers; answered with [`Push::Stats`].
     Stats,
+    /// Play `choice` (a `sounds.start` value) once at `volume_percent`, 0 to 100, as the sliders
+    /// stand, before anything is saved. Whole percent keeps the message `Eq`.
+    PreviewSound {
+        choice: String,
+        volume_percent: u8,
+    },
+    /// Recognition test: one piece of the recording this connection holds, in memory only and
+    /// gone when the connection closes. `pcm` is `tuning::encode_pcm` of raw 16 kHz mono
+    /// samples, before gain, normalise, noise suppression and trim; `reset` starts a new
+    /// recording. Pieces of at most `tuning::PCM_CHUNK_SAMPLES`.
+    TestAudio {
+        reset: bool,
+        pcm: String,
+    },
+    /// Recognition test: run the held recording through `set` in `language`. Answered with
+    /// [`Push::TestResult`] carrying `id`; send the next set after that answer, so a dictation
+    /// waits for one run at most.
+    TestTranscribe {
+        id: u32,
+        set: SettingsSet,
+        language: Language,
+    },
     Shutdown,
 }
 
@@ -60,6 +85,46 @@ pub enum DownloadResult {
     Ok,
     Cancelled,
     Failed { message: String },
+}
+
+/// Why a recognition test run has no text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TestFailure {
+    /// No recording held (never sent, or refused as bad or too long).
+    NoAudio,
+    /// A dictation is running, or this window's previous run has not answered yet.
+    Busy,
+    /// The model is not downloaded.
+    ModelMissing,
+    /// The model file failed its check or would not load.
+    ModelBad,
+    /// Whisper or the audio steps failed.
+    Failed,
+}
+
+/// How a recognition test run ended.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "r")]
+pub enum TestOutcome {
+    /// `text` is what a dictation would paste, without the trailing space; empty when nothing
+    /// was heard. `ms` is the whisper run alone, model load excluded.
+    Heard {
+        text: String,
+        ms: u64,
+    },
+    Failed {
+        why: TestFailure,
+    },
+}
+
+// By hand: the text is dictated speech and must not reach a log through `{:?}`.
+impl std::fmt::Debug for TestOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Heard { text, ms } => write!(f, "Heard({} bytes, {ms} ms)", text.len()),
+            Self::Failed { why } => write!(f, "Failed({why:?})"),
+        }
+    }
 }
 
 /// Daemon to settings: replies and pushes.
@@ -108,6 +173,11 @@ pub enum Push {
     },
     /// Counts only, never text (SPEC, History).
     Stats(Summary),
+    /// Answer to [`Request::TestTranscribe`] with the same `id`.
+    TestResult {
+        id: u32,
+        outcome: TestOutcome,
+    },
 }
 
 /// Windows named pipe for one user: `\\.\pipe\OxiYapper-<SID>`.

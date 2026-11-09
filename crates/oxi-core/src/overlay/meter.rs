@@ -25,6 +25,10 @@ pub struct Meter {
     pending: f32,
     last_bar: Option<Millis>,
     clip_until: Millis,
+    /// Per bar, parallel to `bars`: a block in it peaked at `CLIP_PEAK`.
+    clipped: VecDeque<bool>,
+    /// A block since the last bar peaked at `CLIP_PEAK`.
+    pending_clip: bool,
 }
 
 impl Meter {
@@ -38,6 +42,8 @@ impl Meter {
             pending: 0.0,
             last_bar: None,
             clip_until: Millis(0),
+            clipped: VecDeque::from(vec![false; len.max(1)]),
+            pending_clip: false,
         }
     }
 
@@ -46,12 +52,16 @@ impl Meter {
     pub fn push(&mut self, level: Level, now: Millis) {
         if level.peak >= CLIP_PEAK {
             self.clip_until = now + CLIP_HOLD;
+            self.pending_clip = true;
         }
         self.pending = self.pending.max(level.rms);
         if self.last_bar.is_none_or(|t| now >= t + PERIOD) {
             self.bars.pop_front();
             self.bars.push_back(bar(self.pending, self.sensitivity_db));
             self.pending = 0.0;
+            self.clipped.pop_front();
+            self.clipped.push_back(self.pending_clip);
+            self.pending_clip = false;
             // Step the schedule (not `now`) so a poll slightly slower than the period keeps
             // 30 Hz; `now - PERIOD` drops the backlog after a stall.
             self.last_bar = Some(
@@ -65,6 +75,11 @@ impl Meter {
         self.bars.iter().copied()
     }
 
+    /// Which bars clipped, parallel to [`Meter::bars`]: a long history marks where, not all of it.
+    pub fn clipped(&self) -> impl ExactSizeIterator<Item = bool> + '_ {
+        self.clipped.iter().copied()
+    }
+
     #[must_use]
     pub fn clipping(&self, now: Millis) -> bool {
         now < self.clip_until
@@ -75,4 +90,28 @@ impl Meter {
 fn bar(rms: f32, sensitivity_db: f32) -> f32 {
     let dbfs = 20.0 * rms.max(0.0).log10() + sensitivity_db;
     ((dbfs - FLOOR_DBFS) / -FLOOR_DBFS).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_bar_that_clipped_is_marked() {
+        let mut m = Meter::new(4, 0.0);
+        let calm = Level {
+            rms: 0.1,
+            peak: 0.2,
+        };
+        let loud = Level {
+            rms: 0.3,
+            peak: 1.0,
+        };
+        m.push(calm, Millis(0));
+        m.push(loud, Millis(40));
+        m.push(calm, Millis(80));
+        assert_eq!(m.clipped().collect::<Vec<_>>(), [false, false, true, false]);
+        assert_eq!(m.clipped().len(), m.bars().len());
+        assert!(m.clipping(Millis(80)));
+    }
 }

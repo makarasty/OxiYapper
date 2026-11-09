@@ -4,8 +4,8 @@
 mod schema;
 
 pub use schema::{
-    Audio, Config, Debug, History, Hotkey, Model, Overlay, OverlayPosition, Paste, PasteMode,
-    PasteRule, Sounds, System, Theme, Ui,
+    AppLanguage, Audio, Config, Debug, History, Hotkey, Model, Overlay, OverlayPosition, Paste,
+    PasteMode, PasteRule, Sounds, System, Theme, Ui,
 };
 
 use crate::paths::CONFIG_FILE;
@@ -127,7 +127,13 @@ impl ConfigFile {
         };
         let mut config = toml::from_str::<Config>(&migrated)
             .map_err(|e| located(&migrated, e.span(), e.message()))?;
-        let warnings = config.audio.clamp_meter_sensitivity().into_iter().collect();
+        let warnings = config
+            .audio
+            .clamp_meter_sensitivity()
+            .into_iter()
+            .chain(config.model.normalise_recent_languages())
+            .chain(config.sounds.normalise())
+            .collect();
         if !read_only {
             put(raw.as_table_mut(), "version", &toml_edit::value(current));
         }
@@ -176,6 +182,10 @@ fn typed_doc(config: &Config) -> Result<DocumentMut, ConfigError> {
         .map_err(|e: toml_edit::TomlError| ConfigError::Invalid(e.to_string()))
 }
 
+/// Tables whose keys are user data (a map), not a fixed set: a key the typed config lacks is
+/// removed from the file. Any other table keeps the keys this build does not know.
+const MAP_TABLES: [&str; 1] = ["app_names"];
+
 /// Writes every key of `src` into `dst`: tables merge key by key, arrays of tables merge
 /// element by element on `app`, values replace only when they differ and keep their decor.
 /// `default` is the same place in the default config (`None` inside a rule).
@@ -197,6 +207,16 @@ fn merge(dst: &mut dyn TableLike, src: &dyn TableLike, default: Option<&dyn Tabl
             }
         } else if let (Some(o), Some(n)) = (old.as_table_like_mut(), new.as_table_like()) {
             merge(o, n, fallback.and_then(Item::as_table_like));
+            if MAP_TABLES.contains(&key) {
+                let gone: Vec<String> = o
+                    .iter()
+                    .map(|(k, _)| k.to_owned())
+                    .filter(|k| !n.contains_key(k))
+                    .collect();
+                for k in gone {
+                    o.remove(&k);
+                }
+            }
         } else {
             put(dst, key, new);
         }
@@ -373,5 +393,48 @@ fn located(text: &str, span: Option<Range<usize>>, message: &str) -> ConfigError
         line,
         column: before[line_start..].chars().count() + 1,
         message: message.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_removed_app_name_leaves_the_file_and_other_keys_and_comments_stay() {
+        let text = "version = 1
+# keep me
+future = 1
+[ui]
+theme = \"dark\" # mine
+unknown = 2
+
+[ui.app_names]
+\"a.exe\" = \"Aaa\" # note
+\"b.exe\" = \"Bbb\"
+";
+        let mut file = ConfigFile::parse(text).unwrap();
+        assert_eq!(file.config.ui.app_names.len(), 2);
+        file.config.ui.app_names.remove("a.exe");
+        let out = file.to_toml_string().unwrap();
+        assert!(!out.contains("a.exe") && !out.contains("Aaa"), "{out}");
+        for kept in [
+            "# keep me",
+            "future = 1",
+            "theme = \"dark\" # mine",
+            "unknown = 2",
+            "\"b.exe\" = \"Bbb\"",
+        ] {
+            assert!(
+                out.contains(kept),
+                "{kept} lost:
+{out}"
+            );
+        }
+        let back = ConfigFile::parse(&out).unwrap();
+        assert_eq!(
+            back.config.ui.app_names.keys().collect::<Vec<_>>(),
+            ["b.exe"]
+        );
     }
 }

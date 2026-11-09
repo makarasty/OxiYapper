@@ -2,11 +2,13 @@ use oxi_core::config::OverlayPosition;
 use oxi_core::device::{Device, DeviceChoice};
 use oxi_core::hotkey::Key;
 use oxi_core::ipc::{
-    DecodeError, Decoder, DownloadResult, MAX_LINE, PROTO, Push, Request, encode, pipe_name,
-    socket_file,
+    DecodeError, Decoder, DownloadResult, MAX_LINE, PROTO, Push, Request, TestFailure, TestOutcome,
+    encode, pipe_name, socket_file,
 };
 use oxi_core::machine::Phase;
 use oxi_core::stats::{Date, Summary};
+use oxi_core::tuning::SettingsSet;
+use oxi_core::types::Language;
 
 fn requests() -> Vec<Request> {
     vec![
@@ -24,6 +26,19 @@ fn requests() -> Vec<Request> {
             position: OverlayPosition::TopCentre,
         },
         Request::Stats,
+        Request::PreviewSound {
+            choice: "pop".into(),
+            volume_percent: 40,
+        },
+        Request::TestAudio {
+            reset: true,
+            pcm: "3f000000".into(),
+        },
+        Request::TestTranscribe {
+            id: 7,
+            set: SettingsSet::defaults(),
+            language: Language::RU,
+        },
         Request::Shutdown,
     ]
 }
@@ -87,6 +102,19 @@ fn pushes() -> Vec<Push> {
             heat_start: Date::from_ymd(2026, 11, 2).unwrap(),
             heat: vec![0, 1, 4, 2, 3, 0],
         }),
+        Push::TestResult {
+            id: 7,
+            outcome: TestOutcome::Heard {
+                text: "test".into(),
+                ms: 840,
+            },
+        },
+        Push::TestResult {
+            id: 8,
+            outcome: TestOutcome::Failed {
+                why: TestFailure::ModelMissing,
+            },
+        },
     ]
 }
 
@@ -221,4 +249,16 @@ fn oversized_line_without_newline_fails_early_and_resyncs() {
     d.push(b"tail\n");
     d.push(encode(&Request::Shutdown).as_bytes());
     assert_eq!(d.decode::<Request>().unwrap().unwrap(), Request::Shutdown);
+}
+
+#[test]
+fn test_result_debug_never_shows_the_text() {
+    let push = Push::TestResult {
+        id: 1,
+        outcome: TestOutcome::Heard {
+            text: "secret words".into(),
+            ms: 5,
+        },
+    };
+    assert!(!format!("{push:?}").contains("secret"));
 }

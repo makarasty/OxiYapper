@@ -181,6 +181,40 @@ fn label_is_drawn_when_the_font_is_there() {
     }
 }
 
+/// Where the label really lands: the pixels that differ between the pill with and without the
+/// font (the icon is the same in both) are the label. States without a meter centre it on the pill.
+#[test]
+fn a_meterless_label_is_drawn_centred_on_the_pill() {
+    let Some(bytes) = font_bytes() else {
+        eprintln!("skip: no {FONT}");
+        return;
+    };
+    let font = FontRef::try_from_slice(&bytes).unwrap();
+    let (meter, now) = speech(0.5);
+    for scale in SCALES {
+        let r = rect(scale);
+        for state in [
+            OverlayState::LoadingModel,
+            OverlayState::Transcribing,
+            OverlayState::Pasting,
+        ] {
+            let with = pill(state, &meter, now, r, Some(&font)).unwrap();
+            let without = pill(state, &meter, now, r, None).unwrap();
+            let xs: Vec<u32> = (0..with.width())
+                .filter(|&x| (0..with.height()).any(|y| with.pixel(x, y) != without.pixel(x, y)))
+                .collect();
+            let (first, last) = (*xs.first().unwrap(), *xs.last().unwrap());
+            let centre = f32::midpoint(first as f32, last as f32 + 1.0);
+            // Glyph side bearings move the ink off the advance box by a pixel or two.
+            assert!(
+                (centre - r.w as f32 / 2.0).abs() <= 2.0 + scale,
+                "{state:?} at {scale}: ink {first}..={last} centre {centre} in {}",
+                r.w
+            );
+        }
+    }
+}
+
 const TRAY_SIZES: [u32; 4] = [16, 20, 24, 32];
 /// The sizes in `assets/oxi.ico`.
 const ICO_SIZES: [u32; 8] = [16, 20, 24, 32, 40, 48, 64, 256];

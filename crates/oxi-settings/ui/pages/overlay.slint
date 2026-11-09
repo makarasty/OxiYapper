@@ -1,6 +1,7 @@
 // Overlay page (SPEC Feedback): the pill on or off, its spot on screen, hiding it over
-// fullscreen apps, and a preview the daemon shows at the picked spot.
-import { Theme, Icons, Group, Card, ToggleRow, ScreenPicker, Button } from "../theme/index.slint";
+// fullscreen apps, and a preview the daemon shows at the picked spot. One card of four rows, like
+// System (owner's direction B, item 17).
+import { Theme, Shell, Icons, Card, Row, Divider, ToggleRow, Button, PositionTiles } from "../theme/index.slint";
 
 // Filled and read by `pages::overlay`.
 export global OverlayState {
@@ -18,31 +19,12 @@ export global OverlayState {
     callback preview();
 }
 
-// The Preview button; why it is off is its tooltip (the banner above already says the daemon is
-// off).
-component PreviewAction inherits VerticalLayout {
-    alignment: center;
-    HorizontalLayout {
-        alignment: start;
-        Button {
-            text: @tr("Preview");
-            icon: Icons.eye-16;
-            enabled: OverlayState.online;
-            tooltip: OverlayState.note;
-            accessible-description: OverlayState.note;
-            clicked => {
-                OverlayState.preview();
-            }
-        }
-    }
-}
-
 export component OverlayPage inherits VerticalLayout {
-    property <bool> narrow: root.width < 640px;
+    property <[string]> names: [@tr("Top left"), @tr("Top centre"), @tr("Top right"), @tr("Bottom left"), @tr("Bottom centre"), @tr("Bottom right")];
     alignment: start;
-    spacing: Theme.group-gap;
-    Group {
+    Card {
         ToggleRow {
+            flat: true;
             title: @tr("Show the overlay");
             description: @tr("A small pill shows recording and transcription.");
             checked <=> OverlayState.enabled;
@@ -50,7 +32,9 @@ export component OverlayPage inherits VerticalLayout {
                 OverlayState.enabled-toggled(on);
             }
         }
+        Divider { }
         ToggleRow {
+            flat: true;
             title: @tr("Hide over fullscreen apps");
             description: @tr("Keeps games and videos clear.");
             checked <=> OverlayState.hide-over-fullscreen;
@@ -58,26 +42,39 @@ export component OverlayPage inherits VerticalLayout {
                 OverlayState.hide-over-fullscreen-toggled(on);
             }
         }
-    }
-    Group {
-        title: @tr("Position");
-        Card {
-            HorizontalLayout {
-                alignment: root.narrow ? LayoutAlignment.start : LayoutAlignment.stretch;
-                spacing: Theme.space-6;
-                ScreenPicker {
+        Divider { }
+        // The picked spot's name is the description, left of the tiles, so it moves nothing.
+        Row {
+            title: @tr("Position");
+            enabled: !Shell.locked;
+            description: OverlayState.position >= 0 && OverlayState.position < root.names.length ? root.names[OverlayState.position] : "";
+            VerticalLayout {
+                alignment: center;
+                PositionTiles {
                     accessible-label: @tr("Position");
-                    names: [@tr("Top left"), @tr("Top centre"), @tr("Top right"), @tr("Bottom left"), @tr("Bottom centre"), @tr("Bottom right")];
+                    names: root.names;
                     selected: OverlayState.position;
                     picked(i) => {
                         OverlayState.position-picked(i);
                     }
                 }
-                if !root.narrow: PreviewAction {
-                    horizontal-stretch: 1;
+            }
+        }
+        Divider { }
+        // Why Preview is off is its tooltip (the banner above already says the daemon is off).
+        Row {
+            title: @tr("Preview");
+            description: @tr("Shows the pill on your desktop for a few seconds.");
+            Button {
+                text: @tr("Preview");
+                icon: Icons.eye-16;
+                enabled: OverlayState.online;
+                tooltip: OverlayState.note;
+                accessible-description: OverlayState.note;
+                clicked => {
+                    OverlayState.preview();
                 }
             }
-            if root.narrow: PreviewAction { }
         }
     }
 }

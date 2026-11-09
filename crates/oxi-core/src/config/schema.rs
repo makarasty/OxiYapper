@@ -3,8 +3,10 @@
 
 use crate::device::DeviceChoice;
 use crate::machine::Mode;
+use crate::sounds::{Builtin, Choice};
 use crate::types::Language;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -102,8 +104,12 @@ pub struct Model {
     pub custom_path: String,
     pub gpu: DeviceChoice,
     pub language: Language,
-    /// 0 means never unload.
+    /// The two languages used last, most recent first, for the picker's short list.
+    pub recent_languages: [Language; 2],
+    /// 0 means never unload (older files keep that meaning).
     pub idle_unload_minutes: u32,
+    /// Unload as soon as a dictation ends; wins over `idle_unload_minutes`.
+    pub unload_immediately: bool,
 }
 
 impl Default for Model {
@@ -112,8 +118,42 @@ impl Default for Model {
             id: "turbo".into(),
             custom_path: String::new(),
             gpu: DeviceChoice::Auto,
-            language: Language::Ru,
+            language: Language::RU,
+            recent_languages: [Language::RU, Language::EN],
             idle_unload_minutes: 5,
+            unload_immediately: false,
+        }
+    }
+}
+
+impl Model {
+    /// Makes `recent_languages` two different real languages (never auto): keeps the good
+    /// entries in order and fills the rest from the defaults, and says so.
+    pub(crate) fn normalise_recent_languages(&mut self) -> Option<String> {
+        let got = self.recent_languages;
+        if got[0] != got[1] && !got.contains(&Language::AUTO) {
+            return None;
+        }
+        let mut fixed = Vec::with_capacity(2);
+        for lang in got.into_iter().chain(Self::default().recent_languages) {
+            if lang != Language::AUTO && !fixed.contains(&lang) {
+                fixed.push(lang);
+            }
+        }
+        self.recent_languages = [fixed[0], fixed[1]];
+        Some(format!(
+            "model.recent_languages must be two different languages and not auto, using {}, {}",
+            fixed[0].as_str(),
+            fixed[1].as_str()
+        ))
+    }
+
+    /// Picks `lang` and moves it to the front of `recent_languages`; auto is not a language
+    /// to pick again, so it leaves the list alone.
+    pub fn use_language(&mut self, lang: Language) {
+        self.language = lang;
+        if lang != Language::AUTO && self.recent_languages[0] != lang {
+            self.recent_languages = [lang, self.recent_languages[0]];
         }
     }
 }
@@ -148,6 +188,8 @@ pub struct Paste {
     pub mode: PasteMode,
     pub restore_delay_ms: u32,
     pub trailing_space: bool,
+    /// Dictated text stays in the OS clipboard history (Win+V). Cloud upload is never allowed.
+    pub keep_in_clipboard_history: bool,
     pub rules: Vec<PasteRule>,
 }
 
@@ -157,6 +199,7 @@ impl Default for Paste {
             mode: PasteMode::Clipboard,
             restore_delay_ms: 300,
             trailing_space: true,
+            keep_in_clipboard_history: true,
             // Remote desktop drops a synthetic Ctrl+V, so type there.
             rules: vec![PasteRule {
                 app: "mstsc.exe".into(),
@@ -203,7 +246,46 @@ impl Default for Overlay {
 #[serde(default)]
 pub struct Sounds {
     pub enabled: bool,
+    /// 0 to 1.
     pub volume: f64,
+    /// A built-in id (`Builtin::id`) or the path of a `.wav` file.
+    pub start: String,
+    pub stop: String,
+}
+
+impl Sounds {
+    pub const VOLUME: RangeInclusive<f64> = 0.0..=1.0;
+
+    /// Puts `volume` back in range (NaN becomes the default) and a `start` or `stop` that is
+    /// neither a built-in id nor a `.wav` path back to its default, and says so.
+    pub(crate) fn normalise(&mut self) -> Vec<String> {
+        let mut said = Vec::new();
+        let default = Self::default();
+        let v = self.volume;
+        if !Self::VOLUME.contains(&v) {
+            self.volume = if v.is_nan() {
+                default.volume
+            } else {
+                v.clamp(*Self::VOLUME.start(), *Self::VOLUME.end())
+            };
+            said.push(format!(
+                "sounds.volume = {v} is outside 0..1, using {}",
+                self.volume
+            ));
+        }
+        for (key, value, fallback) in [
+            ("start", &mut self.start, default.start),
+            ("stop", &mut self.stop, default.stop),
+        ] {
+            if Choice::parse(value).is_err() {
+                said.push(format!(
+                    "sounds.{key} = \"{value}\" is not a built-in sound or a .wav path, using {fallback}"
+                ));
+                *value = fallback;
+            }
+        }
+        said
+    }
 }
 
 impl Default for Sounds {
@@ -211,6 +293,8 @@ impl Default for Sounds {
         Self {
             enabled: true,
             volume: 0.5,
+            start: Builtin::Rise.id().into(),
+            stop: Builtin::Fall.id().into(),
         }
     }
 }
@@ -219,7 +303,13 @@ impl Default for Sounds {
 #[serde(default)]
 pub struct History {
     pub enabled: bool,
+    /// Size cap of the folder; the oldest entries go first. 0 means no cap.
     pub max_bytes: u64,
+    /// Keep the last this many days (today included). 0 means no age limit.
+    pub max_days: u32,
+    /// Absolute path of a folder (may be another drive) to keep the app's `OxiYapper history`
+    /// subfolder in; empty or relative means `history/` in the data directory.
+    pub folder: String,
 }
 
 impl Default for History {
@@ -227,6 +317,8 @@ impl Default for History {
         Self {
             enabled: false,
             max_bytes: 2_147_483_648,
+            max_days: 30,
+            folder: String::new(),
         }
     }
 }
@@ -265,10 +357,23 @@ pub enum Theme {
     Light,
 }
 
+/// Language of the settings window and tray text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AppLanguage {
+    #[default]
+    En,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Ui {
     pub theme: Theme,
+    pub language: AppLanguage,
+    /// Human names of apps with a per-app rule, by lowercase exe: what the settings window shows
+    /// for a rule picked from a scan, so the name outlives the window (UI rule 30). Display only.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub app_names: BTreeMap<String, String>,
 }
 
 #[cfg(test)]

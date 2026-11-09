@@ -25,9 +25,13 @@ use super::cmd::{ChordHook, Inbox, UiCmd, Workers};
 use super::coordinator::Coordinator;
 use super::ipc::{Pushes, Start, SystemHost};
 use super::ui::Ui;
-use super::{audio, io, ipc, paste, watch, whisper};
+use super::{audio, history, io, ipc, paste, sound, watch, whisper};
 use crate::log;
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "start-up wiring reads top to bottom, one thread after another"
+)]
 pub fn run() -> anyhow::Result<()> {
     let layout = oxi_platform::dirs::layout().context("no data directory")?;
     oxi_platform::dirs::ensure(&layout).context("cannot create the data directories")?;
@@ -74,13 +78,19 @@ pub fn run() -> anyhow::Result<()> {
     let (audio_tx, audio_rx) = mpsc::channel();
     let (whisper_tx, whisper_rx) = mpsc::channel();
     let (paste_tx, paste_rx) = mpsc::channel();
+    let (sound_tx, sound_rx) = mpsc::channel();
+    let (history_tx, history_rx) = mpsc::channel();
     let (io_tx, io_rx) = mpsc::channel();
     let workers = [
         audio::spawn(audio_rx, inbox.clone(), meter)?,
-        whisper::spawn(whisper_rx, inbox.clone(), layout.clone())?,
+        whisper::spawn(whisper_rx, inbox.clone(), layout.clone(), phase.clone())?,
         paste::spawn(paste_rx, inbox.clone())?,
+        sound::spawn(sound_rx, inbox.clone())?,
+        history::spawn(history_rx, inbox.clone(), layout.history_dir())?,
     ];
     let pushes = Pushes::default();
+    // Before any download can resume: a model `.part` untouched for 7 days is dropped.
+    sweep_partials(&layout.models_dir());
     // Never joined: the IPC threads hold its sender until the process ends.
     io::spawn(io_rx, pushes.clone(), layout.models_dir())?;
     let host = Arc::new(SystemHost::new(Arc::clone(&hook)));
@@ -103,13 +113,10 @@ pub fn run() -> anyhow::Result<()> {
             audio: audio_tx,
             whisper: whisper_tx,
             paste: paste_tx,
+            sound: sound_tx,
+            history: history_tx,
             ui: ui_tx,
-            wake_ui: Box::new({
-                let waker = waker.clone();
-                move || {
-                    let _ = waker.wake();
-                }
-            }),
+            wake_ui: wake_ui(&waker),
         };
         let (hook, quit) = (HookChord(Arc::clone(&hook)), QuitOnDrop(waker.clone()));
         spawn("coordinator", move || {
@@ -159,6 +166,22 @@ fn load_config(path: &Path) -> (Config, Vec<String>, Option<ConfigError>) {
             (Config::default(), Vec::new(), Some(e))
         }
     }
+}
+
+fn sweep_partials(models_dir: &Path) {
+    match oxi_platform::fs::sweep_partials(models_dir, std::time::SystemTime::now()) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(removed = n, "removed stale partial model downloads"),
+        Err(e) => tracing::warn!(error = %e, "cannot sweep partial model downloads"),
+    }
+}
+
+/// Wakes the UI loop from any thread.
+fn wake_ui(waker: &Waker) -> Box<dyn Fn() + Send> {
+    let waker = waker.clone();
+    Box::new(move || {
+        let _ = waker.wake();
+    })
 }
 
 /// The overlay label font (decision D4): the system Segoe UI. Without it the pill shows its icon

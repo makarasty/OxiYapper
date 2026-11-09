@@ -923,6 +923,23 @@ fn zero_idle_unload_means_never() {
     assert_eq!(s.0.next_deadline(), None);
 }
 
+#[test]
+fn immediate_unload_waits_for_the_job_to_end() {
+    let mut s = Sim(State::new(MachineConfig {
+        unload_immediately: true,
+        ..untailed()
+    }));
+    s.at(0, Event::ChordDown); // recording: the model loads for it
+    s.at(10, Event::ModelLoaded);
+    assert_eq!(s.core(500, Event::ChordUp), stop(J0));
+    for (t, event) in [(600, Event::JobAudioReady(J0)), (900, done(J0))] {
+        let fx = s.core(t, event);
+        assert!(!fx.contains(&Effect::Unload), "unloaded mid-job at {t}");
+    }
+    assert_eq!(s.0.next_deadline(), None, "no idle timer is armed");
+    assert_eq!(s.core(1000, pasted(J0)), [Effect::Unload]);
+}
+
 // ---- release tail (ARCHITECTURE 3: keeps the last syllable) ---------------------------------
 
 fn tailed(mode: Mode, tail: u64) -> Sim {
@@ -1039,6 +1056,10 @@ fn machine_config_maps_the_file_settings() {
     file.audio.tail_ms = 150;
     file.audio.max_seconds = 300;
     file.model.idle_unload_minutes = 0;
+    assert!(
+        !MachineConfig::from(&file).unload_immediately,
+        "0 stays never"
+    );
     assert_eq!(
         MachineConfig::from(&file),
         MachineConfig {

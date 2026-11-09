@@ -8,7 +8,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
-use oxi_core::config::Config;
+use oxi_core::config::{Config, History};
+use oxi_core::ipc::{Push, TestFailure, TestOutcome};
 use oxi_core::machine::{
     self, Effect, EngineWarning, Event, JobId, MachineConfig, Notice, Phase, PhaseCell, State,
 };
@@ -18,7 +19,8 @@ use oxi_core::types::Millis;
 use oxi_core::{stats, strings};
 
 use super::cmd::{
-    AudioCmd, ChordHook, Inbox, IpcAsk, PasteCmd, StatusReport, UiCmd, WhisperCmd, Workers,
+    AudioCmd, ChordHook, HistoryCmd, Inbox, IpcAsk, PasteCmd, SoundCmd, StatusReport, UiCmd,
+    WhisperCmd, Workers,
 };
 use super::stats::Recorder;
 
@@ -36,6 +38,13 @@ pub struct Coordinator<H> {
     warnings: Vec<String>,
     /// The whisper worker's latest `EngineWarning`.
     engine_warning: Option<EngineWarning>,
+    /// The sound worker's latest `Inbox::SoundWarnings`.
+    sound_warnings: Vec<String>,
+    /// The history worker's latest `Inbox::HistoryWarning`.
+    history_warning: Option<String>,
+    /// The 16 kHz samples of a job being transcribed, kept for the history file; only while
+    /// `[history]` is on.
+    history_audio: HashMap<JobId, Vec<f32>>,
     /// The whisper worker's latest `Inbox::Backend`.
     backend: String,
     config_error: Option<String>,
@@ -79,6 +88,9 @@ impl<H: ChordHook> Coordinator<H> {
             active: config,
             warnings,
             engine_warning: None,
+            sound_warnings: Vec::new(),
+            history_warning: None,
+            history_audio: HashMap::new(),
             backend: "none".into(),
             config_error: None,
             shown_warnings: Vec::new(),
@@ -151,6 +163,7 @@ impl<H: ChordHook> Coordinator<H> {
             }
             Inbox::Transcribed { job, text: None } => {
                 self.spoken.remove(&job);
+                self.history_audio.remove(&job);
                 self.feed(Event::TranscriptionFailed(job), now);
             }
             Inbox::Transcribed {
@@ -161,7 +174,18 @@ impl<H: ChordHook> Coordinator<H> {
                 let empty = text.trim().is_empty();
                 if empty {
                     self.spoken.remove(&job);
+                    self.history_audio.remove(&job);
                 } else {
+                    if let Some(samples) = self.history_audio.remove(&job) {
+                        send(
+                            &self.workers.history,
+                            HistoryCmd::Save {
+                                samples,
+                                text: text.clone(),
+                                cfg: self.latest_history(),
+                            },
+                        );
+                    }
                     self.text.insert(job, text);
                 }
                 self.feed(Event::TranscriptionDone { job, empty }, now);
@@ -177,22 +201,65 @@ impl<H: ChordHook> Coordinator<H> {
                 self.config_error = Some(e.to_string());
             }
             Inbox::EngineWarning(warning) => self.engine_warning = warning,
+            Inbox::SoundWarnings(lines) => self.sound_warnings = lines,
+            Inbox::HistoryWarning(line) => self.history_warning = line,
             Inbox::Backend(device) => self.backend = device,
             Inbox::AssetsChanged => send(&self.workers.whisper, WhisperCmd::ReloadAssets),
-            Inbox::Ipc(IpcAsk::Status(reply)) => {
-                // The asking connection may be gone already; nothing to do then.
-                let _ = reply.send(self.status());
-            }
-            Inbox::Ipc(IpcAsk::PreviewOverlay(position)) => {
-                self.ui(UiCmd::PreviewOverlay(position));
-            }
+            Inbox::Ipc(ask) => self.ipc(ask),
             Inbox::CopyLastText => {
                 if let Some(text) = &self.last_text {
-                    send(&self.workers.paste, PasteCmd::CopyOnly(text.clone()));
+                    send(
+                        &self.workers.paste,
+                        PasteCmd::CopyOnly {
+                            text: text.clone(),
+                            in_history: self.active.paste.keep_in_clipboard_history,
+                        },
+                    );
                 }
             }
             Inbox::Shutdown => {} // `run` ends the loop before it gets here
         }
+    }
+
+    fn ipc(&mut self, ask: IpcAsk) {
+        match ask {
+            IpcAsk::Status(reply) => {
+                // The asking connection may be gone already; nothing to do then.
+                let _ = reply.send(self.status());
+            }
+            IpcAsk::PreviewOverlay(position) => {
+                self.ui(UiCmd::PreviewOverlay(position));
+            }
+            IpcAsk::PreviewSound {
+                choice,
+                volume_percent,
+            } => send(
+                &self.workers.sound,
+                SoundCmd::Preview {
+                    choice,
+                    volume_percent,
+                },
+            ),
+            IpcAsk::Test(job) => {
+                if self.state.phase() == Phase::Idle {
+                    send(&self.workers.whisper, WhisperCmd::Test(job));
+                } else {
+                    job.reply.send(Push::TestResult {
+                        id: job.id,
+                        outcome: TestOutcome::Failed {
+                            why: TestFailure::Busy,
+                        },
+                    });
+                }
+            }
+            IpcAsk::TestDone => send(&self.workers.whisper, WhisperCmd::TestDone),
+        }
+    }
+
+    /// The newest `[history]`: turned off during a job counts, the worker then writes nothing.
+    fn latest_history(&self) -> History {
+        let config = self.pending.as_ref().map_or(&self.active, |(c, _)| c);
+        config.history.clone()
     }
 
     /// Machine steps until no effect answers with an event. Mirror the phase first (the hook
@@ -228,11 +295,15 @@ impl<H: ChordHook> Coordinator<H> {
                 self.audio.remove(&job);
                 self.text.remove(&job);
                 self.spoken.remove(&job);
+                self.history_audio.remove(&job);
             }
             Effect::Preload => send(&self.workers.whisper, WhisperCmd::Preload),
             Effect::Unload => send(&self.workers.whisper, WhisperCmd::Unload),
             Effect::Transcribe(job) => {
                 if let Some(samples) = self.audio.remove(&job) {
+                    if self.active.history.enabled {
+                        self.history_audio.insert(job, samples.clone());
+                    }
                     send(
                         &self.workers.whisper,
                         WhisperCmd::Transcribe { job, samples },
@@ -273,8 +344,7 @@ impl<H: ChordHook> Coordinator<H> {
                     self.send_config();
                 }
             }
-            // shortcut: sounds land in M10; until then a played sound is only logged.
-            Effect::Play(sound) => tracing::debug!(?sound, "sound"),
+            Effect::Play(sound) => send(&self.workers.sound, SoundCmd::Play(sound)),
             Effect::Overlay(state) => self.ui(UiCmd::Overlay(state)),
             Effect::Notify(notice) => {
                 if tray::is_error(notice) {
@@ -314,6 +384,11 @@ impl<H: ChordHook> Coordinator<H> {
             &self.workers.whisper,
             WhisperCmd::Config(Box::new(cfg.clone())),
         );
+        send(&self.workers.sound, SoundCmd::Config(cfg.sounds.clone()));
+        send(
+            &self.workers.history,
+            HistoryCmd::Config(cfg.history.clone()),
+        );
         self.ui(UiCmd::Config {
             overlay: cfg.overlay.clone(),
             meter_sensitivity_db: cfg.audio.meter_sensitivity_db,
@@ -332,12 +407,15 @@ impl<H: ChordHook> Coordinator<H> {
         }
     }
 
-    /// Load corrections of the active config, the engine warning, then the last parse error.
+    /// Load corrections of the active config, the engine warning, the sound and history warnings,
+    /// then the last parse error.
     fn warnings(&self) -> Vec<String> {
         self.warnings
             .iter()
             .cloned()
             .chain(self.engine_warning.as_ref().map(strings::engine_warning))
+            .chain(self.sound_warnings.iter().cloned())
+            .chain(self.history_warning.clone())
             .chain(self.config_error.clone())
             .collect()
     }
@@ -399,7 +477,11 @@ mod tests {
     use std::sync::mpsc::channel;
 
     use oxi_core::config::{ConfigError, Hotkey};
-    use oxi_core::machine::{EmptyAudio, ModelFailure, Notice, OverlayState};
+    use oxi_core::machine::{EmptyAudio, ModelFailure, Notice, OverlayState, Sound};
+    use oxi_core::tuning::SettingsSet;
+    use oxi_core::types::Language;
+
+    use crate::daemon::cmd::TestJob;
 
     use super::*;
 
@@ -428,6 +510,8 @@ mod tests {
         audio: Receiver<AudioCmd>,
         whisper: Receiver<WhisperCmd>,
         paste: Receiver<PasteCmd>,
+        sound: Receiver<SoundCmd>,
+        history: Receiver<HistoryCmd>,
         ui: Receiver<UiCmd>,
     }
 
@@ -445,11 +529,15 @@ mod tests {
             let (audio_tx, audio) = channel();
             let (whisper_tx, whisper) = channel();
             let (paste_tx, paste) = channel();
+            let (sound_tx, sound) = channel();
+            let (history_tx, history) = channel();
             let (ui_tx, ui) = channel();
             let workers = Workers {
                 audio: audio_tx,
                 whisper: whisper_tx,
                 paste: paste_tx,
+                sound: sound_tx,
+                history: history_tx,
                 ui: ui_tx,
                 wake_ui: Box::new(|| {}),
             };
@@ -466,6 +554,8 @@ mod tests {
                 audio,
                 whisper,
                 paste,
+                sound,
+                history,
                 ui,
             };
             rig.drain_all();
@@ -476,6 +566,8 @@ mod tests {
             drain(&self.audio);
             drain(&self.whisper);
             drain(&self.paste);
+            drain(&self.sound);
+            drain(&self.history);
             drain(&self.ui);
         }
 
@@ -519,6 +611,43 @@ mod tests {
             );
             job
         }
+    }
+
+    #[test]
+    fn a_recognition_test_runs_only_while_the_machine_is_idle() {
+        let mut rig = Rig::new();
+        let reply = crate::daemon::ipc::Pushes::default();
+        let (_, pushes) = reply.claim(1);
+        let job = |id| {
+            Inbox::Ipc(IpcAsk::Test(TestJob {
+                id,
+                set: SettingsSet::defaults(),
+                language: Language::RU,
+                samples: vec![0.1],
+                reply: reply.clone(),
+            }))
+        };
+        rig.c.handle(job(1), Millis(0));
+        assert!(
+            drain(&rig.whisper)
+                .iter()
+                .any(|c| matches!(c, WhisperCmd::Test(j) if j.id == 1))
+        );
+        assert!(pushes.try_recv().is_err());
+
+        rig.event(Event::ChordDown, 0);
+        drain(&rig.whisper);
+        rig.c.handle(job(2), Millis(1));
+        assert!(drain(&rig.whisper).is_empty());
+        assert_eq!(
+            pushes.try_recv().ok(),
+            Some(Push::TestResult {
+                id: 2,
+                outcome: TestOutcome::Failed {
+                    why: TestFailure::Busy
+                }
+            })
+        );
     }
 
     #[test]
@@ -591,11 +720,126 @@ mod tests {
 
             rig.c.handle(Inbox::CopyLastText, Millis(3100));
             let copies = drain(&rig.paste);
-            let [PasteCmd::CopyOnly(text)] = copies.as_slice() else {
+            let [PasteCmd::CopyOnly { text, .. }] = copies.as_slice() else {
                 panic!("expected one CopyOnly after {outcome:?}");
             };
             assert_eq!(text, "hello");
         }
+    }
+
+    #[test]
+    fn copy_last_text_follows_the_history_setting_applied_after_the_dictation() {
+        for dictated_with in [true, false] {
+            let mut config = Config::default();
+            config.paste.keep_in_clipboard_history = dictated_with;
+            let mut rig = Rig::with(config.clone());
+            let job = rig.transcribed("hello");
+            rig.event(
+                Event::PasteDone {
+                    job,
+                    outcome: PasteOutcome::Pasted,
+                },
+                3000,
+            );
+            rig.drain_all();
+
+            config.paste.keep_in_clipboard_history = !dictated_with;
+            rig.c.handle(
+                Inbox::Config {
+                    config: Box::new(config),
+                    warnings: Vec::new(),
+                },
+                Millis(3050),
+            );
+            rig.drain_all();
+
+            rig.c.handle(Inbox::CopyLastText, Millis(3100));
+            let copies = drain(&rig.paste);
+            let [PasteCmd::CopyOnly { in_history, .. }] = copies.as_slice() else {
+                panic!("expected one CopyOnly");
+            };
+            assert_eq!(*in_history, !dictated_with);
+        }
+    }
+
+    #[test]
+    fn history_gets_the_audio_and_text_only_when_on_and_only_for_a_heard_dictation() {
+        let saves = |rig: &Rig| {
+            drain(&rig.history)
+                .into_iter()
+                .filter_map(|c| match c {
+                    HistoryCmd::Save { samples, text, cfg } => Some((samples.len(), text, cfg)),
+                    HistoryCmd::Config(_) => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let dictate = |rig: &mut Rig, text: Option<&str>| {
+            rig.event(Event::ModelLoaded, 0);
+            let job = rig.record();
+            let samples = vec![0.1; 16_000];
+            rig.c.handle(Inbox::JobAudio { job, samples }, Millis(2100));
+            let text = text.map(str::to_owned);
+            rig.c.handle(Inbox::Transcribed { job, text }, Millis(2500));
+        };
+        let mut off = Rig::new();
+        dictate(&mut off, Some("hello"));
+        assert!(saves(&off).is_empty(), "off writes nothing");
+        assert!(off.c.history_audio.is_empty());
+
+        let mut config = Config::default();
+        config.history.enabled = true;
+        let mut on = Rig::with(config);
+        dictate(&mut on, Some("hello"));
+        let [(len, text, cfg)] = saves(&on).try_into().unwrap();
+        assert_eq!((len, text.as_str(), cfg.enabled), (16_000, "hello", true));
+        assert!(on.c.history_audio.is_empty());
+
+        for text in [None, Some("  ")] {
+            let mut rig = Rig::with(on.c.active.clone());
+            dictate(&mut rig, text);
+            assert!(saves(&rig).is_empty(), "nothing heard is not saved");
+            assert!(rig.c.history_audio.is_empty(), "no audio kept for it");
+        }
+    }
+
+    #[test]
+    fn history_turned_off_during_a_job_is_off_at_its_save() {
+        let mut config = Config::default();
+        config.history.enabled = true;
+        let mut rig = Rig::with(config.clone());
+        rig.event(Event::ModelLoaded, 0);
+        let job = rig.record();
+        let samples = vec![0.1; 16_000];
+        rig.c.handle(Inbox::JobAudio { job, samples }, Millis(2100));
+        config.history.enabled = false;
+        rig.c.handle(
+            Inbox::Config {
+                config: Box::new(config),
+                warnings: Vec::new(),
+            },
+            Millis(2200),
+        );
+        let text = Some("hello".to_owned());
+        rig.c.handle(Inbox::Transcribed { job, text }, Millis(2500));
+        let saves: Vec<_> = drain(&rig.history)
+            .into_iter()
+            .filter_map(|c| match c {
+                HistoryCmd::Save { cfg, .. } => Some(cfg.enabled),
+                HistoryCmd::Config(_) => None,
+            })
+            .collect();
+        assert_eq!(saves, [false]);
+    }
+
+    #[test]
+    fn a_history_warning_shows_in_the_status_until_it_clears() {
+        let mut rig = Rig::new();
+        let line = "History not saved (StorageFull)";
+        rig.c
+            .handle(Inbox::HistoryWarning(Some(line.into())), Millis(10));
+        assert_eq!(rig.c.warnings(), [line]);
+        rig.c.handle(Inbox::HistoryWarning(None), Millis(20));
+        assert_eq!(rig.c.warnings(), Vec::<String>::new());
     }
 
     #[test]
@@ -779,6 +1023,38 @@ mod tests {
             oxi_core::device::DeviceChoice::Named("Vulkan1".into())
         );
         assert_eq!(status.warnings, ["gain clamped"]);
+    }
+
+    #[test]
+    fn sounds_go_to_the_sound_worker_and_its_warnings_show_in_status() {
+        let mut rig = Rig::new();
+        rig.event(Event::ChordDown, 0);
+        assert_eq!(drain(&rig.sound), [SoundCmd::Play(Sound::Start)]);
+        rig.c.handle(
+            Inbox::Ipc(IpcAsk::PreviewSound {
+                choice: "pop".into(),
+                volume_percent: 30,
+            }),
+            Millis(10),
+        );
+        assert_eq!(
+            drain(&rig.sound),
+            [SoundCmd::Preview {
+                choice: "pop".into(),
+                volume_percent: 30
+            }]
+        );
+        let status = |rig: &mut Rig| {
+            let (tx, rx) = channel();
+            rig.c.handle(Inbox::Ipc(IpcAsk::Status(tx)), Millis(20));
+            rx.try_recv().expect("status answered").warnings
+        };
+        let line = "sounds.start: cannot read the file (entity not found), using rise";
+        rig.c
+            .handle(Inbox::SoundWarnings(vec![line.into()]), Millis(20));
+        assert_eq!(status(&mut rig), [line]);
+        rig.c.handle(Inbox::SoundWarnings(Vec::new()), Millis(30));
+        assert_eq!(status(&mut rig), [] as [String; 0]);
     }
 
     #[test]
