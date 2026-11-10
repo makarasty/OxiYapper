@@ -122,6 +122,11 @@ opt-level = 3
 # cmake maps a non-zero opt-level to an optimised build of whisper.cpp.
 [profile.dev.package."*"]
 opt-level = 2
+debug = false
+
+# Full debuginfo made the shared target dir grow past 100 GB; line tables keep backtraces.
+[profile.dev]
+debug = "line-tables-only"
 
 # Release speed without the fat-LTO link: benches and the Vulkan/CUDA measurement.
 [profile.profiling]
