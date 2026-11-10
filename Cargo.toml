@@ -36,6 +36,7 @@ rubato = "5"
 hound = "3.5"
 earshot = "1.2"
 nnnoiseless = "0.5"
+unicode-normalization = "0.1.26"
 windows-sys = "0.61"
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd", "png-format"] }
 ab_glyph = "0.2"

@@ -253,9 +253,14 @@ fn draw_whole_frames(window: &AppWindow) {
     let _ = window.window().set_rendering_notifier(|_, _| {});
 }
 
-/// The OS "Animation effects" is off (UI rule 22).
-fn os_reduced_motion() -> bool {
-    oxi_platform::reduced_motion()
+/// Follows the OS "Animation effects" setting (UI rule 22): off zeroes `motion-quick` and
+/// `motion-open`.
+fn follow_os_motion(window: &AppWindow) {
+    set_reduced_motion(window, oxi_platform::reduced_motion());
+}
+
+fn set_reduced_motion(window: &AppWindow, reduced: bool) {
+    window.global::<Shell>().set_reduced_motion(reduced);
 }
 
 /// The settings window on `layout`'s config with no daemon link (it stays offline and shows no
@@ -277,9 +282,7 @@ fn open_inner(
     let window = AppWindow::new()?;
     own_accent(&window);
     draw_whole_frames(&window);
-    window
-        .global::<Shell>()
-        .set_reduced_motion(os_reduced_motion());
+    follow_os_motion(&window);
     let (mut ctx, problem) = Ctx::load(layout)?;
     let followed = link(&window)?;
     if let Some(ipc) = &followed {
@@ -338,9 +341,7 @@ fn open_inner(
                 own_accent(&window);
                 // Puts back a frame the OS lost with no paint message (see `draw_whole_frames`).
                 window.window().request_redraw();
-                window
-                    .global::<Shell>()
-                    .set_reduced_motion(os_reduced_motion());
+                follow_os_motion(&window);
                 reload(&window, &c, linked);
                 pages::poll(&window, &c);
             }
@@ -498,10 +499,18 @@ mod tests {
     #[test]
     fn window_takes_reduced_motion_from_the_os() {
         let (window, _ipc, _sent, _) = crate::testing::linked("lib", "motion", super::Page::Home);
-        assert_eq!(
-            window.global::<super::Shell>().get_reduced_motion(),
-            super::os_reduced_motion()
+        let (shell, tokens) = (
+            window.global::<super::Shell>(),
+            window.global::<super::Tokens>(),
         );
+        // The testing backend has no OS setting: `open` read the platform's value.
+        assert_eq!(shell.get_reduced_motion(), oxi_platform::reduced_motion());
+        super::set_reduced_motion(&window, false);
+        assert_eq!(tokens.get_motion_quick(), 100);
+        super::set_reduced_motion(&window, true);
+        assert!(shell.get_reduced_motion());
+        assert_eq!(tokens.get_motion_quick(), 0);
+        assert_eq!(tokens.get_motion_open(), 0);
     }
 
     #[test]

@@ -320,9 +320,9 @@ System
 49. Hand-edited config with an error: daemon keeps the last good config; settings shows the line and offers "Open file" or "Reset to defaults" (old file kept as `config.toml.bak`).
 50. Config from a newer build (downgrade): read-only, never written.
 51. Crash during a wav write: `.part` removed at next start; the text was already pasted.
-52. History over its cap: oldest entries removed after each save and at start; only files matching the history naming inside the app-owned folder that holds the marker are ever deleted.
+52. History over its cap: oldest entries removed after each dictation and at start, saving on or off, in the current folder only (a former folder is never touched; `.txt.tmp`/`.wav.part` leftovers are swept on the same pass); age is strict by date, entries dated after today are kept; only files matching the history naming inside the app-owned folder that holds the marker are ever deleted.
 53. Update check offline or rate-limited: silent, try again the next day. Asset for this build variant missing: the badge opens the release page instead of Install.
-54. Autostart path moved (portable zip moved): each start re-registers autostart if it points elsewhere.
+54. Autostart path moved (portable zip moved): each daemon start and config reload re-registers autostart (`HKCU\...\Run\OxiYapper`, quoted exe path) if it points elsewhere, and removes it when off and it is this exe; a test daemon (`OXI_PIPE_SUFFIX` set) never touches it.
 55. Installer and portable copy both present: same per-user socket, the second opens the first one's settings.
 56. Two users logged in on one machine: socket name and data are per user; hooks are per session.
 57. Stale Unix socket after a crash: connect refused, unlink, bind.

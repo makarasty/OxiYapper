@@ -1,5 +1,6 @@
 //! OS code behind traits, one module per OS chosen by `cfg` (ARCHITECTURE section 4).
 
+pub mod autostart;
 pub mod capture;
 pub mod dirs;
 pub mod draw;

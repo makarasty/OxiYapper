@@ -110,8 +110,6 @@ export component SystemPage inherits VerticalLayout {
             ToggleRow {
                 flat: true;
                 title: @tr("Start at sign-in");
-                // Until the OS registration lands (ROADMAP M10) the switch only saves the setting.
-                description: @tr("Takes effect in a later version.");
                 checked <=> SystemState.autostart;
                 toggled(on) => {
                     SystemState.autostart-toggled(on);
@@ -173,9 +171,9 @@ export component SystemPage inherits VerticalLayout {
     if SystemState.tab == 1: Card {
             Row {
                 title: @tr("Save recordings");
-                // Limits act only while on, on the folder below: recordings left after Off or in an earlier
-                // folder are never deleted (SPEC History: retention is part of saving).
-                description: @tr("While on, keeps audio and text in the folder below, up to these limits.");
+                // Limits act on the folder below, saving on or off; an earlier folder is never touched
+                // (SPEC History, owner 2026-11-10).
+                description: @tr("Keeps audio and text in the folder below up to these limits. Older ones are deleted, even while off.");
                 warning: SystemState.history-limit-note;
                 NumberField {
                     value <=> SystemState.history-days;

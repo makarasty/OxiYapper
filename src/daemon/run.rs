@@ -44,6 +44,10 @@ pub fn run() -> anyhow::Result<()> {
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "daemon started");
     watch::ensure_config(&layout).context("cannot write the default config.toml")?;
     let (config, warnings, config_error) = load_config(&layout.config_file());
+    // A config that does not parse is no answer: autostart stays as it is until it is fixed.
+    if config_error.is_none() {
+        sync_autostart(config.system.autostart);
+    }
 
     // The overlay first: it makes the process per-monitor DPI aware (v2) before any window exists.
     let meter = LevelMeter::default();
@@ -101,8 +105,12 @@ pub fn run() -> anyhow::Result<()> {
     let watcher = watch::spawn(&layout, watch_tx, notify).context("config watcher")?;
     // A parse error also goes to the settings window, which shows its line.
     forward("config-events", watch_rx, inbox.clone(), move |msg| {
-        if let Inbox::ConfigError(e) = &msg {
-            pushes.send(config_error_push(e));
+        match &msg {
+            Inbox::ConfigError(e) => {
+                pushes.send(config_error_push(e));
+            }
+            Inbox::Config { config, .. } => sync_autostart(config.system.autostart),
+            _ => {}
         }
         msg
     })?;
@@ -151,6 +159,39 @@ pub fn run() -> anyhow::Result<()> {
     drop(tray);
     tracing::info!("daemon stopped");
     Ok(())
+}
+
+/// Makes the OS autostart entry follow `on` for this exe (item 54). A test daemon (the pipe
+/// suffix set) never touches it: it would point the user's entry at a temp copy.
+fn sync_autostart(on: bool) {
+    use oxi_core::autostart::{Action, decide};
+    use oxi_platform::autostart::{NAME, query, register, unregister};
+    // A debug build runs from a cargo target dir; it must never repoint the user's Run entry there.
+    if cfg!(debug_assertions) || std::env::var_os(oxi_platform::ipc::PIPE_SUFFIX_ENV).is_some() {
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => return tracing::warn!("autostart not checked, no exe path: {e}"),
+    };
+    let current = match query(NAME) {
+        Ok(current) => current,
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => return,
+        // Unreadable (another type, say): treated as absent, so autostart on writes it anew.
+        Err(e) => {
+            tracing::warn!("autostart entry unreadable: {e}");
+            None
+        }
+    };
+    let done = match decide(on, current.as_deref(), &exe) {
+        Action::Keep => return,
+        Action::Write(command) => register(NAME, &command),
+        Action::Remove => unregister(NAME),
+    };
+    match done {
+        Ok(()) => tracing::info!(on, "autostart entry updated"),
+        Err(e) => tracing::warn!("autostart entry not updated: {e}"),
+    }
 }
 
 /// The start config. One that does not parse starts on the defaults and is reported like a

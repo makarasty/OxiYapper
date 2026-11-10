@@ -70,6 +70,8 @@ component TechCard inherits ClickCard {
 
 component AuthorCard inherits Card {
     callback open(string);
+    // Under the second tile column the line shows "Made in Ukraine" alone.
+    in property <bool> compact;
     HorizontalLayout {
         spacing: Theme.icon-gap;
         Rectangle {
@@ -96,9 +98,20 @@ component AuthorCard inherits Card {
                 font-weight: Theme.weight-strong;
                 color: Theme.text-primary;
             }
-            Caption {
-                text: @tr("Issues and ideas welcome");
-                wrap: word-wrap;
+            HorizontalLayout {
+                alignment: start;
+                spacing: Theme.space-1;
+                Caption {
+                    text: "Made in Ukraine";
+                }
+                if !root.compact: Caption {
+                    text: "·";
+                    accessible-role: none;
+                }
+                if !root.compact: Caption {
+                    text: @tr("Issues and ideas welcome");
+                    overflow: elide;
+                }
             }
         }
         VerticalLayout {
@@ -247,6 +260,7 @@ export component AboutPage inherits VerticalLayout {
             alignment: center;
             width: root.column-x(root.columns - 1) - Theme.tile-gap;
             AuthorCard {
+                compact: true;
                 open(url) => {
                     root.open(url);
                 }

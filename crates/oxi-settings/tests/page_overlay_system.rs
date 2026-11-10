@@ -458,10 +458,11 @@ fn app_language_is_its_own_picker_and_says_it_is_not_the_dictation_language() {
 }
 
 #[test]
-fn autostart_says_it_takes_effect_later() {
+fn autostart_no_longer_says_it_takes_effect_later() {
     let l = layout("autostart-note", None);
     let window = open(&l, Page::System);
-    assert!(has(&window, "Takes effect in a later version."));
+    assert!(has(&window, "Start at sign-in"));
+    assert!(!has(&window, "Takes effect in a later version."));
 }
 
 const FOLDER_MISSING: &str =
@@ -576,12 +577,12 @@ fn a_stored_limit_above_the_field_maximum_is_never_lowered_by_a_step() {
 }
 
 #[test]
-fn the_limits_say_they_act_only_while_saving_in_the_folder_shown() {
+fn the_limits_say_they_act_on_the_folder_shown_even_while_off() {
     let l = layout("history-honest", None);
     let window = open_recordings(&l);
     assert!(has(
         &window,
-        "While on, keeps audio and text in the folder below, up to these limits."
+        "Keeps audio and text in the folder below up to these limits. Older ones are deleted, even while off."
     ));
 }
 

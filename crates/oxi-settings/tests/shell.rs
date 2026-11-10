@@ -57,6 +57,15 @@ fn about_shows_name_version_and_licence() {
     }
 }
 
+/// Owner 2026-11-10: the author line says "Made in Ukraine" (it was cut once). The std `AboutSlint`
+/// widget stays on About: the Slint royalty-free licence requires it.
+#[test]
+fn about_has_made_in_ukraine_and_the_std_slint_widget() {
+    let window = open(&layout("about-slint-badge", None), Page::About);
+    assert!(has(&window, "Made in Ukraine"));
+    assert!(has(&window, "#MadeWithSlint"), "AboutSlint is missing");
+}
+
 #[test]
 fn about_links_open_from_the_keyboard() {
     let (window, opened) = about_with_links("about-keys");
@@ -135,7 +144,13 @@ fn about_fits_the_minimum_size_with_a_banner() {
         window.set_daemon_text(daemon.into());
         window.set_daemon_start(!daemon.is_empty());
         i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(1));
-        for label in ["Apache-2.0 licence", "tiny-skia", "github.com/makarasty"] {
+        for label in [
+            "Apache-2.0 licence",
+            "tiny-skia",
+            "github.com/makarasty",
+            "Made in Ukraine",
+            "#MadeWithSlint",
+        ] {
             assert!(
                 whole_at_minimum(&window, label),
                 "{label} is cut (banner {banner:?}, daemon {daemon:?})"

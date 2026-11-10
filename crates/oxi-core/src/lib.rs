@@ -6,6 +6,7 @@
 pub const APP_NAME: &str = "OxiYapper";
 
 pub mod audio;
+pub mod autostart;
 pub mod cli;
 pub mod config;
 pub mod constants;

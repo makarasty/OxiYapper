@@ -16,7 +16,7 @@ param(
   [string]$Page = 'home',
   [int]$Width = 1000,
   [int]$Height = 700,
-  [ValidateSet('light', 'dark')][string]$Theme = 'light',
+  [ValidateSet('light', 'dark', 'system')][string]$Theme = 'light',
   [string]$Tab = '',
   [Parameter(Mandatory)][string]$Out,
   [switch]$NoBuild,

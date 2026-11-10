@@ -29,6 +29,24 @@ fn word_error_table() {
         // Decomposed letters are the same word (NFC).
         ("cafe\u{301} йод", "café и\u{306}од", 0, 2, 0.0),
         ("ёж", "е\u{308}ж", 0, 1, 0.0),
+        // Scripts the old hand table missed: Greek, Vietnamese (two marks), uppercase Cyrillic.
+        (
+            "\u{3AC}\u{3BB}\u{3C6}\u{3B1}",
+            "\u{3B1}\u{301}\u{3BB}\u{3C6}\u{3B1}",
+            0,
+            1,
+            0.0,
+        ),
+        ("vi\u{1EC7}t", "vie\u{323}\u{302}t", 0, 1, 0.0),
+        ("vi\u{1EC7}t", "vie\u{302}\u{323}t", 0, 1, 0.0),
+        (
+            "\u{419}\u{41E}\u{414}",
+            "\u{418}\u{306}\u{41E}\u{414}",
+            0,
+            1,
+            0.0,
+        ),
+        ("\u{401}\u{416}", "\u{415}\u{308}\u{416}", 0, 1, 0.0),
         // A different accent is a different word.
         ("cafe", "café", 1, 1, 100.0),
     ] {

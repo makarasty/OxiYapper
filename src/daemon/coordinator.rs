@@ -176,15 +176,16 @@ impl<H: ChordHook> Coordinator<H> {
                     self.spoken.remove(&job);
                     self.history_audio.remove(&job);
                 } else {
+                    let cfg = self.latest_history();
                     if let Some(samples) = self.history_audio.remove(&job) {
+                        let text = text.clone();
                         send(
                             &self.workers.history,
-                            HistoryCmd::Save {
-                                samples,
-                                text: text.clone(),
-                                cfg: self.latest_history(),
-                            },
+                            HistoryCmd::Save { samples, text, cfg },
                         );
+                    } else {
+                        // Saving is off: nothing to write, but the limits still act (SPEC History).
+                        send(&self.workers.history, HistoryCmd::Config(cfg));
                     }
                     self.text.insert(job, text);
                 }
@@ -800,6 +801,22 @@ mod tests {
             assert!(saves(&rig).is_empty(), "nothing heard is not saved");
             assert!(rig.c.history_audio.is_empty(), "no audio kept for it");
         }
+    }
+
+    #[test]
+    fn a_dictation_with_history_off_still_sends_the_prune() {
+        let mut rig = Rig::new();
+        rig.event(Event::ModelLoaded, 0);
+        let job = rig.record();
+        let samples = vec![0.1; 16_000];
+        rig.c.handle(Inbox::JobAudio { job, samples }, Millis(2100));
+        let text = Some("hello".to_owned());
+        rig.c.handle(Inbox::Transcribed { job, text }, Millis(2500));
+        let sent = drain(&rig.history);
+        let [HistoryCmd::Config(cfg)] = sent.as_slice() else {
+            panic!("expected one prune, got {} commands", sent.len());
+        };
+        assert!(!cfg.enabled);
     }
 
     #[test]

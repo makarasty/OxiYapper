@@ -178,7 +178,7 @@ pub enum PasteCmd {
 /// Commands for the history worker. It answers `Inbox::HistoryWarning` when the outcome changes.
 /// No `Debug`: `Save` carries the dictated text.
 pub enum HistoryCmd {
-    /// The active `[history]`: applies the retention limits to the folder now (only when on).
+    /// The active `[history]`: applies the retention limits to the folder now, saving on or off.
     Config(History),
     /// Save one dictation as `<stem>.wav` and `<stem>.txt` in the configured folder, then apply
     /// the retention limits. Nothing is written when `cfg.enabled` is false.

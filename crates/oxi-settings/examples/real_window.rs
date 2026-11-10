@@ -8,6 +8,8 @@
 //! came back flat white in about 4 runs of 10 (the frame is only there if it is read early).
 //! The window is never activated, so it cannot take the owner's focus. The Audio page still opens
 //! the default microphone for its level meter (`pages/audio.rs`, in memory, nothing is written).
+//! `--idle <seconds>` (anywhere in the arguments, `out.png` is then unused) takes no shot: the window
+//! stays open that long, untouched, for the idle-CPU measurement of UI rule 23, then exits.
 //! `tab` opens a sub-tab by name; a name it does not know is an error, never a shot of another tab.
 
 // No console: a console exe started by the script shares the caller's console and was killed
@@ -146,8 +148,18 @@ fn open_tab(window: &AppWindow, page: Page, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // one linear setup script; splitting it hides the order
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = env::args().skip(1);
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    let mut idle = None;
+    if let Some(i) = args.iter().position(|a| a == "--idle") {
+        idle = args.get(i + 1).and_then(|n| n.parse::<u64>().ok());
+        if idle.is_none() {
+            return Err("--idle needs a whole number of seconds".into());
+        }
+        args.drain(i..=i + 1);
+    }
+    let mut args = args.into_iter();
     let usage = "usage: real_window <page> <width> <height> <light|dark|system> <out.png> [tab]";
     let (Some(name), Some(w), Some(h), Some(theme), Some(out)) = (
         args.next(),
@@ -216,42 +228,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             oxi_settings::caption_theme(&window, window.get_theme());
         }
     })?;
-    Timer::single_shot(DEADLINE, || {
+    Timer::single_shot(idle.map_or(DEADLINE, Duration::from_secs), || {
         let _ = slint::quit_event_loop();
     });
     let shooter = Timer::default();
     let weak = window.as_weak();
     let want = (w, h);
-    shooter.start(TimerMode::Repeated, RETRY, {
-        let started = std::time::Instant::now();
-        move || {
-            if started.elapsed() < SETTLE {
-                return;
+    // Idle mode starts no timer of its own: it must not add load to what it measures.
+    if idle.is_none() {
+        shooter.start(TimerMode::Repeated, RETRY, {
+            let started = std::time::Instant::now();
+            move || {
+                if started.elapsed() < SETTLE {
+                    return;
+                }
+                let Some(window) = weak.upgrade() else { return };
+                let Ok(shot) = window.window().take_snapshot() else {
+                    return;
+                };
+                let scale = window.window().scale_factor();
+                // The window is still at its default size until the resize lands.
+                let off =
+                    |got: u32, want: f32| (f64::from(got) - f64::from(want * scale)).abs() > 1.0;
+                if off(shot.width(), want.0) || off(shot.height(), want.1) {
+                    return;
+                }
+                let size = tiny_skia::IntSize::from_wh(shot.width(), shot.height());
+                let Some(pixmap) = size
+                    .and_then(|size| tiny_skia::Pixmap::from_vec(shot.as_bytes().to_vec(), size))
+                else {
+                    return;
+                };
+                if let Err(e) = pixmap.save_png(&out) {
+                    eprintln!("real_window: cannot save {}: {e}", out.display());
+                    process::exit(2);
+                }
+                eprintln!("real_window: shot {}x{}", shot.width(), shot.height());
+                let _ = slint::quit_event_loop();
             }
-            let Some(window) = weak.upgrade() else { return };
-            let Ok(shot) = window.window().take_snapshot() else {
-                return;
-            };
-            let scale = window.window().scale_factor();
-            // The window is still at its default size until the resize lands.
-            let off = |got: u32, want: f32| (f64::from(got) - f64::from(want * scale)).abs() > 1.0;
-            if off(shot.width(), want.0) || off(shot.height(), want.1) {
-                return;
-            }
-            let size = tiny_skia::IntSize::from_wh(shot.width(), shot.height());
-            let Some(pixmap) =
-                size.and_then(|size| tiny_skia::Pixmap::from_vec(shot.as_bytes().to_vec(), size))
-            else {
-                return;
-            };
-            if let Err(e) = pixmap.save_png(&out) {
-                eprintln!("real_window: cannot save {}: {e}", out.display());
-                process::exit(2);
-            }
-            eprintln!("real_window: shot {}x{}", shot.width(), shot.height());
-            let _ = slint::quit_event_loop();
-        }
-    });
+        });
+    }
     let result = window.run();
     let _ = fs::remove_dir_all(&dir);
     Ok(result?)

@@ -54,6 +54,7 @@ How to look:
 18. **The light theme is warm like dawn, slightly yellow, not pure white.**
     Check: every opaque neutral light `bg-*` token in `tokens.slint` has red above blue and none is `#FFFFFF`. Teal and success tints and translucent overlays are exempt.
 19. **Text is at least 12 px and at least 4.5:1 against its background, in both themes.** Disabled text is exempt from the 4.5:1 limit (rule 31 still says why it is disabled).
+    Exempt: the Slint `AboutSlint` widget on About. Its 10 px text is fixed by Slint, and the Slint royalty-free licence requires the widget.
     Check: `rg "font-size: *[0-9]" crates/oxi-settings/ui` prints nothing; the gallery contrast swatches all read 4.5 or more, except the swatches of disabled text.
 20. **The on-screen keyboard's style is the base for every component: bright caps on grey, crisp 1 px strokes. Icons are Fluent UI System Icons, not hand-made.** The own logo mark is the one exception.
     Check: a new icon is listed in `crates/oxi-settings/ui/icons/SOURCE.md` and read through the `Icons` global.
@@ -70,8 +71,8 @@ How to look:
 ## Window and navigation
 
 24. **The window has a maximum and maximize is off; the content adapts.** It resizes from the minimum up to the maximum in SPEC.
-    Check: the maximize button is disabled, dragging an edge stops at the maximum, and shots at the three sizes show no stretched control or large empty band.
-25. **No scroll on normal pages. A page that does not fit gets horizontal sub-tabs under the title.** The sidebar stays short and works icons-only. Page scrolling stays only as SPEC's fallback. A one-view page (Home; Hotkey with the keyboard open) gets a tight layout under a token-defined height instead of sub-tabs: it drops what is secondary and keeps its actions in view.
+    Check: the maximize button is disabled, dragging an edge stops at the maximum, and shots at the three sizes show no stretched control. An empty area below short content in a large window is allowed: do not stretch controls or cards to fill the height.
+25. **No scroll on normal pages. A page that does not fit gets horizontal sub-tabs under the title.** The sidebar stays short and works icons-only. Page scrolling stays only as SPEC's fallback. Two one-view pages that cannot be split into meaningful sub-tabs, Home and Hotkey with the on-screen keyboard open, may use a tight layout at small window sizes under a token-defined height instead of sub-tabs: it hides captions, the legend, headings and instruction text and keeps actions in view (owner, 2026-11-10). System General's tight layout at low height (system.slint:49, token `system-tight-height` in tokens.slint) is also allowed.
     Check: a real shot of every page and sub-tab at 720x520 with default content shows no scrollbar; at the same size the icons-only sidebar shows every section.
 26. **No scroll inside a scroll.** A long list scrolls by itself and the page around it does not.
     Check: with a list over its height, wheel over the list moves only the list.

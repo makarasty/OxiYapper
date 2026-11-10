@@ -50,28 +50,26 @@ fn spawn_with(
         })
 }
 
-/// Runs one command; returns the warning it leaves standing (history off has none). The limits act
-/// only while saving is on and only on the folder in use (SPEC History; the System page says so).
+/// Runs one command; returns the warning it leaves standing. The limits always act on the folder
+/// in use, saving on or off; a former folder is never touched (SPEC History, owner 2026-11-10).
 fn handle(cmd: HistoryCmd, default_dir: &Path, now: (Date, u32)) -> Option<String> {
     let mut pass = Pass::default();
-    match cmd {
-        HistoryCmd::Config(cfg) if cfg.enabled => {
-            let dir = history::folder(&cfg, default_dir);
-            if owned(&dir) {
-                sweep_leftovers(&dir, &mut pass);
-                prune(&dir, &cfg, now.0, &mut pass);
-            }
-        }
-        HistoryCmd::Save { samples, text, cfg } if cfg.enabled => {
-            let dir = history::folder(&cfg, default_dir);
+    let (cfg, dictation) = match cmd {
+        HistoryCmd::Config(cfg) => (cfg, None),
+        HistoryCmd::Save { samples, text, cfg } => (cfg, Some((samples, text))),
+    };
+    let dir = history::folder(&cfg, default_dir);
+    match dictation {
+        Some((samples, text)) if cfg.enabled => {
             if let Err(e) = claim(&dir).and_then(|()| save(&dir, &samples, &text, now)) {
                 tracing::warn!(kind = ?e.kind(), "history not written");
                 return Some(format!("History not saved ({:?})", e.kind()));
             }
-            prune(&dir, &cfg, now.0, &mut pass);
         }
-        HistoryCmd::Config(_) | HistoryCmd::Save { .. } => {}
+        _ if owned(&dir) => sweep_leftovers(&dir, &mut pass),
+        _ => return None,
     }
+    prune(&dir, &cfg, now.0, &mut pass);
     pass.failed
         .map(|kind| format!("Old history not removed ({kind:?})"))
 }
@@ -313,34 +311,44 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// SPEC History: the limits are part of saving. Off, or a folder no longer in use, keeps what
-    /// it holds; turning saving off is no consent to delete.
+    /// SPEC History (owner 2026-11-10): the limits act on the folder in use while saving is off;
+    /// a folder no longer in use keeps what it holds.
     #[test]
-    fn off_and_a_former_folder_delete_nothing() {
+    fn off_prunes_the_current_folder_and_never_a_former_one() {
         let (dir, former, current) = (
-            owned_temp("off-keeps"),
+            owned_temp("off-prunes"),
             owned_temp("former"),
             temp("current"),
         );
-        let old = file(dir.join("2026-01-01/090000-000.wav"));
+        let in_use = current.join(history::OWNED_DIR);
+        claim(&in_use).unwrap();
+        let in_use_aged = file(in_use.join("2026-01-01/090000-000.wav"));
+        let aged = file(dir.join("2026-01-01/090000-000.wav"));
+        let recent = file(dir.join("2026-11-07/090000-000.wav"));
+        let tmp = file(dir.join("2026-11-07/090001-000.txt.tmp"));
         let elsewhere = file(former.join("2026-01-01/090000-000.wav"));
-        let tight = |enabled| History {
-            max_days: 1,
-            max_bytes: 1,
-            ..cfg(enabled)
+        let off = |max_days, max_bytes| History {
+            max_days,
+            max_bytes,
+            ..cfg(false)
         };
+        run(&dir, vec![HistoryCmd::Config(off(30, 0))]);
+        assert!(!aged.exists(), "the days limit acts while off");
+        assert!(!tmp.exists(), "a leftover is swept while off");
+        assert!(recent.is_file());
+        run(&dir, vec![save_cmd(off(0, 1))]);
+        assert!(!recent.exists(), "the size limit acts while off");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "only the marker");
         let moved = History {
             folder: current.to_string_lossy().into_owned(),
-            ..tight(true)
+            ..off(1, 1)
         };
-        let cmds = vec![
-            HistoryCmd::Config(tight(false)),
-            save_cmd(tight(false)),
-            HistoryCmd::Config(moved.clone()),
-            save_cmd(moved),
-        ];
-        run(&dir, cmds);
-        assert!(old.is_file() && elsewhere.is_file());
+        run(
+            &former,
+            vec![HistoryCmd::Config(moved.clone()), save_cmd(moved)],
+        );
+        assert!(elsewhere.is_file(), "a former folder is never touched");
+        assert!(!in_use_aged.exists(), "the folder in use is pruned");
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&former);
         let _ = fs::remove_dir_all(&current);
@@ -367,10 +375,6 @@ mod tests {
     #[test]
     fn retention_removes_old_days_and_never_other_files() {
         let dir = owned_temp("prune");
-        file(dir.join("2026-11-07/090000-000.wav")); // a recent entry: the clock is sane
-        // bridging days: age_floor stops at a gap of more than 31 days between dated entries
-        file(dir.join("2026-10-09/090000-000.wav"));
-        file(dir.join("2026-09-20/090000-000.wav"));
         let old = dir.join("2026-09-01");
         fs::create_dir_all(&old).unwrap();
         fs::write(old.join("090000-000.wav"), [0; 8]).unwrap();
@@ -497,10 +501,6 @@ mod tests {
     #[test]
     fn prune_removes_only_regular_files() {
         let dir = owned_temp("regular");
-        file(dir.join("2026-11-07/100000-000.wav")); // a recent entry: the clock is sane
-        // bridging days: age_floor stops at a gap of more than 31 days between dated entries
-        file(dir.join("2026-10-09/100000-000.wav"));
-        file(dir.join("2026-09-20/100000-000.wav"));
         let wav = file(dir.join("2026-09-01/090000-000.wav"));
         let inside = file(dir.join("2026-09-01/090000-000.txt/mine.doc"));
         assert_eq!(run(&dir, vec![HistoryCmd::Config(cfg(true))]), NO_WARNINGS);
@@ -509,22 +509,15 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A clock set back: entries dated after today are not deleted by age; older ones still are.
     #[test]
-    fn a_clock_jump_keeps_the_history() {
-        let dir = owned_temp("jump");
-        let wav = file(dir.join("2026-11-07/090000-000.wav"));
-        let (tx, rx) = channel();
-        let (inbox, _replies) = channel();
-        let worker = spawn_with(rx, inbox, dir.clone(), || {
-            (Date::from_ymd(2099, 1, 1).unwrap(), 0)
-        })
-        .unwrap();
-        tx.send(HistoryCmd::Config(cfg(true))).unwrap();
-        tx.send(save_cmd(cfg(true))).unwrap();
-        drop(tx);
-        worker.join().unwrap();
-        assert!(wav.is_file());
-        assert!(dir.join("2099-01-01/000000-000.txt").is_file());
+    fn a_clock_set_back_keeps_future_dated_entries() {
+        let dir = owned_temp("set-back");
+        let future = file(dir.join("2027-01-01/090000-000.wav"));
+        let aged = file(dir.join("2026-09-01/090000-000.wav"));
+        assert_eq!(run(&dir, vec![HistoryCmd::Config(cfg(false))]), NO_WARNINGS);
+        assert!(future.is_file());
+        assert!(!aged.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

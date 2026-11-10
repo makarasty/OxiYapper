@@ -7,6 +7,7 @@
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization as _;
 
 use crate::audio::SAMPLE_RATE;
 use crate::config::Config;
@@ -209,30 +210,6 @@ fn is_punctuation(c: char) -> bool {
         )
 }
 
-/// shortcut: no Unicode tables in the workspace, so only lowercase Cyrillic and Latin-1 letters
-/// compose (NFC for those); add `unicode-normalization` when another script shows false errors.
-const COMPOSE: [(char, &str); 8] = [
-    ('\u{300}', "aàeèiìoòuù"),
-    ('\u{301}', "aáeéiíoóuúyý"),
-    ('\u{302}', "aâeêiîoôuû"),
-    ('\u{303}', "aãnñoõ"),
-    ('\u{306}', "ийуў"),
-    ('\u{308}', "aäeëiïoöuüyÿеёії"),
-    ('\u{30A}', "aå"),
-    ('\u{327}', "cç"),
-];
-
-fn composed(base: char, mark: char) -> Option<char> {
-    let (_, pairs) = COMPOSE.iter().find(|(m, _)| *m == mark)?;
-    let mut pairs = pairs.chars();
-    while let (Some(plain), Some(whole)) = (pairs.next(), pairs.next()) {
-        if plain == base {
-            return Some(whole);
-        }
-    }
-    None
-}
-
 /// Lowercase words without punctuation, yo folded to ye. An apostrophe joins (`don't` is one
 /// word); any other punctuation separates (`кто-то` and `кто то` match).
 ///
@@ -241,18 +218,11 @@ fn composed(base: char, mark: char) -> Option<char> {
 fn words(text: &str) -> Vec<String> {
     let fold = |c| if c == 'ё' { 'е' } else { c };
     let mut clean = String::with_capacity(text.len());
-    for c in text.to_lowercase().chars() {
+    for c in text.to_lowercase().nfc() {
         if matches!(c, '\'' | '\u{2019}' | '\u{2BC}') {
             continue;
         }
-        if is_punctuation(c) {
-            clean.push(' ');
-        } else if let Some(whole) = clean.chars().next_back().and_then(|b| composed(b, c)) {
-            clean.pop();
-            clean.push(fold(whole));
-        } else {
-            clean.push(fold(c));
-        }
+        clean.push(if is_punctuation(c) { ' ' } else { fold(c) });
     }
     clean.split_whitespace().map(str::to_owned).collect()
 }

@@ -56,7 +56,7 @@ All measured against the 8 owner reference phrases before becoming defaults.
 ## Settings UI
 
 - Look modelled on Windows 11 Settings: opens large; resizable from a minimum (720x520) up to a set maximum (for example 1280x860); maximize is disabled; content adapts to the size, and the hotkey keyboard no longer changes the content width in a jarring way: the content adapts (owner 2026-11-08). Page scrolling is a fallback only: normal pages fit without it. Own teal accent, not the Windows accent.
-- Look modelled on XClicker: compact, with few controls per screen. No single-panel layout: pages have horizontal sub-tabs under the page title (owner 2026-11-08): Model has choice / settings / Advanced; Text has Dictionary / Replacements; Per-app rules has its own sub-tab or page. The sidebar stays short and keeps working in icons-only mode.
+- Look modelled on XClicker: compact, with few controls per screen. No single-panel layout, except Home and Hotkey (with the on-screen keyboard open), which are one-view pages with a tight layout (owner, 2026-11-10): pages have horizontal sub-tabs under the page title (owner 2026-11-08): Model has choice / settings / Advanced; Text has Dictionary / Replacements; Per-app rules has its own sub-tab or page. The sidebar stays short and keeps working in icons-only mode.
 - A Test tab (owner 2026-11-08): ready phrases in the person's language or their own phrase; scenario profiles (fast speech, bad microphone, long dictation, others) choose which settings sets to try (normalisation, noise suppression, model, tuning); a table with error percent per set; an "Apply best" button. No AI. Recordings stay in memory and are deleted on close.
 - Rows never change height (owner 2026-11-08). A persistent state shows a "!" icon in a reserved slot of the row with the text in a hover tooltip. Short events (for example the mic test recording) are toasts at the bottom of the window.
 - Visual pickers instead of long lists: Fluent icons in tiles and a drawn screen picker for overlay position, mode and the like.
@@ -81,7 +81,7 @@ All measured against the 8 owner reference phrases before becoming defaults.
 
 - Paste: restore the previous clipboard (see Text); add a trailing space; a "type character by character" mode for fields where Ctrl+V does not work (games, terminals, remote desktop). No auto-Enter.
 - Cancel key is Esc, fixed. No "paste last again" hotkey, no second-language hotkey.
-- History (recording storage, see History): retention by size cap and by age, both configurable (default 2 GB and the last 30 days; whichever limit is hit first removes the oldest entries). A history view in settings: play, copy, add to replacements.
+- History (recording storage, see History): retention by size cap and by age, both configurable (default 2 GB and the last 30 days; whichever limit is hit first removes the oldest entries). The age limit is strict by date; only entries dated after today (clock set back) are spared. Both limits apply to the folder in use also while saving is off; a former folder is never touched (owner 2026-11-10). A history view in settings: play, copy, add to replacements.
 - Distribution: free only. Windows per-user installer (no admin) plus portable zip; macOS .dmg; Linux AppImage and .deb. Package managers and code signing later.
 
 ## Decided in round 4

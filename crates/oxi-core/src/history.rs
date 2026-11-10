@@ -6,7 +6,6 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::History;
-use crate::constants::MAX_CLOCK_JUMP;
 use crate::stats::Date;
 
 /// Extension of the saved audio.
@@ -76,43 +75,17 @@ fn entry_day(e: &Entry) -> Option<Date> {
     e.stem.split_once('/').and_then(|(day, _)| day_dir(day))
 }
 
-/// The oldest day age retention may reach. Entries dated after `today` are ignored (they neither
-/// vouch for the clock nor stop retention). The distinct days are walked from `today` backwards;
-/// a gap of more than [`MAX_CLOCK_JUMP`] days (from `today` or between two days) stops the walk,
-/// and nothing past the gap is deleted by age: it may be a clock that jumped forward.
-/// shortcut: a person who dictates on days more than 31 days apart never has entries aged out,
-/// only the size cap trims them; upgrade when a real clock-jump signal exists.
-fn age_floor(entries: &[Entry], today: Date) -> Date {
-    let mut days: Vec<Date> = entries
-        .iter()
-        .filter_map(entry_day)
-        .filter(|&d| d <= today)
-        .collect();
-    days.sort_unstable_by(|a, b| b.cmp(a));
-    days.dedup();
-    let mut floor = today;
-    for d in days {
-        if d.add_days(MAX_CLOCK_JUMP) < floor {
-            break;
-        }
-        floor = d;
-    }
-    floor
-}
-
 /// The stems to delete: every entry older than `max_days` local days (the last 30 days keep 30
-/// day folders, today included) and inside [`age_floor`], then the oldest ones until the rest
-/// fits `max_bytes`. A limit of 0 is off. The size limit needs no clock.
+/// day folders, today included), strictly by date, then the oldest ones until the rest fits
+/// `max_bytes`. An entry dated after `today` (the clock was set back) is never deleted by age.
+/// A limit of 0 is off. The size limit needs no clock.
 pub fn expired(entries: &[Entry], today: Date, cfg: &History) -> Vec<String> {
     let mut sorted: Vec<&Entry> = entries.iter().collect();
     sorted.sort_by(|a, b| a.stem.cmp(&b.stem)); // fixed-width names: oldest first
-    let range = (cfg.max_days > 0).then(|| {
-        let cutoff = today.add_days(-i32::try_from(cfg.max_days).unwrap_or(i32::MAX));
-        (age_floor(entries, today), cutoff)
-    });
-    let old = |e: &Entry| {
-        range.is_some_and(|(floor, cutoff)| entry_day(e).is_some_and(|d| floor <= d && d <= cutoff))
-    };
+    let cutoff = (cfg.max_days > 0)
+        .then(|| today.add_days(-i32::try_from(cfg.max_days).unwrap_or(i32::MAX)));
+    // `cutoff` is before `today`, so a future-dated entry is never past it.
+    let old = |e: &Entry| cutoff.is_some_and(|c| entry_day(e).is_some_and(|d| d <= c));
     // Age frees size first: the cap counts only what the age limit leaves.
     let mut total: u64 = sorted.iter().filter(|e| !old(e)).map(|e| e.bytes).sum();
     let mut gone = Vec::new();
@@ -278,23 +251,31 @@ mod tests {
         assert_eq!(expired(&entries, today, &cfg(0, 100)).len(), 2);
     }
 
+    /// SPEC History (owner 2026-11-10): age retention is strict by date; only entries dated after
+    /// today (the clock was set back) are kept from it.
     #[test]
-    fn the_age_limit_does_not_cross_a_gap_it_cannot_trust() {
+    fn the_age_limit_is_strict_by_date_and_skips_future_entries() {
         let now = day(2026, 11, 8);
         let far = day(2099, 1, 1);
         let table = [
             // today, entry days, how many the age limit of 30 days deletes
-            ("clock jumps, no save", far, vec![day(2026, 11, 7), now], 0),
             (
-                "jump to 2099-01-01, one save, pass the next day",
-                day(2099, 1, 2),
-                vec![day(2026, 11, 7), now, far],
-                0,
+                "dictation 60 days apart",
+                now,
+                vec![day(2026, 8, 1), day(2026, 10, 1)],
+                2,
             ),
             (
-                "stray future folder, the clock is right",
+                "gap between two entries",
                 now,
-                vec![day(2026, 10, 1), day(2026, 10, 20), day(2026, 11, 7), far],
+                vec![day(2026, 8, 1), day(2026, 10, 20), now],
+                1,
+            ),
+            ("clock jumped forward", far, vec![day(2026, 11, 7), now], 2),
+            (
+                "clock set back: future entries stay",
+                now,
+                vec![day(2026, 10, 1), day(2026, 11, 9), far],
                 1,
             ),
             (
@@ -304,27 +285,9 @@ mod tests {
                 9,
             ),
             (
-                "dictation more than 31 days apart (accepted limit)",
+                "the 31st day back goes, the 30th stays",
                 now,
-                vec![day(2026, 8, 1), day(2026, 10, 1)],
-                0,
-            ),
-            (
-                "gap between two entries stops the walk",
-                now,
-                vec![day(2026, 8, 1), day(2026, 10, 20), now],
-                0,
-            ),
-            (
-                "32 days since the newest",
-                day(2026, 11, 9),
-                vec![day(2026, 9, 1), day(2026, 10, 8)],
-                0,
-            ),
-            (
-                "31 days since the newest, then a gap",
-                now,
-                vec![day(2026, 9, 1), day(2026, 10, 8)],
+                vec![day(2026, 10, 9), day(2026, 10, 10)],
                 1,
             ),
         ];
@@ -341,7 +304,7 @@ mod tests {
             entry(day(2026, 11, 8), "100000-000", 60),
         ];
         assert_eq!(
-            expired(&entries, day(2099, 1, 1), &cfg(30, 100)),
+            expired(&entries, day(2000, 1, 1), &cfg(30, 100)),
             ["2026-11-07/100000-000"]
         );
     }

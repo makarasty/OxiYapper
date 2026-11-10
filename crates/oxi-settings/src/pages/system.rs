@@ -1,6 +1,6 @@
 //! System page: `[system]` (autostart, update check), `[history]` and `debug.log_text`. The theme
 //! picker on the same page belongs to the shell. `ui.language` is the app language, not the
-//! dictation one. Autostart is written to the config only; registering it with the OS is M10.
+//! dictation one. The daemon registers autostart with the OS when the config changes.
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
