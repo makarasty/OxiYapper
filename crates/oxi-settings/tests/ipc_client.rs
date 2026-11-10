@@ -7,9 +7,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use oxi_core::ipc::{PROTO, Push, Request};
+use oxi_core::ipc::{Attention, PROTO, Push, Request, SettingsPage};
 use oxi_platform::ipc::{Conn, Server};
-use oxi_settings::ipc::{Action, Cmd, Event, Ipc, Link, Notice, Options, notice, spawn_worker};
+use oxi_settings::ipc::{
+    Action, Cmd, Event, Ipc, Level, Link, Notice, Options, chip, notice, spawn_worker,
+};
 
 /// A name no other test or running daemon uses.
 fn name(tag: &str) -> String {
@@ -186,6 +188,32 @@ fn start_while_the_name_is_held_spawns_nothing() {
     until(&events, link(Link::Offline));
     tx.send(Cmd::Start).unwrap();
     spawned_at.recv_timeout(Duration::from_secs(4)).unwrap();
+}
+
+#[test]
+fn attention_push_arrives_and_names_its_page() {
+    let n = name("attention");
+    let server = Server::bind(&n).unwrap();
+    let daemon = thread::spawn(move || {
+        let mut conn = server.accept().unwrap();
+        ack(&mut conn, PROTO);
+        conn.send(&Push::Attention {
+            items: vec![Attention::OutOfMemory { cpu: true }, Attention::NoMicrophone],
+        })
+        .unwrap();
+        drain(&mut conn);
+    });
+    let (tx, events) = start(options(&n, Duration::ZERO, || {}));
+    let shown = until(&events, |e| matches!(e, Event::Push(_)));
+    let Event::Push(Push::Attention { items }) = shown else {
+        panic!("not an Attention push");
+    };
+    let chip = chip(Link::Online, &items);
+    assert_eq!(chip.text, "Out of memory");
+    assert_eq!(chip.level, Level::Attention);
+    assert_eq!(chip.target.unwrap().page, SettingsPage::Model);
+    drop(tx);
+    daemon.join().unwrap();
 }
 
 #[test]

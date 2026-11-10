@@ -1,0 +1,416 @@
+// History page (SPEC History, R1.3, R3.2, R3.3): the saved recordings, newest first, in a list
+// that draws only the rows in view (500 entries scroll like 5). The picked one: play with its
+// waveform, its full text, Copy, Transcribe again, add a replacement, Copy path, Delete.
+import { Theme, Shell, Icons, CardFrame, Caption, Button, ButtonKind, IconButton, InfoTip, ScrollBox, EmptyState, ProgressBar, Badge, BadgeKind, TextArea, TextField, Toast, FocusRing, KeyFocus } from "../theme/index.slint";
+
+// One saved recording, ready to show.
+export struct HistoryRow {
+    id: string,
+    // "2026-11-08 13:45:01".
+    when: string,
+    // "0:12".
+    duration: string,
+    // Empty for a finished one; "Interrupted", "Cancelled" or "Failed".
+    status: string,
+    // The first line of the text; empty when there is none.
+    first: string,
+    text: string,
+    // The recording's `.wav`, for Copy path.
+    path: string,
+}
+
+// Filled and read by `pages::history`.
+export global HistoryState {
+    in property <[HistoryRow]> items;
+    // The row shown on the right.
+    in-out property <int> selected;
+    // `[history] enabled`: off and empty shows Turn on.
+    in property <bool> history-on: true;
+    // A list request is out: no empty state yet.
+    in property <bool> loading;
+    // Why the list cannot be read (no daemon); empty while it can.
+    in property <string> link-off;
+    // The picked recording's waveform, 0 to 1 per bar; empty when its audio cannot be read.
+    in property <[float]> peaks;
+    in property <bool> playing;
+    // Why Play is off; empty while it is on.
+    in property <string> play-off;
+    // Why Transcribe is off; empty while it is on.
+    in property <string> redo-off;
+    // The recording being transcribed again, and how far it is (0 to 1).
+    in property <string> running-id;
+    in property <float> progress;
+    callback shown();
+    callback select(int);
+    callback play();
+    callback redo();
+    callback delete();
+    callback turn-on();
+    // Adds `heard => wanted` to the replacements; true when it was added.
+    callback add-replacement(string, string) -> bool;
+}
+
+// The bars of a recording, centred on its middle line.
+component Wave inherits Rectangle {
+    in property <[float]> peaks;
+    property <length> slot: root.width / max(1, root.peaks.length);
+    accessible-role: none;
+    for p[i] in root.peaks: Rectangle {
+        x: i * root.slot + root.slot * 0.2;
+        width: root.slot * 0.6;
+        height: max(Theme.space-1 / 2, p * root.height);
+        y: (root.height - self.height) / 2;
+        border-radius: Theme.radius-small;
+        background: Theme.text-secondary;
+    }
+}
+
+// One line of the list: when, how it ended if not finished, how long, and the start of its text.
+// A subtle surface (DS-5): hover and selected fills, no frame.
+component ListRow inherits Rectangle {
+    in property <HistoryRow> entry;
+    in property <bool> selected;
+    in property <bool> ring;
+    callback clicked;
+    border-radius: Theme.radius-control;
+    background: root.selected ? Theme.bg-subtle-selected : touch.has-hover ? Theme.bg-subtle-hover : transparent;
+    animate background { duration: Theme.motion-quick; easing: ease-out; }
+    accessible-role: list-item;
+    accessible-label: root.entry.when;
+    accessible-description: root.entry.status;
+    accessible-item-selected: root.selected;
+    accessible-action-default => {
+        root.clicked();
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+    VerticalLayout {
+        padding-left: Theme.space-3;
+        padding-right: Theme.space-3;
+        padding-top: Theme.space-2;
+        padding-bottom: Theme.space-2;
+        HorizontalLayout {
+            spacing: Theme.control-gap;
+            height: Theme.body-line;
+            Text {
+                text: root.entry.when;
+                font-size: Theme.body-size;
+                color: Theme.text-primary;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+                min-width: 0;
+                accessible-role: none;
+            }
+            Text {
+                text: root.entry.duration;
+                font-size: Theme.body-size;
+                color: Theme.text-secondary;
+                vertical-alignment: center;
+                horizontal-stretch: 0;
+                accessible-role: none;
+            }
+        }
+        // An entry that did not finish shows how it ended here instead of its (empty) text.
+        HorizontalLayout {
+            height: Theme.body-line;
+            alignment: start;
+            if root.entry.status != "": Badge {
+                text: root.entry.status;
+                kind: BadgeKind.accent;
+                y: (parent.height - self.height) / 2;
+            }
+            if root.entry.status == "": Caption {
+                text: root.entry.first != "" ? root.entry.first : @tr("No text");
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+                min-width: 0;
+                accessible-role: none;
+            }
+        }
+    }
+    FocusRing {
+        shown: root.ring;
+        radius: Theme.radius-control;
+    }
+}
+
+// The list: rows of one height, only those in view are built, so 500 entries cost what a screen
+// does. Up and Down move the pick and keep it in view.
+component HistoryList {
+    in property <[HistoryRow]> items;
+    property <length> row-h: 2 * Theme.body-line + 2 * Theme.space-2;
+    property <int> first: max(0, floor(-box.viewport-y / root.row-h));
+    property <int> shown: ceil(root.height / root.row-h) + 1;
+    property <bool> key-focus;
+    accessible-role: list;
+    accessible-label: @tr("Recordings");
+    function reveal() {
+        let top = HistoryState.selected * root.row-h;
+        if (top < -box.viewport-y) {
+            box.viewport-y = -top;
+        } else if (top + root.row-h > -box.viewport-y + box.height) {
+            box.viewport-y = box.height - top - root.row-h;
+        }
+    }
+    function pick(i: int) {
+        if (i >= 0 && i < root.items.length) {
+            HistoryState.select(i);
+            root.reveal();
+        }
+    }
+    fs := FocusScope {
+        focus-on-click: false;
+        focus-gained(reason) => {
+            root.key-focus = KeyFocus.from-key(reason);
+        }
+        key-pressed(event) => {
+            if (event.text == Key.UpArrow) {
+                root.pick(HistoryState.selected - 1);
+                return accept;
+            }
+            if (event.text == Key.DownArrow) {
+                root.pick(HistoryState.selected + 1);
+                return accept;
+            }
+            reject
+        }
+    }
+    box := ScrollBox {
+        width: root.width;
+        height: root.height;
+        content-height: root.items.length * root.row-h;
+        for i in root.shown: ListRow {
+            property <int> at: root.first + i;
+            visible: self.at < root.items.length;
+            x: 0;
+            y: self.at * root.row-h;
+            width: box.content-width;
+            height: root.row-h;
+            entry: root.items[self.at];
+            selected: self.at == HistoryState.selected;
+            ring: self.selected && root.key-focus && fs.has-focus;
+            clicked => {
+                fs.focus();
+                root.key-focus = false;
+                HistoryState.select(self.at);
+            }
+        }
+    }
+}
+
+// The picked recording.
+component Detail inherits CardFrame {
+    in property <HistoryRow> entry;
+    property <bool> asking;
+    property <bool> running: HistoryState.running-id != "" && HistoryState.running-id == root.entry.id;
+    changed entry => {
+        root.asking = false;
+    }
+    VerticalLayout {
+        padding-left: Theme.card-padding-h;
+        padding-right: Theme.card-padding-h;
+        padding-top: Theme.card-padding-v;
+        padding-bottom: Theme.card-padding-v;
+        spacing: Theme.space-3;
+        HorizontalLayout {
+            spacing: Theme.control-gap;
+            Button {
+                icon: HistoryState.playing ? Icons.stop : Icons.play;
+                text: HistoryState.playing ? @tr("Stop") : @tr("Play");
+                enabled: HistoryState.play-off == "";
+                tooltip: HistoryState.play-off;
+                clicked => {
+                    HistoryState.play();
+                }
+            }
+            Wave {
+                peaks: HistoryState.peaks;
+                horizontal-stretch: 1;
+                height: Theme.control-height;
+            }
+            Text {
+                text: root.entry.duration;
+                font-size: Theme.body-size;
+                color: Theme.text-secondary;
+                vertical-alignment: center;
+                horizontal-stretch: 0;
+            }
+        }
+        TextArea {
+            vertical-stretch: 1;
+            min-height: Theme.control-height * 2;
+            locked: false;
+            read-only: true;
+            text: root.entry.text;
+            placeholder-text: @tr("No text");
+            accessible-label: @tr("Transcript");
+        }
+        if root.running: ProgressBar {
+            value: HistoryState.progress;
+            label: @tr("Transcribing");
+        }
+        if !root.asking: HorizontalLayout {
+            spacing: Theme.control-gap;
+            Button {
+                icon: Icons.redo;
+                // An entry with no text stands out: transcribing it is the next step.
+                text: root.entry.text == "" ? @tr("Transcribe") : @tr("Transcribe again");
+                kind: root.entry.text == "" ? ButtonKind.primary : ButtonKind.secondary;
+                enabled: HistoryState.redo-off == "";
+                tooltip: HistoryState.redo-off;
+                clicked => {
+                    HistoryState.redo();
+                }
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+            IconButton {
+                icon: Icons.clipboard-paste-24;
+                label: @tr("Copy text");
+                enabled: root.entry.text != "";
+                clicked => {
+                    copier.text = root.entry.text;
+                    copier.select-all();
+                    copier.copy();
+                    copier.clear-selection();
+                    Toast.show(@tr("Copied."));
+                }
+            }
+            IconButton {
+                icon: Icons.path;
+                label: @tr("Copy path");
+                clicked => {
+                    copier.text = root.entry.path;
+                    copier.select-all();
+                    copier.copy();
+                    copier.clear-selection();
+                    Toast.show(@tr("Path copied."));
+                }
+            }
+            IconButton {
+                icon: Icons.delete-16;
+                label: @tr("Delete");
+                destructive: true;
+                enabled: !root.running;
+                clicked => {
+                    root.asking = true;
+                }
+            }
+        }
+        if root.asking: HorizontalLayout {
+            spacing: Theme.control-gap;
+            Text {
+                text: @tr("Delete this recording?");
+                font-size: Theme.body-size;
+                color: Theme.text-primary;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+                min-width: 0;
+            }
+            Button {
+                text: @tr("Cancel");
+                clicked => {
+                    root.asking = false;
+                }
+            }
+            Button {
+                icon: Icons.delete-16;
+                text: @tr("Delete");
+                kind: ButtonKind.danger;
+                clicked => {
+                    root.asking = false;
+                    HistoryState.delete();
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.control-gap;
+            heard := TextField {
+                horizontal-stretch: 1;
+                locked: false;
+                placeholder-text: @tr("Heard");
+                accessible-label: @tr("Heard");
+            }
+            wanted := TextField {
+                horizontal-stretch: 1;
+                locked: false;
+                placeholder-text: @tr("Replace with");
+                accessible-label: @tr("Replace with");
+            }
+            Button {
+                icon: Icons.add;
+                text: @tr("Add");
+                enabled: heard.text != "";
+                tooltip: @tr("Add to replacements");
+                clicked => {
+                    if (HistoryState.add-replacement(heard.text, wanted.text)) {
+                        heard.text = "";
+                        wanted.text = "";
+                    }
+                }
+            }
+            InfoTip {
+                y: (parent.height - self.height) / 2;
+                text: @tr("Fix a word whisper gets wrong: every later dictation gets the replacement.");
+            }
+        }
+    }
+    // The clipboard is reached through a text input's own Copy.
+    copier := TextInput {
+        visible: false;
+        width: 0;
+        height: 0;
+        accessible-role: none;
+    }
+}
+
+export component HistoryPage inherits VerticalLayout {
+    // The column's height under the header row (banners already taken off).
+    in property <length> free-height;
+    init => {
+        HistoryState.shown();
+    }
+    if HistoryState.items.length > 0: HorizontalLayout {
+        height: root.free-height;
+        spacing: Theme.tile-gap;
+        CardFrame {
+            width: clamp(root.width * 0.4, Theme.control-column-min, Theme.control-column-max);
+            HistoryList {
+                x: Theme.space-1;
+                y: Theme.space-1;
+                width: parent.width - 2 * Theme.space-1;
+                height: parent.height - 2 * Theme.space-1;
+                items: HistoryState.items;
+            }
+        }
+        Detail {
+            horizontal-stretch: 1;
+            entry: HistoryState.items[HistoryState.selected];
+        }
+    }
+    if HistoryState.items.length == 0 && !HistoryState.loading: EmptyState {
+        height: root.free-height;
+        icon: Icons.history;
+        text: !HistoryState.history-on ? @tr("Saving recordings is off") : HistoryState.link-off != "" ? HistoryState.link-off : @tr("No recordings yet");
+        if !HistoryState.history-on: Button {
+            text: @tr("Turn on");
+            kind: ButtonKind.primary;
+            enabled: !Shell.locked;
+            tooltip: Shell.locked ? Shell.locked-tip : "";
+            clicked => {
+                HistoryState.turn-on();
+            }
+        }
+        if HistoryState.history-on && HistoryState.link-off == "": InfoTip {
+            text: @tr("Dictate with your hotkey: every recording is kept here.");
+        }
+    }
+}

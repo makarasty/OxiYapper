@@ -33,13 +33,13 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
-    DestroyMenu, DestroyWindow, DispatchMessageW, GetMessageW, HICON, MENUITEMINFOW, MF_GRAYED,
-    MF_STRING, MIIM_BITMAP, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW,
-    RegisterClassExW, RegisterWindowMessageW, SM_CXSMICON, SetForegroundWindow, SetMenuItemInfoW,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP,
-    WM_CONTEXTMENU, WM_LBUTTONUP, WM_NULL, WM_POWERBROADCAST, WM_SETTINGCHANGE,
-    WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP, WTS_SESSION_LOCK,
-    WTS_SESSION_UNLOCK,
+    DestroyMenu, DestroyWindow, DispatchMessageW, GetMessageW, HICON, MB_ICONERROR, MB_OK,
+    MB_SETFOREGROUND, MENUITEMINFOW, MF_GRAYED, MF_STRING, MIIM_BITMAP, MSG, MessageBoxW,
+    PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW, RegisterClassExW, RegisterWindowMessageW,
+    SM_CXSMICON, SetForegroundWindow, SetMenuItemInfoW, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CONTEXTMENU, WM_ENDSESSION,
+    WM_LBUTTONUP, WM_NULL, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_WTSSESSION_CHANGE, WNDCLASSEXW,
+    WS_EX_TOOLWINDOW, WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
 use super::wide;
@@ -106,6 +106,7 @@ enum Incoming {
 }
 
 type OnSession = Box<dyn FnMut(Event)>;
+type OnEndSession = Box<dyn FnOnce()>;
 
 thread_local! {
     static INBOX: RefCell<VecDeque<Incoming>> = const { RefCell::new(VecDeque::new()) };
@@ -115,6 +116,8 @@ thread_local! {
     static PENDING: RefCell<VecDeque<Event>> = const { RefCell::new(VecDeque::new()) };
     /// A panic of `on_session` caught in the window procedure; `run` rethrows it.
     static PANIC: RefCell<Option<Box<dyn Any + Send>>> = const { RefCell::new(None) };
+    /// [`MainLoop::on_end_session`], until the loop is dropped.
+    static END_SESSION: RefCell<Option<OnEndSession>> = const { RefCell::new(None) };
 }
 
 /// Clears [`SESSION`] when `run` ends, also by panic.
@@ -290,6 +293,13 @@ impl MainLoop {
         // The daemon plays its own sounds.
         data.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
         shell(NIM_MODIFY, &data)
+    }
+
+    /// `f` runs inside the window procedure when Windows ends the session (shutdown, restart,
+    /// logoff: `WM_ENDSESSION`). The process may be ended as soon as it returns, so it does the
+    /// quit work itself and returns within a few seconds. It must not pump messages.
+    pub fn on_end_session(&mut self, f: impl FnOnce() + 'static) {
+        END_SESSION.with_borrow_mut(|slot| *slot = Some(Box::new(f)));
     }
 
     /// Runs the thread's message loop until [`Waker::quit`]. `on_wake` runs for each
@@ -526,6 +536,7 @@ impl Drop for MainLoop {
     fn drop(&mut self) {
         // First, under the lock: no Waker posts to this handle once the window is gone.
         *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        END_SESSION.with_borrow_mut(|slot| *slot = None);
         let _ = shell(NIM_DELETE, &self.data(0));
         // SAFETY: our window, on its own thread (MainLoop is not Send); a failed unregister
         // (never registered) is harmless.
@@ -592,6 +603,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             None
         }
+        // `wparam` 0: the session goes on (another app refused the end).
+        WM_ENDSESSION if wparam != 0 => {
+            // Taken out first: the call may block for seconds, and nothing else may borrow it.
+            if let Some(f) = END_SESSION.with_borrow_mut(Option::take)
+                && let Err(payload) = panic::catch_unwind(panic::AssertUnwindSafe(f))
+            {
+                PANIC.with_borrow_mut(|p| *p = Some(payload));
+            }
+            return 0;
+        }
         // SAFETY: for this message `lparam` is null or a NUL-terminated string (the changed area).
         WM_SETTINGCHANGE if unsafe { names(lparam, "ImmersiveColorSet") } => Some(Incoming::Theme),
         m if TASKBAR_CREATED.get() == Some(&m) => Some(Incoming::TaskbarCreated),
@@ -604,6 +625,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     // Default handling suits every message above (TRUE for WM_POWERBROADCAST, 0 otherwise).
     // SAFETY: the arguments Windows passed to this procedure.
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// A blocking error box for a daemon that stops after its start: a GUI exe has no console, so
+/// without it the app would vanish with no word (t11). Owned by no window; waits for OK.
+pub fn error_box(text: &str) {
+    let (text, title) = (wide(text), wide(APP_NAME));
+    // SAFETY: both strings are NUL-terminated and outlive the call; a null owner is allowed.
+    unsafe {
+        MessageBoxW(
+            ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+        );
+    }
 }
 
 /// A sent message (`PBT_APMSUSPEND`, `TaskbarCreated`, the shell's callback) is handled inside

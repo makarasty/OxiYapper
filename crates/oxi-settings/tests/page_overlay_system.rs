@@ -162,8 +162,8 @@ fn system_sub_tabs_fit_the_small_windows_without_scrolling() {
     }
 }
 
-/// The "!" of a switch row sits just left of the switch it warns about, and the folder name just
-/// left of its buttons, not alone at the start of the control column (UI rule 9).
+/// The "!" of a switch row sits just left of the switch it warns about, not alone at the start of
+/// the control column (UI rule 9). The folder path fills the column (DS-3.1): `page_system.rs`.
 #[test]
 fn the_warning_and_the_folder_name_sit_beside_their_controls() {
     let warning = "Dictated text is written to the log files while this is on. Turn it off when you are done.";
@@ -177,9 +177,6 @@ log_text = true
         ),
     );
     let window = open_recordings(&l);
-    let path = window
-        .global::<oxi_settings::SystemState>()
-        .get_history_path();
     let gap = window.global::<Tokens>().get_control_gap() + 1.0;
     for (w, h) in [(720.0_f32, 520.0_f32), (1280.0, 860.0)] {
         window.window().set_size(slint::LogicalSize::new(w, h));
@@ -191,16 +188,6 @@ log_text = true
         assert!(
             (0.0..=gap).contains(&apart),
             "{w}: ! ends {end}, switch at {apart} from it"
-        );
-        let folder = with_role(&window, &path, AccessibleRole::Text);
-        let open = with_role(&window, "Open recordings folder", AccessibleRole::Button);
-        let end = folder.absolute_position().x + folder.size().width;
-        let first = ElementHandle::find_by_accessible_label(&window, "Change recordings folder")
-            .next()
-            .map_or(open.absolute_position().x, |b| b.absolute_position().x);
-        assert!(
-            first - end <= gap,
-            "{w}: folder name ends {end}, buttons start {first}"
         );
     }
 }
@@ -469,6 +456,7 @@ const FOLDER_MISSING: &str =
     "This folder is gone. Nothing is saved until it is back or you choose another one.";
 const FOLDER_READ_ONLY: &str =
     "This folder cannot be written to. Nothing is saved: choose another one.";
+const FOLDER_IS_A_FILE: &str = "This is a file, not a folder. Nothing is saved: choose a folder.";
 const FOLDER_REFUSED: &str = "The \"OxiYapper history\" folder here holds other files. Nothing is saved: choose another one.";
 
 fn history_config(folder: &std::path::Path) -> String {
@@ -476,6 +464,11 @@ fn history_config(folder: &std::path::Path) -> String {
         "version = 1\n[history]\nfolder = {:?}\n",
         folder.display().to_string()
     )
+}
+
+/// The Recordings folder field's text, which holds the whole path where recordings land.
+fn folder_field(window: &AppWindow) -> ElementHandle {
+    with_role(window, "Recordings folder", AccessibleRole::TextInput)
 }
 
 /// Runs the page's poll until the folder check has answered, then says whether `label` is shown.
@@ -510,16 +503,16 @@ fn recordings_again(l: &Layout) -> AppWindow {
 }
 
 #[test]
-fn saving_is_off_by_default_and_the_switch_writes_it() {
+fn saving_is_on_by_default_and_the_switch_writes_it() {
     let l = layout("history-switch", None);
     let window = open_recordings(&l);
     let on = switch(&window, "Save recordings");
-    assert_eq!(on.accessible_checked(), Some(false));
+    assert_eq!(on.accessible_checked(), Some(true));
     assert!(!l.config_file().exists(), "showing it writes nothing");
     on.invoke_accessible_default_action();
-    assert!(config(&l).config.history.enabled);
-    on.invoke_accessible_default_action();
     assert!(!config(&l).config.history.enabled);
+    on.invoke_accessible_default_action();
+    assert!(config(&l).config.history.enabled);
 }
 
 #[test]
@@ -590,7 +583,10 @@ fn the_limits_say_they_act_on_the_folder_shown_even_while_off() {
 fn the_default_folder_is_named_and_warns_of_nothing() {
     let l = layout("history-default", None);
     let window = open_recordings(&l);
-    assert!(has(&window, &l.history_dir().display().to_string()));
+    assert_eq!(
+        folder_field(&window).accessible_value().as_deref(),
+        Some(l.history_dir().to_string_lossy().as_ref())
+    );
     assert!(!has(&window, FOLDER_MISSING) && !has(&window, FOLDER_REFUSED));
 }
 
@@ -604,7 +600,21 @@ fn a_folder_whose_drive_is_gone_is_the_warning_of_the_row() {
     assert!(after_the_check(&window, FOLDER_MISSING));
     // Where recordings would land, in full, behind the cut path.
     let path = gone.join(oxi_core::history::OWNED_DIR);
-    assert!(has(&window, &path.display().to_string()));
+    assert_eq!(
+        folder_field(&window).accessible_value().as_deref(),
+        Some(path.to_string_lossy().as_ref())
+    );
+}
+
+/// A stored folder that is a file is the row's "!", with the reason.
+#[test]
+fn a_folder_that_is_a_file_is_the_warning_of_the_row() {
+    let l = layout("history-is-file", None);
+    let file = l.data_dir.join("a.txt");
+    fs::write(&file, b"abc").unwrap();
+    fs::write(l.config_file(), history_config(&file)).unwrap();
+    let window = open_recordings(&l);
+    assert!(after_the_check(&window, FOLDER_IS_A_FILE));
 }
 
 #[test]

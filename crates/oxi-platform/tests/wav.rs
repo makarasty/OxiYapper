@@ -3,11 +3,12 @@ use std::path::PathBuf;
 
 use oxi_platform::wav::{read_wav_mono_f32, write_wav};
 
+#[path = "../src/scratch.rs"]
+mod scratch_guard;
+use scratch_guard::scratch_dir;
+
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("oxi-wav-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    scratch_dir(&format!("oxi-wav-{name}-{}", std::process::id()))
 }
 
 #[test]

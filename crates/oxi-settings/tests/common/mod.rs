@@ -14,17 +14,18 @@ use oxi_settings::{AppWindow, Ipc, Page};
 use slint::ComponentHandle;
 
 mod elements;
+mod scratch;
 pub use elements::{assert_nothing_moved, has, spots, with_role};
+pub use scratch::{fake_model, scratch_dir};
 
-/// A fresh directory per test and test binary; `config` is written as `config.toml` when given.
+/// A fresh directory per test and test binary, removed when the test ends; `config` is written
+/// as `config.toml` when given.
 pub fn layout(name: &str, config: Option<&str>) -> Layout {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = scratch_dir(&format!(
         "oxi-settings-{}-{}-{name}",
         env!("CARGO_CRATE_NAME"),
         std::process::id()
     ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
     if let Some(text) = config {
         fs::write(dir.join("config.toml"), text).unwrap();
     }

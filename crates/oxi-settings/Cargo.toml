@@ -29,5 +29,14 @@ slint-build.workspace = true
 i-slint-backend-testing.workspace = true
 tiny-skia.workspace = true
 
+# Test helpers: sparse fake model files and their real size on disk (tests/common/scratch.rs).
+[target.'cfg(windows)'.dev-dependencies.windows-sys]
+workspace = true
+features = [
+    "Win32_Foundation",         # HANDLE
+    "Win32_Storage_FileSystem", # GetCompressedFileSizeW
+    "Win32_System_IO",          # DeviceIoControl
+]
+
 [lints]
 workspace = true

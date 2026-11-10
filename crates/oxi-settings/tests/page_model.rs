@@ -12,6 +12,7 @@ use common::{config, has, layout, open, open_again, open_linked, with_role};
 use i_slint_backend_testing::{AccessibleRole, ElementHandle};
 use oxi_core::config::{ConfigFile, Model};
 use oxi_core::ipc::Push;
+use oxi_core::models::MODELS;
 use oxi_core::paths::Layout;
 use oxi_core::types::Language;
 use oxi_settings::ipc::{Event, Link};
@@ -51,6 +52,15 @@ fn sub_tab(window: &AppWindow, label: &str) {
     with_role(window, label, AccessibleRole::Tab).invoke_accessible_default_action();
 }
 
+/// Picks a gallery tile: its card shows below the gallery. It writes no config.
+fn view(window: &AppWindow, name: &str) {
+    radio(window, name).invoke_accessible_default_action();
+}
+
+fn button(window: &AppWindow, label: &str) -> ElementHandle {
+    with_role(window, label, AccessibleRole::Button)
+}
+
 #[test]
 fn rows_show_size_and_status_from_the_files() {
     let l = layout("rows", None);
@@ -58,35 +68,59 @@ fn rows_show_size_and_status_from_the_files() {
     // A cut-off download: the right name, far from the right size.
     fs::write(l.models_dir().join("ggml-large-v3.bin"), b"synthetic").unwrap();
     let window = open(&l, Page::Model);
+    // The gallery opens on the model in use.
     assert!(has(&window, "1.6 GB · fast, good for most"));
     assert!(has(&window, "Whisper large-v3 turbo: Not downloaded"));
     // The badge says "Damaged"; the caption only says what to do.
+    view(&window, "Whisper large-v3");
     assert!(has(&window, "3.1 GB · download it again"));
     assert!(has(&window, "Whisper large-v3: Damaged"));
     for name in ["Whisper large-v3 turbo", "Whisper large-v3"] {
-        with_role(&window, &format!("Download {name}"), AccessibleRole::Button);
+        view(&window, name);
+        button(&window, &format!("Download {name}"));
     }
+    // A damaged file can go too.
+    assert!(
+        !has(&window, "Delete Whisper large-v3 turbo"),
+        "nothing on disk"
+    );
+    view(&window, "Whisper large-v3");
+    button(&window, "Delete Whisper large-v3");
     // The test model is not offered.
     assert!(!has(&window, "Whisper tiny (tests and CI)"));
 }
 
 #[test]
-fn picking_a_row_writes_model_id() {
+fn use_writes_model_id_and_viewing_does_not() {
     let l = layout("pick", Some("version = 1\n# mine\n"));
+    // Every model on disk at its registry size (sparse): ready, so each card offers Use.
+    fs::create_dir_all(l.models_dir()).unwrap();
+    for m in MODELS.iter().filter(|m| m.id != "tiny") {
+        common::fake_model(&l.models_dir().join(m.file_name), m.size);
+    }
     let window = open(&l, Page::Model);
     assert_eq!(
         radio(&window, "Whisper large-v3 turbo").accessible_checked(),
         Some(true)
     );
+    view(&window, "Whisper large-v3");
+    let before = fs::read_to_string(l.config_file()).unwrap();
+    view(&window, "Whisper large-v3 Russian");
+    assert_eq!(
+        fs::read_to_string(l.config_file()).unwrap(),
+        before,
+        "viewing a model saved"
+    );
     for (label, id) in [
         ("Whisper large-v3", "large-v3"),
         ("Whisper large-v3 Russian", "podlodka"),
-        ("Use my own .bin", "custom"),
         ("Whisper large-v3 turbo", "turbo"),
     ] {
-        radio(&window, label).invoke_accessible_default_action();
+        view(&window, label);
+        button(&window, &format!("Use {label}")).invoke_accessible_default_action();
         assert_eq!(saved(&l).id, id, "{label}");
-        assert_eq!(radio(&window, label).accessible_checked(), Some(true));
+        let used = button(&window, &format!("{label} in use"));
+        assert_eq!(used.accessible_enabled(), Some(false));
     }
     let text = fs::read_to_string(l.config_file()).unwrap();
     assert!(text.contains("# mine"), "comment lost: {text}");
@@ -123,6 +157,7 @@ fn missing_custom_path_shows_an_error() {
 fn relative_custom_path_is_refused() {
     let l = layout("relative", None);
     let window = open(&l, Page::Model);
+    view(&window, "Use my own .bin");
     with_role(&window, "Model file", AccessibleRole::TextInput)
         .set_accessible_value("mine.bin".to_owned());
     assert!(has(
@@ -136,11 +171,15 @@ fn relative_custom_path_is_refused() {
 fn typing_a_good_path_picks_the_custom_model() {
     let l = layout("custom-pick", None);
     let window = open(&l, Page::Model);
+    // Viewed, not in use: an empty path is no error yet, and Use waits for a file.
+    view(&window, "Use my own .bin");
     assert!(!has(&window, "Choose a .bin model file"));
-    radio(&window, "Use my own .bin").invoke_accessible_default_action();
-    assert!(has(&window, "Choose a .bin model file"));
-    radio(&window, "Whisper large-v3").invoke_accessible_default_action();
-    assert!(!has(&window, "Choose a .bin model file"));
+    let use_it = button(&window, "Use the model file");
+    assert_eq!(use_it.accessible_enabled(), Some(false));
+    assert_eq!(
+        use_it.accessible_description().as_deref(),
+        Some("Choose a .bin model file")
+    );
 
     let model = l.config_dir.join("mine.bin");
     fs::write(&model, b"synthetic").unwrap();
@@ -149,10 +188,7 @@ fn typing_a_good_path_picks_the_custom_model() {
     wait_for(|| path_saved(&l, &model.to_string_lossy()));
     assert_eq!(saved(&l).id, "custom");
     assert_eq!(saved(&l).custom_path, model.to_string_lossy());
-    assert_eq!(
-        radio(&window, "Use my own .bin").accessible_checked(),
-        Some(true)
-    );
+    button(&window, "Own model file in use");
 }
 
 #[test]
@@ -230,6 +266,7 @@ fn sub_tabs_show_one_part_of_the_page() {
 fn download_without_the_daemon_says_to_start_it() {
     let l = layout("offline", None);
     let window = open(&l, Page::Model);
+    view(&window, "Whisper large-v3");
     let download = with_role(&window, "Download Whisper large-v3", AccessibleRole::Button);
     assert_eq!(download.accessible_enabled(), Some(false));
     assert_eq!(
@@ -249,8 +286,8 @@ fn a_selected_model_not_on_disk_warns() {
     let l = layout("not-on-disk", None);
     let window = open(&l, Page::Model);
     assert!(has(&window, warning));
-
-    radio(&window, "Use my own .bin").invoke_accessible_default_action();
+    // Only the card of the model in use warns.
+    view(&window, "Whisper large-v3");
     assert!(!has(&window, warning));
 }
 
@@ -263,14 +300,16 @@ fn locked_config_disables_the_controls() {
         let e = with_role(&window, label, role);
         assert_eq!(e.accessible_enabled(), Some(false), "{label}");
     };
-    off("Whisper large-v3 turbo", AccessibleRole::RadioButton);
-    off("Use my own .bin", AccessibleRole::RadioButton);
-    off("Model file", AccessibleRole::TextInput);
     off("Russian", AccessibleRole::RadioButton);
-    off("More languages", AccessibleRole::RadioButton);
+    off("More languages", AccessibleRole::Button);
     more_languages(&window);
     assert!(!popup_open(&window), "a locked config opened the popup");
-    radio(&window, "Whisper large-v3 turbo").invoke_accessible_default_action();
+    // Viewing writes nothing, so the gallery stays on; what writes the config is off.
+    view(&window, "Use my own .bin");
+    off("Model file", AccessibleRole::TextInput);
+    off("Use the model file", AccessibleRole::Button);
+    view(&window, "Whisper large-v3 turbo");
+    assert!(has(&window, "Whisper large-v3 turbo: Not downloaded"));
     // The sub-tabs only navigate: they stay on.
     sub_tab(&window, "Settings");
     off("GPU", AccessibleRole::Combobox);
@@ -283,7 +322,7 @@ fn segment(window: &AppWindow, label: &str) -> ElementHandle {
 }
 
 fn more_languages(window: &AppWindow) {
-    segment(window, "More languages").invoke_accessible_default_action();
+    button(window, "More languages").invoke_accessible_default_action();
 }
 
 fn search(window: &AppWindow, text: &str) {
@@ -313,15 +352,10 @@ fn popup_open(window: &AppWindow) -> bool {
 fn language_is_on_the_first_tab_and_auto_keeps_working() {
     let l = layout("language", None);
     let window = open(&l, Page::Model);
-    assert!(has(
-        &window,
-        "The language the model listens for. Auto detects it."
-    ));
     assert_eq!(segment(&window, "Russian").accessible_checked(), Some(true));
-    assert_eq!(
-        segment(&window, "More languages").accessible_checked(),
-        Some(false)
-    );
+    // "More" is a button with a glyph, not a fourth segment of typed dots (DS-17.1).
+    button(&window, "More languages");
+    assert!(!has(&window, "…") && !has(&window, "..."));
 
     segment(&window, "Auto").invoke_accessible_default_action();
     let model = saved(&l);
@@ -438,15 +472,15 @@ fn the_popup_works_from_the_keyboard() {
     let l = layout("language-keys", None);
     let window = open(&l, Page::Model);
     tab_to_the_segments(&window, "Russian");
-    // The "..." is the next Tab stop: it opens the list, and getting there saves nothing.
+    // The "more" button is the next Tab stop: it opens the list, and getting there saves nothing.
     press(&window, Key::Tab);
     assert!(!popup_open(&window));
-    assert!(!l.config_file().exists(), "Tab onto the \"...\" saved");
+    assert!(!l.config_file().exists(), "Tab onto the more button saved");
     press(&window, " ");
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(350));
     assert!(popup_open(&window));
     assert!(!l.config_file().exists(), "opening the list saved");
-    // Esc closes it and the focus is back on the "...", where Enter opens it again.
+    // Esc closes it and the focus is back on the more button, where Enter opens it again.
     press(&window, Key::Escape);
     assert!(!popup_open(&window));
     assert!(!l.config_file().exists(), "closing the list saved");
@@ -464,7 +498,7 @@ fn the_popup_works_from_the_keyboard() {
 }
 
 #[test]
-fn the_arrows_skip_the_more_languages_segment() {
+fn the_arrows_stop_at_auto() {
     let l = layout("language-arrows", None);
     let window = open(&l, Page::Model);
     tab_to_the_segments(&window, "Russian");
@@ -472,7 +506,7 @@ fn the_arrows_skip_the_more_languages_segment() {
     assert_eq!(saved(&l).language, Language::EN);
     press(&window, Key::RightArrow);
     assert_eq!(saved(&l).language, Language::AUTO);
-    // "..." is not a choice: the arrow stops at Auto and opens nothing.
+    // "More languages" is not a segment: the arrow stops at Auto and opens nothing.
     press(&window, Key::RightArrow);
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(350));
     assert!(!popup_open(&window), "an arrow opened the list");
@@ -609,7 +643,7 @@ fn a_language_set_by_hand_is_shown() {
 fn part_of(l: &Layout, bytes: u64) -> std::path::PathBuf {
     fs::create_dir_all(l.models_dir()).unwrap();
     let part = l.models_dir().join("ggml-large-v3.bin.part");
-    fs::File::create(&part).unwrap().set_len(bytes).unwrap();
+    common::fake_model(&part, bytes);
     part
 }
 
@@ -727,6 +761,33 @@ fn a_state_change_moves_no_column_of_the_card() {
     );
 }
 
+/// The gallery holds every model and the own file, as tall as its rows: two at the least
+/// window, one where four tiles fit side by side; the page does not scroll.
+#[test]
+fn the_gallery_is_as_tall_as_its_rows() {
+    let l = layout("gallery-rows", None);
+    let window = open(&l, Page::Model);
+    let tiles = |window: &AppWindow| {
+        let mut ys: Vec<f32> = [
+            "Whisper large-v3 turbo",
+            "Whisper large-v3",
+            "Whisper large-v3 Russian",
+            "Use my own .bin",
+        ]
+        .iter()
+        .map(|n| radio(window, n).absolute_position().y)
+        .collect();
+        ys.dedup();
+        ys.len()
+    };
+    for (w, h, rows) in [(720.0, 520.0, 2), (1280.0, 860.0, 1)] {
+        window.window().set_size(slint::LogicalSize::new(w, h));
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+        assert_eq!(tiles(&window), rows, "{w} x {h}");
+        assert_eq!(window.get_scroll_y(), 0.0);
+    }
+}
+
 /// UI rule 16: a button that cancels turns red on hover, which only the danger kind does.
 #[test]
 fn cancel_on_a_downloading_card_is_a_danger_button() {
@@ -738,8 +799,9 @@ fn cancel_on_a_downloading_card_is_a_danger_button() {
     assert!(block.contains("ButtonKind.danger"), "{block}");
 }
 
-/// UI rule 9: row titles on one page start at one x: the language row (an icon), the model
-/// choices (a radio), the Settings rows and the Advanced rows. An Advanced row has no control, so
+/// UI rule 9: row titles on one page start at one x: the language row, the card of the model
+/// under the gallery's check and the own file's (an icon each), the Settings rows and the
+/// Advanced rows. An Advanced row has no control, so
 /// its description takes the whole width instead of wrapping beside an empty column.
 #[test]
 fn row_titles_start_at_one_x_and_text_rows_use_the_width() {
@@ -755,12 +817,15 @@ fn row_titles_start_at_one_x_and_text_rows_use_the_width() {
     };
     let language = x("Dictation language");
     for (tab, title) in [
-        (None, "Use my own .bin"),
+        (None, "Whisper large-v3 turbo: Not downloaded"),
+        (Some("Use my own .bin"), "Use my own .bin"),
         (Some("Settings"), "GPU"),
         (Some("Advanced"), "Processor threads"),
     ] {
-        if let Some(tab) = tab {
-            with_role(&window, tab, AccessibleRole::Tab).invoke_accessible_default_action();
+        match tab {
+            Some("Use my own .bin") => view(&window, "Use my own .bin"),
+            Some(tab) => sub_tab(&window, tab),
+            None => {}
         }
         let got = x(title);
         assert!(

@@ -18,7 +18,7 @@ pub enum TrayBadge {
     None,
     /// Red, bottom-right: the last dictation failed or the config is invalid.
     Error,
-    /// Teal, top-right: an update is available (M10).
+    /// Green, top-right over the record dot: an update is available (M10).
     Update,
 }
 
@@ -29,31 +29,42 @@ pub fn is_error(notice: Notice) -> bool {
 }
 
 #[cfg(test)]
+#[path = "../tests/common/notices.rs"]
+mod notices;
+
+#[cfg(test)]
 mod tests {
+    use super::notices::ALL_NOTICES;
     use super::*;
+
+    /// Exhaustive on purpose: a new notice must be put on one side here.
+    fn raises_the_badge(n: Notice) -> bool {
+        match n {
+            Notice::NoModel
+            | Notice::ModelBad
+            | Notice::OutOfMemory
+            | Notice::DeviceLost
+            | Notice::CaptureFailed
+            | Notice::TranscriptionFailed
+            | Notice::PasteFailed
+            | Notice::ConfigInvalid => true,
+            Notice::Cancelled
+            | Notice::CancelledKept
+            | Notice::NothingHeard
+            | Notice::PressPaste
+            | Notice::AdminWindow
+            | Notice::RestoreSkipped
+            | Notice::MicFallback
+            | Notice::MicSilence
+            | Notice::ConfigAdjusted
+            | Notice::HistoryOn => false,
+        }
+    }
 
     #[test]
     fn failures_raise_the_badge_and_hints_do_not() {
-        for n in [
-            Notice::NoModel,
-            Notice::ModelBad,
-            Notice::DeviceLost,
-            Notice::CaptureFailed,
-            Notice::TranscriptionFailed,
-            Notice::PasteFailed,
-            Notice::ConfigInvalid,
-        ] {
-            assert!(is_error(n), "{n:?}");
-        }
-        for n in [
-            Notice::Cancelled,
-            Notice::NothingHeard,
-            Notice::PressPaste,
-            Notice::MicFallback,
-            Notice::MicSilence,
-            Notice::ConfigAdjusted,
-        ] {
-            assert!(!is_error(n), "{n:?}");
+        for n in ALL_NOTICES {
+            assert_eq!(is_error(n), raises_the_badge(n), "{n:?}");
         }
     }
 }

@@ -7,6 +7,7 @@
 mod play;
 mod stream;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -88,6 +89,17 @@ impl From<cpal::Error> for CaptureError {
     }
 }
 
+/// What a finished recording gave.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Recorded {
+    /// The processed 16 kHz mono audio.
+    pub samples: Vec<f32>,
+    /// The raw recording streamed to the history folder while it ran (`wav::WavSpool`), waiting
+    /// for its transcript; `None` while saving is off. Hand it to `wav::spool_take` or
+    /// `wav::spool_give_up`.
+    pub spool: Option<PathBuf>,
+}
+
 /// One microphone recording: open on key-down, [`Capture::finish`] on key-up.
 pub trait Capture: Sized {
     /// Open the device named `opts.device`; an empty name, or a name that is not found, opens the
@@ -112,6 +124,15 @@ pub trait Capture: Sized {
     ///
     /// Dropping without `finish` (Esc, an early `?`) stops the stream and discards the audio.
     fn finish(self) -> Result<Vec<f32>, CaptureError>;
+
+    /// [`Capture::finish`] plus the recording streamed to the history folder. A caller that uses
+    /// `finish` instead leaves that recording waiting until the daemon quits (then kept as failed).
+    fn finish_recording(self) -> Result<Recorded, CaptureError> {
+        self.finish().map(|samples| Recorded {
+            samples,
+            spool: None,
+        })
+    }
 }
 
 #[cfg(test)]

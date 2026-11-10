@@ -4,8 +4,8 @@
 mod schema;
 
 pub use schema::{
-    AppLanguage, Audio, Config, Debug, History, Hotkey, Model, Overlay, OverlayPosition, Paste,
-    PasteMode, PasteRule, Sounds, System, Theme, Ui,
+    AppLanguage, Audio, Config, Debug, History, Hotkey, Model, OtherKey, Overlay, OverlayPosition,
+    Paste, PasteMode, PasteRule, Sounds, System, Theme, Ui,
 };
 
 use crate::paths::CONFIG_FILE;
@@ -16,13 +16,30 @@ use toml_edit::{
 };
 
 /// Schema version this build writes. Equals `MIGRATIONS.len() + 1` (checked by a test).
-pub const CURRENT_VERSION: i64 = 1;
+pub const CURRENT_VERSION: i64 = 2;
 
 /// A pure step `vN -> vN+1` on the raw document. It does not touch `version`; `parse_with` does.
 pub type Migration = fn(&mut DocumentMut);
 
-/// `MIGRATIONS[i]` turns version `i + 1` into `i + 2`. Empty while v1 is the only schema.
-pub const MIGRATIONS: &[Migration] = &[];
+/// `MIGRATIONS[i]` turns version `i + 1` into `i + 2`.
+pub const MIGRATIONS: &[Migration] = &[history_on];
+
+/// v1 -> v2 (R1.3): history was off by default in v1, so no v1 file can have chosen "off"
+/// on purpose; an explicit `false` becomes `true`. A later `false` (v2) is left alone.
+fn history_on(doc: &mut DocumentMut) {
+    if let Some(h) = doc.get_mut("history").and_then(Item::as_table_like_mut)
+        && h.get("enabled").and_then(Item::as_bool) == Some(false)
+    {
+        put(h, "enabled", &toml_edit::value(true));
+    }
+}
+
+fn history_enabled(doc: &DocumentMut) -> Option<bool> {
+    doc.get("history")?
+        .as_table_like()?
+        .get("enabled")?
+        .as_bool()
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -42,12 +59,16 @@ pub enum ConfigError {
 /// A loaded `config.toml`: typed settings plus the raw document, so comments, key order and
 /// keys this build does not know survive a write.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools, reason = "independent load flags")]
 pub struct ConfigFile {
     pub config: Config,
     /// True when the file's `version` is newer than this build: never write it back.
     pub read_only: bool,
     /// Values the load had to correct, for the tray and settings to show.
     pub warnings: Vec<String>,
+    /// True when this load migrated `history.enabled` from an explicit `false` to `true`, so
+    /// the daemon can show a one-time notice.
+    pub history_turned_on: bool,
     raw: DocumentMut,
     /// The file started with a UTF-8 byte order mark; written back with it.
     bom: bool,
@@ -65,6 +86,7 @@ impl Default for ConfigFile {
             config: Config::default(),
             read_only: false,
             warnings: Vec::new(),
+            history_turned_on: false,
             raw,
             bom: false,
             crlf: false,
@@ -115,9 +137,12 @@ impl ConfigFile {
         } else {
             &migrations[done..]
         };
+        let history_before = history_enabled(&raw);
         for migration in pending {
             migration(&mut raw);
         }
+        let history_turned_on =
+            history_before == Some(false) && history_enabled(&raw) == Some(true);
         // Typed values come from the migrated text, so error lines point into it; with no
         // migration that text is the file itself.
         let migrated = if pending.is_empty() {
@@ -141,6 +166,7 @@ impl ConfigFile {
             config,
             read_only,
             warnings,
+            history_turned_on,
             raw,
             bom,
             crlf,

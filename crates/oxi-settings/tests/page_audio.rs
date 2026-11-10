@@ -14,7 +14,7 @@ use oxi_core::ipc::{Push, Request};
 use oxi_core::machine::Phase;
 use oxi_core::paths::Layout;
 use oxi_settings::ipc::{Cmd, Event};
-use oxi_settings::{AppWindow, Ipc, Page};
+use oxi_settings::{AppWindow, AudioState, Ipc, Page};
 use slint::ComponentHandle;
 use slint::platform::{Key, PointerEventButton, WindowEvent};
 
@@ -25,6 +25,12 @@ fn saved(layout: &Layout) -> Config {
 /// Opens a sub-tab of the page.
 fn tab(window: &AppWindow, label: &str) {
     with_role(window, label, AccessibleRole::Tab).invoke_accessible_default_action();
+}
+
+/// Opens the Sounds tab on the sound `role`: 0 start, 1 stop, 2 text ready, 3 cancel, 4 error.
+fn sounds(window: &AppWindow, role: i32) {
+    tab(window, "Sounds");
+    window.global::<AudioState>().set_view(2 + role);
 }
 
 fn checked(window: &AppWindow, label: &str) -> Option<bool> {
@@ -80,6 +86,15 @@ fn every_control_writes_its_key() {
 
     let text = fs::read_to_string(l.config_file()).unwrap();
     assert!(text.contains("# mine"), "comment lost: {text}");
+}
+
+/// UI rule 35: the Gain and Meter sensitivity hints are the rows' "i" tips.
+#[test]
+fn gain_and_sensitivity_have_info_tips() {
+    let l = layout("hints", None);
+    let window = open(&l, Page::Audio);
+    assert!(has(&window, "Changes what Whisper hears."));
+    assert!(has(&window, "Changes only the meter, not the recording."));
 }
 
 #[test]
@@ -201,8 +216,27 @@ fn locked_config_disables_the_controls() {
     tab(&window, "Recording");
     off("Trim silence", AccessibleRole::Switch);
     // The sub-tabs still work; only the settings are locked.
-    tab(&window, "Start sound");
-    off("Pop", AccessibleRole::RadioButton);
+    tab(&window, "Sounds");
+    let picker = with_role(&window, "Sound for", AccessibleRole::Combobox);
+    assert_eq!(picker.accessible_enabled(), Some(true), "the sound picker");
+    // A real click opens the list, Down and Enter take Stop: the view follows, nothing is saved.
+    picker.mock_single_click(PointerEventButton::Left);
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(350));
+    for key in [Key::DownArrow, Key::Return] {
+        window
+            .window()
+            .dispatch_event(WindowEvent::KeyPressed { text: key.into() });
+        window
+            .window()
+            .dispatch_event(WindowEvent::KeyReleased { text: key.into() });
+    }
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(350));
+    assert_eq!(
+        window.global::<AudioState>().get_view(),
+        3,
+        "the Combo moved off Start"
+    );
+    off("Apa hit 4", AccessibleRole::RadioButton);
     assert_eq!(fs::read_to_string(l.config_file()).unwrap(), original);
 }
 
@@ -253,14 +287,17 @@ fn control_columns_start_at_one_x_at_the_minimum_width() {
     tab(&window, "Recording");
     same("Tail after release", AccessibleRole::Slider);
     same("Max length", AccessibleRole::Slider);
-    tab(&window, "Stop sound");
+    sounds(&window, 1);
     same("Volume", AccessibleRole::Slider);
+    same("Sound for", AccessibleRole::Combobox);
 }
 
-/// The level track lies exactly under the Device select at the three window sizes: before, the
-/// select kept its 240 px at the right of the wider column and the track started left of it.
+/// The level track starts under the Device select and the Test button beside it ends where the
+/// select ends (DS-3.3): one column, one pair of edges. shortcut: no size above 1280 px, where
+/// the Row's column outgrows the Combo's 360 px cap (finding on layout.slint `Row`); add
+/// 1920x1080 once that is fixed.
 #[test]
-fn level_track_has_the_edges_of_the_device_select() {
+fn level_row_has_the_edges_of_the_device_select() {
     let l = layout("level-edges", None);
     let window = open(&l, Page::Audio);
     for (width, height) in [(720.0, 520.0), (1000.0, 700.0), (1280.0, 860.0)] {
@@ -269,19 +306,32 @@ fn level_track_has_the_edges_of_the_device_select() {
             .set_size(slint::LogicalSize::new(width, height));
         // Runs the shell's page-width handler; the 30 Hz meter timer stays asleep.
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
-        let device = with_role(&window, "Device", AccessibleRole::Combobox);
-        let level = ElementQuery::from_root(&window)
-            .match_accessible_role(AccessibleRole::ProgressIndicator)
-            .find_first()
-            .expect("no level meter");
         let edges = |e: &ElementHandle| {
             let x = e.absolute_position().x;
             (x, x + e.size().width)
         };
-        let (select, track) = (edges(&device), edges(&level));
+        let select = edges(&with_role(&window, "Device", AccessibleRole::Combobox));
+        let track = edges(
+            &ElementQuery::from_root(&window)
+                .match_accessible_role(AccessibleRole::ProgressIndicator)
+                .find_first()
+                .expect("no level meter"),
+        );
+        let test = edges(&with_role(&window, "Test", AccessibleRole::Button));
+        let gain = edges(&with_role(&window, "Gain", AccessibleRole::Spinbox));
         assert!(
-            (select.0 - track.0).abs() < 0.5 && (select.1 - track.1).abs() < 0.5,
+            (select.0 - track.0).abs() < 0.5,
             "{width}: select {select:?}, track {track:?}"
+        );
+        for (name, right) in [("Test", test.1), ("Gain field", gain.1)] {
+            assert!(
+                (select.1 - right).abs() < 0.5,
+                "{width}: select {select:?}, {name} ends at {right}"
+            );
+        }
+        assert!(
+            track.1 < test.0,
+            "{width}: track {track:?} under Test {test:?}"
         );
     }
 }
@@ -290,7 +340,7 @@ fn level_track_has_the_edges_of_the_device_select() {
 #[test]
 fn preview_is_not_in_the_own_file_row() {
     let window = open(&layout("preview-row", None), Page::Audio);
-    tab(&window, "Start sound");
+    sounds(&window, 0);
     let y = |label: &str| {
         let e = with_role(&window, label, AccessibleRole::Button);
         e.absolute_position().y + e.size().height / 2.0
@@ -302,31 +352,49 @@ fn preview_is_not_in_the_own_file_row() {
     );
 }
 
-/// Picking a built-in tile writes that sound's own key, plays it, and each sub-tab shows its own.
+/// Picking a built-in tile writes that sound's own key, plays it, and each sound shows its own.
 #[test]
 fn picking_a_built_in_saves_it_and_plays_it() {
     let l = layout("builtin", None);
     let (ipc, sent) = Ipc::fake();
     let window = open_linked(&l, Page::Audio, ipc);
-    tab(&window, "Start sound");
-    assert_eq!(checked(&window, "Rise"), Some(true), "the default");
-    with_role(&window, "Pop", AccessibleRole::RadioButton).invoke_accessible_default_action();
-    assert_eq!(saved(&l).sounds.start, "pop");
-    assert_eq!(saved(&l).sounds.stop, "fall", "the other sound stays");
-    assert_eq!(checked(&window, "Pop"), Some(true));
+    sounds(&window, 0);
+    assert_eq!(checked(&window, "Apa hit 3"), Some(true), "the default");
+    with_role(&window, "Apa hit 4", AccessibleRole::RadioButton).invoke_accessible_default_action();
+    assert_eq!(saved(&l).sounds.start, "apa-hit-4");
+    assert_eq!(saved(&l).sounds.stop, "apa-hit-2", "the other sound stays");
+    assert_eq!(checked(&window, "Apa hit 4"), Some(true));
     let previews: Vec<Cmd> = sent.try_iter().collect();
     assert!(
         previews.contains(&Cmd::Send(Request::PreviewSound {
-            choice: "pop".into(),
+            choice: "apa-hit-4".into(),
             volume_percent: 50,
         })),
         "{previews:?}"
     );
-    tab(&window, "Stop sound");
-    assert_eq!(checked(&window, "Fall"), Some(true));
-    with_role(&window, "Tick", AccessibleRole::RadioButton).invoke_accessible_default_action();
-    assert_eq!(saved(&l).sounds.stop, "tick");
-    assert_eq!(saved(&l).sounds.start, "pop");
+    sounds(&window, 1);
+    assert_eq!(checked(&window, "Apa hit 2"), Some(true));
+    with_role(&window, "Apa hit 5", AccessibleRole::RadioButton).invoke_accessible_default_action();
+    assert_eq!(saved(&l).sounds.stop, "apa-hit-5");
+    assert_eq!(saved(&l).sounds.start, "apa-hit-4");
+    // The sound picker follows a view set from outside (the status chip opens the stop sound).
+    let picker = || with_role(&window, "Sound for", AccessibleRole::Combobox);
+    assert_eq!(picker().accessible_value().as_deref(), Some("Stop"));
+    sounds(&window, 4);
+    assert_eq!(picker().accessible_value().as_deref(), Some("Error"));
+}
+
+/// The text ready sound has its switch, the other sounds have none.
+#[test]
+fn the_text_ready_sound_can_be_switched_off() {
+    let l = layout("done-off", None);
+    let window = open(&l, Page::Audio);
+    sounds(&window, 0);
+    let label = "Play when the text is ready";
+    assert!(!has(&window, label));
+    sounds(&window, 2);
+    with_role(&window, label, AccessibleRole::Switch).invoke_accessible_default_action();
+    assert!(!saved(&l).sounds.done_enabled);
 }
 
 /// An own file from the config stands on its tile with its name; the whole path is the tooltip.
@@ -337,14 +405,14 @@ fn own_file_shows_on_its_tile() {
         Some("version = 1\n[sounds]\nstart = 'C:\\Sounds\\my start.wav'\n"),
     );
     let window = open(&l, Page::Audio);
-    tab(&window, "Start sound");
+    sounds(&window, 0);
     assert_eq!(checked(&window, "Own file"), Some(true));
     let tile = with_role(&window, "Own file", AccessibleRole::RadioButton);
     assert_eq!(
         tile.accessible_description().as_deref(),
         Some(r"C:\Sounds\my start.wav")
     );
-    tab(&window, "Stop sound");
+    sounds(&window, 1);
     assert_eq!(checked(&window, "Own file"), Some(false));
 }
 
@@ -353,7 +421,7 @@ fn own_file_shows_on_its_tile() {
 fn volume_slider_writes_the_fraction() {
     let l = layout("volume", None);
     let window = open(&l, Page::Audio);
-    tab(&window, "Start sound");
+    sounds(&window, 0);
     with_role(&window, "Volume", AccessibleRole::Spinbox).set_accessible_value("55");
     assert!((saved(&l).sounds.volume - 0.55).abs() < 1e-9);
     with_role(&window, "Volume", AccessibleRole::Spinbox).set_accessible_value("400");
@@ -370,7 +438,7 @@ fn a_bad_own_file_is_the_warning_of_the_row() {
     );
     let (ipc, _sent) = Ipc::fake();
     let window = open_linked(&l, Page::Audio, ipc.clone());
-    tab(&window, "Start sound");
+    sounds(&window, 0);
     window
         .window()
         .set_size(slint::LogicalSize::new(1280.0, 860.0));
@@ -413,7 +481,8 @@ fn sound_tabs_never_scroll_inside_a_scroll() {
         (oxi_core::strings::DAEMON_OFFLINE, ""),
         (oxi_core::strings::DAEMON_OFFLINE, "Synthetic action error."),
     ] {
-        for sound in ["Start sound", "Stop sound"] {
+        // The start sound, and the text ready one with its switch row.
+        for sound in [0, 2] {
             window.set_daemon_text(daemon.into());
             window.set_daemon_start(!daemon.is_empty());
             window.set_action_error(error.into());
@@ -422,16 +491,20 @@ fn sound_tabs_never_scroll_inside_a_scroll() {
             settle();
             window.set_page(Page::Audio);
             settle();
-            tab(&window, sound);
+            sounds(&window, sound);
             settle();
             let at = |label: &str, role| {
                 let e = with_role(&window, label, role).absolute_position();
                 slint::LogicalPosition::new(e.x + 4.0, e.y + 4.0)
             };
-            let (tile, bar) = (
-                at("Rise", AccessibleRole::RadioButton),
-                at(sound, AccessibleRole::Tab),
-            );
+            // The first tile drawn: the grid makes only the rows in view.
+            let first = ElementQuery::from_root(&window)
+                .match_accessible_role(AccessibleRole::RadioButton)
+                .find_first()
+                .expect("no tile")
+                .absolute_position();
+            let tile = slint::LogicalPosition::new(first.x + 4.0, first.y + 4.0);
+            let bar = at("Sounds", AccessibleRole::Tab);
             assert!(tile.y < 520.0, "the first tile is below the window");
             // The wheel over a tile: the gallery takes it if it scrolls, else the page does.
             wheel(tile);
@@ -439,7 +512,7 @@ fn sound_tabs_never_scroll_inside_a_scroll() {
             // Over the sub-tabs only the page can take it.
             wheel(bar);
             let by_bar = window.get_scroll_y() != 0.0;
-            let what = format!("{sound}, daemon {daemon:?}, error {error:?}");
+            let what = format!("sound {sound}, daemon {daemon:?}, error {error:?}");
             assert!(
                 !by_bar || by_tile,
                 "the page and the gallery both scroll: {what}"

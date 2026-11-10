@@ -204,6 +204,7 @@ pub fn finish(transcript: &Transcript, assets: &TextAssets, trailing_space: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log::scratch::{fake_model, scratch_dir};
     use oxi_core::device::DeviceChoice;
     use oxi_core::models::stamp_file_name;
     use oxi_core::paths::{BaseDirs, Os, layout};
@@ -213,9 +214,7 @@ mod tests {
     type Case = (Model, Result<(PathBuf, bool), ModelFailure>);
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("oxi-pipeline-{}-{name}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        scratch_dir(&format!("oxi-pipeline-{}-{name}", std::process::id()))
     }
 
     fn model(id: &str, custom: &str) -> Model {
@@ -297,10 +296,7 @@ mod tests {
         assert_eq!(verify_stamped(&resolved, &dir), Err(ModelFailure::Missing));
 
         // Right size, wrong bytes: no stamp, so it is hashed and refused; no stamp is written.
-        fs::File::create(&file)
-            .unwrap()
-            .set_len(entry.size)
-            .unwrap();
+        fake_model(&file, entry.size);
         assert_eq!(verify_stamped(&resolved, &dir), Err(ModelFailure::Bad));
         assert!(!dir.join(stamp_file_name(entry.file_name)).exists());
 

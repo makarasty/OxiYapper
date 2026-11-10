@@ -10,5 +10,11 @@ mod gallery {
 use slint::ComponentHandle;
 
 fn main() -> Result<(), slint::PlatformError> {
-    gallery::GalleryWindow::new()?.run()
+    let window = gallery::GalleryWindow::new()?;
+    window
+        .global::<gallery::PathText>()
+        .on_elide(|path, budget| {
+            oxi_core::paths::elide_path(&path, usize::try_from(budget).unwrap_or(0)).into()
+        });
+    window.run()
 }

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
+use crate::config::{Config, OtherKey};
 use crate::device::DeviceChoice;
 use crate::paste::PasteOutcome;
 use crate::types::Millis;
@@ -24,6 +24,10 @@ pub enum Mode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineConfig {
     pub mode: Mode,
+    /// Esc cancels a recording; off, Esc is an ordinary key (R2.1).
+    pub esc_cancels: bool,
+    /// Whether a key outside the chord cancels the recording while the chord is held (R2.1).
+    pub other_key: OtherKey,
     /// A press shorter than this can be half of a double tap.
     pub double_tap_max_press: Millis,
     /// Largest gap between the two presses of a double tap.
@@ -63,6 +67,8 @@ impl From<&Config> for MachineConfig {
     fn from(cfg: &Config) -> Self {
         Self {
             mode: cfg.hotkey.mode,
+            esc_cancels: cfg.hotkey.esc_cancels,
+            other_key: cfg.hotkey.other_key,
             double_tap_max_press: Millis(250),
             double_tap_gap: Millis(300),
             tap_max: Millis(300),
@@ -103,6 +109,8 @@ pub enum ModelFailure {
     Missing,
     /// Hash check or whisper init failed (item 23).
     Bad,
+    /// The load ran out of memory, also on the CPU.
+    OutOfMemory,
 }
 
 /// Why a stopped job has no audio for whisper (ARCHITECTURE 9 step 6, 11 item 17).
@@ -138,10 +146,14 @@ pub enum Event {
     ChordPolled {
         held: bool,
     },
-    /// Esc went down (the hook swallows it only while the phase is Recording).
+    /// Esc went down while recording (the hook swallows it only when `esc_cancels` is on).
     Esc,
-    /// Another key went down while the chord was held.
+    /// Another key went down while the chord was held. The key always reaches the system; the
+    /// machine decides from `other_key` and [`Event::SpeechHeard`] whether it cancels.
     OtherKey,
+    /// The audio side heard speech in the recording in progress (level over the threshold for
+    /// long enough). Sent once per recording; later ones are ignored.
+    SpeechHeard,
     /// Capture ended on its own (microphone unplugged); the audio so far is kept.
     DeviceLost,
     /// Capture could not run (no permission, device error); nothing is kept.
@@ -230,6 +242,8 @@ impl PhaseCell {
 pub enum Sound {
     Start,
     Stop,
+    /// The text is pasted (`sounds.done`); apart from `Stop`, which ends the recording.
+    Done,
     Cancel,
     Error,
 }
@@ -238,6 +252,8 @@ pub enum Sound {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Notice {
     Cancelled,
+    /// Cancelled after speech: the audio went to the history (R2.1).
+    CancelledKept,
     NothingHeard,
     NoModel,
     ModelBad,
@@ -261,6 +277,10 @@ pub enum Notice {
     ConfigAdjusted,
     /// Every sample was zero: hardware mute or a privacy switch (item 17).
     MicSilence,
+    /// The model did not fit in memory, even on the CPU.
+    OutOfMemory,
+    /// The config migration turned history on; shown once, when the migrated file is written.
+    HistoryOn,
 }
 
 /// What the overlay shows; emitted only when it changes.
@@ -287,6 +307,11 @@ pub enum Effect {
     StopCapture(JobId),
     /// Stop capture and throw the audio away.
     DiscardCapture,
+    /// A recording cancelled after speech: its audio (a stopped job, answered with
+    /// [`Event::JobAudioReady`] or [`Event::JobAudioEmpty`] as usual) is not transcribed. This
+    /// effect comes once the audio is ready; the coordinator routes it to the history as a
+    /// cancelled recording.
+    KeepCancelled(JobId),
     /// Free the audio of a job that will never be transcribed.
     DropJob(JobId),
     Preload,

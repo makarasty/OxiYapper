@@ -316,11 +316,10 @@ mod tests {
     use oxi_platform::fs::write_atomic;
 
     use super::*;
+    use crate::log::scratch::scratch_dir;
 
     fn layout(name: &str) -> Layout {
-        let dir = std::env::temp_dir().join(format!("oxi-watch-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir(&format!("oxi-watch-{name}-{}", std::process::id()));
         Layout {
             config_dir: dir.clone(),
             data_dir: dir.clone(),

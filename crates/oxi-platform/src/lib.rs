@@ -7,6 +7,8 @@ pub mod draw;
 pub mod fs;
 pub mod ipc;
 pub mod open;
+#[cfg(test)]
+mod scratch;
 pub mod stats_store;
 pub mod wav;
 

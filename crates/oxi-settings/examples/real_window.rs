@@ -117,6 +117,7 @@ fn page(name: &str) -> Option<Page> {
         "model" => Page::Model,
         "text" => Page::Text,
         "overlay" => Page::Overlay,
+        "history" => Page::History,
         "test" => Page::Test,
         "system" => Page::System,
         "about" => Page::About,
@@ -146,6 +147,15 @@ fn open_tab(window: &AppWindow, page: Page, name: &str) -> Result<(), String> {
         _ => {}
     }
     Ok(())
+}
+
+/// The shot's config folder: removed when dropped, so every way out of `main` cleans up.
+struct TempDir(PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 #[allow(clippy::too_many_lines)] // one linear setup script; splitting it hides the order
@@ -188,6 +198,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let dir = env::temp_dir().join(format!("oxi-real-shot-{}", process::id()));
     fs::create_dir_all(&dir)?;
+    let _temp = TempDir(dir.clone());
     let layout = Layout {
         config_dir: dir.clone(),
         data_dir: dir.clone(),
@@ -197,17 +208,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let skia = oxi_settings::use_skia();
     let (ipc, _daemon_side) = Ipc::fake();
     let window = oxi_settings::open_with(layout, ipc)?;
-    // The window never grows past its maximum, so a larger shot would wait for a size it never gets.
-    let (most_w, most_h) = (window.get_largest_width(), window.get_largest_height());
-    if w > most_w || h > most_h {
-        let _ = fs::remove_dir_all(&dir);
-        return Err(format!("{w}x{h} is above the window's largest size {most_w}x{most_h}").into());
-    }
     window.set_page(page);
     if let Some(tab) = &tab
         && let Err(e) = open_tab(&window, page, tab)
     {
-        let _ = fs::remove_dir_all(&dir);
         return Err(e.into());
     }
     window.set_theme(theme);
@@ -261,6 +265,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 if let Err(e) = pixmap.save_png(&out) {
                     eprintln!("real_window: cannot save {}: {e}", out.display());
+                    // `exit` runs no destructors.
+                    let _ = fs::remove_dir_all(&dir);
                     process::exit(2);
                 }
                 eprintln!("real_window: shot {}x{}", shot.width(), shot.height());
@@ -269,6 +275,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     let result = window.run();
-    let _ = fs::remove_dir_all(&dir);
     Ok(result?)
 }

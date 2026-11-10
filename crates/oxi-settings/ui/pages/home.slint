@@ -1,5 +1,7 @@
-// Home page (SPEC, History): four usage numbers and the speaking-activity heatmap.
-import { Theme, Icons, Caption, Group, Card, StatCard, ActivityHeatmap, MonthLabel, Button, ButtonKind, Tip } from "../theme/index.slint";
+// Home page (SPEC, History): four usage numbers and the speaking-activity heatmap, or the open
+// card's chart by day.
+import { Theme, Icons, Group, CardFrame, StatCard, ActivityHeatmap, MonthLabel, Button, ButtonKind, InfoTip, EmptyState } from "../theme/index.slint";
+import { HoverTip, Tooltip } from "../theme/components/base.slint";
 import { TrendChart } from "../theme/components/stats.slint";
 
 // Filled by `pages::home`.
@@ -10,7 +12,7 @@ export global HomeState {
     in property <int> streak;
     in property <int> longest-streak;
     in property <int> active-days;
-    // Nothing dictated yet: the heatmap card says how to start.
+    // Nothing dictated yet: the activity card shows an empty state.
     in property <bool> empty: true;
     in property <string> chord;
     // Recording mode is Toggle: the hint says press once, not hold.
@@ -23,12 +25,21 @@ export global HomeState {
     in property <int> today: -1;
     // The open stat card (0..3 in the order of the cards), -1: none, the heatmap shows.
     in property <int> selected: -1;
-    // The open card's chart: one bar per day in thousandths of the peak, oldest first.
+    // The open card's chart: one bar per day in thousandths of the peak, oldest first. At least a
+    // month of days, so a short history still reads as a time axis.
     in property <[int]> trend;
+    // What each bar's tooltip says ("Nov 8: 1,234 words"), one per bar.
+    in property <[string]> trend-tips;
+    // Days with data (the bars before the first dictation are padding); 0 shows the empty state.
+    in property <int> trend-days;
     in property <string> trend-peak;
     in property <string> trend-first;
     in property <string> trend-last;
     callback shown();
+    // How many heatmap weeks fit the card, from the page; `levels` then holds that many (within
+    // 26..53). Set before the page's code is bound too, so it is a property, and `fit` tells a change.
+    in-out property <int> fit-weeks;
+    callback fit();
     callback pick(int);
     callback open-history();
 }
@@ -53,13 +64,30 @@ export component HomePage inherits VerticalLayout {
     in property <length> free-height;
     // Under this the four cards stop fitting their labels.
     property <bool> wide: root.window-width >= Theme.narrow-window;
-    // A window too low for the drawn layout (UI rule 25): one row of cards even when narrow, a smaller
-    // grid, a one-line hint and disclaimer.
+    // A window too low for the drawn layout (UI rule 25): one row of cards even when narrow, a
+    // smaller grid without its legend.
     property <bool> tight: root.free-height < (root.wide ? Theme.home-wide-height : Theme.home-full-height);
     property <bool> one-row: root.wide || root.tight;
     property <length> card-width: root.one-row ? (root.content-width - 3 * Theme.tile-gap) / 4 : (root.content-width - Theme.tile-gap) / 2;
     property <int> weeks: max(1, ceil(HomeState.levels.length / 7));
-    property <length> cell: min(root.tight ? Theme.heat-cell-tight : Theme.heat-cell-max, Theme.heat-cell(root.content-width - 2 * Theme.card-padding-h - heat.label-w, root.weeks, heat.gap));
+    property <length> heat-room: root.content-width - 2 * Theme.card-padding-h - heat.label-w;
+    // A wider card shows more weeks (item 12: no empty band), the cells kept at their fitting size.
+    property <int> fit-weeks: floor(root.heat-room / ((root.tight ? Theme.heat-cell-tight : Theme.heat-cell-fit) + heat.gap));
+    // Once a year fits, the cells grow to fill the width, as far as the window's spare height
+    // lets the grid grow (the full heights hold `heat-cell-fit` cells). A cell's growth costs 8
+    // rows of height, not 7: the legend (shown whenever this applies) is as tall as a cell.
+    property <length> cell-height-room: Theme.heat-cell-fit + floor((root.free-height - (root.wide ? Theme.home-wide-height : Theme.home-full-height)) / 8 / 1px) * 1px;
+    property <length> cell: min(root.tight ? Theme.heat-cell-tight : max(Theme.heat-cell-fit, root.cell-height-room), Theme.heat-cell(root.heat-room, root.weeks, heat.gap));
+    function tell-fit() {
+        HomeState.fit-weeks = root.fit-weeks;
+        HomeState.fit();
+    }
+    init => {
+        root.tell-fit();
+    }
+    changed fit-weeks => {
+        root.tell-fit();
+    }
     // Under 172 px a card's longest label (Words per minute) wraps: reserve two lines in all four.
     property <int> label-lines: root.card-width < Theme.stat-card-one-line ? 2 : 1;
     property <[Stat]> stats: [
@@ -75,12 +103,17 @@ export component HomePage inherits VerticalLayout {
         },
     ];
     property <bool> trend-open: HomeState.selected >= 0;
+    // Nothing to draw in the activity card: no dictation yet, or no day for the open chart.
+    property <bool> blank: root.trend-open ? HomeState.trend-days == 0 : HomeState.empty;
+    // The hint behind the activity card's "i" (UI rule 35: no loose explanatory text).
+    property <string> how: HomeState.toggle ? @tr("Press {} once to start, again to stop.", HomeState.chord) : @tr("Hold {} and speak.", HomeState.chord);
+    property <string> hint: root.how + " " + (HomeState.empty ? @tr("Your words, pace and streak show up here after the first dictation.") : @tr("Click a card above to see it day by day."));
     // Indexes into `stats`: a new number must update the cards, not rebuild them (focus and hover
     // live in the instances).
     property <[[int]]> rows: root.one-row ? [[0, 1, 2, 3]] : [[0, 1], [2, 3]];
-    alignment: start;
     spacing: Theme.tile-gap;
     for row in root.rows: HorizontalLayout {
+        vertical-stretch: 0;
         spacing: Theme.tile-gap;
         for i in row: StatCard {
             width: root.card-width;
@@ -95,75 +128,165 @@ export component HomePage inherits VerticalLayout {
             }
         }
     }
+    // The activity card takes the window's spare height (UI rule 26): the chart grows with it.
     Group {
-        title: root.trend-open ? root.stats[HomeState.selected].trend : @tr("Speaking activity");
-        icon: root.trend-open ? root.stats[HomeState.selected].icon : Icons.calendar;
-        Card {
-            // Kept after the first dictation with a caption of no more lines, so the card does not
-            // shrink and the row under it does not jump (UI rules 1, 5).
-            VerticalLayout {
-                spacing: Theme.title-gap;
-                padding-bottom: Theme.space-2;
-                Text {
-                    text: HomeState.toggle ? @tr("Press {} once to start, again to stop", HomeState.chord) : @tr("Hold {} and speak", HomeState.chord);
-                    font-size: Theme.body-size;
-                    color: Theme.text-primary;
-                    wrap: word-wrap;
-                }
-                if !root.tight: Caption {
-                    text: HomeState.empty ? @tr("Your words, pace and streak show up here after the first dictation.") : @tr("Click a card above to see it day by day.");
-                    wrap: word-wrap;
+        vertical-stretch: 1;
+        // Group's own title row has no place for an "i": the same row, built here.
+        HorizontalLayout {
+            vertical-stretch: 0;
+            padding-bottom: Theme.header-gap - Theme.card-gap;
+            spacing: Theme.pair-gap;
+            alignment: start;
+            // On the title's cap centre, which sits 1.5 px under its line box's centre at body
+            // size: the whole pixel nearest it (DS-16.1).
+            Rectangle {
+                width: Theme.icon-size;
+                min-height: Theme.icon-size;
+                Image {
+                    y: round(((parent.height - self.height) / 2 + 1.5px) / 1px) * 1px;
+                    source: root.trend-open ? root.stats[HomeState.selected].icon : Icons.calendar;
+                    width: Theme.icon-size;
+                    height: Theme.icon-size;
+                    colorize: Theme.text-primary;
+                    accessible-role: none;
                 }
             }
-            // The chart takes the heatmap's room, so opening it moves nothing.
-            Rectangle {
-                height: grid.min-height;
-                grid := HorizontalLayout {
-                    alignment: center;
-                    heat := ActivityHeatmap {
-                        visible: !root.trend-open;
-                        levels: HomeState.levels;
-                        months: HomeState.months;
-                        today: HomeState.today;
-                        cell: root.cell;
-                        legend-shown: !root.tight;
-                        summary: @tr("{n} active day in the last {} weeks" | "{n} active days in the last {} weeks" % HomeState.active-days, root.weeks);
-                    }
+            Text {
+                text: root.trend-open ? root.stats[HomeState.selected].trend : @tr("Speaking activity");
+                font-size: Theme.body-size;
+                font-weight: Theme.weight-strong;
+                color: Theme.text-primary;
+                vertical-alignment: center;
+            }
+            VerticalLayout {
+                alignment: center;
+                InfoTip {
+                    text: root.hint;
                 }
-                if root.trend-open: TrendChart {
-                    width: parent.width;
-                    height: parent.height;
-                    bars: HomeState.trend;
-                    peak: @tr("Highest: {}", HomeState.trend-peak);
-                    first-day: HomeState.trend-first;
-                    last-day: HomeState.trend-last;
-                    summary: @tr("{n} day, highest {}" | "{n} days, highest {}" % HomeState.trend.length, HomeState.trend-peak);
+            }
+        }
+        CardFrame {
+            vertical-stretch: 1;
+            min-height: body.min-height;
+            preferred-height: body.preferred-height;
+            body := VerticalLayout {
+                padding-left: Theme.card-padding-h;
+                padding-right: Theme.card-padding-h;
+                padding-top: Theme.card-padding-v;
+                padding-bottom: Theme.card-padding-v;
+                // At least the heatmap's room, so opening a chart or the first dictation moves
+                // nothing (UI rules 1, 5); in a taller card the heatmap stays centred.
+                Rectangle {
+                    min-height: grid.min-height;
+                    vertical-stretch: 1;
+                    grid := VerticalLayout {
+                        alignment: center;
+                        HorizontalLayout {
+                            alignment: center;
+                            heat := ActivityHeatmap {
+                                visible: !root.trend-open && !root.blank;
+                                levels: HomeState.levels;
+                                months: HomeState.months;
+                                today: HomeState.today;
+                                cell: root.cell;
+                                legend-shown: !root.tight;
+                                summary: @tr("{n} active day in the last {} weeks" | "{n} active days in the last {} weeks" % HomeState.active-days, root.weeks);
+                            }
+                        }
+                    }
+                    if root.blank: EmptyState {
+                        width: parent.width;
+                        height: parent.height;
+                        icon: Icons.mic;
+                        text: @tr("No dictations yet");
+                    }
+                    if root.trend-open && !root.blank: plot := Rectangle {
+                        width: parent.width;
+                        height: parent.height;
+                        // `max-pitch` below is the full width, so the bars always span it.
+                        property <int> days: HomeState.trend.length;
+                        property <length> pitch: self.width / max(1, self.days);
+                        // TrendChart's plot: the peak caption above it, the dates below.
+                        property <length> plot-top: Theme.caption-line + Theme.space-1;
+                        property <length> baseline: self.height - Theme.caption-line - Theme.space-1;
+                        property <int> hovered: touch.has-hover ? max(0, min(self.days - 1, floor(touch.mouse-x / self.pitch))) : -1;
+                        // The hovered day's column, under its bar.
+                        if plot.hovered >= 0: Rectangle {
+                            x: floor(plot.hovered * plot.pitch / 1px) * 1px;
+                            y: plot.plot-top;
+                            width: max(1px, floor((plot.hovered + 1) * plot.pitch / 1px) * 1px - self.x);
+                            height: plot.baseline - plot.plot-top;
+                            border-radius: Theme.radius-small;
+                            background: Theme.bg-subtle-hover;
+                        }
+                        TrendChart {
+                            width: parent.width;
+                            height: parent.height;
+                            max-pitch: parent.width;
+                            bars: HomeState.trend;
+                            peak: @tr("Highest: {}", HomeState.trend-peak);
+                            first-day: HomeState.trend-first;
+                            last-day: HomeState.trend-last;
+                            summary: @tr("{n} day, highest {}" | "{n} days, highest {}" % HomeState.trend-days, HomeState.trend-peak);
+                        }
+                        // Hover only: the bars take no click, so the pointer stays an arrow.
+                        touch := TouchArea { }
+                        // The hovered bar's tip; a refresh under a still pointer brings its new text.
+                        property <string> tip: self.hovered >= 0 ? HomeState.trend-tips[self.hovered] : "";
+                        // Not drawn: the bubble's width, to place it before it opens.
+                        measure := Tooltip {
+                            visible: false;
+                            width: 0;
+                            height: 0;
+                            text: plot.tip;
+                        }
+                        // Right of the column, as a web chart's tooltip; left of it where the
+                        // window's edge leaves no room, so it never covers the hovered bar.
+                        property <length> tip-right: self.absolute-position.x + (self.hovered + 1) * self.pitch + Theme.space-2;
+                        property <length> tip-x: self.tip-right + measure.preferred-width + Theme.space-2 <= root.window-width ? self.tip-right : self.absolute-position.x + self.hovered * self.pitch - Theme.space-2 - measure.preferred-width;
+                        function show-tip() {
+                            HoverTip.text = self.tip;
+                            HoverTip.x = self.tip-x;
+                            HoverTip.y = self.absolute-position.y + self.plot-top;
+                        }
+                        // At once, beside the bar's top.
+                        changed tip => {
+                            self.show-tip();
+                        }
+                        changed tip-x => {
+                            if (self.hovered >= 0) {
+                                self.show-tip();
+                            }
+                        }
+                        // The bubble lives while a bar is hovered (see `HoverTip.beat`).
+                        Timer {
+                            interval: 150ms;
+                            running: plot.hovered >= 0;
+                            triggered => {
+                                HoverTip.beat += 1;
+                            }
+                        }
+                    }
                 }
             }
         }
     }
     HorizontalLayout {
-        spacing: Theme.control-gap;
-        disclaimer := Caption {
-            text: HomeState.history-on ? @tr("Statistics keep only dates, word and dictation counts and speech time. History is on, so its folder also holds your dictated text and audio.") : @tr("Statistics keep only dates, word and dictation counts and speech time, never the text itself.");
-            wrap: root.tight ? no-wrap : word-wrap;
-            overflow: elide;
-            vertical-alignment: center;
-            horizontal-stretch: 1;
-            preferred-width: 0;
-            hover := TouchArea { }
-            // Cut to one line in a low window: the full text stands here (rule 28).
-            Tip {
-                text: root.tight ? disclaimer.text : "";
-                hovered: hover.has-hover;
-            }
-        }
+        vertical-stretch: 0;
+        alignment: end;
+        spacing: Theme.pair-gap;
         Button {
             kind: ButtonKind.subtle;
             icon: Icons.folder-open-16;
             text: @tr("History folder");
             clicked => {
                 HomeState.open-history();
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            InfoTip {
+                text: HomeState.history-on ? @tr("Statistics keep only dates, word and dictation counts and speech time. History is on, so its folder also holds your dictated text and audio.") : @tr("Statistics keep only dates, word and dictation counts and speech time, never the text itself.");
             }
         }
     }

@@ -247,15 +247,18 @@ pub struct PartialDownload {
 }
 
 #[cfg(test)]
+#[path = "../tests/common/scratch.rs"]
+mod scratch;
+
+#[cfg(test)]
 mod tests {
+    use super::scratch::scratch_dir;
     use super::*;
 
     #[test]
     fn a_non_empty_part_file_is_partial() {
         let entry = find("tiny").unwrap();
-        let dir = std::env::temp_dir().join(format!("oxi-core-partial-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir(&format!("oxi-core-partial-{}", std::process::id()));
         let part = part_path(&dir.join(entry.file_name));
         fs::write(&part, b"").unwrap();
         assert_eq!(status(entry, &dir), ModelStatus::Missing, "empty .part");

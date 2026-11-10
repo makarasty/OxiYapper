@@ -17,3 +17,4 @@
 7. New dependencies: add the version to `[workspace.dependencies]` in the root `Cargo.toml`; licence must pass `deny.toml`.
 8. Pedantic clippy is on. Fix the lint; an `#[allow]` needs a one-line reason.
 9. UI work obeys `docs/UI-RULES.md`.
+10. Tests leave no trace on disk. Every temp folder a test makes is removed when it ends (a guard whose `Drop` deletes it, not a cleanup at the next start). Never create a file at a real model or recording size (`set_len` allocates real disk on NTFS): inject the size, or keep fakes to a few KB. In November 2026 leaked test folders with 2.9 GB fake models filled drive C with 357 GB.

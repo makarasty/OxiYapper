@@ -193,10 +193,15 @@ fn online_a_changed_file_asks_the_daemon_only_on_home() {
     assert_eq!(asked(&rx), 1, "the file changed");
 }
 
+/// What the activity card's "i" says after `how`.
+const FIRST: &str = "Your words, pace and streak show up here after the first dictation.";
+const CLICK: &str = "Click a card above to see it day by day.";
+
 #[test]
 fn no_data_says_to_hold_the_current_chord() {
     let window = open(&layout("empty", Some(CHORD)), Page::Home);
-    assert!(has(&window, "Hold Ctrl + F13 and speak"));
+    assert!(has(&window, &format!("Hold Ctrl + F13 and speak. {FIRST}")));
+    assert!(has(&window, "No dictations yet"), "the empty state");
     assert!(has(&window, "Current streak: 0 days, Longest: 0 days"));
     assert!(has(
         &window,
@@ -238,7 +243,7 @@ fn the_first_dictation_moves_nothing_below_the_heatmap() {
 fn the_chord_reads_as_the_hotkey_page_shows_it() {
     let chord = "version = 1\n[hotkey]\nchord = [\"LCtrl\", \"BracketLeft\"]\n";
     let window = open(&layout("empty-label", Some(chord)), Page::Home);
-    assert!(has(&window, "Hold Ctrl + [ and speak"));
+    assert!(has(&window, &format!("Hold Ctrl + [ and speak. {FIRST}")));
 }
 
 #[test]
@@ -246,9 +251,153 @@ fn toggle_mode_says_press_not_hold() {
     let window = open(&layout("empty-toggle", Some(TOGGLE)), Page::Home);
     assert!(has(
         &window,
-        "Press Ctrl + F13 once to start, again to stop"
+        &format!("Press Ctrl + F13 once to start, again to stop. {FIRST}")
     ));
-    assert!(!has(&window, "Hold Ctrl + F13 and speak"));
+    assert!(!has(
+        &window,
+        &format!("Hold Ctrl + F13 and speak. {FIRST}")
+    ));
+}
+
+/// UI rule 35: the hints are the "i" tips' text, not lines of their own, and say what is true now.
+#[test]
+fn the_hints_live_in_info_tips() {
+    let l = layout("hints", Some(CHORD));
+    let window = open(&l, Page::Home);
+    let tips = |window: &AppWindow| {
+        ElementQuery::from_root(window)
+            .match_descendants()
+            .match_accessible_role(AccessibleRole::Text)
+            .find_all()
+            .into_iter()
+            .filter_map(|e| e.accessible_label())
+            .map(|l| l.to_string())
+            .filter(|l| l.contains(FIRST) || l.contains(CLICK) || l.starts_with("Statistics"))
+            .fold(Vec::<String>::new(), |mut seen, l| {
+                // A component and its inner parts can answer with one label.
+                if !seen.contains(&l) {
+                    seen.push(l);
+                }
+                seen
+            })
+    };
+    assert_eq!(
+        tips(&window),
+        [
+            format!("Hold Ctrl + F13 and speak. {FIRST}"),
+            ON_NOTE.to_owned()
+        ]
+    );
+    write_stats(&l, 42);
+    poll();
+    assert_eq!(
+        tips(&window),
+        [
+            format!("Hold Ctrl + F13 and speak. {CLICK}"),
+            ON_NOTE.to_owned()
+        ]
+    );
+    assert!(!has(&window, "No dictations yet"), "the heatmap is back");
+}
+
+/// Item 12: a large window gives the activity card the spare height; the folder row ends the page.
+#[test]
+fn the_page_fills_a_large_window() {
+    let (ipc, _rx) = Ipc::fake();
+    let window = open_linked(&layout("large", None), Page::Home, ipc.clone());
+    stats_push(&ipc, sample());
+    for (w, h) in [(1280.0, 860.0), (1920.0, 1080.0)] {
+        window.window().set_size(slint::LogicalSize::new(w, h));
+        settle();
+        let button = common::one(&window, "History folder");
+        let bottom = button.absolute_position().y + button.size().height;
+        // The page's bottom padding is all that is left under it.
+        assert!(
+            bottom > h - 40.0 && bottom <= h,
+            "{w}x{h}: ends at {bottom}"
+        );
+        assert_eq!(window.get_scroll_y(), 0.0);
+    }
+}
+
+/// Item 38: hovering a bar names its day and exact number at once.
+#[test]
+fn hovering_a_bar_shows_its_day_and_number() {
+    let l = layout("trend-hover", None);
+    write_days(&l, 2);
+    let window = open(&l, Page::Home);
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(1280.0, 860.0));
+    settle();
+    click_words(&window);
+    let chart = ElementQuery::from_root(&window)
+        .match_descendants()
+        .match_accessible_role(AccessibleRole::Image)
+        .find_all()
+        .into_iter()
+        .find(|e| e.accessible_label().is_some_and(|l| l.contains("highest")))
+        .unwrap();
+    let (at, size) = (chart.absolute_position(), chart.size());
+    let said = |window: &AppWindow| {
+        ElementQuery::from_root(window)
+            .match_descendants()
+            .find_all()
+            .into_iter()
+            .filter_map(|e| e.accessible_label())
+            .map(|l| l.to_string())
+            .find(|l| l.ends_with(" words") && l.contains(": "))
+    };
+    let hover = |x: f32| {
+        window.window().dispatch_event(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(x, at.y + size.height / 2.0),
+        });
+        settle();
+    };
+    // The drawn bubble (the page also holds an unsized one to measure it): its text, left, right.
+    let bubble = |window: &AppWindow| {
+        ElementQuery::from_root(window)
+            .match_descendants()
+            .find_all()
+            .into_iter()
+            .filter(|e| e.size().width > 0.0)
+            .find_map(|e| {
+                let l = e.accessible_label()?.to_string();
+                let x = e.absolute_position().x;
+                (l.ends_with(" words") && l.contains(": ")).then(|| (l, x, x + e.size().width))
+            })
+    };
+    // Two days of data drawn as the last two of 30: the rightmost bar is today.
+    let last_bar = at.x + size.width - size.width / 30.0;
+    hover(at.x + size.width - 2.0);
+    let today = said(&window).expect("a tooltip on the last bar");
+    assert!(today.ends_with(": 5 words"), "{today}");
+    // No room right of the last column: the bubble opens left of it, off the hovered bar.
+    let (_, _, right) = bubble(&window).expect("a drawn bubble");
+    assert!(
+        right <= last_bar,
+        "the bubble ends at {right}, the bar starts at {last_bar}"
+    );
+    // A refresh under a still pointer: the bubble says the new number.
+    write_stats(&l, 9);
+    poll();
+    settle();
+    let fresh = bubble(&window).expect("still open").0;
+    assert!(
+        fresh.ends_with(": 9 words"),
+        "stale after a refresh: {fresh}"
+    );
+    hover(at.x + 2.0);
+    let first = said(&window).expect("a tooltip on the first day");
+    assert!(first.ends_with(": 0 words"), "padding day: {first}");
+    let (_, left, _) = bubble(&window).expect("a drawn bubble");
+    assert!(
+        left > at.x + size.width / 30.0,
+        "right of the first column: {left}"
+    );
+    window.window().dispatch_event(WindowEvent::PointerExited);
+    settle();
+    assert_eq!(said(&window), None, "gone with the pointer");
 }
 
 /// The four cards' (left, top) at `width` wide.
@@ -396,15 +545,16 @@ fn a_card_click_opens_its_trend_and_a_second_click_closes_it() {
 fn the_three_shapes_of_history_chart() {
     i_slint_backend_testing::init_no_event_loop();
     for (days, want) in [
-        (0, "0 days, highest 0"),
-        (1, "1 day, highest 5"),
-        (366, "365 days, highest 5"),
+        (0, None),
+        (1, Some("1 day, highest 5")),
+        (366, Some("365 days, highest 5")),
     ] {
         let l = layout(&format!("trend-{days}"), None);
         write_days(&l, days);
         let window = common::open_again(&l, Page::Home);
         click_words(&window);
-        assert_eq!(chart(&window).unwrap(), want);
+        assert_eq!(chart(&window).as_deref(), want);
+        assert_eq!(has(&window, "No dictations yet"), days == 0, "{days}");
     }
 }
 
@@ -421,7 +571,7 @@ fn opening_a_chart_moves_nothing() {
                 .set_size(slint::LogicalSize::new(width, 900.0));
             let closed = common::one(&window, "History folder").absolute_position();
             click_words(&window);
-            assert!(chart(&window).is_some());
+            assert!(has(&window, "Words by day"));
             let open = common::one(&window, "History folder").absolute_position();
             assert_eq!((closed.x, closed.y), (open.x, open.y), "{days} {width}");
         }
@@ -433,7 +583,8 @@ fn the_open_chart_follows_the_file() {
     let l = layout("trend-follow", None);
     let window = open(&l, Page::Home);
     click_words(&window);
-    assert_eq!(chart(&window).unwrap(), "0 days, highest 0");
+    assert_eq!(chart(&window), None);
+    assert!(has(&window, "No dictations yet"));
     write_days(&l, 1);
     poll();
     assert_eq!(chart(&window).unwrap(), "1 day, highest 5");
@@ -504,8 +655,9 @@ fn a_new_number_leaves_the_focus_on_the_card() {
     let (ipc, _rx) = Ipc::fake();
     let window = open_linked(&layout("focus", None), Page::Home, ipc.clone());
     stats_push(&ipc, sample());
-    // Backwards from the end of the tab order: the folder button, then the last card.
-    for _ in 0..2 {
+    // Backwards from the end of the tab order: the disclaimer "i", the folder button, the
+    // activity "i", then the last card.
+    for _ in 0..4 {
         press(&window, Key::Backtab);
     }
     stats_push(
@@ -528,7 +680,9 @@ const ON_NOTE: &str = "Statistics keep only dates, word and dictation counts and
 #[test]
 fn the_disclaimer_follows_history() {
     i_slint_backend_testing::init_no_event_loop();
-    let window = common::open_again(&layout("disclaimer", None), Page::Home);
+    // History is on by default, and a v1 file migrates to on (R1.3).
+    let off = "version = 2\n[history]\nenabled = false\n";
+    let window = common::open_again(&layout("disclaimer", Some(off)), Page::Home);
     assert!(has(&window, OFF_NOTE));
     assert!(!has(&window, ON_NOTE));
 
@@ -598,11 +752,15 @@ fn the_page_fits_the_minimum_window_without_scrolling() {
             "the folder button ends at {}",
             at.y + size.height
         );
-        let right = heatmap(window);
+        let right = if has(window, "No dictations yet") {
+            common::one(window, "No dictations yet")
+        } else {
+            heatmap(window)
+        };
         assert!(right.absolute_position().x + right.size().width <= 720.0);
         assert_eq!(window.get_scroll_y(), 0.0);
     };
-    whole(&window); // empty: the hint is on the card
+    whole(&window); // empty: the empty state
     stats_push(&ipc, sample());
     whole(&window); // with data
 }
@@ -628,4 +786,123 @@ fn twenty_six_weeks_fit_the_minimum_window() {
         map.accessible_label().unwrap(),
         format!("{} active days in the last 26 weeks", 26 * 7)
     );
+}
+
+/// Item 12: a wide window shows up to a year of weeks and grows the cells, so the grid fills the
+/// card's width with no empty band beside it.
+#[test]
+fn a_wide_window_fills_the_card_with_a_year() {
+    fills_the_card_with_a_year("year", &[(1280.0, 860.0, None), (1920.0, 1080.0, Some(53))]);
+}
+
+/// The same at a maximised 2560 x 1440: no cell cap leaves a band right of the grid.
+#[test]
+fn a_maximised_window_fills_the_card_with_a_year() {
+    fills_the_card_with_a_year("year-max", &[(2560.0, 1440.0, Some(53))]);
+}
+
+/// A full year in a wide, low window: the cells are height-limited, and the grid still ends in the
+/// card with the page unscrolled and its last row (the folder button) inside the window.
+#[test]
+fn a_wide_low_window_holds_a_year_without_overflow() {
+    // Ultrawide: the height limits the cells, so a band stays right of the grid.
+    fills_the_card_with_a_year(
+        "year-low",
+        &[(2560.0, 700.0, Some(53)), (3440.0, 720.0, Some(53))],
+    );
+}
+
+/// The cell's height room never overshoots: from the lowest to a tall window, at 1920 to 3840 wide, a year in a
+/// window never pushes the page past the window (a 1 px overshoot fails at 3840 x 814).
+#[test]
+fn a_year_never_overflows_at_any_height() {
+    let (ipc, _rx) = Ipc::fake();
+    let window = open_linked(&layout("year-sweep", None), Page::Home, ipc.clone());
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(2560.0, 520.0));
+    settle();
+    stats_push(
+        &ipc,
+        Summary {
+            heat: vec![1; 53 * 7],
+            ..sample()
+        },
+    );
+    for w in [1920.0, 2560.0, 3440.0, 3840.0] {
+        for h in (520..=1100).step_by(3).chain([1440]) {
+            let h = h as f32;
+            window.window().set_size(slint::LogicalSize::new(w, h));
+            settle();
+            ends_inside(&window, &heatmap(&window), w, h);
+        }
+    }
+}
+
+/// The Slint year width is oxi-core's.
+#[test]
+fn the_year_in_the_theme_is_the_core_year() {
+    let window = open(&layout("year-theme", None), Page::Home);
+    assert_eq!(
+        window
+            .global::<oxi_settings::Tokens>()
+            .get_heat_year_weeks(),
+        i32::from(oxi_core::stats::HEAT_WEEKS)
+    );
+}
+
+fn fills_the_card_with_a_year(name: &str, sizes: &[(f32, f32, Option<usize>)]) {
+    let (ipc, _rx) = Ipc::fake();
+    let window = open_linked(&layout(name, None), Page::Home, ipc.clone());
+    for &(w, h, weeks) in sizes {
+        window.window().set_size(slint::LogicalSize::new(w, h));
+        settle();
+        stats_push(
+            &ipc,
+            Summary {
+                heat: vec![1; 53 * 7],
+                ..sample()
+            },
+        );
+        settle();
+        let map = heatmap(&window);
+        let label = map.accessible_label().unwrap().to_string();
+        let shown: usize = label.rsplit(' ').nth(1).unwrap().parse().unwrap();
+        assert!(shown > 26, "{w}: more than the narrow 26 weeks: {label}");
+        if let Some(weeks) = weeks {
+            assert_eq!(shown, weeks, "{w}: a year");
+        }
+        // The activity card is as wide as the row of stat cards: it ends where the last one does.
+        let last = ElementHandle::find_by_accessible_label(&window, CARDS[3])
+            .next()
+            .expect("the streak card");
+        let card_right = last.absolute_position().x + last.size().width;
+        let right = map.absolute_position().x + map.size().width;
+        // Not in an ultrawide low window: there the height limits the cells and a band stays.
+        let height_limited = w > 3000.0 && h < 800.0;
+        assert!(
+            card_right - right < 60.0 || height_limited,
+            "{w}: the grid ends at {right}, the card near {card_right}"
+        );
+        ends_inside(&window, &map, w, h);
+    }
+}
+
+/// The grid ends above the folder button (below the card), whose row ends inside the window: the
+/// page does not overflow or scroll.
+fn ends_inside(window: &AppWindow, map: &ElementHandle, w: f32, h: f32) {
+    let button = ElementHandle::find_by_accessible_label(window, "History folder")
+        .next()
+        .expect("the folder button");
+    let bottom = map.absolute_position().y + map.size().height;
+    assert!(
+        bottom <= button.absolute_position().y,
+        "{w}x{h}: the grid ends at {bottom}, the button starts at {}",
+        button.absolute_position().y
+    );
+    let end = button.absolute_position().y + button.size().height;
+    // Its last row plus the page's bottom padding fit the window, or the page scrolls.
+    let pad = window.global::<oxi_settings::Tokens>().get_page_padding();
+    assert!(end + pad <= h, "{w}x{h}: the page ends at {}", end + pad);
+    assert_eq!(window.get_scroll_y(), 0.0, "{w}x{h} scrolled");
 }

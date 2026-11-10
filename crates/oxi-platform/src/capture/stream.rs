@@ -9,7 +9,8 @@ use oxi_core::audio::{AudioError, CHUNK, Level, Pipeline, downmix, samples_for};
 use oxi_core::config::Audio;
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use super::{Capture, CaptureError, CaptureEvent, LevelMeter};
+use super::{Capture, CaptureError, CaptureEvent, LevelMeter, Recorded};
+use crate::wav::WavSpool;
 
 /// Ring length: the drain thread polls every [`DRAIN_POLL`], this covers a long stall.
 const RING_SECONDS: usize = 2;
@@ -39,7 +40,7 @@ pub struct CpalCapture {
     stream: Option<Stream>,
     shared: Arc<Shared>,
     /// Taken by the first [`CpalCapture::stop`], from `finish` or `Drop`.
-    drain: Option<JoinHandle<Result<Vec<f32>, AudioError>>>,
+    drain: Option<JoinHandle<Result<Recorded, AudioError>>>,
     meter: LevelMeter,
     rate: u32,
     fell_back: bool,
@@ -55,14 +56,14 @@ impl CpalCapture {
 
     /// Stop the callbacks, then the drain thread, and zero the meter; idempotent. With `cancel`
     /// the drain skips the pipeline flush and returns nothing.
-    fn stop(&mut self, cancel: bool) -> Result<Vec<f32>, CaptureError> {
+    fn stop(&mut self, cancel: bool) -> Result<Recorded, CaptureError> {
         drop(self.stream.take());
         self.shared.cancel.store(cancel, Ordering::Relaxed);
         // Release also publishes `cancel` to the drain's Acquire load of `stop`.
         self.shared.stop.store(true, Ordering::Release);
         let Some(drain) = self.drain.take() else {
             // Only `Drop` after `finish` gets here; nothing is left to return.
-            return Ok(Vec::new());
+            return Ok(Recorded::default());
         };
         drain.thread().unpark();
         let joined = drain.join();
@@ -168,7 +169,11 @@ impl Capture for CpalCapture {
                     shared: &drain_shared,
                     meter: &drain_meter,
                 };
-                drain.run(rx, pipeline, notify)
+                let sink = Spooled {
+                    inner: pipeline,
+                    spool: WavSpool::begin(rate),
+                };
+                drain.run(rx, sink, notify)
             })
             .map_err(CaptureError::Thread)?;
         Ok(Self {
@@ -194,7 +199,11 @@ impl Capture for CpalCapture {
         self.fell_back
     }
 
-    fn finish(mut self) -> Result<Vec<f32>, CaptureError> {
+    fn finish(self) -> Result<Vec<f32>, CaptureError> {
+        self.finish_recording().map(|r| r.samples)
+    }
+
+    fn finish_recording(mut self) -> Result<Recorded, CaptureError> {
         self.stop(false)
     }
 }
@@ -240,7 +249,19 @@ where
 /// What the drain feeds; a trait only so tests can inject a failing pipeline.
 trait Sink {
     fn push(&mut self, mono: &[f32]) -> Result<Level, AudioError>;
-    fn finish(self) -> Result<Vec<f32>, AudioError>;
+    fn finish(self) -> Result<Recorded, AudioError>;
+    /// The recording was cancelled: nothing of it is kept.
+    fn cancel(self)
+    where
+        Self: Sized,
+    {
+    }
+    /// Processing failed: what the microphone gave is still worth keeping.
+    fn failed(self)
+    where
+        Self: Sized,
+    {
+    }
 }
 
 impl Sink for Pipeline {
@@ -248,8 +269,54 @@ impl Sink for Pipeline {
         Pipeline::push(self, mono)
     }
 
-    fn finish(self) -> Result<Vec<f32>, AudioError> {
-        Pipeline::finish(self)
+    fn finish(self) -> Result<Recorded, AudioError> {
+        Pipeline::finish(self).map(|samples| Recorded {
+            samples,
+            spool: None,
+        })
+    }
+}
+
+/// Queues the raw mono windows for a [`WavSpool`] as they arrive (its own thread writes them, so
+/// a slow disk never holds up the drain), then hands them to `inner`.
+struct Spooled<S> {
+    inner: S,
+    spool: Option<WavSpool>,
+}
+
+impl<S: Sink> Sink for Spooled<S> {
+    fn push(&mut self, mono: &[f32]) -> Result<Level, AudioError> {
+        if let Some(spool) = &mut self.spool {
+            spool.push(mono);
+        }
+        self.inner.push(mono)
+    }
+
+    fn finish(self) -> Result<Recorded, AudioError> {
+        let mut result = self.inner.finish();
+        if let Some(spool) = self.spool {
+            match &mut result {
+                // The job carries the path to its history save.
+                Ok(r) if !r.samples.is_empty() => r.spool = Some(spool.finish()),
+                // A quiet tap is not a recording.
+                Ok(_) | Err(AudioError::NothingHeard | AudioError::MicSilence) => spool.discard(),
+                // Any other failure still keeps what was said; no transcript will come.
+                Err(_) => spool.fail(),
+            }
+        }
+        result
+    }
+
+    fn cancel(self) {
+        if let Some(spool) = self.spool {
+            spool.discard();
+        }
+    }
+
+    fn failed(self) {
+        if let Some(spool) = self.spool {
+            spool.fail();
+        }
     }
 }
 
@@ -269,13 +336,14 @@ impl Drain<'_> {
         mut rx: Consumer<f32>,
         mut sink: impl Sink,
         mut notify: impl FnMut(CaptureEvent),
-    ) -> Result<Vec<f32>, AudioError> {
+    ) -> Result<Recorded, AudioError> {
         let mut failed = None;
         loop {
             // Read before draining: everything pushed before `stop` is seen by the last pass.
             let stopping = self.shared.stop.load(Ordering::Acquire);
             if stopping && self.shared.cancel.load(Ordering::Relaxed) {
-                return Ok(Vec::new());
+                sink.cancel();
+                return Ok(Recorded::default());
             }
             if failed.is_some() {
                 if let Ok(chunk) = rx.read_chunk(rx.slots()) {
@@ -299,7 +367,10 @@ impl Drain<'_> {
             thread::park_timeout(DRAIN_POLL);
         }
         match failed {
-            Some(e) => Err(e),
+            Some(e) => {
+                sink.failed();
+                Err(e)
+            }
             None => sink.finish(),
         }
     }
@@ -342,6 +413,7 @@ mod tests {
     use oxi_core::audio::SAMPLE_RATE as RATE;
 
     use super::*;
+    use crate::scratch::scratch_dir;
 
     fn run<T: Sample>(data: &[T], channels: usize, ring: usize) -> (Vec<f32>, Shared)
     where
@@ -433,7 +505,7 @@ mod tests {
     }
 
     /// All-zero input: `Pipeline::finish` answers `MicSilence`, so an `Ok` shows it did not run.
-    fn stopped_drain(cancel: bool) -> Result<Vec<f32>, AudioError> {
+    fn stopped_drain(cancel: bool) -> Result<Recorded, AudioError> {
         let opts = Audio {
             denoise: false,
             ..Audio::default()
@@ -462,7 +534,7 @@ mod tests {
 
     #[test]
     fn cancel_discards_without_processing() {
-        assert_eq!(stopped_drain(true).unwrap(), Vec::<f32>::new());
+        assert_eq!(stopped_drain(true).unwrap(), Recorded::default());
     }
 
     /// Fails from the second push on; counts pushes.
@@ -480,8 +552,11 @@ mod tests {
             }
         }
 
-        fn finish(self) -> Result<Vec<f32>, AudioError> {
-            Ok(vec![1.0])
+        fn finish(self) -> Result<Recorded, AudioError> {
+            Ok(Recorded {
+                samples: vec![1.0],
+                spool: None,
+            })
         }
     }
 
@@ -542,5 +617,77 @@ mod tests {
         assert!(matches!(result, Err(AudioError::Resample(_))), "{result:?}");
         assert_eq!(pushes.load(Ordering::Relaxed), 2);
         assert!(events.try_recv().is_err(), "one event only");
+    }
+
+    /// Mono 16 kHz tone in, for a drain over a recording that is spooled to `dir`.
+    fn spooled_drain(dir: &std::path::Path, cancel: bool) -> Result<Recorded, AudioError> {
+        crate::wav::set_spool_dir(Some(dir.to_owned()));
+        let opts = Audio {
+            denoise: false,
+            trim: false,
+            ..Audio::default()
+        };
+        let sink = Spooled {
+            inner: Pipeline::new(RATE, &opts).unwrap(),
+            spool: WavSpool::begin(RATE),
+        };
+        let (mut tx, rx) = RingBuffer::new(32_000);
+        for i in 0..32_000 {
+            tx.push(if i % 2 == 0 { 0.3 } else { -0.3 }).unwrap();
+        }
+        let shared = Shared::default();
+        shared.cancel.store(cancel, Ordering::Relaxed);
+        shared.stop.store(true, Ordering::Release);
+        let drain = Drain {
+            channels: 1,
+            window: samples_for(CHUNK, RATE),
+            shared: &shared,
+            meter: &LevelMeter::default(),
+        };
+        drain.run(rx, sink, |_| {})
+    }
+
+    #[test]
+    fn a_finished_recording_leaves_its_stream_and_a_cancelled_one_does_not() {
+        let _guard = crate::wav::SPOOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = scratch_dir(&format!("oxi-stream-spool-{}", std::process::id()));
+        crate::wav::spool_give_up_all();
+        let _ = crate::wav::spool_take_orphans();
+
+        assert_eq!(spooled_drain(&dir, true).unwrap(), Recorded::default());
+        assert_eq!(
+            crate::wav::spool_take_orphans(),
+            Vec::<std::path::PathBuf>::new()
+        );
+        let parts = || -> Vec<std::path::PathBuf> {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flat_map(|day| std::fs::read_dir(day.unwrap().path()).unwrap())
+                .map(|f| f.unwrap().path())
+                .filter(|p| crate::wav::spool_busy(p) || p.is_file())
+                .collect()
+        };
+        // The writer thread deletes the file; it is busy until it is gone.
+        let start = std::time::Instant::now();
+        while !parts().is_empty() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "cancel keeps nothing"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let processed = spooled_drain(&dir, false).unwrap();
+        let part = processed.spool.expect("the job carries its stream");
+        assert!(
+            crate::wav::spool_take(&part),
+            "the stream waits for its transcript"
+        );
+        let (samples, rate) = crate::wav::read_wav_mono_f32(&part).unwrap();
+        assert_eq!((samples.len(), rate), (32_000, RATE));
+        crate::wav::set_spool_dir(None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,7 +1,7 @@
 // Settings window (redesign spec sections 2 and 3): a nav rail with icons on the left (icons only
 // under 960 px), the page on the right in a scrolling column as wide as the window allows, banners above it.
 import { Palette, ScrollView } from "std-widgets.slint";
-import { Theme, Shell, Icons, Caption, KeyFocus, Tip, Button, Banner, Severity, PageHeader, MonthLabel } from "theme/index.slint";
+import { Theme, Shell, Icons, KeyFocus, Tip, Button, Banner, Severity, HeaderRow, StatusChip, MonthLabel, PathText } from "theme/index.slint";
 import { KeyTipHost, Toast, ToastHost } from "theme/components/feedback.slint";
 import { HomePage, HomeState } from "pages/home.slint";
 import { HotkeyPage, HotkeyState } from "pages/hotkey.slint";
@@ -13,14 +13,15 @@ import { OverlayPage, OverlayState } from "pages/overlay.slint";
 import { SystemPage, ThemeChoice, SystemState } from "pages/system.slint";
 import { TestPage, TestState, TestRow } from "pages/test.slint";
 import { AboutPage } from "pages/about.slint";
+import { HistoryPage, HistoryState, HistoryRow } from "pages/history.slint";
 
 export { GalleryTile } from "theme/index.slint";
-export { Shell, Theme, Toast, ThemeChoice, HomeState, MonthLabel, HotkeyState, KeyCap, AudioState, AudioKey, ModelState, ModelRow, TextState, PasteRuleRow, FileState, FileInfo, TextFile, OverlayState, SystemState, TestState, TestRow }
+export { Shell, Theme, Toast, PathText, ThemeChoice, HomeState, MonthLabel, HotkeyState, KeyCap, AudioState, AudioKey, ModelState, ModelRow, TextState, PasteRuleRow, FileState, FileInfo, TextFile, OverlayState, SystemState, TestState, TestRow, HistoryState, HistoryRow }
 
-export enum Page { home, hotkey, audio, model, text, overlay, test, system, about }
+export enum Page { home, hotkey, audio, model, text, overlay, history, test, system, about }
 
-// The daemon chip at the foot of the rail; `hidden` when the window follows no daemon.
-export enum DaemonStatus { hidden, running, stopped, stuck }
+// The status chip right of the header row (`ipc::Level`); `hidden` when the window follows no daemon.
+export enum ChipLevel { hidden, ok, attention, down }
 
 // One page of the rail. Selected: neutral fill, 3x16 accent pill, filled icon in accent; the label
 // keeps its weight so nothing moves. The rail owns focus; `focused` draws the ring inside.
@@ -88,48 +89,6 @@ component NavItem inherits Rectangle {
     }
 }
 
-// Daemon state: 8 px dot and a caption; a click starts or restarts it, as the banner's button does.
-component StatusChip inherits Rectangle {
-    in property <DaemonStatus> status;
-    in property <bool> compact;
-    callback clicked();
-    property <string> text: root.status == DaemonStatus.running ? @tr("Running") : root.status == DaemonStatus.stopped ? @tr("Not running") : @tr("Not answering");
-    property <length> dot: Theme.space-2;
-    // Centred under the rail icons.
-    property <length> dot-x: Theme.space-3 + (Theme.icon-size - root.dot) / 2;
-    height: Theme.control-height;
-    border-radius: Theme.radius-control;
-    background: touch.has-hover ? Theme.bg-subtle-hover : transparent;
-    accessible-role: button;
-    accessible-label: root.text;
-    accessible-action-default => {
-        root.clicked();
-    }
-    Rectangle {
-        x: root.compact ? (root.width - root.dot) / 2 : root.dot-x;
-        y: (root.height - root.dot) / 2;
-        width: root.dot;
-        height: root.dot;
-        border-radius: Theme.radius-round;
-        background: root.status == DaemonStatus.running ? Theme.success-text : root.status == DaemonStatus.stopped ? Theme.warning-text : Theme.error-text;
-    }
-    if !root.compact: Caption {
-        x: root.dot-x + root.dot + Theme.space-2;
-        text: root.text;
-        vertical-alignment: center;
-        accessible-role: none;
-    }
-    touch := TouchArea {
-        clicked => {
-            root.clicked();
-        }
-    }
-    Tip {
-        text: root.compact ? root.text : "";
-        hovered: touch.has-hover;
-    }
-}
-
 export component AppWindow inherits Window {
     in property <string> app-name;
     in property <string> version;
@@ -150,16 +109,13 @@ export component AppWindow inherits Window {
     in property <bool> daemon-config-error;
     in property <bool> daemon-start;
     in property <bool> daemon-restart;
-    in property <DaemonStatus> daemon-status;
+    // The status chip: its text and level; a click goes to `status-clicked`.
+    in property <string> chip-text;
+    in property <ChipLevel> chip-level;
+    // Hover text with the reason and the fix (`ipc::Chip::tooltip`); empty shows none.
+    in property <string> chip-tooltip;
     // Why the last daemon start failed; shown under the notice.
     in property <string> spawn-error;
-    // Above 0: minimum and maximum size are both this, so the OS window is created with no
-    // maximize button (`open_without_maximize`).
-    in property <length> frame-width;
-    in property <length> frame-height;
-    // The window stops here (SPEC Settings UI): fullscreen is only empty space for this app.
-    out property <length> largest-width: Theme.window-max-width;
-    out property <length> largest-height: Theme.window-max-height;
     // How far the open page is scrolled (0 at the top, negative below).
     out property <length> scroll-y: scroll.content-y;
     // The display scale the window opens at, set once before the OS window exists. Slint gives
@@ -171,6 +127,7 @@ export component AppWindow inherits Window {
     callback restart-daemon();
     callback open-file();
     callback reset-config();
+    callback status-clicked();
 
     title: @tr("{} settings", root.app-name);
     icon: Icons.window-logo(root.icon-scale);
@@ -181,38 +138,41 @@ export component AppWindow inherits Window {
     out property <length> text-size: root.default-font-size;
     preferred-width: Theme.window-first-width;
     preferred-height: Theme.window-first-height;
-    min-width: root.frame-width > 0px ? root.frame-width : Theme.window-min-width;
-    min-height: root.frame-height > 0px ? root.frame-height : Theme.window-min-height;
-    max-width: root.frame-width > 0px ? root.frame-width : root.largest-width;
-    max-height: root.frame-height > 0px ? root.frame-height : root.largest-height;
+    // No maximum: the window maximizes and the pages adapt (UI rule 24, R1.2).
+    min-width: Theme.window-min-width;
+    min-height: Theme.window-min-height;
     background: Theme.bg-page;
     forward-focus: keys;
 
     // A broken config is said once: the window's own banner has the buttons to fix it.
     property <bool> daemon-shown: root.daemon-text != "" && !(root.daemon-config-error && root.banner-text != "");
     property <bool> compact: root.width < Theme.compact-window;
-    property <length> rail-head: Theme.space-6;
     property <length> rail-item: Theme.rail-item-height;
-    // The page title centres on the first rail item (UI rule 8), whatever the font's line height.
-    property <length> title-height: header.preferred-height - Theme.title-top - Theme.title-bottom;
-    property <length> title-centre: root.rail-head + Theme.space-1 + root.rail-item / 2;
+    // The first rail item and the header row start at this y, so they share one centre (UI rule 8).
+    property <length> top: Theme.space-2;
     property <length> pad: root.width < Theme.narrow-window ? Theme.page-padding-narrow : Theme.page-padding;
     // One rule for every page and state (UI rule 6); the window's maximum is the only cap.
     property <length> page-width: root.width - nav.width - 2 * root.pad;
-    property <[{page: Page, label: string, icon: image, filled: image}]> rail: [
-        { page: Page.home, label: @tr("Home"), icon: Icons.home, filled: Icons.home-filled },
-        { page: Page.model, label: @tr("Model"), icon: Icons.brain-circuit, filled: Icons.brain-circuit-filled },
-        { page: Page.hotkey, label: @tr("Hotkey"), icon: Icons.keyboard, filled: Icons.keyboard-filled },
-        { page: Page.audio, label: @tr("Audio"), icon: Icons.mic, filled: Icons.mic-filled },
-        { page: Page.text, label: @tr("Text"), icon: Icons.text-t, filled: Icons.text-t-filled },
-        { page: Page.overlay, label: @tr("Overlay"), icon: Icons.slide-text, filled: Icons.slide-text-filled },
-        { page: Page.test, label: @tr("Test"), icon: Icons.checkmark-circle, filled: Icons.checkmark-circle },
-        { page: Page.system, label: @tr("System"), icon: Icons.settings, filled: Icons.settings-filled },
-        { page: Page.about, label: @tr("About"), icon: Icons.info, filled: Icons.info-filled },
+    // `tabs`: the page opens with its own SubTabs, which are its header row; the others get the
+    // page name there.
+    property <[{page: Page, label: string, icon: image, filled: image, tabs: bool}]> rail: [
+        { page: Page.home, label: @tr("Home"), icon: Icons.home, filled: Icons.home-filled, tabs: false },
+        { page: Page.model, label: @tr("Model"), icon: Icons.brain-circuit, filled: Icons.brain-circuit-filled, tabs: true },
+        { page: Page.hotkey, label: @tr("Hotkey"), icon: Icons.keyboard, filled: Icons.keyboard-filled, tabs: false },
+        { page: Page.audio, label: @tr("Audio"), icon: Icons.mic, filled: Icons.mic-filled, tabs: true },
+        { page: Page.text, label: @tr("Text"), icon: Icons.text-t, filled: Icons.text-t-filled, tabs: true },
+        { page: Page.overlay, label: @tr("Overlay"), icon: Icons.slide-text, filled: Icons.slide-text-filled, tabs: false },
+        { page: Page.history, label: @tr("History"), icon: Icons.history, filled: Icons.history-filled, tabs: false },
+        { page: Page.test, label: @tr("Test"), icon: Icons.checkmark-circle, filled: Icons.checkmark-circle, tabs: true },
+        { page: Page.system, label: @tr("System"), icon: Icons.settings, filled: Icons.settings-filled, tabs: true },
+        { page: Page.about, label: @tr("About"), icon: Icons.info, filled: Icons.info-filled, tabs: false },
     ];
+    property <bool> tabbed: root.rail[root.index-of(root.page)].tabs;
+    // The page's height under the header row (banners already taken off).
+    property <length> free-height: scroll.visible-height - column.padding-top - column.padding-bottom - (root.tabbed ? 0 : Theme.header-row-height + column.spacing);
 
     pure function index-of(p: Page) -> int {
-        return p == Page.home ? 0 : p == Page.model ? 1 : p == Page.hotkey ? 2 : p == Page.audio ? 3 : p == Page.text ? 4 : p == Page.overlay ? 5 : p == Page.test ? 6 : p == Page.system ? 7 : 8;
+        return p == Page.home ? 0 : p == Page.model ? 1 : p == Page.hotkey ? 2 : p == Page.audio ? 3 : p == Page.text ? 4 : p == Page.overlay ? 5 : p == Page.history ? 6 : p == Page.test ? 7 : p == Page.system ? 8 : 9;
     }
 
     // System follows the OS: `unknown` makes the style read the OS scheme.
@@ -283,38 +243,14 @@ export component AppWindow inherits Window {
                 }
                 reject
             }
+            // No logo or app name over the items: the title bar has both (R2.4).
             VerticalLayout {
+                padding-top: root.top;
                 padding-left: Theme.space-1;
                 padding-right: Theme.space-1;
                 padding-bottom: Theme.space-2;
                 spacing: Theme.space-1;
-                HorizontalLayout {
-                    height: root.rail-head;
-                    // The logo at the head's foot: centred it kept 2 px to the window's top edge and
-                    // looked cut. shortcut: 4 px, a taller head costs the 720x520 fit of About, Home
-                    // and Paste (UI rule 25); grow it if those pages get room.
-                    padding-top: Theme.space-1;
-                    // Over the rail icons in both widths.
-                    padding-left: root.compact ? (nav.width - 2 * Theme.space-1 - Theme.icon-size) / 2 : Theme.space-3;
-                    spacing: Theme.space-2;
-                    VerticalLayout {
-                        alignment: center;
-                        logo := Image {
-                            source: Icons.logo;
-                            width: Theme.icon-size;
-                            height: Theme.icon-size;
-                            accessible-role: none;
-                        }
-                    }
-                    if !root.compact: Text {
-                        text: root.app-name;
-                        font-size: Theme.body-size;
-                        font-weight: Theme.weight-strong;
-                        color: Theme.text-primary;
-                        vertical-alignment: center;
-                        accessible-role: none;
-                    }
-                }
+                alignment: start;
                 for item[i] in root.rail: NavItem {
                     height: root.rail-item;
                     label: item.label;
@@ -326,18 +262,6 @@ export component AppWindow inherits Window {
                     activated => {
                         nav.cursor = i;
                         root.page = item.page;
-                    }
-                }
-                Rectangle { }
-                if root.daemon-status != DaemonStatus.hidden: StatusChip {
-                    status: root.daemon-status;
-                    compact: root.compact;
-                    clicked => {
-                        if (root.daemon-start) {
-                            root.start-daemon();
-                        } else if (root.daemon-restart) {
-                            root.restart-daemon();
-                        }
                     }
                 }
             }
@@ -399,38 +323,45 @@ export component AppWindow inherits Window {
                 vertical-stretch: 1;
                 content-width: self.visible-width;
                 content-height: max(self.visible-height, column.preferred-height);
+                // The page gets the full height left under the header row, so its lists can
+                // stretch (UI rule 26); a page taller than that scrolls as a whole.
                 column := VerticalLayout {
                     x: 0;
+                    y: 0;
                     // Not `visible-width`: the 14 px scrollbar sits in the page padding, so the
                     // cards keep their width whether or not it shows.
                     width: scroll.width;
+                    height: scroll.content-height;
                     padding-left: root.pad;
                     padding-right: root.pad;
-                    padding-top: root.title-centre - Theme.title-top - root.title-height / 2;
+                    padding-top: root.top;
                     padding-bottom: root.pad;
-                    alignment: start;
-                    header := PageHeader {
+                    spacing: Theme.header-bottom;
+                    if !root.tabbed: HeaderRow {
                         title: root.rail[root.index-of(root.page)].label;
                     }
                     if root.page == Page.home: HomePage {
                         window-width: root.width;
                         content-width: root.page-width;
-                        free-height: scroll.visible-height - column.padding-top - column.padding-bottom - header.preferred-height;
+                        free-height: root.free-height;
                     }
                     if root.page == Page.hotkey: HotkeyPage {
-                        free-height: scroll.visible-height - column.padding-top - column.padding-bottom - header.preferred-height;
+                        free-height: root.free-height;
                     }
                     if root.page == Page.audio: AudioPage {
-                        free-height: scroll.visible-height - column.padding-top - column.padding-bottom - header.preferred-height;
+                        free-height: root.free-height;
                     }
                     if root.page == Page.model: ModelPage { }
                     if root.page == Page.text: TextPage {
-                        free-height: scroll.visible-height - column.padding-top - column.padding-bottom - header.preferred-height;
+                        free-height: root.free-height;
                     }
                     if root.page == Page.overlay: OverlayPage { }
+                    if root.page == Page.history: HistoryPage {
+                        free-height: root.free-height;
+                    }
                     if root.page == Page.test: TestPage { }
                     if root.page == Page.system: SystemPage {
-                        free-height: scroll.visible-height - column.padding-top - column.padding-bottom - header.preferred-height;
+                        free-height: root.free-height;
                         theme: root.theme;
                         theme-picked(choice) => {
                             root.theme = choice;
@@ -438,11 +369,26 @@ export component AppWindow inherits Window {
                         }
                     }
                     if root.page == Page.about: AboutPage {
-                        free-height: scroll.visible-height - column.padding-top - column.padding-bottom - header.preferred-height;
+                        free-height: root.free-height;
                         app-name: root.app-name;
                         version: root.version;
                         licence: root.licence;
                         repository: root.repository;
+                    }
+                }
+                // Right of the header row, over a page's own SubTabs too; it scrolls with them.
+                if root.chip-level != ChipLevel.hidden: StatusChip {
+                    x: scroll.width - root.pad - self.width;
+                    // Its text centres on the header's: the page name (centred in the row) or the
+                    // SubTabs labels (between the tab paddings, over the 1 px tab line).
+                    y: column.padding-top + floor(((root.tabbed ? Theme.tab-padding-top + (Theme.header-row-height - 1px - Theme.tab-padding-top - Theme.tab-padding-bottom) / 2 : Theme.header-row-height / 2) - self.height / 2) / 1px) * 1px;
+                    width: self.preferred-width;
+                    text: root.chip-text;
+                    tooltip: root.chip-tooltip;
+                    dot: root.chip-level == ChipLevel.ok ? Theme.success-text : root.chip-level == ChipLevel.attention ? Theme.warning-text : Theme.error-text;
+                    actionable: root.chip-level == ChipLevel.attention || (root.chip-level == ChipLevel.down && (root.daemon-start || root.daemon-restart));
+                    clicked => {
+                        root.status-clicked();
                     }
                 }
             }

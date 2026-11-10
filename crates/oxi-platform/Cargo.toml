@@ -20,6 +20,16 @@ interprocess.workspace = true
 directories.workspace = true
 tracing.workspace = true
 
+# Win+V history: Clipboard.GetHistoryItemsAsync, DeleteItemFromHistory (Win10 1809+).
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+    "ApplicationModel_DataTransfer", # Clipboard, ClipboardHistoryItem, StandardDataFormats
+    "Foundation",                    # IAsyncOperation, DateTime
+    "Foundation_Collections",        # IVectorView
+    "Win32_System_Com",              # CoInitializeEx: the clipboard calls need a COM apartment
+]
+
 # Each feature is the module of the listed API in windows-sys 0.61.2 (src/Windows/Win32/...).
 [target.'cfg(windows)'.dependencies.windows-sys]
 workspace = true

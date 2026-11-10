@@ -9,7 +9,7 @@ import { KeyTip } from "feedback.slint";
 // pressed fill, 1 px lower), invalid, disabled (40 %).
 export component Keycap {
     in property <string> label;
-    in property <length> unit: 44px;
+    in property <length> unit: Theme.keycap-width;
     in property <bool> picked;
     in property <bool> held;
     in property <bool> invalid;
@@ -33,27 +33,30 @@ export component Keycap {
         }
     }
     cap := Rectangle {
+        // Held: 1 px lower, the one physical cue of a key that is down.
         y: root.held ? 1px : 0;
         border-radius: Theme.radius-keycap(root.unit);
+        // 1 px hairline: the cap's stroke.
         border-width: root.picked || root.held ? 0 : 1px;
-        border-color: root.invalid ? Theme.error-text.transparentize(0.5) : Theme.stroke-keycap;
-        background: root.held ? Theme.accent-pressed : root.picked ? Theme.accent : root.invalid ? Theme.error-fill : root.hover ? Theme.bg-control-hover : Theme.bg-control;
-        opacity: root.live ? 1 : 0.4;
+        border-color: !root.live ? Theme.stroke-control : root.invalid ? Theme.error-text.transparentize(0.5) : Theme.stroke-keycap;
+        // Off greys the fill and ink, not the layer, so the label stays crisp (DS-8.3 [22]).
+        background: !root.live ? (root.picked || root.held ? Theme.text-disabled : Theme.bg-control) : root.held ? Theme.accent-pressed : root.picked ? Theme.accent : root.invalid ? Theme.error-fill : root.hover ? Theme.bg-control-hover : Theme.bg-control;
         Text {
-            x: 2px;
-            width: parent.width - 4px;
+            x: Theme.radius-small;
+            width: parent.width - 2 * Theme.radius-small;
             text: root.label;
             font-size: Theme.keycap-label-size(root.unit);
             wrap: no-wrap;
             overflow: elide;
             horizontal-alignment: center;
             vertical-alignment: center;
-            color: root.picked || root.held ? Theme.on-accent : root.invalid ? Theme.error-text : Theme.text-primary;
+            color: root.picked || root.held ? Theme.on-accent : !root.live ? Theme.text-disabled : root.invalid ? Theme.error-text : Theme.text-primary;
             accessible-role: none;
         }
     }
     touch := TouchArea {
         enabled: root.live;
+        mouse-cursor: pointer;
         clicked => {
             root.clicked();
         }
@@ -80,7 +83,7 @@ export component KeycapRow {
     // Set by a parent whose own TouchArea lies over the row: the "+N" tooltip follows it too.
     in property <bool> hovered;
     // The longest key label fits with room to spare (`every_label_fits_its_cap_on_one_line`).
-    property <length> cap-width: 44px;
+    property <length> cap-width: Theme.keycap-width;
     property <length> pitch: root.cap-width + Theme.keycap-gap;
     // Whole caps that fit; the last one becomes "+N" when some are left over.
     property <int> slots: max(1, floor((root.width + Theme.keycap-gap) / root.pitch));
@@ -129,15 +132,16 @@ export component KeycapRow {
         width: root.cap-width;
         height: root.cap-height;
         border-radius: Theme.radius-control;
-        opacity: Shell.locked ? 0.4 : 1;
-        background: root.warning ? Theme.warning-fill : Theme.accent;
-        border-width: root.warning ? 1px : 0;
+        // Locked greys the fill, not the layer, so the label stays crisp (DS-8.3 [22]).
+        background: Shell.locked ? Theme.text-disabled : root.warning ? Theme.warning-fill : Theme.accent;
+        // 1 px hairline: the warning cap's stroke.
+        border-width: root.warning && !Shell.locked ? 1px : 0;
         border-color: Theme.warning-text.transparentize(0.7);
         Text {
             text: root.keys[i];
             font-size: Theme.body-size;
             font-weight: Theme.weight-strong;
-            color: root.warning ? Theme.warning-text : Theme.on-accent;
+            color: root.warning && !Shell.locked ? Theme.warning-text : Theme.on-accent;
             horizontal-alignment: center;
             vertical-alignment: center;
             accessible-role: none;
@@ -148,15 +152,15 @@ export component KeycapRow {
         width: root.cap-width;
         height: root.cap-height;
         border-radius: Theme.radius-control;
-        opacity: Shell.locked ? 0.4 : 1;
-        background: root.warning ? Theme.warning-fill : Theme.bg-control;
+        background: root.warning && !Shell.locked ? Theme.warning-fill : Theme.bg-control;
+        // 1 px hairline: the folded cap's stroke.
         border-width: 1px;
         border-color: root.warning ? Theme.warning-text.transparentize(0.7) : Theme.stroke-keycap;
         Text {
             text: "+\{root.folded}";
             font-size: Theme.body-size;
             font-weight: Theme.weight-strong;
-            color: root.warning ? Theme.warning-text : Theme.text-primary;
+            color: Shell.locked ? Theme.text-disabled : root.warning ? Theme.warning-text : Theme.text-primary;
             horizontal-alignment: center;
             vertical-alignment: center;
             accessible-role: none;

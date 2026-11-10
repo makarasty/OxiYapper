@@ -1,6 +1,6 @@
 // System page (SPEC System). The shell owns the theme picker (config `ui.theme`); the rest is
 // `[system]`, `[history]` and `debug.log_text`, filled and read by `pages::system`.
-import { Theme, Shell, Icons, Group, Card, Row, Divider, ToggleRow, TilePicker, Combo, Button, ButtonKind, Switch, NumberField, Tip, SubTabs } from "../theme/index.slint";
+import { Theme, Shell, Icons, Group, Card, Row, Divider, ToggleRow, TilePicker, Combo, Button, ButtonKind, NumberField, PathField, SubTabs } from "../theme/index.slint";
 import { HomeState } from "home.slint";
 
 export enum ThemeChoice { system, dark, light }
@@ -22,12 +22,13 @@ export global SystemState {
     callback open-settings-folder();
     callback open-logs-folder();
     // Recording storage. `history-folder` is the chosen folder (empty: the default one),
-    // `history-path` where recordings land, `history-problem` the row's "!" text.
+    // `history-path` where recordings land (the field's text, typed into), `history-problem` the
+    // row's "!" text.
     in-out property <bool> history-on;
     in-out property <float> history-days;
     in-out property <float> history-gb;
     in property <string> history-folder;
-    in property <string> history-path;
+    in-out property <string> history-path;
     in property <string> history-problem;
     // The config's size limit is not whole GB, so the field shows it rounded up: the row's "!".
     in property <string> history-limit-note;
@@ -36,7 +37,10 @@ export global SystemState {
     callback history-toggled(bool);
     callback history-days-changed(float);
     callback history-gb-changed(float);
-    callback history-browse();
+    // The dialog starts at this path, the field's text (DS-13.4).
+    callback history-browse(string);
+    // Enter in the folder field: a full path, or empty for the default folder.
+    callback history-folder-typed(string);
     // The page was opened: the chosen folder may have gone since the last look.
     callback history-check();
 }
@@ -52,6 +56,15 @@ export component SystemPage inherits VerticalLayout {
     property <bool> confirm-update-off;
     // The swap removes the focused control, so focus moves with it, ringed only for the keyboard.
     property <bool> confirm-by-key;
+    // Text was typed into the folder field and not yet saved (Enter) or put back.
+    property <bool> path-typed;
+    // Puts the saved path back over unsaved text in the folder field; Enter is the only save.
+    function put-back-path() {
+        if (root.path-typed) {
+            root.path-typed = false;
+            SystemState.history-check();
+        }
+    }
     alignment: start;
     spacing: Theme.space-4;
     init => {
@@ -61,6 +74,8 @@ export component SystemPage inherits VerticalLayout {
         items: [@tr("General"), @tr("Recordings and files")];
         selected: SystemState.tab;
         picked(i) => {
+            // The field goes with its tab, so its focus loss is never seen.
+            root.put-back-path();
             SystemState.tab = i;
         }
     }
@@ -169,8 +184,19 @@ export component SystemPage inherits VerticalLayout {
     }
     }
     if SystemState.tab == 1: Card {
-            Row {
+            // Its own row: two limit fields and the switch (252 px) overflow the 240 px column.
+            ToggleRow {
+                flat: true;
                 title: @tr("Save recordings");
+                checked <=> SystemState.history-on;
+                toggled(on) => {
+                    root.put-back-path();
+                    SystemState.history-toggled(on);
+                }
+            }
+            Divider { }
+            Row {
+                title: @tr("Keep recordings");
                 // Limits act on the folder below, saving on or off; an earlier folder is never touched
                 // (SPEC History, owner 2026-11-10).
                 description: @tr("Keeps audio and text in the folder below up to these limits. Older ones are deleted, even while off.");
@@ -181,6 +207,11 @@ export component SystemPage inherits VerticalLayout {
                     unit: @tr("days");
                     zero-text: @tr("Forever");
                     accessible-label: @tr("Keep recordings for");
+                    changed has-focus => {
+                        if (self.has-focus) {
+                            root.put-back-path();
+                        }
+                    }
                     changed(days) => {
                         SystemState.history-days-changed(days);
                     }
@@ -191,15 +222,13 @@ export component SystemPage inherits VerticalLayout {
                     unit: @tr("GB");
                     zero-text: @tr("No limit");
                     accessible-label: @tr("Recordings size limit");
+                    changed has-focus => {
+                        if (self.has-focus) {
+                            root.put-back-path();
+                        }
+                    }
                     changed(gb) => {
                         SystemState.history-gb-changed(gb);
-                    }
-                }
-                Switch {
-                    checked <=> SystemState.history-on;
-                    accessible-label: @tr("Save recordings");
-                    toggled(on) => {
-                        SystemState.history-toggled(on);
                     }
                 }
             }
@@ -207,42 +236,58 @@ export component SystemPage inherits VerticalLayout {
             Row {
                 title: @tr("Recordings folder");
                 warning: SystemState.history-problem;
-                // Packed right with its buttons, as their subject (UI rule 9); a long path is cut.
-                Rectangle {
-                    max-width: folder-text.preferred-width;
-                    accessible-role: text;
-                    accessible-label: SystemState.history-path;
-                    folder-text := Text {
-                        width: 100%;
-                        text: SystemState.history-folder == "" ? @tr("Default folder") : SystemState.history-folder;
-                        font-size: Theme.body-size;
-                        color: Theme.text-secondary;
-                        vertical-alignment: center;
-                        overflow: elide;
+                // DS-3.1: the path fills the control column; under it Browse and Open, both labelled
+                // (items 7, 44): three controls do not fit one 240 px column.
+                fill-controls: true;
+                // Moving focus to another control (Tab, a click on a limit field, a button or switch)
+                // with the field unsaved puts the saved path back; Enter is the only save. Buttons and
+                // switches take no focus on a click, so they put it back themselves. The field losing
+                // focus alone (Alt+Tab away) keeps the typed text.
+                VerticalLayout {
+                    spacing: Theme.space-2;
+                    PathField {
+                        path <=> SystemState.history-path;
+                        display: SystemState.history-folder == "" ? @tr("Default folder") : "";
+                        // The field inside takes the label; the frame itself is no element of its own.
                         accessible-role: none;
+                        accessible-label: @tr("Recordings folder");
+                        edited(text) => {
+                            root.path-typed = true;
+                        }
+                        accepted(text) => {
+                            root.path-typed = false;
+                            SystemState.history-folder-typed(text);
+                        }
+                        tabbed => {
+                            root.put-back-path();
+                        }
                     }
-                    path-hover := TouchArea { }
-                    Tip {
-                        text: SystemState.history-path;
-                        hovered: path-hover.has-hover;
-                    }
-                }
-                if SystemState.can-browse: Button {
-                    text: @tr("Change recordings folder");
-                    kind: ButtonKind.icon;
-                    icon: Icons.edit-16;
-                    enabled: !Shell.locked;
-                    tooltip: Shell.locked-tip;
-                    clicked => {
-                        SystemState.history-browse();
-                    }
-                }
-                Button {
-                    text: @tr("Open recordings folder");
-                    kind: ButtonKind.icon;
-                    icon: Icons.open-folder-16;
-                    clicked => {
-                        HomeState.open-history();
+                    HorizontalLayout {
+                        alignment: end;
+                        spacing: Theme.control-gap;
+                        if SystemState.can-browse: Button {
+                            text: @tr("Browse");
+                            accessible-label: @tr("Change recordings folder");
+                            enabled: !Shell.locked;
+                            tooltip: Shell.locked-tip;
+                            clicked => {
+                                root.path-typed = false;
+                                SystemState.history-browse(SystemState.history-path);
+                                // The dialog blocks: a cancel leaves the typed text, put the saved path back.
+                                SystemState.history-check();
+                            }
+                        }
+                        // Only opens Explorer: live while the config is locked.
+                        Button {
+                            text: @tr("Open");
+                            kind: ButtonKind.subtle;
+                            icon: Icons.folder-open-16;
+                            accessible-label: @tr("Open recordings folder");
+                            clicked => {
+                                root.put-back-path();
+                                HomeState.open-history();
+                            }
+                        }
                     }
                 }
             }
@@ -252,18 +297,20 @@ export component SystemPage inherits VerticalLayout {
                 Button {
                     text: @tr("Settings");
                     kind: ButtonKind.subtle;
-                    icon: Icons.open-folder-16;
+                    icon: Icons.folder-open-16;
                     accessible-label: @tr("Open settings folder");
                     clicked => {
+                        root.put-back-path();
                         SystemState.open-settings-folder();
                     }
                 }
                 Button {
                     text: @tr("Logs");
                     kind: ButtonKind.subtle;
-                    icon: Icons.open-folder-16;
+                    icon: Icons.folder-open-16;
                     accessible-label: @tr("Open logs folder");
                     clicked => {
+                        root.put-back-path();
                         SystemState.open-logs-folder();
                     }
                 }
@@ -275,6 +322,7 @@ export component SystemPage inherits VerticalLayout {
                 warning: SystemState.log-text ? @tr("Dictated text is written to the log files while this is on. Turn it off when you are done.") : "";
                 checked <=> SystemState.log-text;
                 toggled(on) => {
+                    root.put-back-path();
                     SystemState.log-text-toggled(on);
                 }
             }

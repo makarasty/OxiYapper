@@ -1,5 +1,5 @@
-//! Audio page: microphone, live meter, DSP switches, tail, recording cap and the start
-//! and stop sounds.
+//! Audio page: microphone, live meter, DSP switches, tail, recording cap and the sounds of the
+//! five events (start, stop, text ready, cancel, error).
 //!
 //! The meter opens its own capture while the page is shown (decision D3) and polls it at
 //! [`METER_HZ`] through the core [`Meter`]; leaving the page or closing the window closes it.
@@ -17,6 +17,7 @@ use oxi_core::audio::{AudioError, Level, SAMPLE_RATE, db_to_linear};
 use oxi_core::config::{Audio, Config, Sounds};
 use oxi_core::constants::PLAY_TAIL;
 use oxi_core::ipc::{Push, Request};
+use oxi_core::machine::Sound;
 use oxi_core::overlay::{METER_HZ, Meter};
 use oxi_core::sounds::{Builtin, Choice, is_plain_local_path};
 use oxi_core::strings::{self, NO_MIC};
@@ -26,7 +27,7 @@ use oxi_platform::capture::{
 };
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
-use crate::generated::{AudioKey, AudioState, Toast};
+use crate::generated::{AudioKey, AudioState, GalleryTile, Toast};
 use crate::ipc::{Event, Link, Subscription};
 use crate::{AppWindow, Ctx, Page, report};
 
@@ -47,11 +48,19 @@ const NO_SIGNAL: Millis = Millis(3_000);
 /// Length of the Test button's recording.
 const TEST_LENGTH: Millis = Millis(3_000);
 /// Tile of the own file: after the built-in sounds.
-const OWN_FILE_TILE: usize = Builtin::PICKABLE.len();
+const OWN_FILE_TILE: usize = Builtin::ALL.len();
+/// The sounds of the Sounds tab, in the order of its picker: `AudioState.view` 2 to 6.
+const ROLES: [Sound; 5] = [
+    Sound::Start,
+    Sound::Stop,
+    Sound::Done,
+    Sound::Cancel,
+    Sound::Error,
+];
 /// Tooltip of Preview while the daemon is not there to play it.
 const PREVIEW_NEEDS_DAEMON: &str = "Start OxiYapper to hear a preview.";
 /// Toast when the picked sound file is a network, device or stream path.
-const SOUND_PATH_REFUSED: &str = "Pick a WAV file on a local drive";
+const SOUND_PATH_REFUSED: &str = "Pick a WAV or OGG file on a local drive";
 
 /// Opens a capture feeding the meter; the flag is set when the stream stops on its own.
 type Opener<C> = fn(&Audio, LevelMeter, Arc<AtomicBool>) -> Result<Opened<C>, CaptureError>;
@@ -63,7 +72,7 @@ struct Io<C> {
     now: fn() -> Millis,
     play: Player,
     /// The file dialog for an own sound; `None` when cancelled.
-    pick_wav: fn() -> Option<PathBuf>,
+    pick_file: fn() -> Option<PathBuf>,
 }
 
 /// Plays a mono clip at the given rate; the handle keeps it playing.
@@ -99,15 +108,15 @@ fn play_cpal(clip: &[f32], rate: u32) -> Result<Box<dyn Any>, CaptureError> {
 }
 
 #[cfg(windows)]
-fn pick_wav() -> Option<PathBuf> {
+fn pick_file() -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .add_filter("WAV sound", &["wav"])
+        .add_filter("Sound", &["wav", "ogg"])
         .pick_file()
 }
 
 /// No native dialog on this OS: `can-browse` turns the button and the tile off.
 #[cfg(not(windows))]
-fn pick_wav() -> Option<PathBuf> {
+fn pick_file() -> Option<PathBuf> {
     None
 }
 
@@ -123,7 +132,7 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         list: list_input_devices,
         now: since_start,
         play: play_cpal,
-        pick_wav,
+        pick_file,
     };
     bind_with(window, ctx, &io);
 }
@@ -153,7 +162,7 @@ fn bind_with<C: Capture + 'static>(window: &AppWindow, ctx: &Ctx, io: &Io<C>) ->
         timer: Timer::default(),
         open: io.open,
         play: io.play,
-        pick_wav: io.pick_wav,
+        pick_file: io.pick_file,
         test: RefCell::new(None),
     });
     state.set_can_browse(cfg!(windows));
@@ -190,7 +199,7 @@ struct PageState<C> {
     timer: Timer,
     open: Opener<C>,
     play: Player,
-    pick_wav: fn() -> Option<PathBuf>,
+    pick_file: fn() -> Option<PathBuf>,
     test: RefCell<Option<MicTest<C>>>,
 }
 
@@ -386,30 +395,31 @@ impl<C: Capture + 'static> PageState<C> {
         }
     }
 
-    /// Run `f` on the sound setting of the sub-tab shown.
+    /// Run `f` on the sound setting shown on the Sounds tab; `None` on another tab.
     fn with_sound<R>(&self, f: impl FnOnce(&mut String) -> R) -> Option<R> {
         let window = self.window.upgrade()?;
-        let stop = window.global::<AudioState>().get_view() == 3;
+        let role = window.global::<AudioState>().get_view() - 2;
         let sounds = &mut self.ctx.config.borrow_mut().config.sounds;
-        Some(f(if stop {
-            &mut sounds.stop
-        } else {
-            &mut sounds.start
-        }))
+        let slot = match role {
+            0 => &mut sounds.start,
+            1 => &mut sounds.stop,
+            2 => &mut sounds.done,
+            3 => &mut sounds.cancel,
+            4 => &mut sounds.error,
+            _ => return None,
+        };
+        Some(f(slot))
     }
 
     fn sound_picked(&self, tile: i32) {
-        match usize::try_from(tile)
-            .ok()
-            .and_then(|i| Builtin::PICKABLE.get(i))
-        {
+        match usize::try_from(tile).ok().and_then(|i| Builtin::ALL.get(i)) {
             Some(builtin) => self.set_sound(builtin.id().to_owned()),
             None => self.choose_file(),
         }
     }
 
     fn choose_file(&self) {
-        let Some(path) = (self.pick_wav)() else {
+        let Some(path) = (self.pick_file)() else {
             return;
         };
         // The daemon refuses these at every load; saving one would leave a broken setting.
@@ -462,6 +472,7 @@ impl<C: Capture + 'static> PageState<C> {
             AudioKey::Tail => audio.tail_ms = whole(value),
             AudioKey::MaxMinutes => audio.max_seconds = whole(value).max(1) * 60,
             AudioKey::Volume => config.sounds.volume = f64::from(whole(value).min(100)) / 100.0,
+            AudioKey::DoneOn => config.sounds.done_enabled = value != 0.0,
         }
         drop(file);
         report(&self.window, self.ctx.save());
@@ -551,37 +562,96 @@ fn push_config(state: &AudioState<'_>, config: &Config, devices: &Devices) {
     state.set_default_volume(f32::from(percent(defaults.sounds.volume)));
 }
 
-/// Push the sound settings: the tiles, the own files' names and the volume.
+/// Push the sound settings: each sound's tiles and pick, the volume and the text ready switch.
 fn push_sounds(state: &AudioState<'_>, sounds: &Sounds) {
-    let (tile, name, path) = sound_row(&sounds.start);
-    state.set_start_tile(tile);
-    state.set_start_file(name.into());
-    state.set_start_path(path.into());
-    let (tile, name, path) = sound_row(&sounds.stop);
-    state.set_stop_tile(tile);
-    state.set_stop_file(name.into());
-    state.set_stop_path(path.into());
+    let icons = (state.get_sound_icon(), state.get_file_icon());
+    let defaults = Sounds::default();
+    let (tiles, picked): (Vec<_>, Vec<_>) = ROLES
+        .into_iter()
+        .zip(by_role(sounds).into_iter().zip(by_role(&defaults)))
+        .map(|(role, (text, default))| {
+            let (picked, tiles) = sound_tiles(role, text, default, &icons);
+            (ModelRc::from(Rc::new(VecModel::from(tiles))), picked)
+        })
+        .unzip();
+    state.set_role_tiles(ModelRc::from(Rc::new(VecModel::from(tiles))));
+    state.set_role_tile(ModelRc::from(Rc::new(VecModel::from(picked))));
     state.set_volume(f32::from(percent(sounds.volume)));
+    state.set_done_on(sounds.done_enabled);
 }
 
-/// The tile, and for an own file its name and path, of the setting `text`.
-fn sound_row(text: &str) -> (i32, String, String) {
-    let tile = |i: usize| i32::try_from(i).unwrap_or(0);
-    match Choice::parse(text) {
-        Ok(Choice::Custom(path)) => {
-            let name = path.file_name().map_or_else(
-                || path.to_string_lossy().into_owned(),
-                |n| n.to_string_lossy().into_owned(),
-            );
-            (tile(OWN_FILE_TILE), name, text.to_owned())
-        }
-        Ok(Choice::Builtin(b)) => {
-            let row = Builtin::PICKABLE.iter().position(|p| *p == b).unwrap_or(0);
-            (tile(row), String::new(), String::new())
-        }
+/// The settings of [`ROLES`], in its order.
+fn by_role(sounds: &Sounds) -> [&str; 5] {
+    [
+        &sounds.start,
+        &sounds.stop,
+        &sounds.done,
+        &sounds.cancel,
+        &sounds.error,
+    ]
+}
+
+/// The tiles of one sound, `Builtin::ALL` then the own file, and the one its setting `text`
+/// picks (-1: none). The built-in that is the sound's `default` says so.
+fn sound_tiles(
+    role: Sound,
+    text: &str,
+    default: &str,
+    (sound_icon, file_icon): &(slint::Image, slint::Image),
+) -> (i32, Vec<GalleryTile>) {
+    let choice = Choice::parse_for(role, text).ok();
+    let mut tiles: Vec<GalleryTile> = Builtin::ALL
+        .iter()
+        .map(|b| GalleryTile {
+            icon: sound_icon.clone(),
+            title: title(b.id()).into(),
+            caption: if b.id() == default {
+                "Default".into()
+            } else {
+                SharedString::new()
+            },
+            ..GalleryTile::default()
+        })
+        .collect();
+    let own = match &choice {
+        Some(Choice::Custom(path)) => path.file_name().map_or_else(
+            || path.to_string_lossy().into_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        ),
+        _ => String::new(),
+    };
+    tiles.push(GalleryTile {
+        icon: file_icon.clone(),
+        title: "Own file".into(),
+        hint: if own.is_empty() {
+            "Choose a .wav or .ogg file of up to 5 seconds.".into()
+        } else {
+            text.into()
+        },
+        caption: own.into(),
+        disabled: !cfg!(windows),
+        ..GalleryTile::default()
+    });
+    let picked = match choice {
+        Some(Choice::Builtin(b)) => Builtin::ALL.iter().position(|x| *x == b),
+        Some(Choice::Custom(_)) => Some(OWN_FILE_TILE),
         // `Sounds::normalise` already replaced anything else.
-        Err(_) => (0, String::new(), String::new()),
-    }
+        None => None,
+    };
+    (
+        picked.and_then(|i| i32::try_from(i).ok()).unwrap_or(-1),
+        tiles,
+    )
+}
+
+/// A built-in's name on its tile: its id in words, `apa-hit-3` as "Apa hit 3".
+fn title(id: &str) -> String {
+    let words = id.replace('-', " ");
+    let mut chars = words.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 /// The volume as the whole percent the slider and `PreviewSound` use.
@@ -596,7 +666,7 @@ fn percent(volume: f64) -> u8 {
 }
 
 /// The daemon's lines about the sounds, in words for the "!". The preview's line stands only when
-/// no setting has one: it plays the same file, so the fact would be said twice.
+/// no other has one: it plays the same file, so the fact would be said twice.
 fn sound_warning(lines: &[String]) -> String {
     let said = |prefix: &str, name: &str| {
         lines
@@ -604,12 +674,22 @@ fn sound_warning(lines: &[String]) -> String {
             .find_map(|l| l.strip_prefix(prefix))
             .map(|why| format!("{name}: {why}"))
     };
-    let start = said("sounds.start: ", "Start sound");
-    let stop = said("sounds.stop: ", "Stop sound");
-    if start.is_none() && stop.is_none() {
+    let settings: Vec<String> = [
+        ("sounds.start: ", "Start sound"),
+        ("sounds.stop: ", "Stop sound"),
+        ("sounds.done: ", "Text ready sound"),
+        ("sounds.cancel: ", "Cancel sound"),
+        ("sounds.error: ", "Error sound"),
+        // The daemon could not play a sound at all (no output device, the stream stopped).
+        ("sounds: ", "Sounds"),
+    ]
+    .into_iter()
+    .filter_map(|(prefix, name)| said(prefix, name))
+    .collect();
+    if settings.is_empty() {
         return said("sounds.preview: ", "Preview").unwrap_or_default();
     }
-    start.into_iter().chain(stop).collect::<Vec<_>>().join("\n")
+    settings.join("\n")
 }
 
 /// A slider or picker value as a whole non-negative number.
@@ -944,7 +1024,7 @@ mod tests {
             list: fake_list,
             now: fake_now,
             play: fake_play,
-            pick_wav: fake_pick,
+            pick_file: fake_pick,
         };
         let page = bind_with(&window, &ctx, &io);
         (window, page)
@@ -1657,6 +1737,15 @@ device = \"USB Mic\"
         assert_eq!(seconds(), 1500, "set-value took nan");
     }
 
+    /// A path of the OS under test: `Path::file_name` does not split `\` on Unix.
+    fn snd(name: &str) -> String {
+        std::env::temp_dir()
+            .join("Sounds")
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// The window on the Start sound sub-tab, with the fake file dialog.
     fn sounds_page(name: &str, config: Option<&str>) -> (AppWindow, Rc<PageState<Fake>>) {
         i_slint_backend_testing::init_no_event_loop();
@@ -1673,22 +1762,79 @@ device = \"USB Mic\"
         let state = window.global::<AudioState>();
         let start = || page.ctx.config.borrow().config.sounds.start.clone();
         state.invoke_sound_picked(i32::try_from(OWN_FILE_TILE).unwrap());
-        assert_eq!(start(), "rise", "the dialog was cancelled");
-        PICKED.set(Some(r"C:\Sounds\my.wav".into()));
+        assert_eq!(start(), "apa-hit-3", "the dialog was cancelled");
+        PICKED.set(Some(snd("my.wav").into()));
         state.invoke_sound_picked(i32::try_from(OWN_FILE_TILE).unwrap());
-        assert_eq!(start(), r"C:\Sounds\my.wav");
-        assert_eq!(state.get_start_tile(), 4);
-        assert_eq!(state.get_start_file(), "my.wav");
-        assert_eq!(state.get_start_path(), r"C:\Sounds\my.wav");
+        assert_eq!(start(), snd("my.wav"));
+        let own = own_tile(&state, 0);
+        assert_eq!(picked_tile(&state, 0), OWN_FILE_TILE);
+        assert_eq!(own.caption, "my.wav");
+        assert_eq!(own.hint, snd("my.wav"));
         // The stop sound's own file does not touch the start sound.
         state.set_view(3);
-        PICKED.set(Some(r"C:\Sounds\end.wav".into()));
+        PICKED.set(Some(snd("end.wav").into()));
         state.invoke_choose_file();
         assert_eq!(
             page.ctx.config.borrow().config.sounds.stop,
-            r"C:\Sounds\end.wav"
+            snd("end.wav")
         );
-        assert_eq!(start(), r"C:\Sounds\my.wav");
+        assert_eq!(start(), snd("my.wav"));
+    }
+
+    /// The tile picked for the sound `role` (an index of [`ROLES`]).
+    fn picked_tile(state: &AudioState<'_>, role: usize) -> usize {
+        let tile = slint::Model::row_data(&state.get_role_tile(), role).unwrap();
+        usize::try_from(tile).unwrap()
+    }
+
+    fn own_tile(state: &AudioState<'_>, role: usize) -> GalleryTile {
+        let tiles = slint::Model::row_data(&state.get_role_tiles(), role).unwrap();
+        slint::Model::row_data(&tiles, OWN_FILE_TILE).unwrap()
+    }
+
+    /// Every sound of the picker writes its own key; the error default (`boop-3`, not one of the
+    /// four tiles there were) is the tile picked, and an own `.ogg` is taken.
+    #[test]
+    fn every_sound_is_picked_on_its_own_tile_and_key() {
+        let (window, page) = sounds_page("roles", None);
+        let state = window.global::<AudioState>();
+        let sounds = || page.ctx.config.borrow().config.sounds.clone();
+        let defaults = Sounds::default();
+        for (role, default) in by_role(&defaults).into_iter().enumerate() {
+            let at = Builtin::ALL.iter().position(|b| b.id() == default).unwrap();
+            assert_eq!(picked_tile(&state, role), at, "{default}");
+        }
+        let kill = Builtin::ALL
+            .iter()
+            .position(|b| *b == Builtin::Kill1)
+            .unwrap();
+        for role in 0..ROLES.len() {
+            state.set_view(i32::try_from(role).unwrap() + 2);
+            state.invoke_sound_picked(i32::try_from(kill).unwrap());
+            assert_eq!(by_role(&sounds())[role], "kill-1", "role {role}");
+            assert_eq!(picked_tile(&state, role), kill);
+        }
+        state.set_view(5);
+        PICKED.set(Some(snd("no.ogg").into()));
+        state.invoke_choose_file();
+        assert_eq!(sounds().cancel, snd("no.ogg"));
+        assert_eq!(picked_tile(&state, 3), OWN_FILE_TILE);
+        assert_eq!(own_tile(&state, 3).caption, "no.ogg");
+        assert_eq!(
+            sounds().error,
+            "kill-1",
+            "the cancel file left the error sound"
+        );
+        state.invoke_edited(AudioKey::DoneOn, 0.0);
+        assert!(!sounds().done_enabled);
+    }
+
+    #[test]
+    fn tile_names_are_the_ids_in_words() {
+        assert_eq!(title("apa-hit-3"), "Apa hit 3");
+        assert_eq!(title("rx-3-echo"), "Rx 3 echo");
+        assert_eq!(title("nine"), "Nine");
+        assert_eq!(title(""), "");
     }
 
     fn refused(name: &str, bad: &str) {
@@ -1696,7 +1842,7 @@ device = \"USB Mic\"
         PICKED.set(Some(bad.into()));
         window.global::<AudioState>().invoke_choose_file();
         let start = page.ctx.config.borrow().config.sounds.start.clone();
-        assert_eq!(start, "rise", "{bad} was saved");
+        assert_eq!(start, "apa-hit-3", "{bad} was saved");
         assert_eq!(window.global::<Toast>().get_text(), SOUND_PATH_REFUSED);
     }
 
@@ -1707,7 +1853,7 @@ device = \"USB Mic\"
 
     #[test]
     fn a_device_name_file_is_refused_not_saved() {
-        refused("own-file-nul", r"C:\x\NUL.wav");
+        refused("own-file-nul", "NUL.wav");
     }
 
     #[test]
@@ -1759,6 +1905,13 @@ device = \"USB Mic\"
                 "sounds.preview: empty",
             ])),
             "Start sound: empty, using rise\nStop sound: empty, using fall"
+        );
+        assert_eq!(
+            sound_warning(&lines(&[
+                "sounds.done: not a WAV file, using rx-25",
+                "sounds: not played (no output device)",
+            ])),
+            "Text ready sound: not a WAV file, using rx-25\nSounds: not played (no output device)"
         );
     }
 

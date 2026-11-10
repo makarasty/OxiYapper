@@ -28,6 +28,12 @@ fn run_daemon() {
     if let Err(e) = daemon::run() {
         attach();
         eprintln!("error: {e:#}");
+        // Started by Explorer or the Run key the release exe has no console: without the box
+        // the app would vanish with no word (t11). The log file has the same line. No IPC
+        // listener is alive while it waits (`daemon::run` starts it last), so a second launch
+        // starts a daemon of its own instead of being forwarded here.
+        #[cfg(not(debug_assertions))]
+        oxi_platform::os::tray::error_box(&format!("{} stopped: {e:#}", oxi_core::APP_NAME));
         std::process::exit(1);
     }
 }

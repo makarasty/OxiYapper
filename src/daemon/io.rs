@@ -4,21 +4,23 @@
 //! The worker thread only routes [`IoCmd`]s. Each download runs on its own thread, so a
 //! `CancelDownload` is heard while the transfer runs. Progress and the end go to the settings
 //! window as pushes; with no window open they are dropped and the download carries on. A window
-//! that connects gets the last progress of each running download (`IoCmd::Subscribed`).
+//! that connects gets the last progress of each running download (`IoCmd::Subscribed`). The
+//! coordinator hears of each finished download (`Inbox::ModelDownloaded`).
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use oxi_core::ipc::{DownloadResult, Push};
+use oxi_core::ipc::{DeleteResult, DownloadResult, Push};
 use oxi_core::models::{self, ModelEntry};
+use oxi_core::paths::part_path;
 
-use super::cmd::IoCmd;
+use super::cmd::{Inbox, IoCmd};
 use super::ipc::Pushes;
 use super::lock;
 use crate::net::{self, DownloadError, Downloaded};
@@ -36,13 +38,19 @@ type DownloadFn = dyn Fn(
     + Send
     + Sync;
 
+/// The `.part` of every running download in the process. The whisper worker deletes and this
+/// worker downloads: a delete of a model whose download runs answers `InUse`, and the lock is
+/// held across the delete so no download starts in the middle of it.
+static DOWNLOADING: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
 /// Starts the worker thread. Returns when `rx` closes; running downloads end on their own.
 pub fn spawn(
     rx: Receiver<IoCmd>,
+    inbox: Sender<Inbox>,
     pushes: Pushes,
     models_dir: PathBuf,
 ) -> std::io::Result<JoinHandle<()>> {
-    let worker = Worker::new(Arc::new(net::download), pushes, models_dir);
+    let worker = Worker::new(Arc::new(net::download), inbox, pushes, models_dir);
     thread::Builder::new().name("io".into()).spawn(move || {
         for cmd in rx {
             worker.handle(cmd);
@@ -52,6 +60,8 @@ pub fn spawn(
 
 struct Worker {
     download: Arc<DownloadFn>,
+    /// The coordinator, told of each finished download.
+    inbox: Sender<Inbox>,
     pushes: Pushes,
     models_dir: PathBuf,
     /// Every running download, by model id.
@@ -69,9 +79,15 @@ struct Running {
 }
 
 impl Worker {
-    fn new(download: Arc<DownloadFn>, pushes: Pushes, models_dir: PathBuf) -> Self {
+    fn new(
+        download: Arc<DownloadFn>,
+        inbox: Sender<Inbox>,
+        pushes: Pushes,
+        models_dir: PathBuf,
+    ) -> Self {
         Self {
             download,
+            inbox,
             pushes,
             models_dir,
             active: Arc::default(),
@@ -108,8 +124,11 @@ impl Worker {
                 slot.insert(run.clone());
             }
         }
-        let (download, pushes, dir, active) = (
+        let part = part_path(&self.models_dir.join(entry.file_name));
+        lock(&DOWNLOADING).insert(part.clone());
+        let (download, inbox, pushes, dir, active) = (
             self.download.clone(),
+            self.inbox.clone(),
             self.pushes.clone(),
             self.models_dir.clone(),
             self.active.clone(),
@@ -117,13 +136,19 @@ impl Worker {
         let job = move || {
             let result = transfer(&*download, entry, &dir, &pushes, &run);
             // Free the id before the push: a window that asks again on `Done` must be heard.
+            lock(&DOWNLOADING).remove(&part);
             lock(&active).remove(entry.id);
+            // A send fails only when the coordinator is gone: nothing is left to retry then.
+            if result == DownloadResult::Ok {
+                let _ = inbox.send(Inbox::ModelDownloaded(entry.id.into()));
+            }
             pushes.send(Push::DownloadDone {
                 id: entry.id.into(),
                 result,
             });
         };
         if let Err(e) = thread::Builder::new().name("download".into()).spawn(job) {
+            lock(&DOWNLOADING).remove(&part_path(&self.models_dir.join(entry.file_name)));
             lock(&self.active).remove(&id);
             self.failed(id, format!("no thread: {e}"));
         }
@@ -148,6 +173,37 @@ impl Worker {
             result: DownloadResult::Failed { message },
         });
     }
+}
+
+/// Removes a registry model's file, its `.ok` stamp and its `.part` from `dir`; a file that is
+/// not there is fine. The caller has unloaded the model and refused a running dictation.
+/// `freed` counts the bytes of what was removed. A download running for it answers `InUse`: the
+/// window cancels it first.
+pub fn delete_model(dir: &Path, entry: &ModelEntry) -> DeleteResult {
+    let file = dir.join(entry.file_name);
+    let downloading = lock(&DOWNLOADING);
+    if downloading.contains(&part_path(&file)) {
+        return DeleteResult::InUse;
+    }
+    let mut freed = 0;
+    for path in [
+        file.clone(),
+        dir.join(models::stamp_file_name(entry.file_name)),
+        part_path(&file),
+    ] {
+        let size = std::fs::metadata(&path).map_or(0, |m| m.len());
+        match std::fs::remove_file(&path) {
+            Ok(()) => freed += size,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(kind = ?e.kind(), model = entry.id, "model file not deleted");
+                return DeleteResult::Failed {
+                    message: e.to_string(),
+                };
+            }
+        }
+    }
+    DeleteResult::Done { freed }
 }
 
 fn transfer(
@@ -212,6 +268,7 @@ mod tests {
     use std::sync::mpsc::{self, Receiver};
 
     use super::*;
+    use crate::log::scratch::scratch_dir;
 
     const WAIT: Duration = Duration::from_secs(3);
 
@@ -219,7 +276,12 @@ mod tests {
         let pushes = Pushes::default();
         let (_, rx) = pushes.claim(0);
         (
-            Worker::new(download, pushes, PathBuf::from("models-test")),
+            Worker::new(
+                download,
+                mpsc::channel().0,
+                pushes,
+                PathBuf::from("models-test"),
+            ),
             rx,
         )
     }
@@ -229,6 +291,57 @@ mod tests {
             path: dir.join(entry.file_name),
             stamp_error: None,
         }
+    }
+
+    #[test]
+    fn delete_removes_model_stamp_and_part_and_counts_bytes() {
+        let dir = scratch_dir(&format!("oxi-io-delete-{}", std::process::id()));
+        let entry = models::find("tiny").unwrap();
+        let file = dir.join(entry.file_name);
+        std::fs::write(&file, [0; 10]).unwrap();
+        std::fs::write(dir.join(models::stamp_file_name(entry.file_name)), [0; 2]).unwrap();
+        std::fs::write(part_path(&file), [0; 5]).unwrap();
+        let other = dir.join("keep.txt");
+        std::fs::write(&other, "x").unwrap();
+        assert_eq!(delete_model(&dir, entry), DeleteResult::Done { freed: 17 });
+        assert!(!file.exists() && !part_path(&file).exists() && other.exists());
+        // Only a partial download left: it goes too; nothing there is not an error.
+        std::fs::write(part_path(&file), [0; 4]).unwrap();
+        assert_eq!(delete_model(&dir, entry), DeleteResult::Done { freed: 4 });
+        assert_eq!(delete_model(&dir, entry), DeleteResult::Done { freed: 0 });
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn delete_of_a_model_that_is_downloading_is_refused_until_it_ends() {
+        let dir = scratch_dir(&format!("oxi-io-busy-{}", std::process::id()));
+        let entry = models::find("tiny").unwrap();
+        let part = part_path(&dir.join(entry.file_name));
+        std::fs::write(&part, [0; 3]).unwrap();
+        let (go, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let fake: Arc<DownloadFn> = Arc::new(move |_, _, progress, _| {
+            progress(3, 40);
+            let _ = lock(&gate).recv_timeout(WAIT);
+            Err(DownloadError::Cancelled)
+        });
+        let pushes = Pushes::default();
+        let (_, rx) = pushes.claim(0);
+        let worker = Worker::new(fake, mpsc::channel().0, pushes, dir.clone());
+        worker.handle(id("tiny"));
+        assert!(matches!(
+            rx.recv_timeout(WAIT).unwrap(),
+            Push::DownloadProgress { .. }
+        ));
+        assert_eq!(delete_model(&dir, entry), DeleteResult::InUse);
+        assert!(part.exists(), "the running download's file stays");
+        drop(go);
+        assert!(matches!(
+            rx.recv_timeout(WAIT).unwrap(),
+            Push::DownloadDone { .. }
+        ));
+        assert_eq!(delete_model(&dir, entry), DeleteResult::Done { freed: 3 });
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn id(name: &str) -> IoCmd {
@@ -258,6 +371,8 @@ mod tests {
             Ok(downloaded(entry, dir))
         });
         let (worker, rx) = rig(fake);
+        let (inbox, told) = mpsc::channel();
+        let worker = Worker { inbox, ..worker };
         worker.handle(id("tiny"));
         let mut seen = vec![];
         loop {
@@ -274,6 +389,10 @@ mod tests {
             }
         }
         assert_eq!(seen, [10, 20, 30]);
+        assert!(
+            matches!(told.recv_timeout(WAIT), Ok(Inbox::ModelDownloaded(id)) if id == "tiny"),
+            "the coordinator hears of the download"
+        );
     }
 
     #[test]

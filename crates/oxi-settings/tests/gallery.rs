@@ -11,15 +11,15 @@ mod gallery {
 
 mod common;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::purple;
 use gallery::{
-    ClickRingProbe, Contrast, GalleryShot, GalleryTile, IconDangerProbe, SubTabsProbe, Theme,
-    TileGalleryProbe, TipFadeProbe,
+    ClickRingProbe, Contrast, GalleryShot, GalleryTile, IconDangerProbe, PathFieldProbe, PathText,
+    SubTabsProbe, Theme, TileGalleryProbe, TipFadeProbe,
 };
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
@@ -37,11 +37,26 @@ const SLICE: u32 = 1200;
 
 thread_local! {
     static LAST: RefCell<Option<Rc<MinimalSoftwareWindow>>> = const { RefCell::new(None) };
+    static START: Instant = Instant::now();
+    // A test that must dispatch events between time steps owns the clock (`advance`).
+    static CLOCK: Cell<Option<Duration>> = const { Cell::new(None) };
+}
+
+/// Moves the animation clock on by `ms` and runs the animations; a real-clock tick cannot follow it
+/// on this thread, unlike `mock_elapsed_time`, so events may be dispatched between steps.
+fn advance(ms: u64) {
+    let now = CLOCK.get().unwrap_or_else(|| START.with(Instant::elapsed));
+    CLOCK.set(Some(now + Duration::from_millis(ms)));
+    slint::platform::update_timers_and_animations();
 }
 
 struct Shots;
 
 impl Platform for Shots {
+    fn duration_since_start(&self) -> Duration {
+        CLOCK.get().unwrap_or_else(|| START.with(Instant::elapsed))
+    }
+
     fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
         let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
         LAST.with_borrow_mut(|last| *last = Some(window.clone()));
@@ -53,6 +68,9 @@ fn sheet(dark: bool) -> GalleryShot {
     // Once per thread; a second call on the same thread is the same platform.
     let _ = slint::platform::set_platform(Box::new(Shots));
     let shot = GalleryShot::new().unwrap();
+    shot.global::<PathText>().on_elide(|path, budget| {
+        oxi_core::paths::elide_path(&path, usize::try_from(budget).unwrap_or(0)).into()
+    });
     shot.set_dark(dark);
     shot
 }
@@ -118,14 +136,30 @@ fn save(pixmap: &Pixmap, name: &str) {
 #[test]
 fn purple_classifier_catches_the_accent() {
     assert!(purple(0x87, 0x64, 0xB8)); // Windows purple accent
-    assert!(!purple(0x0F, 0x76, 0x6E)); // our teal
+    assert!(!purple(0x1C, 0x1B, 0x19)); // our ink accent
+    assert!(!purple(0x0F, 0x76, 0x6E)); // the old teal
     assert!(!purple(0x80, 0x80, 0x80)); // grey
     assert!(!purple(0xC4, 0x2B, 0x1C)); // error red
 }
 
 #[test]
 fn gallery_light() {
-    save(&render(&sheet(false), 1.0), "light");
+    let shot = sheet(false);
+    save(&render(&shot, 1.0), "light");
+    // The 60-tile grid is sized at creation and opens on tile 31: that tile's row is whole in the
+    // view, which shows `edge` (half a gap) more than the grid's height on each side.
+    let t = shot.global::<Theme>();
+    let row_height = t.get_tile_height() + t.get_tile_gap();
+    #[allow(clippy::cast_precision_loss)] // a row index
+    let top = (31 / shot.get_long_grid_columns()) as f32 * row_height;
+    let (from, to) = (
+        shot.get_long_grid_scrolled(),
+        shot.get_long_grid_scrolled() + shot.get_long_grid_height() + t.get_tile_gap(),
+    );
+    assert!(
+        from > 0.0 && from <= top && top + row_height <= to,
+        "row at {top}, view {from}..{to}"
+    );
 }
 
 #[test]
@@ -192,8 +226,7 @@ fn pressed_danger_fill_differs_from_hover_and_reaches_aa() {
 }
 
 /// The swatch ratios are computed by `Contrast.ratio` from the tokens; they must match the
-/// spec's table (section 1.4, two decimals). The light column is the dawn palette, which replaced
-/// that table's light values.
+/// concept C palette (DESIGN-SYSTEM section 19, two decimals).
 #[test]
 fn contrast_matches_spec() {
     let shot = sheet(false);
@@ -207,35 +240,35 @@ fn contrast_matches_spec() {
         let (card, page, control) = (t.get_bg_card(), t.get_bg_page(), t.get_bg_control());
         let (text2, accent, error) = (t.get_text_secondary(), t.get_accent(), t.get_error_text());
         let tint = c.invoke_over(t.get_accent_tint(), card);
-        // (pair, fg, bg, light, dark); None: the spec gives no ratio for that theme.
+        // (pair, fg, bg, light, dark); None: the design system gives no ratio for that theme.
         let rows = [
             (
                 "text-primary/card",
                 t.get_text_primary(),
                 card,
-                Some(16.0),
-                Some(14.2),
+                Some(16.63),
+                Some(14.74),
             ),
-            ("text-secondary/card", text2, card, Some(7.15), Some(8.2)),
-            ("text-secondary/page", text2, page, Some(6.72), None),
-            ("accent/control", accent, control, Some(5.38), None),
-            ("accent/page", accent, page, Some(4.86), Some(8.74)),
-            ("accent/card", accent, card, None, Some(7.59)),
+            ("text-secondary/card", text2, card, Some(6.84), Some(7.72)),
+            ("text-secondary/page", text2, page, Some(6.50), Some(8.47)),
+            ("accent/control", accent, control, Some(17.06), Some(13.54)),
+            ("accent/page", accent, page, Some(15.80), Some(16.18)),
+            ("accent/card", accent, card, Some(16.63), Some(14.74)),
             (
                 "on-accent/accent",
                 t.get_on_accent(),
                 accent,
-                Some(5.47),
-                Some(9.17),
+                Some(16.63),
+                Some(16.18),
             ),
             (
                 "accent-text/tint",
                 t.get_accent_text(),
                 tint,
-                Some(4.80),
-                Some(5.39),
+                Some(14.19),
+                Some(12.15),
             ),
-            ("error/card", error, card, Some(5.84), Some(6.97)),
+            ("error/card", error, card, Some(5.98), Some(8.12)),
             (
                 "error/fill",
                 error,
@@ -254,7 +287,7 @@ fn contrast_matches_spec() {
                 "stroke-keycap/control",
                 t.get_stroke_keycap(),
                 control,
-                Some(3.74),
+                Some(3.64),
                 None,
             ),
         ];
@@ -304,48 +337,51 @@ fn badge_pairs_reach_aa_on_card_and_hover() {
     }
 }
 
-/// The light theme is the owner's dawn palette (background #F6F1E7): a reverted token fails here.
+/// The light theme is concept C "white minimal" (owner's pick, DESIGN-SYSTEM section 19): a
+/// reverted token fails here.
 #[test]
-fn light_theme_is_the_dawn_palette() {
+fn light_theme_is_concept_c() {
     let shot = sheet(false);
     shot.show().unwrap();
     slint::platform::update_timers_and_animations();
     let t = shot.global::<Theme>();
     assert!(!t.get_dark());
     for (name, got, want) in [
-        ("bg-page", t.get_bg_page(), 0xFFF6_F1E7),
-        ("bg-card", t.get_bg_card(), 0xFFFC_F8F1),
-        ("bg-control", t.get_bg_control(), 0xFFFF_FDF8),
-        ("bg-control-hover", t.get_bg_control_hover(), 0xFFF8_F3E9),
+        ("bg-page", t.get_bg_page(), 0xFFF7_F5F0),
+        ("bg-card", t.get_bg_card(), 0xFFFC_FBF8),
+        ("bg-control", t.get_bg_control(), 0xFFFF_FEFB),
+        ("bg-control-hover", t.get_bg_control_hover(), 0xFFF8_F6F2),
         (
             "bg-control-pressed",
             t.get_bg_control_pressed(),
-            0xFFF1_EBDF,
+            0xFFF1_EEE8,
         ),
-        ("bg-card-pressed", t.get_bg_card_pressed(), 0xFFF1_EBDF),
-        ("bg-subtle-hover", t.get_bg_subtle_hover(), 0x0A34_2812),
+        ("bg-card-pressed", t.get_bg_card_pressed(), 0xFFF1_EEE8),
+        ("bg-subtle-hover", t.get_bg_subtle_hover(), 0x0A1C_1B19),
         (
             "bg-subtle-selected",
             t.get_bg_subtle_selected(),
-            0x0F34_2812,
+            0x0F1C_1B19,
         ),
-        ("bg-inset", t.get_bg_inset(), 0x1434_2812),
-        ("stroke-card", t.get_stroke_card(), 0xFFEB_E5D9),
-        ("stroke-control", t.get_stroke_control(), 0xFFD2_CBBB),
+        ("bg-inset", t.get_bg_inset(), 0x141C_1B19),
+        ("stroke-card", t.get_stroke_card(), 0xFFE6_E2DA),
+        ("stroke-control", t.get_stroke_control(), 0xFFD3_CEC4),
         (
             "stroke-control-bottom",
             t.get_stroke_control_bottom(),
-            0xFFB4_AB98,
+            0xFFB5_AFA4,
         ),
-        ("stroke-keycap", t.get_stroke_keycap(), 0xFF8A_8275),
-        ("divider", t.get_divider(), 0xFFEE_E8DC),
-        ("text-primary", t.get_text_primary(), 0xFF21_1C13),
-        ("text-secondary", t.get_text_secondary(), 0xFF5B_5348),
-        ("text-disabled", t.get_text_disabled(), 0xFFA0_998C),
-        ("focus-outer", t.get_focus_outer(), 0xFF21_1C13),
-        ("focus-inner", t.get_focus_inner(), 0xFFFF_FDF8),
-        ("accent-tint", t.get_accent_tint(), 0xFFEA_F2ED),
-        ("accent-badge", t.get_accent_badge(), 0xFFE9_F1EC),
+        ("stroke-keycap", t.get_stroke_keycap(), 0xFF8A_857C),
+        ("divider", t.get_divider(), 0xFFEA_E7E0),
+        ("text-primary", t.get_text_primary(), 0xFF1C_1B19),
+        ("text-secondary", t.get_text_secondary(), 0xFF5C_5850),
+        ("text-disabled", t.get_text_disabled(), 0xFFA3_9F97),
+        ("focus-ring", t.get_focus_ring(), 0xFF5C_5850),
+        ("accent", t.get_accent(), 0xFF1C_1B19),
+        ("on-accent", t.get_on_accent(), 0xFFFC_FBF8),
+        ("accent-tint", t.get_accent_tint(), 0xFFEC_E9E2),
+        ("accent-badge", t.get_accent_badge(), 0xFFEC_E9E2),
+        ("recording", t.get_recording(), 0xFFE5_484D),
         ("error-text", t.get_error_text(), 0xFFB9_291A),
         ("error-fill", t.get_error_fill(), 0xFFFB_EAE6),
         (
@@ -356,7 +392,7 @@ fn light_theme_is_the_dawn_palette() {
         ("warning-text", t.get_warning_text(), 0xFF8A_5200),
         ("warning-fill", t.get_warning_fill(), 0xFFFA_EFD5),
         ("success-tint", t.get_success_tint(), 0xFFEA_F2E5),
-        ("info-fill", t.get_info_fill(), 0xFFF4_EFE6),
+        ("info-fill", t.get_info_fill(), 0xFFF2_F0EB),
     ] {
         assert_eq!(got, Color::from_argb_encoded(want), "{name}");
     }
@@ -478,8 +514,17 @@ fn tile_gallery_at(count: usize, selected: i32) -> TileGalleryProbe {
         .unwrap()
         .set_size(PhysicalSize::new(560, 360));
     slint::platform::update_timers_and_animations();
-    assert_eq!(probe.get_columns(), 3);
+    assert_eq!(probe.get_columns(), 3.min(i32::try_from(count).unwrap()));
     probe
+}
+
+fn click_at(probe: &impl ComponentHandle, x: f32, y: f32) {
+    let position = LogicalPosition::new(x, y);
+    let button = PointerEventButton::Left;
+    let window = probe.window();
+    window.dispatch_event(WindowEvent::PointerPressed { position, button });
+    window.dispatch_event(WindowEvent::PointerReleased { position, button });
+    slint::platform::update_timers_and_animations();
 }
 
 fn press(probe: &impl ComponentHandle, key: impl Into<SharedString>) {
@@ -583,12 +628,43 @@ fn tile_gallery_click_picks_the_tile_under_the_pointer() {
     assert_eq!(probe.get_selected(), 4, "locked");
 }
 
+/// Fewer tiles than fit in a row: each tile takes a share of the row, not a 3-per-row cell.
+#[test]
+fn tile_gallery_short_gallery_stretches_its_tiles() {
+    let probe = tile_gallery(2);
+    // Cells 276 wide with 8 between: x 200 is inside tile 0, where 3 columns would put tile 1.
+    click_at(&probe, 200.0, 20.0);
+    assert_eq!(probe.get_selected(), 0, "tile 0 spans past the 181 px cell");
+    click_at(&probe, 540.0, 20.0);
+    assert_eq!(probe.get_selected(), 1, "tile 1 reaches the right edge");
+}
+
 #[test]
 fn tile_gallery_opens_on_the_selected_tile() {
     let probe = tile_gallery_at(60, 31);
     // Row 10 ends at 1232, the box shows 368: rows are kept whole, so 8 rows up, not 7.7.
     let got = probe.get_scrolled();
     assert!((got - 896.0).abs() < 0.5, "scrolled {got}");
+}
+
+#[test]
+fn path_field_elides_in_the_middle() {
+    let _ = slint::platform::set_platform(Box::new(Shots));
+    let probe = PathFieldProbe::new().unwrap();
+    probe.global::<PathText>().on_elide(|path, budget| {
+        oxi_core::paths::elide_path(&path, usize::try_from(budget).unwrap_or(0)).into()
+    });
+    probe.show().unwrap();
+    slint::platform::update_timers_and_animations();
+    // Root and file name whole, the middle elided (DS-13.1).
+    let shown = probe.get_shown();
+    assert!(
+        shown.starts_with("C:\\…\\") && shown.ends_with("\\ggml-large-v3-turbo.bin"),
+        "{shown}"
+    );
+    probe.set_path(r"C:\models\a.bin".into());
+    slint::platform::update_timers_and_animations();
+    assert_eq!(probe.get_shown(), r"C:\models\a.bin");
 }
 
 fn sub_tabs(selected: i32) -> SubTabsProbe {
@@ -707,6 +783,104 @@ fn clicks_on_segmented_tiles_and_slider_draw_no_ring() {
         probe.get_tiles_ring(),
         "Shift+Tab back to the tiles draws it"
     );
+}
+
+/// Item 16: a pick cross-fades the check badges with `motion-quick` (no badge popping in at once,
+/// which read as a blink), and the first paint shows the selected tile's badge without a fade.
+#[test]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // whole positive pixels
+fn tile_pick_fades_the_check_badge_in() {
+    let _ = slint::platform::set_platform(Box::new(Shots));
+    let probe = ClickRingProbe::new().unwrap();
+    probe.show().unwrap();
+    let surface = LAST.with_borrow(Clone::clone).unwrap();
+    surface.set_size(PhysicalSize::new(480, 200));
+    slint::platform::update_timers_and_animations();
+    let accent = probe.global::<Theme>().get_accent();
+    let near = |a: u8, b: u8| a.abs_diff(b) <= 8;
+    // Badge-coloured pixels in tile `i`'s top-right corner: two 236 px tiles, 8 px apart.
+    let badge = |i: usize| {
+        surface.request_redraw();
+        let mut buffer = vec![PremultipliedRgbaColor::default(); 480 * 200];
+        surface.draw_if_needed(|renderer| {
+            renderer.render(&mut buffer, 480);
+        });
+        let top = probe.get_tiles_y() as usize;
+        let right = 236 + i * 244;
+        let buffer = &buffer;
+        (top..top + 30)
+            .flat_map(|y| (right - 40..right).map(move |x| buffer[y * 480 + x]))
+            .filter(|p| {
+                near(p.red, accent.red()) && near(p.green, accent.green()) && near(p.blue, accent.blue())
+            })
+            .count()
+    };
+    assert!(badge(0) > 100, "the selected tile opened without its badge");
+    assert_eq!(badge(1), 0, "an unpicked tile shows a badge");
+    let position = LogicalPosition::new(360.0, probe.get_tiles_y() + 10.0);
+    let button = PointerEventButton::Left;
+    let window = probe.window();
+    window.dispatch_event(WindowEvent::PointerPressed { position, button });
+    window.dispatch_event(WindowEvent::PointerReleased { position, button });
+    slint::platform::update_timers_and_animations();
+    assert_eq!(probe.get_picked(), 1, "the click hit the second tile");
+    assert_eq!(badge(1), 0, "the badge popped in at once");
+    // Moves the animation clock on; a real-clock tick after it would go back in time.
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+    assert!(badge(1) > 100, "the badge never faded in");
+    assert_eq!(badge(0), 0, "the old badge never faded out");
+}
+
+/// Item 16 (dark): pressing an unselected tile goes hover -> tint; the pressed fill is darker than
+/// the card, so showing it made the pick blink dark between two brighter fills.
+#[test]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)] // whole positive pixels
+fn tile_press_never_dips_below_the_rest_fill_in_dark() {
+    use slint::private_unstable_api::re_exports::{ColorScheme, WindowInner};
+
+    let _ = slint::platform::set_platform(Box::new(Shots));
+    let probe = ClickRingProbe::new().unwrap();
+    probe.show().unwrap();
+    let surface = LAST.with_borrow(Clone::clone).unwrap();
+    surface.set_size(PhysicalSize::new(480, 200));
+    WindowInner::from_pub(probe.window())
+        .context()
+        .set_color_scheme(ColorScheme::Dark);
+    advance(1);
+    let t = probe.global::<Theme>();
+    assert!(t.get_dark(), "the probe is not dark");
+    let light = |c: Color| u32::from(c.red()) + u32::from(c.green()) + u32::from(c.blue());
+    let rest = light(t.get_bg_card());
+    // Tile 1 (236 px wide, 8 px after tile 0), inside its top edge: no glyph, text or badge.
+    let (x, y) = (244 + 30, probe.get_tiles_y() as usize + 3);
+    let fill = || {
+        surface.request_redraw();
+        let mut buffer = vec![PremultipliedRgbaColor::default(); 480 * 200];
+        surface.draw_if_needed(|renderer| {
+            renderer.render(&mut buffer, 480);
+        });
+        let p = buffer[y * 480 + x];
+        u32::from(p.red) + u32::from(p.green) + u32::from(p.blue)
+    };
+    assert_eq!(fill(), rest, "the tile does not rest on the card fill");
+    let position = LogicalPosition::new(x as f32, y as f32);
+    let button = PointerEventButton::Left;
+    let window = probe.window();
+    let mut lowest = rest;
+    let step = |lowest: &mut u32| {
+        for _ in 0..10 {
+            advance(20);
+            *lowest = (*lowest).min(fill());
+        }
+    };
+    window.dispatch_event(WindowEvent::PointerMoved { position });
+    step(&mut lowest);
+    window.dispatch_event(WindowEvent::PointerPressed { position, button });
+    step(&mut lowest);
+    window.dispatch_event(WindowEvent::PointerReleased { position, button });
+    step(&mut lowest);
+    assert_eq!(probe.get_picked(), 1, "the click hit the second tile");
+    assert!(lowest >= rest, "the fill dipped to {lowest}, rest is {rest}");
 }
 
 /// UI rule 16: Remove turns red under the pointer, also as an icon-only button.

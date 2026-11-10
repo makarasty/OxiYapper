@@ -1,12 +1,15 @@
-// Every vendored Fluent icon by name (see ../icons/SOURCE.md). Pages and components never write
-// icon paths. Names: `<icon>` is the 20 px regular master, `-16`/`-24`/`-12` other masters,
-// `-filled` the filled style. Icons keep their original fill; users set `colorize`.
+// Every vendored icon by name (see ../icons/SOURCE.md): Phosphor 2.1.1, Bold weight, one drawing
+// on a 256 grid scaled to any box. Pages and components never write icon paths. The `-16`, `-24`
+// and `-12` names of the earlier set stay as aliases of the same file so pages keep compiling;
+// `-filled` is Phosphor's Fill weight, only for a selected item's glyph (DS-19.7). Icons keep
+// their own fill (currentColor, black); users set `colorize`.
 export global Icons {
     // The app mark, drawn by `oxi-platform` (`logo.svg` is regenerated, not edited).
     out property <image> logo: @image-url("logo.svg");
     // The title bar's copy of that mark at one small-icon size of Windows each: Slint hands an SVG
     // to the OS at 64 px and the OS shrinks it badly. `scale` is the display scale.
-    // shortcut: these PNGs are rendered from logo.svg by hand, redo them when the mark changes.
+    // shortcut: these PNGs are copied by hand out of assets/oxi.ico (same drawing), redo them when
+    // the mark changes (../icons/SOURCE.md).
     out property <image> window-logo-16: @image-url("../assets/logo-window-16.png");
     out property <image> window-logo-20: @image-url("../assets/logo-window-20.png");
     out property <image> window-logo-24: @image-url("../assets/logo-window-24.png");
@@ -17,76 +20,87 @@ export global Icons {
     // The author's public GitHub avatar (owner approved).
     out property <image> avatar: @image-url("../assets/avatar-makarasty.png");
     // Project marks of the About page, from simple-icons (monochrome, 24 px grid).
+    out property <image> claude-mark: @image-url("../icons/si_claude.svg");
     out property <image> github-mark: @image-url("../icons/si_github.svg");
     out property <image> rust-mark: @image-url("../icons/si_rust.svg");
     out property <image> slint-mark: @image-url("../icons/si_slint.svg");
     // The About page's tiles and link arrow.
-    out property <image> code: @image-url("../icons/ic_fluent_code_20_regular.svg");
-    out property <image> icons: @image-url("../icons/ic_fluent_icons_20_regular.svg");
-    out property <image> open-16: @image-url("../icons/ic_fluent_open_16_regular.svg");
-    out property <image> paint-brush: @image-url("../icons/ic_fluent_paint_brush_20_regular.svg");
-    out property <image> person-voice: @image-url("../icons/ic_fluent_person_voice_20_regular.svg");
-    out property <image> plug-connected: @image-url("../icons/ic_fluent_plug_connected_20_regular.svg");
-    out property <image> sound-wave-circle: @image-url("../icons/ic_fluent_sound_wave_circle_20_regular.svg");
-    out property <image> add-16: @image-url("../icons/ic_fluent_add_16_regular.svg");
-    out property <image> add: @image-url("../icons/ic_fluent_add_20_regular.svg");
-    out property <image> app-generic: @image-url("../icons/ic_fluent_app_generic_20_regular.svg");
-    out property <image> arrow-download-16: @image-url("../icons/ic_fluent_arrow_download_16_regular.svg");
-    out property <image> arrow-download: @image-url("../icons/ic_fluent_arrow_download_20_regular.svg");
-    out property <image> book-letter: @image-url("../icons/ic_fluent_book_letter_20_regular.svg");
-    out property <image> brain-circuit-filled: @image-url("../icons/ic_fluent_brain_circuit_20_filled.svg");
-    out property <image> brain-circuit: @image-url("../icons/ic_fluent_brain_circuit_20_regular.svg");
-    out property <image> calendar: @image-url("../icons/ic_fluent_calendar_20_regular.svg");
-    out property <image> checkmark-12: @image-url("../icons/ic_fluent_checkmark_12_regular.svg");
-    out property <image> checkmark-circle-16: @image-url("../icons/ic_fluent_checkmark_circle_16_regular.svg");
-    out property <image> checkmark-circle: @image-url("../icons/ic_fluent_checkmark_circle_20_regular.svg");
-    out property <image> clipboard-paste-24-filled: @image-url("../icons/ic_fluent_clipboard_paste_24_filled.svg");
-    out property <image> clipboard-paste-24: @image-url("../icons/ic_fluent_clipboard_paste_24_regular.svg");
-    out property <image> dark-theme-24-filled: @image-url("../icons/ic_fluent_dark_theme_24_filled.svg");
-    out property <image> dark-theme-24: @image-url("../icons/ic_fluent_dark_theme_24_regular.svg");
-    out property <image> delete-16: @image-url("../icons/ic_fluent_delete_16_regular.svg");
-    out property <image> delete: @image-url("../icons/ic_fluent_delete_20_regular.svg");
-    out property <image> desktop: @image-url("../icons/ic_fluent_desktop_20_regular.svg");
-    out property <image> dismiss-16: @image-url("../icons/ic_fluent_dismiss_16_regular.svg");
-    out property <image> edit-16: @image-url("../icons/ic_fluent_edit_16_regular.svg");
-    out property <image> error-circle-16: @image-url("../icons/ic_fluent_error_circle_16_regular.svg");
-    out property <image> error-circle: @image-url("../icons/ic_fluent_error_circle_20_regular.svg");
-    out property <image> eye-16: @image-url("../icons/ic_fluent_eye_16_regular.svg");
-    out property <image> fire: @image-url("../icons/ic_fluent_fire_20_regular.svg");
-    out property <image> folder-open-16: @image-url("../icons/ic_fluent_folder_open_16_regular.svg");
-    out property <image> hand-left-24-filled: @image-url("../icons/ic_fluent_hand_left_24_filled.svg");
-    out property <image> hand-left-24: @image-url("../icons/ic_fluent_hand_left_24_regular.svg");
-    out property <image> history: @image-url("../icons/ic_fluent_history_20_regular.svg");
-    out property <image> home-filled: @image-url("../icons/ic_fluent_home_20_filled.svg");
-    out property <image> home: @image-url("../icons/ic_fluent_home_20_regular.svg");
-    out property <image> info-16: @image-url("../icons/ic_fluent_info_16_regular.svg");
-    out property <image> info-filled: @image-url("../icons/ic_fluent_info_20_filled.svg");
-    out property <image> info: @image-url("../icons/ic_fluent_info_20_regular.svg");
-    out property <image> keyboard-filled: @image-url("../icons/ic_fluent_keyboard_20_filled.svg");
-    out property <image> keyboard: @image-url("../icons/ic_fluent_keyboard_20_regular.svg");
-    out property <image> keyboard-24-filled: @image-url("../icons/ic_fluent_keyboard_24_filled.svg");
-    out property <image> keyboard-24: @image-url("../icons/ic_fluent_keyboard_24_regular.svg");
-    out property <image> mic-filled: @image-url("../icons/ic_fluent_mic_20_filled.svg");
-    out property <image> mic: @image-url("../icons/ic_fluent_mic_20_regular.svg");
-    out property <image> open-folder-16: @image-url("../icons/ic_fluent_open_folder_16_regular.svg");
-    out property <image> play: @image-url("../icons/ic_fluent_play_20_regular.svg");
-    out property <image> save-16: @image-url("../icons/ic_fluent_save_16_regular.svg");
-    out property <image> settings-filled: @image-url("../icons/ic_fluent_settings_20_filled.svg");
-    out property <image> settings: @image-url("../icons/ic_fluent_settings_20_regular.svg");
-    out property <image> slide-text-filled: @image-url("../icons/ic_fluent_slide_text_20_filled.svg");
-    out property <image> slide-text: @image-url("../icons/ic_fluent_slide_text_20_regular.svg");
-    out property <image> speaker-2: @image-url("../icons/ic_fluent_speaker_2_20_regular.svg");
-    out property <image> text-t-filled: @image-url("../icons/ic_fluent_text_t_20_filled.svg");
-    out property <image> text-t: @image-url("../icons/ic_fluent_text_t_20_regular.svg");
-    out property <image> text-word-count: @image-url("../icons/ic_fluent_text_word_count_20_regular.svg");
-    out property <image> timer: @image-url("../icons/ic_fluent_timer_20_regular.svg");
-    out property <image> toggle-right-24-filled: @image-url("../icons/ic_fluent_toggle_right_24_filled.svg");
-    out property <image> toggle-right-24: @image-url("../icons/ic_fluent_toggle_right_24_regular.svg");
-    out property <image> top-speed: @image-url("../icons/ic_fluent_top_speed_20_regular.svg");
-    out property <image> warning-16: @image-url("../icons/ic_fluent_warning_16_regular.svg");
-    out property <image> warning: @image-url("../icons/ic_fluent_warning_20_regular.svg");
-    out property <image> weather-moon-24-filled: @image-url("../icons/ic_fluent_weather_moon_24_filled.svg");
-    out property <image> weather-moon-24: @image-url("../icons/ic_fluent_weather_moon_24_regular.svg");
-    out property <image> weather-sunny-24-filled: @image-url("../icons/ic_fluent_weather_sunny_24_filled.svg");
-    out property <image> weather-sunny-24: @image-url("../icons/ic_fluent_weather_sunny_24_regular.svg");
+    out property <image> code: @image-url("../icons/code-bold.svg");
+    out property <image> icons: @image-url("../icons/shapes-bold.svg");
+    out property <image> open-16: @image-url("../icons/arrow-square-out-bold.svg");
+    out property <image> paint-brush: @image-url("../icons/paint-brush-bold.svg");
+    out property <image> person-voice: @image-url("../icons/user-sound-bold.svg");
+    out property <image> plug-connected: @image-url("../icons/plugs-connected-bold.svg");
+    out property <image> sound-wave-circle: @image-url("../icons/waveform-bold.svg");
+    // Everything else, by meaning. One glyph per meaning (DS-19.6): `folder-open` (and its old
+    // names) for every open-folder action, `caret-down`/`dots-three` for "more".
+    out property <image> add-16: @image-url("../icons/plus-bold.svg");
+    out property <image> add: @image-url("../icons/plus-bold.svg");
+    out property <image> app-generic: @image-url("../icons/app-window-bold.svg");
+    out property <image> arrow-download-16: @image-url("../icons/download-simple-bold.svg");
+    out property <image> arrow-download: @image-url("../icons/download-simple-bold.svg");
+    out property <image> book-letter: @image-url("../icons/book-open-text-bold.svg");
+    out property <image> brain-circuit-filled: @image-url("../icons/brain-fill.svg");
+    out property <image> brain-circuit: @image-url("../icons/brain-bold.svg");
+    out property <image> calendar: @image-url("../icons/calendar-blank-bold.svg");
+    out property <image> caret-down: @image-url("../icons/caret-down-bold.svg");
+    out property <image> checkmark-12: @image-url("../icons/check-bold.svg");
+    out property <image> checkmark-circle-16: @image-url("../icons/check-circle-bold.svg");
+    out property <image> checkmark-circle: @image-url("../icons/check-circle-bold.svg");
+    out property <image> clipboard-paste-24-filled: @image-url("../icons/clipboard-text-fill.svg");
+    out property <image> clipboard-paste-24: @image-url("../icons/clipboard-text-bold.svg");
+    out property <image> dark-theme-24-filled: @image-url("../icons/circle-half-fill.svg");
+    out property <image> dark-theme-24: @image-url("../icons/circle-half-bold.svg");
+    out property <image> delete-16: @image-url("../icons/trash-bold.svg");
+    out property <image> delete: @image-url("../icons/trash-bold.svg");
+    out property <image> desktop: @image-url("../icons/desktop-bold.svg");
+    out property <image> dismiss-16: @image-url("../icons/x-bold.svg");
+    out property <image> dots-three: @image-url("../icons/dots-three-bold.svg");
+    out property <image> edit-16: @image-url("../icons/pencil-simple-bold.svg");
+    out property <image> error-circle-16: @image-url("../icons/x-circle-bold.svg");
+    out property <image> error-circle: @image-url("../icons/x-circle-bold.svg");
+    out property <image> eye-16: @image-url("../icons/eye-bold.svg");
+    out property <image> fire: @image-url("../icons/fire-bold.svg");
+    out property <image> folder-open: @image-url("../icons/folder-open-bold.svg");
+    out property <image> folder-open-16: @image-url("../icons/folder-open-bold.svg");
+    out property <image> hand-left-24-filled: @image-url("../icons/hand-palm-fill.svg");
+    out property <image> hand-left-24: @image-url("../icons/hand-palm-bold.svg");
+    out property <image> history: @image-url("../icons/clock-counter-clockwise-bold.svg");
+    out property <image> history-filled: @image-url("../icons/clock-counter-clockwise-fill.svg");
+    out property <image> home-filled: @image-url("../icons/house-fill.svg");
+    out property <image> home: @image-url("../icons/house-bold.svg");
+    out property <image> info-16: @image-url("../icons/info-bold.svg");
+    out property <image> info-filled: @image-url("../icons/info-fill.svg");
+    out property <image> info: @image-url("../icons/info-bold.svg");
+    out property <image> keyboard-filled: @image-url("../icons/keyboard-fill.svg");
+    out property <image> keyboard: @image-url("../icons/keyboard-bold.svg");
+    out property <image> keyboard-24-filled: @image-url("../icons/keyboard-fill.svg");
+    out property <image> keyboard-24: @image-url("../icons/keyboard-bold.svg");
+    out property <image> mic-filled: @image-url("../icons/microphone-fill.svg");
+    out property <image> mic: @image-url("../icons/microphone-bold.svg");
+    out property <image> open-folder-16: @image-url("../icons/folder-open-bold.svg");
+    out property <image> play: @image-url("../icons/play-bold.svg");
+    out property <image> stop: @image-url("../icons/stop-bold.svg");
+    out property <image> redo: @image-url("../icons/arrow-clockwise-bold.svg");
+    out property <image> path: @image-url("../icons/path-bold.svg");
+    out property <image> save-16: @image-url("../icons/floppy-disk-bold.svg");
+    out property <image> settings-filled: @image-url("../icons/gear-six-fill.svg");
+    out property <image> settings: @image-url("../icons/gear-six-bold.svg");
+    out property <image> slide-text-filled: @image-url("../icons/picture-in-picture-fill.svg");
+    out property <image> slide-text: @image-url("../icons/picture-in-picture-bold.svg");
+    out property <image> speaker-2: @image-url("../icons/speaker-high-bold.svg");
+    out property <image> text-t-filled: @image-url("../icons/text-aa-fill.svg");
+    out property <image> text-t: @image-url("../icons/text-aa-bold.svg");
+    out property <image> text-word-count: @image-url("../icons/article-bold.svg");
+    out property <image> timer: @image-url("../icons/timer-bold.svg");
+    out property <image> toggle-right-24-filled: @image-url("../icons/toggle-right-fill.svg");
+    out property <image> toggle-right-24: @image-url("../icons/toggle-right-bold.svg");
+    out property <image> top-speed: @image-url("../icons/gauge-bold.svg");
+    out property <image> warning-16: @image-url("../icons/warning-bold.svg");
+    out property <image> warning: @image-url("../icons/warning-bold.svg");
+    out property <image> warning-circle: @image-url("../icons/warning-circle-bold.svg");
+    out property <image> weather-moon-24-filled: @image-url("../icons/moon-fill.svg");
+    out property <image> weather-moon-24: @image-url("../icons/moon-bold.svg");
+    out property <image> weather-sunny-24-filled: @image-url("../icons/sun-fill.svg");
+    out property <image> weather-sunny-24: @image-url("../icons/sun-bold.svg");
 }

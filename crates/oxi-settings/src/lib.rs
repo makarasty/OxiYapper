@@ -11,18 +11,18 @@ mod testing;
 use std::io;
 
 use oxi_core::config::{ConfigError, Theme};
-use oxi_core::ipc::Push;
+use oxi_core::ipc::{Push, SettingsPage, SettingsTab, Target};
 #[cfg(windows)]
 use oxi_core::overlay::Rect;
 use oxi_core::paths::Layout;
 use oxi_core::strings::CONFIG_READ_ONLY_NEXT;
-use slint::{Color, ComponentHandle, Timer, TimerMode, Weak};
+use slint::{ComponentHandle, Timer, TimerMode, Weak};
 #[cfg(windows)]
 use slint::{LogicalSize, PhysicalPosition};
 
 pub use ctx::Ctx;
 pub use ipc::Ipc;
-use ipc::{Action, Event, Link, Options};
+use ipc::{Action, Event, Level, Link, Options};
 
 // Slint's generated code trips the workspace `unused_qualifications` lint; it is not ours to fix.
 #[allow(unused_qualifications)]
@@ -31,14 +31,10 @@ mod generated {
 }
 pub use constants::FILE_POLL;
 pub use generated::{
-    AppWindow, AudioState, DaemonStatus, ModelState, Page, Shell, SystemState, TestRow, TestState,
-    TextState, Theme as Tokens, ThemeChoice, Toast,
+    AppWindow, AudioState, ChipLevel, ModelState, Page, PathText, Shell, SystemState, TestRow,
+    TestState, TextState, Theme as Tokens, ThemeChoice, Toast,
 };
 pub use pages::test::{Finish, Mic, bind_with as bind_test_page};
-
-/// The accent the std widgets (`LineEdit`, `TextEdit`, `ComboBox`) derive their focus line and
-/// selection from: our teal (token `accent`), never the Windows accent (redesign spec 7.3).
-const ACCENT: Color = Color::from_rgb_u8(0x0F, 0x76, 0x6E);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -83,7 +79,7 @@ fn show(layout: Layout) -> Result<(), Error> {
         } else {
             LogicalSize::new(constants::DEFAULT.0, constants::DEFAULT.1)
         };
-        open_without_maximize(&window, size);
+        window.window().set_size(size);
     }
     // A window opened by a second launch must not show behind the app the user is in; the
     // daemon allowed this process to take the foreground. The callback runs once the event loop
@@ -102,27 +98,6 @@ fn show(layout: Layout) -> Result<(), Error> {
     });
     window.run()?;
     Ok(())
-}
-
-/// Sizes the window to `size` and has the OS create it with no maximize button (UI rule 24): the
-/// backend turns the button off only for a window that cannot resize when it is created, and
-/// never turns it back on, so minimum and maximum are `size` until the event loop has created it.
-// shortcut: depends on the winit backend of the pinned `slint =1.18.1`; re-check it on every Slint
-// bump (`real_window_has_no_maximize_box_and_stops_at_the_maximum`). A window style call behind
-// `oxi-platform` would not depend on this.
-#[cfg(windows)]
-pub fn open_without_maximize(window: &AppWindow, size: LogicalSize) {
-    window.set_frame_width(size.width);
-    window.set_frame_height(size.height);
-    window.window().set_size(size);
-    let weak = window.as_weak();
-    // Err means the event loop is gone: the window is closing.
-    let _ = slint::invoke_from_event_loop(move || {
-        if let Some(window) = weak.upgrade() {
-            window.set_frame_width(0.0);
-            window.set_frame_height(0.0);
-        }
-    });
 }
 
 /// Env var that forces the software renderer; also how a failed Skia run restarts itself.
@@ -215,7 +190,8 @@ fn placement(area: Rect, scale: f32) -> (LogicalSize, PhysicalPosition) {
     (size, position)
 }
 
-/// Puts our teal where Slint keeps the system accent, which the fluent std widgets tint from.
+/// Puts our accent token (the theme's ink, DS-19.1) where Slint keeps the system accent, which the
+/// std widgets still in use tint from; never the Windows accent (redesign spec 7.3).
 // shortcut: private Slint API, safe only while `slint` is pinned `=1.18.1`; re-check it on every
 // Slint bump. The backend writes the system accent back when it creates the window and on a theme
 // change: `run` calls this once the window is up and the file poll repeats it (a no-op write when
@@ -223,7 +199,7 @@ fn placement(area: Rect, scale: f32) -> (LogicalSize, PhysicalPosition) {
 pub fn own_accent(window: &AppWindow) {
     slint::private_unstable_api::re_exports::WindowInner::from_pub(window.window())
         .context()
-        .set_accent_color(ACCENT);
+        .set_accent_color(window.global::<Tokens>().get_accent());
 }
 
 /// The title bar follows an explicit Light or Dark pick: Slint sets only its own palette, and on
@@ -263,6 +239,13 @@ fn set_reduced_motion(window: &AppWindow, reduced: bool) {
     window.global::<Shell>().set_reduced_motion(reduced);
 }
 
+/// Every `PathField` shows a long path elided in the middle (DS-13.1), not cut at its end.
+fn elide_paths(window: &AppWindow) {
+    window.global::<PathText>().on_elide(|path, budget| {
+        oxi_core::paths::elide_path(&path, usize::try_from(budget).unwrap_or(0)).into()
+    });
+}
+
 /// The settings window on `layout`'s config with no daemon link (it stays offline and shows no
 /// daemon banner); the caller shows it.
 pub fn open(layout: Layout) -> Result<AppWindow, Error> {
@@ -283,6 +266,7 @@ fn open_inner(
     own_accent(&window);
     draw_whole_frames(&window);
     follow_os_motion(&window);
+    elide_paths(&window);
     let (mut ctx, problem) = Ctx::load(layout)?;
     let followed = link(&window)?;
     if let Some(ipc) = &followed {
@@ -296,6 +280,13 @@ fn open_inner(
         if let Some(window) = weak.upgrade() {
             caption_theme(&window, choice);
         }
+        // The token follows the new scheme once the window has applied it.
+        let w = weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(window) = w.upgrade() {
+                own_accent(&window);
+            }
+        });
         c.config.borrow_mut().config.ui.theme = theme(choice);
         report(&weak, c.save());
     });
@@ -315,7 +306,7 @@ fn open_inner(
             window.set_banner_text("".into());
             // The file is valid now: drop the daemon's stale `ConfigError` notice, as `reload` does.
             if linked {
-                on_daemon_event(&window, &Event::Link(c.ipc.link()));
+                on_daemon_event(&window, &c.ipc, &Event::Link(c.ipc.link()));
             }
             bind(&window, &c);
         }
@@ -323,14 +314,14 @@ fn open_inner(
     });
 
     let banner = followed.is_some().then(|| {
-        let weak = window.as_weak();
+        let (weak, ipc) = (window.as_weak(), ctx.ipc.clone());
         let events = ctx.ipc.subscribe(move |event| {
             if let Some(window) = weak.upgrade() {
-                on_daemon_event(&window, event);
+                on_daemon_event(&window, &ipc, event);
             }
         });
         // The worker may have reported before the subscription: show the state as it is now.
-        on_daemon_event(&window, &Event::Link(ctx.ipc.link()));
+        on_daemon_event(&window, &ctx.ipc, &Event::Link(ctx.ipc.link()));
         events
     });
     let poll = Timer::default();
@@ -369,6 +360,14 @@ fn open_inner(
             ipc.restart_daemon();
         }
     });
+    window.on_status_clicked({
+        let (weak, ipc) = (window.as_weak(), ctx.ipc.clone());
+        move || {
+            if let Some(window) = weak.upgrade() {
+                status_clicked(&window, &ipc.chip());
+            }
+        }
+    });
 
     pages::test::bind(&window, &ctx);
     bind(&window, &ctx);
@@ -400,14 +399,16 @@ fn reload(window: &AppWindow, ctx: &Ctx, linked: bool) {
     if problem.is_none() {
         window.set_action_error("".into());
         if linked {
-            on_daemon_event(window, &Event::Link(ctx.ipc.link()));
+            on_daemon_event(window, &ctx.ipc, &Event::Link(ctx.ipc.link()));
         }
     }
     bind(window, ctx);
 }
 
-/// The daemon banner follows the link; a push that is not a notice leaves it alone.
-fn on_daemon_event(window: &AppWindow, event: &Event) {
+/// The status chip follows every event; the daemon banner follows the link, and a push that is
+/// not a notice leaves it alone.
+fn on_daemon_event(window: &AppWindow, ipc: &Ipc, event: &Event) {
+    show_chip(window, &ipc.chip());
     if matches!(event, Event::Push(Push::Raise)) {
         window.window().set_minimized(false);
         let _ = window.show();
@@ -420,9 +421,6 @@ fn on_daemon_event(window: &AppWindow, event: &Event) {
     if notice.is_none() && !matches!(event, Event::Link(_)) {
         return;
     }
-    if let Event::Link(link) = event {
-        window.set_daemon_status(status(*link));
-    }
     let action = notice.as_ref().and_then(|n| n.action);
     window.set_daemon_config_error(matches!(event, Event::Push(Push::ConfigError { .. })));
     window.set_daemon_text(notice.map(|n| n.text).unwrap_or_default().into());
@@ -434,12 +432,46 @@ fn on_daemon_event(window: &AppWindow, event: &Event) {
     }
 }
 
-/// The rail's daemon chip for `link`.
-const fn status(link: Link) -> DaemonStatus {
-    match link {
-        Link::Online | Link::Mismatch { .. } => DaemonStatus::Running,
-        Link::Connecting | Link::Offline => DaemonStatus::Stopped,
-        Link::Busy | Link::Stuck | Link::Untrusted | Link::Foreign => DaemonStatus::Stuck,
+fn show_chip(window: &AppWindow, chip: &ipc::Chip) {
+    window.set_chip_text(chip.text.into());
+    window.set_chip_tooltip(chip.tooltip.as_str().into());
+    window.set_chip_level(match chip.level {
+        Level::Ok => ChipLevel::Ok,
+        Level::Attention => ChipLevel::Attention,
+        Level::Down => ChipLevel::Down,
+    });
+}
+
+/// A click on the chip: open the setting that fixes it, or start the daemon as the banner's
+/// button does. The normal state takes no click.
+fn status_clicked(window: &AppWindow, chip: &ipc::Chip) {
+    match (chip.level, chip.target) {
+        (Level::Attention, Some(target)) => open_target(window, target),
+        (Level::Down, _) if window.get_daemon_start() => window.invoke_start_daemon(),
+        (Level::Down, _) if window.get_daemon_restart() => window.invoke_restart_daemon(),
+        _ => {}
+    }
+}
+
+/// Opens the page and sub-tab that fix the chip's status; no tab means the page's first one, not
+/// the sub-tab the user left it on.
+fn open_target(window: &AppWindow, target: Target) {
+    // The Audio page's tabs, in `SettingsTab` order.
+    let view = target.tab.map_or(0, |tab| match tab {
+        SettingsTab::Microphone => 0,
+        SettingsTab::Recording => 1,
+        SettingsTab::StartSound => 2,
+        SettingsTab::StopSound => 3,
+    });
+    match target.page {
+        SettingsPage::Model => {
+            window.set_page(Page::Model);
+            window.global::<ModelState>().set_tab(0);
+        }
+        SettingsPage::Audio => {
+            window.set_page(Page::Audio);
+            window.global::<AudioState>().set_view(view);
+        }
     }
 }
 
@@ -482,7 +514,7 @@ const fn theme(choice: ThemeChoice) -> Theme {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppWindow, DaemonStatus, Link, ThemeChoice, choice, spawn_note, status, theme};
+    use super::{AppWindow, ThemeChoice, choice, spawn_note, theme};
     use oxi_core::config::Theme;
     use slint::ComponentHandle;
     use std::io::{Error, ErrorKind};
@@ -525,12 +557,12 @@ mod tests {
     #[test]
     fn resets_leave_one_subscriber_per_page() {
         let (window, ipc, _sent, _) = crate::testing::linked("lib", "resets", super::Page::Hotkey);
-        // The banner, Home, Hotkey, Audio, Model, Overlay and Test.
-        assert_eq!(ipc.subscribers(), 7);
+        // The banner, Home, Hotkey, Audio, Model, Overlay, History and Test.
+        assert_eq!(ipc.subscribers(), 8);
         for _ in 0..3 {
             window.invoke_reset_config();
         }
-        assert_eq!(ipc.subscribers(), 7);
+        assert_eq!(ipc.subscribers(), 8);
     }
 
     #[cfg(windows)]
@@ -567,20 +599,92 @@ mod tests {
         assert_eq!(renderer_name(Some("skia")), "skia-software");
     }
 
+    /// Each status t12 reports shows in the chip with its level, and a click opens the page and
+    /// tab that fix it (item 33).
     #[test]
-    fn daemon_chip_follows_the_link() {
-        for (link, want) in [
-            (Link::Online, DaemonStatus::Running),
-            (Link::Mismatch { daemon_proto: 9 }, DaemonStatus::Running),
-            (Link::Connecting, DaemonStatus::Stopped),
-            (Link::Offline, DaemonStatus::Stopped),
-            (Link::Busy, DaemonStatus::Stuck),
-            (Link::Stuck, DaemonStatus::Stuck),
-            (Link::Untrusted, DaemonStatus::Stuck),
-            (Link::Foreign, DaemonStatus::Stuck),
+    fn chip_shows_each_status_and_opens_its_fix() {
+        use super::{AudioState, ChipLevel, Event, ModelState, Page, Push};
+        use crate::ipc::{Cmd, Link};
+        use oxi_core::ipc::Attention;
+        use oxi_core::strings;
+        let (window, ipc, sent, _) = crate::testing::linked("lib", "chip", Page::Home);
+        let chip = |w: &AppWindow| (w.get_chip_text().to_string(), w.get_chip_level());
+        let attention = |items: Vec<Attention>| Event::Push(Push::Attention { items });
+        ipc.deliver(&Event::Link(Link::Online));
+        assert_eq!(
+            chip(&window),
+            (strings::HEALTH_RUNNING.into(), ChipLevel::Ok)
+        );
+        window.invoke_status_clicked();
+        assert_eq!(
+            window.get_page(),
+            Page::Home,
+            "the normal state takes no click"
+        );
+        let sound = |stop| Attention::SoundFailed {
+            line: "x".into(),
+            stop,
+        };
+        for (item, page, view) in [
+            (Attention::NoModel, Page::Model, None),
+            (Attention::ModelDamaged, Page::Model, None),
+            (
+                Attention::CpuFallback { reason: "x".into() },
+                Page::Model,
+                None,
+            ),
+            (Attention::OutOfMemory { cpu: true }, Page::Model, None),
+            (Attention::OutOfMemory { cpu: false }, Page::Model, None),
+            (Attention::NoMicrophone, Page::Audio, Some(0)),
+            (sound(false), Page::Audio, Some(2)),
+            (sound(true), Page::Audio, Some(3)),
         ] {
-            assert_eq!(status(link), want, "{link:?}");
+            // Both pages left on another sub-tab: the click opens the one that fixes it.
+            window.set_page(Page::Home);
+            window.global::<AudioState>().set_view(1);
+            window.global::<ModelState>().set_tab(1);
+            ipc.deliver(&attention(vec![item.clone()]));
+            assert_eq!(
+                chip(&window),
+                (strings::attention_chip(&item).into(), ChipLevel::Attention),
+                "{item:?}"
+            );
+            assert_eq!(
+                window.get_chip_tooltip().as_str(),
+                strings::attention_text(&item),
+                "{item:?}: the reason and the fix on hover"
+            );
+            window.invoke_status_clicked();
+            assert_eq!(window.get_page(), page, "{item:?}");
+            match view {
+                Some(view) => {
+                    assert_eq!(window.global::<AudioState>().get_view(), view, "{item:?}");
+                }
+                None => assert_eq!(
+                    window.global::<ModelState>().get_tab(),
+                    0,
+                    "{item:?}: the Models list"
+                ),
+            }
         }
+        ipc.deliver(&attention(vec![]));
+        assert_eq!(chip(&window).1, ChipLevel::Ok, "all well again");
+        ipc.deliver(&Event::Link(Link::Offline));
+        assert_eq!(
+            chip(&window),
+            (strings::HEALTH_NOT_RUNNING.into(), ChipLevel::Down)
+        );
+        while sent.try_recv().is_ok() {}
+        window.invoke_status_clicked();
+        assert!(
+            sent.try_iter().any(|c| matches!(c, Cmd::Start)),
+            "a click starts the daemon"
+        );
+        ipc.deliver(&Event::Link(Link::Stuck));
+        assert_eq!(
+            chip(&window),
+            (strings::HEALTH_NOT_ANSWERING.into(), ChipLevel::Down)
+        );
     }
 
     #[test]

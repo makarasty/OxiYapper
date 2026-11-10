@@ -3,8 +3,8 @@
 import { Theme, Shell } from "../tokens.slint";
 import { FocusRing, KeyFocus } from "base.slint";
 
-// Rail 4 px, accent fill from the minimum (or from 0 when `bipolar`), 20 px thumb with an accent
-// dot. Left/Right step, PgUp/PgDn ten steps, Home/End the ends; a double click on the thumb
+// Rail 4 px, accent fill from the minimum (or from 0 when `bipolar`), 20 px thumb with a 12 px
+// accent dot that keeps its size in every state (no scale, DS-5.4): hover and pressed change colour. Left/Right step, PgUp/PgDn ten steps, Home/End the ends; a double click on the thumb
 // restores `default-value` (from Rust, `Config::default()`).
 export component Slider {
     in-out property <float> value;
@@ -26,7 +26,7 @@ export component Slider {
     property <bool> key-focus;
     // Whether the keyboard focus ring is drawn (tests: a click draws none).
     out property <bool> ring: root.key-focus && fs.has-focus;
-    property <length> travel: root.width - 20px;
+    property <length> travel: root.width - Theme.slider-thumb;
     property <float> span: max(root.maximum - root.minimum, 0.000001);
     property <length> thumb-x: (clamp(root.value, root.minimum, root.maximum) - root.minimum) / root.span * root.travel;
     property <length> origin-x: root.bipolar ? (clamp(0, root.minimum, root.maximum) - root.minimum) / root.span * root.travel : 0;
@@ -42,10 +42,10 @@ export component Slider {
         }
     }
     function set-x(x: length) {
-        root.set(root.minimum + clamp((x - 10px) / root.travel, 0, 1) * root.span);
+        root.set(root.minimum + clamp((x - Theme.slider-thumb / 2) / root.travel, 0, 1) * root.span);
     }
 
-    min-width: 120px;
+    min-width: Theme.slider-min-width;
     height: Theme.control-height;
     horizontal-stretch: 1;
     accessible-role: slider;
@@ -62,33 +62,35 @@ export component Slider {
     }
 
     Rectangle {
-        x: 10px;
+        x: Theme.slider-thumb / 2;
         width: root.travel;
-        height: 4px;
+        height: Theme.rail-height;
         border-radius: Theme.radius-round;
         background: Theme.bg-inset;
     }
     Rectangle {
-        x: 10px + min(root.origin-x, root.thumb-x);
+        x: Theme.slider-thumb / 2 + min(root.origin-x, root.thumb-x);
         width: abs(root.thumb-x - root.origin-x);
-        height: 4px;
+        height: Theme.rail-height;
         border-radius: Theme.radius-round;
         background: root.live ? Theme.accent : Theme.text-disabled;
     }
     thumb := Rectangle {
         x: root.thumb-x;
-        width: 20px;
-        height: 20px;
+        width: Theme.slider-thumb;
+        height: Theme.slider-thumb;
         border-radius: Theme.radius-round;
-        background: Theme.bg-control;
+        background: root.hover ? Theme.bg-control-hover : Theme.bg-control;
+        // 1 px hairline: the thumb's stroke.
         border-width: 1px;
         border-color: Theme.stroke-control;
+        animate background { duration: Theme.motion-quick; easing: ease-out; }
         Rectangle {
-            width: root.down ? 10px : root.hover ? 14px : 12px;
+            width: Theme.slider-dot;
             height: self.width;
             border-radius: Theme.radius-round;
-            background: root.live ? (root.down ? Theme.accent-pressed : Theme.accent) : Theme.text-disabled;
-            animate width { duration: Theme.motion-quick; easing: ease-out; }
+            background: root.live ? (root.down ? Theme.accent-pressed : root.hover ? Theme.accent-hover : Theme.accent) : Theme.text-disabled;
+            animate background { duration: Theme.motion-quick; easing: ease-out; }
         }
         FocusRing {
             shown: root.force-focus || (root.key-focus && fs.has-focus);
@@ -97,6 +99,7 @@ export component Slider {
     }
     touch := TouchArea {
         enabled: root.live;
+        mouse-cursor: pointer;
         pointer-event(event) => {
             if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
                 fs.focus();
@@ -111,7 +114,7 @@ export component Slider {
             }
         }
         double-clicked => {
-            if (self.mouse-x >= root.thumb-x && self.mouse-x <= root.thumb-x + 20px) {
+            if (self.mouse-x >= root.thumb-x && self.mouse-x <= root.thumb-x + Theme.slider-thumb) {
                 root.set(root.default-value);
             }
         }
@@ -143,14 +146,14 @@ export component Slider {
     }
 }
 
-// A typed value: right-aligned digits with the unit as a suffix inside the field, 72 px. Up/Down
+// A typed value: right-aligned digits with the unit as a suffix inside the field, 80 px, in the
+// input shape of DS-8 (editing: 1 px accent border; invalid: error border). Up/Down
 // step (Shift: ten steps), the wheel steps while focused. Enter or leaving the field commits:
 // parse, round to the step, clamp, then `changed` (the slider's callback). Text that is not a
 // number (empty, nan, inf included) gets a red stroke and reverts. Only text the user changed is
 // committed, so a config value off the step survives a pass through the field. `signed` shows "+3".
 // `zero-text` ("never") stands in the field for a 0 and its unit, until the field is focused.
-// Our own frame around a `TextInput` (not `LineEdit`): the suffix needs room inside the frame,
-// and the focus underline must be our teal, not the system accent.
+// Our own frame around a `TextInput`: the suffix needs room inside the frame.
 export component NumberField {
     in-out property <float> value;
     in property <float> minimum: 0;
@@ -167,6 +170,8 @@ export component NumberField {
     // Shows the field as if the user had typed this text (gallery: the invalid state).
     in property <string> force-text;
     callback changed(float);
+    // The text has the keyboard focus.
+    out property <bool> has-focus: input.has-focus;
 
     property <bool> live: root.enabled && !root.locked;
     property <string> shown: (root.signed && root.value > 0 ? "+" : "") + root.value.to-fixed(root.decimals);
@@ -205,7 +210,7 @@ export component NumberField {
         input.text = self.shown;
     }
 
-    width: 72px;
+    width: Theme.number-field-width;
     accessible-role: spinbox;
     accessible-value: root.shown;
     accessible-enabled: root.live;
@@ -234,9 +239,12 @@ export component NumberField {
         frame := Rectangle {
             height: Theme.control-height;
             border-radius: Theme.radius-control;
-            background: !root.live ? Theme.bg-control.transparentize(0.5) : root.focused ? Theme.bg-control : touch.has-hover || root.force-hover ? Theme.bg-control-hover : Theme.bg-control;
+            // Disabled and locked keep the rest fill; only the ink greys (DS-8.3).
+            background: root.live && !root.focused && (touch.has-hover || root.force-hover) ? Theme.bg-control-hover : Theme.bg-control;
+            // 1 px hairline: the field's stroke, accent while editing (DS-8.2).
             border-width: 1px;
-            border-color: root.invalid ? Theme.error-text : Theme.stroke-control;
+            border-color: root.invalid ? Theme.error-text : root.focused && root.live ? Theme.accent : Theme.stroke-control;
+            animate background, border-color { duration: Theme.motion-quick; easing: ease-out; }
             touch := TouchArea {
                 enabled: root.live;
                 mouse-cursor: text;
@@ -266,8 +274,8 @@ export component NumberField {
                     reject
                 }
                 HorizontalLayout {
-                    padding-left: Theme.space-2;
-                    padding-right: Theme.space-2;
+                    padding-left: Theme.space-3;
+                    padding-right: Theme.space-3;
                     spacing: Theme.space-1;
                     input := TextInput {
                         enabled: root.live;
@@ -302,19 +310,18 @@ export component NumberField {
                     }
                 }
             }
-            // Fluent focus underline, in our accent.
+            // The darker bottom edge at rest (1 px hairline), as every input.
             Rectangle {
-                visible: root.focused && root.live;
+                visible: !root.focused && !root.invalid;
                 x: Theme.radius-control;
-                y: parent.height - 2px;
+                y: parent.height - 1px;
                 width: parent.width - 2 * Theme.radius-control;
-                height: 2px;
-                border-radius: Theme.radius-round;
-                background: root.invalid ? Theme.error-text : Theme.accent;
+                height: 1px;
+                background: Theme.stroke-control-bottom;
             }
             if root.zero-shown: Text {
-                x: Theme.space-2;
-                width: parent.width - 2 * Theme.space-2;
+                x: Theme.space-3;
+                width: parent.width - 2 * Theme.space-3;
                 text: root.zero-text;
                 font-size: Theme.body-size;
                 color: root.live ? Theme.text-primary : Theme.text-disabled;

@@ -6,8 +6,8 @@ use std::rc::Rc;
 use oxi_core::config::{Paste, PasteMode, PasteRule};
 use oxi_core::hotkey::Key;
 use oxi_core::paste::{
-    ClipError, Clipboard, ClipboardOnlyWhy, Foreground, Input, InputBlocked, PasteOutcome, Plan,
-    Snap, TYPE_GAP, copy_only, paste, plan,
+    ClipError, Clipboard, ClipboardOnlyWhy, Foreground, Input, InputBlocked, OurEntries,
+    PasteOutcome, Plan, Snap, TYPE_GAP, copy_only, paste, plan,
 };
 use oxi_core::types::Millis;
 
@@ -76,11 +76,11 @@ impl Clipboard for FakeClip {
         self.log.borrow_mut().push(Call::Seq);
         self.seq + u32::from(self.foreign_write)
     }
-    fn restore(&mut self, _snapshot: bool, in_history: bool) -> Result<(), ClipError> {
+    fn restore(&mut self, _snapshot: &bool, in_history: bool) -> Result<u32, ClipError> {
         let mut log = self.log.borrow_mut();
         log.push(Call::RestoreInHistory(in_history));
         log.push(Call::Restore);
-        Ok(())
+        Ok(self.seq)
     }
 }
 
@@ -135,7 +135,6 @@ impl Input for FakeInput {
 enum Fail {
     Nothing,
     SetText,
-    SetLocked,
     Chord,
     Typing,
 }
@@ -178,7 +177,6 @@ fn run(case: &Case, text: &str) -> (PasteOutcome, Vec<Call>) {
                 call: "SetClipboardData",
                 code: 5,
             }),
-            Fail::SetLocked => Some(ClipError::Locked),
             _ => None,
         },
         excluded: case.excluded,
@@ -214,13 +212,16 @@ fn normal_paste_snapshots_sets_sends_waits_checks_and_restores() {
         [
             Call::Mods,
             Call::Foreground,
+            // Before the snapshot and after the history work: a copy in between is restored.
+            Call::Seq,
             Call::Snapshot,
+            Call::Seq,
             Call::KeepInHistory(true),
             Call::Set("hi ".into()),
             ctrl_v(),
             Call::Sleep(300),
             Call::Seq,
-            Call::RestoreInHistory(true),
+            Call::RestoreInHistory(false),
             Call::Restore,
         ]
     );
@@ -254,9 +255,10 @@ fn modifiers_held_two_seconds_leave_the_text_on_the_clipboard() {
         PasteOutcome::ClipboardOnly(ClipboardOnlyWhy::ModifiersHeld)
     );
     assert!(has(&calls, |c| *c == Call::Set("hi".into())));
+    // A snapshot is read (is the user's copy kept out of Win+V?), never restored.
     assert!(!has(&calls, |c| matches!(
         c,
-        Call::Chord(_) | Call::Restore | Call::Snapshot
+        Call::Chord(_) | Call::Restore
     )));
     let waited: u64 = calls
         .iter()
@@ -295,8 +297,8 @@ fn locked_clipboard_types_and_leaves_the_clipboard_alone() {
 }
 
 #[test]
-fn incomplete_snapshot_pastes_without_restore_whatever_the_length() {
-    // Cyrillic: short and long texts both paste, none is typed.
+fn incomplete_snapshot_types_and_never_overwrites_the_clipboard() {
+    // Item 52 (owner 2026-11-10): a copy that cannot be put back whole is not overwritten.
     for text in ["hi".to_owned(), "я".repeat(300), "я".repeat(301)] {
         let (out, calls) = run(
             &Case {
@@ -305,29 +307,13 @@ fn incomplete_snapshot_pastes_without_restore_whatever_the_length() {
             },
             &text,
         );
-        assert_eq!(out, PasteOutcome::PastedNoRestore);
-        assert!(has(&calls, |c| *c == Call::Set(text.clone())));
-        assert!(has(&calls, |c| *c == ctrl_v()));
-        assert!(!has(&calls, |c| matches!(c, Call::Restore | Call::Type(_))));
+        assert_eq!(out, PasteOutcome::Typed);
+        assert!(has(&calls, |c| matches!(c, Call::Type(_))));
+        assert!(!has(&calls, |c| matches!(
+            c,
+            Call::Set(_) | Call::Chord(_) | Call::Restore
+        )));
     }
-}
-
-#[test]
-fn incomplete_snapshot_with_a_locked_set_types_the_text() {
-    let (out, calls) = run(
-        &Case {
-            snap: SnapKind::Incomplete,
-            fail: Fail::SetLocked,
-            ..Case::default()
-        },
-        "hi",
-    );
-    assert_eq!(out, PasteOutcome::Typed);
-    assert!(has(&calls, |c| matches!(c, Call::Type(_))));
-    assert!(!has(&calls, |c| matches!(
-        c,
-        Call::Chord(_) | Call::Restore
-    )));
 }
 
 #[test]
@@ -378,15 +364,10 @@ fn the_history_setting_reaches_the_clipboard_before_any_set() {
 }
 
 #[test]
-fn the_restored_copy_enters_history_only_with_the_setting_on_and_no_exclusion_marker() {
-    // setting, snapshot excluded, restored into history
-    let table = [
-        (true, false, true),
-        (true, true, false),
-        (false, false, false),
-        (false, true, false),
-    ];
-    for (keep, excluded, want) in table {
+fn the_restored_copy_never_enters_history() {
+    // Win+V still has its own entry of the copy: a restore into history would add a twin and
+    // push the oldest entry out of a full history (item 52, owner 2026-11-10).
+    for (keep, excluded) in [(true, false), (true, true), (false, false), (false, true)] {
         let (out, calls) = run(
             &Case {
                 excluded,
@@ -404,7 +385,7 @@ fn the_restored_copy_enters_history_only_with_the_setting_on_and_no_exclusion_ma
             "the dictation follows the setting"
         );
         assert!(
-            has(&calls, |c| *c == Call::RestoreInHistory(want)),
+            has(&calls, |c| *c == Call::RestoreInHistory(false)),
             "keep {keep} excluded {excluded}"
         );
     }
@@ -581,21 +562,6 @@ fn set_text_error_fails_restores_the_clipboard_and_sends_nothing() {
 }
 
 #[test]
-fn set_text_error_without_restore_fails_and_sends_nothing() {
-    let (out, calls) = run(
-        &Case {
-            snap: SnapKind::Incomplete,
-            fail: Fail::SetText,
-            ..Case::default()
-        },
-        "hi",
-    );
-    assert_eq!(out, PasteOutcome::Failed);
-    assert!(!has(&calls, |c| matches!(c, Call::Restore)));
-    assert!(!sends(&calls));
-}
-
-#[test]
 fn set_text_error_on_a_clipboard_only_path_fails() {
     let (out, calls) = run(
         &Case {
@@ -626,20 +592,6 @@ fn blocked_chord_fails_without_waiting_but_still_restores() {
 }
 
 #[test]
-fn blocked_chord_without_snapshot_data_fails_and_does_not_restore() {
-    let (out, calls) = run(
-        &Case {
-            snap: SnapKind::Incomplete,
-            fail: Fail::Chord,
-            ..Case::default()
-        },
-        "hi",
-    );
-    assert_eq!(out, PasteOutcome::Failed);
-    assert!(!has(&calls, |c| matches!(c, Call::Restore)));
-}
-
-#[test]
 fn blocked_typing_fails_in_every_typing_path() {
     let type_mode = Paste {
         mode: PasteMode::Type,
@@ -648,6 +600,10 @@ fn blocked_typing_fails_in_every_typing_path() {
     for case in [
         Case {
             snap: SnapKind::Locked,
+            ..Case::default()
+        },
+        Case {
+            snap: SnapKind::Incomplete,
             ..Case::default()
         },
         Case {
@@ -667,4 +623,18 @@ fn blocked_typing_fails_in_every_typing_path() {
             Call::Set(_) | Call::Chord(_) | Call::Restore
         )));
     }
+}
+
+/// t15 step 4: the entries of ours outlive a daemon restart as ids and a number, never text.
+#[test]
+fn our_entries_go_to_text_and_back_and_a_bad_line_is_skipped() {
+    let text = "seq 41\ntop {B}\nid {A}\nid {C}\n";
+    let ours = OurEntries::from_text(text);
+    assert_eq!(ours.to_text(), text);
+    assert_eq!(OurEntries::from_text(&ours.to_text()), ours);
+
+    let torn = "seq x\nid {A}\nid {A}\nid \nwhat {D}\nid {E}\r\ntop";
+    assert_eq!(OurEntries::from_text(torn).to_text(), "id {A}\nid {E}\n");
+    assert_eq!(OurEntries::default().to_text(), "");
+    assert_eq!(OurEntries::from_text(""), OurEntries::default());
 }

@@ -2,11 +2,16 @@ use oxi_core::audio::Level;
 use oxi_core::config::{Overlay, OverlayPosition as P};
 use oxi_core::machine::{Notice, OverlayState, Phase};
 use oxi_core::overlay::{
-    CLIP_HOLD, Icon, MARGIN_DIP, METER_HZ, Meter, PILL_EM, PILL_GAP, PILL_H_DIP, PILL_ICON,
-    PILL_PAD, PILL_W_DIP, Quns, Rect, label_x, look, palette, place, visible,
+    CARD_RADIUS, CLIP_HOLD, Icon, LOCK_HINT, MARGIN_DIP, METER_HZ, Meter, PILL_EM, PILL_GAP,
+    PILL_H_DIP, PILL_ICON, PILL_PAD, PILL_W_DIP, Quns, RecClock, Rect, SWEEP, label_x, look,
+    palette, pill_label, place, progress_span, visible,
 };
 use oxi_core::strings;
 use oxi_core::types::Millis;
+
+#[path = "common/notices.rs"]
+mod notices;
+use notices::ALL_NOTICES;
 
 const ALL_POSITIONS: [P; 6] = [
     P::BottomRight,
@@ -15,24 +20,6 @@ const ALL_POSITIONS: [P; 6] = [
     P::TopRight,
     P::TopCentre,
     P::TopLeft,
-];
-
-const ALL_NOTICES: [Notice; 15] = [
-    Notice::Cancelled,
-    Notice::NothingHeard,
-    Notice::NoModel,
-    Notice::ModelBad,
-    Notice::DeviceLost,
-    Notice::CaptureFailed,
-    Notice::TranscriptionFailed,
-    Notice::PressPaste,
-    Notice::AdminWindow,
-    Notice::RestoreSkipped,
-    Notice::PasteFailed,
-    Notice::MicFallback,
-    Notice::ConfigInvalid,
-    Notice::ConfigAdjusted,
-    Notice::MicSilence,
 ];
 
 #[test]
@@ -355,4 +342,131 @@ fn status_label_is_centred_in_the_pill_within_one_pixel() {
         // The six status labels (three of them Cyrillic) all fit, so they are all asserted.
         assert!(centred >= 6, "only {centred} labels centred at {scale}");
     }
+}
+
+/// DS-2.2: the pill's corner is the settings window's `radius-card`, one value for both.
+#[test]
+fn pill_radius_is_the_card_radius_token() {
+    let tokens = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../oxi-settings/ui/theme/tokens.slint"),
+    )
+    .unwrap();
+    let line = tokens
+        .lines()
+        .find(|l| l.contains("property <length> radius-card:"))
+        .expect("radius-card token");
+    let px: i32 = line
+        .split(':')
+        .nth(1)
+        .and_then(|v| v.trim().trim_end_matches(';').strip_suffix("px"))
+        .and_then(|v| v.parse().ok())
+        .expect("radius-card in px");
+    assert_eq!(px, CARD_RADIUS);
+}
+
+#[test]
+fn a_known_percent_fills_the_track_up_to_it() {
+    for now in [Millis(0), Millis(777)] {
+        assert_eq!(progress_span(Some(0), now), (0.0, 0.0));
+        assert_eq!(progress_span(Some(42), now), (0.0, 0.42));
+        assert_eq!(progress_span(Some(100), now), (0.0, 1.0));
+        assert_eq!(progress_span(Some(250), now), (0.0, 1.0), "clamped");
+    }
+}
+
+#[test]
+fn an_unknown_percent_sweeps_a_segment_left_to_right() {
+    let mut last_head = -1.0;
+    for ms in (0..SWEEP.0).step_by(50) {
+        let (a, b) = progress_span(None, Millis(ms));
+        assert!(
+            (0.0..=1.0).contains(&a) && (0.0..=1.0).contains(&b) && a <= b,
+            "{ms}: {a} {b}"
+        );
+        assert!(b - a <= 0.3 + 1e-6, "{ms}: segment {a}..{b}");
+        assert!(b >= last_head, "{ms}: moves right only");
+        last_head = b;
+    }
+    // Enters from the left, leaves at the right, then starts again.
+    assert_eq!(progress_span(None, Millis(0)), (0.0, 0.0));
+    let (a, b) = progress_span(None, Millis(SWEEP.0 - 1));
+    assert!(a > 0.99 && (b - 1.0).abs() < f32::EPSILON, "{a} {b}");
+    assert_eq!(progress_span(None, SWEEP), progress_span(None, Millis(0)));
+    let mid = progress_span(None, Millis(SWEEP.0 / 2));
+    assert!(mid.1 - mid.0 > 0.29, "a full segment mid-sweep: {mid:?}");
+}
+
+fn label(state: OverlayState, percent: Option<u8>, clock: RecClock, now: u64) -> String {
+    let mut out = String::from("stale");
+    pill_label(&mut out, state, percent, clock, Millis(now));
+    out
+}
+
+#[test]
+fn transcribing_shows_the_percent_when_known() {
+    let c = RecClock::default();
+    assert_eq!(
+        label(OverlayState::Transcribing, None, c, 0),
+        "Transcribing"
+    );
+    assert_eq!(
+        label(OverlayState::Transcribing, Some(42), c, 0),
+        "Transcribing 42%"
+    );
+    assert_eq!(
+        label(OverlayState::Transcribing, Some(100), c, 0),
+        "Transcribing 100%"
+    );
+    // Only transcription has a percent.
+    assert_eq!(
+        label(OverlayState::LoadingModel, Some(42), c, 0),
+        strings::overlay_label(OverlayState::LoadingModel)
+    );
+}
+
+#[test]
+fn a_locked_recording_says_how_to_stop_then_shows_its_length() {
+    let rec = |locked, ending_soon| OverlayState::Recording {
+        locked,
+        ending_soon,
+    };
+    let mut c = RecClock::default();
+    c.see(rec(false, false), Millis(1_000));
+    assert_eq!(label(rec(false, false), None, c, 9_000), "Recording");
+    // Locked at 5 s, 4 s into the recording.
+    c.see(rec(true, false), Millis(5_000));
+    c.see(rec(true, false), Millis(5_033));
+    let hint = strings::overlay_label(rec(true, false));
+    assert_eq!(label(rec(true, false), None, c, 5_000), hint);
+    assert_eq!(
+        label(rec(true, false), None, c, 5_000 + LOCK_HINT.0 - 1),
+        hint
+    );
+    assert_eq!(
+        label(rec(true, false), None, c, 5_000 + LOCK_HINT.0),
+        "0:07"
+    );
+    assert_eq!(label(rec(true, false), None, c, 66_000), "1:05");
+    assert_eq!(label(rec(true, false), None, c, 1_000 + 600_000), "10:00");
+    // The warning before the cap keeps its own words.
+    assert_eq!(
+        label(rec(true, true), None, c, 66_000),
+        strings::overlay_label(rec(true, true))
+    );
+    // A new recording starts its own clock.
+    c.see(OverlayState::Transcribing, Millis(70_000));
+    c.see(rec(false, false), Millis(80_000));
+    c.see(rec(true, false), Millis(81_000));
+    assert_eq!(
+        label(rec(true, false), None, c, 81_000 + LOCK_HINT.0),
+        "0:04"
+    );
+    // A hidden pill ends it too: a minute later the next one starts at zero.
+    c.see(OverlayState::Hidden, Millis(90_000));
+    c.see(rec(true, false), Millis(150_000));
+    assert_eq!(
+        label(rec(true, false), None, c, 150_000 + LOCK_HINT.0),
+        "0:03"
+    );
 }

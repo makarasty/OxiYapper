@@ -14,7 +14,7 @@ use i_slint_backend_testing::{
 use oxi_core::config::{ConfigFile, Theme};
 use oxi_core::ipc::Push;
 use oxi_settings::ipc::{Cmd, Event, Link};
-use oxi_settings::{AppWindow, Ipc, Page, Shell, ThemeChoice, Toast, Tokens};
+use oxi_settings::{AppWindow, ChipLevel, Ipc, Page, Shell, ThemeChoice, Toast, Tokens};
 use slint::ComponentHandle;
 use slint::platform::{Key, PointerEventButton, WindowEvent};
 
@@ -58,12 +58,20 @@ fn about_shows_name_version_and_licence() {
 }
 
 /// Owner 2026-11-10: the author line says "Made in Ukraine" (it was cut once). The std `AboutSlint`
-/// widget stays on About: the Slint royalty-free licence requires it.
+/// widget stays on About, in the popup the Slint tile opens (R2.3): the Slint royalty-free licence
+/// requires it.
 #[test]
 fn about_has_made_in_ukraine_and_the_std_slint_widget() {
     let window = open(&layout("about-slint-badge", None), Page::About);
     assert!(has(&window, "Made in Ukraine"));
+    open_slint_badge(&window);
     assert!(has(&window, "#MadeWithSlint"), "AboutSlint is missing");
+}
+
+/// Clicks the About page's Slint tile, which opens the "Made with Slint" badge.
+fn open_slint_badge(window: &AppWindow) {
+    with_role(window, "Slint", AccessibleRole::Button).invoke_accessible_default_action();
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(1));
 }
 
 #[test]
@@ -149,13 +157,24 @@ fn about_fits_the_minimum_size_with_a_banner() {
             "tiny-skia",
             "github.com/makarasty",
             "Made in Ukraine",
-            "#MadeWithSlint",
         ] {
             assert!(
                 whole_at_minimum(&window, label),
                 "{label} is cut (banner {banner:?}, daemon {daemon:?})"
             );
         }
+        // The badge lives in the Slint tile's popup: whole once open, then Esc closes it.
+        open_slint_badge(&window);
+        assert!(
+            whole_at_minimum(&window, "#MadeWithSlint"),
+            "the Slint badge is cut (banner {banner:?}, daemon {daemon:?})"
+        );
+        press(&window, Key::Escape);
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(1));
+        assert!(
+            !has(&window, "#MadeWithSlint"),
+            "Esc left the Slint badge open"
+        );
         let at = one(&window, "Version").absolute_position();
         window
             .window()
@@ -698,21 +717,12 @@ fn rail_starts_with_what_a_person_configures_first() {
     assert!(tops.is_sorted(), "{tops:?}");
 }
 
-#[test]
-fn window_stops_at_its_maximum() {
-    let window = open(&layout("largest", None), Page::Home);
-    assert_eq!(
-        (window.get_largest_width(), window.get_largest_height()),
-        (1280.0, 860.0)
-    );
-}
-
 /// The real window on the real backend; `OXI_WINDOW_TEST=1 cargo test -p oxi-settings --test
 /// shell real_window -- --test-threads=1` (the event loop needs the main thread).
 #[cfg(windows)]
 #[allow(clippy::cast_precision_loss)] // window pixels
 #[test]
-fn real_window_has_no_maximize_box_and_stops_at_the_maximum() {
+fn real_window_has_a_maximize_box_and_no_maximum_size() {
     use slint::{LogicalSize, PhysicalPosition, Timer, TimerMode};
     use std::cell::Cell;
     use std::rc::Rc;
@@ -721,7 +731,6 @@ fn real_window_has_no_maximize_box_and_stops_at_the_maximum() {
 
     const GWL_STYLE: i32 = -16;
     const WS_MAXIMIZEBOX: i32 = 0x0001_0000;
-    const WS_THICKFRAME: i32 = 0x0004_0000;
     const WM_GETMINMAXINFO: u32 = 0x0024;
 
     /// This thread's visible window as the OS has it: the style, and the largest client size
@@ -758,7 +767,7 @@ fn real_window_has_no_maximize_box_and_stops_at_the_maximum() {
     window
         .window()
         .set_position(PhysicalPosition::new(-20_000, -20_000));
-    oxi_settings::open_without_maximize(&window, LogicalSize::new(1000.0, 700.0));
+    window.window().set_size(LogicalSize::new(1000.0, 700.0));
 
     let seen = Rc::new(Cell::new(None));
     Timer::single_shot(Duration::from_secs(20), || {
@@ -768,8 +777,7 @@ fn real_window_has_no_maximize_box_and_stops_at_the_maximum() {
     poll.start(TimerMode::Repeated, Duration::from_millis(20), {
         let seen = seen.clone();
         move || {
-            // Resizable again means the opening's fixed size is over.
-            if let Some(found) = frame().filter(|(style, ..)| style & WS_THICKFRAME != 0) {
+            if let Some(found) = frame() {
                 seen.set(Some(found));
                 let _ = slint::quit_event_loop();
             }
@@ -777,10 +785,11 @@ fn real_window_has_no_maximize_box_and_stops_at_the_maximum() {
     });
     window.run().unwrap();
 
-    let (style, w, h) = seen.get().expect("the window became resizable");
-    assert_eq!(style & WS_MAXIMIZEBOX, 0, "style {style:#x}");
+    let (style, w, h) = seen.get().expect("the window showed");
+    assert_ne!(style & WS_MAXIMIZEBOX, 0, "style {style:#x}");
+    // UI rule 24: no maximum, so dragging an edge is not stopped at the old 1280 x 860.
     let scale = window.window().scale_factor();
-    assert_eq!(
+    assert_ne!(
         ((w as f32 / scale).round(), (h as f32 / scale).round()),
         (1280.0, 860.0)
     );
@@ -799,8 +808,6 @@ fn real_window_icon_is_a_small_icon() {
     use std::rc::Rc;
     use std::time::Duration;
 
-    const GWL_STYLE: i32 = -16;
-    const WS_THICKFRAME: i32 = 0x0004_0000;
     const ICON_SMALL: usize = 0;
     const ICON_BIG: usize = 1;
 
@@ -813,7 +820,7 @@ fn real_window_icon_is_a_small_icon() {
     window
         .window()
         .set_position(PhysicalPosition::new(-20_000, -20_000));
-    oxi_settings::open_without_maximize(&window, LogicalSize::new(1000.0, 700.0));
+    window.window().set_size(LogicalSize::new(1000.0, 700.0));
 
     // (small icon, scale) once up, then the big icon after the scale changed.
     let opened = Rc::new(Cell::new(None));
@@ -837,9 +844,7 @@ fn real_window_icon_is_a_small_icon() {
                 }
                 return;
             }
-            // Resizable again means the opening's fixed size is over.
-            // SAFETY: `hwnd` is a live window of this thread.
-            if unsafe { win32::GetWindowLongW(hwnd, GWL_STYLE) } & WS_THICKFRAME != 0 {
+            {
                 let scale = window.window().scale_factor();
                 opened.set(Some((win32::icon_width(hwnd, ICON_SMALL), scale)));
                 // What moving to another display does: a scale with another small bitmap.
@@ -859,7 +864,7 @@ fn real_window_icon_is_a_small_icon() {
     });
     window.run().unwrap();
 
-    let (small, scale) = opened.get().expect("the window became resizable");
+    let (small, scale) = opened.get().expect("the window showed");
     let big = big.get().expect("the title changed");
     let want = [16, 20, 24, 32]
         .into_iter()
@@ -895,7 +900,7 @@ fn os_lost_pixels_are_repainted() {
     window
         .window()
         .set_position(PhysicalPosition::new(120, 120));
-    oxi_settings::open_without_maximize(&window, LogicalSize::new(1000.0, 700.0));
+    window.window().set_size(LogicalSize::new(1000.0, 700.0));
 
     // The stage reached: 0 waits for the first frame, 1 and 2 for the repaint after a wipe.
     let stage = Rc::new(Cell::new(0));
@@ -950,9 +955,9 @@ fn os_lost_pixels_are_repainted() {
 #[test]
 fn opening_the_keyboard_moves_no_content_edge() {
     let heading_x = |window: &AppWindow| {
-        ElementHandle::find_by_element_id(window, "PageHeader::heading")
+        ElementHandle::find_by_element_type_name(window, "HeaderRow")
             .next()
-            .expect("the page title")
+            .expect("the page header row")
             .absolute_position()
             .x
     };
@@ -990,30 +995,52 @@ fn opening_the_keyboard_moves_no_content_edge() {
 
 #[test]
 fn page_title_centres_on_the_first_rail_item() {
-    let window = open(&layout("title-line", None), Page::Home);
+    let (window, _ipc, _rx) = linked("title-line");
+    let centre = |e: &ElementHandle| e.absolute_position().y + e.size().height / 2.0;
     for (w, h) in [(720.0, 520.0), (1000.0, 700.0), (1280.0, 800.0)] {
         window.window().set_size(slint::LogicalSize::new(w, h));
         for page in [
             Page::Home,
+            Page::Model,
             Page::Hotkey,
             Page::Audio,
-            Page::Model,
             Page::Text,
             Page::Overlay,
+            Page::History,
             Page::Test,
             Page::System,
             Page::About,
         ] {
             window.set_page(page);
-            let home = tab(&window, "Home");
-            let rail = home.absolute_position().y + home.size().height / 2.0;
-            let heading = ElementHandle::find_by_element_id(&window, "PageHeader::heading")
-                .next()
-                .expect("the page title");
-            let title = heading.absolute_position().y + heading.size().height / 2.0;
+            let rail = centre(&tab(&window, "Home"));
+            // The header row is the page name's HeaderRow or the page's own SubTabs; both are
+            // centred on the first rail item.
+            let (row, label) =
+                match ElementHandle::find_by_element_type_name(&window, "HeaderRow").next() {
+                    // The page name is centred in its row.
+                    Some(row) => (centre(&row), centre(&row)),
+                    None => (
+                        centre(
+                            &ElementHandle::find_by_element_type_name(&window, "SubTabs")
+                                .next()
+                                .unwrap_or_else(|| panic!("{page:?}: no header row, no SubTabs")),
+                        ),
+                        centre(
+                            &ElementHandle::find_by_element_id(&window, "SubTabs::strong")
+                                .next()
+                                .expect("a tab label"),
+                        ),
+                    ),
+                };
             assert!(
-                (rail - title).abs() <= 1.0,
-                "{page:?} at {w}x{h}: rail {rail}, title {title}"
+                (rail - row).abs() <= 1.0,
+                "{page:?} at {w}x{h}: rail {rail}, header row {row}"
+            );
+            // The status chip's text sits on the line of the page name or the tab labels.
+            let chip = centre(&with_role(&window, "Running", AccessibleRole::Button));
+            assert!(
+                (chip - label).abs() <= 1.0,
+                "{page:?} at {w}x{h}: chip {chip}, header label {label}"
             );
         }
     }
@@ -1022,25 +1049,26 @@ fn page_title_centres_on_the_first_rail_item() {
 #[test]
 fn daemon_chip_shows_the_state_and_starts_the_daemon() {
     let (window, ipc, rx) = linked("chip");
-    assert_eq!(
-        window.get_daemon_status(),
-        oxi_settings::DaemonStatus::Running
-    );
+    let chip = |w: &AppWindow| (w.get_chip_text().to_string(), w.get_chip_level());
+    assert_eq!(chip(&window), ("Running".into(), ChipLevel::Ok));
     assert!(has(&window, "Running"));
     ipc.deliver(&Event::Link(Link::Offline));
+    assert_eq!(chip(&window), ("Not running".into(), ChipLevel::Down));
     with_role(&window, "Not running", AccessibleRole::Button).invoke_accessible_default_action();
     assert_eq!(rx.try_recv(), Ok(Cmd::Start));
+    // A daemon of another version still runs: the chip is the normal state and takes no click;
+    // the banner's Restart does.
     ipc.deliver(&Event::Link(Link::Mismatch { daemon_proto: 9 }));
-    with_role(&window, "Running", AccessibleRole::Button).invoke_accessible_default_action();
+    assert_eq!(chip(&window), ("Running".into(), ChipLevel::Ok));
+    window.invoke_status_clicked();
+    assert!(rx.try_recv().is_err(), "the normal state takes no click");
+    one(&window, "Restart").invoke_accessible_default_action();
     assert_eq!(rx.try_recv(), Ok(Cmd::Restart));
     ipc.deliver(&Event::Link(Link::Stuck));
     assert!(has(&window, "Not answering"));
 
     let alone = common::open_again(&layout("chip-none", None), Page::Hotkey);
-    assert_eq!(
-        alone.get_daemon_status(),
-        oxi_settings::DaemonStatus::Hidden
-    );
+    assert_eq!(alone.get_chip_level(), ChipLevel::Hidden);
     assert!(
         !has(&alone, "Running") && !has(&alone, "Not running"),
         "no link, no chip"
@@ -1136,8 +1164,8 @@ fn a_hover_tip_does_not_take_the_keyboard_focus() {
     let window = open(&l, Page::System);
     system_tab(&window, "Recordings and files");
     tall(&window);
-    // The rail, the sub-tabs, the two recording limits, the Save recordings switch.
-    for _ in 0..5 {
+    // Four Tabs from the opened sub-tab reach the Save recordings switch (limits, then switch).
+    for _ in 0..4 {
         press(&window, Key::Tab);
     }
     let folder = with_role(&window, "Open recordings folder", AccessibleRole::Button);
@@ -1177,9 +1205,9 @@ fn the_warning_is_a_tab_stop_that_opens_its_tooltip() {
     };
     press_switch(&window, "Log dictated text");
     assert_eq!(copies(), 1);
-    // The rail, the sub-tabs, the two recording limits and their switch, the two folder
-    // buttons, Settings, Logs, the "!".
-    for _ in 0..10 {
+    // The rail, the sub-tabs, the two recording limits and their switch, the folder field, the
+    // two folder buttons, Settings, Logs, the "!".
+    for _ in 0..11 {
         press(&window, Key::Tab);
     }
     assert_eq!(copies(), 2, "focus on the \"!\" opens the tooltip");
@@ -1617,19 +1645,6 @@ mod win32 {
             ReleaseDC(hwnd, dc);
         }
     }
-}
-
-/// The logo keeps a 4 px inset from the window's top edge; centred in the head it kept 2 px.
-#[test]
-fn rail_logo_keeps_a_4_px_top_inset() {
-    let l = layout("logo-inset", None);
-    let window = open_default(&l);
-    let logo = ElementHandle::find_by_element_id(&window, "AppWindow::logo")
-        .next()
-        .expect("the rail logo");
-    let at = logo.absolute_position();
-    let inset = window.global::<Tokens>().get_space_1();
-    assert!((at.y - inset).abs() < 0.5, "logo top at {} px", at.y);
 }
 
 /// The std widgets (the Combo and its list) set no size: they read the window's, which is body size.

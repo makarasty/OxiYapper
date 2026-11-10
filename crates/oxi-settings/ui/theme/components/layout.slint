@@ -1,7 +1,7 @@
 // Page structure: header, groups, cards and the setting rows inside them (Windows 11 Settings
 // pattern: one card per setting, label and description left, control right).
 import { Theme, Shell } from "../tokens.slint";
-import { FocusRing, KeyFocus, CardFrame, Caption, Tip } from "base.slint";
+import { FocusRing, KeyFocus, CardFrame, Caption, Tip, InfoTip, ScrollBox } from "base.slint";
 import { Switch } from "switch.slint";
 import { Slider, NumberField } from "slider.slint";
 import { WarningSlot } from "feedback.slint";
@@ -34,7 +34,7 @@ export component Group inherits VerticalLayout {
     spacing: Theme.card-gap;
     if root.title != "": HorizontalLayout {
         padding-bottom: Theme.header-gap - Theme.card-gap;
-        spacing: Theme.space-2;
+        spacing: Theme.pair-gap;
         if root.icon.width > 0: Image {
             source: root.icon;
             width: Theme.icon-size;
@@ -85,6 +85,7 @@ export component ClickCard inherits CardFrame {
     property <bool> down: root.enabled && (touch.pressed || root.force-pressed);
     property <bool> key-focus;
     background: root.down ? Theme.bg-card-pressed : root.hover ? Theme.bg-control-hover : Theme.bg-card;
+    animate background { duration: Theme.motion-quick; easing: ease-out; }
     accessible-role: button;
     accessible-enabled: root.enabled;
     accessible-action-default => {
@@ -96,6 +97,7 @@ export component ClickCard inherits CardFrame {
     preferred-height: inner.preferred-height;
     touch := TouchArea {
         enabled: root.enabled;
+        mouse-cursor: pointer;
         clicked => {
             root.clicked();
         }
@@ -126,10 +128,13 @@ export component ClickCard inherits CardFrame {
 // `[icon 20?] [title + description, both wrap] .... [!] [control column]` inside a Card. The control
 // column (children, right-aligned) is 36 % of the card, 240 to 360 px, the same in every row of a
 // page (the wrapping of the text on the left must not move it); the "!" sits just left of the
-// packed controls.
+// packed controls; an `info` hint is an "i" `pair-gap` after the title.
 export component Row inherits HorizontalLayout {
     in property <image> icon;
     in property <string> title;
+    // A hint about the setting: the "i" after the title, this text its tooltip (UI rule 35). Empty
+    // shows none.
+    in property <string> info;
     in property <string> description;
     in property <bool> enabled: true;
     // Stretch the controls over the column (slider, meter) instead of packing them right.
@@ -146,8 +151,10 @@ export component Row inherits HorizontalLayout {
     in property <bool> text-only;
     // Why the controls are off while `enabled` is false: their tooltip (UI rule 31).
     in property <string> off-tip;
+    // Where the title's text starts (tests).
+    out property <length> title-x: title.absolute-position.x;
     spacing: Theme.icon-gap;
-    min-height: root.description == "" ? 24px : 32px;
+    min-height: root.description == "" ? Theme.row-min-height : Theme.control-height;
     if root.icon.width > 0: VerticalLayout {
         alignment: center;
         Image {
@@ -167,7 +174,10 @@ export component Row inherits HorizontalLayout {
             min-height: title.min-height;
             preferred-height: title.preferred-height;
             title := Text {
-                width: 100%;
+                // Without an x Slint centres a narrowed child: the title would start half the "i" room in.
+                x: 0;
+                // The "i" keeps its room so a long title wraps before it, not under it.
+                width: parent.width - (root.info == "" ? 0 : Theme.pair-gap + Theme.icon-size);
                 height: 100%;
                 text: root.title;
                 font-size: Theme.body-size;
@@ -182,6 +192,21 @@ export component Row inherits HorizontalLayout {
                     hovered: parent.has-hover;
                 }
             }
+            // One line of the title's font: the "i" centres on the first line when the title wraps.
+            line := Text {
+                visible: false;
+                text: "X";
+                font-size: Theme.body-size;
+                accessible-role: none;
+            }
+            // Slint does not give where a wrapped line ends, so a wrapped title's "i" sits at the end
+            // of the first line's room (kept free above): never under the text, never on line two.
+            if root.info != "": InfoTip {
+                x: min(title.preferred-width, title.width) + Theme.pair-gap;
+                // The box is the text block's height (the layout gives it its preferred), so line one starts at 0.
+                y: (line.preferred-height - self.height) / 2;
+                text: root.info;
+            }
         }
         if root.description != "": Caption {
             text: root.description;
@@ -195,7 +220,7 @@ export component Row inherits HorizontalLayout {
     }
     Rectangle {
         horizontal-stretch: 0;
-        preferred-width: root.text-only ? 0 : clamp(Theme.control-column-min, (Shell.page-width - 2 * Theme.card-padding-h) * 0.36, Theme.control-column-max);
+        preferred-width: root.text-only ? 0 : clamp((Shell.page-width - 2 * Theme.card-padding-h) * 0.36, Theme.control-column-min, Theme.control-column-max);
         min-width: self.preferred-width;
         max-width: self.preferred-width;
         min-height: controls.min-height;
@@ -243,6 +268,7 @@ export component Row inherits HorizontalLayout {
 
 // 1 px line between two Rows of one Card (a card with a single Row has none).
 export component Divider inherits Rectangle {
+    // 1 px hairline.
     height: 1px;
     background: Theme.divider;
     accessible-role: none;
@@ -256,6 +282,7 @@ export component ToggleRow inherits CardFrame {
     in property <image> icon;
     in property <string> title;
     in property <string> description;
+    in property <string> info;
     in property <string> warning;
     in property <string> off-tip;
     in-out property <bool> checked;
@@ -264,27 +291,32 @@ export component ToggleRow inherits CardFrame {
     in property <bool> force-hover;
     in property <bool> force-focus;
     out property <bool> key-focused: switch.key-focused;
+    out property <length> title-x: row.title-x;
     callback toggled(bool);
     public function take-focus(ring: bool) {
         switch.take-focus(ring);
     }
     property <bool> live: root.enabled && !root.locked;
     background: root.flat ? transparent : root.live && (touch.has-hover || root.force-hover) ? Theme.bg-control-hover : Theme.bg-card;
+    animate background { duration: Theme.motion-quick; easing: ease-out; }
+    // 1 px hairline: the card's stroke.
     border-width: root.flat ? 0 : 1px;
     min-height: inner.min-height;
     preferred-height: inner.preferred-height;
     touch := TouchArea {
         enabled: root.live;
+        mouse-cursor: pointer;
         clicked => {
             switch.toggle();
         }
     }
     inner := CardBody {
         flush: root.flat;
-        Row {
+        row := Row {
             icon: root.icon;
             title: root.title;
             description: root.description;
+            info: root.info;
             warning: root.warning;
             off-tip: root.off-tip;
             enabled: root.live;
@@ -347,5 +379,142 @@ export component SliderRow inherits Row {
         changed(v) => {
             root.changed(v);
         }
+    }
+}
+
+// A vertical scroller with the design-system bar (DS-18), over Flickable: std's fluent bar grows
+// off its axis on hover and cannot be restyled. Content takes the full width and leaves exactly
+// `scrollbar-gutter` only while it overflows; the 6 px thumb is centred in that gutter. Children
+// are laid out at `visible-width` (a layout child takes it and reports its height).
+export component ScrollView {
+    in-out property <length> viewport-y <=> box.viewport-y;
+    out property <length> visible-width: box.content-width;
+    out property <length> visible-height: root.height;
+    out property <bool> overflows: box.overflows;
+    // The content's height; the layout inside reports it.
+    property <length> content-h: body.preferred-height;
+    min-height: 0;
+    preferred-height: root.content-h;
+    box := ScrollBox {
+        width: root.width;
+        height: root.height;
+        // shortcut: the gutter is reserved from the height at full width; content that only
+        // overflows once narrowed by the gutter shows no bar, fine for card pages.
+        content-height: max(root.height, root.content-h);
+        body := VerticalLayout {
+            width: box.content-width;
+            alignment: start;
+            @children
+        }
+    }
+}
+
+// The page's header row (DS-14, R2.4): `SubTabs` (or the page name) left, the status chip slot
+// right, a 1 px divider across the whole content width at the bottom. Children go left; set
+// `title` instead on a page without tabs.
+export component HeaderRow {
+    in property <string> title;
+    height: Theme.header-row-height;
+    vertical-stretch: 0;
+    horizontal-stretch: 1;
+    Rectangle {
+        y: root.height - self.height;
+        // 1 px hairline: the tab line.
+        height: 1px;
+        background: Theme.divider;
+    }
+    HorizontalLayout {
+        spacing: Theme.control-gap;
+        if root.title != "": Text {
+            text: root.title;
+            font-size: Theme.body-size;
+            font-weight: Theme.weight-strong;
+            color: Theme.text-primary;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+        @children
+    }
+}
+
+// The status at the right of the header row (DS-14.4): the text, then a status dot `pair-gap` right
+// of it. Inert while `actionable` is off (the normal state); with an action (no model, no
+// microphone, daemon down) it hovers, takes the pointer and the keyboard, and `clicked` fires.
+export component StatusChip {
+    in property <string> text;
+    in property <color> dot: Theme.success-text;
+    in property <bool> actionable;
+    // Shown on hover, inert chip or not: what the status means, or what a click does.
+    in property <string> tooltip;
+    in property <bool> force-hover;
+    in property <bool> force-focus;
+    callback clicked;
+    property <bool> hover: root.actionable && (touch.has-hover || root.force-hover);
+    property <bool> key-focus;
+    height: Theme.control-height;
+    horizontal-stretch: 0;
+    accessible-role: button;
+    accessible-enabled: root.actionable;
+    accessible-label: root.text;
+    accessible-action-default => {
+        if (root.actionable) {
+            root.clicked();
+        }
+    }
+    face := Rectangle {
+        border-radius: Theme.radius-control;
+        background: root.hover ? (touch.pressed ? Theme.bg-subtle-selected : Theme.bg-subtle-hover) : transparent;
+        animate background { duration: Theme.motion-quick; easing: ease-out; }
+    }
+    HorizontalLayout {
+        padding-left: Theme.space-2;
+        padding-right: Theme.space-2;
+        spacing: Theme.pair-gap;
+        Text {
+            text: root.text;
+            font-size: Theme.body-size;
+            color: Theme.text-secondary;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: Theme.status-dot-size;
+                height: Theme.status-dot-size;
+                border-radius: Theme.radius-round;
+                background: root.dot;
+            }
+        }
+    }
+    // Enabled on an inert chip too, for the tooltip; only an actionable one clicks.
+    touch := TouchArea {
+        mouse-cursor: root.actionable ? MouseCursor.pointer : MouseCursor.default;
+        clicked => {
+            if (root.actionable) {
+                root.clicked();
+            }
+        }
+    }
+    Tip {
+        text: root.tooltip;
+        hovered: touch.has-hover;
+    }
+    fs := FocusScope {
+        enabled: root.actionable;
+        focus-on-click: false;
+        focus-gained(reason) => {
+            root.key-focus = KeyFocus.from-key(reason);
+        }
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+    FocusRing {
+        shown: root.force-focus || (root.key-focus && fs.has-focus);
     }
 }

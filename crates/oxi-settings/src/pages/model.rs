@@ -1,6 +1,6 @@
-//! Model page: the dictation language, the curated models with their status on disk, download
-//! and cancel through the daemon (the page itself never touches the network), "use my own .bin",
-//! the models folder and its partial downloads, the GPU and the unload.
+//! Model page: the dictation language, the curated models as a gallery with their status on disk,
+//! download, cancel and delete through the daemon (the page itself never touches the network),
+//! "use my own .bin", the models folder and its partial downloads, the GPU and the unload.
 
 use std::cell::{Cell, RefCell};
 use std::fs;
@@ -11,7 +11,7 @@ use std::thread;
 use std::time::SystemTime;
 
 use oxi_core::device::{Device, DeviceChoice};
-use oxi_core::ipc::{DownloadResult, Push, Request};
+use oxi_core::ipc::{DeleteResult, DownloadResult, Push, Request};
 use oxi_core::languages::{self, LanguageInfo};
 use oxi_core::models::{self, MODELS, ModelEntry, ModelStatus, PartialDownload};
 use oxi_core::paths::PART_SUFFIX;
@@ -21,7 +21,7 @@ use oxi_platform::fs::list_partials;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
 use crate::constants::FOLDER_POLL;
-use crate::generated::{ModelRow, ModelState, Toast};
+use crate::generated::{GalleryTile, ModelRow, ModelState, Toast};
 use crate::ipc::{Event, Link, Subscription};
 use crate::{AppWindow, Ctx, Error, Page, report};
 
@@ -42,6 +42,10 @@ const UNLOAD: [Option<u32>; 8] = [
 /// Why "Delete partial downloads" is off.
 const PARTIALS_NONE: &str = "No partial downloads";
 const PARTIALS_BUSY: &str = "Wait until the download stops";
+/// Why a model's Delete is off without the daemon, which may hold the file open.
+const DELETE_NEEDS_DAEMON: &str = "Start OxiYapper to delete.";
+/// A delete the daemon refused: a dictation, a test or a download is using the model.
+const DELETE_IN_USE: &str = "In use right now. Try again when it is done.";
 
 pub fn bind(window: &AppWindow, ctx: &Ctx) {
     let s = window.global::<ModelState>();
@@ -66,6 +70,7 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         ctx: ctx.clone(),
         entries,
         rows: Rc::new(VecModel::from(rows)),
+        tiles: Rc::new(VecModel::default()),
         partials: RefCell::new(Vec::new()),
         listed: RefCell::new(None),
         choices: RefCell::new(Vec::new()),
@@ -82,9 +87,11 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         },
     });
     s.set_rows(ModelRc::from(page.rows.clone()));
+    s.set_tiles(ModelRc::from(page.tiles.clone()));
     s.set_can_browse(cfg!(windows));
     s.set_warning(SharedString::new());
     s.set_download_off(download_off(ctx.ipc.link()).into());
+    s.set_delete_off(delete_off(ctx.ipc.link()).into());
     page.refresh_rows();
     page.push_config(&s);
 
@@ -105,9 +112,11 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     let p = Rc::clone(&page);
     s.on_cancel(move |i| p.cancel(i));
     let p = Rc::clone(&page);
+    s.on_delete(move |i| p.delete(i));
+    let p = Rc::clone(&page);
     s.on_custom_edited(move |text| p.custom_edited(&text));
     let p = Rc::clone(&page);
-    s.on_browse(move || p.browse());
+    s.on_browse(move |path| p.browse(&path));
     let p = Rc::clone(&page);
     s.on_open_folder(move || p.open_folder());
     let p = Rc::clone(&page);
@@ -131,6 +140,8 @@ struct PageState {
     /// The registry models the page offers, in row order.
     entries: Vec<&'static ModelEntry>,
     rows: Rc<VecModel<ModelRow>>,
+    /// The gallery: a tile per row, then "use my own .bin".
+    tiles: Rc<VecModel<GalleryTile>>,
     /// The `.part` files of the models folder as last read.
     partials: RefCell<Vec<PartialDownload>>,
     /// The daemon's GPU list; `None` until it answers `ListDevices`.
@@ -186,16 +197,25 @@ impl PageState {
         self.ask();
     }
 
-    /// Every config value the page shows.
-    fn push_config(&self, s: &ModelState<'_>) {
+    /// The model in use: an index in `entries`, `entries.len()` for "use my own .bin".
+    fn in_use(&self) -> Option<usize> {
         let file = self.ctx.config.borrow();
-        let model = &file.config.model;
-        let selected = if model.id == CUSTOM {
+        let id = &file.config.model.id;
+        if id == CUSTOM {
             Some(self.entries.len())
         } else {
-            self.entries.iter().position(|e| e.id == model.id)
-        };
+            self.entries.iter().position(|e| e.id == id)
+        }
+    }
+
+    /// Every config value the page shows; the gallery opens on the model in use.
+    fn push_config(&self, s: &ModelState<'_>) {
+        let selected = self.in_use();
         s.set_selected(selected.map_or(-1, int));
+        s.set_viewed(int(selected.unwrap_or(0)));
+        self.push_tiles();
+        let file = self.ctx.config.borrow();
+        let model = &file.config.model;
         s.set_custom_path(model.custom_path.as_str().into());
         let unload = (!model.unload_immediately).then_some(model.idle_unload_minutes);
         let path = model.custom_path.clone();
@@ -300,6 +320,42 @@ impl PageState {
         if let Some(mut r) = self.rows.row_data(i) {
             f(&mut r);
             self.rows.set_row_data(i, r);
+            self.push_tiles();
+        }
+    }
+
+    /// The gallery from the rows and the model in use; a tile that did not change is left alone,
+    /// so a progress push does not rebuild the others.
+    fn push_tiles(&self) {
+        let in_use = self.in_use();
+        let mut tiles: Vec<GalleryTile> = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| GalleryTile {
+                title: r.name.clone(),
+                caption: tile_caption(&r, in_use == Some(i)).into(),
+                ..GalleryTile::default()
+            })
+            .collect();
+        tiles.push(GalleryTile {
+            title: "Use my own .bin".into(),
+            caption: if in_use == Some(self.entries.len()) {
+                IN_USE
+            } else {
+                "Loaded as is"
+            }
+            .into(),
+            ..GalleryTile::default()
+        });
+        if self.tiles.row_count() != tiles.len() {
+            self.tiles.set_vec(tiles);
+            return;
+        }
+        for (i, tile) in tiles.into_iter().enumerate() {
+            if self.tiles.row_data(i).as_ref() != Some(&tile) {
+                self.tiles.set_row_data(i, tile);
+            }
         }
     }
 
@@ -336,6 +392,42 @@ impl PageState {
         id.clone_into(&mut self.ctx.config.borrow_mut().config.model.id);
         self.state(|s| self.push_config(s));
         report(&self.window, self.ctx.save());
+    }
+
+    /// Asks the daemon to delete the model's files (and its `.part`); the card asked first. The
+    /// ready model in use is refused here too: its card offers no Delete.
+    fn delete(&self, i: i32) {
+        let Some((i, entry)) = self.entry(i) else {
+            return;
+        };
+        let off = delete_off(self.ctx.ipc.link());
+        let ready = self.rows.row_data(i).is_some_and(|r| r.ready);
+        if !off.is_empty() || (ready && self.in_use() == Some(i)) {
+            self.update(i, |r| r.error = off.into());
+            return;
+        }
+        self.update(i, |r| r.error = SharedString::new());
+        self.ctx.ipc.send(Request::DeleteModel {
+            id: entry.id.to_owned(),
+        });
+    }
+
+    fn deleted(&self, id: &str, result: &DeleteResult) {
+        let Some(i) = self.index_of(id) else { return };
+        let error = match result {
+            DeleteResult::Done { freed } => {
+                if let Some(window) = self.window.upgrade() {
+                    let name = self.entries[i].display_name;
+                    let note = format!("Deleted {name}, freed {}", size(*freed));
+                    window.global::<Toast>().invoke_show(note.into());
+                }
+                String::new()
+            }
+            DeleteResult::InUse => DELETE_IN_USE.to_owned(),
+            DeleteResult::Failed { message } => format!("Not deleted: {message}"),
+        };
+        self.update(i, |r| r.error = error.into());
+        self.refresh_rows();
     }
 
     fn download(&self, i: i32) {
@@ -444,15 +536,19 @@ impl PageState {
             drop(file);
             report(&self.window, self.ctx.save());
             self.state(|s| s.set_selected(int(self.entries.len())));
+            self.push_tiles();
         }
         self.state(|s| s.set_custom_error(answer.problem.unwrap_or_default().into()));
     }
 
+    /// The dialog starts at the folder of `path`, the field's text (DS-13.4).
     #[cfg(windows)]
-    fn browse(&self) {
-        let picked = rfd::FileDialog::new()
-            .add_filter("Whisper model", &["bin"])
-            .pick_file();
+    fn browse(&self, path: &str) {
+        let mut dialog = rfd::FileDialog::new().add_filter("Whisper model", &["bin"]);
+        if let Some(dir) = start_dir(clean(path), &self.ctx.layout.models_dir()) {
+            dialog = dialog.set_directory(dir);
+        }
+        let picked = dialog.pick_file();
         if let Some(path) = picked {
             let text = path.to_string_lossy().into_owned();
             self.state(|s| s.set_custom_path(text.as_str().into()));
@@ -462,7 +558,7 @@ impl PageState {
 
     /// No native dialog on this OS: `can-browse` hides the button.
     #[cfg(not(windows))]
-    fn browse(&self) {}
+    fn browse(&self, _path: &str) {}
 
     /// Opens the models folder, made first when nothing was downloaded yet.
     fn open_folder(&self) {
@@ -527,7 +623,10 @@ impl PageState {
 
     fn event(&self, event: &Event) {
         if let Event::Link(link) = event {
-            self.state(|s| s.set_download_off(download_off(*link).into()));
+            self.state(|s| {
+                s.set_download_off(download_off(*link).into());
+                s.set_delete_off(delete_off(*link).into());
+            });
         }
         match event {
             // The daemon replays its active downloads right after this, so a flag left from an
@@ -580,6 +679,7 @@ impl PageState {
                     self.refresh_rows();
                 }
             }
+            Event::Push(Push::ModelDeleted { id, result }) => self.deleted(id, result),
             Event::Push(_) => {}
         }
     }
@@ -604,6 +704,8 @@ impl PageState {
                     r.ready = fresh.ready;
                     r.can_download = fresh.can_download;
                     r.paused = fresh.paused;
+                    r.can_delete = fresh.can_delete;
+                    r.frees = fresh.frees;
                 }
             });
         }
@@ -667,6 +769,8 @@ fn row(
         None if note.is_empty() => gb(entry.size),
         None => format!("{} · {note}", gb(entry.size)),
     };
+    let on_disk =
+        fs::metadata(dir.join(entry.file_name)).map_or(0, |m| m.len()) + part.map_or(0, |p| p.size);
     ModelRow {
         id: entry.id.into(),
         name: entry.display_name.into(),
@@ -683,7 +787,50 @@ fn row(
         progress: 0.0,
         error: SharedString::new(),
         heavy: false,
+        can_delete: status != ModelStatus::Missing,
+        frees: size(on_disk).into(),
     }
+}
+
+/// What the model in use's tile says beside its state.
+const IN_USE: &str = "In use";
+
+/// A tile's caption: its state, "Downloading 45%" while it downloads, "In use" first for the
+/// model in use (alone when it is ready, as nothing is to be done).
+fn tile_caption(r: &ModelRow, in_use: bool) -> String {
+    let state = if r.downloading {
+        format!(
+            "{} {:.0}%",
+            strings::MODEL_BADGE_DOWNLOADING,
+            r.progress * 100.0
+        )
+    } else {
+        r.badge.to_string()
+    };
+    match (in_use, r.ready && !r.downloading) {
+        (true, true) => IN_USE.to_owned(),
+        (true, false) => format!("{IN_USE} · {state}"),
+        (false, _) => state,
+    }
+}
+
+/// Where a file dialog for `path` starts: its folder, else the nearest folder above it that is
+/// there, else the models folder (or the nearest one above it). `None` only when none exists.
+/// shortcut: `is_dir` runs on the UI thread and an offline network path can stall it; the dialog
+/// that follows is modal anyway. Move it to the path worker if that ever shows.
+#[cfg(any(windows, test))] // only the Windows file dialog uses it
+fn start_dir(path: &str, models: &Path) -> Option<std::path::PathBuf> {
+    let path = Path::new(path);
+    let from_path = path
+        .is_absolute()
+        .then(|| path.parent())
+        .flatten()
+        .into_iter()
+        .flat_map(Path::ancestors);
+    from_path
+        .chain(models.ancestors())
+        .find(|dir| dir.is_dir())
+        .map(Path::to_path_buf)
 }
 
 /// How long a paused download stays: "kept 7 more days", or gone at the next start.
@@ -720,6 +867,11 @@ fn unload_rows(current: Option<u32>) -> (Vec<SharedString>, Vec<Option<u32>>) {
 /// Why Download is off on `link`; empty while it is on.
 fn download_off(link: Link) -> &'static str {
     link.off_reason(strings::DOWNLOAD_NEEDS_DAEMON)
+}
+
+/// Why a model's Delete is off on `link`; empty while it is on.
+fn delete_off(link: Link) -> &'static str {
+    link.off_reason(DELETE_NEEDS_DAEMON)
 }
 
 fn fraction(done: u64, total: u64) -> f32 {
@@ -886,9 +1038,18 @@ mod tests {
         }
     }
 
+    /// Picks the tile: its card shows below the gallery.
+    fn view(window: &AppWindow, name: &str) {
+        radio(window, name).invoke_accessible_default_action();
+    }
+
+    fn click(window: &AppWindow, label: &str) {
+        with_role(window, label, AccessibleRole::Button).invoke_accessible_default_action();
+    }
+
     fn download_large(window: &AppWindow) {
-        with_role(window, "Download Whisper large-v3", AccessibleRole::Button)
-            .invoke_accessible_default_action();
+        view(window, "Whisper large-v3");
+        click(window, "Download Whisper large-v3");
     }
 
     /// The large-v3 progress bar's value, `None` while it has none.
@@ -924,6 +1085,7 @@ mod tests {
     #[test]
     fn failed_download_shows_its_text() {
         let (window, ipc, _sent, _) = window("failed");
+        view(&window, "Whisper large-v3");
         let message = "connection reset (os error 10054)";
         push(&ipc, progress("large-v3", 5, 10));
         assert!(bar(&window).is_some());
@@ -972,8 +1134,8 @@ mod tests {
     #[test]
     fn a_card_keeps_its_place_in_every_state() {
         let (window, ipc, _sent, layout) = window("states");
-        // Picked and not on disk: the "!" of the card warns, the card keeps its height.
-        radio(&window, "Whisper large-v3").invoke_accessible_default_action();
+        // In use and not on disk: the "!" of the card warns, the card keeps its height.
+        window.global::<ModelState>().invoke_picked(1);
         assert!(has(&window, NOT_ON_DISK));
         let kept = assert_rows_kept(spots(&window));
         push(&ipc, progress("large-v3", 5, 10));
@@ -1024,16 +1186,18 @@ mod tests {
         assert!(!has(&window, SLOW));
         gpus(&ipc, &[("Vulkan0", true)]);
         // Both 3.1 GB models warn, turbo does not.
-        let warned = ElementHandle::find_by_accessible_label(&window, SLOW).count();
-        assert_eq!(warned, 2);
+        assert!(!has(&window, SLOW));
+        view(&window, "Whisper large-v3 Russian");
+        assert!(has(&window, SLOW));
         let _ = requests(&sent);
         download_large(&window);
+        assert!(has(&window, SLOW));
         let want = Request::DownloadModel {
             id: "large-v3".into(),
         };
         assert_eq!(requests(&sent), [want], "the warning blocked the download");
-        // A picked model not on disk says both.
-        radio(&window, "Whisper large-v3 Russian").invoke_accessible_default_action();
+        // The model in use, not on disk, says both.
+        window.global::<ModelState>().invoke_picked(2);
         assert!(has(&window, &format!("{NOT_ON_DISK}\n{SLOW}")));
         gpus(&ipc, &[("Vulkan0", false), ("Vulkan1", true)]);
         assert!(!has(&window, SLOW) && !has(&window, &format!("{NOT_ON_DISK}\n{SLOW}")));
@@ -1054,6 +1218,7 @@ mod tests {
         fs::write(&part, vec![0; 1000]).unwrap();
         fs::write(&other, b"x").unwrap();
         s.invoke_shown();
+        view(&window, "Whisper large-v3");
         assert_eq!(s.get_partials_off(), "");
         assert_eq!(s.get_partials(), "0 MB in 2 files");
         assert_eq!(size(3_000_000), "3 MB");
@@ -1086,6 +1251,7 @@ mod tests {
     #[test]
     fn download_button_is_not_inside_the_radio() {
         let (window, _ipc, _sent, _) = window("nodes");
+        view(&window, "Whisper large-v3");
         let radio = with_role(&window, "Whisper large-v3", AccessibleRole::RadioButton);
         with_role(&window, "Download Whisper large-v3", AccessibleRole::Button);
         let inside = radio
@@ -1098,20 +1264,23 @@ mod tests {
     #[test]
     fn cancelled_download_with_a_part_file_shows_paused() {
         let (window, ipc, _sent, layout) = window("paused");
+        view(&window, "Whisper large-v3");
         push(&ipc, progress("large-v3", 5, 10));
         fs::create_dir_all(layout.models_dir()).unwrap();
         fs::write(layout.models_dir().join("ggml-large-v3.bin.part"), b"half").unwrap();
         push(&ipc, done("large-v3", DownloadResult::Cancelled));
         // How much is there and how long it stays.
         assert!(has(&window, "1 MB of 3.1 GB · kept 7 more days"));
-        // A model with no `.part` stays "Not downloaded".
-        assert!(has(&window, "Whisper large-v3 turbo: Not downloaded"));
         with_role(&window, "Resume Whisper large-v3", AccessibleRole::Button);
+        // A model with no `.part` stays "Not downloaded".
+        view(&window, "Whisper large-v3 turbo");
+        assert!(has(&window, "Whisper large-v3 turbo: Not downloaded"));
     }
 
     #[test]
     fn relative_custom_path_is_refused_and_not_saved() {
         let (window, _ipc, _sent, layout) = window("relative");
+        view(&window, "Use my own .bin");
         let field = with_role(&window, "Model file", AccessibleRole::TextInput);
         field.set_accessible_value("mine.bin".to_owned());
         assert!(has(&window, RELATIVE));
@@ -1121,6 +1290,7 @@ mod tests {
     #[test]
     fn an_answer_for_an_older_edit_is_dropped() {
         let (window, _ipc, _sent, layout) = window("stale");
+        view(&window, "Use my own .bin");
         let good = layout.config_dir.join("good.bin");
         fs::write(&good, b"synthetic").unwrap();
         let field = with_role(&window, "Model file", AccessibleRole::TextInput);
@@ -1189,6 +1359,7 @@ mod tests {
     #[test]
     fn cancel_waits_for_the_daemon_to_stop() {
         let (window, ipc, sent, _) = window("cancel");
+        view(&window, "Whisper large-v3");
         push(&ipc, progress("large-v3", 5, 10));
         let _ = requests(&sent);
         with_role(&window, "Cancel Whisper large-v3", AccessibleRole::Button)
@@ -1209,6 +1380,7 @@ mod tests {
     #[test]
     fn lost_daemon_ends_the_downloads() {
         let (window, ipc, _sent, _) = window("lost");
+        view(&window, "Whisper large-v3");
         push(&ipc, progress("large-v3", 5, 10));
         ipc.deliver(&Event::Link(Link::Offline));
         assert_eq!(bar(&window), None);
@@ -1307,7 +1479,7 @@ mod tests {
 
     #[test]
     fn custom_path_problems() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::testing::scratch_dir(&format!(
             "oxi-settings-lib-model-{}-custom",
             std::process::id()
         ));
@@ -1334,6 +1506,7 @@ mod tests {
     #[test]
     fn custom_path_answers_come_from_the_worker() {
         let (window, _ipc, _sent, layout) = window("worker");
+        view(&window, "Use my own .bin");
         let field = with_role(&window, "Model file", AccessibleRole::TextInput);
         let missing = layout.config_dir.join("gone.bin");
         field.set_accessible_value(missing.to_string_lossy().into_owned());
@@ -1349,8 +1522,393 @@ mod tests {
         assert_eq!(saved.id, "custom");
         assert_eq!(saved.custom_path, model.to_string_lossy());
         assert!(!has(&window, "File not found"));
-        let radio = with_role(&window, "Use my own .bin", AccessibleRole::RadioButton);
-        assert_eq!(radio.accessible_checked(), Some(true));
+        with_role(&window, "Own model file in use", AccessibleRole::Button);
+        let tiles = window.global::<ModelState>().get_tiles();
+        assert_eq!(tiles.row_data(3).unwrap().caption, IN_USE);
+    }
+
+    /// A model file of the registry's size: "ready" without a hash (the stamp is not there).
+    fn on_disk(layout: &Layout, file: &str, bytes: u64) -> std::path::PathBuf {
+        fs::create_dir_all(layout.models_dir()).unwrap();
+        let path = layout.models_dir().join(file);
+        crate::testing::fake_model(&path, bytes);
+        path
+    }
+
+    fn large() -> &'static ModelEntry {
+        MODELS.iter().find(|m| m.id == "large-v3").unwrap()
+    }
+
+    fn deleted(id: &str, result: DeleteResult) -> Push {
+        Push::ModelDeleted {
+            id: id.into(),
+            result,
+        }
+    }
+
+    /// Ready: Use and Delete. Delete asks first and names what it frees; Keep sends nothing, the
+    /// second answer sends the request, the daemon's answer says what was freed.
+    #[test]
+    fn delete_asks_first_then_frees_the_space() {
+        let (window, ipc, sent, layout) = window("delete");
+        let file = on_disk(&layout, large().file_name, large().size);
+        window.global::<ModelState>().invoke_shown();
+        view(&window, "Whisper large-v3");
+        with_role(&window, "Use Whisper large-v3", AccessibleRole::Button);
+        let _ = requests(&sent);
+        let question = "Delete Whisper large-v3? Frees 3.1 GB.";
+        click(&window, "Delete Whisper large-v3");
+        assert!(has(&window, question));
+        click(&window, "Keep Whisper large-v3");
+        assert!(!has(&window, question));
+        assert_eq!(requests(&sent), []);
+        assert!(file.exists());
+
+        click(&window, "Delete Whisper large-v3");
+        click(&window, "Confirm: delete Whisper large-v3");
+        let want = Request::DeleteModel {
+            id: "large-v3".into(),
+        };
+        assert_eq!(requests(&sent), [want]);
+        fs::remove_file(&file).unwrap();
+        push(
+            &ipc,
+            deleted(
+                "large-v3",
+                DeleteResult::Done {
+                    freed: large().size,
+                },
+            ),
+        );
+        assert_eq!(
+            window.global::<Toast>().get_text(),
+            "Deleted Whisper large-v3, freed 3.1 GB"
+        );
+        assert!(has(&window, "Whisper large-v3: Not downloaded"));
+        assert!(!has(&window, question));
+        with_role(&window, "Download Whisper large-v3", AccessibleRole::Button);
+    }
+
+    /// Return on the focused button, then the `changed` handlers that move the focus.
+    fn enter(window: &AppWindow) {
+        let text = SharedString::from(slint::platform::Key::Return);
+        let w = window.window();
+        w.dispatch_event(slint::platform::WindowEvent::KeyPressed { text: text.clone() });
+        w.dispatch_event(slint::platform::WindowEvent::KeyReleased { text });
+        slint::platform::update_timers_and_animations();
+    }
+
+    /// The question's buttons leave with it; the focus stays on the card, not the window top:
+    /// Keep gives it to Delete, a confirmed Delete to the Download that takes the files' place.
+    #[test]
+    fn the_focus_stays_on_the_card_after_the_question() {
+        let (window, ipc, sent, layout) = window("delete-focus");
+        let file = on_disk(&layout, large().file_name, large().size);
+        window.global::<ModelState>().invoke_shown();
+        view(&window, "Whisper large-v3");
+        // The card's `changed index` closes a question: let it run now, as a frame would.
+        slint::platform::update_timers_and_animations();
+        let question = "Delete Whisper large-v3? Frees 3.1 GB.";
+        click(&window, "Delete Whisper large-v3");
+        assert!(has(&window, question));
+        enter(&window); // on Keep, which the question focused
+        assert!(!has(&window, question));
+        enter(&window);
+        assert!(has(&window, question), "Keep left the focus nowhere");
+
+        click(&window, "Confirm: delete Whisper large-v3");
+        fs::remove_file(&file).unwrap();
+        let _ = requests(&sent);
+        let freed = DeleteResult::Done {
+            freed: large().size,
+        };
+        push(&ipc, deleted("large-v3", freed));
+        assert!(has(&window, "Whisper large-v3: Not downloaded"));
+        slint::platform::update_timers_and_animations();
+        enter(&window);
+        let want = Request::DownloadModel {
+            id: "large-v3".into(),
+        };
+        assert_eq!(requests(&sent), [want], "Delete left the focus nowhere");
+    }
+
+    /// A delete that fails ends the card's wait for the files to go: when they vanish later (Explorer,
+    /// the folder poll), the Download that appears does not take the focus from where the user is.
+    #[test]
+    fn a_failed_delete_does_not_steal_the_focus_later() {
+        let (window, ipc, sent, layout) = window("delete-failed-focus");
+        let file = on_disk(&layout, large().file_name, large().size);
+        window.global::<ModelState>().invoke_shown();
+        view(&window, "Whisper large-v3");
+        slint::platform::update_timers_and_animations();
+        click(&window, "Delete Whisper large-v3");
+        click(&window, "Confirm: delete Whisper large-v3");
+        let failed = DeleteResult::Failed {
+            message: "Access is denied. (os error 5)".into(),
+        };
+        push(&ipc, deleted("large-v3", failed));
+        slint::platform::update_timers_and_animations(); // the focus returns to Delete
+        // The user moves on, to Use.
+        let w = window.window();
+        let back = SharedString::from(slint::platform::Key::Backtab);
+        w.dispatch_event(slint::platform::WindowEvent::KeyPressed { text: back.clone() });
+        w.dispatch_event(slint::platform::WindowEvent::KeyReleased { text: back });
+
+        fs::remove_file(&file).unwrap();
+        // The daemon lists the devices again: the rows are read from the files.
+        push(
+            &ipc,
+            Push::Devices {
+                mics: Vec::new(),
+                gpus: Vec::new(),
+            },
+        );
+        assert!(has(&window, "Whisper large-v3: Not downloaded"));
+        slint::platform::update_timers_and_animations();
+        let _ = requests(&sent);
+        enter(&window);
+        assert_eq!(requests(&sent), [], "the focus was taken to Download");
+    }
+
+    /// Draws the card's states the other shots miss: paused (Resume, Delete), ready and not in use
+    /// (Use, Delete), and the delete question; each frame non-empty and not one colour. With
+    /// `OXI_SHOTS_DIR` set they land in `settings-model-card-<state>-<w>-<theme>.png`. The renderer
+    /// platform is per thread and the other tests here use the testing backend: a thread of its own.
+    #[test]
+    fn shots_model_card() {
+        thread::spawn(draw_cards).join().unwrap();
+    }
+
+    fn draw_cards() {
+        use slint::platform::software_renderer::{
+            MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
+        };
+        use slint::platform::{Platform, WindowAdapter};
+
+        thread_local! {
+            static LAST: RefCell<Option<Rc<MinimalSoftwareWindow>>> = const { RefCell::new(None) };
+            // The animation clock, stepped by hand past the theme fades.
+            static CLOCK: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        }
+        struct Shots;
+        impl Platform for Shots {
+            fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
+                let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+                LAST.with_borrow_mut(|last| *last = Some(window.clone()));
+                Ok(window)
+            }
+            fn duration_since_start(&self) -> Duration {
+                CLOCK.get()
+            }
+        }
+
+        slint::platform::set_platform(Box::new(Shots)).unwrap();
+        let dir = std::env::var_os("OXI_SHOTS_DIR").map(std::path::PathBuf::from);
+        for state in ["paused", "ready", "question"] {
+            let layout = crate::testing::layout("model", &format!("shot-{state}"));
+            let window = crate::open_with(layout.clone(), Ipc::fake().0).unwrap();
+            let surface = LAST.with_borrow(Clone::clone).unwrap();
+            window.set_page(Page::Model);
+            if state == "paused" {
+                on_disk(
+                    &layout,
+                    &format!("{}{PART_SUFFIX}", large().file_name),
+                    1_000_000,
+                );
+            } else {
+                on_disk(&layout, large().file_name, large().size);
+            }
+            surface.set_size(slint::PhysicalSize::new(1280, 860));
+            window.show().unwrap();
+            window.global::<ModelState>().invoke_shown();
+            view(&window, "Whisper large-v3");
+            slint::platform::update_timers_and_animations();
+            if state == "question" {
+                click(&window, "Delete Whisper large-v3");
+            }
+            for (w, h) in [(1280_u32, 860_u32), (720, 520)] {
+                surface.set_size(slint::PhysicalSize::new(w, h));
+                for (theme, choice) in [
+                    ("light", crate::ThemeChoice::Light),
+                    ("dark", crate::ThemeChoice::Dark),
+                ] {
+                    window.set_theme(choice);
+                    let mut buffer = vec![PremultipliedRgbaColor::default(); (w * h) as usize];
+                    // A fade starts when a frame reads the new colour: draw one, then step past it.
+                    for step in [Duration::ZERO, Duration::from_millis(300)] {
+                        CLOCK.set(CLOCK.get() + step);
+                        slint::platform::update_timers_and_animations();
+                        surface.request_redraw();
+                        assert!(surface.draw_if_needed(|r| {
+                            r.render(&mut buffer, w as usize);
+                        }));
+                    }
+                    let bytes = buffer
+                        .iter()
+                        .flat_map(|p| [p.red, p.green, p.blue, p.alpha])
+                        .collect();
+                    let size = tiny_skia::IntSize::from_wh(w, h).unwrap();
+                    let pixmap = tiny_skia::Pixmap::from_vec(bytes, size).unwrap();
+                    let pixels = pixmap.pixels();
+                    let first = pixels[0];
+                    assert!(
+                        pixels.iter().any(|p| p.alpha() > 0),
+                        "{state} {theme} drew nothing"
+                    );
+                    assert!(
+                        pixels.iter().any(|p| *p != first),
+                        "{state} {theme} is flat"
+                    );
+                    if let Some(dir) = &dir {
+                        let name = format!("settings-model-card-{state}-{w}-{theme}.png");
+                        fs::create_dir_all(dir).unwrap();
+                        pixmap.save_png(dir.join(name)).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    /// The daemon's refusals stay on the card, as its "!".
+    #[test]
+    fn a_refused_delete_says_why() {
+        let (window, ipc, _sent, layout) = window("delete-refused");
+        on_disk(&layout, large().file_name, large().size);
+        window.global::<ModelState>().invoke_shown();
+        view(&window, "Whisper large-v3");
+        push(&ipc, deleted("large-v3", DeleteResult::InUse));
+        assert!(has(&window, DELETE_IN_USE));
+        let failed = DeleteResult::Failed {
+            message: "Access is denied. (os error 5)".into(),
+        };
+        push(&ipc, deleted("large-v3", failed));
+        assert!(has(&window, "Not deleted: Access is denied. (os error 5)"));
+        assert!(has(&window, "Whisper large-v3: Downloaded"));
+    }
+
+    /// In use: no Use, and Delete is off with the reason; another model in use frees it.
+    #[test]
+    fn the_model_in_use_is_not_deleted() {
+        let (window, _ipc, sent, layout) = window("delete-in-use");
+        on_disk(&layout, large().file_name, large().size);
+        let s = window.global::<ModelState>();
+        s.invoke_shown();
+        view(&window, "Whisper large-v3");
+        click(&window, "Use Whisper large-v3");
+        assert_eq!(saved_model(&layout).id, "large-v3");
+        let used = with_role(&window, "Whisper large-v3 in use", AccessibleRole::Button);
+        assert_eq!(used.accessible_enabled(), Some(false));
+        let delete = with_role(&window, "Delete Whisper large-v3", AccessibleRole::Button);
+        assert_eq!(delete.accessible_enabled(), Some(false));
+        assert_eq!(
+            delete.accessible_description().as_deref(),
+            Some("In use. Use another model first to delete this one.")
+        );
+        // The callback refuses it too.
+        let _ = requests(&sent);
+        s.invoke_delete(1);
+        assert_eq!(requests(&sent), []);
+        assert_eq!(s.get_tiles().row_data(1).unwrap().caption, IN_USE);
+        assert_eq!(s.get_tiles().row_data(0).unwrap().caption, "Not downloaded");
+    }
+
+    /// Paused: Resume and Delete; the question names the partial download and its size.
+    #[test]
+    fn a_paused_download_can_be_deleted() {
+        let (window, _ipc, sent, layout) = window("delete-paused");
+        on_disk(
+            &layout,
+            &format!("{}{PART_SUFFIX}", large().file_name),
+            400_000_000,
+        );
+        window.global::<ModelState>().invoke_shown();
+        view(&window, "Whisper large-v3");
+        with_role(&window, "Resume Whisper large-v3", AccessibleRole::Button);
+        let _ = requests(&sent);
+        click(&window, "Delete Whisper large-v3");
+        assert!(has(
+            &window,
+            "Delete the partial download of Whisper large-v3? Frees 400 MB."
+        ));
+        click(&window, "Confirm: delete Whisper large-v3");
+        let want = Request::DeleteModel {
+            id: "large-v3".into(),
+        };
+        assert_eq!(requests(&sent), [want]);
+    }
+
+    /// Not downloaded and downloading offer no Delete; without the daemon Delete is off.
+    #[test]
+    fn delete_is_offered_only_for_files_and_needs_the_daemon() {
+        let (window, ipc, _sent, layout) = window("delete-offer");
+        view(&window, "Whisper large-v3");
+        let shown = |window: &AppWindow| has(window, "Delete Whisper large-v3");
+        assert!(!shown(&window), "nothing on disk");
+        push(&ipc, progress("large-v3", 5, 10));
+        assert!(!shown(&window), "downloading");
+        on_disk(&layout, large().file_name, large().size);
+        push(&ipc, done("large-v3", DownloadResult::Ok));
+        assert!(shown(&window));
+        ipc.deliver(&Event::Link(Link::Offline));
+        let delete = with_role(&window, "Delete Whisper large-v3", AccessibleRole::Button);
+        assert_eq!(delete.accessible_enabled(), Some(false));
+        assert_eq!(
+            delete.accessible_description().as_deref(),
+            Some(DELETE_NEEDS_DAEMON)
+        );
+    }
+
+    #[test]
+    fn tile_captions_say_the_state() {
+        let row = |badge: &str, ready, downloading, progress| ModelRow {
+            badge: badge.into(),
+            ready,
+            downloading,
+            progress,
+            ..ModelRow::default()
+        };
+        let cases = [
+            (row("Ready", true, false, 0.0), false, "Ready"),
+            (row("Ready", true, false, 0.0), true, "In use"),
+            (
+                row("Not downloaded", false, false, 0.0),
+                true,
+                "In use · Not downloaded",
+            ),
+            (
+                row("Downloading", false, true, 0.454),
+                false,
+                "Downloading 45%",
+            ),
+            (row("Paused", false, false, 0.0), false, "Paused"),
+        ];
+        for (r, in_use, want) in cases {
+            assert_eq!(tile_caption(&r, in_use), want);
+        }
+    }
+
+    #[test]
+    fn a_dialog_starts_at_the_current_file() {
+        let dir = crate::testing::scratch_dir(&format!(
+            "oxi-settings-lib-model-{}-start",
+            std::process::id()
+        ));
+        let (models, other) = (dir.join("models"), dir.join("mine"));
+        fs::create_dir_all(&models).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let file = other.join("x.bin").to_string_lossy().into_owned();
+        assert_eq!(start_dir(&file, &models), Some(other.clone()));
+        // A folder that is gone: the nearest one above it.
+        let gone = other
+            .join("gone")
+            .join("x.bin")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(start_dir(&gone, &models), Some(other));
+        // Empty or relative: the models folder, or the nearest one above it.
+        assert_eq!(start_dir("", &models), Some(models.clone()));
+        assert_eq!(start_dir("mine.bin", &models), Some(models.clone()));
+        assert_eq!(start_dir("", &models.join("not-yet")), Some(models));
     }
 
     #[test]

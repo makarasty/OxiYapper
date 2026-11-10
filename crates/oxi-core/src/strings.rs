@@ -2,6 +2,7 @@
 //! Each lookup is an exhaustive match: a new variant does not compile until it has its text.
 
 use crate::APP_NAME;
+use crate::ipc::Attention;
 use crate::machine::{EngineWarning, Notice, OverlayState, Phase};
 use crate::models::ModelStatus;
 
@@ -14,6 +15,7 @@ pub const MENU_QUIT: &str = "Quit";
 pub const fn notice(notice: Notice) -> &'static str {
     match notice {
         Notice::Cancelled => "Cancelled",
+        Notice::CancelledKept => "Cancelled. The recording was kept",
         Notice::NothingHeard => "Nothing heard",
         Notice::NoModel => "No speech model. Open Settings to download one",
         Notice::ModelBad => "The speech model file is damaged. Download it again in Settings",
@@ -32,15 +34,79 @@ pub const fn notice(notice: Notice) -> &'static str {
         Notice::MicSilence => {
             "The microphone gives no sound. Check mute, reconnect it or pick another mic"
         }
+        Notice::OutOfMemory => {
+            "Not enough memory to load the speech model. Close other apps or pick a smaller model"
+        }
+        Notice::HistoryOn => "Recordings are now kept for 30 days. Turn off in Audio.",
     }
 }
+
+/// Start of the `Status` line of [`EngineWarning::CpuFallback`]; [`cpu_fallback_reason`] reads it back.
+const CPU_FALLBACK_PREFIX: &str = "running on CPU: ";
 
 /// Tray and `Status` line of an [`EngineWarning`].
 #[must_use]
 pub fn engine_warning(warning: &EngineWarning) -> String {
     match warning {
-        EngineWarning::CpuFallback { reason } => format!("running on CPU: {reason}"),
+        EngineWarning::CpuFallback { reason } => format!("{CPU_FALLBACK_PREFIX}{reason}"),
         EngineWarning::GpuNotFound { name } => format!("GPU {name:?} not found, using auto"),
+    }
+}
+
+/// The reason in a `Status` line made by [`engine_warning`] for a CPU fallback.
+#[must_use]
+pub fn cpu_fallback_reason(line: &str) -> Option<&str> {
+    line.strip_prefix(CPU_FALLBACK_PREFIX)
+}
+
+/// Is a CPU fallback's reason a memory failure of the GPU load.
+#[must_use]
+pub fn is_out_of_memory(reason: &str) -> bool {
+    reason.to_lowercase().contains("out of memory")
+}
+
+// The status chip of the settings window, one text per state.
+pub const HEALTH_RUNNING: &str = "Running";
+pub const HEALTH_NOT_RUNNING: &str = "Not running";
+pub const HEALTH_NOT_ANSWERING: &str = "Not answering";
+
+/// Chip text of an [`Attention`](crate::ipc::Attention): a few words, the state and not the fix.
+#[must_use]
+pub const fn attention_chip(attention: &Attention) -> &'static str {
+    match attention {
+        Attention::NoModel => "No model",
+        Attention::ModelDamaged => "Model damaged",
+        Attention::NoMicrophone => "No microphone",
+        Attention::CpuFallback { .. } => "Running on CPU",
+        Attention::OutOfMemory { cpu: true } => "Out of memory",
+        Attention::OutOfMemory { cpu: false } => "GPU out of memory",
+        Attention::SoundFailed { .. } => "Sound failed",
+    }
+}
+
+/// The chip's tooltip: what happened and where to fix it.
+#[must_use]
+pub fn attention_text(attention: &Attention) -> String {
+    match attention {
+        Attention::NoModel => "No speech model is downloaded. Open Model to download one".into(),
+        Attention::ModelDamaged => {
+            "The speech model file is damaged. Download it again in Model".into()
+        }
+        Attention::NoMicrophone => {
+            "The chosen microphone is not connected. Pick another in Audio".into()
+        }
+        Attention::CpuFallback { reason } => {
+            format!("The GPU is not used, so dictation is slower ({reason}). See Model")
+        }
+        Attention::OutOfMemory { cpu: true } => {
+            "Not enough memory to load the model. Close other programs or pick a smaller model in Model"
+                .into()
+        }
+        Attention::OutOfMemory { cpu: false } => {
+            "The GPU ran out of memory loading the model, so it runs on the CPU. Pick a smaller model in Model"
+                .into()
+        }
+        Attention::SoundFailed { line, .. } => format!("A sound did not play ({line}). See Audio"),
     }
 }
 
@@ -52,6 +118,7 @@ pub const OVERLAY_LABEL_MAX: usize = 16;
 pub const fn notice_short(notice: Notice) -> &'static str {
     match notice {
         Notice::Cancelled => "Cancelled",
+        Notice::CancelledKept => "Cancelled, kept",
         Notice::NothingHeard => "Nothing heard",
         Notice::NoModel => "No model",
         Notice::ModelBad => "Model error",
@@ -66,6 +133,8 @@ pub const fn notice_short(notice: Notice) -> &'static str {
         Notice::ConfigInvalid => "Config error",
         Notice::ConfigAdjusted => "Config adjusted",
         Notice::MicSilence => "Mic silent",
+        Notice::OutOfMemory => "Out of memory",
+        Notice::HistoryOn => "History on",
     }
 }
 
@@ -79,7 +148,8 @@ pub const fn overlay_label(state: OverlayState) -> &'static str {
         OverlayState::Recording {
             ending_soon: true, ..
         } => "Ending soon",
-        OverlayState::Recording { locked: true, .. } => "Locked",
+        // The lock icon says "locked"; the label says how to end it (16 characters at most).
+        OverlayState::Recording { locked: true, .. } => "Press to stop",
         OverlayState::Recording { .. } => "Recording",
         OverlayState::LoadingModel => "Loading model",
         OverlayState::Transcribing => "Transcribing",
@@ -306,6 +376,41 @@ mod tests {
         assert_eq!(
             model_status(ModelStatus::Partial),
             "resumes where it stopped"
+        );
+    }
+
+    #[test]
+    fn engine_lines_read_back() {
+        let line = engine_warning(&EngineWarning::CpuFallback {
+            reason: "out of memory".into(),
+        });
+        assert_eq!(line, "running on CPU: out of memory");
+        assert_eq!(cpu_fallback_reason(&line), Some("out of memory"));
+        assert!(is_out_of_memory("Vulkan: Out of Memory"));
+        let gpu = engine_warning(&EngineWarning::GpuNotFound { name: "x".into() });
+        assert_eq!(cpu_fallback_reason(&gpu), None);
+    }
+
+    #[test]
+    fn a_chip_text_is_short_and_the_tooltip_names_the_fix() {
+        for a in [
+            Attention::NoModel,
+            Attention::ModelDamaged,
+            Attention::NoMicrophone,
+            Attention::CpuFallback { reason: "x".into() },
+            Attention::OutOfMemory { cpu: true },
+            Attention::OutOfMemory { cpu: false },
+            Attention::SoundFailed {
+                line: "x".into(),
+                stop: false,
+            },
+        ] {
+            assert!(attention_chip(&a).len() <= 20, "{a:?}");
+            assert!(attention_text(&a).len() > attention_chip(&a).len(), "{a:?}");
+        }
+        assert_ne!(
+            attention_text(&Attention::OutOfMemory { cpu: true }),
+            attention_text(&Attention::OutOfMemory { cpu: false })
         );
     }
 

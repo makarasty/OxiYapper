@@ -1,10 +1,11 @@
-// Segmented choice and the std text/combo fields with our sizes and fonts. LineEdit, TextEdit
-// and ComboBox stay std for their popups and IME; their focus underline is the context accent,
-// which the window sets to our teal (spec 7.3, d2).
-import { ComboBox, LineEdit, TextEdit } from "std-widgets.slint";
+// Segmented choice and the input fields (DS-8). Combo, TextField, TextArea, SearchField and
+// PathField are our own on `TextInput`/`PopupWindow`: the fluent ones draw their own underline,
+// fill and focus border, which the design system replaces with one shape for all five.
 import { Theme, Shell } from "../tokens.slint";
-import { FocusRing, KeyFocus, Tip } from "base.slint";
+import { Icons } from "../icons.slint";
+import { FocusRing, KeyFocus, Tip, ScrollBox } from "base.slint";
 import { KeyTip } from "feedback.slint";
+import { Button } from "button.slint";
 
 // Equal segments on an inset track; the selected one is a strong accent fill (replaces the
 // language buttons). Left/Right move the pick. One-way like the pickers: `picked` fires, the
@@ -32,10 +33,10 @@ export component Segmented {
     // Whether the keyboard focus ring is drawn (tests: a click draws none).
     out property <bool> ring: root.key-focus && fs.has-focus;
     // Equal segments in the 2 px padding and gaps, for the keyboard tooltip.
-    property <length> segment-width: (root.width - 4px - 2px * (root.items.length - 1)) / max(root.items.length, 1);
+    property <length> segment-width: (root.width - 2 * Theme.segment-inset - Theme.segment-inset * (root.items.length - 1)) / max(root.items.length, 1);
     property <string> key-tip-text: root.key-focus && fs.has-focus ? root.tips[root.selected] : "";
     // Tracked, because Tab scrolls the row into view after the focus lands.
-    property <length> key-tip-x: root.absolute-position.x + 2px + root.selected * (root.segment-width + 2px);
+    property <length> key-tip-x: root.absolute-position.x + Theme.segment-inset + root.selected * (root.segment-width + Theme.segment-inset);
     property <length> key-tip-y: root.absolute-position.y + root.height + Theme.space-1;
 
     function pick(i: int) {
@@ -69,7 +70,7 @@ export component Segmented {
     }
 
     height: Theme.control-height;
-    min-width: root.items.length * 44px;
+    min-width: root.items.length * Theme.segment-min-width;
     accessible-role: radio-group;
     accessible-enabled: root.live;
 
@@ -77,14 +78,16 @@ export component Segmented {
         border-radius: Theme.radius-control;
         background: Theme.bg-inset;
         HorizontalLayout {
-            padding: 2px;
-            spacing: 2px;
+            padding: Theme.segment-inset;
+            spacing: Theme.segment-inset;
             for item[i] in root.items: Rectangle {
                 property <bool> on: i == root.selected;
                 property <bool> hover: root.live && (touch.has-hover || root.force-hover == i);
                 property <bool> down: root.live && (touch.pressed || root.force-pressed == i);
                 horizontal-stretch: 1;
-                border-radius: Theme.radius-control - 1px;
+                // DS-2.3: the inner fill's radius is the track's less its inset, at least radius-small.
+                border-radius: max(Theme.radius-control - Theme.segment-inset, Theme.radius-small);
+                animate background { duration: Theme.motion-quick; easing: ease-out; }
                 background: self.on ? (!root.live ? Theme.text-disabled : self.down ? Theme.accent-pressed : self.hover ? Theme.accent-hover : Theme.accent) : self.down ? Theme.bg-subtle-selected : self.hover ? Theme.bg-subtle-hover : transparent;
                 accessible-role: radio-button;
                 accessible-label: root.spoken[i] != "" ? root.spoken[i] : item;
@@ -95,7 +98,7 @@ export component Segmented {
                     root.pick(i);
                 }
                 if i == root.action: FocusRing {
-                    radius: Theme.radius-control - 1px;
+                    radius: max(Theme.radius-control - Theme.segment-inset, Theme.radius-small);
                     shown: root.key-focus && afs.has-focus;
                 }
                 Text {
@@ -108,6 +111,7 @@ export component Segmented {
                 }
                 touch := TouchArea {
                     enabled: root.live;
+                    mouse-cursor: pointer;
                     clicked => {
                         fs.focus();
                         // After `focus()`: its reason is not a pointer click, and this was one.
@@ -165,30 +169,648 @@ export component Segmented {
     }
 }
 
-// std ComboBox sized to the control column (240..360 px).
-export component Combo inherits ComboBox {
+
+// The one input shape (DS-8.1): control height, radius 4, `bg-control` fill, 1 px stroke with the
+// darker bottom edge; hover lifts the fill, editing draws a 1 px accent border (DS-8.2), the
+// keyboard adds the ring. Disabled and locked keep the rest fill (DS-8.3). Children go on top.
+component FieldFrame inherits Rectangle {
+    in property <bool> live: true;
+    in property <bool> hover;
+    in property <bool> editing;
+    in property <bool> ring;
+    in property <bool> invalid;
+    border-radius: Theme.radius-control;
+    background: root.live && root.hover && !root.editing ? Theme.bg-control-hover : Theme.bg-control;
+    // 1 px hairline: the field's stroke.
+    border-width: 1px;
+    border-color: root.invalid ? Theme.error-text : root.editing && root.live ? Theme.accent : Theme.stroke-control;
+    animate background, border-color { duration: Theme.motion-quick; easing: ease-out; }
+    // The darker bottom edge (1 px hairline), under the accent border while editing.
+    Rectangle {
+        visible: !root.editing && !root.invalid;
+        x: Theme.radius-control;
+        y: parent.height - 1px;
+        width: parent.width - 2 * Theme.radius-control;
+        height: 1px;
+        background: Theme.stroke-control-bottom;
+    }
+    @children
+    FocusRing {
+        shown: root.ring;
+    }
+}
+
+// A field's own button (the clear "x", DS-6.4): 24 px square, inset 4 from the field's edge, the
+// subtle hover of an IconButton. Not an IconButton and not a Tab stop: Esc clears too.
+component Adornment inherits Rectangle {
+    in property <image> icon;
+    in property <string> tip;
+    callback clicked;
+    width: Theme.adornment-size;
+    height: Theme.adornment-size;
+    border-radius: Theme.radius-control;
+    background: touch.pressed ? Theme.bg-subtle-selected : touch.has-hover ? Theme.bg-subtle-hover : transparent;
+    animate background { duration: Theme.motion-quick; easing: ease-out; }
+    accessible-role: button;
+    accessible-label: root.tip;
+    accessible-action-default => {
+        root.clicked();
+    }
+    Image {
+        source: root.icon;
+        width: Theme.icon-size-small;
+        height: Theme.icon-size-small;
+        colorize: touch.has-hover ? Theme.text-primary : Theme.text-secondary;
+        accessible-role: none;
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+    Tip {
+        text: root.tip;
+        hovered: touch.has-hover;
+    }
+}
+
+// One line of text. `clearable` adds the clear "x" while there is text (SearchField). The ring
+// shows when the focus came by keyboard; a click only draws the accent border (UI rule 17).
+export component TextField {
+    in-out property <string> text <=> input.text;
+    in property <string> placeholder-text;
+    in property <bool> enabled: true;
+    in property <bool> read-only;
     in property <bool> locked: Shell.locked;
-    enabled: !root.locked;
+    in property <InputType> input-type <=> input.input-type;
+    in property <bool> clearable;
+    // Gallery: forced hover, editing (accent border) and keyboard ring.
+    in property <bool> force-hover;
+    in property <bool> force-editing;
+    in property <bool> force-focus;
+    out property <bool> has-focus: input.has-focus;
+    out property <bool> has-hover: hover-area.has-hover;
+    callback edited(string);
+    callback accepted(string);
+
+    public function select-all() {
+        input.select-all();
+    }
+    public function clear-selection() {
+        input.clear-selection();
+    }
+
+    property <bool> live: root.enabled && !root.locked;
+    // shortcut: "keyboard focus" is focus gained while the pointer is not over the field, so a Tab
+    // with the mouse resting on this very field draws no ring; a FocusReason on TextInput fixes it.
+    property <bool> key-focus;
+    changed has-focus => {
+        if (self.has-focus) {
+            self.key-focus = !hover-area.has-hover;
+        }
+    }
+    property <bool> show-clear: root.clearable && root.text != "" && root.live && !root.read-only;
+    property <length> text-left: Theme.space-3;
+    property <length> text-right: root.show-clear ? Theme.adornment-size + 2 * Theme.space-1 : Theme.space-3;
+
+    forward-focus: input;
+    height: Theme.control-height;
+    min-width: 2 * Theme.adornment-size;
+    horizontal-stretch: 1;
+    accessible-role: text-input;
+    accessible-enabled: root.live;
+    accessible-value <=> root.text;
+    accessible-placeholder-text: root.placeholder-text;
+    accessible-read-only: root.read-only || root.locked;
+    accessible-action-set-value(v) => {
+        root.text = v;
+        root.edited(v);
+    }
+
+    // A parent TouchArea sees the hover and still hands the pointer to the text.
+    hover-area := TouchArea {
+        enabled: root.live;
+        mouse-cursor: MouseCursor.text;
+        FieldFrame {
+            live: root.live;
+            hover: hover-area.has-hover || root.force-hover;
+            editing: root.force-editing || input.has-focus;
+            ring: root.force-focus || (root.key-focus && input.has-focus);
+            Rectangle {
+                x: root.text-left;
+                width: parent.width - root.text-left - root.text-right;
+                clip: true;
+                Text {
+                    width: 100%;
+                    height: 100%;
+                    vertical-alignment: center;
+                    text: root.text == "" && input.preedit-text == "" ? root.placeholder-text : "";
+                    font-size: Theme.body-size;
+                    color: root.live ? Theme.text-secondary : Theme.text-disabled;
+                    overflow: elide;
+                    accessible-role: none;
+                }
+                input := TextInput {
+                    property <length> scroll-x;
+                    x: min(0px, max(parent.width - self.width - self.text-cursor-width, self.scroll-x));
+                    width: max(parent.width - self.text-cursor-width, self.preferred-width);
+                    height: 100%;
+                    vertical-alignment: center;
+                    single-line: true;
+                    enabled: root.enabled;
+                    read-only: root.read-only || root.locked;
+                    font-size: Theme.body-size;
+                    color: root.live ? Theme.text-primary : Theme.text-disabled;
+                    selection-background-color: Theme.accent;
+                    selection-foreground-color: Theme.on-accent;
+                    accessible-role: none;
+                    cursor-position-changed(at) => {
+                        if (at.x + self.scroll-x < 0) {
+                            self.scroll-x = -at.x;
+                        } else if (at.x + self.scroll-x > parent.width - self.text-cursor-width) {
+                            self.scroll-x = parent.width - at.x - self.text-cursor-width;
+                        }
+                    }
+                    accepted => {
+                        root.accepted(self.text);
+                    }
+                    edited => {
+                        root.edited(self.text);
+                    }
+                    key-pressed(event) => {
+                        if (event.text == Key.Escape && root.clearable && self.text != "") {
+                            self.text = "";
+                            root.edited("");
+                            return accept;
+                        }
+                        reject
+                    }
+                }
+            }
+            if root.show-clear: Adornment {
+                x: parent.width - self.width - Theme.space-1;
+                y: (parent.height - self.height) / 2;
+                icon: Icons.dismiss-16;
+                tip: @tr("Clear");
+                clicked => {
+                    root.text = "";
+                    root.edited("");
+                    input.focus();
+                }
+            }
+        }
+    }
+}
+
+// A filter field: a TextField with the clear "x" (DS-5.1 [43]); Esc clears too.
+export component SearchField inherits TextField {
+    clearable: true;
+}
+
+// Several lines in the input shape, at least `editor-min-height`; give it `vertical-stretch` (or
+// a height) to take the rest of a page. Scrolls inside itself and keeps the caret in view.
+export component TextArea {
+    in-out property <string> text <=> input.text;
+    in property <string> placeholder-text;
+    in property <bool> enabled: true;
+    in property <bool> read-only;
+    in property <bool> locked: Shell.locked;
+    in property <bool> force-hover;
+    in property <bool> force-editing;
+    in property <bool> force-focus;
+    out property <bool> has-focus: input.has-focus;
+    callback edited(string);
+
+    public function select-all() {
+        input.select-all();
+    }
+
+    property <bool> live: root.enabled && !root.locked;
+    // shortcut: as TextField's `key-focus`.
+    property <bool> key-focus;
+    changed has-focus => {
+        if (self.has-focus) {
+            self.key-focus = !hover-area.has-hover;
+        }
+    }
+
+    forward-focus: input;
+    min-height: Theme.editor-min-height;
+    min-width: Theme.control-column-min;
+    accessible-role: text-input;
+    accessible-enabled: root.live;
+    accessible-value <=> root.text;
+    accessible-placeholder-text: root.placeholder-text;
+    accessible-read-only: root.read-only || root.locked;
+    accessible-action-set-value(v) => {
+        root.text = v;
+        root.edited(v);
+    }
+
+    hover-area := TouchArea {
+        enabled: root.live;
+        mouse-cursor: MouseCursor.text;
+        FieldFrame {
+            live: root.live;
+            hover: hover-area.has-hover || root.force-hover;
+            editing: root.force-editing || input.has-focus;
+            ring: root.force-focus || (root.key-focus && input.has-focus);
+            view := ScrollBox {
+                x: Theme.space-3;
+                y: Theme.space-2;
+                width: parent.width - Theme.space-3 - Theme.space-1;
+                height: parent.height - 2 * Theme.space-2;
+                content-height: max(self.height, input.preferred-height);
+                input := TextInput {
+                    width: view.content-width;
+                    height: view.content-height;
+                    single-line: false;
+                    wrap: word-wrap;
+                    enabled: root.enabled;
+                    read-only: root.read-only || root.locked;
+                    font-size: Theme.body-size;
+                    color: root.live ? Theme.text-primary : Theme.text-disabled;
+                    selection-background-color: Theme.accent;
+                    selection-foreground-color: Theme.on-accent;
+                    page-height: view.height;
+                    accessible-role: none;
+                    edited => {
+                        root.edited(self.text);
+                    }
+                    cursor-position-changed(at) => {
+                        // A line of room below the caret, as the std editor keeps.
+                        if (at.y + view.viewport-y < 0) {
+                            view.viewport-y = -at.y;
+                        } else if (at.y + view.viewport-y > view.height - Theme.body-line) {
+                            view.viewport-y = min(0px, view.height - at.y - Theme.body-line);
+                        }
+                    }
+                }
+            }
+            Text {
+                x: Theme.space-3;
+                y: Theme.space-2;
+                width: parent.width - 2 * Theme.space-3;
+                text: root.text == "" && input.preedit-text == "" ? root.placeholder-text : "";
+                font-size: Theme.body-size;
+                color: root.live ? Theme.text-secondary : Theme.text-disabled;
+                wrap: word-wrap;
+                accessible-role: none;
+            }
+        }
+    }
+}
+
+// Shortens a path for a field (DS-13.1); the app wires `elide` to `oxi_core::paths::elide_path`
+// (path, character budget). Unwired it returns "" and `PathField` cuts the path at its end.
+export global PathText {
+    pure callback elide(string, int) -> string;
+}
+
+// A file or folder path (DS-13): at rest the field shows `display`, else the path elided in the
+// middle by `PathText` (root and file name whole) or, when the value is empty, `placeholder-text`
+// (the default, in secondary ink); with focus it holds the whole path as editable, selectable
+// text. The tooltip is the whole path. With `browse-text` set, a Browse button sits beside it and
+// `browse` hands over the current value, so the dialog opens there; the Open button is the page's.
+export component PathField {
+    in-out property <string> path;
+    in property <string> display;
+    in property <string> placeholder-text;
+    in property <string> browse-text;
+    in property <bool> enabled: true;
+    in property <bool> locked: Shell.locked;
+    in property <bool> force-hover;
+    in property <bool> force-focus;
+    callback edited(string);
+    callback accepted(string);
+    callback browse(string);
+    // Tab or Shift+Tab was pressed in the field: focus is about to move to another control.
+    callback tabbed();
+    // The text has the keyboard focus. It also drops when the window is deactivated (Alt+Tab),
+    // so a page must not undo unsaved text on it; it uses `tabbed` and its other controls' focus.
+    out property <bool> has-focus: field.has-focus;
+    // The text at rest; read by `tests/gallery.rs`.
+    out property <string> shown: root.display != "" ? root.display : root.elided != "" ? root.elided : root.path;
+    property <bool> live: root.enabled && !root.locked;
+    property <bool> focused: field.has-focus || root.force-focus;
+    property <length> room: field.width - 2 * Theme.space-3;
+    // The whole path's width; 0 until the window can measure text, so it is watched too.
+    property <length> full: measure.preferred-width;
+    // Characters that fit (-1: the whole path does): the path's length scaled by the room it gets,
+    // so it follows the font and the path's own letters. Set from `changed`, not bound: a binding
+    // that measures text would feed the drawn text, and the software renderer measures
+    // re-entrantly mid-draw (panics).
+    property <int> budget: -1;
+    function measure-budget() {
+        self.budget = self.full <= self.room ? -1 : floor(self.path.character-count * self.room / self.full);
+    }
+    init => {
+        self.measure-budget();
+    }
+    changed path => {
+        self.measure-budget();
+    }
+    changed full => {
+        self.measure-budget();
+    }
+    changed room => {
+        self.measure-budget();
+    }
+    // Bound, not set at init: the app wires `PathText` after the window is created.
+    property <string> elided: root.budget < 0 ? "" : PathText.elide(root.path, root.budget);
+    height: Theme.control-height;
+    min-width: Theme.control-column-min;
+    horizontal-stretch: 1;
+    forward-focus: field;
+    measure := Text {
+        visible: false;
+        text: root.path;
+        font-size: Theme.body-size;
+        accessible-role: none;
+    }
+    HorizontalLayout {
+        spacing: Theme.pair-gap;
+        Rectangle {
+            horizontal-stretch: 1;
+            // Not a tab stop (as in NumberField): only sees the keys of the field inside.
+            FocusScope {
+                enabled: false;
+                capture-key-pressed(event) => {
+                    if (event.text == Key.Tab || event.text == Key.Backtab) {
+                        root.tabbed();
+                    }
+                    reject
+                }
+                field := TextField {
+                    width: 100%;
+                    height: 100%;
+                    text <=> root.path;
+                    enabled: root.enabled;
+                    locked: root.locked;
+                    force-hover: root.force-hover;
+                    force-editing: root.force-focus;
+                    force-focus: root.force-focus;
+                    placeholder-text: root.placeholder-text;
+                    accessible-label: root.accessible-label;
+                    edited(t) => {
+                        root.edited(t);
+                    }
+                    accepted(t) => {
+                        root.accepted(t);
+                    }
+                }
+            }
+            // At rest: the elided path over the field's own text, on the field's fill, inside its stroke.
+            if !root.focused && root.path != "": Rectangle {
+                x: Theme.space-3;
+                y: 1px;
+                width: root.room;
+                // Inside the field's 1 px stroke, top and bottom.
+                height: parent.height - 2px;
+                background: root.live && (field.has-hover || root.force-hover) ? Theme.bg-control-hover : Theme.bg-control;
+                // The field's own fill fades: this patch fades with it (DS-5.3).
+                animate background { duration: Theme.motion-quick; easing: ease-out; }
+                Text {
+                    width: 100%;
+                    height: 100%;
+                    text: root.shown;
+                    font-size: Theme.body-size;
+                    color: root.live ? Theme.text-primary : Theme.text-disabled;
+                    vertical-alignment: center;
+                    // A name too long alone, or no `PathText` wired: cut at the end.
+                    overflow: elide;
+                    accessible-role: none;
+                }
+            }
+            Tip {
+                text: root.path;
+                hovered: field.has-hover;
+            }
+        }
+        if root.browse-text != "": Button {
+            text: root.browse-text;
+            enabled: root.live;
+            clicked => {
+                root.browse(root.path);
+            }
+        }
+    }
+}
+
+// The open list of a Combo: a popup card, rows in the subtle states, the current one selected.
+component ComboList inherits Rectangle {
+    in property <[string]> model;
+    in property <int> current;
+    in property <int> force-hover: -1;
+    callback picked(int);
+    property <length> row-h: Theme.control-height;
+    background: Theme.bg-control;
+    // 1 px hairline: the popup's stroke.
+    border-width: 1px;
+    border-color: Theme.stroke-control;
+    border-radius: Theme.radius-card;
+    ScrollBox {
+        x: Theme.space-1;
+        y: Theme.space-1;
+        width: parent.width - 2 * Theme.space-1;
+        height: parent.height - 2 * Theme.space-1;
+        content-height: root.model.length * root.row-h;
+        // Opens on the current row.
+        viewport-y: -max(0, (root.current + 1) * root.row-h - self.height);
+        for item[i] in root.model: Rectangle {
+            property <bool> on: i == root.current;
+            property <bool> hover: row-touch.has-hover || root.force-hover == i;
+            y: i * root.row-h;
+            height: root.row-h;
+            border-radius: Theme.radius-control;
+            background: row-touch.pressed ? Theme.bg-subtle-selected : self.on ? Theme.accent-tint : self.hover ? Theme.bg-subtle-hover : transparent;
+            animate background { duration: Theme.motion-quick; easing: ease-out; }
+            accessible-role: list-item;
+            accessible-label: item;
+            accessible-item-selectable: true;
+            accessible-item-selected: self.on;
+            accessible-action-default => {
+                root.picked(i);
+            }
+            Text {
+                x: Theme.space-2;
+                width: parent.width - 2 * Theme.space-2;
+                text: item;
+                font-size: Theme.body-size;
+                color: parent.on ? Theme.accent-text : Theme.text-primary;
+                vertical-alignment: center;
+                overflow: elide;
+                accessible-role: none;
+            }
+            row-touch := TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.picked(i);
+                }
+            }
+        }
+    }
+}
+
+// A closed list in the input shape with the `caret-down` chevron. Click, Space or Enter opens the
+// list over the field (DS-4.4: same x and width, it covers the field); Up/Down pick while closed and
+// while open; Enter, Space or Esc closes. No ring while the list is open (DS-4.3). As the std
+// ComboBox: `current-index` changes, then `selected` fires.
+export component Combo {
+    in property <[string]> model;
+    in-out property <int> current-index: 0;
+    out property <string> current-value: root.current-index >= 0 && root.current-index < root.model.length ? root.model[root.current-index] : "";
+    in property <bool> enabled: true;
+    in property <bool> locked: Shell.locked;
+    in property <bool> force-hover;
+    in property <bool> force-focus;
+    // Gallery: draw the open list in place (a static shot cannot open a popup).
+    in property <bool> force-open;
+    out property <bool> has-focus: fs.has-focus;
+    out property <bool> open: root.popup-focused || root.force-open;
+    callback selected(string);
+
+    property <bool> live: root.enabled && !root.locked;
+    property <bool> key-focus;
+    property <bool> popup-focused;
+    property <int> rows: min(Theme.combo-visible-rows, root.model.length);
+    property <length> list-h: root.rows * Theme.control-height + 2 * Theme.space-1;
+
+    public function select(i: int) {
+        if (root.live && i >= 0 && i < root.model.length) {
+            root.current-index = i;
+            root.selected(root.current-value);
+        }
+    }
+    function show-list() {
+        if (root.live && root.model.length > 0) {
+            popup.show();
+        }
+    }
+
+    forward-focus: fs;
+    height: Theme.control-height;
     min-width: Theme.control-column-min;
     max-width: Theme.control-column-max;
     horizontal-stretch: 1;
-}
+    accessible-role: combobox;
+    accessible-enabled: root.live;
+    accessible-expandable: true;
+    accessible-expanded: root.popup-focused;
+    accessible-value: root.current-value;
+    accessible-action-expand => {
+        root.show-list();
+    }
 
-export component TextField inherits LineEdit {
-    in property <bool> locked: Shell.locked;
-    read-only: root.locked;
-    opacity: root.locked ? 0.6 : 1;
-    font-size: Theme.body-size;
-    height: Theme.control-height;
-    horizontal-stretch: 1;
-}
-
-// At least six lines; give it `vertical-stretch` on the Text page to take the rest of the page.
-export component TextArea inherits TextEdit {
-    in property <bool> locked: Shell.locked;
-    read-only: root.locked;
-    opacity: root.locked ? 0.6 : 1;
-    font-size: Theme.body-size;
-    min-height: 120px;
-    wrap: word-wrap;
+    touch := TouchArea {
+        enabled: root.live;
+        mouse-cursor: pointer;
+        clicked => {
+            fs.focus();
+            root.key-focus = false;
+            root.show-list();
+        }
+    }
+    FieldFrame {
+        live: root.live;
+        hover: touch.has-hover || root.force-hover;
+        ring: !root.open && (root.force-focus || (root.key-focus && fs.has-focus));
+        Text {
+            x: Theme.space-3;
+            width: parent.width - Theme.space-3 - Theme.adornment-size - Theme.space-1;
+            text: root.current-value;
+            font-size: Theme.body-size;
+            color: root.live ? Theme.text-primary : Theme.text-disabled;
+            vertical-alignment: center;
+            overflow: elide;
+            accessible-role: none;
+        }
+        // The chevron's 24 px box, inset 4: part of the field, it hovers with it (DS-6.4).
+        Rectangle {
+            x: parent.width - self.width - Theme.space-1;
+            y: (parent.height - self.height) / 2;
+            width: Theme.adornment-size;
+            height: Theme.adornment-size;
+            border-radius: Theme.radius-control;
+            background: (touch.has-hover || root.force-hover) && root.live ? Theme.bg-subtle-hover : transparent;
+            animate background { duration: Theme.motion-quick; easing: ease-out; }
+            Image {
+                source: Icons.caret-down;
+                width: Theme.icon-size-small;
+                height: Theme.icon-size-small;
+                colorize: root.live ? Theme.text-secondary : Theme.text-disabled;
+                accessible-role: none;
+            }
+        }
+    }
+    fs := FocusScope {
+        enabled: root.live;
+        focus-on-click: false;
+        focus-gained(reason) => {
+            // Back from the list: as it was before, so a click draws no ring.
+            if (reason != FocusReason.popup-activation) {
+                root.key-focus = KeyFocus.from-key(reason);
+            }
+        }
+        key-pressed(event) => {
+            if (event.text == Key.UpArrow) {
+                root.select(max(root.current-index - 1, 0));
+                return accept;
+            }
+            if (event.text == Key.DownArrow) {
+                root.select(min(root.current-index + 1, root.model.length - 1));
+                return accept;
+            }
+            if (event.text == " " || event.text == Key.Return) {
+                root.show-list();
+                return accept;
+            }
+            reject
+        }
+    }
+    if root.force-open: ComboList {
+        y: 0;
+        width: root.width;
+        height: root.list-h;
+        model: root.model;
+        current: root.current-index;
+        force-hover: root.current-index + 1;
+    }
+    popup := PopupWindow {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.list-h;
+        close-policy: close-on-click-outside;
+        forward-focus: list-fs;
+        list-fs := FocusScope {
+            focus-changed-event => {
+                root.popup-focused = self.has-focus;
+            }
+            key-pressed(event) => {
+                if (event.text == Key.UpArrow) {
+                    root.select(max(root.current-index - 1, 0));
+                    return accept;
+                }
+                if (event.text == Key.DownArrow) {
+                    root.select(min(root.current-index + 1, root.model.length - 1));
+                    return accept;
+                }
+                if (event.text == Key.Return || event.text == Key.Escape || event.text == " ") {
+                    popup.close();
+                    return accept;
+                }
+                reject
+            }
+            ComboList {
+                model: root.model;
+                current: root.current-index;
+                picked(i) => {
+                    root.select(i);
+                    popup.close();
+                }
+            }
+        }
+    }
 }

@@ -138,12 +138,11 @@ pub fn summary(path: Option<&Path>, today: Date) -> Summary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log::scratch::scratch_dir;
 
     #[test]
     fn entries_land_in_the_file_and_the_summary() {
-        let dir = std::env::temp_dir().join(format!("oxi-dstats-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir(&format!("oxi-dstats-{}", std::process::id()));
         let path = dir.join(stats::FILE);
         let today = || Date::from_ymd(2026, 11, 7).unwrap();
         let recorder = Recorder::spawn(path.clone(), today).unwrap();
@@ -164,8 +163,7 @@ mod tests {
 
     #[test]
     fn entries_wait_for_a_file_that_cannot_be_loaded() {
-        let dir = std::env::temp_dir().join(format!("oxi-dstats-wait-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch_dir(&format!("oxi-dstats-wait-{}", std::process::id()));
         std::fs::create_dir_all(dir.join(stats::FILE)).unwrap(); // reading a directory fails
         let today = Date::from_ymd(2026, 11, 7).unwrap();
         let mut writer = Writer::new(dir.join(stats::FILE));

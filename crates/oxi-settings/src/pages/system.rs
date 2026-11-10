@@ -24,6 +24,7 @@ const FOLDER_MISSING: &str =
     "This folder is gone. Nothing is saved until it is back or you choose another one.";
 const FOLDER_READ_ONLY: &str =
     "This folder cannot be written to. Nothing is saved: choose another one.";
+const FOLDER_IS_A_FILE: &str = "This is a file, not a folder. Nothing is saved: choose a folder.";
 const FOLDER_REFUSED: &str = "The \"OxiYapper history\" folder here holds other files. Nothing is saved: choose another one.";
 
 pub fn bind(window: &AppWindow, ctx: &Ctx) {
@@ -84,8 +85,10 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     show_folder(&window.as_weak(), ctx, &check);
     let (w, c, t) = (window.as_weak(), ctx.clone(), check.clone());
     s.on_history_check(move || show_folder(&w, &c, &t));
+    let (w, c, t) = (window.as_weak(), ctx.clone(), check.clone());
+    s.on_history_browse(move |path| browse(&w, &c, &t, &path));
     let (w, c) = (window.as_weak(), ctx.clone());
-    s.on_history_browse(move || browse(&w, &c, &check));
+    s.on_history_folder_typed(move |text| typed(&w, &c, &check, &text));
 }
 
 /// The "!" of a size limit the GB field can only show rounded up: the daemon trims to the stored
@@ -115,23 +118,62 @@ fn whole(value: f32) -> u32 {
     value.round().max(0.0) as u32
 }
 
+/// The dialog starts at `path`, the field's text, or the nearest folder of it that exists
+/// (DS-13.4); picking the folder it opened on changes nothing.
 #[cfg(windows)]
-fn browse(weak: &Weak<AppWindow>, ctx: &Ctx, check: &Rc<Timer>) {
-    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-        match picked_folder(&path) {
-            Ok(folder) => {
-                apply(weak, ctx, |cfg| cfg.history.folder = folder);
-                show_folder(weak, ctx, check);
-            }
-            Err(e) => report(weak, Err(e)),
-        }
+fn browse(weak: &Weak<AppWindow>, ctx: &Ctx, check: &Rc<Timer>, path: &str) {
+    let mut dialog = rfd::FileDialog::new();
+    if let Some(dir) = Path::new(path.trim()).ancestors().find(|d| d.is_dir()) {
+        dialog = dialog.set_directory(dir);
     }
+    if let Some(path) = dialog.pick_folder() {
+        choose(weak, ctx, check, picked_folder(&path));
+    }
+}
+
+/// Enter in the folder field. Its unchanged text writes nothing, so the default folder is not
+/// pinned by a look at it; empty is the default folder again; a relative path is refused.
+fn typed(weak: &Weak<AppWindow>, ctx: &Ctx, check: &Rc<Timer>, text: &str) {
+    let text = text.trim().trim_matches('"');
+    let now = history::folder(
+        &ctx.config.borrow().config.history,
+        &ctx.layout.history_dir(),
+    );
+    if Path::new(text) == now {
+        return;
+    }
+    let folder = if text.is_empty() {
+        Ok(String::new())
+    } else if Path::new(text).is_absolute() {
+        // shortcut: the stat runs on the UI thread, so a share that is offline can stall it; move it
+        // to the check's thread when that shows up.
+        if fs::metadata(text).is_ok_and(|m| !m.is_dir()) {
+            Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, FOLDER_IS_A_FILE).into())
+        } else {
+            picked_folder(Path::new(text))
+        }
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Type the whole path of a folder, from its drive.",
+        )
+        .into())
+    };
+    choose(weak, ctx, check, folder);
+}
+
+/// Saves a chosen folder and shows it; a refused one is reported and the field shows the saved one.
+fn choose(weak: &Weak<AppWindow>, ctx: &Ctx, check: &Rc<Timer>, folder: Result<String, Error>) {
+    match folder {
+        Ok(folder) => apply(weak, ctx, |cfg| cfg.history.folder = folder),
+        Err(e) => report(weak, Err(e)),
+    }
+    show_folder(weak, ctx, check);
 }
 
 /// The config value for a picked folder. The app's own [`history::OWNED_DIR`] (what Open shows)
 /// stands for the folder around it: the daemon appends that name itself. A name that is not valid
 /// text would be stored as U+FFFD and point elsewhere, so it is refused.
-#[cfg(windows)]
 fn picked_folder(path: &Path) -> Result<String, Error> {
     let own = path
         .file_name()
@@ -152,7 +194,7 @@ fn picked_folder(path: &Path) -> Result<String, Error> {
 
 /// No native dialog on this OS: `can-browse` hides the button.
 #[cfg(not(windows))]
-fn browse(_: &Weak<AppWindow>, _: &Ctx, _: &Rc<Timer>) {}
+fn browse(_: &Weak<AppWindow>, _: &Ctx, _: &Rc<Timer>, _: &str) {}
 
 /// Fills the folder row. The check touches the disk and a UNC path to an offline host can block,
 /// so it runs off the UI thread; a newer check replaces the timer and drops the older answer.
@@ -202,6 +244,9 @@ fn show_folder(weak: &Weak<AppWindow>, ctx: &Ctx, check: &Rc<Timer>) {
 /// [`history::OWNED_DIR`] must be absent, empty or marked as the app's.
 fn folder_problem(chosen: &Path) -> &'static str {
     if !chosen.is_dir() {
+        if chosen.exists() {
+            return FOLDER_IS_A_FILE;
+        }
         return match chosen.parent() {
             Some(parent) if parent.is_dir() => writable(parent),
             _ => FOLDER_MISSING,
@@ -260,13 +305,12 @@ mod tests {
 
     #[test]
     fn the_owned_folder_stands_for_its_parent_and_bad_names_are_refused() {
-        let root = std::env::temp_dir().join(format!("oxi-picked-{}", std::process::id()));
+        let root = crate::testing::scratch_dir(&format!("oxi-picked-{}", std::process::id()));
         let own = root.join(history::OWNED_DIR);
         fs::create_dir_all(&own).unwrap();
         assert_eq!(picked_folder(&own).unwrap(), root.to_str().unwrap());
         assert_eq!(picked_folder(&root).unwrap(), root.to_str().unwrap());
         let lone = OsString::from_wide(&[u16::from(b'a'), 0xD800]);
         assert!(picked_folder(&root.join(lone)).is_err());
-        fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -155,13 +155,12 @@ fn sweep_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::scratch_dir;
     use std::time::Duration;
 
     #[test]
     fn a_file_that_cannot_be_removed_does_not_stop_the_sweep() {
-        let dir = std::env::temp_dir().join(format!("oxi-sweep-stuck-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir(&format!("oxi-sweep-stuck-{}", std::process::id()));
         let now = SystemTime::now();
         for name in ["a.bin.part", "b.bin.part"] {
             let f = File::create(dir.join(name)).unwrap();

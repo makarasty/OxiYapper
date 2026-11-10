@@ -5,15 +5,17 @@
 //! the machine (ARCHITECTURE 3); this module only carries values to the right worker.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
 use oxi_core::config::{Config, History};
-use oxi_core::ipc::{Push, TestFailure, TestOutcome};
+use oxi_core::ipc::{DeleteResult, Push, SoundWarning, TestFailure, TestOutcome};
 use oxi_core::machine::{
-    self, Effect, EngineWarning, Event, JobId, MachineConfig, Notice, Phase, PhaseCell, State,
+    self, Effect, EngineWarning, Event, JobId, MachineConfig, ModelFailure, Notice, OverlayState,
+    Phase, PhaseCell, State,
 };
-use oxi_core::paste::PasteOutcome;
+use oxi_core::paste::{ClipboardOnlyWhy, PasteOutcome};
 use oxi_core::tray::{self, TrayBadge};
 use oxi_core::types::Millis;
 use oxi_core::{stats, strings};
@@ -23,6 +25,10 @@ use super::cmd::{
     WhisperCmd, Workers,
 };
 use super::stats::Recorder;
+
+/// How long a quit waits for the dictation in flight: its text, or its audio back from the
+/// capture. Short, so a settings Restart (3 s wait for the pipe) finds this daemon gone.
+const SHUTDOWN_GRACE: Millis = Millis(2000);
 
 pub struct Coordinator<H> {
     state: State,
@@ -39,14 +45,25 @@ pub struct Coordinator<H> {
     /// The whisper worker's latest `EngineWarning`.
     engine_warning: Option<EngineWarning>,
     /// The sound worker's latest `Inbox::SoundWarnings`.
-    sound_warnings: Vec<String>,
+    sound_warnings: Vec<SoundWarning>,
     /// The history worker's latest `Inbox::HistoryWarning`.
     history_warning: Option<String>,
     /// The 16 kHz samples of a job being transcribed, kept for the history file; only while
-    /// `[history]` is on.
+    /// `[history]` is on or the job streamed a recording.
     history_audio: HashMap<JobId, Vec<f32>>,
+    /// The recording each job streamed to the history folder (`Inbox::JobAudio`), until its save
+    /// or `no_transcript`. It is what says "history was on" for that job: a spool made while
+    /// saving was on always ends as an entry or is deleted, whatever the setting is by then.
+    spools: HashMap<JobId, PathBuf>,
     /// The whisper worker's latest `Inbox::Backend`.
     backend: String,
+    /// The last `Event::ModelFailed` until a load works or the model setting changes.
+    model_failure: Option<ModelFailure>,
+    /// Whisper's progress of the job in `Phase::Transcribing`, 0 to 100; `None` outside it. The
+    /// overlay draws it from `Workers::progress`.
+    progress: Option<u8>,
+    /// The job last sent to whisper while `Phase::Transcribing`; a progress of another is late.
+    transcribing: Option<JobId>,
     config_error: Option<String>,
     /// Last warnings sent as `UiCmd::Warnings`.
     shown_warnings: Vec<String>,
@@ -66,6 +83,8 @@ pub struct Coordinator<H> {
     stats: Option<Recorder>,
     workers: Workers,
     hook: H,
+    /// Quit is waiting for the dictation in flight: its text goes to the clipboard, not pasted.
+    quitting: bool,
 }
 
 impl<H: ChordHook> Coordinator<H> {
@@ -91,7 +110,11 @@ impl<H: ChordHook> Coordinator<H> {
             sound_warnings: Vec::new(),
             history_warning: None,
             history_audio: HashMap::new(),
+            spools: HashMap::new(),
             backend: "none".into(),
+            model_failure: None,
+            progress: None,
+            transcribing: None,
             config_error: None,
             shown_warnings: Vec::new(),
             pending: None,
@@ -103,6 +126,7 @@ impl<H: ChordHook> Coordinator<H> {
             stats: Recorder::system(),
             workers,
             hook,
+            quitting: false,
         };
         c.send_config();
         c.sync_warnings();
@@ -118,11 +142,40 @@ impl<H: ChordHook> Coordinator<H> {
                 None => inbox.recv().map_err(|_| RecvTimeoutError::Disconnected),
             };
             match msg {
-                Ok(Inbox::Shutdown) | Err(RecvTimeoutError::Disconnected) => return,
+                Ok(Inbox::Shutdown) => return self.shutdown(inbox, &now, SHUTDOWN_GRACE),
+                Err(RecvTimeoutError::Disconnected) => return,
                 Ok(msg) => self.handle(msg, now()),
                 Err(RecvTimeoutError::Timeout) => self.handle(Inbox::Event(Event::Tick), now()),
             }
         }
+    }
+
+    /// Quit (tray, IPC `Shutdown`, settings Restart): a recording stops as on a session lock (its
+    /// audio kept after speech), then the dictation in flight gets `grace` to finish. Its text
+    /// goes to the history and the clipboard. What is still running then is cut: whisper stops at
+    /// its next check, and a streamed recording stays in the history folder (kept as failed).
+    fn shutdown(mut self, inbox: &Receiver<Inbox>, now: &impl Fn() -> Millis, grace: Millis) {
+        tracing::info!(phase = ?self.state.phase(), "shutdown requested");
+        self.quitting = true;
+        self.handle(Inbox::Event(Event::Lock), now());
+        let end = now() + grace;
+        while self.state.busy() {
+            let left = end - now();
+            if left == Millis(0) {
+                // Whisper's cancel check reads the phase: Idle ends its run.
+                self.phase.store(Phase::Idle);
+                tracing::warn!("shutdown: a dictation was cut short; a saved recording is kept");
+                return;
+            }
+            match inbox.recv_timeout(Duration::from_millis(left.0)) {
+                // Nothing new starts now; an IPC ask is dropped, its connection sees it.
+                Ok(Inbox::Event(Event::ChordDown) | Inbox::Ipc(_) | Inbox::Shutdown)
+                | Err(RecvTimeoutError::Timeout) => {}
+                Ok(msg) => self.handle(msg, now()),
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        tracing::info!("shutdown: no dictation in flight");
     }
 
     pub fn handle(&mut self, msg: Inbox, now: Millis) {
@@ -140,8 +193,15 @@ impl<H: ChordHook> Coordinator<H> {
                     // A failed paste raises its notice again in `feed`.
                     self.failed.clear();
                 }
+                match event {
+                    Event::ModelFailed(why) => self.model_failure = Some(why),
+                    Event::ModelLoaded => self.model_failure = None,
+                    _ => {}
+                }
                 if event == Event::ModelLoaded {
-                    self.clear_failed(|n, _| matches!(n, Notice::NoModel | Notice::ModelBad));
+                    self.clear_failed(|n, _| {
+                        matches!(n, Notice::NoModel | Notice::ModelBad | Notice::OutOfMemory)
+                    });
                 }
                 self.feed(event, now);
             }
@@ -150,20 +210,14 @@ impl<H: ChordHook> Coordinator<H> {
                     self.feed(event, now);
                 }
             }
-            Inbox::JobAudio { job, samples } => {
-                // Sound from a recording started after the failure; the one that lost its
-                // device delivers its own tail first.
-                let capture = self.capture;
-                self.clear_failed(|n, session| {
-                    matches!(n, Notice::DeviceLost | Notice::CaptureFailed) && session < capture
-                });
-                self.spoken.insert(job, stats::audio_length(samples.len()));
-                self.audio.insert(job, samples);
-                self.feed(Event::JobAudioReady(job), now);
-            }
+            Inbox::JobAudio {
+                job,
+                samples,
+                spool,
+            } => self.job_audio(job, samples, spool, now),
             Inbox::Transcribed { job, text: None } => {
                 self.spoken.remove(&job);
-                self.history_audio.remove(&job);
+                self.no_transcript(job);
                 self.feed(Event::TranscriptionFailed(job), now);
             }
             Inbox::Transcribed {
@@ -174,14 +228,20 @@ impl<H: ChordHook> Coordinator<H> {
                 let empty = text.trim().is_empty();
                 if empty {
                     self.spoken.remove(&job);
-                    self.history_audio.remove(&job);
+                    self.no_transcript(job);
                 } else {
                     let cfg = self.latest_history();
+                    let spool = self.spools.remove(&job);
                     if let Some(samples) = self.history_audio.remove(&job) {
                         let text = text.clone();
                         send(
                             &self.workers.history,
-                            HistoryCmd::Save { samples, text, cfg },
+                            HistoryCmd::Save {
+                                samples,
+                                text,
+                                cfg,
+                                spool,
+                            },
                         );
                     } else {
                         // Saving is off: nothing to write, but the limits still act (SPEC History).
@@ -205,6 +265,12 @@ impl<H: ChordHook> Coordinator<H> {
             Inbox::SoundWarnings(lines) => self.sound_warnings = lines,
             Inbox::HistoryWarning(line) => self.history_warning = line,
             Inbox::Backend(device) => self.backend = device,
+            Inbox::Progress { job, percent } => {
+                if self.state.phase() == Phase::Transcribing && self.transcribing == Some(job) {
+                    self.set_progress(Some(percent));
+                }
+            }
+            Inbox::ModelDownloaded(id) => self.model_downloaded(&id, now),
             Inbox::AssetsChanged => send(&self.workers.whisper, WhisperCmd::ReloadAssets),
             Inbox::Ipc(ask) => self.ipc(ask),
             Inbox::CopyLastText => {
@@ -220,6 +286,21 @@ impl<H: ChordHook> Coordinator<H> {
             }
             Inbox::Shutdown => {} // `run` ends the loop before it gets here
         }
+    }
+
+    fn job_audio(&mut self, job: JobId, samples: Vec<f32>, spool: Option<PathBuf>, now: Millis) {
+        if let Some(spool) = spool {
+            self.spools.insert(job, spool);
+        }
+        // Sound from a recording started after the failure; the one that lost its
+        // device delivers its own tail first.
+        let capture = self.capture;
+        self.clear_failed(|n, session| {
+            matches!(n, Notice::DeviceLost | Notice::CaptureFailed) && session < capture
+        });
+        self.spoken.insert(job, stats::audio_length(samples.len()));
+        self.audio.insert(job, samples);
+        self.feed(Event::JobAudioReady(job), now);
     }
 
     fn ipc(&mut self, ask: IpcAsk) {
@@ -254,6 +335,54 @@ impl<H: ChordHook> Coordinator<H> {
                 }
             }
             IpcAsk::TestDone => send(&self.workers.whisper, WhisperCmd::TestDone),
+            IpcAsk::DeleteModel { id, reply } => {
+                if self.state.phase() == Phase::Idle {
+                    send(&self.workers.whisper, WhisperCmd::DeleteModel { id, reply });
+                } else {
+                    reply.send(Push::ModelDeleted {
+                        id,
+                        result: DeleteResult::InUse,
+                    });
+                }
+            }
+        }
+    }
+
+    /// No text will come for `job`: its recording, streamed to the history folder, is kept as
+    /// failed. The history worker files it at once.
+    fn no_transcript(&mut self, job: JobId) {
+        self.history_audio.remove(&job);
+        if let Some(spool) = self.spools.remove(&job)
+            && super::history::no_transcript(&spool)
+        {
+            send(
+                &self.workers.history,
+                HistoryCmd::Config(self.latest_history()),
+            );
+        }
+    }
+
+    /// Model `id` was downloaded. When it is the configured one and its load failed (deleted, a
+    /// bad file), the machine tries it again instead of refusing every dictation until a config
+    /// change, and the failure's tray badge goes at once.
+    fn model_downloaded(&mut self, id: &str, now: Millis) {
+        let config = self.pending.as_ref().map_or(&self.active, |(c, _)| c);
+        if config.model.id == id && self.model_failure.is_some() {
+            let machine = MachineConfig::from(config);
+            self.model_failure = None;
+            self.clear_failed(|n, _| {
+                matches!(n, Notice::NoModel | Notice::ModelBad | Notice::OutOfMemory)
+            });
+            // The same config again: the machine leaves Failed when it applies it (at Idle).
+            self.feed(Event::ConfigChanged(machine), now);
+        }
+    }
+
+    /// Tells the overlay when whisper's percent changed.
+    fn set_progress(&mut self, percent: Option<u8>) {
+        if self.progress != percent {
+            self.progress = percent;
+            self.workers.progress.set(percent);
         }
     }
 
@@ -272,6 +401,10 @@ impl<H: ChordHook> Coordinator<H> {
             let effects = machine::step(&mut self.state, event, now);
             let phase = self.state.phase();
             self.phase.store(phase);
+            if phase != Phase::Transcribing {
+                self.transcribing = None;
+                self.set_progress(None);
+            }
             if phase != self.tray {
                 self.tray = phase;
                 self.ui(UiCmd::Tray(phase));
@@ -288,21 +421,50 @@ impl<H: ChordHook> Coordinator<H> {
             Effect::StartCapture => {
                 self.capture += 1;
                 let session = self.capture;
+                tracing::info!(session, "recording started");
                 send(&self.workers.audio, AudioCmd::Start { session });
             }
-            Effect::StopCapture(job) => send(&self.workers.audio, AudioCmd::Stop(job)),
-            Effect::DiscardCapture => send(&self.workers.audio, AudioCmd::Discard),
+            Effect::StopCapture(job) => {
+                tracing::info!(?job, "recording stopped");
+                send(&self.workers.audio, AudioCmd::Stop(job));
+            }
+            Effect::DiscardCapture => {
+                tracing::info!("recording discarded");
+                send(&self.workers.audio, AudioCmd::Discard);
+            }
             Effect::DropJob(job) => {
                 self.audio.remove(&job);
                 self.text.remove(&job);
                 self.spoken.remove(&job);
-                self.history_audio.remove(&job);
+                self.no_transcript(job);
+            }
+            Effect::KeepCancelled(job) => {
+                self.spoken.remove(&job);
+                if let Some(samples) = self.audio.remove(&job) {
+                    // Interim route until t10's history API has a cancelled entry: the audio is
+                    // saved as a dictation with no text, so "kept" is true while history is on.
+                    let cfg = self.latest_history();
+                    let text = String::new();
+                    let spool = self.spools.remove(&job);
+                    send(
+                        &self.workers.history,
+                        HistoryCmd::Save {
+                            samples,
+                            text,
+                            cfg,
+                            spool,
+                        },
+                    );
+                }
             }
             Effect::Preload => send(&self.workers.whisper, WhisperCmd::Preload),
             Effect::Unload => send(&self.workers.whisper, WhisperCmd::Unload),
             Effect::Transcribe(job) => {
                 if let Some(samples) = self.audio.remove(&job) {
-                    if self.active.history.enabled {
+                    self.transcribing = Some(job);
+                    // The same `[history]` the save is sent with; a streamed recording needs its
+                    // save whatever the setting is now.
+                    if self.latest_history().enabled || self.spools.contains_key(&job) {
                         self.history_audio.insert(job, samples.clone());
                     }
                     send(
@@ -315,23 +477,7 @@ impl<H: ChordHook> Coordinator<H> {
                     return Some(Event::TranscriptionFailed(job));
                 }
             }
-            Effect::Paste(job) => match self.text.get(&job) {
-                Some(text) => send(
-                    &self.workers.paste,
-                    PasteCmd::Paste {
-                        job,
-                        text: text.clone(),
-                        cfg: self.active.paste.clone(),
-                    },
-                ),
-                // Cannot happen (empty text is never pasted); fail the job, not the machine.
-                None => {
-                    return Some(Event::PasteDone {
-                        job,
-                        outcome: PasteOutcome::Failed,
-                    });
-                }
-            },
+            Effect::Paste(job) => return self.paste(job),
             Effect::PollChord => {
                 return Some(Event::ChordPolled {
                     held: self.hook.chord_held(),
@@ -340,13 +486,25 @@ impl<H: ChordHook> Coordinator<H> {
             Effect::ReinstallHook => self.hook.reinstall(),
             Effect::ApplyConfig => {
                 if let Some((config, warnings)) = self.pending.take() {
+                    if config.model.id != self.active.model.id {
+                        self.model_failure = None; // another model: not tried yet
+                    }
                     self.active = config;
                     self.warnings = warnings;
                     self.send_config();
                 }
             }
             Effect::Play(sound) => send(&self.workers.sound, SoundCmd::Play(sound)),
-            Effect::Overlay(state) => self.ui(UiCmd::Overlay(state)),
+            Effect::Overlay(state) => {
+                if let OverlayState::Recording {
+                    locked: true,
+                    ending_soon: false,
+                } = state
+                {
+                    tracing::info!("recording locked");
+                }
+                self.ui(UiCmd::Overlay(state));
+            }
             Effect::Notify(notice) => {
                 if tray::is_error(notice) {
                     self.failed.retain(|&(n, _)| n != notice);
@@ -355,6 +513,27 @@ impl<H: ChordHook> Coordinator<H> {
                 self.ui(UiCmd::Notify(notice));
             }
         }
+        None
+    }
+
+    /// Hands the text of `job` to the paste worker; the event when the paste is answered here.
+    fn paste(&self, job: JobId) -> Option<Event> {
+        // Cannot happen (empty text is never pasted); fail the job, not the machine.
+        let Some(text) = self.text.get(&job) else {
+            let outcome = PasteOutcome::Failed;
+            return Some(Event::PasteDone { job, outcome });
+        };
+        let text = text.clone();
+        if self.quitting {
+            // At quit the focus is the tray or a closing window: the text waits on the
+            // clipboard, and the notice says so ("press Ctrl+V").
+            let in_history = self.active.paste.keep_in_clipboard_history;
+            send(&self.workers.paste, PasteCmd::CopyOnly { text, in_history });
+            let outcome = PasteOutcome::ClipboardOnly(ClipboardOnlyWhy::ModifiersHeld);
+            return Some(Event::PasteDone { job, outcome });
+        }
+        let cfg = self.active.paste.clone();
+        send(&self.workers.paste, PasteCmd::Paste { job, text, cfg });
         None
     }
 
@@ -404,7 +583,9 @@ impl<H: ChordHook> Coordinator<H> {
             device: self.active.audio.device.clone(),
             gpu: self.active.model.gpu.clone(),
             backend: self.backend.clone(),
+            model_failure: self.model_failure,
             warnings: self.warnings(),
+            sounds: self.sound_warnings.clone(),
         }
     }
 
@@ -415,7 +596,7 @@ impl<H: ChordHook> Coordinator<H> {
             .iter()
             .cloned()
             .chain(self.engine_warning.as_ref().map(strings::engine_warning))
-            .chain(self.sound_warnings.iter().cloned())
+            .chain(self.sound_warnings.iter().map(|w| w.line.clone()))
             .chain(self.history_warning.clone())
             .chain(self.config_error.clone())
             .collect()
@@ -483,8 +664,10 @@ mod tests {
     use oxi_core::types::Language;
 
     use crate::daemon::cmd::TestJob;
+    use oxi_platform::os::overlay::Progress;
 
     use super::*;
+    use crate::log::scratch::scratch_dir;
 
     #[derive(Default)]
     struct FakeHook {
@@ -514,6 +697,8 @@ mod tests {
         sound: Receiver<SoundCmd>,
         history: Receiver<HistoryCmd>,
         ui: Receiver<UiCmd>,
+        /// What the overlay would draw.
+        progress: Progress,
     }
 
     fn drain<T>(rx: &Receiver<T>) -> Vec<T> {
@@ -523,7 +708,9 @@ mod tests {
     impl Rig {
         /// A coordinator with the default config; the start-up config commands are drained.
         fn new() -> Self {
-            Self::with(Config::default())
+            let mut config = Config::default();
+            config.hotkey.esc_cancels = true; // the Esc tests; off is the default
+            Self::with(config)
         }
 
         fn with(config: Config) -> Self {
@@ -533,6 +720,7 @@ mod tests {
             let (sound_tx, sound) = channel();
             let (history_tx, history) = channel();
             let (ui_tx, ui) = channel();
+            let progress = Progress::default();
             let workers = Workers {
                 audio: audio_tx,
                 whisper: whisper_tx,
@@ -541,6 +729,7 @@ mod tests {
                 history: history_tx,
                 ui: ui_tx,
                 wake_ui: Box::new(|| {}),
+                progress: progress.clone(),
             };
             let hook = Rc::new(FakeHook {
                 held: Cell::new(true),
@@ -558,6 +747,7 @@ mod tests {
                 sound,
                 history,
                 ui,
+                progress,
             };
             rig.drain_all();
             rig
@@ -600,6 +790,7 @@ mod tests {
                 Inbox::JobAudio {
                     job,
                     samples: vec![0.5; 4],
+                    spool: None,
                 },
                 Millis(2100),
             );
@@ -612,6 +803,95 @@ mod tests {
             );
             job
         }
+    }
+
+    #[test]
+    fn the_last_model_load_failure_shows_in_status_until_a_load_works() {
+        let mut rig = Rig::new();
+        assert_eq!(rig.c.status().model_failure, None);
+        for why in [ModelFailure::Bad, ModelFailure::OutOfMemory] {
+            rig.event(Event::ModelFailed(why), 0);
+            assert_eq!(rig.c.status().model_failure, Some(why));
+            rig.event(Event::ModelLoaded, 10);
+            assert_eq!(rig.c.status().model_failure, None);
+        }
+    }
+
+    #[test]
+    fn whisper_progress_is_kept_only_while_transcribing() {
+        let mut rig = Rig::new();
+        rig.event(Event::ModelLoaded, 0);
+        let job = rig.record();
+        rig.c.handle(
+            Inbox::JobAudio {
+                job,
+                samples: vec![0.5; 4],
+                spool: None,
+            },
+            Millis(2100),
+        );
+        assert_eq!(rig.c.state.phase(), Phase::Transcribing);
+        assert_eq!(rig.progress.get(), None, "unknown until whisper reports");
+        let other = JobId(job.0 + 1);
+        rig.c.handle(
+            Inbox::Progress {
+                job: other,
+                percent: 70,
+            },
+            Millis(2150),
+        );
+        assert_eq!(rig.progress.get(), None, "another job's progress is late");
+        rig.c
+            .handle(Inbox::Progress { job, percent: 40 }, Millis(2200));
+        assert_eq!(rig.c.progress, Some(40));
+        assert_eq!(rig.progress.get(), Some(40), "the overlay draws it");
+        rig.c.handle(
+            Inbox::Transcribed {
+                job,
+                text: Some("x".into()),
+            },
+            Millis(2500),
+        );
+        assert_eq!(rig.c.progress, None, "gone with the phase");
+        assert_eq!(rig.progress.get(), None, "the next pill starts unknown");
+        // A late progress after the job ended is not kept.
+        rig.c
+            .handle(Inbox::Progress { job, percent: 90 }, Millis(2600));
+        assert_eq!(rig.c.progress, None);
+    }
+
+    #[test]
+    fn a_model_delete_waits_for_idle() {
+        let mut rig = Rig::new();
+        let reply = crate::daemon::ipc::Pushes::default();
+        let (_, window) = reply.claim(1);
+        let ask = || {
+            Inbox::Ipc(IpcAsk::DeleteModel {
+                id: "turbo".into(),
+                reply: reply.clone(),
+            })
+        };
+        rig.c.handle(ask(), Millis(0));
+        assert!(
+            drain(&rig.whisper)
+                .iter()
+                .any(|c| matches!(c, WhisperCmd::DeleteModel { id, .. } if id == "turbo"))
+        );
+        assert!(window.try_recv().is_err(), "the whisper worker answers");
+        rig.event(Event::ChordDown, 100);
+        rig.c.handle(ask(), Millis(200));
+        assert!(
+            !drain(&rig.whisper)
+                .iter()
+                .any(|c| matches!(c, WhisperCmd::DeleteModel { .. }))
+        );
+        assert_eq!(
+            window.try_recv().unwrap(),
+            Push::ModelDeleted {
+                id: "turbo".into(),
+                result: DeleteResult::InUse
+            }
+        );
     }
 
     #[test]
@@ -680,6 +960,7 @@ mod tests {
             Inbox::JobAudio {
                 job,
                 samples: vec![0.25, -0.5],
+                spool: None,
             },
             Millis(2100),
         );
@@ -769,7 +1050,9 @@ mod tests {
             drain(&rig.history)
                 .into_iter()
                 .filter_map(|c| match c {
-                    HistoryCmd::Save { samples, text, cfg } => Some((samples.len(), text, cfg)),
+                    HistoryCmd::Save {
+                        samples, text, cfg, ..
+                    } => Some((samples.len(), text, cfg)),
                     HistoryCmd::Config(_) => None,
                 })
                 .collect::<Vec<_>>()
@@ -778,11 +1061,20 @@ mod tests {
             rig.event(Event::ModelLoaded, 0);
             let job = rig.record();
             let samples = vec![0.1; 16_000];
-            rig.c.handle(Inbox::JobAudio { job, samples }, Millis(2100));
+            rig.c.handle(
+                Inbox::JobAudio {
+                    job,
+                    samples,
+                    spool: None,
+                },
+                Millis(2100),
+            );
             let text = text.map(str::to_owned);
             rig.c.handle(Inbox::Transcribed { job, text }, Millis(2500));
         };
-        let mut off = Rig::new();
+        let mut config = Config::default();
+        config.history.enabled = false;
+        let mut off = Rig::with(config);
         dictate(&mut off, Some("hello"));
         assert!(saves(&off).is_empty(), "off writes nothing");
         assert!(off.c.history_audio.is_empty());
@@ -805,11 +1097,20 @@ mod tests {
 
     #[test]
     fn a_dictation_with_history_off_still_sends_the_prune() {
-        let mut rig = Rig::new();
+        let mut config = Config::default();
+        config.history.enabled = false;
+        let mut rig = Rig::with(config);
         rig.event(Event::ModelLoaded, 0);
         let job = rig.record();
         let samples = vec![0.1; 16_000];
-        rig.c.handle(Inbox::JobAudio { job, samples }, Millis(2100));
+        rig.c.handle(
+            Inbox::JobAudio {
+                job,
+                samples,
+                spool: None,
+            },
+            Millis(2100),
+        );
         let text = Some("hello".to_owned());
         rig.c.handle(Inbox::Transcribed { job, text }, Millis(2500));
         let sent = drain(&rig.history);
@@ -827,7 +1128,14 @@ mod tests {
         rig.event(Event::ModelLoaded, 0);
         let job = rig.record();
         let samples = vec![0.1; 16_000];
-        rig.c.handle(Inbox::JobAudio { job, samples }, Millis(2100));
+        rig.c.handle(
+            Inbox::JobAudio {
+                job,
+                samples,
+                spool: None,
+            },
+            Millis(2100),
+        );
         config.history.enabled = false;
         rig.c.handle(
             Inbox::Config {
@@ -861,9 +1169,7 @@ mod tests {
 
     #[test]
     fn a_finished_dictation_updates_the_stats_file_a_failed_one_does_not() {
-        let dir = std::env::temp_dir().join(format!("oxi-coord-stats-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir(&format!("oxi-coord-stats-{}", std::process::id()));
         let path = dir.join(stats::FILE);
         let today = || stats::Date::from_ymd(2026, 11, 7).unwrap();
         for outcome in [PasteOutcome::Failed, PasteOutcome::Pasted] {
@@ -872,7 +1178,14 @@ mod tests {
             rig.event(Event::ModelLoaded, 0);
             let job = rig.record();
             let samples = vec![0.1; 16_000]; // 1 s
-            rig.c.handle(Inbox::JobAudio { job, samples }, Millis(2100));
+            rig.c.handle(
+                Inbox::JobAudio {
+                    job,
+                    samples,
+                    spool: None,
+                },
+                Millis(2100),
+            );
             let text = Some("Привет, мир".to_owned());
             rig.c.handle(Inbox::Transcribed { job, text }, Millis(2500));
             rig.event(Event::PasteDone { job, outcome }, 3000);
@@ -910,6 +1223,7 @@ mod tests {
                 Inbox::JobAudio {
                     job,
                     samples: vec![0.0],
+                    spool: None,
                 },
                 Millis(2100),
             );
@@ -995,6 +1309,54 @@ mod tests {
     }
 
     #[test]
+    fn esc_after_speech_keeps_the_audio_in_the_history_and_never_transcribes() {
+        let mut rig = Rig::new();
+        rig.event(Event::ModelLoaded, 0);
+        rig.event(Event::ChordDown, 0);
+        // Capture session 1 heard speech; a stale session's speech is ignored.
+        rig.c.handle(
+            Inbox::Capture {
+                session: 1,
+                event: Event::SpeechHeard,
+            },
+            Millis(100),
+        );
+        rig.event(Event::Esc, 500);
+        let job = drain(&rig.audio)
+            .into_iter()
+            .find_map(|c| match c {
+                AudioCmd::Stop(job) => Some(job),
+                _ => None,
+            })
+            .expect("capture stopped, not discarded");
+        drain(&rig.history);
+        let samples = vec![0.1; 8_000];
+        rig.c.handle(
+            Inbox::JobAudio {
+                job,
+                samples,
+                spool: None,
+            },
+            Millis(600),
+        );
+
+        let saved = drain(&rig.history);
+        assert!(
+            matches!(saved.as_slice(), [HistoryCmd::Save { samples, text, .. }]
+                if samples.len() == 8_000 && text.is_empty()),
+            "{} history commands",
+            saved.len()
+        );
+        assert!(
+            !drain(&rig.whisper)
+                .iter()
+                .any(|c| matches!(c, WhisperCmd::Transcribe { .. }))
+        );
+        assert!(rig.c.audio.is_empty());
+        assert_eq!(rig.phase.load(), Phase::Idle);
+    }
+
+    #[test]
     fn config_received_while_recording_applies_when_idle() {
         let mut rig = Rig::new();
         rig.event(Event::ChordDown, 0);
@@ -1064,14 +1426,19 @@ mod tests {
         let status = |rig: &mut Rig| {
             let (tx, rx) = channel();
             rig.c.handle(Inbox::Ipc(IpcAsk::Status(tx)), Millis(20));
-            rx.try_recv().expect("status answered").warnings
+            let report = rx.try_recv().expect("status answered");
+            (report.warnings, report.sounds)
         };
-        let line = "sounds.start: cannot read the file (entity not found), using rise";
+        let warning = SoundWarning {
+            kind: oxi_core::ipc::SoundWarningKind::Unused(Sound::Start),
+            line: "sounds.start: cannot read the file (entity not found), using rise".into(),
+        };
         rig.c
-            .handle(Inbox::SoundWarnings(vec![line.into()]), Millis(20));
-        assert_eq!(status(&mut rig), [line]);
+            .handle(Inbox::SoundWarnings(vec![warning.clone()]), Millis(20));
+        let line = warning.line.clone();
+        assert_eq!(status(&mut rig), (vec![line], vec![warning]));
         rig.c.handle(Inbox::SoundWarnings(Vec::new()), Millis(30));
-        assert_eq!(status(&mut rig), [] as [String; 0]);
+        assert_eq!(status(&mut rig), (Vec::new(), Vec::new()));
     }
 
     #[test]
@@ -1181,7 +1548,14 @@ mod tests {
         };
         let audio = |rig: &mut Rig, job, at| {
             let samples = vec![0.5; 4];
-            rig.c.handle(Inbox::JobAudio { job, samples }, Millis(at));
+            rig.c.handle(
+                Inbox::JobAudio {
+                    job,
+                    samples,
+                    spool: None,
+                },
+                Millis(at),
+            );
         };
         let mut rig = Rig::new();
 
@@ -1237,6 +1611,72 @@ mod tests {
         let text = Some("three".to_owned());
         rig.c.handle(Inbox::Transcribed { job, text }, Millis(2300));
         assert_eq!(badges(&rig), [TrayBadge::None], "a transcription worked");
+    }
+
+    /// History turned on while busy: the worker streams already (it gets the newest `[history]`)
+    /// but the active config, applied at Idle, still says off. The transcribed job must be saved,
+    /// not left waiting until quit and kept as failed.
+    #[test]
+    fn a_job_that_streamed_a_recording_is_saved_whatever_the_active_setting_says() {
+        let mut config = Config::default();
+        config.history.enabled = false;
+        let mut rig = Rig::with(config.clone());
+        rig.event(Event::ModelLoaded, 0);
+        let job = rig.record();
+        config.history.enabled = true;
+        let (config, warnings) = (Box::new(config), Vec::new());
+        rig.c
+            .handle(Inbox::Config { config, warnings }, Millis(1500));
+        let spool = PathBuf::from("h/2026-11-10/120000-000.wav.part");
+        let (samples, text) = (vec![0.5; 4], Some("hello".to_owned()));
+        let audio = Inbox::JobAudio {
+            job,
+            samples,
+            spool: Some(spool.clone()),
+        };
+        rig.c.handle(audio, Millis(2100));
+        rig.c.handle(Inbox::Transcribed { job, text }, Millis(2500));
+        let saves: Vec<_> = drain(&rig.history)
+            .into_iter()
+            .filter_map(|cmd| match cmd {
+                HistoryCmd::Save { spool, cfg, .. } => Some((spool, cfg.enabled)),
+                HistoryCmd::Config(_) => None,
+            })
+            .collect();
+        assert_eq!(saves, [(Some(spool), true)]);
+        assert!(rig.c.spools.is_empty() && rig.c.history_audio.is_empty());
+    }
+
+    /// t13: deleting the configured model fails it as `Missing`; downloading it again must let
+    /// dictation start without a config change.
+    #[test]
+    fn a_download_of_the_deleted_model_lets_dictation_start_again() {
+        let mut config = Config::default();
+        config.model.id = "t10b-downloaded-again".into(); // no other test downloads this id
+        let mut rig = Rig::with(config);
+        rig.event(Event::ModelLoaded, 0);
+        rig.event(Event::ModelFailed(ModelFailure::Missing), 10);
+        let starts = |rig: &Rig| {
+            drain(&rig.audio)
+                .iter()
+                .filter(|c| matches!(c, AudioCmd::Start { .. }))
+                .count()
+        };
+        rig.event(Event::ChordDown, 100);
+        rig.event(Event::ChordUp, 150);
+        assert_eq!(starts(&rig), 0, "refused while the file is gone");
+        assert_eq!(rig.c.badge, TrayBadge::Error);
+        rig.c
+            .handle(Inbox::ModelDownloaded("another-model".into()), Millis(200));
+        assert_eq!(rig.c.status().model_failure, Some(ModelFailure::Missing));
+        rig.c.handle(
+            Inbox::ModelDownloaded("t10b-downloaded-again".into()),
+            Millis(300),
+        );
+        assert_eq!(rig.c.badge, TrayBadge::None, "the cause is gone");
+        rig.event(Event::ChordDown, 5000);
+        assert_eq!(starts(&rig), 1, "the downloaded model is tried again");
+        assert_eq!(rig.c.status().model_failure, None);
     }
 
     #[test]
@@ -1299,7 +1739,144 @@ mod tests {
             tx.send(msg).expect("open channel");
         }
         rig.c.run(&rx, || Millis(0));
-        assert_eq!(drain(&rig.audio), [AudioCmd::Start { session: 1 }]);
+        // Quit stops the recording; nothing was heard, so nothing is kept.
+        assert_eq!(
+            drain(&rig.audio),
+            [AudioCmd::Start { session: 1 }, AudioCmd::Discard]
+        );
+    }
+
+    /// What a quit left on the worker channels.
+    struct Quit {
+        phase: PhaseCell,
+        audio: Vec<AudioCmd>,
+        whisper: Vec<WhisperCmd>,
+        paste: Vec<PasteCmd>,
+        /// The text of each `HistoryCmd::Save`.
+        saved: Vec<String>,
+        took: Duration,
+    }
+
+    /// Quits `rig` with `msgs` already queued for the grace period.
+    fn quit(rig: Rig, msgs: Vec<Inbox>, grace: u64) -> Quit {
+        let (tx, rx) = channel();
+        for msg in msgs {
+            tx.send(msg).expect("open channel");
+        }
+        let start = std::time::Instant::now();
+        let clock = || Millis(u64::try_from(start.elapsed().as_millis()).unwrap());
+        rig.c.shutdown(&rx, &clock, Millis(grace));
+        let saved = drain(&rig.history)
+            .into_iter()
+            .filter_map(|c| match c {
+                HistoryCmd::Save { text, .. } => Some(text),
+                HistoryCmd::Config(_) => None,
+            })
+            .collect();
+        Quit {
+            phase: rig.phase,
+            audio: drain(&rig.audio),
+            whisper: drain(&rig.whisper),
+            paste: drain(&rig.paste),
+            saved,
+            took: start.elapsed(),
+        }
+    }
+
+    // t15: a quit during transcription lost the text. It now waits for it: the text goes to
+    // the history and the clipboard, never pasted into whatever has the focus at quit.
+    #[test]
+    fn quit_during_transcription_keeps_the_text_on_the_clipboard_and_in_the_history() {
+        let mut config = Config::default();
+        config.history.enabled = true;
+        let mut rig = Rig::with(config);
+        rig.event(Event::ModelLoaded, 0);
+        let job = rig.record();
+        rig.c.handle(
+            Inbox::JobAudio {
+                job,
+                samples: vec![0.5; 4],
+                spool: None,
+            },
+            Millis(2100),
+        );
+        rig.drain_all();
+        let msgs = vec![
+            Inbox::Event(Event::ChordDown), // a press while quitting starts nothing
+            Inbox::Transcribed {
+                job,
+                text: Some("hello".into()),
+            },
+        ];
+        let q = quit(rig, msgs, 60_000);
+        assert!(
+            q.took < Duration::from_secs(10),
+            "waited for the grace: {:?}",
+            q.took
+        );
+        let pastes: Vec<_> = q
+            .paste
+            .into_iter()
+            .map(|c| match c {
+                PasteCmd::CopyOnly { text, .. } => text,
+                PasteCmd::Paste { .. } => panic!("pasted at quit"),
+            })
+            .collect();
+        assert_eq!(pastes, ["hello"]);
+        assert_eq!(q.saved, ["hello"]);
+        assert!(!q.audio.iter().any(|c| matches!(c, AudioCmd::Start { .. })));
+    }
+
+    // t15: a transcription that does not end in the grace is cut: whisper's cancel check sees
+    // Idle, and the quit does not wait for it.
+    #[test]
+    fn quit_cuts_a_transcription_that_outlives_the_grace() {
+        let mut rig = Rig::new();
+        rig.event(Event::ModelLoaded, 0);
+        let job = rig.record();
+        rig.c.handle(
+            Inbox::JobAudio {
+                job,
+                samples: vec![0.5; 4],
+                spool: None,
+            },
+            Millis(2100),
+        );
+        assert_eq!(rig.phase.load(), Phase::Transcribing);
+        let q = quit(rig, Vec::new(), 50);
+        assert!(q.took >= Duration::from_millis(50), "{:?}", q.took);
+        assert_eq!(q.phase.load(), Phase::Idle, "whisper is told to stop");
+        assert!(q.paste.is_empty());
+    }
+
+    // t15: a quit while recording after speech keeps the audio, as a session lock does.
+    #[test]
+    fn quit_while_recording_keeps_the_heard_audio() {
+        let mut rig = Rig::new();
+        rig.event(Event::ModelLoaded, 0);
+        rig.event(Event::ChordDown, 0);
+        rig.c.handle(
+            Inbox::Capture {
+                session: 1,
+                event: Event::SpeechHeard,
+            },
+            Millis(100),
+        );
+        rig.drain_all();
+        // The capture's answer to the quit's Stop, for the first job.
+        let msgs = vec![Inbox::JobAudio {
+            job: JobId(0),
+            samples: vec![0.1; 800],
+            spool: None,
+        }];
+        let q = quit(rig, msgs, 60_000);
+        assert!(q.audio.contains(&AudioCmd::Stop(JobId(0))));
+        assert_eq!(q.saved, [""], "kept with no text");
+        assert!(
+            !q.whisper
+                .iter()
+                .any(|c| matches!(c, WhisperCmd::Transcribe { .. }))
+        );
     }
 
     #[test]

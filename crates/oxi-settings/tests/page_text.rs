@@ -412,7 +412,7 @@ fn restore_delay_is_saved_once_the_slider_rests() {
     let l = layout("delay", None);
     let window = open_tall(&l);
     sub_tab(&window, "Paste");
-    let slider = with_role(&window, "Restore clipboard after", AccessibleRole::Spinbox);
+    let slider = with_role(&window, "Restore your copy after", AccessibleRole::Spinbox);
     slider.set_accessible_value("400");
     slider.set_accessible_value("500");
     assert_eq!(slider.accessible_value().as_deref(), Some("500"));
@@ -445,7 +445,7 @@ fn closing_within_the_debounce_still_saves_the_delay() {
     let l = layout("delay-close", None);
     let window = open_tall(&l);
     sub_tab(&window, "Paste");
-    with_role(&window, "Restore clipboard after", AccessibleRole::Spinbox)
+    with_role(&window, "Restore your copy after", AccessibleRole::Spinbox)
         .set_accessible_value("700");
     assert!(!l.config_file().exists(), "saved during the drag");
     window.hide().unwrap();
@@ -496,10 +496,10 @@ fn mode_thumb_and_rules_write_the_config() {
         [
             with_role(
                 &window,
-                "Keep dictation in Win+V history",
+                "Keep the last dictation in Win+V",
                 AccessibleRole::Switch,
             ),
-            with_role(&window, "Restore clipboard after", AccessibleRole::Slider),
+            with_role(&window, "Restore your copy after", AccessibleRole::Slider),
         ]
         .map(|e| e.accessible_enabled())
     };
@@ -553,6 +553,8 @@ fn rule_count_keeps_the_tab_width_at_zero() {
     one(&window, "Remove mstsc.exe").invoke_accessible_default_action();
     assert_eq!(config(&l).config.paste.rules, []);
     assert_eq!(tab().accessible_description().as_deref(), Some("0"));
+    // Item 39: the empty list says so where the rules were.
+    assert!(has(&window, "No app has a rule of its own"));
     assert!(
         (tab().size().width - wide).abs() < 0.5,
         "{wide} -> {}",
@@ -608,7 +610,7 @@ fn win_v_history_is_on_by_default_and_saved_off() {
     let switch = || {
         with_role(
             &window,
-            "Keep dictation in Win+V history",
+            "Keep the last dictation in Win+V",
             AccessibleRole::Switch,
         )
     };
@@ -725,7 +727,7 @@ fn every_tab_fits_the_minimum_size_with_long_lists() {
         for (tab, last) in [
             ("Dictionary", "Save dictionary.txt"),
             ("Replacements", "Save replace.txt"),
-            ("Paste", "Restore clipboard after"),
+            ("Paste", "Restore your copy after"),
             ("Per-app rules", "Add rule"),
         ] {
             sub_tab(&window, tab);

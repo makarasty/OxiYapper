@@ -29,16 +29,21 @@ export component SubTabs {
         }
     }
 
+    // As tall as the header row of a page without tabs, so both line up with the first rail item.
+    height: Theme.header-row-height;
     vertical-stretch: 0;
+    // The tab line spans the whole content width, card edge to card edge (DS-14.2 [24]).
+    horizontal-stretch: 1;
     accessible-role: tab-list;
 
-    // Before the tabs: the underline lies on top of it.
+    // Before the tabs: the underline lies on top of it (1 px hairline).
     Rectangle {
         y: root.height - self.height;
         height: 1px;
         background: Theme.divider;
     }
     HorizontalLayout {
+        // Clear of the 1 px tab line.
         padding-bottom: 1px;
         spacing: Theme.space-1;
         alignment: start;
@@ -52,6 +57,7 @@ export component SubTabs {
             border-top-left-radius: Theme.radius-control;
             border-top-right-radius: Theme.radius-control;
             background: self.down ? Theme.bg-subtle-selected : self.hover ? Theme.bg-subtle-hover : transparent;
+            animate background { duration: Theme.motion-quick; easing: ease-out; }
             accessible-role: tab;
             accessible-label: item;
             // The count, so a screen reader hears it too.
@@ -62,9 +68,9 @@ export component SubTabs {
                 root.pick(i);
             }
             content := HorizontalLayout {
-                padding-top: 6px;
-                padding-bottom: 10px;
-                spacing: 6px;
+                padding-top: Theme.tab-padding-top;
+                padding-bottom: Theme.tab-padding-bottom;
+                spacing: Theme.tab-count-gap;
                 alignment: center;
                 // Always as wide as the semibold label, so opening a tab moves nothing.
                 Rectangle {
@@ -75,6 +81,7 @@ export component SubTabs {
                         font-weight: Theme.weight-strong;
                         color: Theme.text-primary;
                         opacity: item-box.on ? 1 : 0;
+                        animate opacity { duration: Theme.motion-quick; easing: ease-out; }
                         accessible-role: none;
                     }
                     Text {
@@ -84,6 +91,7 @@ export component SubTabs {
                         color: item-box.hover ? Theme.text-primary : Theme.text-secondary;
                         horizontal-alignment: center;
                         opacity: item-box.on ? 0 : 1;
+                        animate opacity, color { duration: Theme.motion-quick; easing: ease-out; }
                         accessible-role: none;
                     }
                 }
@@ -97,12 +105,15 @@ export component SubTabs {
                     accessible-role: none;
                 }
             }
+            // The underline fades with the selection, no slide or scale (DS-5.5); it covers the
+            // 1 px tab line.
             Rectangle {
-                visible: parent.on;
-                x: (parent.width - self.width) / 2;
-                y: parent.height - 2px;
+                opacity: parent.on ? 1 : 0;
+                animate opacity { duration: Theme.motion-quick; easing: ease-out; }
+                x: Theme.whole((parent.width - self.width) / 2);
+                y: parent.height - Theme.tab-underline + 1px;
                 width: content.preferred-width;
-                height: 3px;
+                height: Theme.tab-underline;
                 border-radius: Theme.radius-small;
                 background: Theme.accent;
             }
@@ -110,6 +121,7 @@ export component SubTabs {
                 shown: parent.on && root.ring;
             }
             touch := TouchArea {
+                mouse-cursor: pointer;
                 clicked => {
                     fs.focus();
                     // After `focus()`: its reason is not a pointer click, and this was one.

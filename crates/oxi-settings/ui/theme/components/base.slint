@@ -1,6 +1,7 @@
 // Small pieces every control shares: the focus visual, the hover tooltip, the card frame and the
 // caption text.
 import { Theme } from "../tokens.slint";
+import { Icons } from "../icons.slint";
 
 // The frame of every card-shaped surface (Card, ClickCard, ToggleRow, StatCard): fill, 1 px stroke,
 // radius 8. The shell sets its own height from the layout inside it.
@@ -17,31 +18,24 @@ export component Caption inherits Text {
     color: Theme.text-secondary;
 }
 
-// Fluent focus visual: a 2 px focus-outer ring 2 px outside the parent plus a 1 px focus-inner
-// ring between them. Fills its parent; shown only on keyboard focus (see `KeyFocus`).
+// The one focus visual (DS-4.1): a 2 px `focus-ring` stroke 2 px outside the parent, its outer
+// radius the control's plus offset and width. Fills its parent; shown only on keyboard focus
+// (see `KeyFocus`) and never while the control's popup is open (the owner folds that into `shown`).
 export component FocusRing {
     in property <bool> shown;
     in property <length> radius: Theme.radius-control;
+    property <length> out: Theme.focus-ring-offset + Theme.focus-ring-width;
     width: 100%;
     height: 100%;
     Rectangle {
         visible: root.shown;
-        x: -3px;
-        y: -3px;
-        width: root.width + 6px;
-        height: root.height + 6px;
-        border-width: 2px;
-        border-color: Theme.focus-outer;
-        border-radius: root.radius + 3px;
-        Rectangle {
-            x: 2px;
-            y: 2px;
-            width: parent.width - 4px;
-            height: parent.height - 4px;
-            border-width: 1px;
-            border-color: Theme.focus-inner;
-            border-radius: root.radius + 1px;
-        }
+        x: -root.out;
+        y: -root.out;
+        width: root.width + 2 * root.out;
+        height: root.height + 2 * root.out;
+        border-width: Theme.focus-ring-width;
+        border-color: Theme.focus-ring;
+        border-radius: root.radius + root.out;
     }
 }
 
@@ -68,7 +62,7 @@ export component Tooltip inherits Rectangle {
         padding-top: Theme.space-1;
         padding-bottom: Theme.space-1;
         Text {
-            max-width: 320px;
+            max-width: Theme.tooltip-max-width;
             text: root.text;
             font-size: root.font-size;
             color: Theme.text-primary;
@@ -134,5 +128,166 @@ export component Tip {
         if (self.open) {
             HoverTip.text = self.text;
         }
+    }
+}
+
+// The "i" that holds a hint instead of loose text (DS-11, UI rule 35): a 16 px `info` glyph in a
+// 20 px round hover box, the text in a `Tip`. It opens on hover, on keyboard focus, and Enter or
+// Space toggles it. Put it `pair-gap` after the title or control it explains.
+export component InfoTip {
+    in property <string> text;
+    // Gallery: the hovered and the focused look.
+    in property <bool> force-hover;
+    in property <bool> force-focus;
+    property <bool> hover: touch.has-hover || root.force-hover;
+    property <bool> key-focus;
+    property <bool> key-open;
+    out property <bool> key-focused: root.key-focus && fs.has-focus;
+    width: Theme.icon-size;
+    height: Theme.icon-size;
+    accessible-role: AccessibleRole.text;
+    accessible-label: root.text;
+    face := Rectangle {
+        border-radius: Theme.radius-round;
+        background: root.hover ? Theme.bg-subtle-hover : transparent;
+        animate background { duration: Theme.motion-quick; easing: ease-out; }
+        Image {
+            source: Icons.info;
+            width: Theme.icon-size-small;
+            height: Theme.icon-size-small;
+            colorize: root.hover || root.key-focused ? Theme.text-primary : Theme.text-secondary;
+            accessible-role: none;
+            animate colorize { duration: Theme.motion-quick; easing: ease-out; }
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+    }
+    fs := FocusScope {
+        focus-on-click: false;
+        focus-gained(reason) => {
+            root.key-focus = KeyFocus.from-key(reason);
+            root.key-open = root.key-focus;
+            root.show-key-tip();
+        }
+        focus-lost => {
+            root.key-open = false;
+            root.show-key-tip();
+        }
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                root.key-open = !root.key-open;
+                root.show-key-tip();
+                return accept;
+            }
+            reject
+        }
+    }
+    function show-key-tip() {
+        HoverTip.text = root.key-open ? root.text : "";
+        HoverTip.x = root.absolute-position.x;
+        HoverTip.y = root.absolute-position.y + root.height + Theme.space-1;
+    }
+    // The key-opened bubble lives while focused: keep its heartbeat (see `HoverTip.beat`).
+    Timer {
+        interval: 150ms;
+        running: root.key-open;
+        triggered => {
+            HoverTip.beat += 1;
+        }
+    }
+    FocusRing {
+        shown: root.force-focus || root.key-focused;
+        radius: Theme.radius-round;
+    }
+    Tip {
+        text: root.text;
+        hovered: touch.has-hover;
+    }
+}
+
+// The thumb of a vertical scroller; drag it, or click the track to page.
+export component Bar {
+    in property <length> total;
+    in-out property <length> position;
+    property <length> page: root.height;
+    property <length> travel: max(0, root.total - root.page);
+    property <length> thumb-h: max(Theme.scrollbar-min-thumb, root.height * root.page / max(root.total, 1px));
+    property <length> thumb-y: root.travel <= 0 ? 0 : (root.height - root.thumb-h) * (-root.position / root.travel);
+    property <length> grab-y;
+    property <length> grab-pos;
+    accessible-role: none;
+    thumb := Rectangle {
+        y: root.thumb-y;
+        height: root.thumb-h;
+        border-radius: Theme.radius-small;
+        background: touch.has-hover || touch.pressed ? Theme.text-secondary : Theme.text-disabled;
+        animate background { duration: Theme.motion-quick; easing: ease-out; }
+    }
+    touch := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                if (self.mouse-y < root.thumb-y || self.mouse-y > root.thumb-y + root.thumb-h) {
+                    // A click on the track pages toward it.
+                    root.position = clamp(root.position + (self.mouse-y < root.thumb-y ? root.page : -root.page), -root.travel, 0);
+                }
+                root.grab-y = self.mouse-y;
+                root.grab-pos = root.position;
+            }
+        }
+        moved => {
+            if (self.pressed && root.height > root.thumb-h) {
+                root.position = clamp(root.grab-pos - (self.mouse-y - root.grab-y) * root.travel / (root.height - root.thumb-h), -root.travel, 0);
+            }
+        }
+    }
+}
+
+// Scrolls its children vertically with the design-system bar (DS-18): while the content overflows
+// it leaves exactly `scrollbar-gutter` on the right and draws a 6 px thumb `bar-inset` from the
+// right edge (centred in the gutter by default), `text-disabled` at rest and `text-secondary` on
+// hover or drag, same rect in every state. The owner sets `content-height`; the children take
+// `content-width`.
+export component ScrollBox {
+    in-out property <length> viewport-y <=> fl.content-y;
+    in property <length> content-height;
+    in property <length> bar-inset: (Theme.scrollbar-gutter - Theme.scrollbar-width) / 2;
+    out property <length> content-width: fl.width;
+    // Set from `changed`, not bound: the content's height depends on the width the gutter leaves,
+    // so a binding would loop. Stable both ways: narrower content is never shorter.
+    out property <bool> overflows;
+    // The one overflow rule: an owner that lays out for the gutter ahead (`CardGrid`) asks this.
+    public pure function overflow-for(content: length) -> bool {
+        return content > root.height + 0.5px;
+    }
+    function measure() {
+        self.overflows = root.overflow-for(root.content-height);
+    }
+    init => {
+        self.measure();
+    }
+    changed content-height => {
+        self.measure();
+    }
+    changed height => {
+        self.measure();
+    }
+    fl := Flickable {
+        // A sized child without `x` is centred: pinned left, so the content does not shift half the
+        // gutter when the bar comes.
+        x: 0;
+        width: root.width - (root.overflows ? Theme.scrollbar-gutter : 0);
+        height: root.height;
+        content-width: self.width;
+        content-height: root.content-height;
+        @children
+    }
+    if root.overflows: Bar {
+        x: root.width - self.width - root.bar-inset;
+        width: Theme.scrollbar-width;
+        height: root.height;
+        total: root.content-height;
+        position <=> fl.content-y;
     }
 }

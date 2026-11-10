@@ -5,13 +5,20 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::History;
 use crate::stats::Date;
+use crate::tuning::SettingsSet;
 
 /// Extension of the saved audio.
 pub const WAV: &str = "wav";
 /// Extension of the saved text.
 pub const TXT: &str = "txt";
+/// Extension of the meta file (see [`Meta`] and `docs/HISTORY-FORMAT.md`).
+pub const JSON: &str = "json";
+/// The files of one entry, in the order they are written.
+pub const EXTENSIONS: [&str; 3] = [WAV, TXT, JSON];
 
 /// The subfolder made inside a folder the user chose.
 pub const OWNED_DIR: &str = "OxiYapper history";
@@ -53,11 +60,125 @@ pub fn is_file_stem(name: &str) -> bool {
         && &name[4..6] < "60"
 }
 
-/// Is `name` what a killed write left: the `.wav.part` or `.txt.tmp` of a history stem?
+/// Is `name` what a killed write left: the `.wav.part`, `.txt.tmp` or `.json.tmp` of a history stem?
 pub fn is_leftover(name: &str) -> bool {
     name.strip_suffix(".wav.part")
         .or_else(|| name.strip_suffix(".txt.tmp"))
+        .or_else(|| name.strip_suffix(".json.tmp"))
         .is_some_and(is_file_stem)
+}
+
+/// Is `id` exactly the `YYYY-MM-DD/HHMMSS-mmm` stem of an entry? The only form the daemon accepts
+/// from a caller, so an id can never name a path outside the folder.
+pub fn is_id(id: &str) -> bool {
+    id.split_once('/')
+        .is_some_and(|(day, file)| day_dir(day).is_some() && is_file_stem(file))
+}
+
+/// `2026-11-08T13:00:00.123`: the local time an entry's stem stands for; `None` for a bad id.
+pub fn started(id: &str) -> Option<String> {
+    let (day, t) = id.split_once('/').filter(|_| is_id(id))?;
+    Some(format!(
+        "{day}T{}:{}:{}.{}",
+        &t[..2],
+        &t[2..4],
+        &t[4..6],
+        &t[7..]
+    ))
+}
+
+/// How an entry ended (`status` in the meta file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
+    /// Transcribed and delivered.
+    Done,
+    /// Cancelled after speech was heard; the audio was kept, there is no text.
+    Cancelled,
+    /// The daemon died while recording; the audio was recovered at the next start.
+    Interrupted,
+    /// Recorded, but no transcript came out of it.
+    Failed,
+}
+
+/// The meta file `<stem>.json` of an entry. The layout is a stable contract (R3.3): fields are
+/// only ever added, and a reader must ignore the ones it does not know.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Meta {
+    /// Layout version of this file, [`Meta::VERSION`].
+    pub version: u32,
+    /// Local start of the recording, `YYYY-MM-DDTHH:MM:SS.mmm` (no zone).
+    pub started: String,
+    pub duration_ms: u64,
+    pub status: Status,
+    /// Registry id of the model that made the text, `custom` for a custom file; empty when unknown.
+    pub model: String,
+    /// `auto` or a language code; empty when unknown.
+    pub language: String,
+    /// The audio settings and model of the run that made the text; `None` when unknown.
+    pub settings: Option<SettingsSet>,
+}
+
+impl Meta {
+    pub const VERSION: u32 = 1;
+
+    /// # Errors
+    /// Never in practice: every field serialises.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// # Errors
+    /// The text is not a meta file of this layout.
+    pub fn from_json(text: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(text)
+    }
+}
+
+/// Bytes of the canonical 16-bit mono PCM wav header the spool writes.
+pub const WAV_HEADER: usize = 44;
+
+/// A spool file with its header made true to the bytes on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repaired {
+    pub header: [u8; WAV_HEADER],
+    /// Whole bytes of audio the file keeps; a half sample at the end is cut.
+    pub data_bytes: u64,
+    pub sample_rate: u32,
+}
+
+/// The header of a recording killed mid-write: the sizes in it are those of the last flush, so
+/// they are set again from the real `file_len`. `None` when `header` is not the canonical
+/// 16-bit mono PCM header (then the file is not ours to repair).
+pub fn repaired_header(header: &[u8], file_len: u64) -> Option<Repaired> {
+    let header: &[u8; WAV_HEADER] = header.get(..WAV_HEADER)?.try_into().ok()?;
+    let word = |at: usize| {
+        u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]])
+    };
+    let half = |at: usize| u16::from_le_bytes([header[at], header[at + 1]]);
+    let canonical = &header[..4] == b"RIFF"
+        && &header[8..16] == b"WAVEfmt "
+        && word(16) == 16
+        && half(20) == 1 // PCM
+        && half(22) == 1 // mono
+        && half(34) == 16
+        && &header[36..40] == b"data"
+        && word(24) > 0;
+    if !canonical {
+        return None;
+    }
+    let size =
+        u32::try_from((file_len.checked_sub(WAV_HEADER as u64)?).min(u64::from(u32::MAX - 36)))
+            .ok()?
+            & !1; // whole samples only
+    let mut fixed = *header;
+    fixed[4..8].copy_from_slice(&(36 + size).to_le_bytes());
+    fixed[40..44].copy_from_slice(&size.to_le_bytes());
+    Some(Repaired {
+        header: fixed,
+        data_bytes: u64::from(size),
+        sample_rate: word(24),
+    })
 }
 
 /// The app's own folder history goes to: [`OWNED_DIR`] inside `[history] folder` when that is an
@@ -314,5 +435,127 @@ mod tests {
         let today = day(2026, 11, 8);
         let entries = [entry(day(2020, 1, 1), "100000-000", u64::MAX / 4)];
         assert_eq!(expired(&entries, today, &cfg(0, 0)), Vec::<String>::new());
+    }
+
+    fn meta(status: Status) -> Meta {
+        Meta {
+            version: Meta::VERSION,
+            started: "2026-11-08T13:00:00.123".into(),
+            duration_ms: 4_500,
+            status,
+            model: "small".into(),
+            language: "ru".into(),
+            settings: Some(SettingsSet {
+                normalize: true,
+                denoise: false,
+                trim: true,
+                model: "small".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn meta_round_trips_and_names_the_status_in_lowercase() {
+        for status in [
+            Status::Done,
+            Status::Cancelled,
+            Status::Interrupted,
+            Status::Failed,
+        ] {
+            let m = meta(status);
+            assert_eq!(Meta::from_json(&m.to_json().unwrap()).unwrap(), m);
+        }
+        let json = meta(Status::Interrupted).to_json().unwrap();
+        assert!(json.contains("\"status\": \"interrupted\""), "{json}");
+        let none = Meta {
+            settings: None,
+            ..meta(Status::Done)
+        };
+        assert_eq!(Meta::from_json(&none.to_json().unwrap()).unwrap(), none);
+    }
+
+    #[test]
+    fn a_reader_ignores_fields_it_does_not_know() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(&meta(Status::Done).to_json().unwrap()).unwrap();
+        json["added_later"] = serde_json::json!([1, 2]);
+        assert_eq!(
+            Meta::from_json(&json.to_string()).unwrap(),
+            meta(Status::Done)
+        );
+    }
+
+    #[test]
+    fn an_id_is_a_day_and_a_time_and_nothing_else() {
+        assert!(is_id("2026-11-08/134501-123"));
+        for bad in [
+            "",
+            "../x/134501-123",
+            "2026-11-08/../134501-123",
+            "2026-11-08/134501-123/x",
+            r"2026-11-08\134501-123",
+            "2026-11-08/134501-123.wav",
+            "134501-123",
+        ] {
+            assert!(!is_id(bad), "{bad}");
+        }
+        assert_eq!(
+            started("2026-11-08/134501-123").as_deref(),
+            Some("2026-11-08T13:45:01.123")
+        );
+        assert_eq!(started("nope"), None);
+    }
+
+    #[test]
+    fn a_meta_leftover_is_a_leftover() {
+        assert!(is_leftover("134501-123.json.tmp"));
+        assert!(!is_leftover("notes.json.tmp"));
+    }
+
+    /// A header as the spool writes it (hound, 16 kHz mono 16-bit), with the sizes of an old flush.
+    fn header(rate: u32, flushed_data: u32) -> Vec<u8> {
+        let mut h = b"RIFF".to_vec();
+        h.extend((36 + flushed_data).to_le_bytes());
+        h.extend(b"WAVEfmt ");
+        h.extend(16_u32.to_le_bytes());
+        h.extend([1, 0, 1, 0]); // PCM, mono
+        h.extend(rate.to_le_bytes());
+        h.extend((rate * 2).to_le_bytes());
+        h.extend([2, 0, 16, 0]);
+        h.extend(b"data");
+        h.extend(flushed_data.to_le_bytes());
+        h
+    }
+
+    #[test]
+    fn a_truncated_spool_gets_the_sizes_of_the_bytes_it_has() {
+        // Flushed at 100 bytes of audio, killed after 1001 bytes (the last sample is half).
+        let got = repaired_header(&header(16_000, 100), 44 + 1001).unwrap();
+        assert_eq!(got.data_bytes, 1000);
+        assert_eq!(got.sample_rate, 16_000);
+        assert_eq!(got.header[..], header(16_000, 1000)[..]);
+        // Only the header was ever written: nothing to keep, but a valid result.
+        assert_eq!(
+            repaired_header(&header(48_000, 0), 44).unwrap().data_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_our_spool_is_not_repaired() {
+        let good = header(16_000, 0);
+        assert!(repaired_header(&good[..40], 100).is_none(), "short header");
+        assert!(
+            repaired_header(&good, 20).is_none(),
+            "shorter than a header"
+        );
+        for (at, byte) in [(0, b'X'), (22, 2), (34, 8), (20, 3), (24, 0)] {
+            let mut bad = good.clone();
+            bad[at] = byte;
+            if at == 24 {
+                bad[25..28].fill(0);
+            }
+            assert!(repaired_header(&bad, 100).is_none(), "byte {at}");
+        }
     }
 }

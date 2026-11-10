@@ -4,7 +4,7 @@ The owner's permanent rules for the OxiYapper interface. Every UI change obeys t
 
 How to look:
 
-- **Three sizes:** minimum 720x520, middle 1000x700, the window maximum.
+- **Three sizes:** minimum 720x520, 1280x860, and full screen (maximized).
 - **Real look:** `scripts/real-shot.ps1` gives a PNG from the runtime renderer. `crates/oxi-settings/tests/shots.rs` covers states, but its software renderer differs, so it is not the final look.
 - **Both themes** count, light and dark. Open the PNGs and read them; a passing test is not a look.
 
@@ -28,8 +28,8 @@ How to look:
 
 7. **One spacing system. All values live in `crates/oxi-settings/ui/theme/tokens.slint`.** Pages and the shell (`ui/app.slint`) hold no pixel numbers and no extra container padding on any side.
    Check: `rg "[1-9]px|[0-9]{2,}px" crates/oxi-settings/ui/pages crates/oxi-settings/ui/app.slint` prints nothing (a `0px` comparison is no value).
-8. **Page title and sidebar start on one line.**
-   Check: on every page, in a real shot (no window banner shown, see rule 1), the vertical centre of the page title and of the first sidebar item differ by at most 1 px.
+8. **The header row and the first sidebar item start on one line.**
+   Check: on every page, in a real shot (no window banner shown, see rule 1), the vertical centre of the header row (rule 34) and of the first sidebar item differ by at most 1 px.
 9. **Things stacked in one card line up.** Controls start and end at one x; row titles on one page start at one x; a field below a select is exactly as wide as the select.
    Check: measure the edges in a shot at the three sizes; they differ by 0 px.
 10. **One layer of surface.** No card inside a card, no frame inside a frame. An action sits at the end of its row or next to what it acts on, never alone in empty space.
@@ -45,7 +45,7 @@ How to look:
     Check: the `Badge` component's `border-radius`, and a zoomed shot of Ready, Downloading and Not downloaded.
 14. **Sharp corners are minimal.** Blocks and icons have softened corners. Only window edges, full-bleed panels and 1 px dividers may be square.
     Check: a real shot zoomed 2x on each page shows no other square corner; no `border-radius: 0` in `crates/oxi-settings/ui`.
-15. **Own teal accent, never the Windows accent.**
+15. **Own ink accent (brand "white minimal"), never the Windows accent.**
     Check: `no_system_accent_on_any_page` in `crates/oxi-settings/tests/shots.rs` passes; `rg "Palette\.accent" crates/oxi-settings/ui` prints nothing.
 16. **Danger and cancel buttons turn red on hover** (Cancel, Remove, Delete, Stop and the like).
     Check: each such button uses the danger variant; a forced-hover shot in the gallery shows the `error-*` colours.
@@ -56,7 +56,7 @@ How to look:
 19. **Text is at least 12 px and at least 4.5:1 against its background, in both themes.** Disabled text is exempt from the 4.5:1 limit (rule 31 still says why it is disabled).
     Exempt: the Slint `AboutSlint` widget on About. Its 10 px text is fixed by Slint, and the Slint royalty-free licence requires the widget.
     Check: `rg "font-size: *[0-9]" crates/oxi-settings/ui` prints nothing; the gallery contrast swatches all read 4.5 or more, except the swatches of disabled text.
-20. **The on-screen keyboard's style is the base for every component: bright caps on grey, crisp 1 px strokes. Icons are Fluent UI System Icons, not hand-made.** The own logo mark is the one exception.
+20. **The on-screen keyboard's style is the base for every component: bright caps on grey, crisp 1 px strokes. Icons are Phosphor, Bold weight (`@phosphor-icons/core@2.1.1`), not hand-made; the Fill weight only for a selected item's glyph.** The own logo mark is the one exception.
     Check: a new icon is listed in `crates/oxi-settings/ui/icons/SOURCE.md` and read through the `Icons` global.
 
 ## Motion
@@ -70,18 +70,18 @@ How to look:
 
 ## Window and navigation
 
-24. **The window has a maximum and maximize is off; the content adapts.** It resizes from the minimum up to the maximum in SPEC.
-    Check: the maximize button is disabled, dragging an edge stops at the maximum, and shots at the three sizes show no stretched control. An empty area below short content in a large window is allowed: do not stretch controls or cards to fill the height.
-25. **No scroll on normal pages. A page that does not fit gets horizontal sub-tabs under the title.** The sidebar stays short and works icons-only. Page scrolling stays only as SPEC's fallback. Two one-view pages that cannot be split into meaningful sub-tabs, Home and Hotkey with the on-screen keyboard open, may use a tight layout at small window sizes under a token-defined height instead of sub-tabs: it hides captions, the legend, headings and instruction text and keeps actions in view (owner, 2026-11-10). System General's tight layout at low height (system.slint:49, token `system-tight-height` in tokens.slint) is also allowed.
-    Check: a real shot of every page and sub-tab at 720x520 with default content shows no scrollbar; at the same size the icons-only sidebar shows every section.
-26. **No scroll inside a scroll.** A long list scrolls by itself and the page around it does not.
-    Check: with a list over its height, wheel over the list moves only the list.
+24. **Maximize is allowed and the window has no maximum size (owner 2026-11-10); the content adapts.** It resizes from the minimum (720x520) to full screen.
+    Check: the maximize button works and dragging an edge never stops at a limit. Every page is checked at 720x520, 1280x860 and full screen. Controls and short cards keep their natural size; an empty area below short content is allowed.
+25. **No scroll on normal pages. A page that does not fit gets horizontal sub-tabs in the header row (rule 34).** The sidebar stays short and works icons-only. Page scrolling stays only as SPEC's fallback. Two one-view pages that cannot be split into meaningful sub-tabs, Home and Hotkey with the on-screen keyboard open, may use a tight layout at small window sizes under a token-defined height instead of sub-tabs: it hides captions, the legend, headings and instruction text and keeps actions in view (owner, 2026-11-10). System General's tight layout at low height (system.slint:49, token `system-tight-height` in tokens.slint) is also allowed.
+    Check: a real shot of every page and sub-tab at 720x520 with default content shows no page scrollbar; at the same size the icons-only sidebar shows every section.
+26. **Lists and galleries stretch and scroll inside themselves.** In a larger window a list, a gallery or a grid (the Per-app grid, the model gallery, History) takes the free space and shows more rows or tiles; when it has more than fits, it scrolls by itself and the page around it does not. No scroll inside a scroll.
+    Check: at 720x520, 1280x860 and full screen with a list over its height, wheel over the list moves only the list, and the larger window shows more of it.
 
 ## Edge cases
 
 27. **Many-items and few-items states are checked per screen, using the table below.**
     Check: each cell is rendered and looked at. Nothing leaves its box, overlaps or breaks rules 1 to 3 (window banners are exempt from rule 1, see there). Every screen is also checked with OxiYapper not running and with a read-only config.
-28. **Visible text fits at minimum, middle and maximum window size,** and at every width where the layout switches (960 px today, full sidebar to icons-only). Only unbounded user text (device names, paths, app names) may be cut with an ellipsis, and then its tooltip has the full text.
+28. **Visible text fits at 720x520, 1280x860 and full screen,** and at every width where the layout switches (960 px today, full sidebar to icons-only). Only unbounded user text (device names, paths, app names) may be cut with an ellipsis, and then its tooltip has the full text.
     Check: shots at those sizes, with the longest real strings: no cut, overlapping or clipped text, except an ellipsis on user-supplied text (device names, paths, app names) that has the full text in its tooltip.
 
 | Screen | Few, empty | Many, long |
@@ -112,3 +112,16 @@ How to look:
     Check: click the value field, type a number, press Enter: the slider moves, and an out-of-range number is clamped.
 33. **Things that have more behind them are clickable** (for example a stat card opens its trend by day).
     Check: on Home and any status element with more detail, a click opens that detail and hover shows it can be clicked.
+
+## Header, cues and hover
+
+34. **No page title.** The top of the content is one header row (owner 2026-11-10): the sub-tabs on the left (or a small page name on a page without tabs), the status chip on the right. The "OxiYapper" line in the sidebar and the big page title are gone.
+    Check: a real shot of every page shows no large title; the header row has the tabs left and the chip right, and the tab line spans the full width.
+35. **An explanation is an "i" tooltip, not free text.** No explanatory line floats on a page. A short hint goes in an "i" icon's tooltip next to the thing it explains.
+    Check: read each page's shot: no loose explanatory paragraph; each hint opens from an "i".
+36. **Every clickable element reacts to hover.** Buttons, cards, rows, tiles, chips, links and icons that take a click show a hover state and a pointer.
+    Check: hover each clickable element in a real run: its look changes.
+37. **Nothing inert reacts to hover.** Labels, plain text, a status chip in the normal state and a card with no click action show no hover state.
+    Check: hover each non-clickable element: nothing changes.
+38. **No scale or bounce motion.** Transitions are fades and colour changes only; nothing grows, shrinks, jumps or overshoots (rule 21 still limits the time).
+    Check: `rg "animate" crates/oxi-settings/ui` shows only colour, opacity and position changes, and no animated `width`, `height` or scale used as a bounce.

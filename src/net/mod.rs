@@ -331,6 +331,7 @@ fn resolve(base: &Uri, location: &str) -> Result<Uri, DownloadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log::scratch::scratch_dir;
     use oxi_core::models::Stamp;
     use std::io::BufRead;
     use std::net::TcpListener;
@@ -473,10 +474,7 @@ mod tests {
     }
 
     fn tempdir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("oxi-net-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        scratch_dir(&format!("oxi-net-{}-{name}", std::process::id()))
     }
 
     #[test]

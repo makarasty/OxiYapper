@@ -5,8 +5,9 @@ mod common;
 
 use std::fs;
 
-use common::{config, has, layout, one, open_linked};
+use common::{config, has, layout, one, open_linked, with_role};
 use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+use oxi_core::config::OtherKey;
 use oxi_core::machine::Mode;
 use oxi_core::paths::Layout;
 use oxi_settings::ipc::{Event, Link};
@@ -126,6 +127,57 @@ fn mode_thumb_writes_toggle() {
     let text = fs::read_to_string(l.config_file()).unwrap();
     assert!(
         text.contains("mode = \"toggle\"") && text.contains("# mine"),
+        "{text}"
+    );
+}
+
+/// R2.1: "Another key while holding" and "Esc cancels a recording" start from the file and
+/// write it back; the Keys caption names Esc only while it cancels.
+#[test]
+fn other_key_and_esc_round_trip() {
+    const WITH_ESC: &str = "Hold these keys to talk. Esc cancels a recording.";
+    let fresh = open(&layout("recording-default", None));
+    let esc = |w: &AppWindow| with_role(w, "Esc cancels a recording", AccessibleRole::Switch);
+    let other = |w: &AppWindow| with_role(w, "Another key while holding", AccessibleRole::Combobox);
+    assert_eq!(esc(&fresh).accessible_checked(), Some(false));
+    assert_eq!(other(&fresh).accessible_value().as_deref(), Some("Auto"));
+    assert!(has(&fresh, "Hold these keys to talk.") && !has(&fresh, WITH_ESC));
+    // The Auto hint is the "i" after the title (Row.info), not text on the page.
+    assert!(has(
+        &fresh,
+        "The key always reaches the app. Auto cancels only if you have not spoken yet."
+    ));
+
+    let l = layout(
+        "recording",
+        Some("version = 1\n# mine\n[hotkey]\nesc_cancels = true\nother_key = \"always\"\n"),
+    );
+    let window = common::open_again(&l, Page::Hotkey);
+    assert_eq!(esc(&window).accessible_checked(), Some(true));
+    assert_eq!(
+        other(&window).accessible_value().as_deref(),
+        Some("Always cancel")
+    );
+    assert!(has(&window, WITH_ESC));
+
+    esc(&window).invoke_accessible_default_action();
+    assert!(!config(&l).config.hotkey.esc_cancels);
+    assert!(has(&window, "Hold these keys to talk.") && !has(&window, WITH_ESC));
+
+    other(&window).invoke_accessible_expand_action();
+    with_role(&window, "Never cancel", AccessibleRole::ListItem).invoke_accessible_default_action();
+    assert_eq!(
+        other(&window).accessible_value().as_deref(),
+        Some("Never cancel")
+    );
+    // The pick saves once the Combo rests.
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(350));
+    let file = config(&l);
+    assert_eq!(file.config.hotkey.other_key, OtherKey::Never);
+    assert!(!file.config.hotkey.esc_cancels);
+    let text = fs::read_to_string(l.config_file()).unwrap();
+    assert!(
+        text.contains("other_key = \"never\"") && text.contains("# mine"),
         "{text}"
     );
 }

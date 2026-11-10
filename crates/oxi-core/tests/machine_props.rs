@@ -34,6 +34,7 @@ fn config() -> impl Strategy<Value = MachineConfig> {
         .prop_map(|(mode, file)| {
             let mut cfg = MachineConfig {
                 mode,
+                esc_cancels: true,
                 ..MachineConfig::default()
             };
             cfg.model.file = file.into();
@@ -48,6 +49,7 @@ fn quiet_event() -> impl Strategy<Value = Event> {
         2 => any::<bool>().prop_map(|held| Event::ChordPolled { held }),
         2 => Just(Event::Esc),
         1 => Just(Event::OtherKey),
+        1 => Just(Event::SpeechHeard),
         1 => Just(Event::DeviceLost),
         1 => Just(Event::CaptureFailed),
         4 => job().prop_map(Event::JobAudioReady),

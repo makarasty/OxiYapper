@@ -1,10 +1,12 @@
-// A gallery of any number of tiles (sound picker, per-app list): the grid scrolls inside itself, so
-// the page around it stays still (UI rules 25, 26). Give it a height from the page; put it on the
-// page, not in a `Card`, a tile is already a card (rule 10). Empty and full fill the same box.
-import { ListView } from "std-widgets.slint";
+// The card grid (DS-15) shared by the Per-app apps, the model gallery and the sounds: the grid
+// scrolls inside itself with the design-system bar, so the page around it stays still (UI rules 25,
+// 26). Give it a height from the page; put it on the page, not in a `Card`, a tile is already a
+// card (rule 10). Empty and full fill the same box. One anatomy: glyph or picture top-left, title
+// (one line, cut, whole in the tooltip), caption, the top-right slot for the check badge.
 import { Theme, Shell } from "../tokens.slint";
-import { CardFrame, Caption, KeyFocus, Tip } from "base.slint";
+import { CardFrame, Caption, KeyFocus, Tip, ScrollBox } from "base.slint";
 import { Tile } from "tiles.slint";
+import { EmptyState } from "feedback.slint";
 
 export struct GalleryTile {
     // Monochrome glyph, tinted like a `TileItem`; `icon-selected` (filled) is drawn while picked.
@@ -22,11 +24,12 @@ export struct GalleryTile {
 // One-way like `TilePicker`: `picked` fires, the owner updates `selected` (-1: none). The arrows
 // move a cursor (focus ring), Enter or Space picks, so walking 100 tiles fires nothing and a
 // disabled tile cannot trap the keyboard. Give it an `accessible-label` (the group title).
-export component TileGallery {
+export component CardGrid {
     in property <[GalleryTile]> tiles;
     in property <int> selected: -1;
-    // Centred in the box when `tiles` is empty.
+    // Centred in the box when `tiles` is empty, as an `EmptyState` (DS-12); the glyph is optional.
     in property <string> empty-text;
+    in property <image> empty-icon;
     // Drawn for a tile with neither picture nor icon (a found app whose shortcut gave none).
     in property <image> fallback-icon;
     in property <bool> locked: Shell.locked;
@@ -37,25 +40,27 @@ export component TileGallery {
     // Read by `tests/gallery.rs`.
     out property <int> cursor: clamp(root.raw-cursor, 0, max(0, root.tiles.length - 1));
     out property <int> columns: root.cols;
-    out property <length> scrolled: -list.content-y;
+    out property <length> scrolled: -list.viewport-y;
     // The height at which no tile row scrolls, whatever the height given.
     out property <length> full-height: ceil(root.tiles.length / root.fit(root.width)) * root.row-height;
-    // The height that holds `empty-text` and a card's padding: a page may give an empty gallery
-    // just this.
-    out property <length> empty-height: empty-measure.preferred-height + 2 * Theme.card-padding-v;
+    // The height that holds the empty state: a page may give an empty gallery just this.
+    out property <length> empty-height: empty-measure.preferred-height;
 
-    // The widest column that still fits, so a wider window gets more tiles, not stretched ones.
-    property <length> min-cell: 160px;
-    property <length> tile-height: 104px;
+    // The widest column that still fits, so a wider window gets more tiles, not stretched ones
+    // (until every tile has its own column).
+    property <length> min-cell: Theme.tile-min-width;
+    property <length> tile-height: Theme.tile-height;
     property <length> gap: Theme.tile-gap;
     // Half a gap around every tile inside the scroller: the focus ring must not be clipped.
     property <length> edge: root.gap / 2;
     property <length> row-height: root.tile-height + root.gap;
-    // The scrollbar lies over the list, so the tiles step aside only when there is one.
-    property <length> bar: 14px;
-    property <bool> overflows: ceil(root.tiles.length / root.fit(root.width)) * root.row-height > root.height;
-    property <length> usable: root.width - (root.overflows ? root.bar : 0);
-    property <int> cols: root.fit(root.usable);
+    // The tiles step aside for the bar's gutter only when there is one (DS-18.2), by the scroller's
+    // own rule and width: rows at full width that overflow it still overflow once narrowed.
+    property <bool> overflows: list.overflow-for(ceil(root.tiles.length / root.fit(root.width)) * root.row-height);
+    property <length> usable: root.width - (root.overflows ? Theme.scrollbar-gutter : 0);
+    // Never more columns than tiles: a short gallery stretches its tiles over the row instead of
+    // leaving empty columns that cut every title (t21b).
+    property <int> cols: min(root.fit(root.usable), max(1, root.tiles.length));
     property <length> cell: (root.usable - (root.cols - 1) * root.gap) / root.cols;
     property <int> rows: ceil(root.tiles.length / root.cols);
     property <int> raw-cursor;
@@ -72,13 +77,17 @@ export component TileGallery {
     }
 
     function reveal(i: int) {
+        // Before the first layout there is no box to scroll in; `changed height` comes back.
+        if (root.height <= 0) {
+            return;
+        }
         let top = floor(i / root.cols) * root.row-height;
-        if (top < -list.content-y) {
-            list.content-y = -top;
-        } else if (top + root.row-height > -list.content-y + list.visible-height) {
-            // Whole rows: a `ListView` snaps a long jump back to a row start, which would cut this tile.
-            let whole = ceil((top + root.row-height - list.visible-height) / root.row-height) * root.row-height;
-            list.content-y = -min(whole, max(0, root.rows * root.row-height - list.visible-height));
+        if (top < -list.viewport-y) {
+            list.viewport-y = -top;
+        } else if (top + root.row-height > -list.viewport-y + list.height) {
+            // Whole rows, so the view never stops on a cut row.
+            let whole = ceil((top + root.row-height - list.height) / root.row-height) * root.row-height;
+            list.viewport-y = -min(whole, max(0, root.rows * root.row-height - list.height));
         }
     }
 
@@ -98,6 +107,14 @@ export component TileGallery {
     }
 
     changed selected => {
+        root.follow-selection();
+    }
+    // Opening on a tile: now when the box is sized at creation (a fixed height never fires
+    // `changed`), else on its first layout.
+    init => {
+        root.follow-selection();
+    }
+    changed height => {
         root.follow-selection();
     }
 
@@ -143,36 +160,32 @@ export component TileGallery {
         }
     }
 
-    empty-measure := Caption {
+    empty-measure := EmptyState {
         visible: false;
-        width: root.width - 2 * Theme.card-padding-h;
+        width: root.width;
         text: root.empty-text;
-        wrap: word-wrap;
+        icon: root.empty-icon;
         accessible-role: none;
     }
 
     if root.tiles.length == 0: CardFrame {
-        Caption {
-            x: Theme.card-padding-h;
-            width: parent.width - 2 * Theme.card-padding-h;
+        EmptyState {
             text: root.empty-text;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-            wrap: word-wrap;
+            icon: root.empty-icon;
         }
     }
 
-    list := ListView {
+    list := ScrollBox {
         x: -root.edge;
         y: -root.edge;
         width: root.width + 2 * root.edge;
         height: root.height + 2 * root.edge;
+        // The thumb centred in the grid's gutter: the scroller overhangs the grid by `edge`.
+        bar-inset: root.edge + (Theme.scrollbar-gutter - Theme.scrollbar-width) / 2;
         visible: root.tiles.length > 0;
-        // The list knows its height only after its first layout; opening on a tile waits for that.
-        changed content-height => {
-            root.follow-selection();
-        }
+        content-height: root.rows * root.row-height;
         for row in root.rows: Rectangle {
+            y: row * root.row-height;
             height: root.row-height;
             // shortcut: an empty `Tile` draws frame, fill, badge and ring, and the content goes on top, because
             // `Tile` wraps and always tints; move elide and `picture` into `Tile` when tiles.slint is in scope.
@@ -200,16 +213,20 @@ export component TileGallery {
                 }
                 VerticalLayout {
                     padding: Theme.space-3;
+                    // Keeps the title clear of the top-right check badge.
+                    padding-right: Theme.space-3 + Theme.check-badge-size;
                     spacing: Theme.space-1;
-                    alignment: center;
+                    alignment: start;
                     HorizontalLayout {
-                        alignment: center;
+                        alignment: start;
                         Image {
                             source: tile.data.picture.width > 0 ? tile.data.picture : tile.selected && tile.data.icon-selected.width > 0 ? tile.data.icon-selected : tile.data.icon.width > 0 ? tile.data.icon : root.fallback-icon;
-                            width: 32px;
-                            height: 32px;
+                            width: Theme.icon-size-large;
+                            height: Theme.icon-size-large;
                             image-fit: contain;
-                            colorize: tile.data.picture.width > 0 ? transparent : tile.selected ? Theme.accent-text : Theme.text-primary;
+                            colorize: tile.data.picture.width > 0 ? transparent : tile.ink;
+                            // A full-colour picture has no ink to grey: it fades instead (an image, no text).
+                            opacity: tile.read-only && tile.data.picture.width > 0 ? 0.4 : 1;
                             accessible-role: none;
                         }
                     }
@@ -217,20 +234,20 @@ export component TileGallery {
                         text: tile.data.title;
                         font-size: Theme.body-size;
                         font-weight: Theme.weight-strong;
-                        color: tile.selected ? Theme.accent-text : Theme.text-primary;
-                        horizontal-alignment: center;
+                        color: tile.ink;
                         overflow: elide;
                         accessible-role: none;
                     }
                     if tile.data.caption != "": Caption {
                         text: tile.data.caption;
-                        horizontal-alignment: center;
+                        color: tile.caption-ink;
                         overflow: elide;
                         accessible-role: none;
                     }
                 }
                 // Enabled on a disabled tile too: its tooltip says why (rule 31); `pick` refuses it.
                 touch := TouchArea {
+                    mouse-cursor: root.locked || tile.data.disabled ? MouseCursor.default : MouseCursor.pointer;
                     clicked => {
                         if (!root.locked) {
                             fs.focus();
@@ -249,3 +266,6 @@ export component TileGallery {
         }
     }
 }
+
+// The earlier name, kept while the pages move to `CardGrid` (t22-t32).
+export component TileGallery inherits CardGrid { }

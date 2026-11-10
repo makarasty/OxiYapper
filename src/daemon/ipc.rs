@@ -23,11 +23,18 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use oxi_core::hotkey::Key;
-use oxi_core::ipc::{PROTO, Push, Request, TestFailure, TestOutcome};
-use oxi_core::tuning::append_pcm;
+use oxi_core::ipc::{
+    HistoryItem, HistoryOp, Observed, PROTO, Push, Request, Spoken, TestFailure, TestOutcome,
+    attention,
+};
+use oxi_core::machine::ModelFailure;
+use oxi_core::models::{self, ModelStatus};
+use oxi_core::tuning::{SettingsSet, append_pcm};
+use oxi_core::types::Language;
 use oxi_platform::ipc::{Conn, Error, Server, default_name, forward_open_settings};
 
 use super::cmd::{Inbox, IoCmd, IpcAsk, StatusReport, TestJob};
+use super::history::{self, Context as HistoryContext};
 use super::lock;
 
 /// Concurrent connections; more are closed unanswered.
@@ -49,6 +56,18 @@ const MAX_ASKS: usize = 4;
 /// own: a stalled send or a slow ask on the connection must not delay turning capture off.
 const FOCUS_POLL: Duration = Duration::from_millis(20);
 
+/// Longest `History` page: items, and bytes of text and names (the line limit is 1 MiB).
+const HISTORY_PAGE_ITEMS: usize = 200;
+const HISTORY_PAGE_BYTES: usize = 512 * 1024;
+
+/// What the daemon checks on disk and on the system before each `Attention` push.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Probe {
+    /// The chosen registry model's files; `None` for a custom file or an unknown id.
+    pub model: Option<ModelStatus>,
+    pub mic_missing: bool,
+}
+
 /// What the server needs from the OS and the rest of the daemon; fake in the tests.
 pub trait Host: Send + Sync + 'static {
     /// Hotkey capture on or off; `swallow` while the settings window is foreground.
@@ -64,6 +83,22 @@ pub trait Host: Send + Sync + 'static {
     fn stats(&self) -> Push;
     /// Start a settings window.
     fn open_settings(&self) -> io::Result<()>;
+    /// What the `Attention` push needs: the files of model `model` and whether input device
+    /// `device` (empty is the system default) is there.
+    fn probe(&self, model: &str, device: &str) -> Probe;
+    /// One `History` push: the recordings older than `older_than`, newest first.
+    fn history_list(&self, older_than: Option<&str>) -> Push;
+    /// The audio of recording `id`, 16 kHz mono, for a new transcript.
+    fn history_audio(&self, id: &str) -> io::Result<Vec<f32>>;
+    /// Stores `text` as the transcript of recording `id`, made by `set` in `language`.
+    fn history_set_text(
+        &self,
+        id: &str,
+        text: &str,
+        set: &SettingsSet,
+        language: Language,
+    ) -> io::Result<()>;
+    fn history_delete(&self, id: &str) -> io::Result<()>;
 }
 
 /// Queue to the settings connection, shared by every thread that pushes. Cheap to clone.
@@ -334,7 +369,7 @@ impl Ctx {
             {
                 session.capture = None;
             }
-            if !answer_status(conn, session) {
+            if !answer_status(conn, session, &*self.host) {
                 return;
             }
             match conn.recv::<Request>() {
@@ -362,25 +397,7 @@ impl Ctx {
     fn handle(&self, req: Request, conn: &mut Conn, session: &mut Session) -> bool {
         let first = session.settings.is_none();
         match req {
-            Request::OpenSettings => {
-                // Windows only lets a window take the foreground when the process allows it.
-                if let Some(client) = self.pushes.client()
-                    && let Err(e) = self.host.allow_foreground(client)
-                {
-                    tracing::debug!(kind = ?e.kind(), "foreground not allowed for settings");
-                }
-                if !self.pushes.send(Push::Raise)
-                    && let Err(e) = self.host.open_settings()
-                {
-                    tracing::warn!(kind = ?e.kind(), "settings window not started");
-                }
-                if first {
-                    // The second launch waits for this ack and the close after it; a close
-                    // without the ack (no free slot) tells it nothing was acted on.
-                    let _ = conn.send(&hello_ack());
-                }
-                !first
-            }
+            Request::OpenSettings => self.open_settings(conn, first),
             Request::Hello { .. } => {
                 session.client = conn.peer_pid().unwrap_or(0);
                 if session.settings.is_none() {
@@ -423,27 +440,98 @@ impl Ctx {
             }
             Request::TestTranscribe { id, set, language } => {
                 if session.test_running.is_some() {
-                    let outcome = TestOutcome::Failed {
-                        why: TestFailure::Busy,
-                    };
-                    return conn.send(&Push::TestResult { id, outcome }).is_ok();
+                    return conn.send(&test_failed(id, TestFailure::Busy)).is_ok();
                 }
-                session.test_running = Some(id);
-                session.tested = true;
-                let job = TestJob {
-                    id,
-                    set,
-                    language,
-                    samples: session.test_audio.clone().unwrap_or_default(),
-                    reply: self.pushes.clone(),
-                };
-                self.inbox.send(Inbox::Ipc(IpcAsk::Test(job))).is_ok()
+                let samples = session.test_audio.clone().unwrap_or_default();
+                self.start_test(session, id, set, language, samples)
             }
+            Request::HistoryList { older_than } => conn
+                .send(&self.host.history_list(older_than.as_deref()))
+                .is_ok(),
+            Request::HistoryRetranscribe {
+                run,
+                id,
+                set,
+                language,
+            } => {
+                if session.test_running.is_some() {
+                    return conn.send(&test_failed(run, TestFailure::Busy)).is_ok();
+                }
+                let Ok(samples) = self.host.history_audio(&id) else {
+                    return conn.send(&test_failed(run, TestFailure::NoAudio)).is_ok();
+                };
+                self.start_test(session, run, set, language, samples)
+            }
+            Request::HistorySetText {
+                id,
+                text: Spoken(text),
+                set,
+                language,
+            } => {
+                let done = self.host.history_set_text(&id, &text, &set, language);
+                history_result(conn, id, HistoryOp::SetText, done)
+            }
+            Request::HistoryDelete { id } => {
+                let done = self.host.history_delete(&id);
+                history_result(conn, id, HistoryOp::Delete, done)
+            }
+            // The coordinator refuses it while a job runs; the whisper worker unloads and deletes,
+            // and the answer comes back as a push.
+            Request::DeleteModel { id } => self
+                .inbox
+                .send(Inbox::Ipc(IpcAsk::DeleteModel {
+                    id,
+                    reply: self.pushes.clone(),
+                }))
+                .is_ok(),
             Request::Shutdown => {
                 let _ = self.inbox.send(Inbox::Shutdown);
                 false
             }
         }
+    }
+
+    /// Raises the settings window, or starts it. `first`: a second launch forwarded its click
+    /// and waits for the ack; the connection closes after it.
+    fn open_settings(&self, conn: &mut Conn, first: bool) -> bool {
+        // Windows only lets a window take the foreground when the process allows it.
+        if let Some(client) = self.pushes.client()
+            && let Err(e) = self.host.allow_foreground(client)
+        {
+            tracing::debug!(kind = ?e.kind(), "foreground not allowed for settings");
+        }
+        if !self.pushes.send(Push::Raise)
+            && let Err(e) = self.host.open_settings()
+        {
+            tracing::warn!(kind = ?e.kind(), "settings window not started");
+        }
+        if first {
+            // The second launch waits for this ack and the close after it; a close
+            // without the ack (no free slot) tells it nothing was acted on.
+            let _ = conn.send(&hello_ack());
+        }
+        !first
+    }
+
+    /// Hands a recognition test run to the coordinator; its result comes back as a push.
+    fn start_test(
+        &self,
+        session: &mut Session,
+        id: u32,
+        set: SettingsSet,
+        language: Language,
+        samples: Vec<f32>,
+    ) -> bool {
+        session.test_running = Some(id);
+        session.tested = true;
+        let job = TestJob {
+            id,
+            set,
+            language,
+            samples,
+            reply: self.pushes.clone(),
+        };
+        self.inbox.send(Inbox::Ipc(IpcAsk::Test(job))).is_ok()
     }
 
     /// Asks the coordinator; the answer is sent by [`answer_status`], so a busy
@@ -489,12 +577,14 @@ impl Ctx {
 }
 
 /// Sends the answers that came in; drops asks the coordinator left unanswered too long.
-fn answer_status(conn: &mut Conn, session: &mut Session) -> bool {
+fn answer_status(conn: &mut Conn, session: &mut Session, host: &dyn Host) -> bool {
     while let Some((rx, asked)) = session.asks.front() {
         match rx.try_recv() {
             Ok(report) => {
                 session.asks.pop_front();
-                if conn.send(&status_push(report)).is_err() {
+                let probe = host.probe(&report.model, &report.device);
+                let attention = attention_push(&report, probe);
+                if conn.send(&status_push(report)).is_err() || conn.send(&attention).is_err() {
                     return false;
                 }
             }
@@ -530,6 +620,25 @@ fn flush(conn: &mut Conn, session: &mut Session) -> bool {
     }
 }
 
+fn test_failed(id: u32, why: TestFailure) -> Push {
+    Push::TestResult {
+        id,
+        outcome: TestOutcome::Failed { why },
+    }
+}
+
+/// Answers a history edit; a failure is logged by its kind only, never with the text.
+fn history_result(conn: &mut Conn, id: String, op: HistoryOp, done: io::Result<()>) -> bool {
+    let ok = match done {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(kind = ?e.kind(), ?op, "history entry not changed");
+            false
+        }
+    };
+    conn.send(&Push::HistoryResult { id, op, ok }).is_ok()
+}
+
 fn hello_ack() -> Push {
     Push::HelloAck {
         proto: PROTO,
@@ -545,6 +654,60 @@ fn status_push(report: StatusReport) -> Push {
         backend: report.backend,
         warnings: report.warnings,
     }
+}
+
+/// What the files say, corrected by the last load: a file of the right size that did not load
+/// is damaged too. A file that is not there stays what it is.
+fn seen_model(files: Option<ModelStatus>, load: Option<ModelFailure>) -> Option<ModelStatus> {
+    match (files, load) {
+        (Some(ModelStatus::Missing | ModelStatus::Partial), _) => files,
+        (_, Some(ModelFailure::Bad)) => Some(ModelStatus::Bad),
+        _ => files,
+    }
+}
+
+/// Everything that needs the user, from the status report and what the disk and the system say.
+fn attention_push(report: &StatusReport, probe: Probe) -> Push {
+    let seen = Observed {
+        model: seen_model(probe.model, report.model_failure),
+        mic_missing: probe.mic_missing,
+        load_oom_on_cpu: report.model_failure == Some(ModelFailure::OutOfMemory),
+        warnings: &report.warnings,
+        sounds: &report.sounds,
+    };
+    Push::Attention {
+        items: attention(&seen),
+    }
+}
+
+/// Is input device `device` (empty: the system default) missing from `mics`.
+fn mic_missing(device: &str, mics: &[String]) -> bool {
+    if device.is_empty() {
+        mics.is_empty()
+    } else {
+        !mics.iter().any(|m| m == device)
+    }
+}
+
+/// The page of `all` (newest first) after `older_than`, and whether older items remain.
+fn history_page(
+    all: impl IntoIterator<Item = HistoryItem>,
+    older_than: Option<&str>,
+) -> (Vec<HistoryItem>, bool) {
+    let mut items = Vec::new();
+    let mut bytes = 0;
+    // Ids are `YYYY-MM-DD/HHMMSS-mmm`: text order is time order.
+    let rest = all
+        .into_iter()
+        .filter(|i| older_than.is_none_or(|id| i.id.as_str() < id));
+    for item in rest {
+        bytes += 128 + item.id.len() + item.model.len() + item.language.len() + item.text.0.len();
+        if !items.is_empty() && (items.len() >= HISTORY_PAGE_ITEMS || bytes > HISTORY_PAGE_BYTES) {
+            return (items, true);
+        }
+        items.push(item);
+    }
+    (items, false)
 }
 
 /// The foreground window belongs to the settings client, and that client is not this daemon
@@ -652,6 +815,7 @@ pub struct SystemHost {
     hook: Arc<oxi_platform::os::hook::HookHandle>,
     settings: SettingsProc,
     stats: Option<std::path::PathBuf>,
+    layout: Option<oxi_core::paths::Layout>,
 }
 
 impl SystemHost {
@@ -660,7 +824,22 @@ impl SystemHost {
             hook,
             settings: SettingsProc::default(),
             stats: super::stats::path(),
+            layout: oxi_platform::dirs::layout().ok(),
         }
+    }
+
+    /// The folder history goes to, by the `[history] folder` of `config.toml` as it is now.
+    fn history_dir(&self) -> io::Result<std::path::PathBuf> {
+        let layout = self.layout.as_ref().ok_or(io::ErrorKind::NotFound)?;
+        let cfg = std::fs::read_to_string(layout.config_file())
+            .ok()
+            .and_then(|text| oxi_core::config::ConfigFile::parse(&text).ok())
+            .map(|file| file.config)
+            .unwrap_or_default();
+        Ok(oxi_core::history::folder(
+            &cfg.history,
+            &layout.history_dir(),
+        ))
     }
 
     /// The daemon is going down: a later `OpenSettings` starts nothing. An open settings window
@@ -713,6 +892,57 @@ impl Host for SystemHost {
         ))
     }
 
+    fn probe(&self, model: &str, device: &str) -> Probe {
+        let mics = oxi_platform::capture::list_input_devices().unwrap_or_default();
+        Probe {
+            model: self.layout.as_ref().and_then(|layout| {
+                models::find(model).map(|entry| models::status(entry, &layout.models_dir()))
+            }),
+            mic_missing: mic_missing(device, &mics),
+        }
+    }
+
+    fn history_list(&self, older_than: Option<&str>) -> Push {
+        let all = self
+            .history_dir()
+            .map(|dir| history::list(&dir))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| HistoryItem {
+                id: r.id,
+                status: r.meta.status,
+                duration_ms: r.meta.duration_ms,
+                model: r.meta.model,
+                language: r.meta.language,
+                text: Spoken(r.text),
+            });
+        let (items, more) = history_page(all, older_than);
+        Push::History { items, more }
+    }
+
+    fn history_audio(&self, id: &str) -> io::Result<Vec<f32>> {
+        history::audio_16k(&self.history_dir()?, id)
+    }
+
+    fn history_set_text(
+        &self,
+        id: &str,
+        text: &str,
+        set: &SettingsSet,
+        language: Language,
+    ) -> io::Result<()> {
+        let ctx = HistoryContext {
+            model: set.model.clone(),
+            language: language.as_str().to_owned(),
+            settings: Some(set.clone()),
+        };
+        history::set_text(&self.history_dir()?, id, text, &ctx)
+    }
+
+    fn history_delete(&self, id: &str) -> io::Result<()> {
+        history::delete(&self.history_dir()?, id)
+    }
+
     fn open_settings(&self) -> io::Result<()> {
         self.settings.open(|| {
             let started = std::process::Command::new(std::env::current_exe()?)
@@ -733,8 +963,8 @@ mod tests {
 
     use oxi_core::config::OverlayPosition;
     use oxi_core::device::DeviceChoice;
-    use oxi_core::ipc::MAX_LINE;
-    use oxi_core::machine::Phase;
+    use oxi_core::ipc::{Attention, DeleteResult, MAX_LINE, SoundWarning, SoundWarningKind};
+    use oxi_core::machine::{Phase, Sound};
 
     use super::*;
 
@@ -788,7 +1018,49 @@ mod tests {
             let _ = self.calls.send(Call::Open);
             Ok(())
         }
+        fn probe(&self, _model: &str, _device: &str) -> Probe {
+            Probe {
+                model: Some(ModelStatus::Bad),
+                mic_missing: true,
+            }
+        }
+        fn history_list(&self, older_than: Option<&str>) -> Push {
+            let item = |id: &str| HistoryItem {
+                id: id.into(),
+                status: oxi_core::history::Status::Done,
+                duration_ms: 900,
+                model: "turbo".into(),
+                language: "auto".into(),
+                text: Spoken("words".into()),
+            };
+            let (items, more) = history_page(
+                [item("2026-11-10/120000-000"), item("2026-11-09/120000-000")],
+                older_than,
+            );
+            Push::History { items, more }
+        }
+        fn history_audio(&self, id: &str) -> io::Result<Vec<f32>> {
+            if id == GOOD_ID {
+                Ok(vec![0.25; 3])
+            } else {
+                Err(io::ErrorKind::NotFound.into())
+            }
+        }
+        fn history_set_text(
+            &self,
+            id: &str,
+            _text: &str,
+            _set: &SettingsSet,
+            _language: Language,
+        ) -> io::Result<()> {
+            self.history_audio(id).map(drop)
+        }
+        fn history_delete(&self, id: &str) -> io::Result<()> {
+            self.history_audio(id).map(drop)
+        }
     }
+
+    const GOOD_ID: &str = "2026-11-10/101500-123";
 
     /// A one-process child (`ping` starts no grandchild), so nothing is left behind.
     fn sleeper() -> std::process::Child {
@@ -947,7 +1219,9 @@ mod tests {
             device: "mic".into(),
             gpu: DeviceChoice::Named("Vulkan0".into()),
             backend: "cpu".into(),
+            model_failure: None,
             warnings: vec!["w".into()],
+            sounds: Vec::new(),
         };
         conn.send(&Request::Status).unwrap();
         let Ok(Inbox::Ipc(IpcAsk::Status(reply))) = rig.inbox.recv_timeout(WAIT) else {
@@ -964,10 +1238,221 @@ mod tests {
                 warnings: vec!["w".into()],
             })
         );
+        // The fake host reports a damaged model and no microphone; the engine line is a plain
+        // warning, so it adds nothing.
+        assert_eq!(
+            conn.recv::<Push>().unwrap(),
+            Some(Push::Attention {
+                items: vec![Attention::ModelDamaged, Attention::NoMicrophone]
+            })
+        );
         conn.send(&Request::ListDevices).unwrap();
         assert_eq!(conn.recv::<Push>().unwrap(), Some(rig.host.devices()));
         conn.send(&Request::Stats).unwrap();
         assert_eq!(conn.recv::<Push>().unwrap(), Some(rig.host.stats()));
+    }
+
+    #[test]
+    fn history_requests_reach_the_host_and_answer() {
+        let rig = rig("history");
+        let mut conn = settings(&rig);
+        conn.send(&Request::HistoryList { older_than: None })
+            .unwrap();
+        let Some(Push::History { items, more }) = conn.recv::<Push>().unwrap() else {
+            panic!("no History");
+        };
+        assert_eq!((items.len(), more), (2, false));
+        conn.send(&Request::HistoryList {
+            older_than: Some("2026-11-10/120000-000".into()),
+        })
+        .unwrap();
+        let Some(Push::History { items, .. }) = conn.recv::<Push>().unwrap() else {
+            panic!("no History");
+        };
+        assert_eq!(items.len(), 1);
+        for (id, ok) in [(GOOD_ID, true), ("2026-11-10/000000-000", false)] {
+            conn.send(&Request::HistorySetText {
+                id: id.into(),
+                text: Spoken("new".into()),
+                set: SettingsSet::defaults(),
+                language: Language::RU,
+            })
+            .unwrap();
+            assert_eq!(
+                conn.recv::<Push>().unwrap(),
+                Some(Push::HistoryResult {
+                    id: id.into(),
+                    op: HistoryOp::SetText,
+                    ok
+                })
+            );
+            conn.send(&Request::HistoryDelete { id: id.into() })
+                .unwrap();
+            assert_eq!(
+                conn.recv::<Push>().unwrap(),
+                Some(Push::HistoryResult {
+                    id: id.into(),
+                    op: HistoryOp::Delete,
+                    ok
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_retranscribe_runs_the_saved_audio_one_at_a_time() {
+        let rig = rig("retranscribe");
+        let mut conn = settings(&rig);
+        let ask = |run, id: &str| Request::HistoryRetranscribe {
+            run,
+            id: id.into(),
+            set: SettingsSet::defaults(),
+            language: Language::RU,
+        };
+        conn.send(&ask(1, "2026-11-10/000000-000")).unwrap();
+        assert_eq!(
+            conn.recv::<Push>().unwrap(),
+            Some(Push::TestResult {
+                id: 1,
+                outcome: TestOutcome::Failed {
+                    why: TestFailure::NoAudio
+                }
+            })
+        );
+        conn.send(&ask(2, GOOD_ID)).unwrap();
+        let Ok(Inbox::Ipc(IpcAsk::Test(job))) = rig.inbox.recv_timeout(WAIT) else {
+            panic!("no test job");
+        };
+        assert_eq!((job.id, job.samples), (2, vec![0.25; 3]));
+        // Its answer is pending: the next one waits.
+        conn.send(&ask(3, GOOD_ID)).unwrap();
+        assert_eq!(
+            conn.recv::<Push>().unwrap(),
+            Some(Push::TestResult {
+                id: 3,
+                outcome: TestOutcome::Failed {
+                    why: TestFailure::Busy
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn a_model_delete_goes_to_the_coordinator_and_its_answer_comes_back_as_a_push() {
+        let rig = rig("delete-model");
+        let mut conn = settings(&rig);
+        for result in [DeleteResult::Done { freed: 9 }, DeleteResult::InUse] {
+            conn.send(&Request::DeleteModel { id: "turbo".into() })
+                .unwrap();
+            let Ok(Inbox::Ipc(IpcAsk::DeleteModel { id, reply })) = rig.inbox.recv_timeout(WAIT)
+            else {
+                panic!("no DeleteModel ask");
+            };
+            assert_eq!(id, "turbo");
+            reply.send(Push::ModelDeleted {
+                id,
+                result: result.clone(),
+            });
+            assert_eq!(
+                conn.recv::<Push>().unwrap(),
+                Some(Push::ModelDeleted {
+                    id: "turbo".into(),
+                    result
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_load_reaches_the_attention_even_when_the_file_looks_right() {
+        use ModelFailure::{Bad, OutOfMemory};
+        use ModelStatus::{Bad as Wrong, Missing, NeedsHash, Partial, Ready};
+        // (what the files say, what the last load said, what the chip sees)
+        for (files, load, want) in [
+            (Some(Ready), Some(Bad), Some(Wrong)),
+            (Some(NeedsHash), Some(Bad), Some(Wrong)),
+            (None, Some(Bad), Some(Wrong)),
+            (Some(Missing), Some(Bad), Some(Missing)),
+            (Some(Partial), Some(Bad), Some(Partial)),
+            (Some(Ready), None, Some(Ready)),
+            (Some(Ready), Some(OutOfMemory), Some(Ready)),
+        ] {
+            assert_eq!(seen_model(files, load), want, "{files:?} {load:?}");
+        }
+        let mut report = StatusReport {
+            phase: Phase::Idle,
+            model: "tiny".into(),
+            device: String::new(),
+            gpu: DeviceChoice::Auto,
+            backend: "none".into(),
+            model_failure: Some(OutOfMemory),
+            warnings: Vec::new(),
+            sounds: Vec::new(),
+        };
+        let probe = Probe {
+            model: Some(Ready),
+            mic_missing: false,
+        };
+        assert_eq!(
+            attention_push(&report, probe),
+            Push::Attention {
+                items: vec![Attention::OutOfMemory { cpu: true }]
+            }
+        );
+        // The sound worker's kind decides, not its line's wording.
+        report.model_failure = None;
+        report.sounds = vec![SoundWarning {
+            kind: SoundWarningKind::Unused(Sound::Stop),
+            line: "any wording".into(),
+        }];
+        assert_eq!(
+            attention_push(&report, probe),
+            Push::Attention {
+                items: vec![Attention::SoundFailed {
+                    line: "any wording".into(),
+                    stop: true
+                }]
+            }
+        );
+        report.sounds[0].kind = SoundWarningKind::SlowOpen;
+        assert_eq!(
+            attention_push(&report, probe),
+            Push::Attention { items: Vec::new() }
+        );
+    }
+
+    #[test]
+    fn a_history_page_is_capped_and_continues_after_its_last_id() {
+        let item = |n: usize| HistoryItem {
+            id: format!("2026-11-10/{:06}-000", 999_999 - n),
+            status: oxi_core::history::Status::Done,
+            duration_ms: 1,
+            model: String::new(),
+            language: String::new(),
+            text: Spoken("t".into()),
+        };
+        let all: Vec<_> = (0..HISTORY_PAGE_ITEMS + 5).map(item).collect();
+        let (first, more) = history_page(all.clone(), None);
+        assert_eq!((first.len(), more), (HISTORY_PAGE_ITEMS, true));
+        let (rest, more) = history_page(all, first.last().map(|i| i.id.as_str()));
+        assert_eq!((rest.len(), more), (5, false));
+        // One huge text is still sent alone, and the next item waits for the next page.
+        let huge = HistoryItem {
+            text: Spoken("x".repeat(HISTORY_PAGE_BYTES + 1)),
+            ..item(0)
+        };
+        let (page, more) = history_page([huge, item(1)], None);
+        assert_eq!((page.len(), more), (1, true));
+        assert_eq!(history_page([], None), (Vec::new(), false));
+    }
+
+    #[test]
+    fn the_microphone_is_missing_when_the_chosen_one_or_any_is_not_listed() {
+        let mics = vec!["USB Mic".to_owned()];
+        assert!(!mic_missing("", &mics));
+        assert!(mic_missing("", &[]));
+        assert!(!mic_missing("USB Mic", &mics));
+        assert!(mic_missing("Other", &mics));
     }
 
     #[test]
@@ -1017,8 +1502,8 @@ mod tests {
         }
         conn.send(&Request::TestTranscribe {
             id: 3,
-            set: oxi_core::tuning::SettingsSet::defaults(),
-            language: oxi_core::types::Language::EN,
+            set: SettingsSet::defaults(),
+            language: Language::EN,
         })
         .unwrap();
         assert!(matches!(
@@ -1038,8 +1523,8 @@ mod tests {
         let mut conn = settings(&rig);
         let run = |id| Request::TestTranscribe {
             id,
-            set: oxi_core::tuning::SettingsSet::defaults(),
-            language: oxi_core::types::Language::EN,
+            set: SettingsSet::defaults(),
+            language: Language::EN,
         };
         conn.send(&run(1)).unwrap();
         let Ok(Inbox::Ipc(IpcAsk::Test(job))) = rig.inbox.recv_timeout(WAIT) else {
@@ -1387,7 +1872,9 @@ mod tests {
                 device: String::new(),
                 gpu: DeviceChoice::Auto,
                 backend: "none".into(),
+                model_failure: None,
                 warnings: vec![],
+                sounds: vec![],
             })
             .unwrap();
         assert!(matches!(

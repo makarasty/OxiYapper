@@ -31,6 +31,7 @@ const WM_HOOK_COMMAND: u32 = WM_APP;
 
 enum Command {
     SetChord(Chord),
+    SetEscCancels(bool),
     SetCapture { on: bool, swallow: bool },
     Reinstall,
     Poll,
@@ -103,6 +104,11 @@ impl HookHandle {
     /// Replaces the chord (the coordinator calls it when the phase is Idle, item 11).
     pub fn set_chord(&self, chord: Chord) {
         self.send(Command::SetChord(chord));
+    }
+
+    /// `hotkey.esc_cancels`: while it is off (the default) the hook never swallows Esc.
+    pub fn set_esc_cancels(&self, on: bool) {
+        self.send(Command::SetEscCancels(on));
     }
 
     /// Hotkey capture on or off; `swallow` while the settings window is foreground.
@@ -188,6 +194,7 @@ fn apply(command: Command, hook: &mut HHOOK) {
         let Some(s) = state.as_mut() else { return };
         match command {
             Command::SetChord(chord) => s.tracker.set_chord(chord),
+            Command::SetEscCancels(on) => s.tracker.set_esc_cancels(on),
             Command::SetCapture { on, swallow } => {
                 s.tracker.set_capture(on);
                 s.capture_swallow = swallow;
@@ -318,6 +325,12 @@ mod tests {
         let (tx, events) = mpsc::channel();
         let (captured, _) = mpsc::channel();
         let handle = Hook::spawn(chord, phase.clone(), tx, captured).unwrap();
+        handle.set_esc_cancels(true); // off is the default, and then Esc is no event
+        handle.poll(); // commands run in order: the answer says the setting is in
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(2)),
+            Ok(Event::ChordPolled { .. })
+        ));
         phase.store(Phase::Recording);
         FORCE_START_BLOCKER.store(true, Ordering::Relaxed);
         OURS_SEEN.store(0, Ordering::Relaxed);

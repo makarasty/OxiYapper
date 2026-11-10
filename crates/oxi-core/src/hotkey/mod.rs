@@ -12,3 +12,6 @@ mod tracker;
 pub use chord::{Chord, ChordError};
 pub use key::Key;
 pub use tracker::{Ctx, KeyId, KeyInput, Tracker, Verdict};
+
+#[cfg(test)]
+mod edge_tests;

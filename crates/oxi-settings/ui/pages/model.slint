@@ -1,8 +1,9 @@
 // Model page (SPEC Models, ARCHITECTURE section 8), in three sub-tabs. Models: the dictation
-// language, the curated models with their state on disk, download and cancel through the daemon,
-// "use my own .bin". Settings: the GPU, the unload, the models folder and its partial downloads.
-// Advanced: what the engine does on its own.
-import { Theme, Shell, Icons, Group, Card, ClickCard, Row, Divider, Combo, Segmented, TextField, Button, ButtonKind, Radio, Badge, BadgeKind, ProgressBar, WarningSlot, SubTabs, SubTabPane } from "../theme/index.slint";
+// language, then the models as a gallery (DS-15) with the tile under the check in a card below
+// it: its state on disk and what can be done now (download, resume, cancel, use, delete), or the
+// path of "use my own .bin". Settings: the GPU, the unload, the models folder and its partial
+// downloads. Advanced: what the engine does on its own.
+import { Theme, Shell, Icons, Group, Card, Row, Divider, Combo, Segmented, Button, ButtonKind, IconButton, InfoTip, PathField, ProgressBar, WarningSlot, SubTabs, SubTabPane, CardGrid, GalleryTile } from "../theme/index.slint";
 import { SearchPopup } from "../theme/components/search_popup.slint";
 
 export struct ModelRow {
@@ -14,7 +15,7 @@ export struct ModelRow {
     progress-text: string,
     // "Ready", "Not downloaded", "Paused", "Downloading".
     badge: string,
-    // On disk and usable: the badge is green.
+    // On disk and usable.
     ready: bool,
     can-download: bool,
     // A `.part` is there: the download resumes from it.
@@ -22,10 +23,14 @@ export struct ModelRow {
     downloading: bool,
     // 0..1 while downloading.
     progress: float,
-    // Why the last download failed; empty otherwise.
+    // Why the last download or delete failed; empty otherwise.
     error: string,
     // Likely slow on the GPU picked (`models::too_heavy`); a warning, never a block.
     heavy: bool,
+    // A file of it is on disk (the model, a damaged one or a `.part`): Delete is offered.
+    can-delete: bool,
+    // What a delete frees: "3.1 GB".
+    frees: string,
 }
 
 // Filled and read by `pages::model`.
@@ -33,8 +38,12 @@ export global ModelState {
     // The open sub-tab: 0 Models, 1 Settings, 2 Advanced.
     in-out property <int> tab;
     in property <[ModelRow]> rows;
-    // Index in `rows`; `rows.length` is "use my own .bin", -1 is none.
+    // The gallery: a tile per row, then "use my own .bin".
+    in property <[GalleryTile]> tiles;
+    // The model in use: an index in `rows`; `rows.length` is "use my own .bin", -1 is none.
     in property <int> selected;
+    // The tile under the check, whose card is below the gallery; the model in use on opening.
+    in-out property <int> viewed;
     in-out property <string> custom-path;
     in property <string> custom-error;
     // The native file dialog exists on this OS.
@@ -53,12 +62,14 @@ export global ModelState {
     in property <string> warning;
     // Why Download is off; empty while the daemon is online.
     in property <string> download-off;
+    // Why Delete is off; empty while the daemon is online (it may hold the file open).
+    in property <string> delete-off;
     // The two last used dictation languages: "RU", and "Russian" for a screen reader.
     in property <[string]> language-codes;
     in property <[string]> language-names;
     // 0 and 1 those two, 2 Auto.
     in property <int> language;
-    // The rows of the "..." popup: what the search matches, the native names beside them.
+    // The rows of the "more languages" popup: what the search matches, the native names beside them.
     in property <[string]> language-rows;
     in property <[string]> language-native;
     // The row of the language in use, -1 when the search hides it or it is Auto.
@@ -67,83 +78,335 @@ export global ModelState {
     callback language-search(string);
     callback language-chosen(int);
     callback shown();
+    // Use: the model of `rows` (or `rows.length`, the own file) becomes the one in use.
     callback picked(int);
     callback download(int);
     callback cancel(int);
+    // Deletes the model's files; its card asked first.
+    callback delete(int);
     callback custom-edited(string);
-    callback browse();
+    // The dialog starts at the folder of this path (DS-13.4).
+    callback browse(string);
     callback open-folder();
     callback delete-partials();
     callback gpu-picked(int);
     callback unload-picked(int);
 }
 
-// Radio dot, name and caption: the choice inside a model card. Its own accessible element, so a
-// button beside it in the card is not part of the radio. While `downloading` a progress bar takes
-// the caption's place and its room, so the card keeps its height.
-component Choice inherits Rectangle {
-    in property <string> label;
-    in property <string> detail;
-    in property <bool> checked;
-    in property <bool> hover;
-    in property <bool> downloading;
-    in property <float> progress;
-    in property <string> progress-text;
-    callback picked();
-    horizontal-stretch: 1;
-    min-height: inner.min-height;
-    preferred-height: inner.preferred-height;
-    accessible-role: radio-button;
-    accessible-label: root.label;
-    accessible-checkable: true;
-    accessible-checked: root.checked;
-    accessible-enabled: !Shell.locked;
-    accessible-action-default => {
-        if (!Shell.locked) {
-            root.picked();
+// The curated model under the gallery's check: name and size (or the download's bar), its "!", and
+// two fixed action slots, get (Download, Resume, Cancel, Use) and remove (Delete), each one width,
+// so a state change moves no button (DS-7.3). Delete asks first, in place of the line.
+component ModelCard inherits VerticalLayout {
+    in property <ModelRow> data;
+    in property <int> index;
+    property <bool> in-use: ModelState.selected == root.index;
+    property <string> missing: root.in-use && root.data.can-download && !root.data.downloading ? @tr("Dictation will not start until this is downloaded.") : "";
+    property <string> slow: root.data.heavy ? @tr("Likely slow without a dedicated graphics card. Whisper large-v3 turbo is faster.") : "";
+    property <string> first: root.data.error != "" ? root.data.error : root.missing;
+    property <string> second: root.data.error != "" && root.missing != "" ? root.missing : root.slow;
+    // The model a dictation loads is not deleted from under it: another one is put in use first.
+    property <string> delete-tip: ModelState.delete-off != "" ? ModelState.delete-off : root.in-use && root.data.ready ? @tr("In use. Use another model first to delete this one.") : "";
+    property <bool> confirming;
+    property <bool> confirm-by-key;
+    // The question's buttons go with it: the focus goes back to Delete, not to the window top.
+    property <bool> refocus;
+    // A confirmed Delete: once the files are gone, the get slot's Download takes the focus.
+    property <bool> deleting;
+    changed index => {
+        root.confirming = false;
+        root.refocus = false;
+        root.deleting = false;
+    }
+    // A delete that fails (the daemon's refusal lands as the card's "!") ends the wait for the files.
+    property <string> failure: root.data.error;
+    changed failure => {
+        if root.failure != "" {
+            root.deleting = false;
         }
     }
-    // The radio in an icon-wide column: the title starts where a `Row` title after its icon does
-    // (UI rule 9).
-    inner := HorizontalLayout {
-        spacing: Theme.icon-gap;
-        VerticalLayout {
-            width: Theme.icon-size;
-            alignment: center;
-            Radio {
-                checked: root.checked;
-                enabled: !Shell.locked;
-                hover: root.hover;
-            }
-        }
-        VerticalLayout {
-            alignment: center;
-            spacing: Theme.title-gap;
-            horizontal-stretch: 1;
-            Text {
-                text: root.label;
-                font-size: Theme.body-size;
-                color: Shell.locked ? Theme.text-disabled : Theme.text-primary;
-                wrap: word-wrap;
-            }
-            Rectangle {
+    Card {
+        Rectangle {
+            min-height: line.min-height;
+            preferred-height: line.preferred-height;
+            line := HorizontalLayout {
+                visible: !root.confirming;
+                spacing: Theme.icon-gap;
+                // The icon column of a `Row`: the name starts where row titles do (UI rule 9).
                 VerticalLayout {
-                    Text {
-                        text: root.detail;
-                        visible: !root.downloading;
-                        font-size: Theme.caption-size;
-                        color: Shell.locked ? Theme.text-disabled : Theme.text-secondary;
-                        wrap: word-wrap;
+                    alignment: center;
+                    Image {
+                        source: Icons.brain-circuit;
+                        width: Theme.icon-size;
+                        height: Theme.icon-size;
+                        colorize: Theme.text-primary;
+                        accessible-role: none;
                     }
                 }
-                if root.downloading: ProgressBar {
-                    y: (parent.height - self.height) / 2;
-                    width: parent.width;
-                    height: self.preferred-height;
-                    value: root.progress;
-                    label: root.progress-text;
-                    accessible-label: @tr("{} download", root.label);
-                    accessible-value: root.progress;
+                HorizontalLayout {
+                    spacing: Theme.control-gap;
+                    horizontal-stretch: 1;
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: Theme.title-gap;
+                        horizontal-stretch: 1;
+                        Text {
+                            text: root.data.name;
+                            font-size: Theme.body-size;
+                            color: Theme.text-primary;
+                            overflow: elide;
+                            accessible-label: @tr("{}: {}", root.data.name, root.data.badge);
+                        }
+                        // While downloading the bar takes the caption's place and its room, so
+                        // the card keeps its height.
+                        Rectangle {
+                            VerticalLayout {
+                                Text {
+                                    text: root.data.detail;
+                                    visible: !root.data.downloading;
+                                    font-size: Theme.caption-size;
+                                    color: Theme.text-secondary;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            if root.data.downloading: ProgressBar {
+                                y: (parent.height - self.height) / 2;
+                                width: parent.width;
+                                height: self.preferred-height;
+                                value: root.data.progress;
+                                label: root.data.progress-text;
+                                accessible-label: @tr("{} download", root.data.name);
+                                accessible-value: root.data.progress;
+                            }
+                        }
+                    }
+                    WarningSlot {
+                        text: root.first != "" && root.second != "" ? root.first + "\n" + root.second : root.first + root.second;
+                    }
+                    Rectangle {
+                        width: Theme.model-action-column;
+                        // Downloading writes no config, so it stays on while the config is locked.
+                        if root.data.can-download && !root.data.downloading: VerticalLayout {
+                            property <bool> back: root.deleting && !root.data.can-delete;
+                            // A ready model's Download is new; a paused one's Resume was there.
+                            init => {
+                                if self.back {
+                                    root.deleting = false;
+                                    get.take-focus(root.confirm-by-key);
+                                }
+                            }
+                            changed back => {
+                                if self.back {
+                                    root.deleting = false;
+                                    get.take-focus(root.confirm-by-key);
+                                }
+                            }
+                            width: parent.width;
+                            alignment: center;
+                            get := Button {
+                                text: root.data.paused ? @tr("Resume") : @tr("Download");
+                                icon: Icons.arrow-download-16;
+                                enabled: ModelState.download-off == "";
+                                tooltip: ModelState.download-off;
+                                accessible-label: root.data.paused ? @tr("Resume {}", root.data.name) : @tr("Download {}", root.data.name);
+                                clicked => {
+                                    ModelState.download(root.index);
+                                }
+                            }
+                        }
+                        if root.data.downloading: VerticalLayout {
+                            width: parent.width;
+                            alignment: center;
+                            Button {
+                                text: @tr("Cancel");
+                                icon: Icons.dismiss-16;
+                                kind: ButtonKind.danger;
+                                accessible-label: @tr("Cancel {}", root.data.name);
+                                clicked => {
+                                    ModelState.cancel(root.index);
+                                }
+                            }
+                        }
+                        if root.data.ready: VerticalLayout {
+                            width: parent.width;
+                            alignment: center;
+                            Button {
+                                text: root.in-use ? @tr("In use") : @tr("Use");
+                                icon: Icons.checkmark-12;
+                                kind: root.in-use ? ButtonKind.secondary : ButtonKind.primary;
+                                enabled: !root.in-use && !Shell.locked;
+                                tooltip: Shell.locked ? Shell.locked-tip : "";
+                                accessible-label: root.in-use ? @tr("{} in use", root.data.name) : @tr("Use {}", root.data.name);
+                                clicked => {
+                                    ModelState.picked(root.index);
+                                }
+                            }
+                        }
+                    }
+                    // Kept while empty, so the get slot never moves.
+                    Rectangle {
+                        width: Theme.model-action-column;
+                        // Files, not the config: a locked config keeps it.
+                        if root.data.can-delete && !root.data.downloading: VerticalLayout {
+                            property <bool> back: root.refocus;
+                            changed back => {
+                                if self.back {
+                                    root.refocus = false;
+                                    remove.take-focus(root.confirm-by-key);
+                                }
+                            }
+                            width: parent.width;
+                            alignment: center;
+                            remove := Button {
+                            text: @tr("Delete");
+                            icon: Icons.delete-16;
+                            kind: ButtonKind.danger;
+                            enabled: root.delete-tip == "";
+                            tooltip: root.delete-tip;
+                            accessible-label: @tr("Delete {}", root.data.name);
+                            clicked => {
+                                root.confirm-by-key = self.key-focused;
+                                root.confirming = true;
+                            }
+                        }
+                        }
+                    }
+                }
+            }
+            if root.confirming: HorizontalLayout {
+                spacing: Theme.icon-gap;
+                init => {
+                    keep.take-focus(root.confirm-by-key);
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Image {
+                        source: Icons.delete;
+                        width: Theme.icon-size;
+                        height: Theme.icon-size;
+                        colorize: Theme.text-primary;
+                        accessible-role: none;
+                    }
+                }
+                HorizontalLayout {
+                    spacing: Theme.control-gap;
+                    Text {
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                        text: root.data.paused && !root.data.ready ? @tr("Delete the partial download of {}? Frees {}.", root.data.name, root.data.frees) : @tr("Delete {}? Frees {}.", root.data.name, root.data.frees);
+                        font-size: Theme.body-size;
+                        color: Theme.text-primary;
+                        wrap: word-wrap;
+                    }
+                    VerticalLayout {
+                        width: Theme.model-action-column;
+                        alignment: center;
+                        Button {
+                            text: @tr("Delete");
+                            kind: ButtonKind.danger;
+                            accessible-label: @tr("Confirm: delete {}", root.data.name);
+                            clicked => {
+                                root.refocus = true;
+                                root.deleting = true;
+                                ModelState.delete(root.index);
+                                root.confirming = false;
+                            }
+                        }
+                    }
+                    VerticalLayout {
+                        width: Theme.model-action-column;
+                        alignment: center;
+                        keep := Button {
+                            text: @tr("Keep");
+                            kind: ButtonKind.primary;
+                            accessible-label: @tr("Keep {}", root.data.name);
+                            clicked => {
+                                root.refocus = true;
+                                root.confirming = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// "Use my own .bin" under the gallery's check: the path on a line of its own, wide enough for a
+// real one at the least window width.
+component CustomCard inherits VerticalLayout {
+    property <bool> in-use: ModelState.selected == ModelState.rows.length;
+    Card {
+        HorizontalLayout {
+            spacing: Theme.icon-gap;
+            VerticalLayout {
+                alignment: start;
+                Rectangle {
+                    width: Theme.icon-size;
+                    // The first line's height: the glyph sits beside the title, not the field.
+                    height: Theme.control-height;
+                    Image {
+                        source: Icons.folder-open;
+                        width: Theme.icon-size;
+                        height: Theme.icon-size;
+                        colorize: Theme.text-primary;
+                        accessible-role: none;
+                    }
+                }
+            }
+            VerticalLayout {
+                spacing: Theme.space-2;
+                horizontal-stretch: 1;
+                HorizontalLayout {
+                    spacing: Theme.control-gap;
+                    HorizontalLayout {
+                        horizontal-stretch: 1;
+                        alignment: start;
+                        spacing: Theme.pair-gap;
+                        Text {
+                            text: @tr("Use my own .bin");
+                            font-size: Theme.body-size;
+                            color: Theme.text-primary;
+                            vertical-alignment: center;
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            InfoTip {
+                                text: @tr("Loaded as is, without a hash check.");
+                            }
+                        }
+                    }
+                    WarningSlot {
+                        text: ModelState.custom-error;
+                    }
+                    VerticalLayout {
+                        width: Theme.model-action-column;
+                        alignment: center;
+                        Button {
+                            text: root.in-use ? @tr("In use") : @tr("Use");
+                            icon: Icons.checkmark-12;
+                            kind: root.in-use ? ButtonKind.secondary : ButtonKind.primary;
+                            enabled: !root.in-use && !Shell.locked && ModelState.custom-path != "" && ModelState.custom-error == "";
+                            tooltip: Shell.locked ? Shell.locked-tip : ModelState.custom-path == "" ? @tr("Choose a .bin model file") : "";
+                            accessible-label: root.in-use ? @tr("Own model file in use") : @tr("Use the model file");
+                            clicked => {
+                                ModelState.picked(ModelState.rows.length);
+                            }
+                        }
+                    }
+                }
+                PathField {
+                    path <=> ModelState.custom-path;
+                    placeholder-text: @tr("Path to a .bin file");
+                    browse-text: ModelState.can-browse ? @tr("Browse") : "";
+                    // The field inside takes the label; the frame itself is no element of its own.
+                    accessible-role: none;
+                    accessible-label: @tr("Model file");
+                    edited(text) => {
+                        ModelState.custom-edited(text);
+                    }
+                    browse(path) => {
+                        ModelState.browse(path);
+                    }
                 }
             }
         }
@@ -152,7 +415,8 @@ component Choice inherits Rectangle {
 
 export component ModelPage inherits VerticalLayout {
     alignment: start;
-    spacing: Theme.space-4;
+    // DS-1.3: the first card sits `header-bottom` under the tab line.
+    spacing: Theme.header-bottom;
     init => {
         ModelState.shown();
     }
@@ -168,181 +432,83 @@ export component ModelPage inherits VerticalLayout {
             shown: ModelState.tab == 0;
             VerticalLayout {
                 alignment: start;
-                spacing: Theme.space-3;
-                // No title: the sub-tab says it (UI rule 29), and the room keeps the page unscrolled.
-                Group {
-                    Card {
-                        Row {
-                            icon: Icons.mic;
-                            title: @tr("Dictation language");
-                            description: @tr("The language the model listens for. Auto detects it.");
-                            // The column's least width at every size: four short segments stretched
-                            // over a wide column read as one bar (UI rule 24).
-                            Rectangle {
-                                width: Theme.control-column-min;
-                                min-height: languages.min-height;
-                                preferred-height: languages.preferred-height;
-                                languages := Segmented {
-                                    width: parent.width;
+                spacing: Theme.group-gap;
+                // No group title: the row names it, and the room keeps the page unscrolled (UI rule 25).
+                Card {
+                    Row {
+                        icon: Icons.mic;
+                        title: @tr("Dictation language");
+                        // The column's least width at every size: three short segments stretched
+                        // over a wide column read as one bar (UI rule 24).
+                        Rectangle {
+                            width: Theme.control-column-min;
+                            min-height: language-line.min-height;
+                            preferred-height: language-line.preferred-height;
+                            language-line := HorizontalLayout {
+                                spacing: Theme.control-gap;
+                                Segmented {
+                                    horizontal-stretch: 1;
                                     accessible-label: @tr("Dictation language");
-                                    items: [ModelState.language-codes[0], ModelState.language-codes[1], @tr("Auto"), "…"];
-                                    spoken: [ModelState.language-names[0], ModelState.language-names[1], @tr("Auto"), @tr("More languages")];
+                                    items: [ModelState.language-codes[0], ModelState.language-codes[1], @tr("Auto")];
+                                    spoken: [ModelState.language-names[0], ModelState.language-names[1], @tr("Auto")];
                                     // The code ("HAW", "JW") says little: the English name on hover and keyboard focus.
-                                    tips: [ModelState.language-names[0], ModelState.language-names[1]];
-                                    action: 3;
+                                    tips: [ModelState.language-names[0], ModelState.language-names[1], @tr("Detects the language on its own")];
                                     selected: ModelState.language;
                                     picked(i) => {
-                                        if (i == 3) {
-                                            ModelState.language-search("");
-                                            all-languages.show();
-                                        } else {
-                                            ModelState.language-picked(i);
-                                        }
+                                        ModelState.language-picked(i);
                                     }
                                 }
-                                all-languages := SearchPopup {
-                                    x: parent.width - self.width;
-                                    y: parent.height + Theme.space-1;
-                                    items: ModelState.language-rows;
-                                    notes: ModelState.language-native;
-                                    current: ModelState.language-row;
-                                    placeholder: @tr("Search languages");
-                                    empty-text: @tr("No language matches");
-                                    search(text) => {
-                                        ModelState.language-search(text);
-                                    }
-                                    picked(i) => {
-                                        ModelState.language-chosen(i);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    for row[i] in ModelState.rows: card := ClickCard {
-                        // The card's "!": a failed download, a picked model not on disk, a model
-                        // too heavy for the GPU. Its slot is kept, so none of them grows the card.
-                        property <string> missing: ModelState.selected == i && row.can-download && !row.downloading ? @tr("Dictation will not start until this is downloaded.") : "";
-                        property <string> slow: row.heavy ? @tr("Likely slow without a dedicated graphics card. Whisper large-v3 turbo is faster.") : "";
-                        property <string> first: row.error != "" ? row.error : self.missing;
-                        property <string> second: row.error != "" && self.missing != "" ? self.missing : self.slow;
-                        enabled: !Shell.locked;
-                        accessible-role: none;
-                        clicked => {
-                            ModelState.picked(i);
-                        }
-                        HorizontalLayout {
-                            spacing: Theme.control-gap;
-                            Choice {
-                                label: row.name;
-                                detail: row.detail;
-                                checked: ModelState.selected == i;
-                                hover: card.hover;
-                                downloading: row.downloading;
-                                progress: row.progress;
-                                progress-text: row.progress-text;
-                                picked => {
-                                    ModelState.picked(i);
-                                }
-                            }
-                            WarningSlot {
-                                text: card.first != "" && card.second != "" ? card.first + "\n" + card.second : card.first + card.second;
-                            }
-                            // Fixed columns: a state change moves neither the "!", the badge nor the
-                            // button, across states and across the stacked cards (UI rules 1, 2).
-                            HorizontalLayout {
-                                width: Theme.model-badge-column;
-                                alignment: end;
-                                VerticalLayout {
-                                    alignment: center;
-                                    Badge {
-                                        text: row.badge;
-                                        kind: row.downloading ? BadgeKind.accent : row.ready ? BadgeKind.success : BadgeKind.neutral;
-                                        accessible-label: @tr("{}: {}", row.name, row.badge);
-                                    }
-                                }
-                            }
-                            Rectangle {
-                                width: Theme.model-action-column;
-                                // Downloading writes no config, so it stays on while the config is locked.
-                                if row.can-download && !row.downloading: VerticalLayout {
-                                    width: parent.width;
-                                    alignment: center;
-                                    Button {
-                                        text: row.paused ? @tr("Resume") : @tr("Download");
-                                        icon: Icons.arrow-download-16;
-                                        enabled: ModelState.download-off == "";
-                                        tooltip: ModelState.download-off;
-                                        accessible-label: row.paused ? @tr("Resume {}", row.name) : @tr("Download {}", row.name);
-                                        clicked => {
-                                            ModelState.download(i);
-                                        }
-                                    }
-                                }
-                                if row.downloading: VerticalLayout {
-                                    width: parent.width;
-                                    alignment: center;
-                                    Button {
-                                        text: @tr("Cancel");
-                                        icon: Icons.dismiss-16;
-                                        kind: ButtonKind.danger;
-                                        accessible-label: @tr("Cancel {}", row.name);
-                                        clicked => {
-                                            ModelState.cancel(i);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // One line, as tall as a model card: the page has to fit unscrolled (UI rule 25).
-                    custom := ClickCard {
-                        enabled: !Shell.locked;
-                        accessible-role: none;
-                        clicked => {
-                            ModelState.picked(ModelState.rows.length);
-                        }
-                        HorizontalLayout {
-                            spacing: Theme.control-gap;
-                            Choice {
-                                horizontal-stretch: 0;
-                                label: @tr("Use my own .bin");
-                                detail: @tr("Loaded as is, without a hash check");
-                                checked: ModelState.selected == ModelState.rows.length;
-                                hover: custom.hover;
-                                picked => {
-                                    ModelState.picked(ModelState.rows.length);
-                                }
-                            }
-                            VerticalLayout {
-                                alignment: center;
-                                horizontal-stretch: 1;
-                                TextField {
-                                    text <=> ModelState.custom-path;
-                                    placeholder-text: @tr("Path to a .bin file");
+                                // "More" is a glyph, not typed dots (DS-17.1).
+                                IconButton {
+                                    label: @tr("More languages");
+                                    icon: Icons.caret-down;
                                     enabled: !Shell.locked;
-                                    accessible-label: @tr("Model file");
-                                    edited(text) => {
-                                        ModelState.custom-edited(text);
-                                    }
-                                }
-                            }
-                            WarningSlot {
-                                text: ModelState.custom-error;
-                            }
-                            if ModelState.can-browse: VerticalLayout {
-                                alignment: center;
-                                Button {
-                                    text: @tr("Browse…");
-                                    icon: Icons.folder-open-16;
-                                    enabled: !Shell.locked;
-                                    tooltip: Shell.locked-tip;
                                     clicked => {
-                                        ModelState.browse();
+                                        ModelState.language-search("");
+                                        all-languages.show();
                                     }
+                                }
+                            }
+                            all-languages := SearchPopup {
+                                x: parent.width - self.width;
+                                y: parent.height + Theme.space-1;
+                                items: ModelState.language-rows;
+                                notes: ModelState.language-native;
+                                current: ModelState.language-row;
+                                placeholder: @tr("Search languages");
+                                empty-text: @tr("No language matches");
+                                search(text) => {
+                                    ModelState.language-search(text);
+                                }
+                                picked(i) => {
+                                    ModelState.language-chosen(i);
                                 }
                             }
                         }
                     }
+                }
+                Group {
+                    title: @tr("Models");
+                    // On the page, not in a card: a tile is a card (UI rule 10). Four tiles take
+                    // two rows at the least window width, so the grid is as tall as its rows.
+                    CardGrid {
+                        height: self.full-height;
+                        accessible-label: @tr("Models");
+                        tiles: ModelState.tiles;
+                        selected: ModelState.viewed;
+                        fallback-icon: Icons.brain-circuit;
+                        // Picking only shows a model below, it writes no config: a locked config
+                        // keeps it. Its card's Use puts it in use.
+                        locked: false;
+                        picked(i) => {
+                            ModelState.viewed = i;
+                        }
+                    }
+                    if ModelState.viewed >= 0 && ModelState.viewed < ModelState.rows.length: ModelCard {
+                        data: ModelState.rows[ModelState.viewed];
+                        index: ModelState.viewed;
+                    }
+                    if ModelState.viewed == ModelState.rows.length: CustomCard { }
                 }
             }
         }

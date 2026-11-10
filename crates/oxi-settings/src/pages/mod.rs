@@ -3,6 +3,7 @@
 
 mod about;
 mod audio;
+mod history;
 mod home;
 mod hotkey;
 mod model;
@@ -10,6 +11,7 @@ mod overlay;
 mod system;
 pub mod test;
 mod text;
+pub(crate) mod tuning;
 
 use crate::{AppWindow, Ctx};
 
@@ -20,6 +22,7 @@ pub fn poll(window: &AppWindow, ctx: &Ctx) {
 
 pub fn bind(window: &AppWindow, ctx: &Ctx) {
     home::bind(window, ctx);
+    history::bind(window, ctx);
     hotkey::bind(window, ctx);
     audio::bind(window, ctx);
     model::bind(window, ctx);

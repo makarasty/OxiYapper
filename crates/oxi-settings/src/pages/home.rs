@@ -8,18 +8,18 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use oxi_core::config::History;
 use oxi_core::history;
 use oxi_core::ipc::{Push, Request};
 use oxi_core::machine::Mode;
-use oxi_core::stats::{self, Date, HEAT_WEEKS, Metric, Stats, Summary, format_count};
+use oxi_core::stats::{self, Date, HEAT_WEEKS, Metric, Stats, Summary, Trend, format_count};
 use oxi_platform::stats_store;
-use slint::{ComponentHandle, ModelRc, Timer, TimerMode, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use crate::constants::{FILE_POLL, FOLDER_POLL};
-use crate::generated::{HomeState, MonthLabel, Toast};
+use crate::generated::{HomeState, MonthLabel, Shell, Toast};
 use crate::ipc::{Event, Link};
 use crate::{AppWindow, Ctx, Error, Page, report};
 
@@ -33,6 +33,14 @@ const METRICS: [Metric; 4] = [
     Metric::Dictations,
     Metric::Streak,
 ];
+/// The shortest chart: a history of a few days is drawn as the last days of a month, not as a
+/// few bars alone at the right edge.
+const MIN_DAYS: usize = 30;
+/// The bars grow in left to right within this (UI rule 21): each over `GROW`, the last one
+/// starting at `REVEAL - GROW`.
+const REVEAL: Duration = Duration::from_millis(200);
+const GROW: Duration = Duration::from_millis(120);
+const FRAME: Duration = Duration::from_millis(16);
 const HISTORY_OFF: &str = "History is off, nothing new is saved";
 const HISTORY_EMPTY: &str = "No dictations saved yet";
 
@@ -50,12 +58,24 @@ struct Shown {
     stamp: Cell<Stamp>,
     /// The file as last read: a card opened while it is locked still draws its own bars.
     stats: RefCell<Option<Stats>>,
+    /// The chart's bars as drawn; one model for the page's life, so a reveal frame changes rows.
+    bars: Rc<VecModel<i32>>,
+    /// The bars' full heights, which a reveal grows towards.
+    target: RefCell<Vec<i32>>,
+    /// When the running reveal started.
+    since: Cell<Option<Instant>>,
+    reveal: Timer,
+    /// The last summary, a year of heatmap: a resize shows more or fewer of its weeks.
+    summary: RefCell<Option<Summary>>,
 }
 
 type Seen = Rc<Shown>;
 
 pub fn bind(window: &AppWindow, ctx: &Ctx) {
     let seen = Seen::default();
+    window
+        .global::<HomeState>()
+        .set_trend(ModelRc::from(seen.bars.clone()));
     // The file first: numbers on screen before the link is up. Asking the daemon waits for it.
     let now = stamp(ctx);
     if load(window, ctx, &seen) {
@@ -68,8 +88,8 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
             return;
         };
         match event {
-            Event::Push(Push::Stats(summary)) => show(&window, summary),
-            Event::Link(_) if window.get_page() == Page::Home => refresh(&window, &c, &s),
+            Event::Push(Push::Stats(summary)) => show(&window, &s, summary),
+            Event::Link(_) if window.get_page() == Page::Home => refresh(&window, &c, &s, false),
             _ => {}
         }
     });
@@ -83,7 +103,7 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
                 && window.get_page() == Page::Home
                 && stamp(&c) != s.stamp.get()
             {
-                refresh(&window, &c, &s);
+                refresh(&window, &c, &s, false);
             }
         }
     });
@@ -93,7 +113,14 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         // Held by this callback: a rebind (Reset) replaces it and so stops them.
         let _ = (&events, &poll);
         if let Some(window) = w.upgrade() {
-            refresh(&window, &c, &s);
+            refresh(&window, &c, &s, true);
+        }
+    });
+
+    let (w, s) = (window.as_weak(), seen.clone());
+    window.global::<HomeState>().on_fit(move || {
+        if let Some(window) = w.upgrade() {
+            show_heat(&window, &s);
         }
     });
 
@@ -102,7 +129,7 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         if let Some(window) = w.upgrade() {
             let s = window.global::<HomeState>();
             s.set_selected(if s.get_selected() == card { -1 } else { card });
-            if !show_trend(&window, &c, &seen) {
+            if !show_trend(&window, &c, &seen, true) {
                 seen.stamp.set(Stamp::default());
             }
         }
@@ -174,10 +201,11 @@ fn open_target(w: &slint::Weak<AppWindow>, target: Target) {
     report(w, opened.map_err(Error::from));
 }
 
-/// New numbers: from the daemon while it answers, else from the file.
-fn refresh(window: &AppWindow, ctx: &Ctx, seen: &Seen) {
+/// New numbers: from the daemon while it answers, else from the file. `grow`: the page is being
+/// shown, so an open chart's bars grow in.
+fn refresh(window: &AppWindow, ctx: &Ctx, seen: &Seen, grow: bool) {
     let now = stamp(ctx);
-    let mut read = show_trend(window, ctx, seen);
+    let mut read = show_trend(window, ctx, seen, grow);
     if ctx.ipc.link() == Link::Online {
         push_config(window, ctx);
         ctx.ipc.send(Request::Stats);
@@ -194,7 +222,11 @@ fn load(window: &AppWindow, ctx: &Ctx, seen: &Seen) -> bool {
     let Some(stats) = read_stats(ctx) else {
         return false;
     };
-    show(window, &stats.summary(stats_store::today(), HEAT_WEEKS));
+    show(
+        window,
+        seen,
+        &stats.summary(stats_store::today(), HEAT_WEEKS),
+    );
     *seen.stats.borrow_mut() = Some(stats);
     true
 }
@@ -211,7 +243,8 @@ fn read_stats(ctx: &Ctx) -> Option<Stats> {
 
 /// The open card's chart, from the file: the daemon's summary has no per-day numbers. False when
 /// the file could not be read: the chart then comes from the last read and the next poll retries.
-fn show_trend(window: &AppWindow, ctx: &Ctx, seen: &Seen) -> bool {
+/// `grow`: the chart has just opened or changed card, so its bars grow in.
+fn show_trend(window: &AppWindow, ctx: &Ctx, seen: &Seen, grow: bool) -> bool {
     let s = window.global::<HomeState>();
     let metric = usize::try_from(s.get_selected())
         .ok()
@@ -227,12 +260,118 @@ fn show_trend(window: &AppWindow, ctx: &Ctx, seen: &Seen) -> bool {
     if let Some(stats) = seen.stats.borrow().as_ref() {
         let today = stats_store::today();
         let trend = stats.trend(today, metric);
-        s.set_trend(ModelRc::from(Rc::new(VecModel::from(trend.heights()))));
+        let days = trend.values.len();
+        let trend = padded(trend);
+        let tips: Vec<SharedString> = tips(&trend, metric, today)
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        s.set_trend_days(i32::try_from(days).unwrap_or(i32::MAX));
+        s.set_trend_tips(ModelRc::from(Rc::new(VecModel::from(tips))));
         s.set_trend_peak(format_count(trend.peak()).into());
         s.set_trend_first(day_label(trend.start, today).into());
         s.set_trend_last(day_label(today, today).into());
+        let grow = grow && !window.global::<Shell>().get_reduced_motion();
+        set_bars(seen, trend.heights(), grow);
     }
     read
+}
+
+/// At least `MIN_DAYS` days, the missing ones empty before the first; no day stays none (the
+/// page shows its empty state).
+fn padded(trend: Trend) -> Trend {
+    let pad = MIN_DAYS.saturating_sub(trend.values.len());
+    if trend.values.is_empty() || pad == 0 {
+        return trend;
+    }
+    let mut values = vec![0; pad];
+    values.extend(trend.values);
+    Trend {
+        start: trend.start.add_days(-i32::try_from(pad).unwrap_or(0)),
+        values,
+    }
+}
+
+/// Each bar's tooltip: "Nov 8: 1,234 words".
+fn tips(trend: &Trend, metric: Metric, today: Date) -> Vec<String> {
+    let (one, many) = match metric {
+        Metric::Words => ("word", "words"),
+        Metric::Wpm => ("word per minute", "words per minute"),
+        Metric::Dictations => ("dictation", "dictations"),
+        Metric::Streak => ("day in a row", "days in a row"),
+    };
+    (0..)
+        .zip(&trend.values)
+        .map(|(i, &v)| {
+            let unit = if v == 1 { one } else { many };
+            let day = day_label(trend.start.add_days(i), today);
+            format!("{day}: {} {unit}", grouped(v))
+        })
+        .collect()
+}
+
+/// `1234567` as "1,234,567": a tooltip shows the exact number, a card the short one.
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// New full heights for the bars. `grow` starts a reveal from empty; without it a running reveal
+/// carries on towards the new heights, else they show at once.
+fn set_bars(seen: &Seen, heights: Vec<i32>, grow: bool) {
+    let n = heights.len();
+    *seen.target.borrow_mut() = heights;
+    if grow {
+        seen.since.set(Some(Instant::now()));
+    } else if !seen.reveal.running() {
+        seen.bars.set_vec(seen.target.borrow().clone());
+        return;
+    }
+    if seen.bars.row_count() != n {
+        seen.bars.set_vec(vec![0; n]);
+    }
+    if !seen.reveal.running() {
+        let weak = Rc::downgrade(seen);
+        seen.reveal.start(TimerMode::Repeated, FRAME, move || {
+            if let Some(seen) = weak.upgrade()
+                && reveal_frame(&seen)
+            {
+                seen.reveal.stop();
+            }
+        });
+    }
+    reveal_frame(seen);
+}
+
+/// Draws the reveal as it stands now; true once it is over.
+fn reveal_frame(seen: &Shown) -> bool {
+    let t = seen.since.get().map_or(REVEAL, |s| s.elapsed()).min(REVEAL);
+    let target = seen.target.borrow();
+    for (i, &h) in target.iter().enumerate() {
+        seen.bars.set_row_data(i, revealed(h, i, target.len(), t));
+    }
+    t >= REVEAL
+}
+
+/// Bar `i` of `n` at `t` into the reveal: it starts `i / (n - 1)` of the way into
+/// `REVEAL - GROW`, rises over `GROW` with an ease-out and stops at `height`, never above.
+fn revealed(height: i32, i: usize, n: usize, t: Duration) -> i32 {
+    let micros = |d: Duration| i64::try_from(d.as_micros()).unwrap_or(i64::MAX);
+    let i = i64::try_from(i).unwrap_or(0);
+    let last = i64::try_from(n.saturating_sub(1).max(1)).unwrap_or(1);
+    let grow = micros(GROW);
+    let lead = (micros(REVEAL) - grow) * i / last;
+    let left = grow - (micros(t) - lead).clamp(0, grow);
+    // 1 - (1 - p)^2 in millionths, p the share of `GROW` gone.
+    let eased = 1_000_000 - left * left * 1_000_000 / (grow * grow);
+    i32::try_from(i64::from(height) * eased / 1_000_000).unwrap_or(height)
 }
 
 /// "Nov 8"; with the year when it is not this year's.
@@ -272,28 +411,39 @@ fn push_config(window: &AppWindow, ctx: &Ctx) {
     s.set_history_on(config.config.history.enabled);
 }
 
-fn show(window: &AppWindow, summary: &Summary) {
-    let int = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
+fn show(window: &AppWindow, seen: &Shown, summary: &Summary) {
     let s = window.global::<HomeState>();
     s.set_words(format_count(summary.words).into());
-    s.set_wpm(summary.wpm.to_string().into());
+    s.set_wpm(format_count(u64::from(summary.wpm)).into());
     s.set_dictations(format_count(summary.dictations).into());
     s.set_streak(i32::try_from(summary.streak).unwrap_or(i32::MAX));
     s.set_longest_streak(i32::try_from(summary.longest_streak).unwrap_or(i32::MAX));
-    s.set_active_days(int(summary.heat.iter().filter(|&&l| l > 0).count()));
     s.set_empty(summary.dictations == 0);
-    // `heat_start` is a Monday, so the cells fall in Monday-first columns as they come.
-    let levels: Vec<i32> = summary.heat.iter().map(|&l| i32::from(l)).collect();
+    *seen.summary.borrow_mut() = Some(summary.clone());
+    show_heat(window, seen);
+}
+
+/// The last summary's heatmap, as many weeks as the card has room for.
+fn show_heat(window: &AppWindow, seen: &Shown) {
+    let int = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
+    let Some(summary) = seen.summary.borrow().clone() else {
+        return;
+    };
+    let s = window.global::<HomeState>();
+    // Before the layout settles the room can be 0 or less: the fewest weeks.
+    let (start, heat) = summary.heat_tail(u16::try_from(s.get_fit_weeks()).unwrap_or(0));
+    s.set_active_days(int(heat.iter().filter(|&&l| l > 0).count()));
+    // `start` is a Monday, so the cells fall in Monday-first columns as they come.
+    let levels: Vec<i32> = heat.iter().map(|&l| i32::from(l)).collect();
     s.set_levels(ModelRc::from(Rc::new(VecModel::from(levels))));
-    let weeks = int(summary.heat.len().div_ceil(7));
-    let months = month_labels(summary.heat_start, weeks);
+    let months = month_labels(start, int(heat.len().div_ceil(7)));
     s.set_months(ModelRc::from(Rc::new(VecModel::from(months))));
-    s.set_today(today_cell(summary));
+    s.set_today(today_cell(heat));
 }
 
 /// Today is the last cell: the window ends on it.
-fn today_cell(summary: &Summary) -> i32 {
-    i32::try_from(summary.heat.len()).map_or(i32::MAX, |n| n - 1)
+fn today_cell(heat: &[u8]) -> i32 {
+    i32::try_from(heat.len()).map_or(i32::MAX, |n| n - 1)
 }
 
 /// A label over each week column whose Monday starts a new month. The first column keeps its
@@ -320,10 +470,99 @@ mod tests {
     use oxi_core::stats::{HEAT_WEEKS, Stats};
     use oxi_core::types::Millis;
 
+    use std::time::Duration;
+
     use super::{
-        Date, HISTORY_EMPTY, HISTORY_OFF, History, history_target, month_labels, stamp_of,
-        today_cell,
+        Date, GROW, HISTORY_EMPTY, HISTORY_OFF, History, MIN_DAYS, Metric, REVEAL, Trend, grouped,
+        history_target, month_labels, padded, revealed, stamp_of, tips, today_cell,
     };
+
+    #[test]
+    fn a_short_history_is_drawn_as_the_end_of_a_month() {
+        let today = Date::from_ymd(2026, 11, 10).unwrap();
+        let short = padded(Trend {
+            start: today.add_days(-1),
+            values: vec![5, 7],
+        });
+        assert_eq!(short.values.len(), MIN_DAYS);
+        assert_eq!(&short.values[MIN_DAYS - 2..], &[5, 7]);
+        assert!(short.values[..MIN_DAYS - 2].iter().all(|&v| v == 0));
+        assert_eq!(short.start.add_days(29), today, "still ends today");
+        let none = padded(Trend {
+            start: today,
+            values: vec![],
+        });
+        assert!(none.values.is_empty(), "no day stays no day");
+        let year = padded(Trend {
+            start: today.add_days(-364),
+            values: vec![1; 365],
+        });
+        assert_eq!(year.values.len(), 365);
+    }
+
+    #[test]
+    fn a_tip_names_the_day_and_the_exact_number() {
+        let today = Date::from_ymd(2026, 11, 10).unwrap();
+        let trend = Trend {
+            start: Date::from_ymd(2025, 12, 31).unwrap(),
+            values: vec![1, 1_234_567],
+        };
+        assert_eq!(
+            tips(&trend, Metric::Words, today),
+            ["Dec 31, 2025: 1 word", "Jan 1: 1,234,567 words"]
+        );
+        assert_eq!(
+            tips(&trend, Metric::Streak, today)[0],
+            "Dec 31, 2025: 1 day in a row"
+        );
+        for (n, want) in [
+            (0, "0"),
+            (999, "999"),
+            (1000, "1,000"),
+            (123_456, "123,456"),
+        ] {
+            assert_eq!(grouped(n), want);
+        }
+    }
+
+    #[test]
+    fn the_bars_grow_left_to_right_within_the_cap_and_never_overshoot() {
+        let at = |ms| Duration::from_millis(ms);
+        let n = 30;
+        for i in 0..n {
+            assert_eq!(revealed(1000, i, n, at(0)), 0, "bar {i} at the start");
+            assert_eq!(revealed(1000, i, n, REVEAL), 1000, "bar {i} at the end");
+        }
+        let mut last = vec![0; n];
+        for ms in (0..=200).step_by(8) {
+            let now: Vec<i32> = (0..n).map(|i| revealed(1000, i, n, at(ms))).collect();
+            assert!(now.iter().zip(&last).all(|(a, b)| a >= b), "rises only");
+            assert!(now.windows(2).all(|p| p[0] >= p[1]), "left first: {now:?}");
+            assert!(now.iter().all(|&h| h <= 1000));
+            last = now;
+        }
+        // One bar alone grows at once, over `GROW`.
+        assert_eq!(revealed(1000, 0, 1, GROW), 1000);
+    }
+
+    #[test]
+    fn a_reveal_starts_empty_ends_full_and_stops_its_timer() {
+        use slint::Model;
+        i_slint_backend_testing::init_no_event_loop();
+        let seen = super::Seen::default();
+        let bars = |seen: &super::Seen| seen.bars.iter().collect::<Vec<i32>>();
+        super::set_bars(&seen, vec![500, 1000], true);
+        assert_eq!(bars(&seen), [0, 0], "the first frame is empty");
+        assert!(seen.reveal.running());
+        std::thread::sleep(REVEAL);
+        i_slint_backend_testing::mock_elapsed_time(super::FRAME);
+        assert_eq!(bars(&seen), [500, 1000]);
+        assert!(!seen.reveal.running(), "a still chart draws nothing");
+        // A poll's new numbers, and reduced motion: at once.
+        super::set_bars(&seen, vec![1000, 1, 2], false);
+        assert_eq!(bars(&seen), [1000, 1, 2]);
+        assert!(!seen.reveal.running());
+    }
 
     fn labels(start: (i32, u32, u32), weeks: i32) -> Vec<(i32, String)> {
         month_labels(Date::from_ymd(start.0, start.1, start.2).unwrap(), weeks)
@@ -364,13 +603,11 @@ mod tests {
             let mut stats = Stats::default();
             stats.record(today, 5, Millis(1000));
             let summary = stats.summary(today, HEAT_WEEKS);
-            let cell = usize::try_from(today_cell(&summary)).unwrap();
+            let (_, heat) = summary.heat_tail(HEAT_WEEKS);
+            let cell = usize::try_from(today_cell(heat)).unwrap();
             assert_eq!(cell % 7, row, "Nov {day}");
             assert_eq!(cell / 7, usize::from(HEAT_WEEKS) - 1, "Nov {day}");
-            assert!(
-                summary.heat[cell] > 0,
-                "the dictation lands on today's cell"
-            );
+            assert!(heat[cell] > 0, "the dictation lands on today's cell");
         }
     }
 
@@ -384,8 +621,7 @@ mod tests {
 
     #[test]
     fn the_folder_button_finds_the_nearest_folder_and_creates_none() {
-        let root = std::env::temp_dir().join(format!("oxi-home-target-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::testing::scratch_dir(&format!("oxi-home-target-{}", std::process::id()));
         let data = root.join("data");
         let default = data.join("history");
         let chosen = root.join("chosen");
@@ -397,7 +633,10 @@ mod tests {
             enabled: true,
             ..History::default()
         };
-        let off = History::default();
+        let off = History {
+            enabled: false,
+            ..History::default()
+        };
         let target = history_target;
 
         // Not there yet: the data directory or the chosen parent.
@@ -438,6 +677,5 @@ mod tests {
             target(&on, &default, &data),
             Some((data.clone(), Some(HISTORY_EMPTY)))
         );
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }

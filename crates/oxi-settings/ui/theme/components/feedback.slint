@@ -27,7 +27,7 @@ export global Look {
 export component Banner inherits Rectangle {
     in property <string> text;
     in property <Severity> severity: Severity.warning;
-    property <bool> narrow: root.width < 560px;
+    property <bool> narrow: root.width < Theme.banner-narrow;
     property <length> pad-h: Theme.space-4;
     property <length> pad-v: Theme.space-3;
     property <length> text-x: root.pad-h + Theme.icon-size + Theme.space-3;
@@ -35,12 +35,13 @@ export component Banner inherits Rectangle {
     property <length> text-w: root.narrow || !root.has-actions ? root.width - root.text-x - root.pad-h : root.width - root.text-x - root.pad-h - actions.preferred-width - Theme.space-4;
     property <length> body-h: root.narrow && root.has-actions ? message.preferred-height + Theme.space-2 + actions.preferred-height : max(message.preferred-height, actions.preferred-height, Theme.icon-size);
     background: Look.fill(root.severity);
+    // 1 px hairline: the banner's stroke.
     border-width: 1px;
     border-color: Look.ink(root.severity).transparentize(0.7);
     border-radius: Theme.radius-card;
     accessible-role: banner;
     accessible-label: root.text;
-    min-width: 280px;
+    min-width: Theme.banner-min-width;
     height: root.body-h + 2 * root.pad-v;
     Image {
         x: root.pad-h;
@@ -262,14 +263,14 @@ export component Meter inherits Rectangle {
     in property <bool> live: true;
     in property <string> empty-text;
     in property <string> idle-text;
-    property <length> inset: 4px;
-    property <length> pitch: 5px;
-    property <length> bar-width: 3px;
+    property <length> inset: Theme.space-1;
+    property <length> pitch: Theme.meter-pitch;
+    property <length> bar-width: Theme.meter-bar;
     // Bars that fit between the insets, and where the first of them starts.
     property <int> fit: floor((root.width - 2 * root.inset + root.pitch - root.bar-width) / root.pitch);
     property <length> start: (root.width - (root.fit * root.pitch - (root.pitch - root.bar-width))) / 2;
-    height: 24px;
-    min-width: 120px;
+    height: Theme.meter-height;
+    min-width: Theme.meter-min-width;
     horizontal-stretch: 1;
     border-radius: Theme.radius-control;
     background: Theme.bg-inset;
@@ -280,7 +281,8 @@ export component Meter inherits Rectangle {
         for level[i] in root.bars: Rectangle {
             x: root.start + (root.fit - (root.bars.length - i)) * root.pitch;
             width: root.bar-width;
-            height: max(2px, clamp(level, 0, 1) * (root.height - 6px));
+            // A silent bar keeps a 2 px stub (radius-small); the tallest leaves 3 px above and below.
+            height: max(Theme.radius-small, clamp(level, 0, 1) * (root.height - 2 * root.bar-width));
             border-radius: Theme.radius-round;
             background: root.clipped[i] || level >= 1 ? Theme.error-text : Theme.accent;
             visible: root.bars.length - i <= root.fit;
@@ -307,8 +309,8 @@ export component ProgressBar inherits HorizontalLayout {
         alignment: center;
         horizontal-stretch: 1;
         Rectangle {
-            height: 4px;
-            min-width: 80px;
+            height: Theme.rail-height;
+            min-width: Theme.progress-min-width;
             border-radius: Theme.radius-round;
             background: Theme.bg-inset;
             Rectangle {
@@ -330,7 +332,8 @@ export component ProgressBar inherits HorizontalLayout {
 export enum BadgeKind { success, neutral, accent }
 
 // Small nearly square label (UI rule 13, no pill): "Ready" (success), "Not downloaded" (neutral),
-// "Recommended" (accent).
+// "Recommended" (accent). One height (`badge-height`) so a column of them lines up (DS-9.3); the
+// text fills it, centred both ways, and never wraps (DS-9.1). Every kind reaches 4.5:1 (DS-9.2).
 export component Badge inherits Rectangle {
     in property <string> text;
     in property <BadgeKind> kind: BadgeKind.neutral;
@@ -339,14 +342,58 @@ export component Badge inherits Rectangle {
     background: root.kind == BadgeKind.success ? Theme.success-tint : root.kind == BadgeKind.accent ? Theme.accent-badge : Theme.bg-inset;
     accessible-role: AccessibleRole.text;
     accessible-label: root.text;
-    min-width: t.preferred-width + 16px;
-    min-height: t.preferred-height + 4px;
+    height: Theme.badge-height;
+    min-width: Theme.whole(t.preferred-width) + 2 * Theme.space-2;
     horizontal-stretch: 0;
     vertical-stretch: 0;
     t := Text {
+        x: Theme.space-2;
+        width: parent.width - 2 * Theme.space-2;
+        height: parent.height;
         text: root.text;
         font-size: Theme.caption-size;
         color: root.ink;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        wrap: no-wrap;
         accessible-role: none;
+    }
+}
+
+// What an empty list shows, in the same box the full list takes (DS-12): a 32 px glyph in
+// secondary ink, one line saying what is missing, and the fix as a Button (children) 12 px below.
+// Any longer hint is an InfoTip.
+export component EmptyState {
+    in property <image> icon;
+    in property <string> text;
+    accessible-role: AccessibleRole.text;
+    accessible-label: root.text;
+    VerticalLayout {
+        alignment: center;
+        spacing: Theme.space-3;
+        padding: Theme.space-4;
+        if root.icon.width > 0: HorizontalLayout {
+            alignment: center;
+            Image {
+                source: root.icon;
+                width: Theme.icon-size-large;
+                height: Theme.icon-size-large;
+                colorize: Theme.text-secondary;
+                accessible-role: none;
+            }
+        }
+        Text {
+            text: root.text;
+            font-size: Theme.body-size;
+            color: Theme.text-primary;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+            accessible-role: none;
+        }
+        HorizontalLayout {
+            alignment: center;
+            spacing: Theme.control-gap;
+            @children
+        }
     }
 }

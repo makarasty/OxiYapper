@@ -51,9 +51,10 @@ fn ev(event: Event) -> Verdict {
     }
 }
 
-/// Feeds `steps` to a fresh Ctrl+Win tracker and checks each verdict.
+/// Feeds `steps` to a fresh Ctrl+Win tracker (Esc cancelling is on) and checks each verdict.
 fn run(steps: &[(KeyInput, Ctx, Verdict)]) {
     let mut t = Tracker::new(chord(&["Ctrl", "Win"]));
+    t.set_esc_cancels(true);
     for (i, (input, ctx, want)) in steps.iter().enumerate() {
         assert_eq!(t.on_key(*input, *ctx), *want, "step {i}: {input:?}");
     }
@@ -483,6 +484,7 @@ fn resync_keeps_held_keys_and_a_held_chord() {
 #[test]
 fn resync_clears_a_swallowed_esc_whose_up_was_lost() {
     let mut t = Tracker::new(chord(&["Ctrl", "Win"]));
+    t.set_esc_cancels(true);
     assert!(t.on_key(dn(Key::Esc), REC).swallow);
     assert_eq!(t.resync(|_| false), None);
     // Not recording now: this Esc passes, so its up must pass too.

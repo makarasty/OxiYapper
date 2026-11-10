@@ -2,7 +2,7 @@
 source: crates/oxi-core/tests/ipc.rs
 expression: lines(pushes().iter().map(encode).collect())
 ---
-{"t":"HelloAck","proto":4,"version":"0.1.0"}
+{"t":"HelloAck","proto":5,"version":"0.1.0"}
 {"t":"Raise"}
 {"t":"Status","phase":"recording","model":"turbo","device":"Vulkan0","backend":"Vulkan0","warnings":["gpu not found"]}
 {"t":"Devices","mics":["Mic"],"gpus":[{"name":"Vulkan0","description":"Test GPU","uma":false}]}

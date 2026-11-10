@@ -7,14 +7,14 @@ import { FocusRing, KeyFocus, Caption, CardFrame, Tip } from "base.slint";
 // 20 px accent circle with a white check; grey on a read-only picker.
 export component CheckBadge inherits Rectangle {
     in property <bool> muted;
-    width: 20px;
-    height: 20px;
+    width: Theme.check-badge-size;
+    height: Theme.check-badge-size;
     border-radius: Theme.radius-round;
     background: root.muted ? Theme.text-secondary : Theme.accent;
     Image {
         source: Icons.checkmark-12;
-        width: 12px;
-        height: 12px;
+        width: Theme.check-glyph-size;
+        height: Theme.check-glyph-size;
         colorize: root.muted ? Theme.bg-card : Theme.on-accent;
         accessible-role: none;
     }
@@ -37,48 +37,75 @@ export component Tile inherits Rectangle {
     in property <bool> read-only;
     in property <bool> focused;
     in property <length> tile-height: Theme.tile-height;
-    min-width: 160px;
+    // Glyph and title ink: read-only greys the ink, not the layer, so text stays crisp (DS-8.3 [22]).
+    out property <color> ink: root.read-only ? Theme.text-disabled : root.selected ? Theme.accent-text : Theme.text-primary;
+    animate ink { duration: Theme.motion-quick; easing: ease-out; }
+    out property <color> caption-ink: root.read-only ? Theme.text-disabled : Theme.text-secondary;
+    min-width: Theme.tile-min-width;
     min-height: max(root.tile-height, inner.min-height);
     horizontal-stretch: 1;
     border-radius: Theme.radius-card;
+    // 1 px hairline: the tile's stroke.
     border-width: 1px;
     border-color: Theme.stroke-card;
-    background: root.selected ? Theme.accent-tint : root.pressed && !root.read-only ? Theme.bg-card-pressed : root.hover && !root.read-only ? Theme.bg-control-hover : Theme.bg-card;
-    opacity: root.read-only ? 0.4 : 1;
+    // A press selects: the fill goes hover -> tint, never through the darker pressed fill (a blink
+    // in dark; DS-5.5). `pressed` stays for the callers; the selected tile keeps its fill too.
+    background: root.selected ? Theme.accent-tint : root.hover && !root.read-only ? Theme.bg-control-hover : Theme.bg-card;
+    animate background { duration: Theme.motion-quick; easing: ease-out; }
     inner := VerticalLayout {
         padding: Theme.space-3;
         spacing: Theme.space-1;
         alignment: center;
         HorizontalLayout {
             alignment: center;
-            Image {
-                source: root.selected && root.item.icon-selected.width > 0 ? root.item.icon-selected : root.item.icon;
-                width: 32px;
-                height: 32px;
-                colorize: root.selected ? Theme.accent-text : Theme.text-primary;
-                accessible-role: none;
+            // Both glyphs live for the tile's life and cross-fade on a pick: a swap read as a blink (DS-5.5).
+            Rectangle {
+                width: Theme.icon-size-large;
+                height: Theme.icon-size-large;
+                Image {
+                    source: root.item.icon;
+                    width: parent.width;
+                    height: parent.height;
+                    colorize: root.ink;
+                    opacity: root.selected && root.item.icon-selected.width > 0 ? 0 : 1;
+                    animate opacity { duration: Theme.motion-quick; easing: ease-out; }
+                    accessible-role: none;
+                }
+                if root.item.icon-selected.width > 0: Image {
+                    source: root.item.icon-selected;
+                    width: parent.width;
+                    height: parent.height;
+                    colorize: root.ink;
+                    opacity: root.selected ? 1 : 0;
+                    animate opacity { duration: Theme.motion-quick; easing: ease-out; }
+                    accessible-role: none;
+                }
             }
         }
         Text {
             text: root.item.title;
             font-size: Theme.body-size;
             font-weight: Theme.weight-strong;
-            color: root.selected ? Theme.accent-text : Theme.text-primary;
+            color: root.ink;
             horizontal-alignment: center;
             wrap: word-wrap;
             accessible-role: none;
         }
         if root.item.caption != "": Caption {
             text: root.item.caption;
+            color: root.caption-ink;
             horizontal-alignment: center;
             wrap: word-wrap;
             accessible-role: none;
         }
     }
-    if root.selected: CheckBadge {
-        x: parent.width - self.width - 8px;
-        y: 8px;
+    // Always there and faded, not created by `if`: a badge popping in read as a blink.
+    CheckBadge {
+        x: parent.width - self.width - Theme.space-2;
+        y: Theme.space-2;
         muted: root.read-only;
+        opacity: root.selected ? 1 : 0;
+        animate opacity { duration: Theme.motion-quick; easing: ease-out; }
     }
     FocusRing {
         shown: root.focused;
@@ -146,9 +173,9 @@ export component TilePicker {
                 horizontal-stretch: 1;
                 // Equal columns: share the whole width, not what is left after each caption.
                 preferred-width: 0;
-                min-width: 160px;
+                min-width: Theme.tile-min-width;
                 if row * root.cols + col < root.tiles.length: Tile {
-            tile-height: root.tile-height;
+                    tile-height: root.tile-height;
                     property <int> i: row * root.cols + col;
                     item: root.tiles[self.i];
                     selected: self.i == root.selected;
@@ -166,6 +193,7 @@ export component TilePicker {
                     }
                     touch := TouchArea {
                         enabled: !root.locked;
+                        mouse-cursor: pointer;
                         clicked => {
                             fs.focus();
                             // After `focus()`: its reason is not a pointer click, and this was one.
@@ -234,6 +262,7 @@ export component PositionTiles {
             border-radius: Theme.radius-control;
             border-color: Theme.stroke-control;
             background: self.on ? Theme.accent-tint : self.hover ? Theme.bg-control-hover : Theme.bg-control;
+            animate background { duration: Theme.motion-quick; easing: ease-out; }
             opacity: Shell.locked ? 0.4 : 1;
             accessible-role: radio-button;
             accessible-label: i < root.names.length ? root.names[i] : "";
@@ -257,6 +286,7 @@ export component PositionTiles {
             }
             // Enabled even when locked, like `Button`'s: the tooltip says why the tile is off.
             touch := TouchArea {
+                mouse-cursor: Shell.locked ? MouseCursor.default : MouseCursor.pointer;
                 clicked => {
                     if (!Shell.locked) {
                         fs.focus();

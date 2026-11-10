@@ -1,14 +1,15 @@
 // Audio page (SPEC Recording, Audio before whisper, Sounds): microphone, live meter, the DSP
-// switches, tail, recording cap and the start and stop sounds.
-import { Theme, Shell, Icons, Card, Row, Divider, ToggleRow, SliderRow, Combo, SubTabs, Button, Meter, TileGallery } from "../theme/index.slint";
+// switches, tail, recording cap and the sounds of the five events.
+import { Theme, Shell, Icons, Card, Row, Divider, ToggleRow, SliderRow, Combo, SubTabs, Button, Meter, CardGrid, GalleryTile } from "../theme/index.slint";
 import { Warnings } from "../theme/components/feedback.slint";
 
 // Which control changed; `value` of `AudioState.edited` carries its new value.
-export enum AudioKey { device, gain, sensitivity, normalize, trim, denoise, tail, max-minutes, volume }
+export enum AudioKey { device, gain, sensitivity, normalize, trim, denoise, tail, max-minutes, volume, done-on }
 
 // Filled and read by `pages::audio`.
 export global AudioState {
-    // The sub-tab: 0 Microphone, 1 Recording, 2 Start sound, 3 Stop sound.
+    // 0 Microphone, 1 Recording, 2 to 6 the Sounds tab on the sound of start, stop, text ready,
+    // cancel and error (the order of `pages::audio::ROLES`).
     in-out property <int> view;
     // "System default" first, then the input devices.
     in property <[string]> devices;
@@ -42,17 +43,18 @@ export global AudioState {
     in property <string> silence;
     // The Test button: true while it records and plays back (its steps are toasts).
     in property <bool> testing;
-    // The tile of the start and stop sound: `Builtin::PICKABLE` in order, then the own file.
-    in property <int> start-tile;
-    in property <int> stop-tile;
-    // Name and whole path of an own file; empty for a built-in sound.
-    in property <string> start-file;
-    in property <string> start-path;
-    in property <string> stop-file;
-    in property <string> stop-path;
+    // Per sound (start, stop, text ready, cancel, error): its tiles, `Builtin::ALL` in order then
+    // the own file, and the tile picked (-1: none).
+    in property <[[GalleryTile]]> role-tiles;
+    in property <[int]> role-tile;
+    // The glyphs of the tiles, read by `pages::audio` when it builds them.
+    out property <image> sound-icon: Icons.sound-wave-circle;
+    out property <image> file-icon: Icons.folder-open;
     in-out property <float> volume;
     in property <float> default-volume;
-    // Why a sound cannot be used, from the daemon's warnings; empty otherwise.
+    // `sounds.done_enabled`: the text ready sound plays.
+    in-out property <bool> done-on;
+    // Why a sound cannot be used or played, from the daemon's warnings; empty otherwise.
     in property <string> sound-warning;
     // Why the daemon cannot play a preview now; empty when it can.
     in property <string> preview-off;
@@ -66,17 +68,19 @@ export global AudioState {
 }
 
 export component AudioPage inherits VerticalLayout {
-    // The shell's room under the page title: the sound gallery takes what the sub-tabs and the
-    // card above it leave, so a sound tab fits without the page scrolling (UI rule 25).
+    // The shell's room under the header row: the sound gallery takes what the sub-tabs and the
+    // card above it leave, so the Sounds tab fits without the page scrolling (UI rule 25).
     in property <length> free-height;
+    // The sound shown on the Sounds tab: 0 start, 1 stop, 2 text ready, 3 cancel, 4 error.
+    property <int> role: clamp(AudioState.view - 2, 0, 4);
     alignment: start;
     spacing: Theme.space-4;
     init => {
         AudioState.shown();
     }
     tabs := SubTabs {
-        items: [@tr("Microphone"), @tr("Recording"), @tr("Start sound"), @tr("Stop sound")];
-        selected: AudioState.view;
+        items: [@tr("Microphone"), @tr("Recording"), @tr("Sounds")];
+        selected: min(AudioState.view, 2);
         picked(i) => {
             AudioState.view = i;
         }
@@ -97,6 +101,8 @@ export component AudioPage inherits VerticalLayout {
             }
         }
         Divider { }
+        // The Test button takes its width from the column: the meter shrinks, the right edge stays
+        // the column's (DS-3.3).
         Row {
             title: @tr("Level");
             warning: AudioState.silence;
@@ -109,11 +115,6 @@ export component AudioPage inherits VerticalLayout {
                 idle-text: @tr("Listening");
                 accessible-label: !AudioState.live ? AudioState.note : AudioState.clipping ? @tr("Level, clipping") : @tr("Level");
             }
-        }
-        Divider { }
-        Row {
-            title: @tr("Mic test");
-            description: @tr("Records 3 seconds and plays them back.");
             Button {
                 text: @tr("Test");
                 enabled: !AudioState.testing;
@@ -126,7 +127,7 @@ export component AudioPage inherits VerticalLayout {
         Divider { }
         SliderRow {
             title: @tr("Gain");
-            description: @tr("Boosts or cuts what Whisper hears.");
+            info: @tr("Changes what Whisper hears.");
             minimum: -20;
             maximum: 20;
             bipolar: true;
@@ -141,7 +142,7 @@ export component AudioPage inherits VerticalLayout {
         Divider { }
         SliderRow {
             title: @tr("Meter sensitivity");
-            description: @tr("Only changes how the meter looks.");
+            info: @tr("Changes only the meter, not the recording.");
             minimum: -20;
             maximum: 20;
             bipolar: true;
@@ -158,7 +159,6 @@ export component AudioPage inherits VerticalLayout {
         ToggleRow {
             flat: true;
             title: @tr("Normalise level");
-            description: @tr("Evens out quiet and loud speech.");
             checked <=> AudioState.normalize;
             toggled(on) => {
                 AudioState.edited(AudioKey.normalize, on ? 1 : 0);
@@ -168,7 +168,6 @@ export component AudioPage inherits VerticalLayout {
         ToggleRow {
             flat: true;
             title: @tr("Trim silence");
-            description: @tr("Cuts silence at the start and end.");
             checked <=> AudioState.trim;
             toggled(on) => {
                 AudioState.edited(AudioKey.trim, on ? 1 : 0);
@@ -178,7 +177,6 @@ export component AudioPage inherits VerticalLayout {
         ToggleRow {
             flat: true;
             title: @tr("Noise suppression");
-            description: @tr("Filters background noise from the recording.");
             warning: AudioState.denoise ? @tr("Noise suppression can make Whisper worse.") : "";
             checked <=> AudioState.denoise;
             toggled(on) => {
@@ -188,7 +186,6 @@ export component AudioPage inherits VerticalLayout {
         Divider { }
         SliderRow {
             title: @tr("Tail after release");
-            description: @tr("Keeps recording a moment after you let go.");
             minimum: 0;
             maximum: 1000;
             step: 50;
@@ -202,7 +199,6 @@ export component AudioPage inherits VerticalLayout {
         Divider { }
         SliderRow {
             title: @tr("Max length");
-            description: @tr("Recording stops at this length.");
             minimum: 1;
             maximum: 30;
             unit: "min";
@@ -214,17 +210,40 @@ export component AudioPage inherits VerticalLayout {
         }
     }
     if AudioState.view >= 2: VerticalLayout {
-        property <bool> stop: AudioState.view == 3;
-        property <string> file: self.stop ? AudioState.stop-file : AudioState.start-file;
-        property <string> path: self.stop ? AudioState.stop-path : AudioState.start-path;
+        // Followed by hand: picking a row of the Combo sets its index and so drops a binding.
+        property <int> role: root.role;
+        changed role => {
+            roles.current-index = self.role;
+        }
         spacing: Theme.space-4;
-        // Preview plays the tile picked below, and the one volume serves both sounds: neither sits in
-        // the own-file row.
         sound-card := Card {
             Row {
-                title: @tr("Own file");
-                description: @tr("A .wav file of up to 5 seconds.");
+                title: @tr("Sound for");
                 warning: AudioState.sound-warning;
+                fill-controls: true;
+                roles := Combo {
+                    // Only the view changes: the sounds stay readable on a locked config.
+                    locked: false;
+                    model: [@tr("Start"), @tr("Stop"), @tr("Text ready"), @tr("Cancel"), @tr("Error")];
+                    current-index: root.role;
+                    accessible-label: @tr("Sound for");
+                    selected => {
+                        AudioState.view = 2 + self.current-index;
+                    }
+                }
+            }
+            if root.role == 2: Divider { }
+            if root.role == 2: ToggleRow {
+                flat: true;
+                title: @tr("Play when the text is ready");
+                checked <=> AudioState.done-on;
+                toggled(on) => {
+                    AudioState.edited(AudioKey.done-on, on ? 1 : 0);
+                }
+            }
+            Divider { }
+            Row {
+                title: @tr("Own file");
                 if AudioState.can-browse: Button {
                     text: @tr("Choose file");
                     enabled: !Shell.locked;
@@ -235,11 +254,12 @@ export component AudioPage inherits VerticalLayout {
                 }
             }
             Divider { }
+            // Preview plays the tile picked below, so it is not in the own-file row.
             Row {
                 title: @tr("Picked sound");
-                description: @tr("Preview plays the tile picked below.");
                 Button {
                     text: @tr("Preview");
+                    icon: Icons.play;
                     enabled: AudioState.preview-off == "";
                     tooltip: AudioState.preview-off;
                     clicked => {
@@ -250,7 +270,6 @@ export component AudioPage inherits VerticalLayout {
             Divider { }
             SliderRow {
                 title: @tr("Volume");
-                description: @tr("The same for the start and stop sounds.");
                 minimum: 0;
                 maximum: 100;
                 unit: "%";
@@ -261,27 +280,15 @@ export component AudioPage inherits VerticalLayout {
                 }
             }
         }
-        TileGallery {
-            accessible-label: parent.stop ? @tr("Stop sound") : @tr("Start sound");
-            // Up to two rows of tiles, at least one; more scroll inside the gallery. Under banners not
-            // even one row fits and the page scrolls: then the gallery shows every row, so only one
+        CardGrid {
+            accessible-label: @tr("Sounds");
+            // Up to two rows of tiles, at least one; more scroll inside the grid. Under banners not
+            // even one row fits and the page scrolls: then the grid shows every row, so only one
             // thing scrolls (UI rule 26).
             property <length> room: root.free-height - tabs.preferred-height - sound-card.preferred-height - 2 * Theme.space-4;
             height: self.room < self.min-height ? self.full-height : clamp(self.room, self.min-height, 2 * self.min-height + Theme.tile-gap);
-            tiles: [
-                { icon: Icons.speaker-2, title: @tr("Rise") },
-                { icon: Icons.speaker-2, title: @tr("Fall") },
-                { icon: Icons.speaker-2, title: @tr("Pop") },
-                { icon: Icons.speaker-2, title: @tr("Tick") },
-                {
-                    icon: Icons.folder-open-16,
-                    title: @tr("Own file"),
-                    caption: parent.file,
-                    hint: parent.path != "" ? parent.path : @tr("Choose a .wav file."),
-                    disabled: !AudioState.can-browse,
-                },
-            ];
-            selected: parent.stop ? AudioState.stop-tile : AudioState.start-tile;
+            tiles: AudioState.role-tiles[root.role];
+            selected: AudioState.role-tile[root.role];
             picked(i) => {
                 AudioState.sound-picked(i);
             }

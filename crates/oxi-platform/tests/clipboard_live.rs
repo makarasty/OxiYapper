@@ -50,7 +50,7 @@ impl UserClipboard {
 impl Drop for UserClipboard {
     fn drop(&mut self) {
         if let Some(saved) = self.0.take() {
-            let put_back = WinClipboard::new().and_then(|mut c| c.restore(saved, false));
+            let put_back = WinClipboard::new().and_then(|mut c| c.restore(&saved, false));
             if let Err(err) = put_back {
                 eprintln!("could not put the user's clipboard back: {err}");
             }
@@ -221,7 +221,7 @@ fn set_marks_exclusion_and_restore_brings_back_every_format_byte_for_byte() {
     assert_eq!(read_raw(custom), None);
     assert_excluded();
 
-    clip.restore(saved, false).unwrap();
+    clip.restore(&saved, false).unwrap();
     assert_eq!(read_raw(text), Some(original_text));
     assert_eq!(read_raw(custom), Some(original_custom));
     assert_excluded();

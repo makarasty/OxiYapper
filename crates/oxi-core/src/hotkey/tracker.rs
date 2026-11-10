@@ -57,6 +57,8 @@ struct WinPress {
 pub struct Tracker {
     chord: Chord,
     capture: bool,
+    /// Esc is swallowed and reported while recording; off, it is an ordinary key (R2.1).
+    esc_cancels: bool,
     down: [bool; Key::ALL.len()],
     /// The key's down was swallowed: its repeats and its up are swallowed too, and only then.
     swallowed: [bool; Key::ALL.len()],
@@ -72,6 +74,7 @@ impl Tracker {
         Self {
             chord,
             capture: false,
+            esc_cancels: false,
             down: [false; Key::ALL.len()],
             swallowed: [false; Key::ALL.len()],
             other_down: [0; OTHER_CODES as usize / 64],
@@ -88,6 +91,11 @@ impl Tracker {
     pub fn set_chord(&mut self, chord: Chord) {
         self.chord = chord;
         self.active = false;
+    }
+
+    /// `hotkey.esc_cancels`: while it is off (the default) Esc passes through untouched.
+    pub fn set_esc_cancels(&mut self, on: bool) {
+        self.esc_cancels = on;
     }
 
     /// Hotkey capture on or off. Turning it on drops a held chord without `ChordUp`.
@@ -190,7 +198,7 @@ impl Tracker {
                 ..Verdict::default()
             };
         }
-        if key == Key::Esc && ctx.recording {
+        if key == Key::Esc && ctx.recording && self.esc_cancels {
             return Verdict {
                 event: Some(Event::Esc),
                 swallow: true,

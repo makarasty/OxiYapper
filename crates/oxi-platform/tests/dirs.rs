@@ -4,11 +4,12 @@ use std::path::PathBuf;
 use oxi_core::paths::{PORTABLE_MARKER, portable_layout};
 use oxi_platform::dirs::{ensure, layout_for};
 
+#[path = "../src/scratch.rs"]
+mod scratch_guard;
+use scratch_guard::scratch_dir;
+
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("oxi-dirs-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    scratch_dir(&format!("oxi-dirs-{name}-{}", std::process::id()))
 }
 
 #[test]

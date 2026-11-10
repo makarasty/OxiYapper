@@ -24,6 +24,7 @@ const LOCKED: OverlayState = OverlayState::Recording {
 fn untailed() -> MachineConfig {
     MachineConfig {
         release_tail: Millis(0),
+        esc_cancels: true, // the Esc tests; `hotkey::edge_tests` cover it off
         ..MachineConfig::default()
     }
 }
@@ -157,9 +158,15 @@ fn edge_01_jobs_run_and_paste_in_order_and_a_third_waiting_job_is_refused() {
     );
     // Job 1 is transcribed while job 0 still pastes: it waits for its turn.
     assert_eq!(s.core(1900, done(J1)), [Effect::Transcribe(J2)]);
-    assert_eq!(s.core(2000, pasted(J0)), [Effect::Paste(J1)]);
+    assert_eq!(
+        s.core(2000, pasted(J0)),
+        [Effect::Play(Sound::Done), Effect::Paste(J1)]
+    );
     assert_eq!(s.core(2100, done(J2)), []);
-    assert_eq!(s.core(2200, pasted(J1)), [Effect::Paste(J2)]);
+    assert_eq!(
+        s.core(2200, pasted(J1)),
+        [Effect::Play(Sound::Done), Effect::Paste(J2)]
+    );
     s.at(2300, pasted(J2));
     assert_eq!(s.phase(), Phase::Idle);
 
@@ -207,7 +214,8 @@ fn edge_02_double_tap_locks_recording_on() {
         if locked {
             assert_eq!(s.phase(), Phase::Recording, "{case}");
             assert_eq!(overlay_of(&fx), Some(LOCKED), "{case}");
-            assert_eq!(without_overlay(fx), [], "{case}");
+            // Never silent: the start sound plays again as the lock cue.
+            assert_eq!(without_overlay(fx), [Effect::Play(Sound::Start)], "{case}");
         } else if p2 >= 300 {
             assert_eq!(s.phase(), Phase::Transcribing, "{case}");
         } else {
@@ -223,7 +231,7 @@ fn edge_02_locked_audio_counts_from_the_second_press_and_next_press_stops_it() {
     // The first tap's capture is thrown away; the second press opens a fresh one.
     assert_eq!(s.core(1100, Event::ChordUp), [Effect::DiscardCapture]);
     assert_eq!(s.core(1200, Event::ChordDown), START);
-    assert_eq!(s.core(1300, Event::ChordUp), []);
+    assert_eq!(s.core(1300, Event::ChordUp), [Effect::Play(Sound::Start)]);
     // Locked recording does not poll the key and ignores other keys.
     assert_eq!(s.core(2000, Event::Tick), []);
     assert_eq!(s.core(2100, Event::OtherKey), []);
@@ -300,6 +308,24 @@ fn edge_04_toggle_stops_on_second_press_at_300_ms() {
 }
 
 // ---- 5. max recording -----------------------------------------------------------------------
+
+#[test]
+fn edge_05_a_locked_recording_warns_30_s_before_the_cap_and_stays_locked() {
+    let mut s = Sim::loaded();
+    s.at(1000, Event::ChordDown);
+    s.at(1100, Event::ChordUp);
+    s.at(1200, Event::ChordDown);
+    assert_eq!(s.core(1300, Event::ChordUp), [Effect::Play(Sound::Start)]);
+    let warn = 1200 + 570_000;
+    assert_eq!(s.at(warn - 1, Event::Tick), Effects::new());
+    assert_eq!(
+        s.at(warn, Event::Tick),
+        [Effect::Overlay(OverlayState::Recording {
+            locked: true,
+            ending_soon: true
+        })]
+    );
+}
 
 #[test]
 fn edge_05_warns_30_s_before_the_cap_then_stops_and_keeps_the_audio() {
@@ -380,7 +406,9 @@ fn edge_07_other_key_cancels_silently_in_both_modes() {
     for mode in [Mode::Push, Mode::Toggle] {
         let mut s = Sim::with(MachineConfig { mode, ..untailed() });
         s.at(0, Event::ChordDown);
-        let fx = s.at(50, Event::OtherKey);
+        // Auto rule: the key only arms the decision; the discard comes at key time + DETECTOR_LATENCY.
+        assert_eq!(s.at(50, Event::OtherKey), [], "{mode:?}");
+        let fx = s.at(200, Event::Tick);
         // No sound, no notification, no overlay text: just gone.
         assert_eq!(
             fx,
@@ -393,7 +421,7 @@ fn edge_07_other_key_cancels_silently_in_both_modes() {
         assert_eq!(s.core(900, Event::ChordUp), [], "{mode:?}");
         assert_eq!(s.phase(), Phase::Idle, "{mode:?}");
         // Only the idle unload is armed.
-        assert_eq!(s.0.next_deadline(), Some(Millis(50 + 300_000)), "{mode:?}");
+        assert_eq!(s.0.next_deadline(), Some(Millis(200 + 300_000)), "{mode:?}");
     }
 }
 
@@ -550,7 +578,10 @@ fn edge_11_new_config_waits_for_idle() {
     s.at(550, Event::JobAudioReady(J0));
     assert_eq!(s.core(600, done(J0)), [Effect::Paste(J0)]);
     // Back to Idle: the new config goes live.
-    assert_eq!(s.core(700, pasted(J0)), [Effect::ApplyConfig]);
+    assert_eq!(
+        s.core(700, pasted(J0)),
+        [Effect::Play(Sound::Done), Effect::ApplyConfig]
+    );
     // Toggle now: the release does not stop.
     s.at(800, Event::ChordDown);
     assert_eq!(s.core(900, Event::ChordUp), []);
@@ -937,7 +968,10 @@ fn immediate_unload_waits_for_the_job_to_end() {
         assert!(!fx.contains(&Effect::Unload), "unloaded mid-job at {t}");
     }
     assert_eq!(s.0.next_deadline(), None, "no idle timer is armed");
-    assert_eq!(s.core(1000, pasted(J0)), [Effect::Unload]);
+    assert_eq!(
+        s.core(1000, pasted(J0)),
+        [Effect::Play(Sound::Done), Effect::Unload]
+    );
 }
 
 // ---- release tail (ARCHITECTURE 3: keeps the last syllable) ---------------------------------
@@ -946,6 +980,7 @@ fn tailed(mode: Mode, tail: u64) -> Sim {
     Sim::with(MachineConfig {
         mode,
         release_tail: Millis(tail),
+        esc_cancels: true,
         ..MachineConfig::default()
     })
 }
@@ -1169,8 +1204,10 @@ fn paste_outcome_notices() {
         let mut s = pasting();
         let fx = s.core(1000, Event::PasteDone { job: J0, outcome });
         let mut want: Effects = notice.map(Effect::Notify).into_iter().collect();
-        if outcome == PasteOutcome::Failed {
-            want.insert(0, Effect::Play(Sound::Error));
+        match outcome {
+            PasteOutcome::Failed => want.insert(0, Effect::Play(Sound::Error)),
+            PasteOutcome::ClipboardOnly(_) => {}
+            _ => want.insert(0, Effect::Play(Sound::Done)),
         }
         assert_eq!(fx, want, "{outcome:?}");
         assert_eq!(s.phase(), Phase::Idle, "{outcome:?}");
@@ -1204,10 +1241,16 @@ fn paste_failure_errors_every_time_and_shows_it() {
 }
 
 #[test]
-fn skipped_restore_is_noted_once() {
+fn skipped_restore_is_noted_every_time() {
     let outcome = PasteOutcome::PastedNoRestore;
     let mut s = second_paste(outcome);
-    assert_eq!(s.core(3000, Event::PasteDone { job: J1, outcome }), []);
+    assert_eq!(
+        s.core(3000, Event::PasteDone { job: J1, outcome }),
+        [
+            Effect::Play(Sound::Done),
+            Effect::Notify(Notice::RestoreSkipped)
+        ]
+    );
     assert_eq!(s.phase(), Phase::Idle);
 }
 

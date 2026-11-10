@@ -660,12 +660,10 @@ fn rgba_of(mut bgra: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::scratch_dir;
 
     fn dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("oxi-shortcuts-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        scratch_dir(&format!("oxi-shortcuts-{}-{name}", std::process::id()))
     }
 
     fn write(dir: &Path, name: &str, target: &str, args: &str) {

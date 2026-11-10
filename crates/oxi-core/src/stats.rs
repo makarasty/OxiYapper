@@ -24,8 +24,10 @@ pub const BAD_FILE: &str = "stats.bad";
 pub const VERSION: u32 = 1;
 /// Rows older than this many days fold into [`Stats::before`], so the file stays small.
 pub const KEEP_DAYS: i32 = 3 * 366;
-/// Weeks the Home heatmap shows.
-pub const HEAT_WEEKS: u16 = 26;
+/// Weeks of the Home heatmap's data: a year. A narrow window shows the last of them only.
+pub const HEAT_WEEKS: u16 = 53;
+/// The fewest weeks the Home heatmap shows, however narrow the window.
+pub const HEAT_WEEKS_MIN: u16 = 26;
 /// Days the Home trend chart reaches back, today included.
 pub const TREND_DAYS: i32 = 365;
 
@@ -369,6 +371,17 @@ pub struct Summary {
     pub heat: Vec<u8>,
 }
 
+impl Summary {
+    /// The heatmap's last `weeks` week columns, clamped to [`HEAT_WEEKS_MIN`]..=[`HEAT_WEEKS`]
+    /// and to the weeks there are: their Monday and their levels, today last.
+    pub fn heat_tail(&self, weeks: u16) -> (Date, &[u8]) {
+        let weeks = usize::from(weeks.clamp(HEAT_WEEKS_MIN, HEAT_WEEKS));
+        let skip = self.heat.len().div_ceil(7).saturating_sub(weeks) * 7;
+        let start = self.heat_start.add_days(i32::try_from(skip).unwrap_or(0));
+        (start, &self.heat[skip..])
+    }
+}
+
 /// Rounded words per minute; 0 without audio.
 fn wpm(words: u64, speech_ms: u64) -> u32 {
     if speech_ms == 0 {
@@ -462,4 +475,36 @@ pub fn format_count(n: u64) -> String {
     };
     let tenths = n / (unit / 10);
     format!("{}.{}{suffix}", tenths / 10, tenths % 10)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Date, HEAT_WEEKS, HEAT_WEEKS_MIN, Stats};
+
+    #[test]
+    fn the_heat_tail_keeps_whole_weeks_ending_today() {
+        let today = Date::from_ymd(2026, 11, 10).unwrap(); // Tuesday
+        let s = Stats::default().summary(today, HEAT_WEEKS);
+        assert_eq!(s.heat.len(), usize::from(HEAT_WEEKS - 1) * 7 + 2);
+        for (asked, shown) in [
+            (0, HEAT_WEEKS_MIN),
+            (31, 31),
+            (HEAT_WEEKS, HEAT_WEEKS),
+            (99, HEAT_WEEKS),
+        ] {
+            let (start, tail) = s.heat_tail(asked);
+            assert_eq!(start.weekday(), 0, "{asked}: starts on a Monday");
+            assert_eq!(tail.len(), usize::from(shown - 1) * 7 + 2, "{asked}");
+            assert_eq!(
+                start.add_days(i32::try_from(tail.len()).unwrap() - 1),
+                today
+            );
+        }
+        let short = Stats::default().summary(today, 2);
+        assert_eq!(
+            short.heat_tail(40),
+            (short.heat_start, &short.heat[..]),
+            "fewer weeks: all"
+        );
+    }
 }

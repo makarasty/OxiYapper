@@ -1,41 +1,76 @@
 //! Paste worker: clipboard and synthetic input (ARCHITECTURE section 10). It runs one command at
 //! a time in arrival order, so two queued pastes never interleave. Dictated text is never logged.
 
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::{Builder, JoinHandle};
 
 use oxi_core::machine::Event;
-use oxi_core::paste::{Clipboard, Input, PasteOutcome, copy_only, paste};
+use oxi_core::paste::{Clipboard, Input, OurEntries, PasteOutcome, copy_only, paste_with};
 use oxi_platform::os::clipboard::WinClipboard;
 use oxi_platform::os::input::Keyboard;
 
 use super::cmd::{Inbox, PasteCmd};
 
 /// Start the paste worker on the real clipboard and keyboard. It returns when `rx` closes.
-pub fn spawn(rx: Receiver<PasteCmd>, inbox: Sender<Inbox>) -> std::io::Result<JoinHandle<()>> {
+/// `store` keeps the ids of our Win+V entries across restarts (`OurEntries::to_text`, no text).
+pub fn spawn(
+    rx: Receiver<PasteCmd>,
+    inbox: Sender<Inbox>,
+    store: PathBuf,
+) -> std::io::Result<JoinHandle<()>> {
     Builder::new().name("paste".into()).spawn(move || {
         let clip = WinClipboard::new()
             .inspect_err(|e| tracing::warn!("clipboard unavailable: {e}"))
             .ok();
-        run(&rx, &inbox, clip, Keyboard);
+        let ours = load(&store);
+        run(&rx, &inbox, clip, Keyboard, ours, |ours| save(&store, ours));
     })
 }
 
+/// The entries the last session left in Win+V; none when the file is missing or unreadable.
+fn load(store: &Path) -> OurEntries {
+    match std::fs::read_to_string(store) {
+        Ok(text) => OurEntries::from_text(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => OurEntries::default(),
+        Err(e) => {
+            tracing::warn!(kind = ?e.kind(), "clipboard entries of the last session not read");
+            OurEntries::default()
+        }
+    }
+}
+
+/// A failed write only costs the next session one entry left in Win+V. Atomic: Windows ending
+/// the session may kill the process mid-write, which must leave the old file, not a cut one.
+fn save(store: &Path, ours: &OurEntries) {
+    if let Err(e) = oxi_platform::fs::write_atomic(store, ours.to_text().as_bytes()) {
+        tracing::warn!(kind = ?e.kind(), "clipboard entries not saved");
+    }
+}
+
 /// The command loop. Without a clipboard (`None`) every paste answers `Failed`, so the job is
-/// not stranded in `Pasting` and the coordinator keeps the text for "Copy last text".
+/// not stranded in `Pasting` and the coordinator keeps the text for "Copy last text". `ours`
+/// are our dictation entries still in Win+V, deleted by the next paste (item 52); `save` gets
+/// them each time a paste changed them.
 fn run<C: Clipboard>(
     rx: &Receiver<PasteCmd>,
     inbox: &Sender<Inbox>,
     mut clip: Option<C>,
     mut input: impl Input,
+    mut ours: OurEntries,
+    mut save: impl FnMut(&OurEntries),
 ) {
     for cmd in rx {
         match cmd {
             PasteCmd::Paste { job, text, cfg } => {
+                let before = ours.clone();
                 let outcome = clip.as_mut().map_or(PasteOutcome::Failed, |clip| {
-                    paste(&text, &cfg, clip, &mut input)
+                    paste_with(&text, &cfg, clip, &mut input, &mut ours)
                 });
-                tracing::debug!(?job, ?outcome, "paste done");
+                if ours != before {
+                    save(&ours);
+                }
+                tracing::info!(?job, ?outcome, "paste done");
                 // A send fails only when the coordinator is gone; nothing is left to tell then.
                 let _ = inbox.send(Inbox::Event(Event::PasteDone { job, outcome }));
             }
@@ -61,6 +96,7 @@ mod tests {
     use oxi_core::types::Millis;
 
     use super::*;
+    use crate::log::scratch::scratch_dir;
 
     #[derive(Debug, PartialEq, Eq)]
     enum Call {
@@ -91,8 +127,8 @@ mod tests {
         fn sequence(&self) -> u32 {
             1
         }
-        fn restore(&mut self, (): (), _in_history: bool) -> Result<(), ClipError> {
-            Ok(())
+        fn restore(&mut self, (): &(), _in_history: bool) -> Result<u32, ClipError> {
+            Ok(1)
         }
     }
 
@@ -128,12 +164,21 @@ mod tests {
             tx.send(cmd).unwrap();
         }
         drop(tx);
+        let mut saved = Vec::new();
         run(
             &rx,
             &inbox,
             clip.then(|| FakeClip(log.clone())),
             FakeInput(log.clone()),
+            OurEntries::default(),
+            |ours| saved.push(ours.to_text()),
         );
+        // Ids and a number only: no dictated text reaches the file.
+        for call in log.borrow().iter() {
+            if let Call::Set(text) = call {
+                assert!(saved.iter().all(|file| !file.contains(text.as_str())));
+            }
+        }
         drop(inbox);
         let done = answers
             .iter()
@@ -141,7 +186,12 @@ mod tests {
                 Inbox::Event(Event::PasteDone { job, outcome }) => (job, outcome),
                 _ => panic!("unexpected inbox message"),
             })
-            .collect();
+            .collect::<Vec<_>>();
+        assert_eq!(
+            clip && !done.is_empty(),
+            !saved.is_empty(),
+            "a paste saves its ids"
+        );
         (log.take(), done)
     }
 
@@ -205,6 +255,23 @@ mod tests {
             let (calls, _) = drive(vec![paste, copy("last", !keep)], true);
             assert_eq!(calls[calls.len() - 2..][1], Call::InHistory(!keep));
         }
+    }
+
+    #[test]
+    fn the_entries_file_is_replaced_whole_and_read_back() {
+        let dir = scratch_dir(&format!("oxi-paste-store-{}", std::process::id()));
+        let store = dir.join("clipboard-entries.txt");
+        std::fs::write(&store, "seq 1\nid old\n").unwrap();
+        let ours = OurEntries::from_text("seq 9\ntop t1\nid a1\nid a2\n");
+        save(&store, &ours);
+        assert_eq!(load(&store), ours);
+        // Through `<file>.tmp` and a rename: no temp file stays next to it.
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(names, [store.file_name().unwrap()]);
     }
 
     #[test]

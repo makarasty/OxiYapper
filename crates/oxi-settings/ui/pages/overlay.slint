@@ -26,7 +26,6 @@ export component OverlayPage inherits VerticalLayout {
         ToggleRow {
             flat: true;
             title: @tr("Show the overlay");
-            description: @tr("A small pill shows recording and transcription.");
             checked <=> OverlayState.enabled;
             toggled(on) => {
                 OverlayState.enabled-toggled(on);
@@ -36,7 +35,6 @@ export component OverlayPage inherits VerticalLayout {
         ToggleRow {
             flat: true;
             title: @tr("Hide over fullscreen apps");
-            description: @tr("Keeps games and videos clear.");
             checked <=> OverlayState.hide-over-fullscreen;
             toggled(on) => {
                 OverlayState.hide-over-fullscreen-toggled(on);
@@ -62,9 +60,9 @@ export component OverlayPage inherits VerticalLayout {
         }
         Divider { }
         // Why Preview is off is its tooltip (the banner above already says the daemon is off).
+        // The row says what happens, the button names it: one word is not shown twice.
         Row {
-            title: @tr("Preview");
-            description: @tr("Shows the pill on your desktop for a few seconds.");
+            title: @tr("Try it on the desktop");
             Button {
                 text: @tr("Preview");
                 icon: Icons.eye-16;

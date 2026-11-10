@@ -2,11 +2,11 @@
 // every variant and state, drawn from `theme/`. Not part of the app: the `gallery` example opens
 // it, `tests/gallery.rs` renders it to PNGs. Hover/pressed/focused come from the `force-*`
 // properties, since a static shot has no mouse.
-import { ScrollView, Palette } from "std-widgets.slint";
-import { Theme, Shell, Contrast, Icons, Caption, Tooltip, TipBubble, Button, ButtonKind, Switch, Radio, Slider, NumberField, Segmented, SubTabs, SubTabPane, Combo, TextField, TextArea, PageHeader, Group, Card, ClickCard, Row, ToggleRow, SliderRow, TileItem, Tile, TilePicker, PositionTiles, GalleryTile, TileGallery, Keycap, KeycapRow, Severity, Banner, Note, WarningSlot, Toast, ToastHost, Meter, ProgressBar, BadgeKind, Badge, StatCard, MonthLabel, ActivityHeatmap } from "theme/index.slint";
+import { Palette } from "std-widgets.slint";
+import { Theme, Shell, Contrast, Icons, Caption, CardFrame, Tooltip, TipBubble, Button, ButtonKind, IconButton, InfoTip, SearchField, PathField, PathText, EmptyState, HeaderRow, StatusChip, CardGrid, ScrollView, Switch, Radio, Slider, NumberField, Segmented, SubTabs, SubTabPane, Combo, TextField, TextArea, PageHeader, Group, Card, ClickCard, Row, ToggleRow, SliderRow, TileItem, Tile, TilePicker, PositionTiles, GalleryTile, TileGallery, Keycap, KeycapRow, Severity, Banner, Note, WarningSlot, Toast, ToastHost, Meter, ProgressBar, BadgeKind, Badge, StatCard, MonthLabel, ActivityHeatmap } from "theme/index.slint";
 
 // The test reads token values and the contrast function through these.
-export { Theme, Contrast, GalleryTile }
+export { Theme, Contrast, GalleryTile, PathText }
 
 struct IconEntry {
     name: string,
@@ -140,6 +140,10 @@ component SwatchView inherits VerticalLayout {
 }
 
 component GallerySheet inherits VerticalLayout {
+    // `tests/gallery.rs` checks that the 60-tile grid opened on its selected tile.
+    out property <length> long-grid-scrolled: long-grid.scrolled;
+    out property <int> long-grid-columns: long-grid.columns;
+    out property <length> long-grid-height: long-grid.height;
     property <[Swatch]> swatches: [
         { name: "bg-page", c: Theme.bg-page, bg: Theme.bg-page, bg-name: "", ratio: false },
         { name: "bg-card", c: Theme.bg-card, bg: Theme.bg-page, bg-name: "", ratio: false },
@@ -158,8 +162,8 @@ component GallerySheet inherits VerticalLayout {
         { name: "text-secondary", c: Theme.text-secondary, bg: Theme.bg-card, bg-name: "bg-card", ratio: true },
         { name: "text-secondary", c: Theme.text-secondary, bg: Theme.bg-page, bg-name: "bg-page", ratio: true },
         { name: "text-disabled", c: Theme.text-disabled, bg: Theme.bg-card, bg-name: "bg-card", ratio: true },
-        { name: "focus-outer", c: Theme.focus-outer, bg: Theme.bg-page, bg-name: "bg-page", ratio: true },
-        { name: "focus-inner", c: Theme.focus-inner, bg: Theme.bg-page, bg-name: "", ratio: false },
+        { name: "focus-ring", c: Theme.focus-ring, bg: Theme.bg-page, bg-name: "bg-page", ratio: true },
+        { name: "focus-ring", c: Theme.focus-ring, bg: Theme.bg-control-hover, bg-name: "bg-control-hover", ratio: true },
         { name: "accent", c: Theme.accent, bg: Theme.bg-control, bg-name: "bg-control", ratio: true },
         { name: "accent", c: Theme.accent, bg: Theme.bg-page, bg-name: "bg-page", ratio: true },
         { name: "accent", c: Theme.accent, bg: Theme.bg-card, bg-name: "bg-card", ratio: true },
@@ -187,6 +191,10 @@ component GallerySheet inherits VerticalLayout {
         { name: "brain-circuit-filled", image: Icons.brain-circuit-filled },
         { name: "brain-circuit", image: Icons.brain-circuit },
         { name: "calendar", image: Icons.calendar },
+        { name: "caret-down", image: Icons.caret-down },
+        { name: "dots-three", image: Icons.dots-three },
+        { name: "folder-open", image: Icons.folder-open },
+        { name: "warning-circle", image: Icons.warning-circle },
         { name: "checkmark-12", image: Icons.checkmark-12 },
         { name: "checkmark-circle-16", image: Icons.checkmark-circle-16 },
         { name: "checkmark-circle", image: Icons.checkmark-circle },
@@ -411,7 +419,7 @@ component GallerySheet inherits VerticalLayout {
 
     Section {
         title: "Spacing, radii, motion";
-        note: "4 px base: 4 inside a control, 8 between siblings in a row, 12 card padding vertical, 16 card padding horizontal and icon gap, 24 under the title, 32 page padding and between groups. Radii: 2 cells, 4 controls and badges, 8 cards, round for circles and pills.";
+        note: "4 px base: 4 inside a control and between cards, 8 between siblings and icon to label (pair-gap), 12 card padding vertical and header row to the first card, 16 card padding horizontal, icon gap and page padding, 24 between groups. Radii: 2 cells, 4 controls and badges, 8 cards and popups, round for circles. Focus ring: 2 px focus-ring, 2 px outside the control.";
         HorizontalLayout {
             spacing: Theme.space-4;
             alignment: start;
@@ -462,7 +470,7 @@ component GallerySheet inherits VerticalLayout {
 
     Section {
         title: "Icons";
-        note: "Fluent UI System Icons (MIT), vendored in ui/icons. Name = Icons.<name>; no suffix is the 20 px regular master.";
+        note: "Phosphor 2.1.1 Bold (MIT), vendored in ui/icons. Name = Icons.<name>; -filled is the Fill weight, for a selected glyph only. 16 px in buttons and fields, 20 in rows, 32 in tiles.";
         for r in ceil(root.icon-list.length / 8): HorizontalLayout {
             spacing: Theme.space-2;
             alignment: start;
@@ -517,7 +525,6 @@ component GallerySheet inherits VerticalLayout {
             { name: "secondary", kind: ButtonKind.secondary, text: "Download", icon: Icons.arrow-download-16 },
             { name: "subtle", kind: ButtonKind.subtle, text: "Open file", icon: Icons.open-folder-16 },
             { name: "danger", kind: ButtonKind.danger, text: "Cancel", icon: Icons.dismiss-16 },
-            { name: "icon", kind: ButtonKind.icon, text: "Change hotkey", icon: Icons.edit-16 },
         ]: VerticalLayout {
             spacing: Theme.space-2;
             GridRow {
@@ -607,6 +614,74 @@ component GallerySheet inherits VerticalLayout {
             }
         }
         GridRow {
+            label: "IconButton";
+            Cell {
+                IconButton {
+                    icon: Icons.edit-16;
+                    label: "Change hotkey";
+                }
+            }
+            Cell {
+                IconButton {
+                    icon: Icons.edit-16;
+                    label: "Change hotkey";
+                    force-hover: true;
+                }
+            }
+            Cell {
+                IconButton {
+                    icon: Icons.edit-16;
+                    label: "Change hotkey";
+                    force-pressed: true;
+                }
+            }
+            Cell {
+                IconButton {
+                    icon: Icons.edit-16;
+                    label: "Change hotkey";
+                    force-focus: true;
+                }
+            }
+            Cell {
+                IconButton {
+                    icon: Icons.edit-16;
+                    label: "Change hotkey";
+                    enabled: false;
+                }
+            }
+            Cell {
+                label: "destructive, hover";
+                IconButton {
+                    icon: Icons.delete-16;
+                    label: "Remove";
+                    destructive: true;
+                    force-hover: true;
+                }
+            }
+        }
+        GridRow {
+            label: "geometry";
+            Cell {
+                width: 260px;
+                label: "IconButton 32x32: glyph at (" + round(geo-icon.icon-x / 1px) + ", " + round(geo-icon.icon-y / 1px) + "), 16 px";
+                geo-icon := IconButton {
+                    icon: Icons.folder-open;
+                    label: "Open folder";
+                }
+            }
+            Cell {
+                width: 360px;
+                label: "Download: icon x " + round(geo-btn.icon-x / 1px) + ", y " + round(geo-btn.icon-y / 1px) + "; label x " + round(geo-btn.label-x / 1px) + " (gap " + round((geo-btn.label-x - geo-btn.icon-x - Theme.icon-size-small) / 1px) + " px)";
+                HorizontalLayout {
+                    alignment: start;
+                    geo-btn := Button {
+                        text: "Download";
+                        icon: Icons.arrow-download-16;
+                    }
+                }
+            }
+        }
+        GridRow {
             label: "tooltip";
             Cell {
                 Tooltip {
@@ -614,7 +689,7 @@ component GallerySheet inherits VerticalLayout {
                 }
             }
             Cell {
-                label: "min width 88";
+                label: "min width " + round(Theme.button-min-width / 1px);
                 HorizontalLayout {
                     spacing: Theme.space-2;
                     alignment: start;
@@ -685,6 +760,16 @@ component GallerySheet inherits VerticalLayout {
                 Switch {
                     checked: on;
                     locked: true;
+                }
+            }
+        }
+        GridRow {
+            label: "geometry";
+            Cell {
+                width: 300px;
+                label: "Track " + round(Theme.switch-track-width / 1px) + "x" + round(Theme.switch-track-height / 1px) + ", top " + round(geo-switch.track-y / 1px) + " px in a " + round(Theme.control-height / 1px) + " px box";
+                geo-switch := Switch {
+                    checked: true;
                 }
             }
         }
@@ -761,7 +846,7 @@ component GallerySheet inherits VerticalLayout {
 
     Section {
         title: "Sub-tabs";
-        note: "Under the page title. The open tab: semibold, 3 px accent underline. Left/Right/Home/End switch, Tab leaves the bar. Short of room, the side padding goes first; labels stay whole.";
+        note: "In the header row. The open tab: semibold, 3 px accent underline that fades in; the tab line spans the whole width. Left/Right/Home/End switch, Tab leaves the bar. Short of room, the side padding goes first; labels stay whole.";
         GridRow {
             label: "states";
             for s[i] in ["rest, Model open", "hover Settings", "pressed Settings", "focused (keyboard)"]: Cell {
@@ -974,66 +1059,280 @@ component GallerySheet inherits VerticalLayout {
     }
 
     Section {
-        title: "Fields (std, sized by the theme)";
-        note: "LineEdit / TextEdit / ComboBox stay std for popups and IME. Their focus underline is the context accent, which the window sets to the teal (spec 7.3): not shown focused here.";
+        title: "Inputs";
+        note: "Combo, TextField, NumberField, TextArea, SearchField and PathField share one shape: 32 px, radius 4, bg-control, 1 px stroke with the darker bottom edge. Hover lifts the fill, editing draws a 1 px accent border, the keyboard adds the ring. Disabled and locked keep the fill and grey the ink.";
         GridRow {
-            label: "combo";
-            Cell {
-                width: 260px;
-                label: "rest";
+            label: "side by side";
+            HorizontalLayout {
+                spacing: Theme.control-gap;
+                alignment: start;
                 Combo {
+                    width: 200px;
                     model: root.devices;
                 }
+                TextField {
+                    width: 160px;
+                    text: "app.exe";
+                }
+                NumberField {
+                    value: 300;
+                    maximum: 1000;
+                    unit: "ms";
+                }
+                SearchField {
+                    width: 180px;
+                    text: "disc";
+                }
+                PathField {
+                    width: 340px;
+                    path: "C:\\Users\\Synth\\AppData\\Local\\OxiYapper\\models\\ggml-large-v3-turbo.bin";
+                    browse-text: "Browse";
+                }
             }
-            Cell {
-                width: 260px;
-                label: "disabled / locked";
+        }
+        GridRow {
+            label: "";
+            for s in ["rest", "hover", "editing", "focused (keyboard)", "disabled", "locked"]: Cell {
+                width: 190px;
+                label: s;
+            }
+        }
+        GridRow {
+            label: "combo";
+            for i in 6: Cell {
+                width: 190px;
                 Combo {
+                    // The gallery cell is narrower than a control column.
+                    min-width: 160px;
                     model: root.devices;
-                    locked: true;
+                    force-hover: i == 1;
+                    force-focus: i == 3;
+                    enabled: i != 4;
+                    locked: i == 5;
                 }
             }
         }
         GridRow {
             label: "text field";
-            Cell {
-                width: 260px;
-                label: "rest";
+            for i in 6: Cell {
+                width: 190px;
                 TextField {
-                    text: "app.exe";
-                }
-            }
-            Cell {
-                width: 260px;
-                label: "placeholder";
-                TextField {
+                    text: i == 0 ? "" : "app.exe";
                     placeholder-text: "app.exe";
+                    force-hover: i == 1;
+                    force-editing: i == 2 || i == 3;
+                    force-focus: i == 3;
+                    enabled: i != 4;
+                    locked: i == 5;
+                }
+            }
+        }
+        GridRow {
+            label: "search";
+            for i in 6: Cell {
+                width: 190px;
+                SearchField {
+                    text: i == 0 ? "" : "discord";
+                    placeholder-text: "Search apps";
+                    force-hover: i == 1;
+                    force-editing: i == 2 || i == 3;
+                    force-focus: i == 3;
+                    enabled: i != 4;
+                    locked: i == 5;
+                }
+            }
+        }
+        GridRow {
+            label: "number";
+            for i in 6: Cell {
+                width: 190px;
+                NumberField {
+                    value: 300;
+                    maximum: 1000;
+                    unit: "ms";
+                    force-hover: i == 1;
+                    force-focus: i == 2 || i == 3;
+                    enabled: i != 4;
+                    locked: i == 5;
+                }
+            }
+        }
+        GridRow {
+            label: "path";
+            for i in 6: Cell {
+                width: 190px;
+                PathField {
+                    min-width: 160px;
+                    path: i == 0 ? "" : "C:\\Users\\Synth\\AppData\\Roaming\\OxiYapper\\Recordings";
+                    placeholder-text: "Default folder";
+                    force-hover: i == 1;
+                    force-focus: i == 2 || i == 3;
+                    enabled: i != 4;
+                    locked: i == 5;
+                }
+            }
+        }
+        GridRow {
+            label: "number, more";
+            Cell {
+                width: 190px;
+                label: "signed / never";
+                HorizontalLayout {
+                    spacing: Theme.space-2;
+                    alignment: start;
+                    NumberField {
+                        value: 3;
+                        minimum: -20;
+                        maximum: 20;
+                        unit: "dB";
+                        signed: true;
+                    }
+                    NumberField {
+                        value: 0;
+                        maximum: 60;
+                        unit: "min";
+                        zero-text: "never";
+                    }
                 }
             }
             Cell {
+                width: 190px;
+                label: "invalid";
+                NumberField {
+                    value: 300;
+                    maximum: 1000;
+                    unit: "ms";
+                    force-text: "3o0";
+                }
+            }
+        }
+        GridRow {
+            label: "combo open";
+            Cell {
                 width: 260px;
-                label: "locked (read-only)";
-                TextField {
-                    text: "C:\\models\\ggml-small.bin";
-                    locked: true;
+                height: 120px;
+                label: "the list covers the field, no ring";
+                Combo {
+                    model: root.devices;
+                    current-index: 0;
+                    force-open: true;
+                    force-focus: true;
                 }
             }
         }
         GridRow {
             label: "text area";
-            Cell {
-                width: 400px;
-                label: "min 6 lines";
+            for i in 4: Cell {
+                width: 300px;
+                label: ["rest", "editing", "focused (keyboard)", "locked"][i];
                 TextArea {
                     text: "OxiYapper\nWhisper\nSlint\nVulkan";
+                    force-editing: i == 1 || i == 2;
+                    force-focus: i == 2;
+                    locked: i == 3;
+                }
+            }
+        }
+    }
+
+    Section {
+        title: "Info tip, empty state, header row";
+        note: "InfoTip: a 16 px info glyph in a 20 px round hover box; the hint is its tooltip (hover, keyboard focus, Enter or Space). EmptyState: centred in the box the full list takes. HeaderRow: sub-tabs left, status chip right, the tab line across.";
+        GridRow {
+            label: "info tip";
+            Cell {
+                label: "rest";
+                InfoTip {
+                    text: "Kept on this computer only.";
                 }
             }
             Cell {
-                width: 400px;
-                label: "locked";
-                TextArea {
-                    text: "heard => wanted";
-                    locked: true;
+                label: "hover";
+                InfoTip {
+                    text: "Kept on this computer only.";
+                    force-hover: true;
+                }
+            }
+            Cell {
+                label: "focused (keyboard)";
+                InfoTip {
+                    text: "Kept on this computer only.";
+                    force-focus: true;
+                }
+            }
+            Cell {
+                width: 260px;
+                label: "beside a title, pair-gap";
+                HorizontalLayout {
+                    spacing: Theme.pair-gap;
+                    alignment: start;
+                    Text {
+                        text: "Save recordings";
+                        font-size: Theme.body-size;
+                        color: Theme.text-primary;
+                        vertical-alignment: center;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        InfoTip {
+                            text: "Kept on this computer only.";
+                        }
+                    }
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-8;
+            alignment: start;
+            StateBox {
+                box-height: 200px;
+                label: "EmptyState with its fix";
+                CardFrame {
+                    EmptyState {
+                        icon: Icons.app-generic;
+                        text: "No apps found yet.";
+                        Button {
+                            text: "Scan for apps";
+                            icon: Icons.arrow-download-16;
+                        }
+                    }
+                }
+            }
+        }
+        VerticalLayout {
+            width: 880px;
+            spacing: Theme.space-3;
+            Remark {
+                text: "HeaderRow, normal status (inert)";
+            }
+            HeaderRow {
+                SubTabs {
+                    horizontal-stretch: 0;
+                    items: ["Microphone", "Recording", "Sounds"];
+                    selected: 0;
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+                StatusChip {
+                    text: "Ready";
+                    tooltip: "Dictation is ready";
+                }
+            }
+            Remark {
+                text: "HeaderRow, no model: the chip has an action (hover forced)";
+            }
+            HeaderRow {
+                title: "Home";
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+                StatusChip {
+                    text: "No model";
+                    tooltip: "Open Model to download one";
+                    dot: Theme.warning-text;
+                    actionable: true;
+                    force-hover: true;
                 }
             }
         }
@@ -1041,7 +1340,7 @@ component GallerySheet inherits VerticalLayout {
 
     Section {
         title: "Tiles";
-        note: "Large items: selected = accent tint, accent icon (filled) and title, check badge. Read-only: 40 %, grey badge. Borders never change colour.";
+        note: "Large items: selected = accent tint, accent icon (filled) and title, check badge. Read-only: grey ink (no opacity on text), grey badge. Borders never change colour.";
         GridRow {
             label: "";
             Cell {
@@ -1159,20 +1458,21 @@ component GallerySheet inherits VerticalLayout {
     }
 
     Section {
-        title: "Tile gallery";
-        note: "TileGallery: the grid scrolls inside its box, the page does not. Arrows move the focus ring, Enter or Space picks. A long title is cut and stands in full in the tooltip. Disabled tiles keep their tooltip.";
+        title: "Card grid";
+        note: "CardGrid (Per-app apps, models, sounds): glyph top-left, title, caption, the check badge top-right. The grid scrolls inside its box with the 6 px bar in a 12 px gutter, the page does not. Arrows move the focus ring, Enter or Space picks. A long title is cut and stands in full in the tooltip.";
         HorizontalLayout {
             spacing: Theme.space-8;
             alignment: start;
             StateBox {
                 label: "Empty";
-                TileGallery {
+                CardGrid {
                     empty-text: "Nothing found on this computer.";
+                    empty-icon: Icons.app-generic;
                 }
             }
             StateBox {
                 label: "Found apps, nothing selected; one with no icon";
-                TileGallery {
+                CardGrid {
                     tiles: [
                         { picture: Icons.logo, title: "OxiYapper", caption: "oxiyapper.exe" },
                         { title: "Synth App", caption: "synthapp.exe" },
@@ -1186,7 +1486,7 @@ component GallerySheet inherits VerticalLayout {
             alignment: start;
             StateBox {
                 label: "Selected Soft click, hover Bell, keyboard focus";
-                TileGallery {
+                CardGrid {
                     tiles: root.sound-tiles;
                     selected: 0;
                     force-hover: 1;
@@ -1195,7 +1495,7 @@ component GallerySheet inherits VerticalLayout {
             }
             StateBox {
                 label: "Disabled tiles, one of them selected";
-                TileGallery {
+                CardGrid {
                     tiles: root.disabled-tiles;
                     selected: 0;
                 }
@@ -1206,7 +1506,7 @@ component GallerySheet inherits VerticalLayout {
             alignment: start;
             StateBox {
                 label: "Locked (read-only config)";
-                TileGallery {
+                CardGrid {
                     tiles: root.sound-tiles;
                     selected: 1;
                     locked: true;
@@ -1214,7 +1514,7 @@ component GallerySheet inherits VerticalLayout {
             }
             StateBox {
                 label: "60 tiles, tile 32 selected and scrolled into view";
-                TileGallery {
+                long-grid := CardGrid {
                     tiles: root.many-tiles;
                     selected: 31;
                 }
@@ -1225,7 +1525,7 @@ component GallerySheet inherits VerticalLayout {
             alignment: start;
             StateBox {
                 label: "60 tiles from the top, keyboard focus on tile 5 (long name)";
-                TileGallery {
+                CardGrid {
                     tiles: root.many-tiles;
                     selected: 4;
                     force-focus: true;
@@ -1755,6 +2055,21 @@ export component TipFadeProbe inherits Window {
     }
 }
 
+// Test surface: `tests/gallery.rs` reads what a `PathField` shows at rest.
+export component PathFieldProbe inherits Window {
+    // Known at creation, before the test wires `PathText`, as on a page.
+    in property <string> path: "C:\\Users\\Synth\\AppData\\Local\\OxiYapper\\models\\ggml-large-v3-turbo.bin";
+    out property <string> shown: f.shown;
+    width: 400px;
+    height: 100px;
+    f := PathField {
+        x: 0;
+        y: 0;
+        width: 240px;
+        path: root.path;
+    }
+}
+
 // Test surface: `tests/gallery.rs` walks a gallery by keyboard; the owner side keeps `selected`.
 export component TileGalleryProbe inherits Window {
     in property <[GalleryTile]> tiles;
@@ -1923,6 +2238,9 @@ export component GalleryWindow inherits Window {
 export component GalleryShot inherits Window {
     in-out property <bool> dark;
     out property <length> sheet-height: sheet.preferred-height;
+    out property <length> long-grid-scrolled: sheet.long-grid-scrolled;
+    out property <int> long-grid-columns: sheet.long-grid-columns;
+    out property <length> long-grid-height: sheet.long-grid-height;
     default-font-family: Theme.font-family;
     default-font-size: Theme.body-size;
     background: Theme.bg-page;

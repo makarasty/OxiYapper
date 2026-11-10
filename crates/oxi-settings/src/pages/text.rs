@@ -133,17 +133,20 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
         save.touch();
     });
     let (w, c) = (window.as_weak(), ctx.clone());
+    // Arrowing through the Combo picks on every step: save once it rests, like the slider.
+    let save = SaveDebounce::new(w.clone(), c.clone());
     s.on_rule_mode_picked(move |i, mode| {
         let mode = match mode {
             1 => Some(PasteMode::Clipboard),
             2 => Some(PasteMode::Type),
             _ => None,
         };
-        apply(&w, &c, |p| {
+        change(&w, &c, |p| {
             if let Some(rule) = usize::try_from(i).ok().and_then(|i| p.rules.get_mut(i)) {
                 rule.mode = mode;
             }
         });
+        save.touch();
     });
     let (w, c) = (window.as_weak(), ctx.clone());
     s.on_rule_removed(move |i| {
@@ -332,13 +335,18 @@ fn add_rule(paste: &mut Paste, app: &str) -> bool {
 }
 
 /// Change `[paste]`, show its rules again and save.
-fn apply(weak: &Weak<AppWindow>, ctx: &Ctx, change: impl FnOnce(&mut Paste)) {
-    change(&mut ctx.config.borrow_mut().config.paste);
+fn apply(weak: &Weak<AppWindow>, ctx: &Ctx, edit: impl FnOnce(&mut Paste)) {
+    change(weak, ctx, edit);
+    report(weak, ctx.save());
+}
+
+/// [`apply`] without the save: the caller saves, e.g. through a [`SaveDebounce`].
+fn change(weak: &Weak<AppWindow>, ctx: &Ctx, edit: impl FnOnce(&mut Paste)) {
+    edit(&mut ctx.config.borrow_mut().config.paste);
     with(weak, |s| {
         let file = ctx.config.borrow();
         show_rules(&s, &file.config.paste.rules, &file.config.ui.app_names);
     });
-    report(weak, ctx.save());
 }
 
 /// The rule list, each rule named as the scan found its app, and the found apps with a rule
@@ -365,11 +373,23 @@ fn show_rules(s: &TextState<'_>, rules: &[PasteRule], known: &BTreeMap<String, S
             found.set_row_data(i, tile);
         }
     }
-    s.set_rules(rows(rules, &names));
+    let new = rows(rules, &names);
+    let old = s.get_rules();
+    // Same rules: change rows in place. A new model rebuilds every row, and the Combo the user is
+    // arrowing through (each arrow picks a mode) would lose its focus.
+    if old.row_count() == new.len() {
+        for (i, row) in new.into_iter().enumerate() {
+            if old.row_data(i).as_ref() != Some(&row) {
+                old.set_row_data(i, row);
+            }
+        }
+    } else {
+        s.set_rules(ModelRc::from(Rc::new(VecModel::from(new))));
+    }
 }
 
-fn rows(rules: &[PasteRule], names: &HashMap<String, SharedString>) -> ModelRc<PasteRuleRow> {
-    let rows: Vec<PasteRuleRow> = rules
+fn rows(rules: &[PasteRule], names: &HashMap<String, SharedString>) -> Vec<PasteRuleRow> {
+    rules
         .iter()
         .map(|r| PasteRuleRow {
             app: r.app.as_str().into(),
@@ -383,8 +403,7 @@ fn rows(rules: &[PasteRule], names: &HashMap<String, SharedString>) -> ModelRc<P
                 Some(PasteMode::Type) => 2,
             },
         })
-        .collect();
-    ModelRc::from(Rc::new(VecModel::from(rows)))
+        .collect()
 }
 
 fn show_dictionary(s: &TextState<'_>, text: &str) {
@@ -744,7 +763,7 @@ mod tests {
         assert_eq!(found(&window), []);
         assert!(has(
             &window,
-            "No app shortcuts in the Start menu or on the desktop: type the app's .exe name above."
+            "No apps found: type the app's .exe name above."
         ));
         assert!(whole_in_view(&window, "Add rule"));
         // Said in a line, not a gallery-high empty card that pushes the rules down.
@@ -850,14 +869,16 @@ mode = \"clipboard\"
             one(&window, "New rule app").set_accessible_value("");
         };
         to_field();
-        // Scan is the stop before the field.
-        press(&window, Key::Backtab.into());
+        // Past the empty field (Add is off) Scan is the next stop.
+        press(&window, Key::Tab.into());
         press(&window, " ".into());
         assert!(s.get_scanning(), "Space on Scan did not start a scan");
         wait_scan(&window);
-        // Past the empty field (Add is off) lie the found apps; Enter adds the one under the cursor.
+        // Past Scan and its "i" lie the found apps; Enter adds the one under the cursor.
         to_field();
-        press(&window, Key::Tab.into());
+        for _ in 0..3 {
+            press(&window, Key::Tab.into());
+        }
         press(&window, Key::Return.into());
         assert_eq!(rules(&layout), ["mstsc.exe", "notes.exe"]);
     }
@@ -891,6 +912,85 @@ mode = \"clipboard\"
         }
     }
 
+    /// Item 12: at 1920 x 1080 the found apps fill the room under Add (more than two tile rows,
+    /// nothing left empty below), and the 150 rules keep their own scrolling list under them.
+    #[test]
+    fn found_apps_fill_a_large_window() {
+        let (window, _layout) = per_app("large", Some(&many_rules(150)), many_apps("large", 300));
+        window.window().set_size(LogicalSize::new(1920.0, 1080.0));
+        one(&window, "Scan for apps").invoke_accessible_default_action();
+        wait_scan(&window);
+        mock_elapsed_time(Duration::from_millis(1));
+        let gallery = ElementHandle::find_by_accessible_label(&window, "Found apps")
+            .next()
+            .unwrap();
+        let tile = window.global::<crate::Tokens>().get_tile_height();
+        assert!(
+            gallery.size().height > 3.0 * tile,
+            "{} px",
+            gallery.size().height
+        );
+        let list = ElementHandle::find_by_element_id(&window, "TextPage::rules")
+            .next()
+            .expect("the rule list");
+        let bottom = list.absolute_position().y + list.size().height;
+        assert!(list.size().height >= 120.0, "{:?}", list.size());
+        assert!(
+            bottom > 1080.0 - 2.0 * tile,
+            "the list ends at {bottom} of 1080"
+        );
+        assert!(bottom <= 1080.0, "the list ends at {bottom} of 1080");
+        assert!(!page_scrolls(&window));
+    }
+
+    /// A mode pick changes the row in place: a new model would rebuild the rows and take the
+    /// focus from the Combo being arrowed through. A mode changed from outside still shows.
+    #[test]
+    fn a_mode_pick_keeps_the_rule_rows() {
+        let config = "version = 1
+[[paste.rules]]
+app = \"a.exe\"
+mode = \"type\"
+";
+        let (window, layout) = per_app("in-place", Some(config), shortcuts("in-place", &[]));
+        let s = window.global::<TextState>();
+        let before = s.get_rules();
+        s.invoke_rule_mode_picked(0, 1);
+        assert!(before == s.get_rules(), "the rule model was replaced");
+        assert_eq!(s.get_rules().row_data(0).unwrap().mode, 1);
+        mock_elapsed_time(Duration::from_millis(350));
+        let text = fs::read_to_string(layout.config_file()).unwrap();
+        assert!(text.contains("mode = \"clipboard\""), "{text}");
+        mock_elapsed_time(Duration::from_millis(1));
+        let combo = ElementHandle::find_by_accessible_label(&window, "Mode for a.exe")
+            .next()
+            .unwrap();
+        assert_eq!(combo.accessible_value().as_deref(), Some("Clipboard"));
+    }
+
+    /// Arrowing a mode Combo picks on every key: the file waits for the picks to rest, then holds
+    /// the last one.
+    #[test]
+    fn mode_picks_in_a_row_save_once_they_rest() {
+        let config = "version = 1
+[[paste.rules]]
+app = \"a.exe\"
+mode = \"type\"
+";
+        let (window, layout) = per_app("arrow-save", Some(config), shortcuts("arrow-save", &[]));
+        let s = window.global::<TextState>();
+        s.invoke_rule_mode_picked(0, 1);
+        s.invoke_rule_mode_picked(0, 0);
+        let text = fs::read_to_string(layout.config_file()).unwrap();
+        assert!(text.contains("mode = \"type\""), "saved on an arrow: {text}");
+        mock_elapsed_time(Duration::from_millis(350));
+        let text = fs::read_to_string(layout.config_file()).unwrap();
+        assert!(
+            !text.contains("mode = \"type\""),
+            "the last pick (default) is saved: {text}"
+        );
+    }
+
     /// With the gallery shown and both banners (the daemon's and a config's) up at 720 x 520, the
     /// rule list keeps at least a row; the page scrolls for the rest, the list never goes.
     #[test]
@@ -898,7 +998,7 @@ mode = \"clipboard\"
         let (window, _layout) = per_app("floor", Some(&many_rules(150)), many_apps("floor", 300));
         one(&window, "Scan for apps").invoke_accessible_default_action();
         wait_scan(&window);
-        window.set_banner_text("Synthetic config trouble. ".repeat(12).into());
+        window.set_banner_text("Synthetic config trouble. ".repeat(30).into());
         window.set_daemon_text(oxi_core::strings::DAEMON_OFFLINE.into());
         window.set_daemon_start(true);
         mock_elapsed_time(Duration::from_millis(1));
@@ -911,8 +1011,9 @@ mode = \"clipboard\"
         assert!(has(&window, "Remove synthrule0.exe"));
     }
 
-    /// The found apps drawn by the software renderer: none found, and 300 with 150 rules, at the
-    /// minimum, a middle and the largest size in both themes, into `OXI_SHOTS_DIR` as
+    /// The found apps drawn by the software renderer: none found (with the default rule and with
+    /// none), and 300 with 150 rules, at the
+    /// minimum, two middle and a large size in both themes, into `OXI_SHOTS_DIR` as
     /// `settings-text-found-<state>-<w>-<theme>.png`. Nothing runs without it: the real Start
     /// menu is never scanned here, and `tests/shots.rs` cannot point the scan at synthetic links.
     /// The renderer platform is per thread, so it draws on a thread of its own.
@@ -965,7 +1066,15 @@ mode = \"clipboard\"
         fs::create_dir_all(dir).unwrap();
         slint::platform::set_platform(Box::new(Shots)).unwrap();
         let rules = many_rules(150);
-        for (state, root, config) in [("none", empty, None), ("300", many, Some(rules.as_str()))] {
+        let no_rules = "version = 1
+[paste]
+rules = []
+";
+        for (state, root, config) in [
+            ("none", empty.clone(), None),
+            ("norules", empty, Some(no_rules)),
+            ("300", many, Some(rules.as_str())),
+        ] {
             for (theme, choice) in [("light", ThemeChoice::Light), ("dark", ThemeChoice::Dark)] {
                 TEST_ROOTS.set(vec![root.clone()]);
                 let layout = crate::testing::layout("text-shots", &format!("{state}-{theme}"));
@@ -989,7 +1098,7 @@ mode = \"clipboard\"
                     std::thread::sleep(Duration::from_millis(5));
                     slint::platform::update_timers_and_animations();
                 }
-                for (w, h) in [(720_u32, 520_u32), (1000, 700), (1280, 860)] {
+                for (w, h) in [(720_u32, 520_u32), (1000, 700), (1280, 860), (1920, 1080)] {
                     surface.set_size(slint::PhysicalSize::new(w, h));
                     slint::platform::update_timers_and_animations();
                     surface.request_redraw();

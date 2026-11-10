@@ -19,3 +19,6 @@ use crate::types::Millis;
 pub fn step(state: &mut State, event: Event, now: Millis) -> Effects {
     state.handle(event, now)
 }
+
+#[cfg(test)]
+mod edge_tests;

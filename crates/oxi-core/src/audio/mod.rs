@@ -5,9 +5,11 @@
 mod denoise;
 mod pipeline;
 mod resample;
+mod speech;
 mod trim;
 
 pub use pipeline::{Pipeline, process};
+pub use speech::{DETECTOR_LATENCY, SpeechDetector};
 
 use crate::types::Millis;
 

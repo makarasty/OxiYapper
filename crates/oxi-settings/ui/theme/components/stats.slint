@@ -33,8 +33,8 @@ export component StatCard inherits ClickCard {
         // The row makes the cards one height: the spare goes below, not between the texts.
         alignment: start;
         HorizontalLayout {
-            spacing: Theme.space-2;
-            min-height: root.label-lines * 20px;
+            spacing: Theme.pair-gap;
+            min-height: root.label-lines * Theme.body-line;
             if root.icon.width > 0: VerticalLayout {
                 alignment: center;
                 Image {
@@ -81,10 +81,11 @@ export component TrendChart {
     in property <string> first-day;
     in property <string> last-day;
     in property <string> summary;
-    in property <length> max-pitch: 21px;
+    in property <length> max-pitch: Theme.trend-max-pitch;
     property <length> pitch: min(root.max-pitch, root.width / max(1, root.bars.length));
     property <length> span: root.bars.length * root.pitch;
-    property <length> bar: root.pitch < 4px ? ceil(root.pitch / 1px) * 1px : floor(root.pitch * 0.86 / 1px) * 1px;
+    // Whole pixels: a bar under 4 px fills its pitch, wider ones leave 14 % between.
+    property <length> bar: root.pitch < Theme.rail-height ? ceil(root.pitch / 1px) * 1px : floor(root.pitch * 0.86 / 1px) * 1px;
     property <length> plot-top: Theme.caption-line + Theme.space-1;
     property <length> baseline: root.height - Theme.caption-line - Theme.space-1;
 
@@ -102,10 +103,11 @@ export component TrendChart {
         x: floor((root.width - root.span + i * root.pitch) / 1px) * 1px;
         y: root.baseline - self.height;
         width: root.bar;
-        height: value <= 0 ? 0 : max(2px, (root.baseline - root.plot-top) * value / 1000);
+        height: value <= 0 ? 0 : max(Theme.radius-small, (root.baseline - root.plot-top) * value / 1000);
         border-radius: Theme.radius-small;
         background: Theme.accent;
     }
+    // 1 px hairline: the baseline.
     Rectangle {
         y: root.baseline;
         height: 1px;
@@ -148,17 +150,17 @@ export component ActivityHeatmap {
     in property <[string]> day-labels: [@tr("Mon"), @tr("Tue"), @tr("Wed"), @tr("Thu"), @tr("Fri"), @tr("Sat"), @tr("Sun")];
     in property <string> less-text: @tr("Less");
     in property <string> more-text: @tr("More");
-    in property <length> cell: 12px;
-    in property <length> gap: 3px;
+    in property <length> cell: Theme.heat-cell-default;
+    in property <length> gap: Theme.heat-gap;
     // The Less..More legend swatches; the grid cells can be larger.
-    in property <length> legend-cell: 12px;
+    in property <length> legend-cell: Theme.heat-cell-default;
     property <length> pitch: root.cell + root.gap;
     property <int> weeks: ceil(root.levels.length / 7);
     // Width of the day labels, and what the owner needs to fit the grid to a width.
-    in property <length> label-w: 32px;
+    in property <length> label-w: Theme.heat-label-width;
     // Off in Home's tight layout: the scale is the first thing a low window drops.
     in property <bool> legend-shown: true;
-    property <length> top: 20px;
+    property <length> top: Theme.heat-top;
 
     public pure function level-color(level: int) -> color {
         return level <= 0 ? Theme.bg-inset : level == 1 ? Theme.accent.transparentize(0.75) : level == 2 ? Theme.accent.transparentize(0.5) : level == 3 ? Theme.accent.transparentize(0.25) : Theme.accent;
@@ -194,13 +196,13 @@ export component ActivityHeatmap {
             height: root.cell;
             border-radius: Theme.radius-small;
             background: root.level-color(level);
-            // Today: outlined in the text colour, 1 px outside the cell.
+            // Today: a 1.5 px outline, its outer edge `radius-small` outside the cell.
             if i == root.today: Rectangle {
-                x: -2px;
-                y: -2px;
-                width: parent.width + 4px;
-                height: parent.height + 4px;
-                border-radius: Theme.radius-small + 1px;
+                x: -Theme.radius-small;
+                y: -Theme.radius-small;
+                width: parent.width + 2 * Theme.radius-small;
+                height: parent.height + 2 * Theme.radius-small;
+                border-radius: 2 * Theme.radius-small;
                 border-width: 1.5px;
                 border-color: Theme.text-primary;
             }

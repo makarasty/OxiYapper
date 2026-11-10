@@ -6,6 +6,8 @@
 
 use std::io;
 use std::ptr::{null, null_mut};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
 use ab_glyph::FontRef;
@@ -62,8 +64,36 @@ pub enum OverlayError {
     Win32(&'static str, #[source] io::Error),
 }
 
+/// Whisper's percent of the running transcription, set from any thread (the coordinator); the
+/// pill's timer reads it each frame, as it reads the [`LevelMeter`].
+#[derive(Debug, Clone)]
+pub struct Progress(Arc<AtomicU8>);
+
+/// The stored value of an unknown percent.
+const UNKNOWN: u8 = u8::MAX;
+
+impl Default for Progress {
+    fn default() -> Self {
+        Self(Arc::new(AtomicU8::new(UNKNOWN)))
+    }
+}
+
+impl Progress {
+    /// `None` while whisper reported nothing for this transcription.
+    pub fn set(&self, percent: Option<u8>) {
+        self.0
+            .store(percent.map_or(UNKNOWN, |p| p.min(100)), Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn get(&self) -> Option<u8> {
+        let p = self.0.load(Ordering::Relaxed);
+        (p != UNKNOWN).then_some(p)
+    }
+}
+
 /// The overlay pill window. Create, show and drop it on the UI thread, whose message loop
-/// dispatches the 30 Hz meter timer.
+/// dispatches the 30 Hz frame timer (meter while recording, progress while busy).
 pub struct Overlay<'f> {
     inner: *mut Inner<'f>,
 }
@@ -71,6 +101,7 @@ pub struct Overlay<'f> {
 struct Inner<'f> {
     hwnd: HWND,
     level: LevelMeter,
+    progress: Progress,
     meter: Meter,
     canvas: PillCanvas<'f>,
     state: OverlayState,
@@ -144,6 +175,7 @@ impl<'f> Overlay<'f> {
             let inner = Box::into_raw(Box::new(Inner {
                 hwnd,
                 level,
+                progress: Progress::default(),
                 meter: Meter::new(BARS, 0.0),
                 canvas: PillCanvas::new(font),
                 state: OverlayState::Hidden,
@@ -180,6 +212,13 @@ impl<'f> Overlay<'f> {
         self.inner().hide();
     }
 
+    /// The cell the coordinator writes whisper's percent into.
+    #[must_use]
+    pub fn progress(&self) -> Progress {
+        // SAFETY: `inner` lives until `Drop`.
+        unsafe { (*self.inner).progress.clone() }
+    }
+
     fn inner(&mut self) -> &mut Inner<'f> {
         // SAFETY: `inner` lives until `Drop`; the window procedure borrows it only while a
         // WM_TIMER is dispatched, which never happens inside `show` or `hide` (posted
@@ -202,8 +241,13 @@ impl Inner<'_> {
     fn show(&mut self, state: OverlayState, cfg: &Config) -> Result<(), OverlayError> {
         let shown = self.try_show(state, cfg);
         if shown.is_err() {
-            // No stale pill and no meter timer outside a recording after a failed show.
-            self.hide();
+            // No stale pill and no frame timer after a failed show. A recording goes on, so the
+            // pill's clock keeps its start for the next frame that is drawn.
+            if matches!(state, OverlayState::Recording { .. }) {
+                self.hide_window();
+            } else {
+                self.hide();
+            }
         }
         shown
     }
@@ -218,13 +262,20 @@ impl Inner<'_> {
         if recording && !matches!(self.state, OverlayState::Recording { .. }) {
             self.meter = Meter::new(BARS, cfg.audio.meter_sensitivity_db);
         }
+        // The meter moves while recording, the progress track while loading or transcribing.
+        let animated = recording
+            || matches!(
+                state,
+                OverlayState::LoadingModel | OverlayState::Transcribing
+            );
         self.state = state;
         self.rect = place(cfg.overlay.position, work, dpi as f32 / 96.0);
+        self.canvas.set_progress(self.progress.get());
         self.render()?;
         // SAFETY: `hwnd` is our live window.
         unsafe {
             ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
-            if recording {
+            if animated {
                 #[allow(clippy::cast_possible_truncation)] // 1000 / 30
                 SetTimer(self.hwnd, TIMER, (1000 / METER_HZ) as u32, None);
             } else {
@@ -234,7 +285,14 @@ impl Inner<'_> {
         Ok(())
     }
 
+    /// The pill is gone because its state ended: the next recording's clock starts at zero.
     fn hide(&mut self) {
+        self.hide_window();
+        self.canvas.hide();
+    }
+
+    /// The window and its timer go; the canvas keeps what it knows.
+    fn hide_window(&mut self) {
         self.state = OverlayState::Hidden;
         // SAFETY: `hwnd` is our live window.
         unsafe {
@@ -244,7 +302,10 @@ impl Inner<'_> {
     }
 
     fn tick(&mut self) {
-        self.meter.push(self.level.read(), self.now());
+        if matches!(self.state, OverlayState::Recording { .. }) {
+            self.meter.push(self.level.read(), self.now());
+        }
+        self.canvas.set_progress(self.progress.get());
         // A failed frame keeps the last one on screen; the next tick draws again.
         let _ = self.render();
     }
@@ -422,6 +483,19 @@ mod tests {
     use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
 
     use super::*;
+
+    #[test]
+    fn progress_is_unknown_until_set_and_shared_by_its_clones() {
+        let cell = Progress::default();
+        let reader = cell.clone();
+        assert_eq!(reader.get(), None);
+        cell.set(Some(42));
+        assert_eq!(reader.get(), Some(42));
+        cell.set(Some(250));
+        assert_eq!(reader.get(), Some(100), "a percent stays within 100");
+        cell.set(None);
+        assert_eq!(reader.get(), None);
+    }
 
     /// Live: shows a window. Runs only with `OXI_OVERLAY_TEST=1`.
     #[test]

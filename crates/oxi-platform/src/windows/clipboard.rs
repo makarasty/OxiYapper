@@ -2,14 +2,22 @@
 
 use std::marker::PhantomData;
 use std::ptr::{copy_nonoverlapping, null, null_mut};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, sleep};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use oxi_core::paste::{
-    ClipError, Clipboard, DELAYED_RENDER_TIMEOUT, OPEN_RETRIES, OPEN_RETRY_GAP, SNAPSHOT_CAP, Snap,
+    ClipError, Clipboard, DELAYED_RENDER_TIMEOUT, HISTORY_TIMEOUT, HistoryItem, OPEN_RETRIES,
+    OPEN_RETRY_GAP, SNAPSHOT_CAP, Snap,
 };
 use oxi_core::types::Millis;
+use windows::ApplicationModel::DataTransfer::{
+    Clipboard as Winrt, ClipboardHistoryItem, ClipboardHistoryItemsResultStatus,
+    StandardDataFormats,
+};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows_sys::Win32::Foundation::{GetLastError, GlobalFree, HANDLE, HWND, SetLastError};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardOwner,
@@ -20,8 +28,8 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::Ole::{
     CF_BITMAP, CF_DIB, CF_DIBV5, CF_DSPBITMAP, CF_DSPENHMETAFILE, CF_DSPMETAFILEPICT,
-    CF_ENHMETAFILE, CF_GDIOBJLAST, CF_METAFILEPICT, CF_OEMTEXT, CF_OWNERDISPLAY, CF_PALETTE,
-    CF_PRIVATEFIRST, CF_TEXT, CF_UNICODETEXT,
+    CF_ENHMETAFILE, CF_GDIOBJLAST, CF_HDROP, CF_METAFILEPICT, CF_OEMTEXT, CF_OWNERDISPLAY,
+    CF_PALETTE, CF_PRIVATEFIRST, CF_TEXT, CF_UNICODETEXT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, HWND_MESSAGE, IsHungAppWindow,
@@ -48,6 +56,12 @@ const SYNTH_GROUPS: [&[u16]; 2] = [&[CF_UNICODETEXT, CF_TEXT, CF_OEMTEXT], &[CF_
 #[derive(Debug)]
 pub struct WinClipboard {
     exclude: [u32; 3],
+    /// A history call is running (or stuck after its timeout): the next one fails at once.
+    history_busy: Arc<AtomicBool>,
+    /// Start of [`Clipboard::now`].
+    born: Instant,
+    /// Each history call's limit: [`HISTORY_TIMEOUT`], or less once the budget runs low.
+    history_limit: Millis,
 }
 
 /// Every copied format with its bytes, in clipboard order.
@@ -73,7 +87,12 @@ impl WinClipboard {
                 return Err(os_error("RegisterClipboardFormatW"));
             }
         }
-        Ok(Self { exclude })
+        Ok(Self {
+            exclude,
+            history_busy: Arc::default(),
+            born: Instant::now(),
+            history_limit: HISTORY_TIMEOUT,
+        })
     }
 
     /// Empties the clipboard, writes the marker formats first (a later failure never leaves
@@ -154,7 +173,7 @@ impl Clipboard for WinClipboard {
     }
 
     fn is_excluded(&self, snapshot: &Saved) -> bool {
-        carries_exclusion(&snapshot.0, self.exclude)
+        carries_exclusion(&snapshot.0, self.exclude) || history_skips(&snapshot.0, self.exclude)
     }
 
     fn set_text(&mut self, text: &str, in_history: bool) -> Result<u32, ClipError> {
@@ -171,12 +190,195 @@ impl Clipboard for WinClipboard {
         unsafe { GetClipboardSequenceNumber() }
     }
 
-    fn restore(&mut self, snapshot: Saved, in_history: bool) -> Result<(), ClipError> {
+    fn restore(&mut self, snapshot: &Saved, in_history: bool) -> Result<u32, ClipError> {
         self.replace(
             in_history,
             snapshot.0.iter().map(|(f, b)| (*f, b.as_slice())),
         )
-        .map(drop)
+    }
+
+    /// Win+V, newest first, through the `WinRT` history API. `None` with history switched off
+    /// in Windows settings, a status other than success, a failed call or a timeout.
+    fn history(&mut self) -> Option<Vec<HistoryItem>> {
+        let items = self.history_call(|| {
+            with_items(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        Ok(HistoryItem {
+                            id: item.Id().map_err(winrt("Id"))?.to_string(),
+                            text: item_text(item),
+                        })
+                    })
+                    .collect()
+            })
+        });
+        items.ok().flatten()
+    }
+
+    /// Ids and timestamps only: no entry's text is read, so a look costs one list call.
+    fn history_ids(&mut self) -> Result<Option<Vec<String>>, ClipError> {
+        self.history_call(|| {
+            with_items(|items| {
+                items
+                    .iter()
+                    .map(|item| item.Id().map(|id| id.to_string()))
+                    .collect::<Result<_, _>>()
+                    .map_err(winrt("Id"))
+            })
+        })
+    }
+
+    /// Reads that one entry's text only.
+    fn history_text(&mut self, id: &str) -> Option<String> {
+        let id = id.to_owned();
+        let text = self.history_call(move || {
+            with_items(|items| {
+                let item = items
+                    .iter()
+                    .find(|i| i.Id().is_ok_and(|x| x == id.as_str()));
+                Ok(item.and_then(item_text))
+            })
+        });
+        text.ok().flatten().flatten()
+    }
+
+    fn delete_from_history(&mut self, id: &str) -> Result<(), ClipError> {
+        const FAILED: ClipError = ClipError::Os {
+            call: "DeleteItemFromHistory",
+            code: 0,
+        };
+        let id = id.to_owned();
+        let deleted = self.history_call(move || {
+            with_items(|items| {
+                let item = items
+                    .iter()
+                    .find(|i| i.Id().is_ok_and(|x| x == id.as_str()));
+                match item.map(Winrt::DeleteItemFromHistory) {
+                    Some(Ok(true)) => Ok(()),
+                    Some(Err(e)) => Err(winrt("DeleteItemFromHistory")(e)),
+                    _ => Err(FAILED),
+                }
+            })
+        })?;
+        deleted.ok_or(FAILED)
+    }
+
+    fn now(&self) -> Millis {
+        Millis(u64::try_from(self.born.elapsed().as_millis()).unwrap_or(u64::MAX))
+    }
+
+    fn limit_history_calls(&mut self, limit: Millis) {
+        self.history_limit = limit.min(HISTORY_TIMEOUT);
+    }
+}
+
+impl WinClipboard {
+    /// Runs one history call through [`on_sta`], given up at the time left of the paste's
+    /// budget ([`Clipboard::limit_history_calls`]).
+    fn history_call<R: Send + 'static>(
+        &self,
+        f: impl FnOnce() -> Result<R, ClipError> + Send + 'static,
+    ) -> Result<R, ClipError> {
+        on_sta(&self.history_busy, duration(self.history_limit), f)
+    }
+}
+
+/// A history call that did not answer within its limit (`HRESULT_FROM_WIN32(ERROR_TIMEOUT)`).
+const HISTORY_TIMED_OUT: ClipError = ClipError::Os {
+    call: "WinRT clipboard history",
+    code: 0x8007_05B4,
+};
+
+/// Clears the busy flag when the helper thread ends, also by a panic.
+struct Free(Arc<AtomicBool>);
+
+impl Drop for Free {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Runs `f` on a fresh thread in a single-threaded COM apartment (the `WinRT` clipboard calls
+/// answer `0x8000001D` on a thread without one) and gives up after `limit`: a stalled history
+/// service must not hang the paste worker. A thread that timed out keeps `busy` set until it
+/// returns, and every call meanwhile fails at once instead of stacking another stuck thread.
+/// Every `WinRT` object must be dropped inside `f`: one released after the apartment is gone
+/// crashes.
+fn on_sta<R: Send + 'static>(
+    busy: &Arc<AtomicBool>,
+    limit: Duration,
+    f: impl FnOnce() -> Result<R, ClipError> + Send + 'static,
+) -> Result<R, ClipError> {
+    if busy.swap(true, Ordering::Acquire) {
+        return Err(HISTORY_TIMED_OUT);
+    }
+    let free = Free(Arc::clone(busy));
+    let (tx, rx) = mpsc::channel();
+    // A failed spawn drops the closure, and `free` with it.
+    thread::Builder::new()
+        .name("clipboard-history".into())
+        .spawn(move || {
+            let free = free;
+            // SAFETY: balanced by the `CoUninitialize` below, on this same thread.
+            let init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+            let out = f();
+            if init.is_ok() {
+                // SAFETY: the `CoInitializeEx` above succeeded on this thread.
+                unsafe { CoUninitialize() };
+            }
+            // Freed before the answer, so the caller's next call never finds it still set.
+            drop(free);
+            let _ = tx.send(out);
+        })
+        .map_err(|e| ClipError::Os {
+            call: "spawn clipboard-history thread",
+            code: e.raw_os_error().map_or(0, i32::cast_unsigned),
+        })?;
+    // A panic in `f` disconnects the channel: reported like a timeout.
+    rx.recv_timeout(limit).unwrap_or(Err(HISTORY_TIMED_OUT))
+}
+
+/// Hands `f` the Win+V entries, newest first; `None` when history is off or the call did not
+/// succeed. Must run inside [`on_sta`].
+fn with_items<R>(
+    f: impl FnOnce(&[ClipboardHistoryItem]) -> Result<R, ClipError>,
+) -> Result<Option<R>, ClipError> {
+    if !Winrt::IsHistoryEnabled().map_err(winrt("IsHistoryEnabled"))? {
+        return Ok(None);
+    }
+    let call = winrt("GetHistoryItemsAsync");
+    let result = Winrt::GetHistoryItemsAsync()
+        .and_then(|op| op.join())
+        .map_err(&call)?;
+    if result.Status().map_err(&call)? != ClipboardHistoryItemsResultStatus::Success {
+        return Ok(None);
+    }
+    let mut items: Vec<ClipboardHistoryItem> = result.Items().map_err(&call)?.into_iter().collect();
+    items.sort_by_key(|i| std::cmp::Reverse(i.Timestamp().map_or(0, |t| t.UniversalTime)));
+    f(&items).map(Some)
+}
+
+/// An entry's text, `None` for a non-text entry or one the history cannot render.
+fn item_text(item: &ClipboardHistoryItem) -> Option<String> {
+    let content = item.Content().ok()?;
+    let text = StandardDataFormats::Text().ok()?;
+    if !content.Contains(&text).ok()? {
+        return None;
+    }
+    content
+        .GetTextAsync()
+        .ok()?
+        .join()
+        .ok()
+        .map(|h| h.to_string())
+}
+
+/// A `WinRT` error as the failed call and its HRESULT.
+fn winrt(call: &'static str) -> impl Fn(windows::core::Error) -> ClipError {
+    move |e| ClipError::Os {
+        call,
+        code: e.code().0.cast_unsigned(),
     }
 }
 
@@ -196,6 +398,20 @@ fn carries_exclusion(saved: &[(u32, Vec<u8>)], [monitor, in_history, _]: [u32; 3
         *format == monitor
             || (*format == in_history && bytes.get(..4) != Some(&1u32.to_ne_bytes()[..]))
     })
+}
+
+/// Saved data Win+V never shows: files (Explorer puts `CF_HDROP` and shell formats, no text or
+/// bitmap) or nothing but markers. Anything else may register, however big (Win+V's size limit
+/// is not documented), so a doubt means waiting for the entry, never deleting under it.
+fn history_skips(saved: &[(u32, Vec<u8>)], markers: [u32; 3]) -> bool {
+    let shown = |f: u32| {
+        [CF_UNICODETEXT, CF_TEXT, CF_OEMTEXT, CF_DIB, CF_DIBV5]
+            .iter()
+            .any(|x| u32::from(*x) == f)
+    };
+    let files_only = saved.iter().any(|(f, _)| *f == u32::from(CF_HDROP))
+        && !saved.iter().any(|(f, _)| shown(*f));
+    files_only || saved.iter().all(|(f, _)| markers.contains(f))
 }
 
 /// What the snapshot thread reports: about to block on the clipboard, or finished (closed).
@@ -495,5 +711,228 @@ mod tests {
         for (format, kept, want) in cases {
             assert_eq!(kind(format, kept), want, "format {format:#x} kept {kept:?}");
         }
+    }
+
+    #[test]
+    fn a_stalled_history_call_times_out_and_stacks_no_second_thread() {
+        let busy: Arc<AtomicBool> = Arc::default();
+        let (release, stall) = mpsc::channel::<()>();
+        let started = Instant::now();
+        let stuck = on_sta(&busy, Duration::from_millis(50), move || {
+            let _ = stall.recv();
+            Ok(1)
+        });
+        assert_eq!(stuck, Err(HISTORY_TIMED_OUT));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // Still stuck: the next call fails at once instead of starting another thread.
+        let next = on_sta(&busy, Duration::from_secs(5), || Ok(2));
+        assert_eq!(next, Err(HISTORY_TIMED_OUT));
+        drop(release);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while busy.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(on_sta(&busy, Duration::from_secs(5), || Ok(3)), Ok(3));
+        // A panicking call is an error, and the flag is free again after it.
+        let panicked = on_sta(&busy, Duration::from_secs(5), || -> Result<u8, _> {
+            panic!("helper panics")
+        });
+        assert_eq!(panicked, Err(HISTORY_TIMED_OUT));
+        assert_eq!(on_sta(&busy, Duration::from_secs(5), || Ok(4)), Ok(4));
+    }
+
+    /// Only files are judged never to enter Win+V; a big copy may still register (its measure is
+    /// not documented), so it counts as one to wait for, never as excluded.
+    #[test]
+    fn only_files_are_judged_never_to_enter_history() {
+        let text = |n: usize| (u32::from(CF_UNICODETEXT), vec![0; n]);
+        let files = (u32::from(CF_HDROP), vec![0; 40]);
+        let shell = (0xC100, vec![0; 200]);
+        // PrtScn at 1920x1080, 32-bit: CF_BITMAP only, read back as a synthesised DIB.
+        let screenshot = (u32::from(CF_DIB), vec![0; 40 + 1920 * 1080 * 4]);
+        let cases: [(&str, Vec<Format>, bool); 8] = [
+            ("text", vec![text(10)], false),
+            (
+                "files from Explorer",
+                vec![files.clone(), shell.clone()],
+                true,
+            ),
+            ("files with text", vec![files, text(10)], false),
+            ("text over 4 MB", vec![text(4 << 20)], false),
+            ("big text, small html", vec![text(4 << 20), shell], false),
+            (
+                "big text, markers",
+                vec![(0xC002, vec![1, 0, 0, 0]), text(5 << 20)],
+                false,
+            ),
+            ("PrtScn screenshot", vec![screenshot], false),
+            ("empty", Vec::new(), true),
+        ];
+        for (name, saved, want) in cases {
+            assert_eq!(history_skips(&saved, IDS), want, "{name}");
+        }
+    }
+
+    /// The paste budget is a deadline: each history call waits at most the time left, never
+    /// more than [`HISTORY_TIMEOUT`]. A stalled call is given up at the time left, not at
+    /// [`HISTORY_TIMEOUT`]. No clipboard or Win+V call: the stalled call is a plain closure.
+    #[test]
+    fn history_calls_wait_at_most_the_time_left() {
+        let mut clip = WinClipboard::new().unwrap();
+        assert_eq!(clip.history_limit, HISTORY_TIMEOUT);
+        clip.limit_history_calls(Millis(9000));
+        assert_eq!(clip.history_limit, HISTORY_TIMEOUT);
+        clip.limit_history_calls(Millis(50));
+        let (release, stall) = mpsc::channel::<()>();
+        let started = Instant::now();
+        let stuck = clip.history_call(move || {
+            let _ = stall.recv();
+            Ok(())
+        });
+        let waited = started.elapsed();
+        drop(release);
+        assert_eq!(stuck, Err(HISTORY_TIMED_OUT));
+        assert!(
+            waited < duration(HISTORY_TIMEOUT) / 2,
+            "waited {waited:?}, not the 50 ms left"
+        );
+    }
+
+    /// Runs the real sequence (6 dictations over a user copy) and prints the Win+V order.
+    /// `cargo test -p oxi-platform --lib live_win_v -- --ignored --nocapture`. It overwrites
+    /// the clipboard for a few seconds, puts it back, and deletes the entries it made. It adds
+    /// two entries (its user copy and one dictation), so it refuses a history with less room:
+    /// a full Win+V would push the owner's oldest entries out for good.
+    #[test]
+    #[allow(clippy::too_many_lines, reason = "a linear live script")]
+    #[ignore = "uses this machine's real clipboard and Win+V history"]
+    fn live_win_v_order_after_dictations() {
+        use oxi_core::config::Paste;
+        use oxi_core::hotkey::Key;
+        use oxi_core::paste::{
+            Foreground, HISTORY_CAP, Input, InputBlocked, OurEntries, paste_with,
+        };
+
+        struct Keys;
+        impl Input for Keys {
+            fn modifiers_held(&self) -> bool {
+                false
+            }
+            fn foreground(&self) -> Foreground {
+                Foreground {
+                    app: "notepad.exe".into(),
+                    elevated: false,
+                }
+            }
+            fn send_chord(&mut self, _: &[Key]) -> Result<(), InputBlocked> {
+                Ok(())
+            }
+            fn type_units(&mut self, _: &[u16], _: Millis) -> Result<(), InputBlocked> {
+                Ok(())
+            }
+            fn sleep(&mut self, time: Millis) {
+                sleep(duration(time));
+            }
+        }
+
+        const MINE: &str = "oxi-live";
+        let show = |clip: &mut WinClipboard, label: &str| {
+            let items = clip.history().unwrap();
+            let lines: Vec<String> = items
+                .iter()
+                .take(6)
+                .enumerate()
+                .map(|(i, it)| match &it.text {
+                    Some(t) if t.starts_with(MINE) => format!("{}: {t} [{}]", i + 1, &it.id[..8]),
+                    Some(t) => format!("{}: <other text, {} bytes>", i + 1, t.len()),
+                    None => format!("{}: <non-text>", i + 1),
+                })
+                .collect();
+            println!(
+                "{label} ({} entries):
+  {}",
+                items.len(),
+                lines.join(
+                    "
+  "
+                )
+            );
+        };
+        let mut clip = WinClipboard::new().unwrap();
+        // Refuses before any write when the current clipboard could not be put back whole.
+        let Snap::Complete(original) = clip.snapshot() else {
+            panic!("the current clipboard cannot be saved whole; copy plain text and rerun");
+        };
+        let (seq0, items0) = (clip.sequence(), clip.history().unwrap().len());
+        println!("start: sequence {seq0}, history entries {items0}");
+        assert!(
+            items0 + 2 <= HISTORY_CAP,
+            "Win+V has {items0} entries: clear some so 2 more fit, then rerun"
+        );
+        clip.set_text("oxi-live user copy", true).unwrap();
+        sleep(Duration::from_millis(500));
+        let (mut ours, cfg) = (OurEntries::default(), Paste::default());
+        for n in 1..=6 {
+            let started = Instant::now();
+            let out = paste_with(
+                &format!("oxi-live dictation {n}"),
+                &cfg,
+                &mut clip,
+                &mut Keys,
+                &mut ours,
+            );
+            println!(
+                "dictation {n}: {out:?} in {} ms",
+                started.elapsed().as_millis()
+            );
+            sleep(Duration::from_millis(1000));
+        }
+        show(&mut clip, "Win+V after 6 dictations");
+        let texts: Vec<_> = clip
+            .history()
+            .unwrap()
+            .into_iter()
+            .map(|i| i.text)
+            .collect();
+        let ours = |t: &Option<String>| {
+            t.as_deref()
+                .is_some_and(|t| t.starts_with("oxi-live dictation"))
+        };
+        // The current clipboard, read back through the snapshot path.
+        if let Snap::Complete(Saved(formats)) = clip.snapshot() {
+            let text = formats
+                .iter()
+                .find(|(f, _)| *f == u32::from(CF_UNICODETEXT));
+            let utf16: Vec<u16> = text
+                .map(|(_, b)| {
+                    b.as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|c| u16::from_ne_bytes(*c))
+                        .take_while(|u| *u != 0)
+                        .collect()
+                })
+                .unwrap_or_default();
+            println!("Ctrl+V gives: {}", String::from_utf16_lossy(&utf16));
+        }
+        // Clean up: our entries out of history, the original clipboard back.
+        for it in clip.history().unwrap() {
+            if it.text.as_deref().is_some_and(|t| t.starts_with(MINE)) {
+                clip.delete_from_history(&it.id).unwrap();
+            }
+        }
+        // Outside the history: its own entry is still there.
+        clip.restore(&original, false).unwrap();
+        sleep(Duration::from_millis(500));
+        show(&mut clip, "after clean-up");
+        // After the clean-up, so a failure here leaves nothing behind on this machine.
+        assert_eq!(texts[0].as_deref(), Some("oxi-live dictation 6"));
+        assert_eq!(texts[1].as_deref(), Some("oxi-live user copy"));
+        assert_eq!(
+            texts.len(),
+            items0 + 2,
+            "an entry was pushed out or left behind"
+        );
+        assert_eq!(texts.iter().filter(|t| ours(t)).count(), 1);
     }
 }

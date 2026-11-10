@@ -2,7 +2,7 @@
 //! or empty file loads. Unknown keys are not rejected here; `ConfigFile` keeps them.
 
 use crate::device::DeviceChoice;
-use crate::machine::Mode;
+use crate::machine::{Mode, Sound};
 use crate::sounds::{Builtin, Choice};
 use crate::types::Language;
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,10 @@ pub struct Hotkey {
     /// Key names; "Win" is Cmd on macOS.
     pub chord: Vec<String>,
     pub mode: Mode,
+    /// Esc cancels a recording. Off by default (R2.1).
+    pub esc_cancels: bool,
+    /// What a key that is not part of the chord does while recording.
+    pub other_key: OtherKey,
 }
 
 impl Default for Hotkey {
@@ -37,8 +41,25 @@ impl Default for Hotkey {
         Self {
             chord: vec!["Ctrl".into(), "Win".into()],
             mode: Mode::Push,
+            esc_cancels: false,
+            other_key: OtherKey::Auto,
         }
     }
+}
+
+/// `hotkey.other_key`: a key outside the chord always reaches the system; this says whether it
+/// also cancels the recording (R2.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OtherKey {
+    /// No speech yet (VAD): the key is a shortcut and the recording is cancelled quietly.
+    /// Speech already heard: the recording goes on.
+    #[default]
+    Auto,
+    /// Never cancels.
+    Never,
+    /// Always cancels.
+    Always,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -248,16 +269,24 @@ pub struct Sounds {
     pub enabled: bool,
     /// 0 to 1.
     pub volume: f64,
-    /// A built-in id (`Builtin::id`) or the path of a `.wav` file.
+    /// A built-in id (`Builtin::id`) or the path of a `.wav` or `.ogg` file. Same for the
+    /// other sound keys below.
     pub start: String,
     pub stop: String,
+    /// Played when the text is ready and pasted; on by default.
+    pub done_enabled: bool,
+    pub done: String,
+    /// Played when a recording is cancelled.
+    pub cancel: String,
+    /// Played on an error; `boop-3` is the built-in error sound (`fault` in older files).
+    pub error: String,
 }
 
 impl Sounds {
     pub const VOLUME: RangeInclusive<f64> = 0.0..=1.0;
 
-    /// Puts `volume` back in range (NaN becomes the default) and a `start` or `stop` that is
-    /// neither a built-in id nor a `.wav` path back to its default, and says so.
+    /// Puts `volume` back in range (NaN becomes the default) and a sound that is neither a
+    /// built-in id nor a `.wav` or `.ogg` path back to its default, and says so.
     pub(crate) fn normalise(&mut self) -> Vec<String> {
         let mut said = Vec::new();
         let default = Self::default();
@@ -273,13 +302,16 @@ impl Sounds {
                 self.volume
             ));
         }
-        for (key, value, fallback) in [
-            ("start", &mut self.start, default.start),
-            ("stop", &mut self.stop, default.stop),
+        for (key, role, value, fallback) in [
+            ("start", Sound::Start, &mut self.start, default.start),
+            ("stop", Sound::Stop, &mut self.stop, default.stop),
+            ("done", Sound::Done, &mut self.done, default.done),
+            ("cancel", Sound::Cancel, &mut self.cancel, default.cancel),
+            ("error", Sound::Error, &mut self.error, default.error),
         ] {
-            if Choice::parse(value).is_err() {
+            if Choice::parse_for(role, value).is_err() {
                 said.push(format!(
-                    "sounds.{key} = \"{value}\" is not a built-in sound or a .wav path, using {fallback}"
+                    "sounds.{key} = \"{value}\" is not a built-in sound or a .wav or .ogg path, using {fallback}"
                 ));
                 *value = fallback;
             }
@@ -293,8 +325,12 @@ impl Default for Sounds {
         Self {
             enabled: true,
             volume: 0.5,
-            start: Builtin::Rise.id().into(),
-            stop: Builtin::Fall.id().into(),
+            start: Builtin::ApaHit3.id().into(),
+            stop: Builtin::ApaHit2.id().into(),
+            done_enabled: true,
+            done: Builtin::Rx25.id().into(),
+            cancel: Builtin::CancelSoft.id().into(),
+            error: Builtin::Boop3.id().into(),
         }
     }
 }
@@ -302,6 +338,7 @@ impl Default for Sounds {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct History {
+    /// On by default (R1.3); a file with an explicit value keeps it.
     pub enabled: bool,
     /// Size cap of the folder; the oldest entries go first. 0 means no cap.
     pub max_bytes: u64,
@@ -315,7 +352,7 @@ pub struct History {
 impl Default for History {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             max_bytes: 2_147_483_648,
             max_days: 30,
             folder: String::new(),
@@ -378,7 +415,57 @@ pub struct Ui {
 
 #[cfg(test)]
 mod tests {
-    use super::{PasteMode, PasteRule};
+    use super::{Config, Hotkey, OtherKey, PasteMode, PasteRule};
+
+    #[test]
+    fn an_old_file_gets_the_new_defaults() {
+        let c: Config = toml::from_str(
+            "[hotkey]\nchord = [\"Ctrl\"]\n[sounds]\nstart = \"pop\"\n[history]\nmax_days = 7\n",
+        )
+        .unwrap();
+        assert!(!c.hotkey.esc_cancels);
+        assert_eq!(c.hotkey.other_key, OtherKey::Auto);
+        assert!(c.history.enabled);
+        assert_eq!(c.history.max_days, 7);
+        assert!(c.sounds.done_enabled);
+        assert_eq!(c.sounds.done, "rx-25");
+        assert_eq!(c.sounds.cancel, "cancel-soft");
+        assert_eq!(c.sounds.error, "boop-3");
+        let off: Config = toml::from_str("[history]\nenabled = false\n").unwrap();
+        assert!(!off.history.enabled);
+    }
+
+    #[test]
+    fn explicit_values_survive_a_round_trip() {
+        let mut c = Config::default();
+        c.hotkey.esc_cancels = true;
+        c.history.enabled = false;
+        c.sounds.done_enabled = false;
+        c.sounds.done = "tick".into();
+        c.sounds.cancel = r"C:\Sounds\no.ogg".into();
+        c.sounds.error = "beep.OGG".into();
+        for other in [OtherKey::Auto, OtherKey::Never, OtherKey::Always] {
+            c.hotkey.other_key = other;
+            let text = toml::to_string(&c).unwrap();
+            let back: Config = toml::from_str(&text).unwrap();
+            assert_eq!(back, c);
+        }
+        assert_eq!(c.sounds.normalise(), Vec::<String>::new());
+        let hotkey = Hotkey::default();
+        assert!(!hotkey.esc_cancels && hotkey.other_key == OtherKey::Auto);
+    }
+
+    #[test]
+    fn bad_sound_values_fall_back() {
+        let mut c = Config::default();
+        c.sounds.done = "nope".into();
+        c.sounds.cancel = "fault".into();
+        assert_eq!(c.sounds.normalise().len(), 2);
+        assert_eq!(
+            (c.sounds.done.as_str(), c.sounds.cancel.as_str()),
+            ("rx-25", "cancel-soft")
+        );
+    }
 
     #[test]
     fn rule_keys_name_every_field() {

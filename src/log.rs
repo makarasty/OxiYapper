@@ -109,7 +109,10 @@ pub fn text_for_log(text: &str, log_text: bool) -> Cow<'_, str> {
 }
 
 #[cfg(test)]
+pub(crate) mod scratch; // temp folders for the tests of the whole binary
+#[cfg(test)]
 mod tests {
+    use super::scratch::scratch_dir;
     use super::*;
 
     #[test]
@@ -136,9 +139,7 @@ mod tests {
 
     #[test]
     fn files_are_written_and_flushed_on_guard_drop() {
-        let dir = std::env::temp_dir().join(format!("oxi-log-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir(&format!("oxi-log-{}", std::process::id()));
         let guard = init(&dir);
         tracing::info!("hello from the log test");
         drop(guard);

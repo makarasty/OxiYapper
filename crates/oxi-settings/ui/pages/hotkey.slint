@@ -1,6 +1,6 @@
 // Hotkey page (SPEC Recording, Settings UI): the chord as keycaps and an edit button, which opens
 // the full keyboard (click keys or press them, held keys light up); then the mode.
-import { Theme, Shell, Icons, Caption, Group, Card, Row, KeycapRow, TilePicker, Button, ButtonKind } from "../theme/index.slint";
+import { Theme, Shell, Icons, Caption, Group, Card, Row, Divider, ToggleRow, Combo, KeycapRow, TilePicker, Button, ButtonKind, IconButton } from "../theme/index.slint";
 import { WarningSlot } from "../theme/components/feedback.slint";
 import { Keyboard, KeyCap } from "../keyboard.slint";
 
@@ -11,6 +11,10 @@ export global HotkeyState {
     in property <[string]> chord-keys;
     // 0 push-to-talk, 1 toggle.
     in property <int> mode;
+    // `hotkey.other_key`: 0 auto, 1 never cancel, 2 always cancel.
+    in-out property <int> other-key;
+    // `hotkey.esc_cancels`.
+    in-out property <bool> esc-cancels;
     in property <bool> keyboard-open;
     // The daemon link is up: without it no key is captured and Apply is off.
     in property <bool> online;
@@ -36,6 +40,8 @@ export global HotkeyState {
     callback apply();
     callback cancel();
     callback mode-picked(int);
+    callback other-key-picked(int);
+    callback esc-cancels-toggled(bool);
 }
 
 export component HotkeyPage inherits VerticalLayout {
@@ -57,7 +63,7 @@ export component HotkeyPage inherits VerticalLayout {
             Row {
                 icon: Icons.keyboard;
                 title: @tr("Keys");
-                description: @tr("Hold these keys to talk. Esc cancels a recording.");
+                description: HotkeyState.esc-cancels ? @tr("Hold these keys to talk. Esc cancels a recording.") : @tr("Hold these keys to talk.");
                 Rectangle {
                     preferred-width: chord.preferred-width;
                     chord := KeycapRow {
@@ -74,14 +80,18 @@ export component HotkeyPage inherits VerticalLayout {
                         }
                     }
                 }
-                Button {
-                    kind: ButtonKind.icon;
-                    icon: Icons.edit-16;
-                    text: @tr("Change hotkey");
-                    enabled: !Shell.locked && !HotkeyState.keyboard-open;
-                    tooltip: HotkeyState.keyboard-open ? @tr("The keyboard is open below") : Shell.locked-tip;
-                    clicked => {
-                        HotkeyState.change();
+                // Row tops its controls in a row taller than 32 (the caption makes this one 35): centre
+                // it on the keycaps (DS-3.4).
+                VerticalLayout {
+                    alignment: center;
+                    IconButton {
+                        icon: Icons.edit-16;
+                        label: @tr("Change hotkey");
+                        enabled: !Shell.locked && !HotkeyState.keyboard-open;
+                        tooltip: HotkeyState.keyboard-open ? @tr("The keyboard is open below") : Shell.locked-tip;
+                        clicked => {
+                            HotkeyState.change();
+                        }
                     }
                 }
             }
@@ -187,6 +197,31 @@ export component HotkeyPage inherits VerticalLayout {
             selected: HotkeyState.mode;
             picked(i) => {
                 HotkeyState.mode-picked(i);
+            }
+        }
+        // Gives way to the open keyboard like the tiles: the page must not scroll (UI rule 25).
+        if !HotkeyState.keyboard-open: Card {
+            Row {
+                title: @tr("Another key while holding");
+                info: @tr("The key always reaches the app. Auto cancels only if you have not spoken yet.");
+                fill-controls: true;
+                Combo {
+                    model: [@tr("Auto"), @tr("Never cancel"), @tr("Always cancel")];
+                    current-index <=> HotkeyState.other-key;
+                    accessible-label: @tr("Another key while holding");
+                    selected => {
+                        HotkeyState.other-key-picked(self.current-index);
+                    }
+                }
+            }
+            Divider { }
+            ToggleRow {
+                flat: true;
+                title: @tr("Esc cancels a recording");
+                checked <=> HotkeyState.esc-cancels;
+                toggled(on) => {
+                    HotkeyState.esc-cancels-toggled(on);
+                }
             }
         }
     }

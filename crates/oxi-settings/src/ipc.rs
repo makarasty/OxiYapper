@@ -12,7 +12,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use oxi_core::ipc::{PROTO, Push, Request};
+use oxi_core::ipc::{Attention, PROTO, Push, Request, Target};
 use oxi_core::strings;
 use oxi_platform::ipc::{Client, Error, default_name};
 
@@ -84,6 +84,56 @@ pub enum Cmd {
     Start,
     /// Send `Shutdown`, wait for the old daemon to close, then spawn a new one.
     Restart,
+}
+
+/// How far the daemon is from doing its job, for the status chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    /// Nothing to do; the chip has no hover and no click.
+    Ok,
+    /// Dictation works or can be fixed in a click: the chip leads to `Chip::target`.
+    Attention,
+    /// The daemon cannot be reached.
+    Down,
+}
+
+/// The one status the window shows: what it says, how it looks and where a click goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chip {
+    pub text: &'static str,
+    pub level: Level,
+    /// Hover text with the reason and the fix; empty at [`Level::Ok`] and [`Level::Down`], where
+    /// the banner has the words.
+    pub tooltip: String,
+    /// The page (and tab) that fixes it; `None` when nothing in the settings does.
+    pub target: Option<Target>,
+}
+
+/// The chip for `link` and the daemon's last `Attention` list. A daemon that does not answer
+/// shows no attention: what it told us last is stale.
+#[must_use]
+pub fn chip(link: Link, attention: &[Attention]) -> Chip {
+    let (text, level) = match link {
+        Link::Online | Link::Mismatch { .. } => (strings::HEALTH_RUNNING, Level::Ok),
+        Link::Connecting | Link::Offline => (strings::HEALTH_NOT_RUNNING, Level::Down),
+        Link::Busy | Link::Stuck | Link::Untrusted | Link::Foreign => {
+            (strings::HEALTH_NOT_ANSWERING, Level::Down)
+        }
+    };
+    match (level, attention.first()) {
+        (Level::Ok, Some(first)) => Chip {
+            text: strings::attention_chip(first),
+            level: Level::Attention,
+            tooltip: strings::attention_text(first),
+            target: Some(first.target()),
+        },
+        _ => Chip {
+            text,
+            level,
+            tooltip: String::new(),
+            target: None,
+        },
+    }
 }
 
 /// A banner text and the button that goes with it.
@@ -454,6 +504,8 @@ struct Inner {
     subs: RefCell<Vec<(u64, Subscriber)>>,
     next_sub: Cell<u64>,
     link: Cell<Link>,
+    /// The last `Push::Attention`; cleared when the link is not up.
+    attention: RefCell<Vec<Attention>>,
 }
 
 /// Keeps an [`Ipc::subscribe`] callback alive; dropping it unsubscribes.
@@ -527,6 +579,12 @@ impl Ipc {
         self.0.link.get()
     }
 
+    /// The status chip now: the link, then the daemon's last `Attention` list.
+    #[must_use]
+    pub fn chip(&self) -> Chip {
+        chip(self.link(), &self.0.attention.borrow())
+    }
+
     /// Calls `f` for every event from now on, on the UI thread, until the returned
     /// [`Subscription`] is dropped. Read [`Ipc::link`] for the state before the call.
     pub fn subscribe(&self, f: impl Fn(&Event) + 'static) -> Subscription {
@@ -545,8 +603,17 @@ impl Ipc {
     }
 
     pub fn deliver(&self, event: &Event) {
-        if let Event::Link(link) = event {
-            self.0.link.set(*link);
+        match event {
+            Event::Link(link) => {
+                self.0.link.set(*link);
+                if *link != Link::Online {
+                    self.0.attention.borrow_mut().clear();
+                }
+            }
+            Event::Push(Push::Attention { items }) => {
+                self.0.attention.borrow_mut().clone_from(items);
+            }
+            Event::Push(_) => {}
         }
         // A copy: a callback may subscribe or drop a subscription.
         let subs: Vec<Subscriber> = self
@@ -613,6 +680,62 @@ mod tests {
         let n = notice(&Event::Link(Link::Untrusted)).unwrap();
         assert!(n.text.contains("untrusted") && n.action.is_none());
         assert!(notice(&Event::Link(Link::Online)).is_none());
+    }
+
+    #[test]
+    fn each_link_and_attention_gives_one_chip() {
+        let none: [Attention; 0] = [];
+        let table = [
+            (Link::Online, strings::HEALTH_RUNNING, Level::Ok),
+            (Link::Mismatch { daemon_proto: 1 }, strings::HEALTH_RUNNING, Level::Ok),
+            (Link::Offline, strings::HEALTH_NOT_RUNNING, Level::Down),
+            (Link::Connecting, strings::HEALTH_NOT_RUNNING, Level::Down),
+            (Link::Busy, strings::HEALTH_NOT_ANSWERING, Level::Down),
+            (Link::Stuck, strings::HEALTH_NOT_ANSWERING, Level::Down),
+            (Link::Untrusted, strings::HEALTH_NOT_ANSWERING, Level::Down),
+            (Link::Foreign, strings::HEALTH_NOT_ANSWERING, Level::Down),
+        ];
+        for (link, text, level) in table {
+            let c = chip(link, &none);
+            assert_eq!((c.text, c.level, c.target), (text, level, None), "{link:?}");
+            assert!(c.tooltip.is_empty());
+        }
+    }
+
+    #[test]
+    fn attention_leads_the_chip_to_its_page_only_while_the_daemon_answers() {
+        use oxi_core::ipc::{SettingsPage, SettingsTab};
+        let items = [Attention::NoMicrophone, Attention::NoModel];
+        let c = chip(Link::Online, &items);
+        assert_eq!(c.text, "No microphone");
+        assert_eq!(c.level, Level::Attention);
+        let target = c.target.unwrap();
+        assert_eq!(
+            (target.page, target.tab),
+            (SettingsPage::Audio, Some(SettingsTab::Microphone))
+        );
+        assert!(!c.tooltip.is_empty());
+        // The list is stale once the daemon is gone.
+        assert_eq!(chip(Link::Offline, &items).text, strings::HEALTH_NOT_RUNNING);
+        assert_eq!(chip(Link::Busy, &items).target, None);
+    }
+
+    #[test]
+    fn the_window_keeps_the_last_attention_until_the_link_drops() {
+        let (ipc, _rx) = Ipc::fake();
+        assert_eq!(ipc.chip().text, strings::HEALTH_RUNNING);
+        ipc.deliver(&Event::Push(Push::Attention {
+            items: vec![Attention::ModelDamaged],
+        }));
+        assert_eq!(ipc.chip().text, "Model damaged");
+        ipc.deliver(&Event::Push(Push::Attention { items: vec![] }));
+        assert_eq!(ipc.chip().text, strings::HEALTH_RUNNING);
+        ipc.deliver(&Event::Push(Push::Attention {
+            items: vec![Attention::NoModel],
+        }));
+        ipc.deliver(&Event::Link(Link::Offline));
+        ipc.deliver(&Event::Link(Link::Online));
+        assert_eq!(ipc.chip().text, strings::HEALTH_RUNNING, "cleared by the drop");
     }
 
     #[test]

@@ -12,19 +12,28 @@ use std::time::{Duration, Instant};
 use oxi_core::audio::{self, AudioError};
 use oxi_core::config::{Audio, Config};
 use oxi_core::device::DeviceChoice;
-use oxi_core::ipc::{Push, TestFailure, TestOutcome};
+use oxi_core::ipc::{DeleteResult, Push, TestFailure, TestOutcome};
 use oxi_core::machine::{
-    EngineWarning, Event, MachineConfig, ModelFailure, ModelIdentity, Phase, PhaseCell,
+    EngineWarning, Event, JobId, MachineConfig, ModelFailure, ModelIdentity, Phase, PhaseCell,
 };
+use oxi_core::models;
 use oxi_core::paths::Layout;
 use oxi_core::strings;
 use oxi_core::text::Outcome;
 use oxi_core::tuning::SettingsSet;
 use oxi_core::types::Language;
-use oxi_whisper::{Engine, LoadInfo, Transcript};
+use oxi_whisper::{Cancel, Engine, LoadInfo, Transcript};
 
 use super::cmd::{Inbox, TestJob, WhisperCmd};
+use super::io;
+use super::ipc::Pushes;
 use crate::pipeline::{self, TextAssets};
+
+/// What a run reports and obeys: whisper's progress, and a check that stops it.
+struct Hooks<'a> {
+    progress: &'a mut dyn FnMut(u8),
+    cancel: Option<&'a Cancel>,
+}
 
 /// One loaded model; [`Engine`] in the daemon, a fake in the tests.
 trait Recognizer {
@@ -34,7 +43,36 @@ trait Recognizer {
         samples: &[f32],
         language: Language,
         prompt: &str,
+        hooks: Hooks<'_>,
     ) -> anyhow::Result<Transcript>;
+}
+
+/// Where the progress of the run in hand goes.
+#[derive(Clone)]
+enum Tap {
+    None,
+    /// A dictation: to the coordinator, and the run stops when every job is cancelled.
+    Job(JobId),
+    /// A recognition test: to the settings window as `TestProgress`.
+    Test {
+        id: u32,
+        reply: Pushes,
+    },
+}
+
+/// The failure a failed model load is: memory, or a model that cannot be used.
+fn load_failure(e: &anyhow::Error) -> ModelFailure {
+    match e.downcast_ref::<oxi_whisper::Error>() {
+        Some(oxi_whisper::Error::OutOfMemory) => ModelFailure::OutOfMemory,
+        _ => ModelFailure::Bad,
+    }
+}
+
+fn was_cancelled(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<oxi_whisper::Error>(),
+        Some(oxi_whisper::Error::Cancelled)
+    )
 }
 
 impl Recognizer for Engine {
@@ -47,8 +85,16 @@ impl Recognizer for Engine {
         samples: &[f32],
         language: Language,
         prompt: &str,
+        hooks: Hooks<'_>,
     ) -> anyhow::Result<Transcript> {
-        Ok(Engine::transcribe(self, samples, language, prompt)?)
+        Ok(Engine::transcribe_with(
+            self,
+            samples,
+            language,
+            prompt,
+            Some(hooks.progress),
+            hooks.cancel,
+        )?)
     }
 }
 
@@ -101,6 +147,8 @@ struct Worker<R, L> {
     cpu_reason: Option<String>,
     /// The last `Inbox::EngineWarning` sent.
     reported: Option<EngineWarning>,
+    /// Where the progress of the running job or test goes.
+    tap: Tap,
 }
 
 impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<R, L> {
@@ -120,6 +168,7 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
             quiet: false,
             cpu_reason: None,
             reported: None,
+            tap: Tap::None,
         }
     }
 
@@ -152,6 +201,10 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
                 let _ = self.inbox.send(Inbox::Event(event));
             }
             WhisperCmd::Unload => self.unload(),
+            WhisperCmd::DeleteModel { id, reply } => {
+                let result = self.delete_model(&id);
+                reply.send(Push::ModelDeleted { id, result });
+            }
             WhisperCmd::Test(job) => {
                 let TestJob {
                     id,
@@ -161,7 +214,13 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
                     reply,
                 } = job;
                 let outcome = if self.phase.load() == Phase::Idle {
-                    self.test(&samples, &set, language)
+                    self.tap = Tap::Test {
+                        id,
+                        reply: reply.clone(),
+                    };
+                    let outcome = self.test(&samples, &set, language);
+                    self.tap = Tap::None;
+                    outcome
                 } else {
                     TestOutcome::Failed {
                         why: TestFailure::Busy,
@@ -176,7 +235,22 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
                 }
             }
             WhisperCmd::Transcribe { job, samples } => {
-                let text = self.transcribe(&samples).unwrap_or_else(|failure| {
+                self.tap = Tap::Job(job);
+                let started = Instant::now();
+                let text = self.transcribe(&samples);
+                self.tap = Tap::None;
+                // Lengths only, never the text (AGENTS.md rule 5).
+                let audio_ms = oxi_core::stats::audio_length(samples.len()).0;
+                let took_ms = started.elapsed().as_millis();
+                match &text {
+                    Ok(Some(t)) => {
+                        let chars = t.chars().count();
+                        tracing::info!(?job, audio_ms, took_ms, chars, "transcription done");
+                    }
+                    Ok(None) => tracing::info!(?job, took_ms, "transcription failed or cut"),
+                    Err(why) => tracing::info!(?job, ?why, "transcription had no model"),
+                }
+                let text = text.unwrap_or_else(|failure| {
                     // First, so the machine leaves Loaded before this job ends: the jobs queued
                     // behind it are not dispatched to a model that is not there, one notice.
                     let _ = self.inbox.send(Inbox::Event(Event::ModelFailed(failure)));
@@ -196,6 +270,28 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
             }
             WhisperCmd::ReloadAssets => self.assets = TextAssets::load(&self.layout),
         }
+    }
+
+    /// Deletes the files of registry model `id`. A model this worker holds is unloaded first,
+    /// so its file is not open; the coordinator refused the request while a job runs.
+    fn delete_model(&mut self, id: &str) -> DeleteResult {
+        let Some(entry) = models::find(id) else {
+            return DeleteResult::Failed {
+                message: "unknown model".into(),
+            };
+        };
+        if self.loaded_for.as_ref().is_some_and(|i| i.file == id) {
+            self.unload();
+        }
+        let result = io::delete_model(&self.layout.models_dir(), entry);
+        if matches!(result, DeleteResult::Done { .. }) && self.cfg.model.id == id {
+            // The machine still counts the model as loaded: without this a dictation records,
+            // then fails after the release instead of being refused at chord-down.
+            let _ = self
+                .inbox
+                .send(Inbox::Event(Event::ModelFailed(ModelFailure::Missing)));
+        }
+        result
     }
 
     fn unload(&mut self) {
@@ -279,6 +375,7 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
             why: match failure {
                 ModelFailure::Missing => TestFailure::ModelMissing,
                 ModelFailure::Bad => TestFailure::ModelBad,
+                ModelFailure::OutOfMemory => TestFailure::Failed,
             },
         };
         if let Err(failure) = self.ensure_loaded(None) {
@@ -335,12 +432,12 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
                 reason = Some(e.to_string());
                 (self.load)(&model.path, &DeviceChoice::Cpu).map_err(|e| {
                     tracing::warn!("model load on CPU failed: {e:#}");
-                    ModelFailure::Bad
+                    load_failure(&e)
                 })?
             }
             Err(e) => {
                 tracing::warn!("model load failed: {e:#}");
-                return Err(ModelFailure::Bad);
+                return Err(load_failure(&e));
             }
         };
         let info = engine.info();
@@ -395,6 +492,7 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
         self.ensure_loaded(None)?;
         let transcript = match self.run(samples) {
             Ok(t) => t,
+            Err(e) if was_cancelled(&e) => return Ok(None),
             Err(e) => {
                 let on_gpu = self
                     .loaded
@@ -432,7 +530,26 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
             .loaded
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("no model loaded"))?;
-        engine.transcribe(samples, self.cfg.model.language, &self.assets.prompt)
+        let tap = self.tap.clone();
+        let inbox = self.inbox.clone();
+        let phase = self.phase.clone();
+        let mut progress = |percent: u8| match &tap {
+            Tap::None => {}
+            Tap::Job(job) => {
+                let _ = inbox.send(Inbox::Progress { job: *job, percent });
+            }
+            Tap::Test { id, reply } => {
+                reply.send(Push::TestProgress { id: *id, percent });
+            }
+        };
+        // Every job cancelled leaves the phase Idle; a test only runs while it is Idle already.
+        let is_job = matches!(self.tap, Tap::Job(_));
+        let cancel = move || is_job && phase.load() == Phase::Idle;
+        let hooks = Hooks {
+            progress: &mut progress,
+            cancel: Some(&cancel),
+        };
+        engine.transcribe(samples, self.cfg.model.language, &self.assets.prompt, hooks)
     }
 }
 
@@ -451,6 +568,7 @@ mod tests {
     use oxi_whisper::Segment;
 
     use super::*;
+    use crate::log::scratch::scratch_dir;
 
     /// What a fake load was asked for, and what its engine does.
     #[derive(Clone)]
@@ -464,6 +582,8 @@ mod tests {
         gpu_load_fails: bool,
         /// Loads on CPU fail.
         cpu_load_fails: bool,
+        /// Loads on CPU fail the way whisper says memory ran out.
+        cpu_oom: bool,
         /// `LoadInfo.warning` of a GPU engine (a named device gone).
         load_warning: Option<EngineWarning>,
         /// The first transcription on a GPU engine fails.
@@ -487,7 +607,17 @@ mod tests {
         fn info(&self) -> &LoadInfo {
             &self.info
         }
-        fn transcribe(&mut self, _: &[f32], _: Language, _: &str) -> anyhow::Result<Transcript> {
+        fn transcribe(
+            &mut self,
+            _: &[f32],
+            _: Language,
+            _: &str,
+            hooks: Hooks<'_>,
+        ) -> anyhow::Result<Transcript> {
+            (hooks.progress)(40);
+            if hooks.cancel.is_some_and(|cancel| cancel()) {
+                return Err(oxi_whisper::Error::Cancelled.into());
+            }
             if self.fail_run && self.gpu {
                 anyhow::bail!("device lost");
             }
@@ -508,6 +638,7 @@ mod tests {
                 calls: Rc::default(),
                 gpu_load_fails: false,
                 cpu_load_fails: false,
+                cpu_oom: false,
                 load_warning: None,
                 gpu_run_fails: false,
                 silent_cpu: false,
@@ -521,6 +652,9 @@ mod tests {
                 s.calls.borrow_mut().push(choice.clone());
                 let asked_gpu = *choice != DeviceChoice::Cpu;
                 let cpu = !asked_gpu || s.silent_cpu || s.no_gpu;
+                if cpu && s.cpu_oom {
+                    return Err(oxi_whisper::Error::OutOfMemory.into());
+                }
                 if !cpu && s.gpu_load_fails || cpu && s.cpu_load_fails {
                     anyhow::bail!("out of memory");
                 }
@@ -556,8 +690,7 @@ mod tests {
     }
 
     fn rig(name: &str) -> Rig {
-        let dir = std::env::temp_dir().join(format!("oxi-whisper-{}-{name}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir(&format!("oxi-whisper-{}-{name}", std::process::id()));
         let model = dir.join("mine.bin");
         fs::write(&model, b"x").unwrap();
         Rig { dir, model }
@@ -594,10 +727,14 @@ mod tests {
         (Worker::new(script.loader(), tx, rig.layout(), phase), rx)
     }
 
-    /// The next message that is not an `EngineWarning` or a `Backend`.
+    /// The next message that is not an `EngineWarning`, a `Backend` or a `Progress`.
     fn next(rx: &Receiver<Inbox>) -> Option<Inbox> {
-        rx.try_iter()
-            .find(|m| !matches!(m, Inbox::EngineWarning(_) | Inbox::Backend(_)))
+        rx.try_iter().find(|m| {
+            !matches!(
+                m,
+                Inbox::EngineWarning(_) | Inbox::Backend(_) | Inbox::Progress { .. }
+            )
+        })
     }
 
     fn event(rx: &Receiver<Inbox>) -> Event {
@@ -624,11 +761,109 @@ mod tests {
             .collect()
     }
 
+    /// A dictation job as the daemon runs it: the machine is Transcribing (Idle means every job
+    /// was cancelled, which stops the run).
     fn job(w: &mut TestWorker) {
+        w.phase.store(Phase::Transcribing);
         w.handle(WhisperCmd::Transcribe {
             job: JobId(1),
             samples: vec![0.0; 16],
         });
+    }
+
+    #[test]
+    fn a_cpu_load_that_ran_out_of_memory_is_not_a_damaged_model() {
+        let (r, mut s) = (rig("cpuoom"), Script::new());
+        (s.gpu_load_fails, s.cpu_oom) = (true, true);
+        let (mut w, rx) = worker(&s, &r);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Auto)));
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(event(&rx), Event::ModelFailed(ModelFailure::OutOfMemory));
+        // CPU only, no GPU to retry from.
+        let (r2, mut s2) = (rig("cpuoom2"), Script::new());
+        s2.cpu_oom = true;
+        let (mut w2, rx2) = worker(&s2, &r2);
+        w2.handle(WhisperCmd::Config(r2.cfg(DeviceChoice::Cpu)));
+        w2.handle(WhisperCmd::Preload);
+        assert_eq!(event(&rx2), Event::ModelFailed(ModelFailure::OutOfMemory));
+    }
+
+    #[test]
+    fn a_dictation_reports_whispers_progress_and_stops_when_cancelled() {
+        let (r, s) = (rig("progress"), Script::new());
+        let (mut w, rx) = worker(&s, &r);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        job(&mut w);
+        let seen: Vec<_> = rx.try_iter().collect();
+        assert!(
+            seen.iter().any(|m| matches!(
+                m,
+                Inbox::Progress {
+                    job: JobId(1),
+                    percent: 40
+                }
+            )),
+            "progress reaches the coordinator"
+        );
+        assert!(
+            seen.iter()
+                .any(|m| matches!(m, Inbox::Transcribed { text: Some(_), .. }))
+        );
+        // Every job cancelled (the machine is Idle): the run stops, no text, no GPU retry.
+        w.phase.store(Phase::Idle);
+        w.handle(WhisperCmd::Transcribe {
+            job: JobId(2),
+            samples: vec![0.0; 16],
+        });
+        assert_eq!(text(&rx), None);
+        assert_eq!(s.calls().len(), 1, "no reload after a cancel");
+    }
+
+    #[test]
+    fn a_test_run_reports_progress_to_the_window() {
+        let (r, s) = (rig("testprogress"), Script::new());
+        let (mut w, _rx) = worker(&s, &r);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        let pushes = Pushes::default();
+        let (_, window) = pushes.claim(0);
+        w.handle(test_job(&pushes, "custom"));
+        let got: Vec<_> = window.try_iter().collect();
+        assert_eq!(got[0], Push::TestProgress { id: 9, percent: 40 });
+        assert!(matches!(got[1], Push::TestResult { id: 9, .. }));
+    }
+
+    #[test]
+    fn delete_model_unloads_what_is_loaded_and_removes_its_files() {
+        let (r, s) = (rig("delete"), Script::new());
+        let (mut w, rx) = worker(&s, &r);
+        let mut cfg = Config::default();
+        cfg.model.id = "tiny".into();
+        w.handle(WhisperCmd::Config(Box::new(cfg)));
+        let dir = r.layout().models_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let entry = models::find("tiny").unwrap();
+        fs::write(dir.join(entry.file_name), [0; 6]).unwrap();
+        w.loaded = Some(Fake {
+            gpu: false,
+            info: LoadInfo {
+                device: None,
+                warning: None,
+            },
+            fail_run: false,
+        });
+        w.loaded_for = Some(w.identity());
+        assert_eq!(w.delete_model("tiny"), DeleteResult::Done { freed: 6 });
+        assert!(w.loaded.is_none(), "unloaded first");
+        assert!(!dir.join(entry.file_name).exists());
+        // The active model is gone: the machine hears it, so chord-down refuses at once.
+        assert_eq!(event(&rx), Event::ModelFailed(ModelFailure::Missing));
+        assert!(matches!(
+            w.delete_model("nonsense"),
+            DeleteResult::Failed { .. }
+        ));
+        // Another model's files: the active one is untouched, nothing to tell.
+        assert_eq!(w.delete_model("turbo"), DeleteResult::Done { freed: 0 });
+        assert!(next(&rx).is_none());
     }
 
     #[test]
@@ -915,7 +1150,7 @@ mod tests {
     }
 
     /// An audible second of raw samples and a set that runs the rig's custom model.
-    fn test_job(reply: &super::super::ipc::Pushes, model: &str) -> WhisperCmd {
+    fn test_job(reply: &Pushes, model: &str) -> WhisperCmd {
         WhisperCmd::Test(TestJob {
             id: 9,
             set: SettingsSet {
@@ -931,8 +1166,11 @@ mod tests {
     }
 
     fn outcome(rx: &Receiver<Push>) -> TestOutcome {
-        match rx.try_recv() {
-            Ok(Push::TestResult { id: 9, outcome }) => outcome,
+        match rx
+            .try_iter()
+            .find(|p| !matches!(p, Push::TestProgress { .. }))
+        {
+            Some(Push::TestResult { id: 9, outcome }) => outcome,
             _ => panic!("expected TestResult"),
         }
     }
@@ -941,7 +1179,7 @@ mod tests {
     fn test_answers_final_text_and_done_drops_only_a_model_it_loaded() {
         let (r, s) = (rig("testrun"), Script::new());
         let (mut w, _inbox) = worker(&s, &r);
-        let pushes = super::super::ipc::Pushes::default();
+        let pushes = Pushes::default();
         let (_, rx) = pushes.claim(1);
         w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
         w.handle(test_job(&pushes, "custom"));
@@ -964,7 +1202,7 @@ mod tests {
     fn test_with_a_missing_model_is_an_answer_not_a_machine_event() {
         let (r, s) = (rig("testmissing"), Script::new());
         let (mut w, inbox) = worker(&s, &r);
-        let pushes = super::super::ipc::Pushes::default();
+        let pushes = Pushes::default();
         let (_, rx) = pushes.claim(1);
         w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
         w.handle(test_job(&pushes, "tiny"));
@@ -982,7 +1220,7 @@ mod tests {
     fn empty_recording_is_no_audio() {
         let (r, s) = (rig("testempty"), Script::new());
         let (mut w, _inbox) = worker(&s, &r);
-        let pushes = super::super::ipc::Pushes::default();
+        let pushes = Pushes::default();
         let (_, rx) = pushes.claim(1);
         let WhisperCmd::Test(mut job) = test_job(&pushes, "custom") else {
             unreachable!()
@@ -1003,7 +1241,7 @@ mod tests {
         let (r, mut s) = (rig("testpin"), Script::new());
         s.gpu_load_fails = true;
         let (mut w, _inbox) = worker(&s, &r);
-        let pushes = super::super::ipc::Pushes::default();
+        let pushes = Pushes::default();
         let (_, rx) = pushes.claim(1);
         let mut cfg = r.cfg(DeviceChoice::Auto);
         cfg.model.id = "tiny".into();
@@ -1023,7 +1261,7 @@ mod tests {
     fn a_test_queued_before_a_dictation_answers_busy_and_loads_nothing() {
         let (r, s) = (rig("testbusy"), Script::new());
         let (mut w, _inbox) = worker(&s, &r);
-        let pushes = super::super::ipc::Pushes::default();
+        let pushes = Pushes::default();
         let (_, rx) = pushes.claim(1);
         w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
         w.phase.store(Phase::Recording);
@@ -1041,7 +1279,7 @@ mod tests {
     fn a_dictation_reloads_a_test_model_whose_device_or_file_changed() {
         let (r, s) = (rig("testadopt"), Script::new());
         let (mut w, _inbox) = worker(&s, &r);
-        let pushes = super::super::ipc::Pushes::default();
+        let pushes = Pushes::default();
         let (_, rx) = pushes.claim(1);
         w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Auto)));
         w.handle(test_job(&pushes, "custom"));
@@ -1091,7 +1329,7 @@ mod tests {
         let (r, mut s) = (rig("testquiet"), Script::new());
         s.gpu_load_fails = true;
         let (mut w, inbox) = worker(&s, &r);
-        let pushes = super::super::ipc::Pushes::default();
+        let pushes = Pushes::default();
         let (_, rx) = pushes.claim(1);
         let mut cfg = r.cfg(DeviceChoice::Auto);
         cfg.model.id = "tiny".into();
@@ -1126,7 +1364,7 @@ mod tests {
     fn a_test_of_the_configured_model_still_reports_its_device() {
         let (r, s) = (rig("testloud"), Script::new());
         let (mut w, inbox) = worker(&s, &r);
-        let pushes = super::super::ipc::Pushes::default();
+        let pushes = Pushes::default();
         let (_, rx) = pushes.claim(1);
         w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Auto)));
         w.handle(test_job(&pushes, "custom"));
@@ -1138,7 +1376,7 @@ mod tests {
     fn a_test_only_model_goes_after_the_idle_limit() {
         let (r, s) = (rig("testidle"), Script::new());
         let (mut w, _inbox) = worker(&s, &r);
-        let pushes = super::super::ipc::Pushes::default();
+        let pushes = Pushes::default();
         let (_, rx) = pushes.claim(1);
         let (tx, cmds) = channel();
         w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));

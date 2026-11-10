@@ -12,15 +12,16 @@ use crate::{AppWindow, Page};
 #[path = "../tests/common/elements.rs"]
 mod elements;
 pub use elements::{assert_nothing_moved, has, spots, with_role};
+#[path = "../tests/common/scratch.rs"]
+mod scratch;
+pub use scratch::{fake_model, scratch_dir};
 
-/// A fresh config directory per `module` and test `name`.
+/// A fresh config directory per `module` and test `name`, removed when the test ends.
 pub fn layout(module: &str, name: &str) -> Layout {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = scratch_dir(&format!(
         "oxi-settings-unit-{}-{module}-{name}",
         std::process::id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
     Layout {
         config_dir: dir.clone(),
         data_dir: dir.clone(),

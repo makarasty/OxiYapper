@@ -9,12 +9,14 @@ use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak as RcWeak};
 use std::time::Duration;
 
+use oxi_core::config::OtherKey;
 use oxi_core::hotkey::{Chord, ChordError, Key};
 use oxi_core::ipc::{Push, Request};
 use oxi_core::machine::Mode;
 use oxi_core::strings;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
+use crate::debounce::SaveDebounce;
 use crate::generated::{HotkeyState, KeyCap};
 use crate::ipc::{Event, Link, Subscription};
 use crate::{AppWindow, Ctx, Page, report};
@@ -24,11 +26,19 @@ use crate::{AppWindow, Ctx, Page, report};
 // board, so leaving the page is polled while capturing; use the callback once the shell has one.
 const WATCH: Duration = Duration::from_millis(100);
 
+/// `hotkey.other_key` by the index of its Combo item.
+const OTHER_KEYS: [OtherKey; 3] = [OtherKey::Auto, OtherKey::Never, OtherKey::Always];
+
 pub fn bind(window: &AppWindow, ctx: &Ctx) {
     let s = window.global::<HotkeyState>();
     let file = ctx.config.borrow();
     set_saved_chord(&s, &file.config.hotkey.chord);
     s.set_mode(i32::from(file.config.hotkey.mode == Mode::Toggle));
+    s.set_esc_cancels(file.config.hotkey.esc_cancels);
+    let other = OTHER_KEYS
+        .iter()
+        .position(|&k| k == file.config.hotkey.other_key);
+    s.set_other_key(other.and_then(|i| i32::try_from(i).ok()).unwrap_or(0));
     drop(file);
     s.set_columns(keyboard_layout::WIDTH);
     s.set_rows(keyboard_layout::HEIGHT);
@@ -103,6 +113,20 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
             window.global::<HotkeyState>().set_mode(i);
         }
         report(&w, c.save());
+    });
+    let (w, c) = (window.as_weak(), ctx.clone());
+    s.on_esc_cancels_toggled(move |on| {
+        c.config.borrow_mut().config.hotkey.esc_cancels = on;
+        report(&w, c.save());
+    });
+    let c = ctx.clone();
+    // Arrowing through the Combo picks on every step: save once it rests.
+    let save = SaveDebounce::new(window.as_weak(), ctx.clone());
+    s.on_other_key_picked(move |i| {
+        if let Some(&k) = usize::try_from(i).ok().and_then(|i| OTHER_KEYS.get(i)) {
+            c.config.borrow_mut().config.hotkey.other_key = k;
+            save.touch();
+        }
     });
 }
 
@@ -552,11 +576,11 @@ mod tests {
         let middle = cap(1120.0);
         let large = cap(1600.0);
         let huge = cap(2400.0);
-        // A cap is the unit less its gap: 28 px units give 25 px caps, 43.7 (the widest window,
-        // 1280) give 40.2, 52 give 47.8.
+        // A cap is the unit less its gap: 28 px units give 25 px caps, 44.39 (the widest window,
+        // 1280) give 40.8, 52 give 47.8.
         assert!((small - 25.0).abs() < 0.01, "720: {small}");
         assert!(
-            (default_size - 43.7 * 0.92).abs() < 0.5,
+            (default_size - 44.39 * 0.92).abs() < 0.5,
             "1280: {default_size}"
         );
         assert!((32.0..36.0).contains(&middle), "1120: {middle}");

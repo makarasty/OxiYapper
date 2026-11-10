@@ -8,7 +8,7 @@
 //!   std::io::Result<JoinHandle<()>>` (a named `thread::Builder`). It handles commands in order
 //!   and returns when `rx` closes, which happens when the coordinator ends. Extra arguments are
 //!   the worker's own: audio the shared `LevelMeter`, whisper the `Layout` and the `PhaseCell`,
-//!   io a sender for IPC pushes.
+//!   io a sender for IPC pushes. io answers `Inbox::ModelDownloaded` for each finished download.
 //! - What each worker answers: audio `Inbox::JobAudio`, or `Event::JobAudioEmpty`, for
 //!   `Stop(job)`, plus `Inbox::Capture` with `Event::DeviceLost`, `CaptureFailed` or
 //!   `MicFellBack`; whisper `Event::ModelLoaded` or `ModelFailed` for
@@ -22,16 +22,21 @@
 //!
 //! Types that carry dictated text have no `Debug`, so the text cannot reach a log by `{:?}`.
 
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
 use oxi_core::config::{
     Audio, Config, ConfigError, History, Hotkey, Overlay, OverlayPosition, Paste, Sounds,
 };
 use oxi_core::device::DeviceChoice;
-use oxi_core::machine::{EngineWarning, Event, JobId, Notice, OverlayState, Phase, Sound};
+use oxi_core::ipc::SoundWarning;
+use oxi_core::machine::{
+    EngineWarning, Event, JobId, ModelFailure, Notice, OverlayState, Phase, Sound,
+};
 use oxi_core::tray::TrayBadge;
 use oxi_core::tuning::SettingsSet;
 use oxi_core::types::Language;
+use oxi_platform::os::overlay::Progress;
 
 use super::ipc::Pushes;
 
@@ -39,8 +44,14 @@ use super::ipc::Pushes;
 pub enum Inbox {
     /// Hook, worker and session events, fed straight into the state machine.
     Event(Event),
-    /// Audio worker: the trimmed 16 kHz mono samples of a stopped job, never empty.
-    JobAudio { job: JobId, samples: Vec<f32> },
+    /// Audio worker: the trimmed 16 kHz mono samples of a stopped job, never empty, and its raw
+    /// recording streamed to the history folder (`None` while saving is off). The spool goes
+    /// with the job to its `HistoryCmd::Save`, or to `history::no_transcript`.
+    JobAudio {
+        job: JobId,
+        samples: Vec<f32>,
+        spool: Option<PathBuf>,
+    },
     /// Audio worker: an event of the capture opened by `AudioCmd::Start { session }`. The
     /// coordinator drops it once a later capture started, so a stale `DeviceLost` cannot stop
     /// the next recording.
@@ -51,11 +62,16 @@ pub enum Inbox {
     /// Whisper worker: why the model runs elsewhere than configured; `None` once it runs as
     /// configured again or no model is loaded.
     EngineWarning(Option<EngineWarning>),
+    /// Whisper worker: how far the transcription of `job` is, 0 to 100.
+    Progress { job: JobId, percent: u8 },
+    /// IO worker: registry model `id` is on disk now; a load that failed for it may work.
+    ModelDownloaded(String),
     /// Whisper worker: the device a model load ended up on (`LoadInfo.device`, `cpu` for none).
     Backend(String),
-    /// Sound worker: why a configured sound is not used (a custom file that cannot be read), one
-    /// line each; empty once every sound plays as configured. Dictation goes on with the default.
-    SoundWarnings(Vec<String>),
+    /// Sound worker: why a sound did not play, opened slowly or is not used (a custom file that
+    /// cannot be read), each with its kind; empty once every sound plays as configured.
+    /// Dictation goes on with the default.
+    SoundWarnings(Vec<SoundWarning>),
     /// History worker: why dictations are not saved (a write or clean-up error); `None` once a
     /// save or clean-up worked again. Never carries the text.
     HistoryWarning(Option<String>),
@@ -89,6 +105,9 @@ pub enum IpcAsk {
     Test(TestJob),
     /// The settings connection that ran tests closed.
     TestDone,
+    /// `DeleteModel { id }`: refused while a dictation or test runs, else the whisper worker
+    /// unloads that model if it holds it and deletes its files; the answer goes out on `reply`.
+    DeleteModel { id: String, reply: Pushes },
 }
 
 /// One recognition test run. `samples` live in memory only. No `Debug`, like every type that
@@ -114,8 +133,13 @@ pub struct StatusReport {
     pub gpu: DeviceChoice,
     /// Device of the last model load (`cpu` after a fallback); `none` before the first load.
     pub backend: String,
+    /// Why the last model load failed; `None` once a load worked. The files alone cannot say:
+    /// a file of the right size can still be corrupt.
+    pub model_failure: Option<ModelFailure>,
     /// Load corrections of the active config, the engine warning, then the last parse error.
     pub warnings: Vec<String>,
+    /// The sound worker's warnings, typed; their lines are in `warnings` too.
+    pub sounds: Vec<SoundWarning>,
 }
 
 /// Commands for the audio worker.
@@ -137,6 +161,9 @@ pub enum WhisperCmd {
     Preload,
     /// Drop the context (idle unload, sleep).
     Unload,
+    /// Delete the files of registry model `id` (unloading it first when it is the loaded one)
+    /// and push `ModelDeleted` on `reply`.
+    DeleteModel { id: String, reply: Pushes },
     /// Transcribe and answer `Inbox::Transcribed`.
     Transcribe { job: JobId, samples: Vec<f32> },
     /// Recognition test: run one set, answer `Push::TestResult`, write nothing to disk. A run
@@ -181,11 +208,14 @@ pub enum HistoryCmd {
     /// The active `[history]`: applies the retention limits to the folder now, saving on or off.
     Config(History),
     /// Save one dictation as `<stem>.wav` and `<stem>.txt` in the configured folder, then apply
-    /// the retention limits. Nothing is written when `cfg.enabled` is false.
+    /// the retention limits. Nothing is written when `cfg.enabled` is false. `spool` is the job's
+    /// streamed recording (`Inbox::JobAudio`): the entry takes its name, or it is deleted when
+    /// saving is off.
     Save {
         samples: Vec<f32>,
         text: String,
         cfg: History,
+        spool: Option<PathBuf>,
     },
 }
 
@@ -245,4 +275,6 @@ pub struct Workers {
     pub ui: Sender<UiCmd>,
     /// Wakes the UI loop after each `UiCmd` (Windows: `PostMessage(WM_APP)`).
     pub wake_ui: Box<dyn Fn() + Send>,
+    /// Whisper's percent for the overlay pill, which reads it each frame.
+    pub progress: Progress,
 }

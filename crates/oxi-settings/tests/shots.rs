@@ -769,7 +769,7 @@ fn sub_tab(window: &AppWindow, label: &str) {
     common::with_role(window, label, AccessibleRole::Tab).invoke_accessible_default_action();
 }
 
-/// The start-sound sub-tab: the built-in sounds and an own file with a long name.
+/// The Sounds sub-tab on the start sound: the built-in sounds and an own file with a long name.
 #[test]
 fn shot_audio_sounds() {
     const OWN: &str = "version = 1
@@ -780,7 +780,7 @@ start = 'C:\\Sounds\\a very long own file name that does not fit its tile at all
         let window = open("audio-sounds", Some(OWN));
         window.set_page(Page::Audio);
         window.set_theme(choice);
-        sub_tab(&window, "Start sound");
+        sub_tab(&window, "Sounds");
         window
     });
 }
@@ -828,10 +828,7 @@ fn shot_model_weak() {
         |l| {
             let dir = l.models_dir();
             fs::create_dir_all(&dir).unwrap();
-            fs::File::create(dir.join("ggml-large-v3.bin.part"))
-                .unwrap()
-                .set_len(1_200_000_000)
-                .unwrap();
+            common::fake_model(&dir.join("ggml-large-v3.bin.part"), 1_200_000_000);
         },
         |ipc| {
             push(
@@ -847,7 +844,6 @@ fn shot_model_weak() {
             );
         },
     );
-    fs::remove_dir_all(common::layout("model-weak", None).config_dir).unwrap();
 }
 
 /// A model page on a fake daemon link: `prepare` fills the layout, `drive` pushes what the daemon
@@ -946,7 +942,7 @@ fn shot_model_downloaded() {
                 ("ggml-large-v3-russian-ties-podlodka-v1.2-f16.bin", 1000),
             ] {
                 let file = dir.join(name);
-                fs::File::create(&file).unwrap().set_len(size).unwrap();
+                common::fake_model(&file, size);
                 if name.ends_with("turbo.bin") {
                     oxi_core::models::write_stamp(&file).unwrap();
                 }
@@ -954,8 +950,6 @@ fn shot_model_downloaded() {
         },
         |_| {},
     );
-    // The sparse model files are GBs in size: layout() recreates this shot's dir, then drop it.
-    fs::remove_dir_all(common::layout("model-downloaded", None).config_dir).unwrap();
 }
 
 #[test]

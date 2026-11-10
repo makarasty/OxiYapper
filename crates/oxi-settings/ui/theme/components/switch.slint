@@ -2,7 +2,7 @@
 import { Theme, Shell } from "../tokens.slint";
 import { FocusRing, KeyFocus } from "base.slint";
 
-// 40x20 track with the Fluent "On"/"Off" caption on its left. `locked` (read-only config) and
+// 40x20 track (one knob size, no scale) with the Fluent "On"/"Off" caption on its left. `locked` (read-only config) and
 // `enabled` both grey it out.
 export component Switch {
     in-out property <bool> checked;
@@ -50,27 +50,31 @@ export component Switch {
             color: root.live ? Theme.text-secondary : Theme.text-disabled;
             vertical-alignment: center;
             horizontal-alignment: right;
-            min-width: 24px;
+            min-width: Theme.switch-caption-width;
             accessible-role: none;
         }
-        VerticalLayout {
-            alignment: center;
+        // The track sits (32 - 20) / 2 = 6 px from the box's top and bottom (DS-10.1).
+        Rectangle {
+            width: Theme.switch-track-width;
             track := Rectangle {
-                width: 40px;
-                height: 20px;
+                y: Theme.whole((root.height - self.height) / 2);
+                width: Theme.switch-track-width;
+                height: Theme.switch-track-height;
                 border-radius: Theme.radius-round;
-                background: root.checked ? root.ink : transparent;
+                background: root.checked ? (root.down ? Theme.accent-pressed : root.hover ? Theme.accent-hover : root.ink) : root.down ? Theme.bg-subtle-selected : root.hover ? Theme.bg-subtle-hover : transparent;
+                // 1 px hairline: the off track's outline.
                 border-width: root.checked ? 0 : 1px;
                 border-color: root.ink;
-                // Knob: 12 px, 14 on hover, 17x14 while pressed.
+                animate background, border-color { duration: Theme.motion-quick; easing: ease-out; }
+                // One size in every state: only its place and colour change (DS-5.4).
                 knob := Rectangle {
-                    width: root.down ? 17px : root.hover ? 14px : 12px;
-                    height: root.down || root.hover ? 14px : 12px;
+                    width: Theme.switch-knob;
+                    height: Theme.switch-knob;
                     border-radius: Theme.radius-round;
-                    x: root.checked ? parent.width - self.width - 4px : 4px;
+                    x: root.checked ? parent.width - self.width - Theme.switch-knob-inset : Theme.switch-knob-inset;
                     y: (parent.height - self.height) / 2;
                     background: root.checked ? (root.live ? Theme.on-accent : Theme.bg-card) : root.ink;
-                    animate x, width { duration: Theme.motion-quick; easing: ease-out; }
+                    animate x, background { duration: Theme.motion-quick; easing: ease-out; }
                 }
                 FocusRing {
                     shown: root.force-focus || root.key-focused;
@@ -79,8 +83,11 @@ export component Switch {
             }
         }
     }
+    // Exposed for the gallery's geometry readout: the track's top inside the box.
+    out property <length> track-y: track.y;
     touch := TouchArea {
         enabled: root.live;
+        mouse-cursor: pointer;
         clicked => {
             root.toggle();
         }
@@ -107,17 +114,19 @@ export component Radio {
     in property <bool> checked;
     in property <bool> enabled: true;
     in property <bool> hover;
-    width: 16px;
-    height: 16px;
+    width: Theme.radio-size;
+    height: Theme.radio-size;
     accessible-role: none;
     Rectangle {
         border-radius: Theme.radius-round;
         background: root.checked ? (root.enabled ? Theme.accent : Theme.text-disabled) : root.hover && root.enabled ? Theme.bg-subtle-hover : transparent;
+        // 1 px hairline: the empty radio's outline.
         border-width: root.checked ? 0 : 1px;
         border-color: root.enabled ? Theme.text-secondary : Theme.text-disabled;
+        animate background { duration: Theme.motion-quick; easing: ease-out; }
         Rectangle {
             visible: root.checked;
-            width: root.hover && root.enabled ? 8px : 6px;
+            width: Theme.radio-dot;
             height: self.width;
             border-radius: Theme.radius-round;
             background: Theme.on-accent;

@@ -7,11 +7,12 @@ use oxi_core::constants::HOUR;
 use oxi_core::models::PART_KEEP;
 use oxi_platform::fs::{list_partials, sweep_partials, write_atomic};
 
+#[path = "../src/scratch.rs"]
+mod scratch_guard;
+use scratch_guard::scratch_dir;
+
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("oxi-fs-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    scratch_dir(&format!("oxi-fs-{name}-{}", std::process::id()))
 }
 
 fn names(dir: &Path) -> Vec<String> {

@@ -28,9 +28,9 @@ export global Theme {
     //   space-2 (8): between siblings in one row (icon to text, button to button, segments),
     //                tooltip padding across
     //   space-3 (12): card padding on the vertical, control to its note
-    //   space-4 (16): card padding on the horizontal, icon to the row text, page padding narrow
-    //   space-6 (24): page padding, below the page title, between unrelated blocks in one card
-    //   space-8 (32): between groups
+    //   space-4 (16): card padding on the horizontal, icon to the row text, page padding
+    //   space-6 (24): between groups, between unrelated blocks in one card
+    //   space-8 (32): large empty-state and gallery breathing room
     // The fixed uses below name those steps for one job each; a page reads the named one.
     out property <length> space-1: 4px;
     out property <length> space-2: 8px;
@@ -39,11 +39,17 @@ export global Theme {
     out property <length> space-6: 24px;
     out property <length> space-8: 32px;
     // Fixed uses; no other gaps.
-    out property <length> page-padding: 24px;
-    out property <length> page-padding-narrow: 16px;
+    out property <length> page-padding: 16px;
+    out property <length> page-padding-narrow: 12px;
+    // The page title goes away with R2.4 (HeaderRow); app.slint reads these until its task lands.
     out property <length> title-top: 28px;
     out property <length> title-bottom: 24px;
-    out property <length> group-gap: 32px;
+    out property <length> group-gap: 24px;
+    // The header row (DS-14): as high as a rail item, 12 px from its tab line to the first card.
+    out property <length> header-row-height: self.rail-item-height;
+    out property <length> header-bottom: 12px;
+    // Icon to its label in any icon+label pair: buttons, stat titles, chips, the status dot.
+    out property <length> pair-gap: 8px;
     out property <length> header-gap: 8px;
     out property <length> card-gap: 4px;
     out property <length> card-padding-h: 16px;
@@ -56,9 +62,77 @@ export global Theme {
     out property <length> control-height: 32px;
     out property <length> control-column-min: 240px;
     out property <length> control-column-max: 360px;
-    // Icon boxes: the 20 px master (rows, banners, rail) and the 16 px one (notes, small buttons).
+    // Icon boxes: the 20 px master (rows, banners, rail), the 16 px one (buttons, fields, tips)
+    // and the 32 px one (tiles, empty states).
     out property <length> icon-size: 20px;
     out property <length> icon-size-small: 16px;
+    out property <length> icon-size-large: 32px;
+    // 1.1b Component geometry (DS-6 to DS-18): one job each, so components hold no px.
+    out property <length> button-min-width: 88px;
+    out property <length> number-field-width: 80px;
+    // A field's own clear "x" or chevron: its square hover box.
+    out property <length> adornment-size: 24px;
+    out property <length> switch-track-width: 40px;
+    out property <length> switch-track-height: 20px;
+    // Switch knob: one size in every state (no scale, DS-5.4); hover and pressed change colour.
+    out property <length> switch-knob: 12px;
+    out property <length> switch-knob-inset: 4px;
+    // The "On"/"Off" caption keeps this width, so the track does not move when it flips.
+    out property <length> switch-caption-width: 24px;
+    out property <length> status-dot-size: 8px;
+    out property <length> badge-height: 20px;
+    // Radio dot and its selected centre (one size in every state).
+    out property <length> radio-size: 16px;
+    out property <length> radio-dot: 6px;
+    // The check badge of a selected tile and its glyph.
+    out property <length> check-badge-size: 20px;
+    out property <length> check-glyph-size: 12px;
+    // Slider: thumb and its dot (one size in every state), the rail.
+    out property <length> slider-thumb: 20px;
+    out property <length> slider-dot: 12px;
+    out property <length> rail-height: 4px;
+    out property <length> slider-min-width: 120px;
+    // Segmented: the inset around and between segments, and a segment's least width.
+    out property <length> segment-inset: 2px;
+    out property <length> segment-min-width: 44px;
+    // Sub-tabs: the label's padding above and below (with the 1 px tab line, the bar is
+    // `header-row-height`), the count gap, the underline.
+    out property <length> tab-padding-top: 8px;
+    out property <length> tab-padding-bottom: 12px;
+    out property <length> tab-count-gap: 6px;
+    out property <length> tab-underline: 3px;
+    // Meter: track height, bar width and pitch, the least width.
+    out property <length> meter-height: 24px;
+    out property <length> meter-bar: 3px;
+    out property <length> meter-pitch: 5px;
+    out property <length> meter-min-width: 120px;
+    out property <length> progress-min-width: 80px;
+    // The widest a tooltip line runs before it wraps.
+    out property <length> tooltip-max-width: 320px;
+    // Banner: least width, and the width under which its text goes above the buttons.
+    out property <length> banner-min-width: 280px;
+    out property <length> banner-narrow: 560px;
+    // A row's least height without and with a description.
+    out property <length> row-min-height: 24px;
+    out property <length> keycap-width: 44px;
+    // The fallback min width of a Combo outside a Row (the Per-app mode column sets its own).
+    out property <length> combo-min-width: 160px;
+    // How many rows an open Combo shows before it scrolls.
+    out property <int> combo-visible-rows: 6;
+    // Scrollbar (DS-18): thumb width and the gutter content leaves while it overflows.
+    out property <length> scrollbar-width: 6px;
+    out property <length> scrollbar-gutter: 12px;
+    out property <length> scrollbar-min-thumb: 24px;
+    // Card grid (DS-15): the narrowest column.
+    out property <length> tile-min-width: 160px;
+    // Home heatmap and trend defaults (the page passes its own).
+    out property <length> heat-cell-default: 12px;
+    out property <length> heat-gap: 3px;
+    out property <length> heat-label-width: 32px;
+    out property <length> heat-top: 20px;
+    out property <length> trend-max-pitch: 21px;
+    // A body line's box (Slint 1.18 has no line height): the stat card label lines.
+    out property <length> body-line: 20px;
     // Sizes and breakpoints with one job each (UI rule 7).
     out property <length> narrow-window: 900px;
     // The shell (app.slint): the window's least, first and largest size (SPEC Settings UI), the
@@ -68,8 +142,6 @@ export global Theme {
     out property <length> window-min-height: 520px;
     out property <length> window-first-width: 1280px;
     out property <length> window-first-height: 800px;
-    out property <length> window-max-width: 1280px;
-    out property <length> window-max-height: 860px;
     out property <length> compact-window: 960px;
     out property <length> rail-width: 220px;
     out property <length> rail-width-compact: 56px;
@@ -77,6 +149,8 @@ export global Theme {
     out property <length> rail-pill-width: 3px;
     out property <length> rail-pill-height: 16px;
     out property <length> focus-ring-width: 2px;
+    // The ring's gap outside the control (DS-4.1); the ring's outer radius is radius + offset + width.
+    out property <length> focus-ring-offset: 2px;
     out property <length> stat-card-one-line: 172px;
     // A picker tile's height, and System's General tab in a low window (UI rule 25).
     out property <length> tile-height: 104px;
@@ -98,7 +172,12 @@ export global Theme {
     out property <length> hotkey-tight-height: 480px;
     out property <length> hotkey-open-chrome: 300px;
     out property <length> hotkey-tight-chrome: 190px;
-    out property <length> heat-cell-max: 18px;
+    // Home heatmap cells: the size the shown weeks are fitted at (a wider card shows more weeks, up
+    // to a year), the cap for a history shorter than a year, and the cap in a low window. A full
+    // year (`heat-year-weeks`, oxi-core's HEAT_WEEKS) has no cap: it fills the card at any width.
+    out property <length> heat-cell-fit: 18px;
+    out property <length> heat-cell-max: 30px;
+    out property <int> heat-year-weeks: 53;
     out property <length> heat-cell-tight: 14px;
     out property <length> capture-keycap-height: 40px;
     out property <length> editor-min-height: 120px;
@@ -111,9 +190,9 @@ export global Theme {
     public pure function whole(l: length) -> length {
         return round(l / 1px) * 1px;
     }
-    // The Home heatmap's cell in whole pixels: fills `room` up to 18 px (a taller grid outweighs the four numbers).
+    // The Home heatmap's cell in whole pixels: fills `room`, up to `heat-cell-max` short of a year.
     public pure function heat-cell(room: length, weeks: int, gap: length) -> length {
-        return min(self.heat-cell-max, floor(room / weeks / 1px - gap / 1px) * 1px);
+        return weeks >= self.heat-year-weeks ? floor(room / weeks / 1px - gap / 1px) * 1px : min(self.heat-cell-max, floor(room / weeks / 1px - gap / 1px) * 1px);
     }
 
     // 1.2 Radii (UI rules 12 to 14): low, from here only; no square corner but window edges,
@@ -148,43 +227,47 @@ export global Theme {
     out property <length> title-size: 28px;
     out property <int> weight-strong: 600;
 
-    // 1.4 Neutrals and roles.
-    // The light branch is the dawn palette (owner, 2026-11-08): the mockup's hues at 5/7 of their
-    // chroma, and fills and hairlines lifted toward white as far as #F4EDDF to #F6F1E7 is. Status
-    // and accent inks keep the mockup's values, so their hue still says what they mean.
-    out property <color> bg-page: dark ? #202020 : #F6F1E7;
-    out property <color> bg-card: dark ? #2B2B2B : #FCF8F1;
-    out property <color> bg-control: dark ? #2F2F2F : #FFFDF8;
-    out property <color> bg-control-hover: dark ? #353535 : #F8F3E9;
-    out property <color> bg-control-pressed: dark ? #2A2A2A : #F1EBDF;
-    // Pressed fill for whole-card buttons: bg-control-pressed equals the dark card, so it needs its own step.
-    out property <color> bg-card-pressed: dark ? #222222 : #F1EBDF;
-    out property <color> bg-subtle-hover: dark ? #FFFFFF0F : #3428120A;
-    out property <color> bg-subtle-selected: dark ? #FFFFFF14 : #3428120F;
-    out property <color> bg-inset: dark ? #FFFFFF1A : #34281214;
-    out property <color> stroke-card: dark ? #1D1D1D : #EBE5D9;
-    out property <color> stroke-control: dark ? #3A3A3A : #D2CBBB;
-    out property <color> stroke-control-bottom: dark ? #454545 : #B4AB98;
-    out property <color> stroke-keycap: dark ? #5A5A5A : #8A8275;
-    out property <color> divider: dark ? #353535 : #EEE8DC;
-    out property <color> text-primary: dark ? #FFFFFF : #211C13;
-    out property <color> text-secondary: dark ? #C5C5C5 : #5B5348;
-    out property <color> text-disabled: dark ? #787878 : #A0998C;
-    out property <color> focus-outer: dark ? #FFFFFF : #211C13;
-    out property <color> focus-inner: dark ? #000000 : #FFFDF8;
+    // 1.4 Neutrals and roles: concept C "white minimal" (owner's pick, 2026-11-10, DESIGN-SYSTEM
+    // section 19): ink on paper, neutral steps only. Colour lives here alone, so a later colour
+    // theme replaces these values and touches no page or component (DS-19.3).
+    out property <color> bg-page: dark ? #161616 : #F7F5F0;
+    out property <color> bg-card: dark ? #1F1F1F : #FCFBF8;
+    out property <color> bg-control: dark ? #262626 : #FFFEFB;
+    out property <color> bg-control-hover: dark ? #2C2C2C : #F8F6F2;
+    out property <color> bg-control-pressed: dark ? #222222 : #F1EEE8;
+    // Pressed fill for whole-card buttons: a step under the card in both themes.
+    out property <color> bg-card-pressed: dark ? #1A1A1A : #F1EEE8;
+    out property <color> bg-subtle-hover: dark ? #FFFFFF0F : #1C1B190A;
+    out property <color> bg-subtle-selected: dark ? #FFFFFF14 : #1C1B190F;
+    out property <color> bg-inset: dark ? #FFFFFF1A : #1C1B1914;
+    out property <color> stroke-card: dark ? #2F2F2F : #E6E2DA;
+    out property <color> stroke-control: dark ? #383838 : #D3CEC4;
+    out property <color> stroke-control-bottom: dark ? #444444 : #B5AFA4;
+    out property <color> stroke-keycap: dark ? #5A5A5A : #8A857C;
+    out property <color> divider: dark ? #2A2A2A : #EAE7E0;
+    out property <color> text-primary: dark ? #F4F2EE : #1C1B19;
+    out property <color> text-secondary: dark ? #B5B1AA : #5C5850;
+    out property <color> text-disabled: dark ? #75726D : #A39F97;
+    // The one keyboard-focus ring (DS-4): the ink softened to the secondary text, never white or
+    // black; 3:1 or more on every surface. `focus-outer` is the old name app.slint's rail still
+    // reads (its task moves it to `focus-ring`); `focus-inner` draws nothing.
+    out property <color> focus-ring: dark ? #B5B1AA : #5C5850;
+    out property <color> focus-outer: self.focus-ring;
+    out property <color> focus-inner: transparent;
 
-    // Accent: own teal, never the Windows accent.
-    out property <color> accent: dark ? #4FD1C5 : #0F766E;
-    out property <color> accent-hover: dark ? #5EEAD4 : #0E6F68;
-    out property <color> accent-pressed: dark ? #3BBFB3 : #115E59;
-    out property <color> on-accent: dark ? #0B1F1D : #FFFFFF;
-    out property <color> accent-text: dark ? #4FD1C5 : #0F766E;
-    // Opaque: a translucent #0F766E1F over the card fails AA under accent-text; #EAF2ED gives
-    // 4.80:1. Tiles sit only on cards.
-    out property <color> accent-tint: dark ? #314644 : #EAF2ED;
-    // Badge fills, opaque so the pair holds on bg-card and on a hovered card (bg-control-hover):
-    // the old 14 % alpha tints gave 4.31:1 (success) and 4.35:1 (accent) in light.
-    out property <color> accent-badge: dark ? #304441 : #E9F1EC;
+    // Accent: the ink itself (DS-19.1), never the Windows accent. Hover and pressed step toward
+    // the paper; on-accent is the paper.
+    out property <color> accent: dark ? #F4F2EE : #1C1B19;
+    out property <color> accent-hover: dark ? #FFFEFA : #34322E;
+    out property <color> accent-pressed: dark ? #D9D6D0 : #4A4740;
+    out property <color> on-accent: dark ? #161616 : #FCFBF8;
+    out property <color> accent-text: dark ? #F4F2EE : #1C1B19;
+    // Selected fills: neutral steps, opaque, so accent-text keeps AA on a card and a hovered card.
+    // Concept C has one neutral step for both (its "badge").
+    out property <color> accent-badge: dark ? #2E2E2E : #ECE9E2;
+    out property <color> accent-tint: self.accent-badge;
+    // Red means "recording now" only (DS-19.2): the record dot and live states. Errors use error-*.
+    out property <color> recording: #E5484D;
 
     // Status.
     out property <color> error-text: dark ? #FF99A4 : #B9291A;
@@ -195,7 +278,20 @@ export global Theme {
     out property <color> warning-fill: dark ? #433519 : #FAEFD5;
     out property <color> success-text: dark ? #6CCB5F : #0F7B0F;
     out property <color> success-tint: dark ? #2F3F2F : #EAF2E5;
-    out property <color> info-fill: dark ? #323232 : #F4EFE6;
+    out property <color> info-fill: dark ? #292929 : #F2F0EB;
+
+    // Brand inks of the About "Built with" marks: the project's own colour where it has one (Rust,
+    // Slint, Claude), else a hue of its own. The same in both themes, each 3:1 or more on its 10 %
+    // tinted box in both.
+    out property <color> brand-rust: #CE422B;
+    out property <color> brand-slint: #2379F4;
+    out property <color> brand-whisper-cpp: #E0457B;
+    out property <color> brand-whisper-rs: #27894F;
+    out property <color> brand-nnnoiseless: #0C8693;
+    out property <color> brand-cpal: #A06E00;
+    out property <color> brand-phosphor: #6A8501;
+    out property <color> brand-claude: #C15F3C;
+    out property <color> brand-tiny-skia: #5468D4;
 
     // 1.5 Motion (UI rules 21 to 23): short and calm, never waited for, 0 under
     // `Shell.reduced-motion`. `motion-quick` is a state change inside a control (knob, thumb,

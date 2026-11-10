@@ -1,12 +1,16 @@
-// About page: the hero with the project links, what the app is built with, the author and the
-// "Made with Slint" badge (SPEC Settings UI). The browser opens every link; the app makes no request.
+// About page: the hero with the project links, what the app is built with and the author. The Slint
+// tile opens the std "Made with Slint" badge (SPEC Settings UI, R2.3). The browser opens every link;
+// the app makes no request.
 import { AboutSlint } from "std-widgets.slint";
-import { Theme, Icons, Caption, Group, Card, ClickCard, Button } from "../theme/index.slint";
+import { Theme, Icons, Caption, Group, Card, CardFrame, ClickCard, Button } from "../theme/index.slint";
 
+// `brand`: one of the `Theme.brand-*` inks (DS-19.3).
+// An empty `url`: the tile opens the Slint badge instead of a link.
 struct Tech {
     name: string,
     note: string,
     mark: image,
+    brand: color,
     url: string,
 }
 
@@ -15,25 +19,34 @@ component TechCard inherits ClickCard {
     in property <string> name;
     in property <string> note;
     in property <image> mark;
+    in property <color> brand;
+    // Opens something in the app, not a link: no external-link arrow.
+    in property <bool> inner;
     in property <bool> short;
     accessible-label: root.name;
     accessible-description: root.note;
     border-color: root.hover ? Theme.stroke-control : Theme.stroke-card;
     HorizontalLayout {
+        // The whole tile under its padding: the card body packs at the top, and the page sets the
+        // height so the mark box sits as far from the top and bottom as from the left.
+        height: root.height - 2 * Theme.card-padding-v;
         spacing: Theme.space-3;
         VerticalLayout {
             alignment: center;
-            Rectangle {
+            mark-box := Rectangle {
                 width: root.short ? Theme.icon-size : Theme.control-height;
                 height: self.width;
                 border-radius: Theme.radius-control;
                 // The short tile's square is no bigger than the mark: no tint to crowd it.
-                background: root.short ? transparent : Theme.accent-tint;
-                Image {
+                background: root.short ? transparent : root.brand.transparentize(0.9);
+                // Placed by hand: equal insets on all four sides by construction (DS-15.4).
+                mark := Image {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
                     source: root.mark;
                     width: Theme.icon-size;
                     height: Theme.icon-size;
-                    colorize: Theme.accent-text;
+                    colorize: root.brand;
                     accessible-role: none;
                 }
             }
@@ -44,6 +57,8 @@ component TechCard inherits ClickCard {
             horizontal-stretch: 1;
             Text {
                 text: root.name;
+                height: Theme.body-line;
+                vertical-alignment: center;
                 font-size: Theme.body-size;
                 color: Theme.text-primary;
                 overflow: elide;
@@ -51,6 +66,8 @@ component TechCard inherits ClickCard {
             }
             if !root.short: Caption {
                 text: root.note;
+                height: Theme.caption-line;
+                vertical-alignment: center;
                 overflow: elide;
                 accessible-role: none;
             }
@@ -58,7 +75,7 @@ component TechCard inherits ClickCard {
         VerticalLayout {
             alignment: center;
             Image {
-                source: Icons.open-16;
+                source: root.inner ? Icons.caret-down : Icons.open-16;
                 width: Theme.icon-size-small;
                 height: Theme.icon-size-small;
                 colorize: root.hover ? Theme.accent-text : Theme.text-secondary;
@@ -138,15 +155,15 @@ export component AboutPage inherits VerticalLayout {
         Platform.open-url(url);
     }
     property <[Tech]> techs: [
-        { name: "Rust", note: @tr("The whole app"), mark: Icons.rust-mark, url: "https://github.com/rust-lang/rust" },
-        { name: "Slint", note: @tr("This settings window"), mark: Icons.slint-mark, url: "https://github.com/slint-ui/slint" },
-        { name: "whisper.cpp", note: @tr("Speech recognition"), mark: Icons.person-voice, url: "https://github.com/ggml-org/whisper.cpp" },
-        { name: "whisper-rs", note: @tr("Rust bindings"), mark: Icons.plug-connected, url: "https://codeberg.org/tazz4843/whisper-rs" },
-        { name: "nnnoiseless", note: @tr("Noise suppression"), mark: Icons.sound-wave-circle, url: "https://github.com/jneem/nnnoiseless" },
-        { name: "cpal", note: @tr("Microphone capture"), mark: Icons.mic, url: "https://github.com/RustAudio/cpal" },
-        { name: "Fluent UI icons", note: @tr("Every icon in the app"), mark: Icons.icons, url: "https://github.com/microsoft/fluentui-system-icons" },
-        { name: "Claude Code", note: @tr("Pair programming"), mark: Icons.code, url: "https://github.com/anthropics/claude-code" },
-        { name: "tiny-skia", note: @tr("Draws the overlay pill"), mark: Icons.paint-brush, url: "https://github.com/RazrFalcon/tiny-skia" },
+        { name: "Rust", note: @tr("The whole app"), mark: Icons.rust-mark, brand: Theme.brand-rust, url: "https://github.com/rust-lang/rust" },
+        { name: "Slint", note: @tr("This settings window"), mark: Icons.slint-mark, brand: Theme.brand-slint, url: "" },
+        { name: "whisper.cpp", note: @tr("Speech recognition"), mark: Icons.person-voice, brand: Theme.brand-whisper-cpp, url: "https://github.com/ggml-org/whisper.cpp" },
+        { name: "whisper-rs", note: @tr("Rust bindings"), mark: Icons.plug-connected, brand: Theme.brand-whisper-rs, url: "https://codeberg.org/tazz4843/whisper-rs" },
+        { name: "nnnoiseless", note: @tr("Noise suppression"), mark: Icons.sound-wave-circle, brand: Theme.brand-nnnoiseless, url: "https://github.com/jneem/nnnoiseless" },
+        { name: "cpal", note: @tr("Microphone capture"), mark: Icons.mic, brand: Theme.brand-cpal, url: "https://github.com/RustAudio/cpal" },
+        { name: "Phosphor Icons", note: @tr("Every icon in the app"), mark: Icons.icons, brand: Theme.brand-phosphor, url: "https://github.com/phosphor-icons/core" },
+        { name: "Claude Code", note: @tr("Pair programming"), mark: Icons.claude-mark, brand: Theme.brand-claude, url: "https://github.com/anthropics/claude-code" },
+        { name: "tiny-skia", note: @tr("Draws the overlay pill"), mark: Icons.paint-brush, brand: Theme.brand-tiny-skia, url: "https://github.com/RazrFalcon/tiny-skia" },
     ];
     property <int> columns: 3;
     property <int> rows: ceil(root.techs.length / root.columns);
@@ -159,15 +176,18 @@ export component AboutPage inherits VerticalLayout {
     // A tile's text column once its padding, mark and arrow are off; the longest note needs half a
     // control column.
     property <bool> notes-fit: root.tile-width - 2 * Theme.card-padding-h - Theme.control-height - 2 * Theme.space-3 - Theme.icon-size-small >= Theme.control-column-min / 2;
-    property <length> tall-tile: 2 * Theme.card-padding-v + Theme.control-height;
+    // The mark box sets a tile's height: as far from the tile's top and bottom as the card padding
+    // puts it from the left edge (item 11, DS-15.4). The name and note lines fit inside.
+    property <length> tall-tile: 2 * Theme.card-padding-h + Theme.control-height;
     property <length> card-height: 2 * Theme.card-padding-v + Theme.about-logo-size;
     property <length> group-head: Theme.icon-size + Theme.header-gap;
-    // The page as drawn: two cards, the tile grid, two group titles, the badge and the gaps.
-    property <length> drawn-height: 2 * root.card-height + root.rows * root.tall-tile + (root.rows - 1) * Theme.tile-gap + 2 * root.group-head + 3 * Theme.group-gap + Theme.about-slint-height;
-    // Too low for that (UI rule 25): no group titles, short tiles, the badge beside the author.
+    property <length> short-tile: 2 * Theme.card-padding-h + Theme.icon-size;
+    // The page as drawn: two cards, the tile grid, two group titles and the gaps.
+    property <length> drawn-height: 2 * root.card-height + root.rows * (root.notes-fit ? root.tall-tile : root.short-tile) + (root.rows - 1) * Theme.tile-gap + 2 * root.group-head + 2 * Theme.group-gap;
+    // Too low for that (UI rule 25): no group titles, short tiles.
     property <bool> tight: root.free-height < root.drawn-height;
     property <bool> short: root.tight || !root.notes-fit;
-    property <length> tile-height: root.short ? 2 * Theme.card-padding-v + Theme.icon-size : root.tall-tile;
+    property <length> tile-height: root.short ? root.short-tile : root.tall-tile;
     alignment: start;
     spacing: root.tight ? Theme.space-3 : Theme.group-gap;
     Card {
@@ -247,46 +267,52 @@ export component AboutPage inherits VerticalLayout {
                 name: tech.name;
                 note: tech.note;
                 mark: tech.mark;
+                brand: tech.brand;
+                inner: tech.url == "";
                 short: root.short;
                 clicked => {
-                    root.open(tech.url);
+                    if (tech.url == "") {
+                        slint-badge.show();
+                    } else {
+                        root.open(tech.url);
+                    }
+                }
+            }
+            // R2.3: the royalty-free licence's "Made with Slint" badge, under the Slint tile.
+            slint-badge := PopupWindow {
+                x: root.column-x(1);
+                y: root.tile-height + Theme.space-1;
+                close-policy: close-on-click-outside;
+                CardFrame {
+                    VerticalLayout {
+                        padding-left: Theme.card-padding-h;
+                        padding-right: Theme.card-padding-h;
+                        padding-top: Theme.card-padding-v;
+                        padding-bottom: Theme.card-padding-v;
+                        spacing: Theme.space-2;
+                        AboutSlint {
+                            width: Theme.about-slint-width;
+                            height: Theme.about-slint-height;
+                        }
+                        Button {
+                            text: @tr("Project page");
+                            icon: Icons.github-mark;
+                            clicked => {
+                                slint-badge.close();
+                                root.open("https://github.com/slint-ui/slint");
+                            }
+                        }
+                    }
                 }
             }
         }
     }
-    // The author card ends with the second tile column; the badge sits at the grid's right end.
-    if root.tight: HorizontalLayout {
-        VerticalLayout {
-            alignment: center;
-            width: root.column-x(root.columns - 1) - Theme.tile-gap;
-            AuthorCard {
-                compact: true;
-                open(url) => {
-                    root.open(url);
-                }
-            }
-        }
-        Rectangle {
-            horizontal-stretch: 1;
-        }
-        AboutSlint {
-            width: Theme.about-slint-width;
-            height: Theme.about-slint-height;
-        }
-    }
-    if !root.tight: Group {
-        title: @tr("Author");
+    Group {
+        title: root.tight ? "" : @tr("Author");
         AuthorCard {
             open(url) => {
                 root.open(url);
             }
-        }
-    }
-    if !root.tight: HorizontalLayout {
-        alignment: center;
-        AboutSlint {
-            width: Theme.about-slint-width;
-            height: Theme.about-slint-height;
         }
     }
 }

@@ -30,7 +30,7 @@ The daemon runs these threads. Each owns its data; they talk only through channe
 | history | history writes and retention (`src/daemon/history.rs`) | One worker with a job channel; a failed write comes back as a status warning. |
 | ipc | local socket server | One connection at a time is the settings window; other connections only send `OpenSettings`. |
 
-Shared atomics, read lock-free by the UI thread at 30 Hz: `LEVEL` (peak and RMS of the last 20 ms, for the overlay meter) and `PHASE` (current phase as `u8`, read by the hook callback to decide whether Esc is ours).
+Shared atomics, read lock-free by the UI thread at 30 Hz: `LEVEL` (peak and RMS of the last 20 ms, for the overlay meter) and `PHASE` (current phase as `u8`, read by the hook callback to decide whether Esc is ours; Esc is ours only while recording and `hotkey.esc_cancels` is on).
 
 ### Channels
 
@@ -48,7 +48,7 @@ Phases: `Idle -> Recording -> Transcribing -> Pasting -> Idle`, plus two outcome
 - Key-up (push-to-talk) or second press (toggle): stop capture, the audio becomes a job, phase `Transcribing`.
 - Transcription done: phase `Pasting`, the paste worker gets the text. Paste done: `Idle`, schedule the idle unload.
 - A new key-down during `Transcribing` or `Pasting` starts a new recording at once: no lost words. Jobs run and paste strictly in order. At most two jobs wait; a third key-down gets the error sound. The phase shown is the most urgent one: Recording, then Transcribing, then Pasting.
-- Esc during Recording: `Cancelled`, the audio is dropped, Esc is swallowed. Esc at any other time is not ours and passes through.
+- Esc during Recording, only with `hotkey.esc_cancels` on (default off, R2.1): `Cancelled`, Esc is swallowed. With it off, Esc always passes through. A cancel keeps the audio in history when speech was heard (see section 11, item 7); with no speech it is dropped. Esc at any other time is not ours and passes through.
 
 Timers the machine owns: double-tap window, max recording length, speech watchdog (push-to-talk key-up recovery), idle model unload, overlay hide delay.
 
@@ -141,10 +141,12 @@ Hotkey capture: while `CaptureHotkey { on: true }` the daemon pauses the chord, 
 Loading: parse to a `toml_edit::DocumentMut`, read `version`, run migrations `v1 -> v2 -> ...` (each a pure function on the document, unit-tested with a fixture per version), then deserialise into `Config` where every field has `#[serde(default)]`. Saving writes the typed values into the document's existing items, so comments, key order and formatting survive, an unchanged file is written back byte-identical (a partial file, CRLF line endings and a UTF-8 BOM included; a file mixing LF and CRLF is normalised to its dominant ending), a key the file lacks is written only when its value differs from the default, and unknown keys stay in the document, so a newer field survives a round trip through an older settings build. Paste rules are matched by `app`. A file with `version` newer than this build is read for the fields it knows and never written; settings shows it read-only. A parse error keeps the last good config in the daemon and shows the file and line in the tray and settings.
 
 ```toml
-version = 1
+version = 2
 [hotkey]
 chord = ["Ctrl", "Win"]        # "Win" is Cmd on macOS
 mode = "push"                  # push | toggle
+esc_cancels = false            # Esc cancels a recording; off by default (R2.1)
+other_key = "auto"             # key outside the chord while recording: auto | never | always
 [audio]
 device = ""                    # empty = system default
 gain_db = 0.0
@@ -174,10 +176,14 @@ hide_over_fullscreen = false
 [sounds]
 enabled = true
 volume = 0.5                  # 0 to 1
-start = "rise"                 # rise, fall, pop, tick, or the path of a .wav file
-stop = "fall"
+start = "apa-hit-3"            # a built-in id (apa-hit-3, apa-hit-2, rx-25, cancel-soft, boop-3, ...) or the path of a .wav or .ogg file; the old ids rise, fall, pop, tick, fault still load
+stop = "apa-hit-2"
+done_enabled = true            # sound when the text is ready and pasted
+done = "rx-25"
+cancel = "cancel-soft"                # sound when a recording is cancelled
+error = "boop-3"
 [history]
-enabled = false                # owner turns it on; off for everyone else
+enabled = true                 # recording storage is on by default (R1.3); a file with an explicit value keeps it
 max_bytes = 2_147_483_648      # size cap, oldest entries go first; 0 = no cap
 max_days = 30                  # keep the last N days, today included; 0 = no age limit
 folder = ""                    # absolute path, may be another drive, gets an "OxiYapper history" subfolder; empty = history/ in the data dir
@@ -204,7 +210,7 @@ From `directories::ProjectDirs`. Portable mode: if a file named `portable` sits 
 | `state.toml`, `stats.json`, `models/`, `history/` | `%LOCALAPPDATA%\OxiYapper\data\` | `~/Library/Application Support/<bundle id>/` | `$XDG_DATA_HOME/OxiYapper/` |
 | `logs/` (daily files, 7 kept) | `%LOCALAPPDATA%\OxiYapper\data\logs\` | `~/Library/Logs/OxiYapper/` | `$XDG_STATE_HOME/OxiYapper/logs/` |
 
-Models are local, not roaming (gigabytes). History entries are `history/YYYY-MM-DD/HHMMSS-mmm.{wav,txt}`. `stats.json` (usage stats for the Home page, `oxi-core::stats`, versioned) holds one row per local day: date, dictations, words, audio ms; rows older than about 3 years fold into one totals row. The daemon's stats thread rewrites it atomically after each dictation that reached the field or the clipboard; a corrupt file is renamed `stats.bad` and counting starts fresh. On Unix the data directory is created 0700. The macOS bundle id is chosen in ROADMAP M12 and never changes after the first release: TCC permissions and paths hang on it.
+Models are local, not roaming (gigabytes). History entries are `history/YYYY-MM-DD/HHMMSS-mmm.{wav,txt,json}`. `stats.json` (usage stats for the Home page, `oxi-core::stats`, versioned) holds one row per local day: date, dictations, words, audio ms; rows older than about 3 years fold into one totals row. The daemon's stats thread rewrites it atomically after each dictation that reached the field or the clipboard; a corrupt file is renamed `stats.bad` and counting starts fresh. On Unix the data directory is created 0700. The macOS bundle id is chosen in ROADMAP M12 and never changes after the first release: TCC permissions and paths hang on it.
 
 ## 8. Model lifecycle
 
@@ -230,7 +236,7 @@ Order, and where each step can fail:
 
 Steps 3-7 are pure functions in `oxi-core::audio`, tested on synthetic signals. Defaults (normalise on, trim on, denoise off, tail 100 ms) are confirmed against the 8 reference phrases in M5 before they ship.
 
-History (when on): the 16 kHz audio after step 7 goes to `<name>.wav.part` through hound, `finalize()`, then rename. The coordinator hands the samples and the final text to the history thread (`src/daemon/history.rs`) once the text is known; it writes the `.wav`, then the `.txt`, then applies `oxi-core::history::expired` (age, then size, oldest first) to the day folders. Everything lives in one app-owned folder: `OxiYapper history` inside `[history] folder`, or `history/` in the data dir when that is empty or relative. It is created with a `.oxiyapper-history` marker; a folder without the marker is never listed or changed, and a non-empty one of that name is refused. Inside it, only `YYYY-MM-DD/HHMMSS-mmm.wav|txt` names with a real date and time are ever listed or deleted, and at start (and on every config change) the leftovers of a killed write, `HHMMSS-mmm.wav.part` and `HHMMSS-mmm.txt.tmp` directly in a day folder, are swept. The age limit sits out a pass with an entry dated after today, or with today more than 31 days past every earlier entry (a clock jump); the size limit always applies. A clean-up failure is logged per entry, the pass goes on, and it shows as its own "Old history not removed" warning. A write error becomes a status warning and never stops the paste; the text is never logged.
+History (on by default, R1.3): the audio is written to disk while recording (streaming, `<name>.wav.part` through hound), so a crash or power loss keeps what was recorded; at start the daemon recovers a leftover `.part`. On a normal stop the file is finalized (`finalize()`) and renamed. The coordinator hands the final text to the history thread (`src/daemon/history.rs`) once it is known; it writes the `.txt` and a `.json` meta file beside the `.wav` (a documented, stable wav + txt + json entry format, so other tools can read it; the settings History page offers Copy path), then applies `oxi-core::history::expired` (age, then size, oldest first) to the day folders. Everything lives in one app-owned folder: `OxiYapper history` inside `[history] folder`, or `history/` in the data dir when that is empty or relative. It is created with a `.oxiyapper-history` marker; a folder without the marker is never listed or changed, and a non-empty one of that name is refused. Inside it, only `YYYY-MM-DD/HHMMSS-mmm.wav|txt|json` names with a real date and time are ever listed or deleted, and at start (and on every config change) the leftovers of a killed write directly in a day folder are handled: a `HHMMSS-mmm.wav.part` with audio in it is recovered (finalized and renamed, the entry has no text), an empty one and any `HHMMSS-mmm.txt.tmp` are swept. The age limit sits out a pass with an entry dated after today, or with today more than 31 days past every earlier entry (a clock jump); the size limit always applies. A clean-up failure is logged per entry, the pass goes on, and it shows as its own "Old history not removed" warning. A write error becomes a status warning and never stops the paste; the text is never logged.
 
 ## 10. Paste pipeline
 
@@ -241,10 +247,12 @@ Then, in the paste worker (Windows shown; other OSes below):
 1. **Pick the mode**: per-app rule for the foreground app, else `paste.mode`.
 2. **Wait for modifiers**: poll the physical state of Ctrl, Shift, Alt, Win (both sides) every 5 ms. A pending Ctrl+V with Win still held would open Win+V. If they are still down after 1.5 s: put the text on the clipboard, do not restore, notify "Text is on the clipboard, press Ctrl+V".
 3. **Elevated target (UIPI)**: compare the foreground process integrity level with ours. Higher: same as above ("Admin window: press Ctrl+V"). SendInput into it fails silently, so we never try.
-4. **Snapshot the clipboard**: open with 10 retries 20 ms apart. Copy every HGLOBAL format up to 32 MiB total; skip GDI-handle formats (CF_BITMAP has CF_DIB beside it), synthesised formats and delayed-render formats the owner fails to render in 500 ms. Locked after retries: switch to type mode. Snapshot incomplete: paste anyway and skip the restore, with a one-time note (no automatic typing of short texts; owner 2026-11-08).
-5. **Set** the text as CF_UNICODETEXT plus `CanUploadToCloudClipboard = 0` always, and `CanIncludeInClipboardHistory = 0` and `ExcludeClipboardContentFromMonitorProcessing` only when the setting "keep dictation in Win+V history" is off (default on). Remember `GetClipboardSequenceNumber`.
+4. **Snapshot the clipboard**: open with 10 retries 20 ms apart. Copy every HGLOBAL format up to 32 MiB total; skip GDI-handle formats (CF_BITMAP has CF_DIB beside it), synthesised formats and delayed-render formats the owner fails to render in 500 ms. Locked after retries: switch to type mode. Snapshot incomplete (too big, an owner that hangs or renders too slowly): type the text instead and leave the clipboard alone, so the user's copy is never lost (owner 2026-11-10).
+5. **Set** the text as CF_UNICODETEXT plus `CanUploadToCloudClipboard = 0` always, and `CanIncludeInClipboardHistory = 0` and `ExcludeClipboardContentFromMonitorProcessing` when the setting "keep dictation in Win+V history" is off (default on), and also when Win+V is full (25 entries), unreadable, or the history work ran out of time (see the sequence below): then the dictation is pasted but not kept in Win+V. Remember `GetClipboardSequenceNumber`.
 6. **Send** Ctrl down, V down, V up, Ctrl up with SendInput (VK codes, which are layout-independent on Windows; the per-app chord may be Shift+Insert or Ctrl+Shift+V).
-7. **Restore** after `restore_delay_ms` (default 300; RDP and some Electron apps read late), only if the sequence number is unchanged (someone else wrote the clipboard: leave theirs). With the setting on, the restored data enters history too (`CanIncludeInClipboardHistory = 1`, `CanUploadToCloudClipboard = 0`), so the earlier copy is on top and the dictation second, unless the snapshot carried `ExcludeClipboardContentFromMonitorProcessing` or `CanIncludeInClipboardHistory = 0` (a password manager's copy): that data, and all restored data with the setting off, carries the three exclusion formats.
+7. **Restore** after `restore_delay_ms` (default 300; RDP and some Electron apps read late), only if the sequence number is unchanged (someone else wrote the clipboard: leave theirs). The restored data never enters history: it always carries the three exclusion formats. Win+V still has its own entry of the copy, and a restore into history would add a twin and push the oldest entry out of a full history.
+
+**Clipboard history sequence (item 52, Windows, owner 2026-11-10: no entry of the user's is ever pushed out)**: Ctrl+V gives the user's copy, Win+V shows the latest dictation on top, and no entry is pushed out. Win+V holds one entry more than before the first dictation (the dictation itself), and one more again while a delete of ours failed or was put off and waits for the next paste; it never passes 25 through us. Done through the WinRT clipboard history API (`Clipboard.GetHistoryItemsAsync`, `DeleteItemFromHistory`, Windows 10 1809+; windows crate feature `ApplicationModel_DataTransfer`), every call on its own STA thread, limited to 2 s or the time left of the 3 s that all history work of one paste may take. Order: (1) delete our earlier dictation entries by id (one list call, one delete each); (2) set the dictation, into the history only while Win+V holds fewer than 25 entries (it pushes the oldest out for a 26th), and paste it; (3) wait until the history shows it and remember its id for the next paste; (4) put the user's copy back outside the history. Our entry is the new top entry whose text hash is the dictation's; a new entry with other text is a copy of the user's that registered late, and ours goes above it. A delete that fails or times out keeps its id for the next paste; a write not seen in time is remembered by its place and a hash of its text and deleted by the next paste once it shows, unless the user copied in between (a same-text copy could sit in that place: the mark is dropped). The user's copies are never lost to a delete (the OS drops a write it is still registering when an entry is deleted): a copy made since our last paste is waited for until it shows (up to 10 looks); one that does not show keeps our deletes for the next paste and a slot free for itself; no delete runs once the clipboard number moved during the history work, and a copy made then is what the restore puts back (the dictation then stays out of Win+V). The user's copy on top of Win+V is deferred (owner 2026-11-10). A failed restore is reported, never ignored.
 
 **Type mode**: SendInput with `KEYEVENTF_UNICODE`, one event pair per UTF-16 unit (surrogate pairs as two), 5 ms between characters by default (games drop faster input), clipboard untouched. It bypasses the IME composition. Games that read raw input or DirectInput ignore it; nothing can be done there, and the QA checklist records which games work.
 
@@ -264,11 +272,11 @@ Recording and hotkey
 3. Single press under 300 ms: a tap, discarded without transcription (taps produce "Thank you." hallucinations).
 4. Toggle mode: key-up ignored, no double tap; under 300 ms of audio between presses is discarded.
 5. Recording reaches `max_seconds` (default 600, SPEC round 4): the overlay warns 30 s before, then stop and transcribe, never discard. Long audio goes to whisper in chunks so one job never holds minutes of state (chunk length set in M5).
-6. Esc while recording: cancel, swallow Esc. Esc while transcribing: not ours, passes through.
-7. Another key pressed while the chord is held (Ctrl+Win+D and friends): the user meant a shortcut; cancel silently and pass the key through.
+6. Esc while recording: cancels and is swallowed only when `hotkey.esc_cancels` is on (default off: Esc may be meant for another app); otherwise it passes through. A cancel after speech is saved to history with the notice of item 7. Esc while transcribing: not ours, passes through.
+7. Another key pressed while the chord is held (Ctrl+Win+D and friends): the key always passes through to the system (R2.1). What happens to the recording is decided by VAD and `hotkey.other_key`. `auto` (default): no speech heard yet, so the user meant a shortcut and the recording is cancelled silently; speech already heard, so the recording goes on (a short phrase is not lost). `never`: never cancels. `always`: always cancels. A cancel after speech saves the audio to history and shows the notice "cancelled, can be restored". The logic is pure, in `oxi-core::machine`, with a test per edge case.
 8. Key-up lost (UAC prompt, Ctrl+Alt+Del, secure desktop): a 100 ms watchdog reads the physical key state while recording; chord not held means key-up.
 9. Win release would open Start (Win11 too): inject VK 0xE8 down/up before the Win key-up passes.
-10. Chord keys are never swallowed, so other apps still see Ctrl and Win; only Esc during recording is swallowed.
+10. Chord keys are never swallowed, so other apps still see Ctrl and Win; only Esc during recording is swallowed, and only with `esc_cancels` on.
 11. Hotkey changed in settings while recording: applied when the phase returns to Idle.
 12. Hook removed by Windows after a stall: the hook thread does nothing but post events, and the hook is reinstalled on resume and on session unlock.
 13. Foreground app runs elevated: whether the low-level hook still sees keys is unverified (QA item); paste handles it per section 10.
@@ -319,8 +327,8 @@ System
 48. Settings and daemon writing config at once: cannot happen, one writer per file (section 6).
 49. Hand-edited config with an error: daemon keeps the last good config; settings shows the line and offers "Open file" or "Reset to defaults" (old file kept as `config.toml.bak`).
 50. Config from a newer build (downgrade): read-only, never written.
-51. Crash during a wav write: `.part` removed at next start; the text was already pasted.
-52. History over its cap: oldest entries removed after each dictation and at start, saving on or off, in the current folder only (a former folder is never touched; `.txt.tmp`/`.wav.part` leftovers are swept on the same pass); age is strict by date, entries dated after today are kept; only files matching the history naming inside the app-owned folder that holds the marker are ever deleted.
+51. Crash during a wav write: a non-empty `.wav.part` is kept and recovered as "interrupted" at next start (see 52), never deleted; the text was already pasted.
+52. History over its cap: oldest entries removed after each dictation and at start, saving on or off, in the current folder only (a former folder is never touched; a `.txt.tmp` leftover is swept and a non-empty `.wav.part` is recovered as "interrupted" on the same pass, never deleted); age is strict by date, entries dated after today are kept; only files matching the history naming inside the app-owned folder that holds the marker are ever deleted.
 53. Update check offline or rate-limited: silent, try again the next day. Asset for this build variant missing: the badge opens the release page instead of Install.
 54. Autostart path moved (portable zip moved): each daemon start and config reload re-registers autostart (`HKCU\...\Run\OxiYapper`, quoted exe path) if it points elsewhere, and removes it when off and it is this exe; a test daemon (`OXI_PIPE_SUFFIX` set) never touches it.
 55. Installer and portable copy both present: same per-user socket, the second opens the first one's settings.
@@ -335,7 +343,7 @@ System
 - Network: only the model download (huggingface.co and its CDN) and the update check (api.github.com, github.com release assets). Both go through one `net` module with a host allowlist; both are visible in settings; the update check can be turned off. No telemetry, no crash upload.
 - Downloads: models by SHA256 pinned in code; updates by the SHA256 from `SHA256SUMS` of the same release (integrity, not authenticity, until code signing; build provenance attestations let a user verify with `gh attestation verify`). Never self-replace: Install runs the per-user installer the user can see.
 - Dictated text never goes to logs; logs hold lengths, timings and errors. `debug.log_text = true` adds text and settings shows a warning while it is on.
-- History is off by default; when on it is a plain local folder in the user's data directory, removable from settings.
+- History is on by default (R1.3), can be turned off, and is a plain local folder in the user's data directory, removable from settings.
 - IPC is owner-only (section 5), because hotkey capture forwards keystrokes.
 - TLS through rustls; `cargo deny` bans OpenSSL and unknown registries or git sources, and fails on RustSec advisories.
 - No secrets in the repo (`docs/SECRETS.md`). No owner audio, dictionary or replacement list in the repo: reference phrases live in a private folder passed by path (`OXI_BENCH_DIR`).

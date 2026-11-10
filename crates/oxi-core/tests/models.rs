@@ -8,6 +8,10 @@ use oxi_core::models::{
     stamp_file_name, stamp_trusted, status, write_stamp,
 };
 
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::{fake_model, scratch_dir};
+
 fn is_hex(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
@@ -72,7 +76,7 @@ fn file_names_resolve_to_their_entry_and_others_are_custom() {
 
 #[test]
 fn sha256_file_is_lower_hex_of_the_bytes() {
-    let path = std::env::temp_dir().join(format!("oxi-sha-{}", std::process::id()));
+    let path = scratch_dir(&format!("oxi-sha-{}", std::process::id())).join("abc.bin");
     std::fs::write(&path, b"abc").unwrap();
     let got = sha256_file(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
@@ -167,15 +171,13 @@ fn stamp_policy() {
 }
 
 fn scratch(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("oxi-status-{}-{name}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    scratch_dir(&format!("oxi-status-{}-{name}", std::process::id()))
 }
 
-/// A file of the registry size without writing its bytes (`set_len`; the content is never read).
+/// A file of the registry size that takes no disk (sparse; the content is never read).
 fn sized_file(dir: &std::path::Path, name: &str, len: u64) -> std::path::PathBuf {
     let path = dir.join(name);
-    std::fs::File::create(&path).unwrap().set_len(len).unwrap();
+    fake_model(&path, len);
     path
 }
 

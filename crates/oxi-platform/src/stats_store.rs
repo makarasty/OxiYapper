@@ -84,12 +84,10 @@ mod tests {
     use oxi_core::types::Millis;
 
     use super::*;
+    use crate::scratch::scratch_dir;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("oxi-stats-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        scratch_dir(&format!("oxi-stats-{}-{name}", std::process::id()))
     }
 
     #[test]
