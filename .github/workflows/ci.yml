@@ -224,6 +224,8 @@ jobs:
     timeout-minutes: 70 # 2026-11-06 cold: 11 min toolkit install + 22 min build
     env:
       CARGO_TARGET_DIR: C:/t
+      # Build only, nothing runs here: native keeps one CUDA arch (OFF builds every arch, past the 70 min limit).
+      GGML_NATIVE: "ON"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
