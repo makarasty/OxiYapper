@@ -397,7 +397,8 @@ fn the_folded_keys_are_told_on_keyboard_focus() {
     resized(&window, SIZES[0]);
     let copies = || ElementHandle::find_by_accessible_label(&window, LONG_TEXT).count();
     assert_eq!(copies(), 1);
-    // The rail, then the "+N" cap.
+    // The rail, the "i" after Keys, then the "+N" cap.
+    tab(&window);
     tab(&window);
     tab(&window);
     assert_eq!(copies(), 2, "focus on the +N cap shows the whole chord");
@@ -411,6 +412,7 @@ fn leaving_the_page_closes_the_tip() {
     resized(&window, SIZES[0]);
     tab(&window);
     tab(&window);
+    tab(&window);
     assert!(has(&window, LONG_TEXT));
     window.set_page(Page::Audio);
     resized(&window, SIZES[0]);
@@ -420,7 +422,8 @@ fn leaving_the_page_closes_the_tip() {
 #[test]
 fn a_chord_that_is_not_folded_is_no_tab_stop() {
     let window = open(&layout("fold-none", None));
-    // The rail, then Change hotkey at once.
+    // The rail, the "i" after Keys, then Change hotkey at once.
+    tab(&window);
     tab(&window);
     tab(&window);
     press(&window, " ".into());

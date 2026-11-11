@@ -11,8 +11,10 @@ use std::path::Path;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use oxi_core::config::Advanced;
 use oxi_core::device::{DeviceChoice, Picked, pick};
 use oxi_core::machine::EngineWarning;
+use oxi_core::tuning::{self, RunParams, Sampling};
 use oxi_core::types::{Language, Millis};
 use whisper_rs::whisper_rs_sys as sys;
 use whisper_rs::{
@@ -137,23 +139,15 @@ pub struct Engine {
     /// Made once per load and reused by every job.
     state: WhisperState,
     info: LoadInfo,
-    /// Threads for the decode loop, fixed per load: the device does not change under an Engine.
-    n_threads: i32,
+    /// Per-run parameters, resolved for this load's device; see [`Engine::set_advanced`].
+    run: RunParams,
+    on_gpu: bool,
 }
 
-/// Decode threads. whisper.cpp scales badly past the physical cores, and `std` only
-/// knows logical ones, so halve (SMT assumed). A GPU does the heavy work: 4 is plenty.
-fn thread_count(on_gpu: bool, logical: usize) -> i32 {
-    let n = if on_gpu { 4 } else { (logical / 2).clamp(1, 8) };
-    i32::try_from(n).unwrap_or(4)
+fn logical_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, usize::from)
 }
 
-fn threads_for(on_gpu: bool) -> i32 {
-    let logical = std::thread::available_parallelism().map_or(1, usize::from);
-    thread_count(on_gpu, logical)
-}
-
-/// `flash_attn` only with a GPU: M5 measured -14..-41 % p50 there; the CPU path stays as it was.
 fn open(
     path: &Path,
     gpu: Option<usize>,
@@ -161,7 +155,7 @@ fn open(
 ) -> Result<(WhisperContext, WhisperState), WhisperError> {
     let mut params = WhisperContextParameters::new();
     params.use_gpu(gpu.is_some());
-    params.flash_attn(flash_attn && gpu.is_some());
+    params.flash_attn(flash_attn);
     if let Some(i) = gpu {
         params.gpu_device(i32::try_from(i).unwrap_or(0));
     }
@@ -171,10 +165,29 @@ fn open(
     Ok((ctx, state))
 }
 
+/// The GPU open: flash attention as asked, then one plain try when the device rejects it.
+fn open_gpu(
+    path: &Path,
+    i: usize,
+    adv: &Advanced,
+) -> Result<(WhisperContext, WhisperState), WhisperError> {
+    let flash = tuning::flash_attn(adv, true).unwrap_or(true);
+    let opened = open(path, Some(i), flash);
+    if flash && opened.is_err() {
+        return open(path, Some(i), false);
+    }
+    opened
+}
+
 impl Engine {
     /// Load a model on the chosen device. A GPU failure (backend start, weights,
     /// KV cache or compute buffers) retries once on CPU; see [`LoadInfo::device`].
     pub fn load(path: &Path, choice: &DeviceChoice) -> Result<Self, Error> {
+        Self::load_with(path, choice, &Advanced::default())
+    }
+
+    /// [`Self::load`] with the context parameters of `adv` (flash attention) and its per-run ones.
+    pub fn load_with(path: &Path, choice: &DeviceChoice, adv: &Advanced) -> Result<Self, Error> {
         watch_logs();
         ALLOC_FAILED.store(false, Ordering::Relaxed);
         let devices = list_devices();
@@ -182,49 +195,54 @@ impl Engine {
         let warning = not_found(choice, &picked);
         let gpu_err = match picked.index {
             None => {
-                let (ctx, state) = open(path, None, false).map_err(load_error)?;
+                let flash = tuning::flash_attn(adv, false).unwrap_or(false);
+                let (ctx, state) = open(path, None, flash).map_err(load_error)?;
                 let info = LoadInfo {
                     device: None,
                     warning,
                 };
-                return Ok(Self {
-                    ctx,
-                    state,
-                    info,
-                    n_threads: threads_for(false),
-                });
+                return Ok(Self::new(ctx, state, info, adv));
             }
             Some(i) if !device::gpu_starts(i) => format!("cannot start {}", devices[i].name),
-            // Flash attention first; a device that rejects it gets one plain GPU try before the CPU retry.
-            Some(i) => match open(path, Some(i), true).or_else(|_| open(path, Some(i), false)) {
+            // Flash attention as asked (on by default with a GPU); a device that rejects it gets one
+            // plain GPU try before the CPU retry.
+            Some(i) => match open_gpu(path, i, adv) {
                 Ok((ctx, state)) => {
                     let info = LoadInfo {
                         device: Some(devices[i].name.clone()),
                         warning,
                     };
-                    return Ok(Self {
-                        ctx,
-                        state,
-                        info,
-                        n_threads: threads_for(true),
-                    });
+                    return Ok(Self::new(ctx, state, info, adv));
                 }
                 // "out of memory" is the words `strings::is_out_of_memory` looks for.
                 Err(_) if ALLOC_FAILED.swap(false, Ordering::Relaxed) => "out of memory".to_owned(),
                 Err(e) => e.to_string(),
             },
         };
-        let (ctx, state) = open(path, None, false).map_err(load_error)?;
+        let flash = tuning::flash_attn(adv, false).unwrap_or(false);
+        let (ctx, state) = open(path, None, flash).map_err(load_error)?;
         let info = LoadInfo {
             device: None,
             warning: Some(EngineWarning::CpuFallback { reason: gpu_err }),
         };
-        Ok(Self {
+        Ok(Self::new(ctx, state, info, adv))
+    }
+
+    fn new(ctx: WhisperContext, state: WhisperState, info: LoadInfo, adv: &Advanced) -> Self {
+        let on_gpu = info.device.is_some();
+        Self {
             ctx,
             state,
             info,
-            n_threads: threads_for(false),
-        })
+            run: tuning::resolve(adv, on_gpu, logical_threads()),
+            on_gpu,
+        }
+    }
+
+    /// Takes the per-run parameters of `adv` for the next jobs (flash attention is a load
+    /// parameter: a change of it needs a new load).
+    pub fn set_advanced(&mut self, adv: &Advanced) {
+        self.run = tuning::resolve(adv, self.on_gpu, logical_threads());
     }
 
     pub fn info(&self) -> &LoadInfo {
@@ -253,14 +271,29 @@ impl Engine {
         mut progress: Option<&mut dyn FnMut(u8)>,
         cancel: Option<&Cancel>,
     ) -> Result<Transcript, Error> {
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        let run = &self.run;
+        let mut params = FullParams::new(match run.sampling {
+            Sampling::Greedy { best_of } => SamplingStrategy::Greedy {
+                best_of: c_int::from(best_of),
+            },
+            Sampling::Beam { beam_size } => SamplingStrategy::BeamSearch {
+                beam_size: c_int::from(beam_size),
+                patience: -1.0,
+            },
+        });
         params.set_language(Some(language.as_str()));
         // set_initial_prompt panics on NUL.
         let prompt = prompt.replace('\0', "");
         if !prompt.is_empty() {
             params.set_initial_prompt(&prompt);
         }
-        params.set_n_threads(self.n_threads);
+        params.set_n_threads(c_int::from(run.threads));
+        params.set_temperature(run.temperature);
+        params.set_temperature_inc(if run.temperature_fallback { 0.2 } else { 0.0 });
+        params.set_no_speech_thold(run.no_speech_threshold);
+        params.set_logprob_thold(run.logprob_threshold);
+        params.set_entropy_thold(run.entropy_threshold);
+        params.set_suppress_nst(run.suppress_non_speech);
         params.set_print_special(false);
         params.set_print_progress(false);
         params.set_print_realtime(false);
@@ -350,26 +383,6 @@ mod tests {
         );
         assert_eq!(not_found(&named, &picked(false)), None);
         assert_eq!(not_found(&DeviceChoice::Auto, &picked(false)), None);
-    }
-
-    #[test]
-    fn thread_count_table() {
-        // (on_gpu, logical threads, expected)
-        for (gpu, logical, want) in [
-            (false, 1, 1),
-            (false, 2, 1),
-            (false, 8, 4),
-            (false, 16, 8),
-            (false, 64, 8),
-            (true, 1, 4),
-            (true, 32, 4),
-        ] {
-            assert_eq!(
-                thread_count(gpu, logical),
-                want,
-                "gpu={gpu} logical={logical}"
-            );
-        }
     }
 
     #[test]

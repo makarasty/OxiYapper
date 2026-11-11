@@ -110,6 +110,16 @@ elements checked, same licence):
 | model-language | translate bold | model class: tuned for one language |
 | model-small | feather bold | model class: small |
 | model-own | folder-user bold | own model file |
+| temperature | thermometer bold | Model Advanced, Temperature |
+| silence-threshold | waveform-slash bold | Model Advanced, Silence threshold |
+| confidence | target bold | Model Advanced, Confidence threshold |
+| repetition | repeat bold | Model Advanced, Repetition threshold |
+| non-speech | ear-slash bold | Model Advanced, Skip non-speech sounds |
+| audio-window | ruler bold | Model Advanced, Audio window |
+| threads | cpu bold | Model Advanced, Processor threads |
+| flash-attention | flashlight bold | Model Advanced, Flash attention |
+| retry-doubtful | seal-question bold | Model Advanced, Retry doubtful segments |
+| reset-auto | eraser bold | Model Advanced, Reset all to Auto |
 | replace | swap bold | always replace (History selection) |
 
 The other constants of the table (`open-external`, `retry`, `edit`, `close`, `error`, `done`,

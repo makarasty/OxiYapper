@@ -1,6 +1,8 @@
-// Hotkey page (SPEC Recording, Settings UI): the chord as keycaps and an edit button, which opens
-// the full keyboard (click keys or press them, held keys light up); then the mode.
-import { Theme, Shell, Icons, Caption, Group, Card, Row, Divider, ToggleRow, Combo, KeycapRow, TilePicker, Button, ButtonKind, IconButton } from "../theme/index.slint";
+// Hotkey page (SPEC Recording, Settings UI): the chord as keycaps and a pencil, which toggles the
+// full keyboard (click keys or press them, held keys light up); while it is open the same row reads
+// "current -> new". Closing the keyboard with keys picked keeps them as a draft (a dot on the
+// pencil) until the page is left. Then the mode.
+import { Theme, Shell, Icons, Group, Card, Row, Divider, ToggleRow, SliderRow, Combo, KeycapRow, TilePicker, Button, ButtonKind, IconButton } from "../theme/index.slint";
 import { WarningSlot } from "../theme/components/feedback.slint";
 import { Keyboard, KeyCap } from "../keyboard.slint";
 
@@ -16,6 +18,10 @@ export global HotkeyState {
     // `hotkey.esc_cancels`.
     in-out property <bool> esc-cancels;
     in property <bool> keyboard-open;
+    // The keyboard is hidden but its pending keys are kept (the dot on the pencil).
+    in property <bool> draft;
+    // `hotkey.hold_gap_ms` as the slider shows it: 0 is off, else 100 to 1500.
+    in-out property <float> hold-gap;
     // The daemon link is up: without it no key is captured and Apply is off.
     in property <bool> online;
     // Why Apply is off on this link (empty while online): its tooltip.
@@ -42,15 +48,14 @@ export global HotkeyState {
     callback mode-picked(int);
     callback other-key-picked(int);
     callback esc-cancels-toggled(bool);
+    callback hold-gap-changed(float);
 }
 
 export component HotkeyPage inherits VerticalLayout {
     // The room of the page in the window (without the title and the banners).
     in property <length> free-height;
     // With the keyboard open the page must not scroll (UI rule 25): the board is capped by height
-    // and Recording mode gives way; in a very low window the heading goes too, with the buttons
-    // beside the pending keys.
-    property <bool> tight: HotkeyState.keyboard-open && root.free-height < Theme.hotkey-tight-height;
+    // and Recording mode gives way.
     property <bool> mode-hidden: HotkeyState.keyboard-open && root.free-height < Theme.hotkey-full-height;
     init => {
         HotkeyState.shown();
@@ -63,14 +68,19 @@ export component HotkeyPage inherits VerticalLayout {
             Row {
                 icon: Icons.keyboard;
                 title: @tr("Keys");
+                info: @tr("Click keys or press them. Left and right modifiers both count.");
+                // The saved chord; while editing it reads as the old value in secondary ink. In the
+                // narrow 240 px column it folds into a "+N" cap (DS-28.3) instead of leaving.
                 Rectangle {
                     preferred-width: chord.preferred-width;
+                    min-width: HotkeyState.keyboard-open ? Theme.keycap-width : 0px;
                     chord := KeycapRow {
                         width: parent.width;
                         pack-end: true;
                         hovered: chord-area.has-hover;
                         keys: HotkeyState.chord-keys;
                         label: HotkeyState.chord;
+                        muted: HotkeyState.keyboard-open;
                     }
                     chord-area := TouchArea {
                         enabled: !Shell.locked && !HotkeyState.keyboard-open;
@@ -80,14 +90,39 @@ export component HotkeyPage inherits VerticalLayout {
                         }
                     }
                 }
+                if HotkeyState.keyboard-open: VerticalLayout {
+                    alignment: center;
+                    Image {
+                        source: Icons.becomes;
+                        width: Theme.icon-size-small;
+                        height: Theme.icon-size-small;
+                        colorize: Theme.text-secondary;
+                        accessible-role: none;
+                    }
+                }
+                // A slot of four caps whatever is pressed: the old chord and the arrow never move.
+                if HotkeyState.keyboard-open: Rectangle {
+                    preferred-width: 4 * Theme.keycap-width + 3 * Theme.keycap-gap;
+                    min-width: Theme.keycap-width;
+                    pending := KeycapRow {
+                        width: parent.width;
+                        keys: HotkeyState.pending-keys;
+                        fresh: true;
+                        warning: HotkeyState.error != "";
+                        empty-text: @tr("Press keys");
+                        label: HotkeyState.pending != "" ? @tr("New hotkey: {}", HotkeyState.pending) : @tr("No keys yet");
+                    }
+                }
                 // Centre the button on the keycaps (DS-3.4).
                 VerticalLayout {
                     alignment: center;
                     IconButton {
                         icon: Icons.edit-16;
                         label: @tr("Change hotkey");
-                        enabled: !Shell.locked && !HotkeyState.keyboard-open;
-                        tooltip: HotkeyState.keyboard-open ? @tr("The keyboard is open below") : Shell.locked-tip;
+                        enabled: !Shell.locked;
+                        toggled: HotkeyState.keyboard-open;
+                        kept-dot: HotkeyState.draft && !HotkeyState.keyboard-open;
+                        tooltip: Shell.locked ? Shell.locked-tip : HotkeyState.keyboard-open ? @tr("Hide the keyboard, keep the keys") : HotkeyState.draft ? @tr("Continue the unsaved hotkey") : "";
                         clicked => {
                             HotkeyState.change();
                         }
@@ -121,28 +156,11 @@ export component HotkeyPage inherits VerticalLayout {
             min-height: panel.min-height;
             preferred-height: panel.preferred-height;
             panel := Card {
-                if !root.tight: Text {
-                    text: @tr("Press the new hotkey");
-                    font-size: Theme.subtitle-size;
-                    font-weight: Theme.weight-strong;
-                    color: Theme.text-primary;
-                }
-                if !root.tight: Caption {
-                    text: @tr("Click keys or press them. Left and right modifiers both count.");
-                    wrap: word-wrap;
-                }
-                if !root.tight: KeycapRow {
-                    keys: HotkeyState.pending-keys;
-                    cap-height: Theme.capture-keycap-height;
-                    warning: HotkeyState.error != "";
-                    empty-text: @tr("No keys yet");
-                    label: HotkeyState.pending != "" ? @tr("New hotkey: {}", HotkeyState.pending) : @tr("No keys yet");
-                }
                 Keyboard {
                     caps: HotkeyState.caps;
                     columns: HotkeyState.columns;
                     rows: HotkeyState.rows;
-                    room: root.free-height - (root.tight ? Theme.hotkey-tight-chrome : Theme.hotkey-open-chrome);
+                    room: root.free-height - Theme.hotkey-tight-chrome;
                     clicked(name) => {
                         board.focus();
                         HotkeyState.key-clicked(name);
@@ -151,14 +169,6 @@ export component HotkeyPage inherits VerticalLayout {
                 HorizontalLayout {
                     spacing: Theme.control-gap;
                     alignment: end;
-                    if root.tight: KeycapRow {
-                        horizontal-stretch: 1;
-                        keys: HotkeyState.pending-keys;
-                        cap-height: Theme.capture-keycap-height;
-                        warning: HotkeyState.error != "";
-                        empty-text: @tr("Press the new hotkey");
-                        label: HotkeyState.pending != "" ? @tr("New hotkey: {}", HotkeyState.pending) : @tr("No keys yet");
-                    }
                     WarningSlot {
                         text: HotkeyState.error;
                     }
@@ -220,6 +230,22 @@ export component HotkeyPage inherits VerticalLayout {
                 checked <=> HotkeyState.esc-cancels;
                 toggled(on) => {
                     HotkeyState.esc-cancels-toggled(on);
+                }
+            }
+            // Only a held key can be let go and pressed again by accident.
+            if HotkeyState.mode == 0: Divider { }
+            if HotkeyState.mode == 0: SliderRow {
+                title: @tr("Continue after a short re-press");
+                info: @tr("Let go of the keys and press them again within this time, and the same dictation goes on. Off starts a new one.");
+                minimum: 0;
+                maximum: 1500;
+                step: 100;
+                default-value: 400;
+                unit: "ms";
+                zero-text: @tr("Off");
+                value <=> HotkeyState.hold-gap;
+                changed(v) => {
+                    HotkeyState.hold-gap-changed(v);
                 }
             }
         }

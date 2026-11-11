@@ -27,7 +27,9 @@ features = [
     "ApplicationModel_DataTransfer", # Clipboard, ClipboardHistoryItem, StandardDataFormats
     "Foundation",                    # IAsyncOperation, DateTime
     "Foundation_Collections",        # IVectorView
-    "Win32_System_Com",              # CoInitializeEx: the clipboard calls need a COM apartment
+    "Win32_System_Com",              # CoInitializeEx: the clipboard calls need a COM apartment; IBindCtx, CoTaskMemFree
+    "Win32_Foundation",              # HANDLE, the known-folder call's token
+    "Win32_UI_Shell",                # SHGetKnownFolderItem, IShellItem, IEnumShellItems: the Store apps of shell:AppsFolder
 ]
 
 # Each feature is the module of the listed API in windows-sys 0.61.2 (src/Windows/Win32/...).

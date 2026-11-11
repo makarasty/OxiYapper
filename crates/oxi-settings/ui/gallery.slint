@@ -2237,6 +2237,28 @@ export component TileGalleryProbe inherits Window {
     }
 }
 
+// Test surface: `tests/gallery.rs` opens the list and checks that `committed` fires only for
+// Return, Space and a line click, never for arrows, Esc or a click outside.
+export component ComboProbe inherits Window {
+    in-out property <int> index;
+    out property <int> commits: self.count;
+    out property <bool> open: c.open;
+    property <int> count;
+    width: 400px;
+    height: 300px;
+    c := Combo {
+        x: 0;
+        y: 0;
+        width: 200px;
+        locked: false;
+        model: ["a", "b", "c"];
+        current-index <=> root.index;
+        committed => {
+            root.count += 1;
+        }
+    }
+}
+
 // Test surface: `tests/gallery.rs` walks the bar by keyboard; pane 0 has a field with unsaved text,
 // pane 1 is taller than the window's share of it.
 export component SubTabsProbe inherits Window {

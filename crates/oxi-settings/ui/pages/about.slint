@@ -75,13 +75,44 @@ component TechCard inherits ClickCard {
         VerticalLayout {
             alignment: center;
             Image {
-                source: root.inner ? Icons.caret-down : Icons.open-16;
+                source: root.inner ? Icons.caret-down : Icons.open-external;
                 width: Theme.icon-size-small;
                 height: Theme.icon-size-small;
                 colorize: root.hover ? Theme.accent-text : Theme.text-secondary;
                 accessible-role: none;
             }
         }
+    }
+}
+
+// The app mark (`oxi-platform` draw::logo, 256 grid): paper tile, ink ring, record dot. The dot is
+// drawn in the accent, so it follows the user's pick (DS-20.8); the rest is the brand's fixed paper
+// and ink, the same in both themes, as in the exe icon.
+component AppMark inherits Rectangle {
+    // One grid unit: the side over 256.
+    property <length> u: self.width / 256;
+    height: self.width;
+    border-radius: 0.22 * self.width;
+    border-width: self.width / 64;
+    border-color: #E4DED2;
+    background: #FAF7F1;
+    accessible-role: none;
+    Rectangle {
+        x: 36 * root.u;
+        y: 60 * root.u;
+        width: 160 * root.u;
+        height: self.width;
+        border-radius: self.width / 2;
+        border-width: 40 * root.u;
+        border-color: #1C1B19;
+    }
+    Rectangle {
+        x: 172 * root.u;
+        y: 36 * root.u;
+        width: 48 * root.u;
+        height: self.width;
+        border-radius: self.width / 2;
+        background: Theme.accent;
     }
 }
 
@@ -193,11 +224,8 @@ export component AboutPage inherits VerticalLayout {
     Card {
         HorizontalLayout {
             spacing: Theme.icon-gap;
-            Image {
-                source: Icons.logo;
+            AppMark {
                 width: Theme.about-logo-size;
-                height: Theme.about-logo-size;
-                accessible-role: none;
             }
             VerticalLayout {
                 alignment: center;

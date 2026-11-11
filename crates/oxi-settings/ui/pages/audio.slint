@@ -1,10 +1,10 @@
 // Audio page (SPEC Recording, Audio before whisper, Sounds): microphone, live meter, the DSP
 // switches, tail, recording cap and the sounds of the five events.
-import { Theme, Shell, Icons, Card, Row, Divider, ToggleRow, SliderRow, Combo, SubTabs, Button, Meter, CardGrid, GalleryTile } from "../theme/index.slint";
+import { Theme, Shell, Icons, Card, Row, Divider, ToggleRow, SliderRow, Combo, SubTabs, Button, IconButton, Meter, CardGrid, GalleryTile } from "../theme/index.slint";
 import { Warnings } from "../theme/components/feedback.slint";
 
 // Which control changed; `value` of `AudioState.edited` carries its new value.
-export enum AudioKey { device, gain, sensitivity, normalize, trim, denoise, tail, max-minutes, volume }
+export enum AudioKey { device, gain, sensitivity, normalize, trim, denoise, tail, max-minutes, volume, channel, vad }
 
 // Filled and read by `pages::audio`.
 export global AudioState {
@@ -16,6 +16,10 @@ export global AudioState {
     in-out property <int> device;
     in-out property <float> gain-db;
     in-out property <float> sensitivity-db;
+    // Which side of a stereo mic is used: 0 both mixed, 1 left, 2 right.
+    in-out property <int> channel;
+    // How easily speech is heard: 0 low, 1 normal, 2 high.
+    in-out property <int> vad;
     in-out property <bool> normalize;
     in-out property <bool> trim;
     in-out property <bool> denoise;
@@ -59,11 +63,15 @@ export global AudioState {
     // Why the daemon cannot play a preview now; empty when it can.
     in property <string> preview-off;
     in property <bool> can-browse;
+    // The sound folder's name; empty while none is set.
+    in property <string> folder-name;
     callback shown();
     callback edited(AudioKey, float);
     callback test();
     callback sound-picked(int);
     callback choose-file();
+    callback choose-folder();
+    callback remove-folder();
     callback preview();
 }
 
@@ -105,12 +113,14 @@ export component AudioPage inherits VerticalLayout {
         // the column's (DS-3.3).
         Row {
             title: @tr("Level");
-            warning: AudioState.silence;
+            // The "!" carries the words of the clip line (DS-21.3).
+            warning: Warnings.both(AudioState.silence, AudioState.clipping ? @tr("Too loud: lower the gain.") : "");
             fill-controls: true;
             Meter {
                 bars: AudioState.bars;
                 live: AudioState.live;
                 clipped: AudioState.clipped;
+                overloaded: AudioState.clipping;
                 empty-text: AudioState.note;
                 idle-text: @tr("Listening");
                 accessible-label: !AudioState.live ? AudioState.note : AudioState.clipping ? @tr("Level, clipping") : @tr("Level");
@@ -152,6 +162,34 @@ export component AudioPage inherits VerticalLayout {
             value <=> AudioState.sensitivity-db;
             changed(v) => {
                 AudioState.edited(AudioKey.sensitivity, v);
+            }
+        }
+        Divider { }
+        Row {
+            title: @tr("Channel");
+            info: @tr("Which side of a stereo microphone is used. Mix averages both; pick one when the other is noisy or silent.");
+            fill-controls: true;
+            Combo {
+                model: [@tr("Mix"), @tr("Left"), @tr("Right")];
+                current-index <=> AudioState.channel;
+                accessible-label: @tr("Channel");
+                selected => {
+                    AudioState.edited(AudioKey.channel, self.current-index);
+                }
+            }
+        }
+        Divider { }
+        Row {
+            title: @tr("Speech sensitivity");
+            info: @tr("How easily quiet speech is counted as speech. Raise it when short phrases are lost.");
+            fill-controls: true;
+            Combo {
+                model: [@tr("Low"), @tr("Normal"), @tr("High")];
+                current-index <=> AudioState.vad;
+                accessible-label: @tr("Speech sensitivity");
+                selected => {
+                    AudioState.edited(AudioKey.vad, self.current-index);
+                }
             }
         }
     }
@@ -234,13 +272,36 @@ export component AudioPage inherits VerticalLayout {
             }
             Divider { }
             Row {
-                title: @tr("Own file");
+                title: @tr("Own sounds");
+                // The folder's name is in the tip: a line under the title made this row taller than its neighbours.
+                info: AudioState.folder-name == "" ? @tr("Choose one WAV or OGG file, or a folder: every file directly in it (up to 200) becomes a tile below.") : @tr("Folder: ") + AudioState.folder-name;
+                // The folder button first, so the file button stays the right-most (DS-3.3).
+                if AudioState.can-browse: Button {
+                    text: @tr("Add folder");
+                    enabled: !Shell.locked;
+                    tooltip: Shell.locked-tip;
+                    clicked => {
+                        AudioState.choose-folder();
+                    }
+                }
                 if AudioState.can-browse: Button {
                     text: @tr("Choose file");
                     enabled: !Shell.locked;
                     tooltip: Shell.locked-tip;
                     clicked => {
                         AudioState.choose-file();
+                    }
+                }
+                // Delete is the right-most action (DS-23.2). It forgets the folder; its files stay.
+                // Always there, off with no folder, so Add folder and Choose file do not jump (DS-23.5).
+                IconButton {
+                    icon: Icons.delete;
+                    label: @tr("Remove folder (its files stay)");
+                    destructive: true;
+                    enabled: AudioState.folder-name != "" && !Shell.locked;
+                    tooltip: Shell.locked ? Shell.locked-tip : @tr("No folder added");
+                    clicked => {
+                        AudioState.remove-folder();
                     }
                 }
             }

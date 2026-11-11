@@ -208,22 +208,27 @@ export global Theme {
     out property <length> model-action-column: 112px;
     // The narrowest Home stat card: four fit across a 720 px window.
     out property <length> stat-card-min: 140px;
-    // Home's full heights: two rows of cards, one row. Under them the page goes tight (rule 25).
+    // Home: the height under which a narrow window keeps one row of cards (two rows need this to
+    // leave the grid its room), and what the page spends outside the heatmap grid: with one row of
+    // cards and one-line labels, for two-line labels, and for the second row (measured by
+    // `the_page_never_needs_a_scrollbar_in_a_low_window`).
     out property <length> home-full-height: 566px;
-    out property <length> home-wide-height: 450px;
+    out property <length> home-chrome: 186px;
+    out property <length> home-chrome-labels: 36px;
+    out property <length> home-chrome-row: 122px;
     // Hotkey page with the keyboard open: the room that shows it all (Recording mode too), the room
     // under which it goes tight, and what each layout spends beside the board.
     out property <length> hotkey-full-height: 914px;
     out property <length> hotkey-tight-height: 480px;
     out property <length> hotkey-open-chrome: 300px;
     out property <length> hotkey-tight-chrome: 190px;
-    // Home heatmap cells: the size the shown weeks are fitted at (a wider card shows more weeks, up
-    // to a year), the cap for a history shorter than a year, and the cap in a low window. A full
+    // Home heatmap cells: the cap for a history shorter than a year. A full
     // year (`heat-year-weeks`, oxi-core's HEAT_WEEKS) has no cap: it fills the card at any width.
-    out property <length> heat-cell-fit: 18px;
     out property <length> heat-cell-max: 36px;
     out property <int> heat-year-weeks: 53;
-    out property <length> heat-cell-tight: 14px;
+    // The least cell that keeps the legend (its swatches are 16 px high), and the least at all.
+    out property <length> heat-cell-legend: 16px;
+    out property <length> heat-cell-floor: 8px;
     out property <length> capture-keycap-height: 40px;
     out property <length> editor-min-height: 120px;
     out property <length> editor-max-height: 360px;

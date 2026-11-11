@@ -6,7 +6,7 @@ use std::time::Duration;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, I24, InputCallbackInfo, Sample, SampleFormat, SizedSample, Stream};
 use oxi_core::audio::{AudioError, CHUNK, Level, Pipeline, downmix, samples_for};
-use oxi_core::config::Audio;
+use oxi_core::config::{Audio, AudioChannel};
 use rtrb::{Consumer, Producer, RingBuffer};
 
 use super::{Capture, CaptureError, CaptureEvent, LevelMeter, Recorded};
@@ -114,6 +114,7 @@ impl Capture for CpalCapture {
             supported.sample_format(),
         );
         let pipeline = Pipeline::new(rate, opts)?;
+        let channel = opts.channel;
         let (tx, rx) = RingBuffer::new(rate as usize * channels * RING_SECONDS);
         let shared = Arc::new(Shared::default());
         // Two senders (cpal error thread, drain thread), both off the data callback.
@@ -165,6 +166,7 @@ impl Capture for CpalCapture {
             .spawn(move || {
                 let drain = Drain {
                     channels,
+                    channel,
                     window,
                     shared: &drain_shared,
                     meter: &drain_meter,
@@ -323,6 +325,8 @@ impl<S: Sink> Sink for Spooled<S> {
 /// The drain thread's fixed inputs.
 struct Drain<'a> {
     channels: usize,
+    /// Which side of a stereo mic is kept (`audio.channel`).
+    channel: AudioChannel,
     window: usize,
     shared: &'a Shared,
     meter: &'a LevelMeter,
@@ -354,6 +358,7 @@ impl Drain<'_> {
             } else if let Err(e) = drain_once(
                 &mut rx,
                 self.channels,
+                self.channel,
                 self.window,
                 &mut sink,
                 self.meter,
@@ -378,12 +383,30 @@ impl Drain<'_> {
     }
 }
 
+/// One channel of each frame for `Left` and `Right` (a mono mic has only the one), else the
+/// average of them all.
+fn pick_channel(interleaved: &[f32], channels: usize, channel: AudioChannel) -> Vec<f32> {
+    let side = match channel {
+        AudioChannel::Left => 0,
+        AudioChannel::Right => 1,
+        AudioChannel::Mix => return downmix(interleaved, channels),
+    };
+    if channels < 2 {
+        return interleaved.to_vec();
+    }
+    interleaved
+        .chunks_exact(channels)
+        .map(|frame| frame[side])
+        .collect()
+}
+
 /// One pass: whole blocks of `window` frames (everything when `all`) go from the ring into
 /// `sink`, one window per push, and the meter gets each window's post-gain level. A part
 /// window waits in the ring for the next pass.
 fn drain_once(
     rx: &mut Consumer<f32>,
     channels: usize,
+    channel: AudioChannel,
     window: usize,
     sink: &mut impl Sink,
     meter: &LevelMeter,
@@ -404,7 +427,7 @@ fn drain_once(
     let (a, b) = chunk.as_slices();
     let interleaved = [a, b].concat();
     chunk.commit_all();
-    for piece in downmix(&interleaved, channels).chunks(window) {
+    for piece in pick_channel(&interleaved, channels, channel).chunks(window) {
         meter.store(sink.push(piece)?);
     }
     Ok(())
@@ -494,14 +517,32 @@ mod tests {
             }
         }
         let meter = LevelMeter::default();
-        drain_once(&mut rx, 2, window, &mut pipeline, &meter, false).unwrap();
+        drain_once(
+            &mut rx,
+            2,
+            AudioChannel::Mix,
+            window,
+            &mut pipeline,
+            &meter,
+            false,
+        )
+        .unwrap();
         let level = meter.read();
         assert!((level.peak - 0.5).abs() < 1e-5, "{level:?}");
         assert!((level.rms - 0.5).abs() < 1e-5, "{level:?}");
         assert_eq!(rx.slots(), window);
 
         // The last pass takes the part window too.
-        drain_once(&mut rx, 2, window, &mut pipeline, &meter, true).unwrap();
+        drain_once(
+            &mut rx,
+            2,
+            AudioChannel::Mix,
+            window,
+            &mut pipeline,
+            &meter,
+            true,
+        )
+        .unwrap();
         assert!((meter.read().peak - 1.8).abs() < 1e-4);
         assert_eq!(rx.slots(), 0);
     }
@@ -522,6 +563,7 @@ mod tests {
         shared.stop.store(true, Ordering::Release);
         let drain = Drain {
             channels: 1,
+            channel: AudioChannel::Mix,
             window: samples_for(CHUNK, RATE),
             shared: &shared,
             meter: &LevelMeter::default(),
@@ -587,6 +629,7 @@ mod tests {
             thread::spawn(move || {
                 let drain = Drain {
                     channels: 1,
+                    channel: AudioChannel::Mix,
                     window: WINDOW_LEN,
                     shared: &shared,
                     meter: &meter,
@@ -656,6 +699,7 @@ mod tests {
             thread::spawn(move || {
                 let drain = Drain {
                     channels: 1,
+                    channel: AudioChannel::Mix,
                     window: 4,
                     shared: &shared,
                     meter: &LevelMeter::default(),
@@ -754,6 +798,7 @@ mod tests {
         shared.stop.store(true, Ordering::Release);
         let drain = Drain {
             channels: 1,
+            channel: AudioChannel::Mix,
             window: samples_for(CHUNK, RATE),
             shared: &shared,
             meter: &LevelMeter::default(),
@@ -787,5 +832,18 @@ mod tests {
         assert_eq!((samples.len(), rate), (32_000, RATE));
         crate::wav::set_spool_dir(None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_side_of_a_stereo_mic_is_kept_and_mix_averages() {
+        let frames = [1.0, 0.0, 0.5, -0.5];
+        assert_eq!(pick_channel(&frames, 2, AudioChannel::Left), [1.0, 0.5]);
+        assert_eq!(pick_channel(&frames, 2, AudioChannel::Right), [0.0, -0.5]);
+        assert_eq!(pick_channel(&frames, 2, AudioChannel::Mix), [0.5, 0.0]);
+        // A mono mic has no sides: every choice gives the one channel.
+        assert_eq!(
+            pick_channel(&[0.25, 0.5], 1, AudioChannel::Right),
+            [0.25, 0.5]
+        );
     }
 }

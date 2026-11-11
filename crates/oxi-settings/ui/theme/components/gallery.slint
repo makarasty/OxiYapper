@@ -4,6 +4,7 @@
 // card (rule 10). Empty and full fill the same box. One anatomy: glyph or picture top-left, title
 // (one line, cut, whole in the tooltip), caption, the top-right slot for the check badge.
 import { Theme, Shell } from "../tokens.slint";
+import { Icons } from "../icons.slint";
 import { CardFrame, Caption, KeyFocus, Tip, ScrollBox } from "base.slint";
 import { Tile } from "tiles.slint";
 import { EmptyState } from "feedback.slint";
@@ -19,6 +20,15 @@ export struct GalleryTile {
     // The tooltip; on a disabled tile it says why (rule 31).
     hint: string,
     disabled: bool,
+    // Ticked on its own (the check badge and the tint), whatever `selected` says: a grid that toggles
+    // many tiles (the Per-app apps popup) keeps the flag in its rows.
+    checked: bool,
+    // The state mark in the top-right slot, drawn only while the tile is not ticked or picked (the
+    // check badge is its mark then): 0 none, 1 done (a success-tinted check), 2 to get (a download
+    // glyph). Its words are `hint`; never repeat them in the caption (rule 29).
+    mark: int,
+    // A percent drawn in that slot, right-aligned, while the tile's file downloads.
+    mark-text: string,
 }
 
 // One-way like `TilePicker`: `picked` fires, the owner updates `selected` (-1: none). The arrows
@@ -68,6 +78,13 @@ export component CardGrid {
 
     pure function fit(w: length) -> int {
         return max(1, floor((w + root.gap) / (root.min-cell + root.gap)));
+    }
+
+    // The cursor takes the keyboard (the arrows walk the tiles): a search field above hands over here.
+    public function focus-grid() {
+        fs.focus();
+        root.key-focus = true;
+        root.reveal(root.cursor);
     }
 
     function pick(i: int) {
@@ -193,11 +210,13 @@ export component CardGrid {
                 property <int> i: row * root.cols + col;
                 property <GalleryTile> data: root.tiles[self.i];
                 property <bool> cut: title.preferred-width > title.width;
+                // Holds "100 %" at the caption size.
+                property <length> percent-slot: 40px;
                 x: root.edge + col * (root.cell + root.gap);
                 y: root.edge;
                 width: root.cell;
                 height: root.tile-height;
-                selected: self.i == root.selected;
+                selected: self.i == root.selected || self.data.checked;
                 hover: touch.has-hover || root.force-hover == self.i;
                 pressed: touch.pressed;
                 read-only: root.locked || self.data.disabled;
@@ -214,7 +233,7 @@ export component CardGrid {
                 VerticalLayout {
                     padding: Theme.space-3;
                     // Keeps the title clear of the top-right check badge.
-                    padding-right: Theme.space-3 + Theme.check-badge-size;
+                    padding-right: Theme.space-3 + (tile.data.mark-text != "" ? tile.percent-slot + (tile.selected ? Theme.check-badge-size + Theme.space-1 : 0px) : Theme.check-badge-size);
                     spacing: Theme.space-1;
                     alignment: start;
                     HorizontalLayout {
@@ -244,6 +263,26 @@ export component CardGrid {
                         overflow: elide;
                         accessible-role: none;
                     }
+                }
+                if tile.data.mark > 0 && !tile.selected: Image {
+                    source: tile.data.mark == 1 ? Icons.done : Icons.download;
+                    x: tile.width - self.width - Theme.space-2;
+                    y: Theme.space-2;
+                    width: Theme.check-badge-size;
+                    height: Theme.check-badge-size;
+                    colorize: tile.data.mark == 1 ? Theme.success-text : Theme.text-secondary;
+                    opacity: tile.read-only ? 0.4 : 1;
+                    accessible-role: none;
+                }
+                if tile.data.mark-text != "": Caption {
+                    x: tile.width - self.width - Theme.space-2 - (tile.selected ? Theme.check-badge-size + Theme.space-1 : 0px);
+                    y: Theme.space-2;
+                    width: tile.percent-slot;
+                    height: Theme.check-badge-size;
+                    text: tile.data.mark-text;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                    accessible-role: none;
                 }
                 // Enabled on a disabled tile too: its tooltip says why (rule 31); `pick` refuses it.
                 touch := TouchArea {

@@ -1142,25 +1142,26 @@ fn shot_text_worst_case() {
         model_tab(&window, "Per-app rules");
         let surface = LAST.with_borrow(Clone::clone).unwrap();
         let _ = render(&window, MIN, 1.0);
-        // The Add button, whole on screen.
+        // The search field and the Scan button, whole on screen.
         let add_in_view = || {
-            ElementHandle::find_by_accessible_label(&window, "Add rule")
-                .next()
-                .is_some_and(|e| e.absolute_position().y + e.size().height <= MIN.1)
+            ["New rule app", "Scan for apps"].iter().all(|label| {
+                ElementHandle::find_by_accessible_label(&window, label)
+                    .next()
+                    .is_some_and(|e| e.absolute_position().y + e.size().height <= MIN.1)
+            })
         };
-        assert!(add_in_view(), "Add is off screen at 720 x 520");
+        assert!(add_in_view(), "the bar is off screen at 720 x 520");
         for app in ["b.exe", "B.EXE"] {
             common::one(&window, "New rule app").set_accessible_value(app);
             common::one(&window, "Add rule").invoke_accessible_default_action();
         }
-        assert!(common::has(
-            &window,
-            "B.EXE already has a rule: change its mode in the list below."
-        ));
+        assert!(!common::has(&window, "already has a rule: change its mode"));
         save(
             &render(&window, MIN, 1.0),
             &format!("text-worst-top-720-{theme}"),
         );
+        // The refused duplicate left its text in the field, which filters the list: clear it.
+        common::one(&window, "New rule app").set_accessible_value("");
         // The wheel over the list moves the list only.
         let first = common::one(
             &window,
@@ -1178,7 +1179,7 @@ fn shot_text_worst_case() {
             0.0,
             "the page scrolled with the list"
         );
-        assert!(add_in_view(), "Add left the screen");
+        assert!(add_in_view(), "the bar left the screen");
         save(
             &render(&window, MIN, 1.0),
             &format!("text-worst-bottom-720-{theme}"),
@@ -1194,7 +1195,7 @@ fn shot_text_worst_case() {
             slint::platform::update_timers_and_animations();
             tabs += 1;
         }
-        assert_eq!(field().as_deref(), Some("c"), "Tab never reached Add");
+        assert_eq!(field().as_deref(), Some("c"), "Tab never reached the field");
         save(
             &render(&window, MIN, 1.0),
             &format!("text-worst-tabbed-720-{theme}"),

@@ -1,6 +1,6 @@
 // Home page (SPEC, History): four usage numbers and the speaking-activity heatmap, or the open
 // card's chart by day.
-import { Theme, Icons, Group, CardFrame, StatCard, ActivityHeatmap, MonthLabel, Button, ButtonKind, InfoTip, EmptyState } from "../theme/index.slint";
+import { Theme, Icons, Group, CardFrame, StatCard, ActivityHeatmap, MonthLabel, EmptyState } from "../theme/index.slint";
 import { HoverTip, Tooltip } from "../theme/components/base.slint";
 import { TrendChart } from "../theme/components/stats.slint";
 
@@ -21,6 +21,8 @@ export global HomeState {
     in property <bool> history-on;
     // One 0..4 per day from a Monday (index = week * 7 + weekday, Monday first) to today.
     in property <[int]> levels;
+    // What each day's tooltip says ("Nov 8 · 3 dictations · 120 words"), one per level.
+    in property <[string]> day-tips;
     in property <[MonthLabel]> months;
     in property <int> today: -1;
     // The open stat card (0..3 in the order of the cards), -1: none, the heatmap shows.
@@ -36,12 +38,14 @@ export global HomeState {
     in property <string> trend-first;
     in property <string> trend-last;
     callback shown();
-    // How many heatmap weeks fit the card, from the page; `levels` then holds that many (within
-    // 26..53). Set before the page's code is bound too, so it is a property, and `fit` tells a change.
+    // How many heatmap weeks the page shows (half a year); `levels` then holds that many. Set
+    // before the page's code is bound too, so it is a property, and `fit` tells the page.
     in-out property <int> fit-weeks;
     callback fit();
     callback pick(int);
     callback open-history();
+    // A day with dictations was clicked: History opens (it cannot filter by day yet).
+    callback open-day();
 }
 
 struct Stat {
@@ -54,6 +58,7 @@ struct Stat {
 }
 
 export component HomePage inherits VerticalLayout {
+    alignment: start;
     // The page column's width, from the window: the card rows are built from it, so it must not
     // come from this layout's own size.
     in property <length> content-width;
@@ -64,29 +69,27 @@ export component HomePage inherits VerticalLayout {
     in property <length> free-height;
     // Under this the four cards stop fitting their labels.
     property <bool> wide: root.window-width >= Theme.narrow-window;
-    // A window too low for the drawn layout (UI rule 25): one row of cards even when narrow, a
-    // smaller grid without its legend.
-    property <bool> tight: root.free-height < (root.wide ? Theme.home-wide-height : Theme.home-full-height);
-    property <bool> one-row: root.wide || root.tight;
+    // A window too low for two rows of cards (UI rule 25): one row even when narrow.
+    property <bool> one-row: root.wide || root.free-height < Theme.home-full-height;
     property <length> card-width: root.one-row ? (root.content-width - 3 * Theme.tile-gap) / 4 : (root.content-width - Theme.tile-gap) / 2;
     property <int> weeks: max(1, ceil(HomeState.levels.length / 7));
     property <length> heat-room: root.content-width - 2 * Theme.card-padding-h - heat.label-w;
-    // A wider card shows more weeks (item 12: no empty band), the cells kept at their fitting size.
-    property <int> fit-weeks: floor(root.heat-room / ((root.tight ? Theme.heat-cell-tight : Theme.heat-cell-fit) + heat.gap));
-    // Once a year fits, the cells grow to fill the width, as far as the window's spare height
-    // lets the grid grow (the full heights hold `heat-cell-fit` cells). A cell's growth costs 8
-    // rows of height, not 7: the legend (shown whenever this applies) is as tall as a cell.
-    property <length> cell-height-room: Theme.heat-cell-fit + floor((root.free-height - (root.wide ? Theme.home-wide-height : Theme.home-full-height)) / 8 / 1px) * 1px;
-    property <length> cell: min(root.tight ? Theme.heat-cell-tight : max(Theme.heat-cell-fit, root.cell-height-room), Theme.heat-cell(root.heat-room, root.weeks, heat.gap));
-    function tell-fit() {
+    // The last half year (oxi-core's HEAT_WEEKS_MIN).
+    property <int> fit-weeks: 26;
+    // The height the page spends outside the grid: the cards (a second row, two label lines), the
+    // card's header and paddings. What is left is the grid's, so the page never scrolls (rule 25).
+    property <length> chrome: Theme.home-chrome + (root.label-lines == 2 ? Theme.home-chrome-labels : 0px) + (root.one-row ? 0px : Theme.home-chrome-row);
+    property <length> grid-room: root.free-height - root.chrome - Theme.heat-top - 7 * heat.gap;
+    // The cell: fills the card's width up to `heat-cell-max`, and no more than the height allows.
+    // With the legend (a gap and one more cell high) when the height leaves cells of
+    // `heat-cell-legend` or more; else the legend is the first thing a low window drops.
+    property <length> cell-wide: Theme.heat-cell(root.heat-room, root.fit-weeks, heat.gap);
+    property <length> cell-high: floor((root.grid-room - Theme.space-3) / 8 / 1px) * 1px;
+    property <bool> legend: root.cell-high >= Theme.heat-cell-legend;
+    property <length> cell: max(Theme.heat-cell-floor, min(root.cell-wide, root.legend ? root.cell-high : floor(root.grid-room / 7 / 1px) * 1px));
+    init => {
         HomeState.fit-weeks = root.fit-weeks;
         HomeState.fit();
-    }
-    init => {
-        root.tell-fit();
-    }
-    changed fit-weeks => {
-        root.tell-fit();
     }
     // Under 172 px a card's longest label (Words per minute) wraps: reserve two lines in all four.
     property <int> label-lines: root.card-width < Theme.stat-card-one-line ? 2 : 1;
@@ -128,45 +131,20 @@ export component HomePage inherits VerticalLayout {
             }
         }
     }
-    // The activity card takes the window's spare height (UI rule 26): the chart grows with it.
+    // The card is as high as its content; the window's spare height stays under it (UI rule 24).
     Group {
-        vertical-stretch: 1;
-        // Group's own title row has no place for an "i": the same row, built here.
-        HorizontalLayout {
-            vertical-stretch: 0;
-            padding-bottom: Theme.header-gap - Theme.card-gap;
-            spacing: Theme.pair-gap;
-            alignment: start;
-            // On the title's cap centre, which sits 1.5 px under its line box's centre at body
-            // size: the whole pixel nearest it (DS-16.1).
-            Rectangle {
-                width: Theme.icon-size;
-                min-height: Theme.icon-size;
-                Image {
-                    y: round(((parent.height - self.height) / 2 + 1.5px) / 1px) * 1px;
-                    source: root.trend-open ? root.stats[HomeState.selected].icon : Icons.calendar;
-                    width: Theme.icon-size;
-                    height: Theme.icon-size;
-                    colorize: Theme.text-primary;
-                    accessible-role: none;
-                }
-            }
-            Text {
-                text: root.trend-open ? root.stats[HomeState.selected].trend : @tr("Speaking activity");
-                font-size: Theme.body-size;
-                font-weight: Theme.weight-strong;
-                color: Theme.text-primary;
-                vertical-alignment: center;
-            }
-            VerticalLayout {
-                alignment: center;
-                InfoTip {
-                    text: root.hint;
-                }
-            }
+        vertical-stretch: 0;
+        title: root.trend-open ? root.stats[HomeState.selected].trend : @tr("Speaking activity");
+        icon: root.trend-open ? root.stats[HomeState.selected].icon : Icons.calendar;
+        info: root.hint;
+        action-text: @tr("History folder");
+        action-icon: Icons.folder-open-16;
+        action-tip: HomeState.history-on ? @tr("Opens the folder with your dictated text and audio. Statistics keep only dates and counts.") : @tr("Opens the History folder. Statistics keep only dates and counts, never the text.");
+        action => {
+            HomeState.open-history();
         }
         CardFrame {
-            vertical-stretch: 1;
+            vertical-stretch: 0;
             min-height: body.min-height;
             preferred-height: body.preferred-height;
             body := VerticalLayout {
@@ -178,7 +156,8 @@ export component HomePage inherits VerticalLayout {
                 // nothing (UI rules 1, 5); in a taller card the heatmap stays centred.
                 Rectangle {
                     min-height: grid.min-height;
-                    vertical-stretch: 1;
+                    preferred-height: grid.min-height;
+                    vertical-stretch: 0;
                     grid := VerticalLayout {
                         alignment: center;
                         HorizontalLayout {
@@ -186,10 +165,14 @@ export component HomePage inherits VerticalLayout {
                             heat := ActivityHeatmap {
                                 visible: !root.trend-open && !root.blank;
                                 levels: HomeState.levels;
+                                day-tips: HomeState.day-tips;
                                 months: HomeState.months;
                                 today: HomeState.today;
                                 cell: root.cell;
-                                legend-shown: !root.tight;
+                                legend-shown: root.legend;
+                                day-clicked(day) => {
+                                    HomeState.open-day();
+                                }
                                 summary: @tr("{n} active day in the last {} weeks" | "{n} active days in the last {} weeks" % HomeState.active-days, root.weeks);
                             }
                         }
@@ -268,25 +251,6 @@ export component HomePage inherits VerticalLayout {
                         }
                     }
                 }
-            }
-        }
-    }
-    HorizontalLayout {
-        vertical-stretch: 0;
-        alignment: end;
-        spacing: Theme.pair-gap;
-        Button {
-            kind: ButtonKind.subtle;
-            icon: Icons.folder-open-16;
-            text: @tr("History folder");
-            clicked => {
-                HomeState.open-history();
-            }
-        }
-        VerticalLayout {
-            alignment: center;
-            InfoTip {
-                text: HomeState.history-on ? @tr("Statistics keep only dates, word and dictation counts and speech time. History is on, so its folder also holds your dictated text and audio.") : @tr("Statistics keep only dates, word and dictation counts and speech time, never the text itself.");
             }
         }
     }

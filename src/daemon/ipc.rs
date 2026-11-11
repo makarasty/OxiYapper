@@ -98,6 +98,10 @@ pub trait Host: Send + Sync + 'static {
         set: &SettingsSet,
         language: Language,
     ) -> io::Result<()>;
+    /// Replaces the transcript of recording `id` with the user's edit; the run stays.
+    fn history_edit(&self, id: &str, text: &str) -> io::Result<()>;
+    /// Swaps the transcript of recording `id` with its other version.
+    fn history_restore(&self, id: &str) -> io::Result<()>;
     fn history_delete(&self, id: &str) -> io::Result<()>;
 }
 
@@ -453,15 +457,7 @@ impl Ctx {
                 id,
                 set,
                 language,
-            } => {
-                if session.test_running.is_some() {
-                    return conn.send(&test_failed(run, TestFailure::Busy)).is_ok();
-                }
-                let Ok(samples) = self.host.history_audio(&id) else {
-                    return conn.send(&test_failed(run, TestFailure::NoAudio)).is_ok();
-                };
-                self.start_test(session, run, set, language, samples)
-            }
+            } => self.retranscribe(conn, session, run, &id, set, language),
             Request::HistorySetText {
                 id,
                 text: Spoken(text),
@@ -470,6 +466,17 @@ impl Ctx {
             } => {
                 let done = self.host.history_set_text(&id, &text, &set, language);
                 history_result(conn, id, HistoryOp::SetText, done)
+            }
+            Request::HistoryEdit {
+                id,
+                text: Spoken(text),
+            } => {
+                let done = self.host.history_edit(&id, &text);
+                history_result(conn, id, HistoryOp::Edit, done)
+            }
+            Request::HistoryRestore { id } => {
+                let done = self.host.history_restore(&id);
+                history_result(conn, id, HistoryOp::Restore, done)
             }
             Request::HistoryDelete { id } => {
                 let done = self.host.history_delete(&id);
@@ -511,6 +518,25 @@ impl Ctx {
             let _ = conn.send(&hello_ack());
         }
         !first
+    }
+
+    /// Runs a stored recording through the test pipeline.
+    fn retranscribe(
+        &self,
+        conn: &mut Conn,
+        session: &mut Session,
+        run: u32,
+        id: &str,
+        set: SettingsSet,
+        language: Language,
+    ) -> bool {
+        if session.test_running.is_some() {
+            return conn.send(&test_failed(run, TestFailure::Busy)).is_ok();
+        }
+        let Ok(samples) = self.host.history_audio(id) else {
+            return conn.send(&test_failed(run, TestFailure::NoAudio)).is_ok();
+        };
+        self.start_test(session, run, set, language, samples)
     }
 
     /// Hands a recognition test run to the coordinator; its result comes back as a push.
@@ -939,6 +965,14 @@ impl Host for SystemHost {
         history::set_text(&self.history_dir()?, id, text, &ctx)
     }
 
+    fn history_edit(&self, id: &str, text: &str) -> io::Result<()> {
+        history::edit_text(&self.history_dir()?, id, text)
+    }
+
+    fn history_restore(&self, id: &str) -> io::Result<()> {
+        history::restore(&self.history_dir()?, id)
+    }
+
     fn history_delete(&self, id: &str) -> io::Result<()> {
         history::delete(&self.history_dir()?, id)
     }
@@ -1053,6 +1087,12 @@ mod tests {
             _set: &SettingsSet,
             _language: Language,
         ) -> io::Result<()> {
+            self.history_audio(id).map(drop)
+        }
+        fn history_edit(&self, id: &str, _text: &str) -> io::Result<()> {
+            self.history_audio(id).map(drop)
+        }
+        fn history_restore(&self, id: &str) -> io::Result<()> {
             self.history_audio(id).map(drop)
         }
         fn history_delete(&self, id: &str) -> io::Result<()> {
@@ -1283,6 +1323,29 @@ mod tests {
                 Some(Push::HistoryResult {
                     id: id.into(),
                     op: HistoryOp::SetText,
+                    ok
+                })
+            );
+            conn.send(&Request::HistoryEdit {
+                id: id.into(),
+                text: Spoken("edited".into()),
+            })
+            .unwrap();
+            assert_eq!(
+                conn.recv::<Push>().unwrap(),
+                Some(Push::HistoryResult {
+                    id: id.into(),
+                    op: HistoryOp::Edit,
+                    ok
+                })
+            );
+            conn.send(&Request::HistoryRestore { id: id.into() })
+                .unwrap();
+            assert_eq!(
+                conn.recv::<Push>().unwrap(),
+                Some(Push::HistoryResult {
+                    id: id.into(),
+                    op: HistoryOp::Restore,
                     ok
                 })
             );

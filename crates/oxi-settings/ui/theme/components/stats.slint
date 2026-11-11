@@ -253,7 +253,8 @@ export component ActivityHeatmap {
         x: grid.width - self.preferred-width;
         y: grid.height + Theme.space-3;
         width: self.preferred-width;
-        height: max(root.cell, Theme.caption-line);
+        // One legend line (DS-28.6): as high as its caption or swatch, not as the grid's cell.
+        height: max(root.legend-cell, Theme.caption-line);
         spacing: root.gap;
         Caption {
             text: root.less-text;

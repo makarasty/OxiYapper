@@ -267,11 +267,9 @@ fn a_new_recording_gets_a_ready_phrase_and_shows_its_length() {
     assert_eq!(take.peaks, 48);
     assert_eq!(take.play_off, "");
     assert_eq!(s.get_run_off(), "");
-    assert_eq!(s.get_run_note(), "1 recording · 4 sets");
 
     f.record_and_stop();
     assert_eq!(f.takes()[1].reference, tuning::phrases(Language::RU)[1]);
-    assert_eq!(s.get_run_note(), "2 recordings · 4 sets");
 }
 
 #[test]
@@ -446,10 +444,10 @@ fn history_recordings_are_offered_picked_and_given_back() {
     assert_eq!(s.get_history().row_count(), 0);
 }
 
-/// The Combo picks on every arrow key: a keyboard user walks to an older recording, and only
-/// Add adds it.
+/// Picking a recording adds it (DS-27.2) and the picker goes back to its prompt; there is no Add
+/// button.
 #[test]
-fn arrows_pick_a_history_recording_and_only_add_adds_it() {
+fn picking_a_history_recording_adds_it_and_there_is_no_add_button() {
     let f = Fixture::new("history-keys", None);
     let s = f.state();
     f.window.window().set_size(LogicalSize::new(1280.0, 860.0));
@@ -458,8 +456,11 @@ fn arrows_pick_a_history_recording_and_only_add_adds_it() {
         item(OLDER_ID, "older"),
         item(HISTORY_ID, "newest"),
     ]);
-    let add = with_role(&f.window, "Add", AccessibleRole::Button);
-    assert_eq!(add.accessible_enabled(), Some(false), "nothing picked yet");
+    assert_eq!(
+        ElementHandle::find_by_accessible_label(&f.window, "Add").count(),
+        0,
+        "no confirm button"
+    );
 
     // Focus the picker as a click does, then shut the list it opens.
     let combo = with_role(&f.window, "From history", AccessibleRole::Combobox);
@@ -475,21 +476,108 @@ fn arrows_pick_a_history_recording_and_only_add_adds_it() {
     press(&f.window, Key::Escape);
     press(&f.window, Key::DownArrow);
     press(&f.window, Key::DownArrow);
-    assert!(f.takes().is_empty(), "an arrow only picks");
+    assert!(f.takes().is_empty(), "arrows on the closed field only walk");
     assert_eq!(s.get_history_pick(), 2);
 
-    add.invoke_accessible_default_action();
+    // A pick from the open list adds it.
+    let click =
+        |event: fn(slint::LogicalPosition, slint::platform::PointerEventButton) -> WindowEvent| {
+            f.window.window().dispatch_event(event(position, button));
+        };
+    click(|position, button| WindowEvent::PointerPressed { position, button });
+    click(|position, button| WindowEvent::PointerReleased { position, button });
+    press(&f.window, Key::DownArrow);
+    assert!(
+        f.takes().is_empty(),
+        "an arrow in the open list adds nothing"
+    );
+    press(&f.window, Key::Return);
     let takes = f.takes();
     assert_eq!(takes.len(), 1, "exactly the picked one");
-    assert_eq!(takes[0].source, "2026-11-07 09:00:00");
+    assert_eq!(takes[0].source, "2026-11-06 08:00:00");
     assert_eq!(s.get_history_pick(), 0, "back on the prompt");
-    assert_eq!(add.accessible_enabled(), Some(false));
 }
 
-/// Under ~1180 px the control column is at its 240 px floor: Add must still sit inside the card,
-/// whose inner right edge is where the Scenario picker (filling the column) ends.
+/// Opens the history picker as a click does.
+fn open_picker(f: &Fixture) {
+    let combo = with_role(&f.window, "From history", AccessibleRole::Combobox);
+    let (at, size) = (combo.absolute_position(), combo.size());
+    let position = slint::LogicalPosition::new(at.x + size.width / 2.0, at.y + size.height / 2.0);
+    click_at(f, position);
+}
+
+fn click_at(f: &Fixture, position: slint::LogicalPosition) {
+    let button = slint::platform::PointerEventButton::Left;
+    let w = f.window.window();
+    w.dispatch_event(WindowEvent::PointerPressed { position, button });
+    w.dispatch_event(WindowEvent::PointerReleased { position, button });
+}
+
+fn picker_fixture(name: &str) -> Fixture {
+    let f = Fixture::new(name, None);
+    f.window.window().set_size(LogicalSize::new(1280.0, 860.0));
+    f.list_history(vec![
+        item("2026-11-06/080000-000", "oldest"),
+        item(OLDER_ID, "older"),
+        item(HISTORY_ID, "newest"),
+    ]);
+    f
+}
+
+/// Esc closes the list and adds nothing, after a walk in it or after a walk on the closed field.
 #[test]
-fn add_button_fits_at_720x520() {
+fn escape_in_the_history_list_adds_nothing() {
+    let f = picker_fixture("history-esc");
+    open_picker(&f);
+    press(&f.window, Key::DownArrow);
+    press(&f.window, Key::DownArrow);
+    press(&f.window, Key::Escape);
+    mock_elapsed_time(Duration::from_millis(1));
+    assert!(f.takes().is_empty(), "Esc after a walk in the open list");
+    assert_eq!(
+        f.state().get_history_pick(),
+        0,
+        "Esc puts the prompt back, not the walked name"
+    );
+
+    press(&f.window, Key::DownArrow);
+    open_picker(&f);
+    press(&f.window, Key::Escape);
+    mock_elapsed_time(Duration::from_millis(1));
+    assert!(f.takes().is_empty(), "Esc after a walk on the closed field");
+    assert_eq!(f.state().get_history_pick(), 0, "closed field: prompt back");
+}
+
+/// A click outside the list closes it and adds nothing.
+#[test]
+fn a_click_outside_the_history_list_adds_nothing() {
+    let f = picker_fixture("history-outside");
+    open_picker(&f);
+    press(&f.window, Key::DownArrow);
+    click_at(&f, slint::LogicalPosition::new(2.0, 2.0));
+    mock_elapsed_time(Duration::from_millis(1));
+    assert!(f.takes().is_empty());
+    assert_eq!(f.state().get_history_pick(), 0, "prompt back");
+}
+
+/// A click on a line adds that line.
+#[test]
+fn a_click_on_a_history_line_adds_it() {
+    let f = picker_fixture("history-line");
+    open_picker(&f);
+    let line = f.state().get_history().row_data(2).unwrap().to_string();
+    with_role(&f.window, &line, AccessibleRole::ListItem).invoke_accessible_default_action();
+    mock_elapsed_time(Duration::from_millis(1));
+    let takes = f.takes();
+    assert_eq!(takes.len(), 1, "exactly the clicked one");
+    assert_eq!(takes[0].source, "2026-11-07 09:00:00");
+    assert_eq!(f.state().get_history_pick(), 0, "back on the prompt");
+}
+
+/// Under ~1180 px the control column is at its 240 px floor: the history picker must still sit
+/// inside the card, whose inner right edge is where the Scenario picker (filling the column) ends.
+#[test]
+fn history_picker_fits_at_720x520() {
     let f = Fixture::new("history-narrow", None);
     f.window.window().set_size(LogicalSize::new(720.0, 520.0));
     f.list_history(vec![
@@ -498,14 +586,7 @@ fn add_button_fits_at_720x520() {
         item(HISTORY_ID, "newest"),
     ]);
     let right = |e: &ElementHandle| e.absolute_position().x + e.size().width;
-    let add = with_role(&f.window, "Add", AccessibleRole::Button);
     let card_right = right(&with_role(&f.window, "Scenario", AccessibleRole::Combobox));
-    assert!(
-        right(&add) <= card_right + 0.5,
-        "Add ends at {}, the card at {card_right}",
-        right(&add)
-    );
-    assert!(right(&add) <= 720.0, "Add ends at {}", right(&add));
     let picker = with_role(&f.window, "From history", AccessibleRole::Combobox);
     assert!(
         right(&picker) <= card_right + 0.5,
@@ -713,10 +794,6 @@ fn the_scenario_picks_the_sets() {
     f.state().invoke_profile_picked();
     f.record_and_stop();
     let sets = Profile::BadMicrophone.sets().len();
-    assert_eq!(
-        f.state().get_run_note(),
-        format!("1 recording · {sets} sets")
-    );
     f.state().invoke_run();
     assert_eq!(f.state().get_rows().row_count(), sets);
 }
@@ -1255,4 +1332,20 @@ fn real_shots_of_the_states() {
         next.set(i + 1);
     });
     window.run().unwrap();
+}
+
+/// Leaving the closed field after an arrow (Tab, a click elsewhere) puts the prompt back: the
+/// walked name was only a preview.
+#[test]
+fn leaving_the_closed_history_field_after_an_arrow_puts_the_prompt_back() {
+    let f = picker_fixture("history-leave");
+    open_picker(&f);
+    press(&f.window, Key::Escape);
+    mock_elapsed_time(Duration::from_millis(1));
+    press(&f.window, Key::DownArrow);
+    assert_eq!(f.state().get_history_pick(), 1, "the arrow walked");
+    press(&f.window, Key::Tab);
+    mock_elapsed_time(Duration::from_millis(1));
+    assert_eq!(f.state().get_history_pick(), 0, "Tab away");
+    assert!(f.takes().is_empty());
 }

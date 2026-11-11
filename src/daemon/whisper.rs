@@ -10,7 +10,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use oxi_core::audio::{self, AudioError};
-use oxi_core::config::{Audio, Config};
+use oxi_core::config::{Advanced, Audio, Config};
 use oxi_core::device::DeviceChoice;
 use oxi_core::ipc::{DeleteResult, Push, TestFailure, TestOutcome};
 use oxi_core::machine::{
@@ -20,7 +20,7 @@ use oxi_core::models;
 use oxi_core::paths::Layout;
 use oxi_core::strings;
 use oxi_core::text::Outcome;
-use oxi_core::tuning::SettingsSet;
+use oxi_core::tuning::{self, SettingsSet};
 use oxi_core::types::Language;
 use oxi_whisper::{Cancel, Engine, LoadInfo, Transcript};
 
@@ -38,6 +38,8 @@ struct Hooks<'a> {
 /// One loaded model; [`Engine`] in the daemon, a fake in the tests.
 trait Recognizer {
     fn info(&self) -> &LoadInfo;
+    /// Takes the per-run engine parameters for the next run.
+    fn set_advanced(&mut self, _: &Advanced) {}
     fn transcribe(
         &mut self,
         samples: &[f32],
@@ -80,6 +82,10 @@ impl Recognizer for Engine {
         Engine::info(self)
     }
 
+    fn set_advanced(&mut self, adv: &Advanced) {
+        Engine::set_advanced(self, adv);
+    }
+
     fn transcribe(
         &mut self,
         samples: &[f32],
@@ -109,9 +115,10 @@ pub fn spawn(
     thread::Builder::new()
         .name("whisper".into())
         .spawn(move || {
-            let load = |path: &Path, choice: &DeviceChoice| -> anyhow::Result<Engine> {
-                Ok(Engine::load(path, choice)?)
-            };
+            let load =
+                |path: &Path, choice: &DeviceChoice, adv: &Advanced| -> anyhow::Result<Engine> {
+                    Ok(Engine::load_with(path, choice, adv)?)
+                };
             let mut worker = Worker::new(load, inbox, layout, phase);
             while let Some(cmd) = worker.next_cmd(&rx) {
                 worker.handle(cmd);
@@ -151,7 +158,7 @@ struct Worker<R, L> {
     tap: Tap,
 }
 
-impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<R, L> {
+impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<R>> Worker<R, L> {
     fn new(load: L, inbox: Sender<Inbox>, layout: Layout, phase: PhaseCell) -> Self {
         let assets = TextAssets::load(&layout);
         Self {
@@ -263,6 +270,17 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
                     self.cpu_reason = None;
                     if self.loaded.is_none() {
                         self.report(None);
+                    }
+                }
+                // Flash attention is a context parameter: the next job loads the model again,
+                // but only when what it resolves to on the loaded device differs.
+                if let Some(engine) = &self.loaded {
+                    let on_gpu = engine.info().device.is_some();
+                    let resolved =
+                        |c: &Config| tuning::flash_attn(&c.model.advanced, on_gpu).unwrap_or(false);
+                    if resolved(&cfg) != resolved(&self.cfg) {
+                        self.loaded = None;
+                        self.loaded_for = None;
                     }
                 }
                 self.cfg = *cfg;
@@ -425,12 +443,13 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
         } else {
             self.cfg.model.gpu.clone()
         };
-        let engine = match (self.load)(&model.path, &choice) {
+        let adv = self.cfg.model.advanced.clone();
+        let engine = match (self.load)(&model.path, &choice, &adv) {
             Ok(engine) => engine,
             Err(e) if choice != DeviceChoice::Cpu => {
                 tracing::warn!("model load on the GPU failed ({e:#}), retrying on CPU");
                 reason = Some(e.to_string());
-                (self.load)(&model.path, &DeviceChoice::Cpu).map_err(|e| {
+                (self.load)(&model.path, &DeviceChoice::Cpu, &adv).map_err(|e| {
                     tracing::warn!("model load on CPU failed: {e:#}");
                     load_failure(&e)
                 })?
@@ -549,7 +568,9 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice) -> anyhow::Result<R>> Worker<
             progress: &mut progress,
             cancel: Some(&cancel),
         };
-        engine.transcribe(samples, self.cfg.model.language, &self.assets.prompt, hooks)
+        engine.set_advanced(&self.cfg.model.advanced);
+        let prompt = tuning::prompt(&self.cfg.model.advanced, &self.assets.prompt);
+        engine.transcribe(samples, self.cfg.model.language, &prompt, hooks)
     }
 }
 
@@ -594,7 +615,7 @@ mod tests {
         no_gpu: bool,
     }
 
-    type Loader = Box<dyn FnMut(&Path, &DeviceChoice) -> anyhow::Result<Fake>>;
+    type Loader = Box<dyn FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<Fake>>;
     type TestWorker = Worker<Fake, Loader>;
 
     struct Fake {
@@ -648,7 +669,7 @@ mod tests {
 
         fn loader(&self) -> Loader {
             let s = self.clone();
-            Box::new(move |_, choice| {
+            Box::new(move |_, choice, _| {
                 s.calls.borrow_mut().push(choice.clone());
                 let asked_gpu = *choice != DeviceChoice::Cpu;
                 let cpu = !asked_gpu || s.silent_cpu || s.no_gpu;
@@ -1127,6 +1148,59 @@ mod tests {
     }
 
     #[test]
+    fn a_flash_attention_change_loads_the_model_again_but_other_parameters_do_not() {
+        let (r, s) = (rig("flash"), Script::new());
+        let (mut w, rx) = worker(&s, &r);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        job(&mut w);
+        let _ = text(&rx);
+        let mut cfg = r.cfg(DeviceChoice::Cpu);
+        cfg.model.advanced.threads = oxi_core::config::Auto::Set(2);
+        w.handle(WhisperCmd::Config(cfg.clone()));
+        job(&mut w);
+        assert_eq!(s.calls().len(), 1, "threads apply per run");
+        cfg.model.advanced.flash_attn = oxi_core::config::Auto::Set(true);
+        w.handle(WhisperCmd::Config(cfg));
+        job(&mut w);
+        assert_eq!(s.calls().len(), 2, "flash attention is a load parameter");
+    }
+
+    #[test]
+    fn a_flash_attention_choice_that_resolves_the_same_keeps_the_model() {
+        use oxi_core::config::Auto;
+        let flash = |w: &mut TestWorker, r: &Rig, device, v: Auto<bool>| {
+            let mut cfg = r.cfg(device);
+            cfg.model.advanced.flash_attn = v;
+            w.handle(WhisperCmd::Config(cfg));
+        };
+        // GPU: Auto is on, so On changes nothing and Off does.
+        let (r, s) = (rig("flash-gpu"), Script::new());
+        let (mut w, rx) = worker(&s, &r);
+        flash(&mut w, &r, DeviceChoice::Auto, Auto::Auto);
+        job(&mut w);
+        let _ = text(&rx);
+        flash(&mut w, &r, DeviceChoice::Auto, Auto::Set(true));
+        job(&mut w);
+        assert_eq!(s.calls().len(), 1, "Auto and On are the same on a GPU");
+        flash(&mut w, &r, DeviceChoice::Auto, Auto::Set(false));
+        job(&mut w);
+        assert_eq!(s.calls().len(), 2);
+        // CPU: Auto is off, so Off changes nothing.
+        let (r, s) = (rig("flash-cpu"), Script::new());
+        let (mut w, rx) = worker(&s, &r);
+        flash(&mut w, &r, DeviceChoice::Cpu, Auto::Auto);
+        job(&mut w);
+        let _ = text(&rx);
+        flash(&mut w, &r, DeviceChoice::Cpu, Auto::Set(false));
+        job(&mut w);
+        assert_eq!(
+            s.calls().len(),
+            1,
+            "Auto and Off are the same on the processor"
+        );
+    }
+
+    #[test]
     fn gpu_failure_during_a_job_retries_that_job_on_cpu() {
         let (r, mut s) = (rig("gpurun"), Script::new());
         s.gpu_run_fails = true;
@@ -1421,8 +1495,9 @@ mod tests {
         assert_eq!(rate, audio::SAMPLE_RATE);
         let r = rig("real");
         let (tx, rx) = channel();
-        let load =
-            |p: &Path, c: &DeviceChoice| -> anyhow::Result<Engine> { Ok(Engine::load(p, c)?) };
+        let load = |p: &Path, c: &DeviceChoice, a: &Advanced| -> anyhow::Result<Engine> {
+            Ok(Engine::load_with(p, c, a)?)
+        };
         let mut w = Worker::new(load, tx, r.layout(), PhaseCell::default());
         let mut cfg = r.cfg(DeviceChoice::Cpu);
         cfg.model.custom_path = model.to_str().unwrap().into();

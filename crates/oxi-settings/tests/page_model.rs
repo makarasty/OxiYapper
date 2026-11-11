@@ -16,7 +16,7 @@ use oxi_core::models::MODELS;
 use oxi_core::paths::Layout;
 use oxi_core::types::Language;
 use oxi_settings::ipc::{Event, Link};
-use oxi_settings::{AppWindow, Ipc, Page, Toast};
+use oxi_settings::{AppWindow, Ipc, ModelState, Page, Toast};
 use slint::ComponentHandle;
 use slint::platform::{Key, PointerEventButton, WindowEvent};
 
@@ -69,11 +69,14 @@ fn rows_show_size_and_status_from_the_files() {
     fs::write(l.models_dir().join("ggml-large-v3.bin"), b"synthetic").unwrap();
     let window = open(&l, Page::Model);
     // The gallery opens on the model in use.
-    assert!(has(&window, "1.6 GB · fast, good for most"));
+    assert!(has(&window, "1.6 GB · Fast · 99 languages"));
     assert!(has(&window, "Whisper large-v3 turbo: Not downloaded"));
     // The badge says "Damaged"; the caption only says what to do.
     view(&window, "Whisper large-v3");
-    assert!(has(&window, "3.1 GB · download it again"));
+    assert!(has(
+        &window,
+        "3.1 GB · Slower · 99 languages · download it again"
+    ));
     assert!(has(&window, "Whisper large-v3: Damaged"));
     for name in ["Whisper large-v3 turbo", "Whisper large-v3"] {
         view(&window, name);
@@ -847,8 +850,173 @@ fn row_titles_start_at_one_x_and_text_rows_use_the_width() {
     }
     let line = with_role(
         &window,
-        "4 with a GPU; without one, half the processor's threads, at most 8.",
+        "Auto: 4 now, a GPU does the heavy work. On the processor alone: half its threads, at most 8.",
         AccessibleRole::Text,
     );
     assert!(line.size().height < 24.0, "wraps: {:?}", line.size());
+}
+
+/// The Prompt field is typed in, so its binding to the config ends: "Reset all to Auto" must
+/// still empty it, and a saved prompt shows again after the page reads the config.
+#[test]
+fn reset_all_to_auto_empties_the_typed_prompt() {
+    let l = layout("prompt-reset", None);
+    let window = open(&l, Page::Model);
+    sub_tab(&window, "Advanced");
+    let field = with_role(&window, "Prompt", AccessibleRole::TextInput);
+    field.set_accessible_value("Notes.".to_owned());
+    // Enter or leaving the field commits it.
+    window
+        .global::<ModelState>()
+        .invoke_adv_prompt_edited("Notes.".into());
+    assert_eq!(saved(&l).advanced.initial_prompt, "Notes.");
+    // Slint runs `changed` handlers on the next tick, as the running app does between two clicks.
+    let tick = || i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    tick();
+    button(&window, "Reset all to Auto").invoke_accessible_default_action();
+    assert_eq!(saved(&l).advanced.initial_prompt, "");
+    tick();
+    assert_eq!(field.accessible_value().as_deref(), Some(""));
+}
+
+/// Every engine parameter has its Auto row, the audio window included, each with its own glyph
+/// (DS-24.1: one meaning, one icon).
+#[test]
+fn advanced_has_a_row_per_parameter_and_none_shares_a_glyph() {
+    let window = open(&layout("adv-rows", None), Page::Model);
+    sub_tab(&window, "Advanced");
+    for title in ["Audio window", "Temperature", "Repetition threshold"] {
+        assert!(has(&window, title), "{title}");
+    }
+    let slint = include_str!("../ui/pages/model.slint");
+    let advanced = &slint[slint.find("ModelState.tab == 2").expect("the Advanced tab")..];
+    let icons: Vec<&str> = advanced
+        .split("icon: Icons.")
+        .skip(1)
+        .filter_map(|t| t.split(';').next())
+        .collect();
+    assert!(icons.len() >= 12, "{icons:?}");
+    let mut seen = std::collections::HashSet::new();
+    for icon in icons {
+        assert!(seen.insert(icon), "{icon} is on two Advanced controls");
+    }
+}
+
+/// DS-23.5, DS-7.3: a card's get slot (Resume, Cancel) and Delete slot keep their place while a
+/// download starts and stops, and both end inside the control column.
+#[test]
+fn a_paused_download_moves_no_button_when_it_resumes_or_cancels() {
+    let l = layout("card-slots", None);
+    let turbo = MODELS.iter().find(|m| m.id == "turbo").unwrap();
+    fs::create_dir_all(l.models_dir()).unwrap();
+    common::fake_model(
+        &l.models_dir().join(format!("{}.part", turbo.file_name)),
+        3_000_000,
+    );
+    let (ipc, _sent) = Ipc::fake();
+    let window = open_linked(&l, Page::Model, ipc.clone());
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(720.0, 520.0));
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    let name = "Whisper large-v3 turbo";
+    let x = |label: String| {
+        let e = button(&window, &label);
+        (
+            e.absolute_position().x,
+            e.absolute_position().x + e.size().width,
+        )
+    };
+    let resume = x(format!("Resume {name}"));
+    let delete = x(format!("Delete {name}"));
+    assert!(delete.0 >= resume.1, "Delete is the right-most");
+    ipc.deliver(&Event::Push(Push::DownloadProgress {
+        id: "turbo".into(),
+        done: 1,
+        total: 2,
+    }));
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    let cancel = x(format!("Cancel {name}"));
+    assert!(
+        (cancel.0 - resume.0).abs() < 0.5,
+        "Resume {resume:?} -> Cancel {cancel:?}"
+    );
+    assert!(
+        !has(&window, &format!("Delete {name}")),
+        "no Delete in a running download"
+    );
+}
+
+/// Every Advanced choice leaves its row the room for the number beside it at the least window
+/// (the 240 column: choice + 8 + the 88 side slot). The Combo's default width is the whole
+/// column, which pushed the number out of the row.
+#[test]
+fn the_advanced_choices_leave_room_for_the_number_at_the_least_window() {
+    let window = open(&layout("adv-fit", None), Page::Model);
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(720.0, 520.0));
+    sub_tab(&window, "Advanced");
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    let combos = i_slint_backend_testing::ElementQuery::from_root(&window)
+        .match_accessible_role(AccessibleRole::Combobox)
+        .find_all();
+    assert!(combos.len() >= 6, "{} choices", combos.len());
+    for c in combos {
+        let w = c.size().width;
+        assert!(
+            w <= 240.0 - 8.0 - 88.0 + 0.5,
+            "{:?} is {w} wide",
+            c.accessible_label()
+        );
+    }
+}
+
+/// DS-24.1 on the three rows that once shared a meaning with another page's icon: each keeps its
+/// own glyph file, and no two Advanced rows draw the same file.
+#[test]
+fn the_advanced_rows_draw_distinct_glyph_files() {
+    let slint = include_str!("../ui/pages/model.slint");
+    let icons = include_str!("../ui/theme/icons.slint");
+    let icon_of = |title: &str| {
+        let at = slint
+            .find(&format!("title: @tr(\"{title}\")"))
+            .expect(title);
+        let before = &slint[..at];
+        let name = before.rsplit("icon: Icons.").next().unwrap();
+        name.split(';').next().unwrap().to_owned()
+    };
+    for (title, want) in [
+        ("Processor threads", "threads"),
+        ("Flash attention", "flash-attention"),
+        ("Retry doubtful segments", "retry-doubtful"),
+    ] {
+        assert_eq!(icon_of(title), want, "{title}");
+    }
+    let file_of = |name: &str| {
+        let line = icons
+            .lines()
+            .find(|l| l.contains(&format!("property <image> {name}:")))
+            .unwrap_or_else(|| panic!("no icon {name}"));
+        line.split("icons/")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    let advanced = &slint[slint.find("ModelState.tab == 2").unwrap()..];
+    let mut seen = std::collections::HashSet::new();
+    for name in advanced
+        .split("icon: Icons.")
+        .skip(1)
+        .filter_map(|t| t.split(';').next())
+    {
+        let file = file_of(name);
+        assert!(
+            seen.insert(file.clone()),
+            "{file} is on two Advanced controls"
+        );
+    }
 }

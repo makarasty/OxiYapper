@@ -101,6 +101,19 @@ pub enum Request {
         set: SettingsSet,
         language: Language,
     },
+    /// Replace the transcript of recording `id` with `text` the user edited; the run that made
+    /// it (model, language, settings) stays. The old text is kept as the other version. Answered
+    /// with [`Push::HistoryResult`] (`Edit`).
+    HistoryEdit {
+        id: String,
+        text: Spoken,
+    },
+    /// Swap the transcript of recording `id` with its other version (Restore old, Use new); the
+    /// swap undoes itself. Answered with [`Push::HistoryResult`] (`Restore`), `ok` false when no
+    /// other version is kept.
+    HistoryRestore {
+        id: String,
+    },
     /// Delete recording `id` (audio, text and meta). Answered with [`Push::HistoryResult`].
     HistoryDelete {
         id: String,
@@ -143,6 +156,8 @@ pub struct HistoryItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HistoryOp {
     SetText,
+    Edit,
+    Restore,
     Delete,
 }
 
@@ -423,7 +438,8 @@ pub enum Push {
         items: Vec<HistoryItem>,
         more: bool,
     },
-    /// Answer to [`Request::HistorySetText`] and [`Request::HistoryDelete`].
+    /// Answer to [`Request::HistorySetText`], [`Request::HistoryEdit`], [`Request::HistoryRestore`]
+    /// and [`Request::HistoryDelete`].
     HistoryResult {
         id: String,
         op: HistoryOp,
@@ -755,6 +771,13 @@ mod tests {
                 text: Spoken("secret words".into()),
                 set,
                 language: Language::RU,
+            },
+            Request::HistoryEdit {
+                id: "2026-11-10/101500-123".into(),
+                text: Spoken("secret words".into()),
+            },
+            Request::HistoryRestore {
+                id: "2026-11-10/101500-123".into(),
             },
             Request::HistoryDelete {
                 id: "2026-11-10/101500-123".into(),

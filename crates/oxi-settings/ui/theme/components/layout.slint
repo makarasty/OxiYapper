@@ -26,12 +26,16 @@ export component Group inherits VerticalLayout {
         padding-bottom: Theme.header-gap - Theme.card-gap;
         spacing: Theme.pair-gap;
         alignment: stretch;
-        if root.icon.width > 0: Image {
-            source: root.icon;
-            width: Theme.icon-size;
-            height: Theme.icon-size;
-            colorize: Theme.text-primary;
-            accessible-role: none;
+        // Centred in the row, which a trailing action button makes taller than the icon.
+        if root.icon.width > 0: VerticalLayout {
+            alignment: center;
+            Image {
+                source: root.icon;
+                width: Theme.icon-size;
+                height: Theme.icon-size;
+                colorize: Theme.text-primary;
+                accessible-role: none;
+            }
         }
         Text {
             text: root.title;
@@ -41,8 +45,11 @@ export component Group inherits VerticalLayout {
             // Centred in the icon's 20 px cell, so the icon and the text share one centre.
             vertical-alignment: center;
         }
-        if root.info != "": InfoTip {
-            text: root.info;
+        if root.info != "": VerticalLayout {
+            alignment: center;
+            InfoTip {
+                text: root.info;
+            }
         }
         Rectangle {
             horizontal-stretch: 1;

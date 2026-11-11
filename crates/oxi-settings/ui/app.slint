@@ -360,6 +360,7 @@ export component AppWindow inherits Window {
                         }
                         if root.page == Page.model: ModelPage { }
                         if root.page == Page.text: TextPage {
+                            window-width: root.width;
                             free-height: root.free-height;
                         }
                         if root.page == Page.overlay: OverlayPage { }

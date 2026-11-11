@@ -126,14 +126,18 @@ pub fn label_variants(state: OverlayState) -> [&'static str; 6] {
             ending_soon,
         })
     };
-    [
-        strings::overlay_label(state),
+    let rest = [
         rec(false, false),
         rec(true, false),
         rec(true, true),
         TOO_LOUD,
         "00:00",
-    ]
+    ];
+    // A label the rest already holds becomes "" (zero width): the slot is the widest text either
+    // way, and every recording state gets the same set.
+    let own = strings::overlay_label(state);
+    let own = if rest.contains(&own) { "" } else { own };
+    [own, rest[0], rest[1], rest[2], rest[3], rest[4]]
 }
 
 /// Left edge of a status label `text_w` wide in a pill `pill_w` wide: its box centred on the

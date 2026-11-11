@@ -209,8 +209,8 @@ fn no_data_says_to_hold_the_current_chord() {
     ));
 }
 
-/// UI rules 1 and 5: the first dictation does not shrink the activity card, so the History folder
-/// row under it stays where it was.
+/// UI rules 1 and 5: the first dictation does not resize the activity card, so the History folder
+/// button in its title row stays where it was.
 #[test]
 fn the_first_dictation_moves_nothing_below_the_heatmap() {
     let l = layout("first-dictation", Some(CHORD));
@@ -272,7 +272,7 @@ fn the_hints_live_in_info_tips() {
             .into_iter()
             .filter_map(|e| e.accessible_label())
             .map(|l| l.to_string())
-            .filter(|l| l.contains(FIRST) || l.contains(CLICK) || l.starts_with("Statistics"))
+            .filter(|l| l.contains(FIRST) || l.contains(CLICK))
             .fold(Vec::<String>::new(), |mut seen, l| {
                 // A component and its inner parts can answer with one label.
                 if !seen.contains(&l) {
@@ -283,24 +283,19 @@ fn the_hints_live_in_info_tips() {
     };
     assert_eq!(
         tips(&window),
-        [
-            format!("Hold Ctrl + F13 and speak. {FIRST}"),
-            ON_NOTE.to_owned()
-        ]
+        [format!("Hold Ctrl + F13 and speak. {FIRST}")]
     );
     write_stats(&l, 42);
     poll();
     assert_eq!(
         tips(&window),
-        [
-            format!("Hold Ctrl + F13 and speak. {CLICK}"),
-            ON_NOTE.to_owned()
-        ]
+        [format!("Hold Ctrl + F13 and speak. {CLICK}")]
     );
     assert!(!has(&window, "No dictations yet"), "the heatmap is back");
 }
 
-/// Item 12: a large window gives the activity card the spare height; the folder row ends the page.
+/// UI rule 24: the activity card is as high as its content; a large window's spare height stays
+/// under it, the folder button sits in the card's title row, and the page does not scroll.
 #[test]
 fn the_page_fills_a_large_window() {
     let (ipc, _rx) = Ipc::fake();
@@ -309,15 +304,31 @@ fn the_page_fills_a_large_window() {
     for (w, h) in [(1280.0, 860.0), (1920.0, 1080.0)] {
         window.window().set_size(slint::LogicalSize::new(w, h));
         settle();
-        let button = common::one(&window, "History folder");
-        let bottom = button.absolute_position().y + button.size().height;
-        // The page's bottom padding is all that is left under it.
-        assert!(
-            bottom > h - 40.0 && bottom <= h,
-            "{w}x{h}: ends at {bottom}"
+        // `ends_inside` also holds the button above the grid.
+        let map = heatmap(&window);
+        ends_inside(&window, &map, w, h);
+        // The card hugs its content: the grid plus the card's paddings, not the window's height.
+        let card = activity_card(&window, &map);
+        let pad = window.global::<oxi_settings::Tokens>().get_card_padding_v();
+        assert_eq!(
+            card.size().height,
+            map.size().height + 2.0 * pad,
+            "{w}x{h}: the activity card is not as high as its content"
         );
-        assert_eq!(window.get_scroll_y(), 0.0);
     }
+}
+
+/// The card around the heatmap (the one `CardFrame` that holds it).
+fn activity_card(window: &AppWindow, map: &ElementHandle) -> ElementHandle {
+    let (top, bottom) = (
+        map.absolute_position().y,
+        map.absolute_position().y + map.size().height,
+    );
+    ElementHandle::find_by_element_type_name(window, "CardFrame")
+        .find(|c| {
+            c.absolute_position().y <= top && c.absolute_position().y + c.size().height >= bottom
+        })
+        .expect("the activity card")
 }
 
 /// Item 38: hovering a bar names its day and exact number at once.
@@ -655,9 +666,9 @@ fn a_new_number_leaves_the_focus_on_the_card() {
     let (ipc, _rx) = Ipc::fake();
     let window = open_linked(&layout("focus", None), Page::Home, ipc.clone());
     stats_push(&ipc, sample());
-    // Backwards from the end of the tab order: the disclaimer "i", the folder button, the
-    // activity "i", then the last card.
-    for _ in 0..4 {
+    // Backwards from the end of the tab order: the folder button, the activity "i", then the
+    // last card.
+    for _ in 0..3 {
         press(&window, Key::Backtab);
     }
     stats_push(
@@ -673,23 +684,19 @@ fn a_new_number_leaves_the_focus_on_the_card() {
     assert!(has(&window, "Streak by day"), "the card lost the focus");
 }
 
-const OFF_NOTE: &str =
-    "Statistics keep only dates, word and dictation counts and speech time, never the text itself.";
-const ON_NOTE: &str = "Statistics keep only dates, word and dictation counts and speech time. History is on, so its folder also holds your dictated text and audio.";
-
+/// The folder button's tooltip (not readable through accessibility) says what the folder holds
+/// by this flag: it follows the config's history switch.
 #[test]
-fn the_disclaimer_follows_history() {
+fn the_folder_tip_follows_history() {
     i_slint_backend_testing::init_no_event_loop();
     // History is on by default, so the off case writes `enabled = false` explicitly (R1.3).
     let off = "version = 2\n[history]\nenabled = false\n";
     let window = common::open_again(&layout("disclaimer", Some(off)), Page::Home);
-    assert!(has(&window, OFF_NOTE));
-    assert!(!has(&window, ON_NOTE));
+    assert!(!window.global::<oxi_settings::HomeState>().get_history_on());
 
     let config = "version = 2\n[history]\nenabled = true\n";
     let window = common::open_again(&layout("disclaimer-on", Some(config)), Page::Home);
-    assert!(has(&window, ON_NOTE));
-    assert!(!has(&window, OFF_NOTE));
+    assert!(window.global::<oxi_settings::HomeState>().get_history_on());
 }
 
 /// With the data directory gone there is nothing to open, so no test ever opens Explorer: the
@@ -788,28 +795,24 @@ fn twenty_six_weeks_fit_the_minimum_window() {
     );
 }
 
-/// Item 12: a wide window shows up to a year of weeks and grows the cells, so the grid fills the
-/// card's width with no empty band beside it.
+/// DS-28.6: a wide window always shows the last 26 weeks, never more; the cells grow to their
+/// 36 px cap and the grid stays centred in the card.
 #[test]
-fn a_wide_window_fills_the_card_with_a_year() {
-    fills_the_card_with_a_year("year", &[(1280.0, 860.0, None), (1920.0, 1080.0, Some(53))]);
+fn a_wide_window_shows_half_a_year_in_larger_cells() {
+    fills_the_card("half", &[(1280.0, 860.0), (1920.0, 1080.0)]);
 }
 
-/// The same at a maximised 2560 x 1440: no cell cap leaves a band right of the grid.
+/// The same at a maximised 2560 x 1440: the capped grid stays inside the card.
 #[test]
-fn a_maximised_window_fills_the_card_with_a_year() {
-    fills_the_card_with_a_year("year-max", &[(2560.0, 1440.0, Some(53))]);
+fn a_maximised_window_shows_half_a_year() {
+    fills_the_card("half-max", &[(2560.0, 1440.0)]);
 }
 
-/// A full year in a wide, low window: the cells are height-limited, and the grid still ends in the
-/// card with the page unscrolled and its last row (the folder button) inside the window.
+/// A wide, low window: the height limits the cells, and the grid still ends in the card with the
+/// page unscrolled and inside the window.
 #[test]
-fn a_wide_low_window_holds_a_year_without_overflow() {
-    // Ultrawide: the height limits the cells, so a band stays right of the grid.
-    fills_the_card_with_a_year(
-        "year-low",
-        &[(2560.0, 700.0, Some(53)), (3440.0, 720.0, Some(53))],
-    );
+fn a_wide_low_window_holds_half_a_year_without_overflow() {
+    fills_the_card("half-low", &[(2560.0, 700.0), (3440.0, 720.0)]);
 }
 
 /// The cell's height room never overshoots: from the lowest to a tall window, at 1920 to 3840 wide, a year in a
@@ -851,10 +854,10 @@ fn the_year_in_the_theme_is_the_core_year() {
     );
 }
 
-fn fills_the_card_with_a_year(name: &str, sizes: &[(f32, f32, Option<usize>)]) {
+fn fills_the_card(name: &str, sizes: &[(f32, f32)]) {
     let (ipc, _rx) = Ipc::fake();
     let window = open_linked(&layout(name, None), Page::Home, ipc.clone());
-    for &(w, h, weeks) in sizes {
+    for &(w, h) in sizes {
         window.window().set_size(slint::LogicalSize::new(w, h));
         settle();
         stats_push(
@@ -868,40 +871,52 @@ fn fills_the_card_with_a_year(name: &str, sizes: &[(f32, f32, Option<usize>)]) {
         let map = heatmap(&window);
         let label = map.accessible_label().unwrap().to_string();
         let shown: usize = label.rsplit(' ').nth(1).unwrap().parse().unwrap();
-        assert!(shown > 26, "{w}: more than the narrow 26 weeks: {label}");
-        if let Some(weeks) = weeks {
-            assert_eq!(shown, weeks, "{w}: a year");
-        }
-        // The activity card is as wide as the row of stat cards: it ends where the last one does.
+        assert_eq!(shown, 26, "{w}: half a year, whatever the width: {label}");
+        // The activity card is as wide as the row of stat cards: the grid ends inside it.
         let last = ElementHandle::find_by_accessible_label(&window, CARDS[3])
             .next()
             .expect("the streak card");
         let card_right = last.absolute_position().x + last.size().width;
         let right = map.absolute_position().x + map.size().width;
-        // Not in an ultrawide low window: there the height limits the cells and a band stays.
-        let height_limited = w > 3000.0 && h < 800.0;
         assert!(
-            card_right - right < 60.0 || height_limited,
-            "{w}: the grid ends at {right}, the card near {card_right}"
+            right <= card_right,
+            "{w}: the grid ends at {right}, the card at {card_right}"
+        );
+        // The cells grow to their cap when the window is big enough, and never past it.
+        let t = window.global::<oxi_settings::Tokens>();
+        let cell = (map.size().width - t.get_heat_label_width()) / 26.0 - t.get_heat_gap();
+        assert!(cell <= t.get_heat_cell_max(), "{w}x{h}: cell {cell}");
+        if w >= 1920.0 && h >= 1080.0 {
+            assert_eq!(cell, t.get_heat_cell_max(), "{w}x{h}: cells at their cap");
+        }
+        // Centred in the card's inner width (the stat cards row spans the same width).
+        let first = ElementHandle::find_by_accessible_label(&window, CARDS[0])
+            .next()
+            .expect("the first card");
+        let gap_left =
+            map.absolute_position().x - (first.absolute_position().x + t.get_card_padding_h());
+        let gap_right = (card_right - t.get_card_padding_h()) - right;
+        assert!(
+            (gap_left - gap_right).abs() <= 1.0,
+            "{w}x{h}: the grid is off-centre: {gap_left} left, {gap_right} right"
         );
         ends_inside(&window, &map, w, h);
     }
 }
 
-/// The grid ends above the folder button (below the card), whose row ends inside the window: the
-/// page does not overflow or scroll.
+/// The grid starts below the folder button (in the card's title row) and ends inside the window:
+/// the page does not overflow or scroll.
 fn ends_inside(window: &AppWindow, map: &ElementHandle, w: f32, h: f32) {
     let button = ElementHandle::find_by_accessible_label(window, "History folder")
         .next()
         .expect("the folder button");
-    let bottom = map.absolute_position().y + map.size().height;
+    let top = map.absolute_position().y;
     assert!(
-        bottom <= button.absolute_position().y,
-        "{w}x{h}: the grid ends at {bottom}, the button starts at {}",
-        button.absolute_position().y
+        button.absolute_position().y + button.size().height <= top,
+        "{w}x{h}: the grid starts at {top}, the button ends lower"
     );
-    let end = button.absolute_position().y + button.size().height;
-    // Its last row plus the page's bottom padding fit the window, or the page scrolls.
+    let end = top + map.size().height;
+    // The grid plus the page's bottom padding fit the window, or the page scrolls.
     let pad = window.global::<oxi_settings::Tokens>().get_page_padding();
     assert!(end + pad <= h, "{w}x{h}: the page ends at {}", end + pad);
     assert_eq!(window.get_scroll_y(), 0.0, "{w}x{h} scrolled");

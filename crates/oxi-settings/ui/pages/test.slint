@@ -66,8 +66,6 @@ export global TestState {
     // The run's progress, 0 to 1, and its label ("42 %").
     in property <float> progress;
     in property <string> progress-text;
-    // What a run will do: "2 recordings · 4 sets".
-    in property <string> run-note;
     // Why Run is off; empty while it is on.
     in property <string> run-off;
     // 0 Recordings, 1 Results.
@@ -207,7 +205,8 @@ component Wave inherits Rectangle {
     }
 }
 
-// One picked recording: play it, see its length and waveform, edit what was said.
+// One picked recording (DS-23): the bar holds Play first and Delete last, the wave and the length
+// between them, then the text of what was said.
 component TakeCard inherits CardFrame {
     in property <TestTake> take;
     in property <int> index;
@@ -218,59 +217,61 @@ component TakeCard inherits CardFrame {
         // dropped the binding).
         area.text = root.take.reference;
     }
-    HorizontalLayout {
+    VerticalLayout {
         padding-left: Theme.card-padding-h;
         padding-right: Theme.card-padding-h;
         padding-top: Theme.card-padding-v;
         padding-bottom: Theme.card-padding-v;
-        spacing: Theme.icon-gap;
-        VerticalLayout {
-            preferred-width: Theme.control-column-min;
-            horizontal-stretch: 0;
-            spacing: Theme.space-2;
-            HorizontalLayout {
-                spacing: Theme.control-gap;
-                Button {
-                    icon: root.playing ? @image-url("") : Icons.play;
-                    text: root.playing ? @tr("Stop") : @tr("Play");
-                    enabled: root.take.play-off == "";
-                    tooltip: root.take.play-off;
-                    clicked => {
-                        TestState.play(root.index);
-                    }
+        spacing: Theme.space-2;
+        HorizontalLayout {
+            spacing: Theme.control-gap;
+            Button {
+                icon: root.playing ? Icons.stop : Icons.play;
+                text: root.playing ? @tr("Stop") : @tr("Play");
+                enabled: root.take.play-off == "";
+                tooltip: root.take.play-off;
+                clicked => {
+                    TestState.play(root.index);
                 }
-                Text {
-                    text: root.take.duration;
-                    font-size: Theme.body-size;
-                    color: root.take.recording ? Theme.recording : Theme.text-primary;
-                    vertical-alignment: center;
-                    horizontal-stretch: 1;
-                    overflow: elide;
-                    min-width: 0;
-                }
-                IconButton {
-                    icon: Icons.delete-16;
-                    label: @tr("Remove");
-                    destructive: true;
-                    enabled: !root.busy && !root.take.recording;
-                    clicked => {
-                        TestState.remove(root.index);
-                    }
-                }
+            }
+            Wave {
+                peaks: root.take.peaks;
+                horizontal-stretch: 1;
+                min-width: 0;
+                height: Theme.control-height;
             }
             Caption {
                 text: root.take.source;
                 overflow: elide;
+                horizontal-stretch: 0;
+                max-width: 160px;
                 min-width: 0;
+                vertical-alignment: center;
             }
-            Wave {
-                peaks: root.take.peaks;
-                vertical-stretch: 1;
-                min-height: Theme.control-height;
+            // A fixed slot: the running length changes every tick and moves nothing (DS-25.7).
+            Text {
+                text: root.take.duration;
+                font-size: Theme.body-size;
+                color: root.take.recording ? Theme.accent-text : Theme.text-primary;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                horizontal-stretch: 0;
+                preferred-width: Theme.control-side + Theme.control-gap;
+                min-width: self.preferred-width;
+                overflow: elide;
+            }
+            IconButton {
+                icon: Icons.delete;
+                label: @tr("Remove");
+                destructive: true;
+                enabled: !root.busy && !root.take.recording;
+                clicked => {
+                    TestState.remove(root.index);
+                }
             }
         }
         area := TextArea {
-            horizontal-stretch: 1;
+            vertical-stretch: 1;
             locked: false;
             enabled: !root.busy;
             text: root.take.reference;
@@ -315,7 +316,7 @@ component HeardCard inherits CardFrame {
             HorizontalLayout {
                 alignment: start;
                 Button {
-                    icon: Icons.clipboard-paste-24;
+                    icon: Icons.copy;
                     text: @tr("Copy");
                     enabled: root.heard.text != "";
                     tooltip: root.heard.text == "" ? @tr("Nothing heard yet") : "";
@@ -348,7 +349,7 @@ component HeardCard inherits CardFrame {
 
 export component TestPage inherits VerticalLayout {
     // A take and a transcript card: the text box and the card's padding.
-    property <length> card-h: Theme.editor-min-height + 2 * Theme.card-padding-v;
+    property <length> card-h: Theme.control-height + Theme.space-2 + Theme.editor-min-height + 2 * Theme.card-padding-v;
     vertical-stretch: 1;
     spacing: Theme.header-bottom;
     init => {
@@ -377,7 +378,6 @@ export component TestPage inherits VerticalLayout {
         vertical-stretch: 0;
         Row {
             title: @tr("Scenario");
-            description: TestState.run-note;
             fill-controls: true;
             Combo {
                 locked: false;
@@ -410,12 +410,7 @@ export component TestPage inherits VerticalLayout {
         Divider { }
         Row {
             title: @tr("New recording");
-            VerticalLayout {
-                alignment: center;
-                InfoTip {
-                    text: TestState.record-tip;
-                }
-            }
+            info: TestState.record-tip;
             Button {
                 // No glyph: Record and Stop keep one width, so the "i" beside them stays put.
                 text: TestState.recording ? @tr("Stop") : @tr("Record");
@@ -428,34 +423,27 @@ export component TestPage inherits VerticalLayout {
             }
         }
         Divider { }
-        // Pick, then Add: the Combo picks on every arrow key, so picking alone must not add.
-        // Add under the picker: beside it, the two overflow the 240 px column of a narrow window.
-        // Outside the Row, so its title sits on the picker's line, not between the two.
-        if TestState.history-on: VerticalLayout {
-            spacing: Theme.space-2;
-            Row {
-                title: @tr("From history");
-                fill-controls: true;
+        // Return or a click on a line adds it (no Add button); arrows, Esc and a click outside
+        // only walk or close the list.
+        if TestState.history-on: Row {
+            title: @tr("From history");
+            fill-controls: true;
+            enabled: TestState.add-off == "";
+            off-tip: TestState.add-off;
+            Combo {
+                locked: false;
                 enabled: TestState.add-off == "";
-                off-tip: TestState.add-off;
-                Combo {
-                    locked: false;
-                    enabled: TestState.add-off == "";
-                    model: TestState.history.length > 0 ? TestState.history : [TestState.add-off];
-                    current-index <=> TestState.history-pick;
-                    accessible-label: @tr("From history");
-                }
-            }
-            HorizontalLayout {
-                alignment: end;
-                Button {
-                    text: @tr("Add");
-                    kind: ButtonKind.secondary;
-                    enabled: TestState.add-off == "" && TestState.history-pick > 0;
-                    tooltip: TestState.add-off != "" ? TestState.add-off : TestState.history-pick > 0 ? "" : @tr("Pick a recording first");
-                    clicked => {
+                model: TestState.history.length > 0 ? TestState.history : [TestState.add-off];
+                current-index <=> TestState.history-pick;
+                accessible-label: @tr("From history");
+                committed => {
+                    if (TestState.history-pick > 0) {
                         TestState.add-history();
                     }
+                }
+                // Esc or a click outside: the arrows only previewed a name, back to the prompt.
+                dismissed => {
+                    TestState.history-pick = 0;
                 }
             }
         }

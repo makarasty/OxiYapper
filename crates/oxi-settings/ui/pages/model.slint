@@ -3,14 +3,18 @@
 // it: its state on disk and what can be done now (download, resume, cancel, use, delete), or the
 // path of "use my own .bin". Settings: the GPU, the unload, the models folder and its partial
 // downloads. Advanced: what the engine does on its own.
-import { Theme, Shell, Icons, Group, Card, Row, Divider, Combo, Segmented, Button, ButtonKind, IconButton, InfoTip, PathField, ProgressBar, WarningSlot, SubTabs, SubTabPane, CardGrid, GalleryTile } from "../theme/index.slint";
+import { Theme, Shell, Icons, Group, Card, Row, Divider, Combo, Segmented, TextField, NumberField, Button, ButtonKind, IconButton, InfoTip, PathField, ProgressBar, WarningSlot, SubTabs, SubTabPane, CardGrid, GalleryTile } from "../theme/index.slint";
 import { SearchPopup } from "../theme/components/search_popup.slint";
 
 export struct ModelRow {
     id: string,
     name: string,
-    // Under the name: "1.6 GB · fast, good for most"; paused: "0.4 of 3.1 GB · kept 7 more days".
+    // Under the name: "1.6 GB · Fast · 99 languages"; paused: "0.4 of 3.1 GB · kept 7 more days".
     detail: string,
+    // The facts alone, a tile's caption and tooltip.
+    facts: string,
+    // The index of the model's glyph in `ModelState.class-icons`.
+    class: int,
     // In place of `detail` while downloading: "0.7 of 1.6 GB".
     progress-text: string,
     // "Ready", "Not downloaded", "Paused", "Downloading".
@@ -38,6 +42,8 @@ export global ModelState {
     // The open sub-tab: 0 Models, 1 Settings, 2 Advanced.
     in-out property <int> tab;
     in property <[ModelRow]> rows;
+    // One glyph per model class (accurate, fast, language, small), then "use my own .bin".
+    out property <[image]> class-icons: [Icons.model-accurate, Icons.model-fast, Icons.model-language, Icons.model-small, Icons.model-own];
     // The gallery: a tile per row, then "use my own .bin".
     in property <[GalleryTile]> tiles;
     // The model in use: an index in `rows`; `rows.length` is "use my own .bin", -1 is none.
@@ -91,11 +97,78 @@ export global ModelState {
     callback delete-partials();
     callback gpu-picked(int);
     callback unload-picked(int);
+    // Advanced: per parameter (0 threads, 1 flash attention, 2 decoding, 3 temperature, 4 retry,
+    // 5 silence, 6 confidence, 7 repetition, 8 non-speech, 9 audio window) its choice (0 is Auto)
+    // and its number.
+    in property <[int]> adv-mode;
+    in property <[float]> adv-value;
+    in property <string> adv-prompt;
+    // The device `Auto` is judged for: a GPU is loaded (or would be picked), not the processor.
+    in property <bool> adv-gpu;
+    // (parameter, choice, number); parameter 10 is the number beside Decoding.
+    callback adv-changed(int, int, float);
+    callback adv-prompt-edited(string);
+    callback adv-reset();
+}
+
+// One engine parameter's control: a choice whose first entry is Auto, and for a number the field
+// beside it (off while the choice is Auto, then showing what Auto gives). The page pushes the
+// values; what the person picks is sent up and pushed back.
+component AdvControl inherits HorizontalLayout {
+    in property <int> index;
+    in property <[string]> choices;
+    in property <string> label;
+    // A number beside the choice; `number-index` is the parameter it reports as.
+    in property <bool> number;
+    in property <int> number-index: root.index;
+    in property <float> minimum;
+    in property <float> maximum: 1;
+    in property <float> step: 1;
+    in property <int> decimals;
+    property <int> mode: ModelState.adv-mode[root.index];
+    property <float> val: ModelState.adv-value[root.index];
+    // The two-way copies the controls edit: a push from the page moves them (Reset all, a save).
+    in-out property <int> shown-mode: root.mode;
+    in-out property <float> shown-value: root.val;
+    changed mode => {
+        root.shown-mode = root.mode;
+    }
+    changed val => {
+        root.shown-value = root.val;
+    }
+    spacing: Theme.control-gap;
+    Combo {
+        horizontal-stretch: 1;
+        // Shrinks to the room left of the number in the 240 column (the default is the whole column).
+        min-width: 0;
+        model: root.choices;
+        current-index <=> root.shown-mode;
+        accessible-label: root.label;
+        selected => {
+            ModelState.adv-changed(root.index, self.current-index, root.shown-value);
+        }
+    }
+    // Every row's choice is as wide as the others' (DS-3.2): the number's room stays when there is none.
+    if !root.number: Rectangle {
+        width: Theme.control-side;
+    }
+    if root.number: NumberField {
+        value <=> root.shown-value;
+        width: Theme.control-side;
+        minimum: root.minimum;
+        maximum: root.maximum;
+        step: root.step;
+        decimals: root.decimals;
+        enabled: root.shown-mode > 0;
+        changed(v) => {
+            ModelState.adv-changed(root.number-index, root.shown-mode, v);
+        }
+    }
 }
 
 // The curated model under the gallery's check: name and size (or the download's bar), its "!", and
-// two fixed action slots, get (Download, Resume, Cancel, Use) and remove (Delete), each one width,
-// so a state change moves no button (DS-7.3). Delete asks first, in place of the line.
+// two action slots, get (Download, Resume, Cancel, Use) and remove (Delete), each one width.
+// Delete asks first, in place of the line.
 component ModelCard inherits VerticalLayout {
     in property <ModelRow> data;
     in property <int> index;
@@ -135,7 +208,7 @@ component ModelCard inherits VerticalLayout {
                 VerticalLayout {
                     alignment: center;
                     Image {
-                        source: Icons.brain-circuit;
+                        source: ModelState.class-icons[root.data.class];
                         width: Theme.icon-size;
                         height: Theme.icon-size;
                         colorize: Theme.text-primary;
@@ -156,31 +229,29 @@ component ModelCard inherits VerticalLayout {
                             overflow: elide;
                             accessible-label: @tr("{}: {}", root.data.name, root.data.badge);
                         }
-                        // While downloading the bar takes the caption's place and its room, so
-                        // the card keeps its height.
-                        Rectangle {
-                            VerticalLayout {
-                                Text {
-                                    text: root.data.detail;
-                                    visible: !root.data.downloading;
-                                    font-size: Theme.caption-size;
-                                    color: Theme.text-secondary;
-                                    wrap: word-wrap;
-                                }
-                            }
-                            if root.data.downloading: ProgressBar {
-                                y: (parent.height - self.height) / 2;
-                                width: parent.width;
-                                height: self.preferred-height;
-                                value: root.data.progress;
-                                label: root.data.progress-text;
-                                accessible-label: @tr("{} download", root.data.name);
-                                accessible-value: root.data.progress;
-                            }
+                        Text {
+                            text: root.data.detail;
+                            font-size: Theme.caption-size;
+                            color: Theme.text-secondary;
+                            wrap: word-wrap;
                         }
                     }
                     WarningSlot {
                         text: root.first != "" && root.second != "" ? root.first + "\n" + root.second : root.first + root.second;
+                    }
+                    // DS-28.2: the bar's slot, kept so nothing moves when a download starts. With the
+                    // two action slots it fills the control column (200 wide, 80 in the 240 column).
+                    Rectangle {
+                        width: Theme.control-column - 2 * Theme.control-gap - Theme.model-action-column - Theme.control-height;
+                        if root.data.downloading: ProgressBar {
+                            y: (parent.height - self.height) / 2;
+                            width: parent.width;
+                            height: self.preferred-height;
+                            value: root.data.progress;
+                            label: root.data.progress-text;
+                            accessible-label: @tr("{} download", root.data.name);
+                            accessible-value: root.data.progress;
+                        }
                     }
                     Rectangle {
                         width: Theme.model-action-column;
@@ -242,10 +313,11 @@ component ModelCard inherits VerticalLayout {
                             }
                         }
                     }
-                    // Kept while empty, so the get slot never moves.
+                    // Delete's slot is always there (DS-23.5, DS-7.3), empty when there is nothing to
+                    // delete or a download runs, so no button moves; Delete is rightmost. Files, not
+                    // the config: a locked config keeps it.
                     Rectangle {
-                        width: Theme.model-action-column;
-                        // Files, not the config: a locked config keeps it.
+                        width: Theme.control-height;
                         if root.data.can-delete && !root.data.downloading: VerticalLayout {
                             property <bool> back: root.refocus;
                             changed back => {
@@ -256,18 +328,18 @@ component ModelCard inherits VerticalLayout {
                             }
                             width: parent.width;
                             alignment: center;
-                            remove := Button {
-                            text: @tr("Delete");
-                            icon: Icons.delete-16;
-                            kind: ButtonKind.danger;
-                            enabled: root.delete-tip == "";
-                            tooltip: root.delete-tip;
-                            accessible-label: @tr("Delete {}", root.data.name);
-                            clicked => {
-                                root.confirm-by-key = self.key-focused;
-                                root.confirming = true;
+                            remove := IconButton {
+                                icon: Icons.delete;
+                                label: @tr("Delete");
+                                destructive: true;
+                                enabled: root.delete-tip == "";
+                                tooltip: root.delete-tip;
+                                accessible-label: @tr("Delete {}", root.data.name);
+                                clicked => {
+                                    root.confirm-by-key = self.key-focused;
+                                    root.confirming = true;
+                                }
                             }
-                        }
                         }
                     }
                 }
@@ -346,7 +418,7 @@ component CustomCard inherits VerticalLayout {
                     // The first line's height: the glyph sits beside the title, not the field.
                     height: Theme.control-height;
                     Image {
-                        source: Icons.folder-open;
+                        source: Icons.model-own;
                         width: Theme.icon-size;
                         height: Theme.icon-size;
                         colorize: Theme.text-primary;
@@ -471,7 +543,9 @@ export component ModelPage inherits VerticalLayout {
                                 }
                             }
                             all-languages := SearchPopup {
-                                x: parent.width - self.width;
+                                // The field is the column's least width, not the column: the list is as wide.
+                                width: parent.width;
+                                x: 0;
                                 y: parent.height + Theme.space-1;
                                 items: ModelState.language-rows;
                                 notes: ModelState.language-native;
@@ -564,8 +638,8 @@ export component ModelPage inherits VerticalLayout {
                             // The look of every open-folder button (System, Home): subtle, folder glyph.
                             Button {
                                 text: @tr("Open");
-                                kind: ButtonKind.subtle;
-                                icon: Icons.folder-open-16;
+                                kind: ButtonKind.soft;
+                                icon: Icons.folder-open;
                                 accessible-label: @tr("Open models folder");
                                 clicked => {
                                     ModelState.open-folder();
@@ -592,64 +666,192 @@ export component ModelPage inherits VerticalLayout {
                 }
             }
         }
-        // shortcut: read-only, it says what oxi-whisper fixes in code (thread_count, open,
-        // transcribe); these rows become controls once the config has keys for them.
         SubTabPane {
             shown: ModelState.tab == 2;
             VerticalLayout {
                 alignment: start;
+                spacing: Theme.group-gap;
                 Group {
-                    title: @tr("Chosen by the engine");
+                    title: @tr("Decoding");
+                    action-text: @tr("Reset all to Auto");
+                    action-icon: Icons.reset-auto;
+                    action-tip: @tr("Every setting here back to Auto, the prompt cleared.");
+                    action-enabled: !Shell.locked;
+                    action => {
+                        ModelState.adv-reset();
+                    }
                     Card {
                         Row {
-                            icon: Icons.top-speed;
+                            icon: Icons.threads;
                             title: @tr("Processor threads");
-                            info: @tr("4 with a GPU; without one, half the processor's threads, at most 8.");
-                            Text {
-                                text: @tr("Auto");
-                                font-size: Theme.body-size;
-                                color: Theme.text-secondary;
-                                horizontal-alignment: right;
-                                vertical-alignment: center;
+                            info: ModelState.adv-gpu ? @tr("Auto: 4 now, a GPU does the heavy work. On the processor alone: half its threads, at most 8.") : @tr("Auto: half the processor's threads, at most 8, now. With a GPU: 4.");
+                            fill-controls: true;
+                            AdvControl {
+                                index: 0;
+                                label: @tr("Processor threads");
+                                choices: [@tr("Auto"), @tr("Custom")];
+                                number: true;
+                                minimum: 1;
+                                maximum: 32;
                             }
                         }
                         Divider { }
                         Row {
-                            icon: Icons.fire;
+                            icon: Icons.flash-attention;
                             title: @tr("Flash attention");
-                            info: @tr("On with a GPU that supports it, off on the processor.");
-                            Text {
-                                text: @tr("With GPU");
-                                font-size: Theme.body-size;
-                                color: Theme.text-secondary;
-                                horizontal-alignment: right;
-                                vertical-alignment: center;
+                            info: ModelState.adv-gpu ? @tr("Auto: on now, a GPU is in use. Off on the processor. Changing what runs loads the model again for the next dictation.") : @tr("Auto: off now, the processor is in use. On with a GPU that supports it. Changing what runs loads the model again for the next dictation.");
+                            fill-controls: true;
+                            AdvControl {
+                                index: 1;
+                                label: @tr("Flash attention");
+                                choices: [@tr("Auto"), @tr("On"), @tr("Off")];
                             }
                         }
                         Divider { }
                         Row {
                             icon: Icons.code;
                             title: @tr("Decoding");
-                            info: @tr("Greedy, no beam search. A segment Whisper doubts is retried at a higher temperature.");
-                            Text {
-                                text: @tr("Greedy");
-                                font-size: Theme.body-size;
-                                color: Theme.text-secondary;
-                                horizontal-alignment: right;
-                                vertical-alignment: center;
+                            info: @tr("Auto: greedy, the fastest. Beam search is slower and can be more accurate. The number is how many candidates are kept: best-of for greedy, the beam width for beam.");
+                            fill-controls: true;
+                            AdvControl {
+                                index: 2;
+                                label: @tr("Decoding");
+                                choices: [@tr("Auto"), @tr("Greedy"), @tr("Beam")];
+                                number: true;
+                                number-index: 10;
+                                minimum: 1;
+                                maximum: 8;
                             }
                         }
                         Divider { }
                         Row {
+                            icon: Icons.temperature;
+                            title: @tr("Temperature");
+                            info: @tr("Auto: 0, the most predictable words. Higher values vary them.");
+                            fill-controls: true;
+                            AdvControl {
+                                index: 3;
+                                label: @tr("Temperature");
+                                choices: [@tr("Auto"), @tr("Custom")];
+                                number: true;
+                                maximum: 1;
+                                step: 0.1;
+                                decimals: 1;
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.retry-doubtful;
+                            title: @tr("Retry doubtful segments");
+                            info: @tr("Auto: on. A segment Whisper doubts is tried again at a higher temperature.");
+                            fill-controls: true;
+                            AdvControl {
+                                index: 4;
+                                label: @tr("Retry doubtful segments");
+                                choices: [@tr("Auto"), @tr("On"), @tr("Off")];
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.audio-window;
+                            title: @tr("Audio window");
+                            info: @tr("Auto: Full, the whole 30 s window Whisper was trained on. Fit cuts the window to the clip.");
+                            fill-controls: true;
+                            AdvControl {
+                                index: 9;
+                                label: @tr("Audio window");
+                                choices: [@tr("Auto"), @tr("Full"), @tr("Fit")];
+                            }
+                        }
+                    }
+                }
+                Group {
+                    title: @tr("Filters");
+                    Card {
+                        Row {
                             icon: Icons.book-letter;
                             title: @tr("Prompt");
-                            info: @tr("Your dictionary on the Text page, so names come out spelled your way.");
-                            Text {
-                                text: @tr("Your dictionary");
-                                font-size: Theme.body-size;
-                                color: Theme.text-secondary;
-                                horizontal-alignment: right;
-                                vertical-alignment: center;
+                            info: @tr("Text Whisper reads first, to set the style or the spelling. Your dictionary follows it. Empty: the dictionary alone.");
+                            fill-controls: true;
+                            TextField {
+                                text: ModelState.adv-prompt;
+                                placeholder-text: @tr("Auto: your dictionary");
+                                accessible-label: @tr("Prompt");
+                                // Typing ends the binding: a prompt pushed from outside (Reset all) still reaches the field.
+                                property <string> pushed: ModelState.adv-prompt;
+                                changed pushed => {
+                                    self.text = self.pushed;
+                                }
+                                // Saved when the person is done, not on every key.
+                                accepted(text) => {
+                                    ModelState.adv-prompt-edited(text);
+                                }
+                                changed has-focus => {
+                                    if !self.has-focus {
+                                        ModelState.adv-prompt-edited(self.text);
+                                    }
+                                }
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.silence-threshold;
+                            title: @tr("Silence threshold");
+                            info: @tr("Auto: 0.6. A segment more likely to be silence than this is dropped.");
+                            fill-controls: true;
+                            AdvControl {
+                                index: 5;
+                                label: @tr("Silence threshold");
+                                choices: [@tr("Auto"), @tr("Custom")];
+                                number: true;
+                                maximum: 1;
+                                step: 0.05;
+                                decimals: 2;
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.confidence;
+                            title: @tr("Confidence threshold");
+                            info: @tr("Auto: -1.0. A segment Whisper is less sure of than this is tried again.");
+                            fill-controls: true;
+                            AdvControl {
+                                index: 6;
+                                label: @tr("Confidence threshold");
+                                choices: [@tr("Auto"), @tr("Custom")];
+                                number: true;
+                                minimum: -5;
+                                maximum: 0;
+                                step: 0.1;
+                                decimals: 1;
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.repetition;
+                            title: @tr("Repetition threshold");
+                            info: @tr("Auto: 2.4. A segment that repeats itself more than this is tried again.");
+                            fill-controls: true;
+                            AdvControl {
+                                index: 7;
+                                label: @tr("Repetition threshold");
+                                choices: [@tr("Auto"), @tr("Custom")];
+                                number: true;
+                                maximum: 10;
+                                step: 0.1;
+                                decimals: 1;
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.non-speech;
+                            title: @tr("Skip non-speech sounds");
+                            info: @tr("Auto: off. On drops sounds written as [MUSIC] or (laughs).");
+                            fill-controls: true;
+                            AdvControl {
+                                index: 8;
+                                label: @tr("Skip non-speech sounds");
+                                choices: [@tr("Auto"), @tr("On"), @tr("Off")];
                             }
                         }
                     }

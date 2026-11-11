@@ -10,12 +10,14 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use std::time::SystemTime;
 
-use oxi_core::device::{Device, DeviceChoice};
+use oxi_core::config::{Advanced, AudioCtx, Auto, Decoding};
+use oxi_core::device::{Device, DeviceChoice, pick};
 use oxi_core::ipc::{DeleteResult, DownloadResult, Push, Request};
 use oxi_core::languages::{self, LanguageInfo};
 use oxi_core::models::{self, MODELS, ModelEntry, ModelStatus, PartialDownload};
 use oxi_core::paths::PART_SUFFIX;
 use oxi_core::strings::{self, gb};
+use oxi_core::tuning::{self, Sampling};
 use oxi_core::types::Language;
 use oxi_platform::fs::list_partials;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
@@ -27,6 +29,8 @@ use crate::{AppWindow, Ctx, Error, Page, report};
 
 /// `[model] id` of "use my own .bin".
 const CUSTOM: &str = "custom";
+/// The glyph of "use my own .bin" in `ModelState.class-icons`, after the model classes.
+const OWN_CLASS: i32 = 4;
 /// "Unload after idle" choices in picker order: `None` is right after a dictation
 /// (`unload_immediately`), `Some(0)` never, the rest minutes.
 const UNLOAD: [Option<u32>; 8] = [
@@ -73,6 +77,7 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         tiles: Rc::new(VecModel::default()),
         partials: RefCell::new(Vec::new()),
         listed: RefCell::new(None),
+        backend: RefCell::new(String::new()),
         choices: RefCell::new(Vec::new()),
         unloads: RefCell::new(Vec::new()),
         // Not a pair the config can hold: the first `push_language` takes the config's.
@@ -125,6 +130,12 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     s.on_gpu_picked(move |i| p.gpu_picked(i));
     let p = Rc::clone(&page);
     s.on_unload_picked(move |i| p.unload_picked(i));
+    let p = Rc::clone(&page);
+    s.on_adv_changed(move |param, mode, value| p.adv_changed(param, mode, value));
+    let p = Rc::clone(&page);
+    s.on_adv_prompt_edited(move |text| p.adv_prompt_edited(&text));
+    let p = Rc::clone(&page);
+    s.on_adv_reset(move || p.adv_reset());
 
     // Reset to defaults rebinds while the page may be open; its `init` does not run again.
     if window.get_page() == Page::Model {
@@ -146,6 +157,8 @@ struct PageState {
     partials: RefCell<Vec<PartialDownload>>,
     /// The daemon's GPU list; `None` until it answers `ListDevices`.
     listed: RefCell<Option<Vec<Device>>>,
+    /// The daemon's `Status.backend` (`cpu`, `Vulkan0`, `none`); empty until it answers.
+    backend: RefCell<String>,
     /// What each GPU picker row writes.
     choices: RefCell<Vec<DeviceChoice>>,
     /// What each unload picker row writes, as in [`UNLOAD`].
@@ -227,6 +240,73 @@ impl PageState {
         self.check_custom(&path, false);
         self.push_gpus(s);
         self.push_language(s);
+        self.push_advanced(s);
+    }
+
+    /// The Advanced tab from the config: each parameter's choice, and the number beside it (what
+    /// `auto` resolves to while it is auto, so turning it to a value starts from there).
+    fn push_advanced(&self, s: &ModelState<'_>) {
+        let file = self.ctx.config.borrow();
+        let model = &file.config.model;
+        let on_gpu = auto_on_gpu(
+            &self.backend.borrow(),
+            self.listed.borrow().as_deref(),
+            &model.gpu,
+        );
+        s.set_adv_gpu(on_gpu);
+        let logical = thread::available_parallelism().map_or(1, usize::from);
+        let r = tuning::resolve(&model.advanced, on_gpu, logical);
+        let candidates = match r.sampling {
+            Sampling::Greedy { best_of } => best_of,
+            Sampling::Beam { beam_size } => beam_size,
+        };
+        let values = [
+            f32::from(r.threads),
+            0.0,
+            f32::from(candidates),
+            r.temperature,
+            0.0,
+            r.no_speech_threshold,
+            r.logprob_threshold,
+            r.entropy_threshold,
+            0.0,
+            0.0,
+        ];
+        s.set_adv_mode(ModelRc::from(Rc::new(VecModel::from(adv_modes(
+            &model.advanced,
+        )))));
+        s.set_adv_value(ModelRc::from(Rc::new(VecModel::from(values.to_vec()))));
+        s.set_adv_prompt(model.advanced.initial_prompt.as_str().into());
+    }
+
+    fn adv_changed(&self, param: i32, mode: i32, value: f32) {
+        {
+            let mut file = self.ctx.config.borrow_mut();
+            adv_apply(&mut file.config.model.advanced, param, mode, value);
+        }
+        report(&self.window, self.ctx.save());
+        self.state(|s| self.push_advanced(s));
+    }
+
+    fn adv_prompt_edited(&self, text: &str) {
+        {
+            let mut file = self.ctx.config.borrow_mut();
+            let adv = &mut file.config.model.advanced;
+            if adv.initial_prompt == text {
+                return;
+            }
+            text.clone_into(&mut adv.initial_prompt);
+        }
+        // The field's own copy: a later push of the same text (Reset all) must still change it.
+        self.state(|s| s.set_adv_prompt(text.into()));
+        report(&self.window, self.ctx.save());
+    }
+
+    /// "Reset all to Auto": every parameter, the candidates and the prompt back to the defaults.
+    fn adv_reset(&self) {
+        self.ctx.config.borrow_mut().config.model.advanced = Advanced::default();
+        report(&self.window, self.ctx.save());
+        self.state(|s| self.push_advanced(s));
     }
 
     /// The language segments and which of them is on.
@@ -328,24 +408,40 @@ impl PageState {
     /// so a progress push does not rebuild the others.
     fn push_tiles(&self) {
         let in_use = self.in_use();
+        let mut icons = Vec::new();
+        self.state(|s| icons = s.get_class_icons().iter().collect());
+        let icon = |class: i32| {
+            usize::try_from(class)
+                .ok()
+                .and_then(|i| icons.get(i).cloned())
+                .unwrap_or_default()
+        };
         let mut tiles: Vec<GalleryTile> = self
             .rows
             .iter()
             .enumerate()
-            .map(|(i, r)| GalleryTile {
-                title: r.name.clone(),
-                caption: tile_caption(&r, in_use == Some(i)).into(),
-                ..GalleryTile::default()
+            .map(|(i, r)| {
+                let (hint, mark, mark_text) = tile_state(&r, in_use == Some(i));
+                GalleryTile {
+                    title: r.name.clone(),
+                    caption: r.facts.clone(),
+                    hint: hint.into(),
+                    icon: icon(r.class),
+                    mark,
+                    mark_text: mark_text.into(),
+                    ..GalleryTile::default()
+                }
             })
             .collect();
         tiles.push(GalleryTile {
             title: "Use my own .bin".into(),
-            caption: if in_use == Some(self.entries.len()) {
-                IN_USE
+            caption: "Loaded as is".into(),
+            hint: if in_use == Some(self.entries.len()) {
+                IN_USE.into()
             } else {
-                "Loaded as is"
-            }
-            .into(),
+                SharedString::new()
+            },
+            icon: icon(OWN_CLASS),
             ..GalleryTile::default()
         });
         if self.tiles.row_count() != tiles.len() {
@@ -645,10 +741,20 @@ impl PageState {
             Event::Link(_) => self.push_partials(),
             Event::Push(Push::Devices { gpus, .. }) => {
                 *self.listed.borrow_mut() = Some(gpus.clone());
-                self.state(|s| self.push_gpus(s));
+                self.state(|s| {
+                    self.push_gpus(s);
+                    self.push_advanced(s);
+                });
                 self.refresh_rows();
             }
-            Event::Push(Push::Status { warnings, .. }) => {
+            Event::Push(Push::Status {
+                warnings, backend, ..
+            }) => {
+                // What Auto picks follows the device that is loaded (DS-11.4 h).
+                if *self.backend.borrow() != *backend {
+                    backend.clone_into(&mut self.backend.borrow_mut());
+                    self.state(|s| self.push_advanced(s));
+                }
                 // The sound lines are the Audio page's (audio::sound_warning).
                 let ours: Vec<&str> = warnings
                     .iter()
@@ -741,6 +847,20 @@ impl PageState {
     }
 }
 
+/// Whether an `auto` setting is judged for a GPU: the loaded device when the daemon says one
+/// (`backend`), else what the picker would pick among the listed GPUs (all but the CPU choice
+/// while they are not listed yet). The CPU choice is the processor whatever is loaded.
+fn auto_on_gpu(backend: &str, listed: Option<&[Device]>, choice: &DeviceChoice) -> bool {
+    if *choice == DeviceChoice::Cpu {
+        return false;
+    }
+    match (backend, listed) {
+        ("" | "none", Some(gpus)) => pick(gpus, choice).index.is_some(),
+        ("" | "none", None) => true,
+        (loaded, _) => loaded != "cpu",
+    }
+}
+
 /// Decimal MB below a gigabyte, so a small `.part` is not "0.0 GB"; `gb` from there.
 fn size(bytes: u64) -> String {
     if bytes < 1_000_000_000 {
@@ -758,19 +878,18 @@ fn row(
     now: SystemTime,
 ) -> ModelRow {
     let status = models::status(entry, dir);
-    // What to do about a state the badge only names takes the place of the hint.
-    let note = match strings::model_status(status) {
-        "" => strings::model_hint(entry.id),
-        todo => todo,
-    };
+    // What to do about a state the badge only names.
+    let note = strings::model_status(status);
+    let f = models::facts(entry.id);
+    let facts = format!("{} · {} · {}", gb(entry.size), f.speed, f.languages);
     let detail = match part.filter(|_| status == ModelStatus::Partial) {
         Some(part) => format!(
             "{} · {}",
             strings::download_progress(part.size, entry.size),
             kept(models::days_kept(part.remove_at, now))
         ),
-        None if note.is_empty() => gb(entry.size),
-        None => format!("{} · {note}", gb(entry.size)),
+        None if note.is_empty() => facts.clone(),
+        None => format!("{facts} · {note}"),
     };
     let on_disk =
         fs::metadata(dir.join(entry.file_name)).map_or(0, |m| m.len()) + part.map_or(0, |p| p.size);
@@ -778,6 +897,8 @@ fn row(
         id: entry.id.into(),
         name: entry.display_name.into(),
         detail: detail.into(),
+        facts: facts.into(),
+        class: i32::try_from(f.class.index()).unwrap_or(OWN_CLASS),
         progress_text: SharedString::new(),
         badge: strings::model_badge(status).into(),
         ready: matches!(status, ModelStatus::Ready | ModelStatus::NeedsHash),
@@ -795,26 +916,152 @@ fn row(
     }
 }
 
-/// What the model in use's tile says beside its state.
-const IN_USE: &str = "In use";
+/// The parameters of the Advanced tab, the order of `ModelState.adv-mode` and `adv-value`.
+const P_THREADS: i32 = 0;
+const P_FLASH: i32 = 1;
+const P_DECODING: i32 = 2;
+const P_TEMPERATURE: i32 = 3;
+const P_FALLBACK: i32 = 4;
+const P_NO_SPEECH: i32 = 5;
+const P_LOGPROB: i32 = 6;
+const P_ENTROPY: i32 = 7;
+const P_SUPPRESS: i32 = 8;
+const P_AUDIO_CTX: i32 = 9;
+/// The number beside Decoding; it has a value but no choice of its own.
+const P_CANDIDATES: i32 = 10;
 
-/// A tile's caption: its state, "Downloading 45%" while it downloads, "In use" first for the
-/// model in use (alone when it is ready, as nothing is to be done).
-fn tile_caption(r: &ModelRow, in_use: bool) -> String {
-    let state = if r.downloading {
-        format!(
-            "{} {:.0}%",
-            strings::MODEL_BADGE_DOWNLOADING,
-            r.progress * 100.0
-        )
-    } else {
-        r.badge.to_string()
+/// The choice each parameter shows: 0 is Auto; a yes/no one then reads 1 On, 2 Off; decoding 1
+/// Greedy, 2 Beam; the numbers 1 Custom; the audio window 1 Full, 2 Fit.
+fn adv_modes(a: &Advanced) -> Vec<i32> {
+    let flag = |v: Auto<bool>| match v {
+        Auto::Auto => 0,
+        Auto::Set(true) => 1,
+        Auto::Set(false) => 2,
     };
-    match (in_use, r.ready && !r.downloading) {
+    let custom = |set: bool| i32::from(set);
+    vec![
+        custom(matches!(a.threads, Auto::Set(_))),
+        flag(a.flash_attn),
+        match a.decoding {
+            Auto::Auto => 0,
+            Auto::Set(Decoding::Greedy) => 1,
+            Auto::Set(Decoding::Beam) => 2,
+        },
+        custom(matches!(a.temperature, Auto::Set(_))),
+        flag(a.temperature_fallback),
+        custom(matches!(a.no_speech_threshold, Auto::Set(_))),
+        custom(matches!(a.logprob_threshold, Auto::Set(_))),
+        custom(matches!(a.entropy_threshold, Auto::Set(_))),
+        flag(a.suppress_non_speech),
+        match a.audio_ctx {
+            Auto::Auto => 0,
+            Auto::Set(AudioCtx::Full) => 1,
+            Auto::Set(AudioCtx::Fit) => 2,
+        },
+    ]
+}
+
+/// Writes what the user chose for `param` (see [`adv_modes`]); numbers are put in range.
+fn adv_apply(a: &mut Advanced, param: i32, mode: i32, value: f32) {
+    let flag = |mode| match mode {
+        1 => Auto::Set(true),
+        2 => Auto::Set(false),
+        _ => Auto::Auto,
+    };
+    let number = |range: &std::ops::RangeInclusive<f32>| {
+        if mode == 0 {
+            Auto::Auto
+        } else {
+            Auto::Set(value.clamp(*range.start(), *range.end()))
+        }
+    };
+    let whole = |range: &std::ops::RangeInclusive<u8>| {
+        // The range is a handful of small numbers, so the cast cannot lose any.
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped to a u8 range"
+        )]
+        let n = value
+            .round()
+            .clamp(f32::from(*range.start()), f32::from(*range.end())) as u8;
+        n
+    };
+    match param {
+        P_THREADS => {
+            a.threads = if mode == 0 {
+                Auto::Auto
+            } else {
+                Auto::Set(whole(&Advanced::THREADS))
+            };
+        }
+        P_FLASH => a.flash_attn = flag(mode),
+        P_DECODING => {
+            a.decoding = match mode {
+                1 => Auto::Set(Decoding::Greedy),
+                2 => Auto::Set(Decoding::Beam),
+                _ => Auto::Auto,
+            };
+        }
+        // The number beside Decoding: the candidates of the mode it is on (Auto is greedy).
+        P_CANDIDATES => {
+            if a.decoding == Auto::Set(Decoding::Beam) {
+                a.beam_size = whole(&Advanced::BEAM_SIZE);
+            } else {
+                a.best_of = whole(&Advanced::BEST_OF);
+            }
+        }
+        P_TEMPERATURE => a.temperature = number(&Advanced::TEMPERATURE),
+        P_FALLBACK => a.temperature_fallback = flag(mode),
+        P_NO_SPEECH => a.no_speech_threshold = number(&Advanced::NO_SPEECH),
+        P_LOGPROB => a.logprob_threshold = number(&Advanced::LOGPROB),
+        P_ENTROPY => a.entropy_threshold = number(&Advanced::ENTROPY),
+        P_SUPPRESS => a.suppress_non_speech = flag(mode),
+        P_AUDIO_CTX => {
+            a.audio_ctx = match mode {
+                1 => Auto::Set(AudioCtx::Full),
+                2 => Auto::Set(AudioCtx::Fit),
+                _ => Auto::Auto,
+            };
+        }
+        _ => {}
+    }
+}
+
+/// What the model in use's tile says: its tooltip.
+const IN_USE: &str = "In use";
+/// A ready model that is not the one in use.
+const DOWNLOADED: &str = "Downloaded";
+/// The marks of `GalleryTile.mark`.
+const MARK_DONE: i32 = 1;
+const MARK_GET: i32 = 2;
+
+/// A tile's state, said once by the mark in its top-right slot (DS-28.2): the tooltip, the mark
+/// and the percent while it downloads. The caption keeps the facts alone. The model in use has
+/// the check badge in place of a mark.
+fn tile_state(r: &ModelRow, in_use: bool) -> (String, i32, String) {
+    let (state, percent) = if r.downloading {
+        let percent = (r.progress * 100.0).round();
+        (
+            format!("{} {percent:.0}%", strings::MODEL_BADGE_DOWNLOADING),
+            format!("{percent:.0} %"),
+        )
+    } else if r.ready {
+        (DOWNLOADED.to_owned(), String::new())
+    } else {
+        (r.badge.to_string(), String::new())
+    };
+    let mark = match (in_use, r.downloading, r.ready) {
+        (true, ..) | (_, true, _) => 0,
+        (_, _, true) => MARK_DONE,
+        _ => MARK_GET,
+    };
+    let hint = match (in_use, r.ready && !r.downloading) {
         (true, true) => IN_USE.to_owned(),
         (true, false) => format!("{IN_USE} · {state}"),
-        (false, _) => state,
-    }
+        _ => state,
+    };
+    (hint, mark, percent)
 }
 
 /// Where a file dialog for `path` starts: its folder, else the nearest folder above it that is
@@ -1527,7 +1774,7 @@ mod tests {
         assert!(!has(&window, "File not found"));
         with_role(&window, "Own model file in use", AccessibleRole::Button);
         let tiles = window.global::<ModelState>().get_tiles();
-        assert_eq!(tiles.row_data(3).unwrap().caption, IN_USE);
+        assert_eq!(tiles.row_data(3).unwrap().hint, IN_USE);
     }
 
     /// A model file of the registry's size: "ready" without a hash (the stamp is not there).
@@ -1843,8 +2090,14 @@ mod tests {
         let _ = requests(&sent);
         assert!(!s.invoke_delete(1));
         assert_eq!(requests(&sent), []);
-        assert_eq!(s.get_tiles().row_data(1).unwrap().caption, IN_USE);
-        assert_eq!(s.get_tiles().row_data(0).unwrap().caption, "Not downloaded");
+        let tiles = s.get_tiles();
+        assert_eq!(tiles.row_data(1).unwrap().hint, IN_USE);
+        let other = tiles.row_data(0).unwrap();
+        assert_eq!(
+            (other.hint.as_str(), other.mark),
+            ("Not downloaded", MARK_GET)
+        );
+        assert_ne!(other.caption, other.hint, "the state is not said twice");
     }
 
     /// Paused: Resume and Delete; the question names the partial download and its size.
@@ -1894,7 +2147,70 @@ mod tests {
     }
 
     #[test]
-    fn tile_captions_say_the_state() {
+    fn advanced_choices_write_the_config_and_read_back() {
+        let mut a = Advanced::default();
+        assert_eq!(adv_modes(&a), [0; 10]);
+        adv_apply(&mut a, P_THREADS, 1, 99.0);
+        assert_eq!(a.threads, Auto::Set(32), "put in range");
+        adv_apply(&mut a, P_FLASH, 2, 0.0);
+        adv_apply(&mut a, P_DECODING, 2, 0.0);
+        adv_apply(&mut a, P_CANDIDATES, 1, 7.0);
+        assert_eq!(
+            (a.decoding, a.beam_size, a.best_of),
+            (Auto::Set(Decoding::Beam), 7, 1)
+        );
+        adv_apply(&mut a, P_TEMPERATURE, 1, 0.3);
+        adv_apply(&mut a, P_LOGPROB, 1, -9.0);
+        assert_eq!(a.logprob_threshold, Auto::Set(-5.0));
+        adv_apply(&mut a, P_AUDIO_CTX, 2, 0.0);
+        assert_eq!(a.audio_ctx, Auto::Set(AudioCtx::Fit));
+        assert_eq!(adv_modes(&a), [1, 2, 2, 1, 0, 0, 1, 0, 0, 2]);
+        for p in [
+            P_THREADS,
+            P_FLASH,
+            P_DECODING,
+            P_TEMPERATURE,
+            P_LOGPROB,
+            P_AUDIO_CTX,
+        ] {
+            adv_apply(&mut a, p, 0, 1.0);
+        }
+        assert_eq!(adv_modes(&a), [0; 10]);
+    }
+
+    /// What `auto` is judged for: the loaded device first, the CPU choice always the processor.
+    #[test]
+    fn auto_follows_the_loaded_device() {
+        let gpu = Device {
+            name: "Vulkan0".into(),
+            description: String::new(),
+            uma: false,
+        };
+        let named = DeviceChoice::Named("Vulkan0".into());
+        let table = [
+            // Loaded: what runs counts, listed or not.
+            ("Vulkan0", None, DeviceChoice::Auto, true),
+            ("cpu", Some(&[gpu.clone()][..]), DeviceChoice::Auto, false),
+            ("cpu", None, named.clone(), false),
+            // Whatever is loaded, the CPU choice is the processor.
+            ("Vulkan0", None, DeviceChoice::Cpu, false),
+            // Nothing loaded: what the picker would pick among the listed GPUs.
+            ("none", Some(&[][..]), DeviceChoice::Auto, false),
+            ("", Some(&[gpu.clone()][..]), DeviceChoice::Auto, true),
+            // Not listed yet: a guess, GPU unless the CPU is chosen.
+            ("", None, DeviceChoice::Auto, true),
+        ];
+        for (backend, listed, choice, want) in table {
+            assert_eq!(
+                auto_on_gpu(backend, listed, &choice),
+                want,
+                "{backend} {choice:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tiles_say_the_state_once_in_the_mark_and_the_facts_in_the_caption() {
         let row = |badge: &str, ready, downloading, progress| ModelRow {
             badge: badge.into(),
             ready,
@@ -1903,22 +2219,38 @@ mod tests {
             ..ModelRow::default()
         };
         let cases = [
-            (row("Ready", true, false, 0.0), false, "Ready"),
-            (row("Ready", true, false, 0.0), true, "In use"),
+            (
+                row("Ready", true, false, 0.0),
+                false,
+                ("Downloaded", MARK_DONE, ""),
+            ),
+            (row("Ready", true, false, 0.0), true, ("In use", 0, "")),
             (
                 row("Not downloaded", false, false, 0.0),
                 true,
-                "In use · Not downloaded",
+                ("In use · Not downloaded", 0, ""),
+            ),
+            (
+                row("Not downloaded", false, false, 0.0),
+                false,
+                ("Not downloaded", MARK_GET, ""),
             ),
             (
                 row("Downloading", false, true, 0.454),
                 false,
-                "Downloading 45%",
+                ("Downloading 45%", 0, "45 %"),
             ),
-            (row("Paused", false, false, 0.0), false, "Paused"),
+            (
+                row("Paused", false, false, 0.0),
+                false,
+                ("Paused", MARK_GET, ""),
+            ),
         ];
-        for (r, in_use, want) in cases {
-            assert_eq!(tile_caption(&r, in_use), want);
+        for (r, in_use, (hint, mark, text)) in cases {
+            assert_eq!(
+                tile_state(&r, in_use),
+                (hint.to_owned(), mark, text.to_owned())
+            );
         }
     }
 

@@ -7,8 +7,8 @@ ignores what it does not know. The app never makes a network call for any of it.
 ## Where
 
 The history folder is `[history] folder`. Set to an absolute path, the app keeps its own subfolder
-`OxiYapper history` in it; left empty, it is `history/` in the data directory. The Copy path
-button on the History page gives the path of one entry.
+`OxiYapper history` in it; left empty, it is `history/` in the data directory. The Show in folder
+button on the History page opens the day folder of one entry.
 
 The folder holds a marker file `.oxiyapper-history`. The app lists, recovers and deletes only
 inside a folder that has it.
@@ -73,6 +73,7 @@ Optional fields (added 2026-11-11; `version` stays 1, and an entry without them 
 - `held`: the parts of the dictation the confidence filter held back, in order, each `{ "text": "...", "t0": 5200, "t1": 6900, "why": "no_speech" }`. `t0` and `t1` are milliseconds from the start of the `.wav` (the audio whisper got is what the `.wav` holds, so no offset applies); `why` is `low_confidence` or `no_speech`. When only some parts were held, the `.txt` has the inserted text and `held` the rest; when all were held, the `.txt` has them too and `delivered` is `filtered`. Absent when nothing was held.
 - `words`: the words of the recording in order, each `{ "w": "hello", "p": 0.93, "t0": 120, "t1": 480 }`. `p` is the confidence of the model in the word, 0 to 1. `t0` and `t1` are its start and end in milliseconds from the start of the `.wav`; they are absent until the times were computed (on demand, when the recording is opened in the History page). The words come from a pass of the model over the audio and can differ from the `.txt`, which also holds replacements and edits.
 - `timings`: present when `words` carry times: `{ "by": "dtw", "preset": "large-v3", "model": "podlodka" }`; `by` is `dtw` or `tokens`.
+- `previous`: the other version of the text, `{ "text": "...", "model": "small", "language": "ru", "settings": { ... } }` (the same three run fields as above). The History page keeps it when a text is replaced by Transcribe again or by an edit (Fix here only): the old text, and the run that made it, go here. Restore old swaps the two: the `.txt` and `model`, `language`, `settings` take the kept version and the version they had become `previous`, so the same step undoes it (Use new). `previous.newer` (`true`, absent when `false`) says the kept version is the newer one: the `.txt` holds an old text that Restore old brought back, so the page says "Old version restored" and offers Use new, also after the entry is picked again. Only one other version is kept, and nothing is written when an edit leaves the text as it was. Absent until a text was replaced, and when the replaced text was empty. `previous.text` is dictated text like the `.txt`: it stays in the entry's own folder and goes into no log.
 
 ## While recording
 

@@ -17,7 +17,7 @@ mod common;
 mod controls {
     slint::slint! {
         import { Palette } from "std-widgets.slint";
-        import { Theme, Button, PathField, PositionTiles, TilePicker } from "../ui/theme/index.slint";
+        import { Theme, Icons, Button, Group, ActivityHeatmap, PathField, PositionTiles, TilePicker } from "../ui/theme/index.slint";
 
         export component PathProbe inherits Window {
             in property <string> display;
@@ -31,6 +31,37 @@ mod controls {
                 path: "C:/models/a.bin";
                 display: root.display;
                 browse-text: "Browse";
+            }
+        }
+
+        // A Group title row with an icon, an "i" and a trailing action: the row is the button's height.
+        export component GroupProbe inherits Window {
+            width: 340px;
+            height: 80px;
+            Group {
+                x: 0;
+                y: 0;
+                width: 300px;
+                title: "Title";
+                icon: Icons.calendar;
+                info: "Hint";
+                action-text: "Go";
+                action-icon: Icons.folder-open-16;
+            }
+        }
+
+        // The heatmap's own height: 34 px cells, 3 px apart, with and without the legend.
+        export component HeatSizeProbe inherits Window {
+            in property <bool> legend;
+            out property <length> total: h.min-height;
+            out property <length> grid: Theme.heat-top + 7 * (34px + 3px);
+            out property <length> gap: Theme.space-3;
+            width: 400px;
+            height: 400px;
+            h := ActivityHeatmap {
+                levels: [1, 2, 3];
+                cell: 34px;
+                legend-shown: root.legend;
             }
         }
 
@@ -91,8 +122,9 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use common::purple;
+use controls::{GroupProbe, HeatSizeProbe};
 use gallery::{
-    ClickRingProbe, Contrast, DotProbe, GalleryShot, GalleryTile, HeatProbe, HoverTip,
+    ClickRingProbe, ComboProbe, Contrast, DotProbe, GalleryShot, GalleryTile, HeatProbe, HoverTip,
     IconDangerProbe, InvalidFieldProbe, MeterProbe, PathFieldProbe, PathText, PickProbe,
     SubTabsProbe, Theme, TileGalleryProbe, TipFadeProbe,
 };
@@ -1265,4 +1297,93 @@ fn icon_button_kept_dot_is_the_accent_in_the_corner() {
         assert_eq!(at(25, 7) == accent, kept, "dot centre");
         assert_ne!(at(30, 2), accent, "outside the dot");
     }
+}
+
+/// DS-1, 02:12: in a Group title row the icon and the "i" share the vertical centre of the trailing
+/// action button (the tallest item), not the row's top.
+#[test]
+fn group_title_icon_is_centred_with_the_action_button() {
+    let _ = slint::platform::set_platform(Box::new(Shots));
+    let probe = GroupProbe::new().unwrap();
+    let at = pixels(&probe, (340, 80));
+    let bg = at(339, 0);
+    // The rows (first, last) where some pixel in columns `xs` differs from the window.
+    let span = |xs: std::ops::Range<u32>| {
+        let rows: Vec<u32> = (0..80)
+            .filter(|&y| xs.clone().any(|x| at(x, y) != bg))
+            .collect();
+        (*rows.first().unwrap(), *rows.last().unwrap())
+    };
+    // The button ends at x 300: its last 4 columns are its fill. The icon is the first 20.
+    let (b0, b1) = span(296..300);
+    let (i0, i1) = span(0..20);
+    assert!(b1 - b0 >= 31, "the button is 32 px high: {b0}..{b1}");
+    let (bc, ic) = (b0 + b1, i0 + i1);
+    assert!(
+        bc.abs_diff(ic) <= 1,
+        "icon rows {i0}..{i1}, button rows {b0}..{b1}"
+    );
+}
+
+/// DS-28.6, 02:12: the legend is one 16 px line under the grid, whatever the cell size.
+#[test]
+fn heatmap_legend_is_one_caption_line_not_a_cell() {
+    let _ = slint::platform::set_platform(Box::new(Shots));
+    let probe = HeatSizeProbe::new().unwrap();
+    probe.show().unwrap();
+    assert_eq!(
+        probe.get_total(),
+        probe.get_grid(),
+        "no legend: the grid only"
+    );
+    probe.set_legend(true);
+    assert_eq!(
+        probe.get_total(),
+        probe.get_grid() + probe.get_gap() + 16.0,
+        "legend: a gap and a 16 px line"
+    );
+}
+
+fn combo_probe() -> ComboProbe {
+    let _ = slint::platform::set_platform(Box::new(Shots));
+    let probe = ComboProbe::new().unwrap();
+    probe.show().unwrap();
+    LAST.with_borrow(Clone::clone)
+        .unwrap()
+        .set_size(PhysicalSize::new(400, 300));
+    slint::platform::update_timers_and_animations();
+    // A click opens the list.
+    click_at(&probe, 100.0, 16.0);
+    assert!(probe.get_open());
+    probe
+}
+
+/// `committed` is Return, Space or a click on a line: not arrows, Esc or a click outside.
+#[test]
+fn combo_commits_on_return_space_and_a_line_click_only() {
+    let probe = combo_probe();
+    press(&probe, Key::DownArrow);
+    assert_eq!((probe.get_index(), probe.get_commits()), (1, 0), "arrow");
+    press(&probe, Key::Escape);
+    assert!(!probe.get_open());
+    assert_eq!(probe.get_commits(), 0, "Esc");
+
+    click_at(&probe, 100.0, 16.0);
+    press(&probe, Key::DownArrow);
+    click_at(&probe, 390.0, 290.0);
+    assert!(!probe.get_open());
+    assert_eq!(probe.get_commits(), 0, "click outside");
+
+    click_at(&probe, 100.0, 16.0);
+    press(&probe, Key::Return);
+    assert_eq!(probe.get_commits(), 1, "Return");
+
+    click_at(&probe, 100.0, 16.0);
+    press(&probe, " ");
+    assert_eq!(probe.get_commits(), 2, "Space");
+
+    click_at(&probe, 100.0, 16.0);
+    // Row 0 sits under the field: 32 px field, 4 px gap, 4 px list padding, rows of 32 px.
+    click_at(&probe, 100.0, 32.0 + 8.0 + 16.0);
+    assert_eq!((probe.get_index(), probe.get_commits()), (0, 3), "a line");
 }

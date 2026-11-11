@@ -1,7 +1,8 @@
 // History page (SPEC History, R1.3, R3.2, R3.3): the saved recordings, newest first, in a list
 // that draws only the rows in view (500 entries scroll like 5). The picked one: play with its
-// waveform, its full text, Copy, Transcribe again, add a replacement, Copy path, Delete.
-import { Theme, Shell, Icons, CardFrame, Caption, Button, ButtonKind, IconButton, InfoTip, ScrollBox, EmptyState, ProgressBar, Badge, BadgeKind, TextArea, TextField, Toast, FocusRing, KeyFocus } from "../theme/index.slint";
+// waveform, its full text (select words to fix them), Copy, Show in folder, Transcribe again with
+// its changes and Restore, Delete.
+import { Theme, Shell, Icons, CardFrame, Caption, Button, ButtonKind, IconButton, InfoTip, ScrollBox, EmptyState, ProgressBar, Badge, BadgeKind, TextField, Toast, FocusRing, KeyFocus } from "../theme/index.slint";
 
 // One saved recording, ready to show.
 export struct HistoryRow {
@@ -15,7 +16,7 @@ export struct HistoryRow {
     // The first line of the text; empty when there is none.
     first: string,
     text: string,
-    // The recording's `.wav`, for Copy path.
+    // The recording's `.wav`.
     path: string,
 }
 
@@ -46,8 +47,24 @@ export global HistoryState {
     callback redo();
     callback delete();
     callback turn-on();
-    // Adds `heard => wanted` to the replacements; true when it was added.
-    callback add-replacement(string, string) -> bool;
+    callback show-folder();
+    // The picked recording has another version (an earlier text, or the one a Restore put aside).
+    in property <bool> has-other;
+    // The shown version is the old one: the button says Use new.
+    in property <bool> restored;
+    // The text shows what changed from the other version.
+    in property <bool> diff-open;
+    in property <styled-text> diff;
+    callback restore();
+    callback toggle-diff();
+    // The theme changed: the diff's colours are made again.
+    callback restyle();
+    // The picked text between two byte offsets.
+    pure callback slice(int, int) -> string;
+    // Each takes the selection as byte offsets and says if it was done.
+    callback always-fix(int, int, string) -> bool;
+    callback fix-here(int, int, string) -> bool;
+    callback add-word(int, int) -> bool;
 }
 
 // The bars of a recording, centred on its middle line.
@@ -73,7 +90,7 @@ component ListRow inherits Rectangle {
     in property <bool> ring;
     callback clicked;
     border-radius: Theme.radius-control;
-    background: root.selected ? Theme.bg-subtle-selected : touch.has-hover ? Theme.bg-subtle-hover : transparent;
+    background: root.selected ? Theme.accent-tint : touch.has-hover ? Theme.bg-subtle-hover : transparent;
     animate background { duration: Theme.motion-quick; easing: ease-out; }
     accessible-role: list-item;
     accessible-label: root.entry.when;
@@ -204,11 +221,248 @@ component HistoryList {
     }
 }
 
-// The picked recording.
+// The picked recording's text: read-only and selectable. Selecting words shows the action bar
+// over it (Copy, Fix here only, Always fix, Add to dictionary); Fix here only and Always fix ask
+// for the right words in the same place. While the changes are open the text shows its diff.
+component TextView inherits Rectangle {
+    in property <string> text;
+    in property <bool> narrow;
+    // The selection as byte offsets; kept while a button of the bar or its field has the focus.
+    property <int> sel-a;
+    property <int> sel-b;
+    // 0: the bar, 1: asking for the right words of Always fix, 2: of Fix here only.
+    property <int> ask;
+    property <string> fix-text;
+    property <length> caret-x;
+    property <length> caret-y;
+    property <bool> bar-on: root.sel-a != root.sel-b && !HistoryState.diff-open;
+    property <length> bar-h: Theme.control-height + 2 * Theme.space-1;
+    public function reset() {
+        input.clear-selection();
+        root.sel-a = 0;
+        root.sel-b = 0;
+        root.ask = 0;
+    }
+    function track() {
+        if (input.has-focus) {
+            root.sel-a = min(input.anchor-position-byte-offset, input.cursor-position-byte-offset);
+            root.sel-b = max(input.anchor-position-byte-offset, input.cursor-position-byte-offset);
+            root.ask = 0;
+        }
+    }
+    function start-ask(mode: int) {
+        root.fix-text = HistoryState.slice(root.sel-a, root.sel-b);
+        root.ask = mode;
+    }
+    function apply() {
+        let ok = root.ask == 1 ? HistoryState.always-fix(root.sel-a, root.sel-b, root.fix-text) : HistoryState.fix-here(root.sel-a, root.sel-b, root.fix-text);
+        if (ok) {
+            root.reset();
+        }
+    }
+    changed text => {
+        root.reset();
+    }
+    property <bool> dark: Theme.dark;
+    changed dark => {
+        HistoryState.restyle();
+    }
+    background: Theme.bg-control;
+    border-width: 1px;
+    border-color: Theme.stroke-control;
+    border-radius: Theme.radius-control;
+    min-height: Theme.editor-min-height;
+    // The bar floats over the text: it must not widen the card (its extents are not the text's).
+    min-width: 0;
+    preferred-width: 0;
+    max-width: 100000px;
+    horizontal-stretch: 1;
+    accessible-role: text-input;
+    accessible-label: @tr("Transcript");
+    accessible-value: root.text;
+    accessible-read-only: true;
+    view := ScrollBox {
+        thin: true;
+        inset: Theme.space-1;
+        x: Theme.space-3;
+        y: Theme.space-2;
+        width: parent.width - Theme.space-3 - Theme.space-1;
+        height: parent.height - 2 * Theme.space-2;
+        content-height: max(self.height, HistoryState.diff-open ? changes.preferred-height : input.preferred-height);
+        input := TextInput {
+            visible: !HistoryState.diff-open;
+            width: view.content-width;
+            height: view.content-height;
+            text: root.text;
+            single-line: false;
+            wrap: word-wrap;
+            read-only: true;
+            font-size: Theme.body-size;
+            color: Theme.text-primary;
+            selection-background-color: Theme.accent;
+            selection-foreground-color: Theme.on-accent;
+            page-height: view.height;
+            accessible-role: none;
+            changed anchor-position-byte-offset => {
+                root.track();
+            }
+            changed cursor-position-byte-offset => {
+                root.track();
+            }
+            cursor-position-changed(at) => {
+                root.caret-x = at.x;
+                root.caret-y = at.y;
+            }
+            key-pressed(event) => {
+                if (event.text == Key.Escape && root.bar-on) {
+                    root.reset();
+                    return accept;
+                }
+                reject
+            }
+        }
+        changes := StyledText {
+            visible: HistoryState.diff-open;
+            width: view.content-width;
+            y: 0;
+            height: self.preferred-height;
+            text: HistoryState.diff;
+            default-color: Theme.text-primary;
+            default-font-size: Theme.body-size;
+        }
+    }
+    // The clipboard is reached through a text input's own Copy.
+    copier := TextInput {
+        visible: false;
+        width: 0;
+        height: 0;
+        accessible-role: none;
+    }
+    Text {
+        x: Theme.space-3;
+        y: Theme.space-2;
+        width: parent.width - 2 * Theme.space-3;
+        text: root.text == "" ? @tr("No text") : "";
+        font-size: Theme.body-size;
+        color: Theme.text-secondary;
+        accessible-role: none;
+    }
+    // On its own layer: nothing moves when it comes or goes (DS-28.5). Over the caret's line, under
+    // it when there is no room; a Slint text input gives the caret, not the selection's first line.
+    if root.bar-on: Rectangle {
+        property <length> above: root.caret-y + view.viewport-y + view.y - root.bar-h - Theme.control-gap;
+        width: bar.preferred-width + 2 * Theme.space-1;
+        height: root.bar-h;
+        x: clamp(root.caret-x + view.x - self.width / 2, Theme.space-2, max(Theme.space-2, root.width - self.width - Theme.space-2));
+        y: min(self.above >= 0 ? self.above : root.caret-y + view.viewport-y + view.y + Theme.body-line + Theme.control-gap, max(0, root.height - root.bar-h - Theme.space-1));
+        background: Theme.bg-control;
+        border-width: 1px;
+        border-color: Theme.stroke-control;
+        border-radius: Theme.radius-card;
+        accessible-role: none;
+        bar := HorizontalLayout {
+            x: Theme.space-1;
+            y: Theme.space-1;
+            height: Theme.control-height;
+            spacing: Theme.control-gap;
+            if root.ask == 0: IconButton {
+                icon: Icons.copy;
+                label: @tr("Copy");
+                clicked => {
+                    // The stored range, not the input's own selection: that one collapses when a field of the bar had the focus.
+                    copier.text = HistoryState.slice(root.sel-a, root.sel-b);
+                    copier.select-all();
+                    copier.copy();
+                    copier.clear-selection();
+                    Toast.show(@tr("Copied."));
+                }
+            }
+            if root.ask == 0 && !root.narrow: Button {
+                icon: Icons.edit;
+                text: @tr("Fix here only");
+                clicked => {
+                    root.start-ask(2);
+                }
+            }
+            if root.ask == 0 && root.narrow: IconButton {
+                icon: Icons.edit;
+                label: @tr("Fix here only");
+                clicked => {
+                    root.start-ask(2);
+                }
+            }
+            if root.ask == 0 && !root.narrow: Button {
+                icon: Icons.replace;
+                text: @tr("Always fix");
+                clicked => {
+                    root.start-ask(1);
+                }
+            }
+            if root.ask == 0 && root.narrow: IconButton {
+                icon: Icons.replace;
+                label: @tr("Always fix");
+                clicked => {
+                    root.start-ask(1);
+                }
+            }
+            if root.ask == 0 && !root.narrow: Button {
+                icon: Icons.dictionary;
+                text: @tr("Add to dictionary");
+                clicked => {
+                    if (HistoryState.add-word(root.sel-a, root.sel-b)) {
+                        root.reset();
+                    }
+                }
+            }
+            if root.ask == 0 && root.narrow: IconButton {
+                icon: Icons.dictionary;
+                label: @tr("Add to dictionary");
+                clicked => {
+                    if (HistoryState.add-word(root.sel-a, root.sel-b)) {
+                        root.reset();
+                    }
+                }
+            }
+            if root.ask != 0: TextField {
+                width: Theme.control-column-min;
+                no-ring: true;
+                locked: false;
+                text <=> root.fix-text;
+                placeholder-text: root.ask == 1 ? @tr("Always replace with") : @tr("Replace here with");
+                accessible-label: self.placeholder-text;
+                init => {
+                    self.focus();
+                }
+                accepted => {
+                    root.apply();
+                }
+            }
+            if root.ask != 0: IconButton {
+                icon: Icons.done;
+                label: root.ask == 1 ? @tr("Always replace") : @tr("Replace here");
+                clicked => {
+                    root.apply();
+                }
+            }
+            if root.ask != 0: IconButton {
+                icon: Icons.close;
+                label: @tr("Cancel");
+                clicked => {
+                    // The field took the focus and with it the selection: the bar goes, as on Esc.
+                    root.reset();
+                }
+            }
+        }
+    }
+}
+
+// The picked recording: the action bar, the text, one reserved strip for what is happening to it.
 component Detail inherits CardFrame {
     in property <HistoryRow> entry;
     property <bool> asking;
     property <bool> running: HistoryState.running-id != "" && HistoryState.running-id == root.entry.id;
+    // Set by the page from its own width: the detail's width depends on what it holds.
+    in property <bool> narrow;
     changed entry => {
         root.asking = false;
     }
@@ -218,11 +472,22 @@ component Detail inherits CardFrame {
         padding-top: Theme.card-padding-v;
         padding-bottom: Theme.card-padding-v;
         spacing: Theme.space-3;
+        // Start: Play, then the length; end: Copy, folder, Transcribe again, Delete last (DS-23).
         HorizontalLayout {
             spacing: Theme.control-gap;
-            Button {
+            height: Theme.control-height;
+            if !root.narrow: Button {
                 icon: HistoryState.playing ? Icons.stop : Icons.play;
                 text: HistoryState.playing ? @tr("Stop") : @tr("Play");
+                enabled: HistoryState.play-off == "";
+                tooltip: HistoryState.play-off;
+                clicked => {
+                    HistoryState.play();
+                }
+            }
+            if root.narrow: IconButton {
+                icon: HistoryState.playing ? Icons.stop : Icons.play;
+                label: HistoryState.playing ? @tr("Stop") : @tr("Play");
                 enabled: HistoryState.play-off == "";
                 tooltip: HistoryState.play-off;
                 clicked => {
@@ -232,6 +497,7 @@ component Detail inherits CardFrame {
             Wave {
                 peaks: HistoryState.peaks;
                 horizontal-stretch: 1;
+                min-width: 0;
                 height: Theme.control-height;
             }
             Text {
@@ -241,38 +507,8 @@ component Detail inherits CardFrame {
                 vertical-alignment: center;
                 horizontal-stretch: 0;
             }
-        }
-        TextArea {
-            vertical-stretch: 1;
-            min-height: Theme.control-height * 2;
-            locked: false;
-            read-only: true;
-            text: root.entry.text;
-            placeholder-text: @tr("No text");
-            accessible-label: @tr("Transcript");
-        }
-        if root.running: ProgressBar {
-            value: HistoryState.progress;
-            label: @tr("Transcribing");
-        }
-        if !root.asking: HorizontalLayout {
-            spacing: Theme.control-gap;
-            Button {
-                icon: Icons.redo;
-                // An entry with no text stands out: transcribing it is the next step.
-                text: root.entry.text == "" ? @tr("Transcribe") : @tr("Transcribe again");
-                kind: root.entry.text == "" ? ButtonKind.primary : ButtonKind.secondary;
-                enabled: HistoryState.redo-off == "";
-                tooltip: HistoryState.redo-off;
-                clicked => {
-                    HistoryState.redo();
-                }
-            }
-            Rectangle {
-                horizontal-stretch: 1;
-            }
             IconButton {
-                icon: Icons.clipboard-paste-24;
+                icon: Icons.copy;
                 label: @tr("Copy text");
                 enabled: root.entry.text != "";
                 clicked => {
@@ -284,18 +520,24 @@ component Detail inherits CardFrame {
                 }
             }
             IconButton {
-                icon: Icons.path;
-                label: @tr("Copy path");
+                icon: Icons.folder-open;
+                label: @tr("Show in folder");
                 clicked => {
-                    copier.text = root.entry.path;
-                    copier.select-all();
-                    copier.copy();
-                    copier.clear-selection();
-                    Toast.show(@tr("Path copied."));
+                    HistoryState.show-folder();
                 }
             }
             IconButton {
-                icon: Icons.delete-16;
+                icon: Icons.retry;
+                // An entry with no text stands out: transcribing it is the next step.
+                label: root.entry.text == "" ? @tr("Transcribe") : @tr("Transcribe again");
+                enabled: HistoryState.redo-off == "";
+                tooltip: HistoryState.redo-off;
+                clicked => {
+                    HistoryState.redo();
+                }
+            }
+            IconButton {
+                icon: Icons.delete;
                 label: @tr("Delete");
                 destructive: true;
                 enabled: !root.running;
@@ -304,25 +546,44 @@ component Detail inherits CardFrame {
                 }
             }
         }
-        if root.asking: HorizontalLayout {
+        TextView {
+            vertical-stretch: 1;
+            narrow: root.narrow;
+            text: root.entry.text;
+        }
+        // Reserved, so nothing moves when a run starts or ends (DS-25). Never an empty layout: the
+        // spacer keeps the card's width the same with nothing to say.
+        HorizontalLayout {
             spacing: Theme.control-gap;
-            Text {
+            height: Theme.control-height;
+            if root.asking: Text {
                 text: @tr("Delete this recording?");
                 font-size: Theme.body-size;
                 color: Theme.text-primary;
                 vertical-alignment: center;
-                horizontal-stretch: 1;
                 overflow: elide;
                 min-width: 0;
             }
-            Button {
+            if !root.asking && !root.running && HistoryState.has-other: Text {
+                text: HistoryState.restored ? @tr("Old version restored") : @tr("New version applied");
+                font-size: Theme.body-size;
+                color: Theme.text-secondary;
+                vertical-alignment: center;
+                overflow: elide;
+                min-width: 0;
+            }
+            if !root.running: Rectangle {
+                horizontal-stretch: 1;
+                min-width: 0;
+            }
+            if root.asking: Button {
                 text: @tr("Cancel");
                 clicked => {
                     root.asking = false;
                 }
             }
-            Button {
-                icon: Icons.delete-16;
+            if root.asking: Button {
+                icon: Icons.delete;
                 text: @tr("Delete");
                 kind: ButtonKind.danger;
                 clicked => {
@@ -330,36 +591,26 @@ component Detail inherits CardFrame {
                     HistoryState.delete();
                 }
             }
-        }
-        HorizontalLayout {
-            spacing: Theme.control-gap;
-            heard := TextField {
-                horizontal-stretch: 1;
-                locked: false;
-                placeholder-text: @tr("Heard");
-                accessible-label: @tr("Heard");
+            if !root.asking && root.running: ProgressBar {
+                value: HistoryState.progress;
+                indeterminate: HistoryState.progress <= 0;
+                label: @tr("Transcribing");
             }
-            wanted := TextField {
-                horizontal-stretch: 1;
-                locked: false;
-                placeholder-text: @tr("Replace with");
-                accessible-label: @tr("Replace with");
-            }
-            Button {
-                icon: Icons.add;
-                text: @tr("Add");
-                enabled: heard.text != "";
-                tooltip: @tr("Add to replacements");
+            // A text toggle: the eye is reserved for the desktop preview (DS-24.1).
+            if !root.asking && !root.running && HistoryState.has-other: Button {
+                text: @tr("Show changes");
+                toggled: HistoryState.diff-open;
                 clicked => {
-                    if (HistoryState.add-replacement(heard.text, wanted.text)) {
-                        heard.text = "";
-                        wanted.text = "";
-                    }
+                    HistoryState.toggle-diff();
                 }
             }
-            InfoTip {
-                y: (parent.height - self.height) / 2;
-                text: @tr("Fix a word whisper gets wrong: every later dictation gets the replacement.");
+            if !root.asking && !root.running && HistoryState.has-other: Button {
+                icon: Icons.revert;
+                text: HistoryState.restored ? @tr("Use new") : @tr("Restore old");
+                kind: ButtonKind.soft;
+                clicked => {
+                    HistoryState.restore();
+                }
             }
         }
     }
@@ -393,6 +644,7 @@ export component HistoryPage inherits VerticalLayout {
         }
         Detail {
             horizontal-stretch: 1;
+            narrow: root.width - clamp(root.width * 0.4, Theme.control-column-min, Theme.control-column-max) - Theme.tile-gap < 520px;
             entry: HistoryState.items[HistoryState.selected];
         }
     }

@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak as RcWeak};
 use std::time::Duration;
 
-use oxi_core::config::OtherKey;
+use oxi_core::config::{Hotkey, OtherKey};
 use oxi_core::hotkey::{Chord, ChordError, Key};
 use oxi_core::ipc::{Push, Request};
 use oxi_core::machine::Mode;
@@ -35,6 +35,9 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     set_saved_chord(&s, &file.config.hotkey.chord);
     s.set_mode(i32::from(file.config.hotkey.mode == Mode::Toggle));
     s.set_esc_cancels(file.config.hotkey.esc_cancels);
+    s.set_hold_gap(f32::from(
+        u16::try_from(file.config.hotkey.hold_gap_ms).unwrap_or(u16::MAX),
+    ));
     let other = OTHER_KEYS
         .iter()
         .position(|&k| k == file.config.hotkey.other_key);
@@ -92,7 +95,7 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     let p = picker.clone();
     s.on_shown(move || p.close());
     let p = picker.clone();
-    s.on_change(move || p.open());
+    s.on_change(move || p.toggle());
     let p = picker.clone();
     s.on_cancel(move || p.close());
     let p = picker.clone();
@@ -105,6 +108,12 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
             p.clicked(key);
         }
     });
+    bind_settings(window, ctx);
+}
+
+/// The mode, Esc, other-key and hold-gap controls: each saves its config field.
+fn bind_settings(window: &AppWindow, ctx: &Ctx) {
+    let s = window.global::<HotkeyState>();
     let (w, c) = (window.as_weak(), ctx.clone());
     s.on_mode_picked(move |i| {
         let mode = if i == 1 { Mode::Toggle } else { Mode::Push };
@@ -119,14 +128,19 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         c.config.borrow_mut().config.hotkey.esc_cancels = on;
         report(&w, c.save());
     });
-    let c = ctx.clone();
-    // Arrowing through the Combo picks on every step: save once it rests.
-    let save = SaveDebounce::new(window.as_weak(), ctx.clone());
+    // Arrowing through the Combo or dragging the slider changes on every step: save once it rests.
+    let save = Rc::new(SaveDebounce::new(window.as_weak(), ctx.clone()));
+    let (c, d) = (ctx.clone(), save.clone());
     s.on_other_key_picked(move |i| {
         if let Some(&k) = usize::try_from(i).ok().and_then(|i| OTHER_KEYS.get(i)) {
             c.config.borrow_mut().config.hotkey.other_key = k;
-            save.touch();
+            d.touch();
         }
+    });
+    let c = ctx.clone();
+    s.on_hold_gap_changed(move |v| {
+        c.config.borrow_mut().config.hotkey.hold_gap_ms = hold_gap_ms(v);
+        save.touch();
     });
 }
 
@@ -150,24 +164,51 @@ struct Picker {
 }
 
 impl Picker {
+    /// The pencil: opens the keyboard, or hides it keeping the keys picked so far.
+    fn toggle(&self) {
+        if self.is_open() {
+            self.collapse();
+        } else {
+            self.open();
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.window
+            .upgrade()
+            .is_some_and(|w| w.global::<HotkeyState>().get_keyboard_open())
+    }
+
+    /// Opens the keyboard; keys kept from a hidden draft are still pending.
     fn open(&self) {
         // A disabled button still runs its accessible default action.
         if self.ctx.config.borrow().read_only {
             return;
         }
-        self.pending.borrow_mut().clear();
         self.with(|s| {
             s.set_keyboard_open(true);
-            s.set_error(SharedString::new());
+            s.set_draft(false);
         });
         self.capture(true);
     }
 
+    /// Hides the keyboard, keeps the pending keys; the pencil's dot says they are there.
+    fn collapse(&self) {
+        self.capture(false);
+        let draft = !self.pending.borrow().is_empty();
+        self.with(|s| {
+            s.set_keyboard_open(false);
+            s.set_draft(draft);
+        });
+    }
+
+    /// Hides the keyboard and drops the draft: Cancel, Apply, leaving the page.
     fn close(&self) {
         self.capture(false);
         self.pending.borrow_mut().clear();
         self.with(|s| {
             s.set_keyboard_open(false);
+            s.set_draft(false);
             s.set_error(SharedString::new());
         });
         self.show();
@@ -175,11 +216,7 @@ impl Picker {
 
     /// Capture runs only while the keyboard is open and has the focus.
     fn capture(&self, on: bool) {
-        let open = self
-            .window
-            .upgrade()
-            .is_some_and(|w| w.global::<HotkeyState>().get_keyboard_open());
-        let on = on && open;
+        let on = on && self.is_open();
         if self.capturing.replace(on) != on {
             self.ctx.ipc.send(Request::CaptureHotkey { on });
         }
@@ -373,6 +410,18 @@ fn chord_text(names: &[String]) -> SharedString {
 fn string_model(items: &[String]) -> ModelRc<SharedString> {
     let items: Vec<SharedString> = items.iter().map(SharedString::from).collect();
     ModelRc::from(Rc::new(VecModel::from(items)))
+}
+
+/// The slider's value as `hotkey.hold_gap_ms`: 0 is off, anything else stays in the allowed range.
+fn hold_gap_ms(v: f32) -> u32 {
+    let range = Hotkey::HOLD_GAP_MS;
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )] // clamped whole ms, far below f32's 2^24
+    let ms = v.clamp(0.0, *range.end() as f32).round() as u32;
+    if ms == 0 { 0 } else { ms.max(*range.start()) }
 }
 
 /// Apply is on only while online; `note` is its tooltip otherwise.
@@ -777,6 +826,79 @@ mod tests {
         // Back on the page, the board is closed.
         window.set_page(Page::Hotkey);
         assert!(!board_open(&window));
+    }
+
+    #[test]
+    fn the_pencil_hides_the_keyboard_and_keeps_the_draft_until_the_page_is_left() {
+        let (window, ipc, sent) = open("draft");
+        let state = window.global::<HotkeyState>();
+        let pencil = || one(&window, "Change hotkey");
+        pencil().invoke_accessible_default_action();
+        assert!(board_open(&window) && !state.get_draft());
+        // Nothing picked: hiding leaves no draft.
+        pencil().invoke_accessible_default_action();
+        assert!(!board_open(&window) && !state.get_draft());
+        assert_eq!(captures(&sent), [true, false]);
+        pencil().invoke_accessible_default_action();
+        key(&ipc, Key::LShift, true);
+        key(&ipc, Key::F13, true);
+        pencil().invoke_accessible_default_action();
+        assert!(!board_open(&window) && state.get_draft());
+        assert_eq!(captures(&sent), [true, false]);
+        // Applying nothing: the saved chord is untouched.
+        assert!(one(&window, "Ctrl + Win").is_valid());
+        // Open again: the draft is still pending and the dot is gone.
+        pencil().invoke_accessible_default_action();
+        assert!(one(&window, "New hotkey: Shift + F13").is_valid());
+        assert!(!state.get_draft());
+        // Hide, then leave the page: the draft is dropped.
+        pencil().invoke_accessible_default_action();
+        assert!(state.get_draft());
+        window.set_page(Page::Audio);
+        // The query makes the window drop the page.
+        assert!(
+            ElementHandle::find_by_accessible_label(&window, "Change hotkey")
+                .next()
+                .is_none()
+        );
+        window.set_page(Page::Hotkey);
+        // The query builds the page, whose init drops the draft.
+        let pencil = one(&window, "Change hotkey");
+        assert!(!state.get_draft());
+        pencil.invoke_accessible_default_action();
+        assert!(one(&window, "No keys yet").is_valid());
+    }
+
+    #[test]
+    fn cancel_drops_the_draft_and_apply_saves_a_kept_one() {
+        let (window, ipc, _sent) = open("draft-apply");
+        let state = window.global::<HotkeyState>();
+        one(&window, "Change hotkey").invoke_accessible_default_action();
+        key(&ipc, Key::F13, true);
+        one(&window, "Change hotkey").invoke_accessible_default_action();
+        assert!(state.get_draft());
+        one(&window, "Change hotkey").invoke_accessible_default_action();
+        one(&window, "Cancel hotkey change").invoke_accessible_default_action();
+        assert!(!state.get_draft() && !board_open(&window));
+        one(&window, "Change hotkey").invoke_accessible_default_action();
+        assert!(one(&window, "No keys yet").is_valid());
+        // A kept draft: collapse, reopen, Apply saves it and clears the draft.
+        key(&ipc, Key::F13, true);
+        one(&window, "Change hotkey").invoke_accessible_default_action();
+        assert!(state.get_draft());
+        one(&window, "Change hotkey").invoke_accessible_default_action();
+        one(&window, "Apply hotkey").invoke_accessible_default_action();
+        assert!(!state.get_draft() && !board_open(&window));
+        assert_eq!(state.get_chord(), "F13");
+    }
+
+    #[test]
+    fn the_hold_gap_slider_maps_to_off_or_a_value_in_range() {
+        assert_eq!(super::hold_gap_ms(0.0), 0);
+        assert_eq!(super::hold_gap_ms(-5.0), 0);
+        assert_eq!(super::hold_gap_ms(40.0), 100);
+        assert_eq!(super::hold_gap_ms(400.0), 400);
+        assert_eq!(super::hold_gap_ms(9000.0), 1500);
     }
 
     #[test]

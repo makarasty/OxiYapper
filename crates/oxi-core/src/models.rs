@@ -64,6 +64,45 @@ pub const MODELS: &[ModelEntry] = &[
     },
 ];
 
+/// What a model is for, one glyph each (DS-24: no two classes share one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelClass {
+    Accurate,
+    Fast,
+    Language,
+    Small,
+}
+
+impl ModelClass {
+    /// The place of the class in the page's glyph list; "own file" comes after the last class.
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// What a model card says besides its size: its class, how fast it is, the languages it hears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Facts {
+    pub class: ModelClass,
+    pub speed: &'static str,
+    pub languages: &'static str,
+}
+
+/// The facts of registry model `id`; an id the registry does not know reads as a small model.
+pub fn facts(id: &str) -> Facts {
+    let (class, speed, languages) = match id {
+        "turbo" => (ModelClass::Fast, "Fast", "99 languages"),
+        "large-v3" => (ModelClass::Accurate, "Slower", "99 languages"),
+        "podlodka" => (ModelClass::Language, "Slower", "Russian"),
+        _ => (ModelClass::Small, "Fastest", "99 languages"),
+    };
+    Facts {
+        class,
+        speed,
+        languages,
+    }
+}
+
 /// Registry entry for `id`; `None` for unknown ids and for `"custom"` (loaded as is, no hash).
 pub fn find(id: &str) -> Option<&'static ModelEntry> {
     MODELS.iter().find(|m| m.id == id)
@@ -286,6 +325,19 @@ mod tests {
         ] {
             assert_eq!(days_kept(remove_at, now), want, "{remove_at:?}");
         }
+    }
+
+    #[test]
+    fn every_curated_model_has_its_own_class_glyph_except_the_tests_one() {
+        let classes: Vec<_> = ["turbo", "large-v3", "podlodka"]
+            .iter()
+            .map(|id| facts(id).class)
+            .collect();
+        for (i, c) in classes.iter().enumerate() {
+            assert!(!classes[i + 1..].contains(c), "{c:?} repeats");
+        }
+        assert_eq!(facts("tiny").class, ModelClass::Small);
+        assert_eq!(ModelClass::Small.index(), 3);
     }
 
     #[test]

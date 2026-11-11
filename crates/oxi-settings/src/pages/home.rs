@@ -14,7 +14,9 @@ use oxi_core::config::History;
 use oxi_core::history;
 use oxi_core::ipc::{Push, Request};
 use oxi_core::machine::Mode;
-use oxi_core::stats::{self, Date, HEAT_WEEKS, Metric, Stats, Summary, Trend, format_count};
+use oxi_core::stats::{
+    self, Date, HEAT_WEEKS, Metric, Stats, Summary, Totals, Trend, format_count,
+};
 use oxi_platform::stats_store;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
@@ -65,7 +67,7 @@ struct Shown {
     /// When the running reveal started.
     since: Cell<Option<Instant>>,
     reveal: Timer,
-    /// The last summary, a year of heatmap: a resize shows more or fewer of its weeks.
+    /// The last summary, a year of heatmap: the page shows its last half.
     summary: RefCell<Option<Summary>>,
 }
 
@@ -88,7 +90,19 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
             return;
         };
         match event {
-            Event::Push(Push::Stats(summary)) => show(&window, &s, summary),
+            Event::Push(Push::Stats(summary)) => {
+                // The daemon's summary has no per-day counts: the day tips come from the file.
+                // File locked: the heatmap and its tips stay as they were, both from the last
+                // read, and the next poll asks again.
+                let fresh = read_stats(&c);
+                let keep_heat = fresh.is_none() && s.stats.borrow().is_some();
+                if let Some(stats) = fresh {
+                    *s.stats.borrow_mut() = Some(stats);
+                } else if keep_heat {
+                    s.stamp.set(Stamp::default());
+                }
+                show(&window, &s, summary, keep_heat);
+            }
             Event::Link(_) if window.get_page() == Page::Home => refresh(&window, &c, &s, false),
             _ => {}
         }
@@ -132,6 +146,14 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
             if !show_trend(&window, &c, &seen, true) {
                 seen.stamp.set(Stamp::default());
             }
+        }
+    });
+
+    // shortcut: History cannot filter by day yet; a click on a day opens it unfiltered.
+    let w = window.as_weak();
+    window.global::<HomeState>().on_open_day(move || {
+        if let Some(window) = w.upgrade() {
+            window.set_page(Page::History);
         }
     });
 
@@ -222,12 +244,9 @@ fn load(window: &AppWindow, ctx: &Ctx, seen: &Seen) -> bool {
     let Some(stats) = read_stats(ctx) else {
         return false;
     };
-    show(
-        window,
-        seen,
-        &stats.summary(stats_store::today(), HEAT_WEEKS),
-    );
+    let summary = stats.summary(stats_store::today(), HEAT_WEEKS);
     *seen.stats.borrow_mut() = Some(stats);
+    show(window, seen, &summary, false);
     true
 }
 
@@ -308,6 +327,22 @@ fn tips(trend: &Trend, metric: Metric, today: Date) -> Vec<String> {
             format!("{day}: {} {unit}", grouped(v))
         })
         .collect()
+}
+
+/// A heatmap day's tooltip: "Nov 8 · 3 dictations · 120 words"; the bare day without its counts.
+fn day_tip(date: Date, today: Date, totals: Option<Totals>) -> String {
+    let day = day_label(date, today);
+    let Some(t) = totals.filter(|t| t.dictations > 0) else {
+        return day;
+    };
+    let s = |n: u64| if n == 1 { "" } else { "s" };
+    format!(
+        "{day} · {} dictation{} · {} word{}",
+        grouped(t.dictations),
+        s(t.dictations),
+        grouped(t.words),
+        s(t.words)
+    )
 }
 
 /// `1234567` as "1,234,567": a tooltip shows the exact number, a card the short one.
@@ -411,7 +446,8 @@ fn push_config(window: &AppWindow, ctx: &Ctx) {
     s.set_history_on(config.config.history.enabled);
 }
 
-fn show(window: &AppWindow, seen: &Shown, summary: &Summary) {
+/// `keep_heat`: the heatmap stays as it is, so it and its day tips are from one read.
+fn show(window: &AppWindow, seen: &Shown, summary: &Summary, keep_heat: bool) {
     let s = window.global::<HomeState>();
     s.set_words(format_count(summary.words).into());
     s.set_wpm(format_count(u64::from(summary.wpm)).into());
@@ -419,8 +455,10 @@ fn show(window: &AppWindow, seen: &Shown, summary: &Summary) {
     s.set_streak(i32::try_from(summary.streak).unwrap_or(i32::MAX));
     s.set_longest_streak(i32::try_from(summary.longest_streak).unwrap_or(i32::MAX));
     s.set_empty(summary.dictations == 0);
-    *seen.summary.borrow_mut() = Some(summary.clone());
-    show_heat(window, seen);
+    if !keep_heat {
+        *seen.summary.borrow_mut() = Some(summary.clone());
+        show_heat(window, seen);
+    }
 }
 
 /// The last summary's heatmap, as many weeks as the card has room for.
@@ -436,6 +474,22 @@ fn show_heat(window: &AppWindow, seen: &Shown) {
     // `start` is a Monday, so the cells fall in Monday-first columns as they come.
     let levels: Vec<i32> = heat.iter().map(|&l| i32::from(l)).collect();
     s.set_levels(ModelRc::from(Rc::new(VecModel::from(levels))));
+    let today = stats_store::today();
+    let tips: Vec<SharedString> = {
+        let stats = seen.stats.borrow();
+        (0..)
+            .zip(heat)
+            .map(|(i, _)| {
+                let date = start.add_days(i);
+                let totals = stats.as_ref().and_then(|st| {
+                    let at = st.days.binary_search_by_key(&date, |d| d.date).ok()?;
+                    Some(st.days[at].n)
+                });
+                day_tip(date, today, totals).into()
+            })
+            .collect()
+    };
+    s.set_day_tips(ModelRc::from(Rc::new(VecModel::from(tips))));
     let months = month_labels(start, int(heat.len().div_ceil(7)));
     s.set_months(ModelRc::from(Rc::new(VecModel::from(months))));
     s.set_today(today_cell(heat));
@@ -523,6 +577,28 @@ mod tests {
         ] {
             assert_eq!(grouped(n), want);
         }
+    }
+
+    #[test]
+    fn a_heatmap_day_tip_names_the_day_and_its_counts() {
+        let today = Date::from_ymd(2026, 11, 10).unwrap();
+        let day = Date::from_ymd(2026, 11, 8).unwrap();
+        let totals = |dictations, words| {
+            Some(super::Totals {
+                dictations,
+                words,
+                speech_ms: 0,
+            })
+        };
+        assert_eq!(
+            super::day_tip(day, today, totals(3, 1240)),
+            "Nov 8 · 3 dictations · 1,240 words"
+        );
+        assert_eq!(
+            super::day_tip(day, today, totals(1, 1)),
+            "Nov 8 · 1 dictation · 1 word"
+        );
+        assert_eq!(super::day_tip(day, today, None), "Nov 8");
     }
 
     #[test]
@@ -617,6 +693,135 @@ mod tests {
         let day = Date::from_ymd(2026, 11, 4).unwrap();
         assert!(stamp_of(file, day) == stamp_of(file, day));
         assert!(stamp_of(file, day) != stamp_of(file, day.add_days(1)));
+    }
+
+    /// The page's window at `size` with a half year of dictation, on Home.
+    fn home_at(name: &str, size: (u32, u32)) -> crate::AppWindow {
+        use slint::ComponentHandle;
+        let layout = crate::testing::layout("home", name);
+        let (ipc, _sent) = crate::ipc::Ipc::fake();
+        let window = crate::open_with(layout, ipc.clone()).unwrap();
+        window.show().unwrap();
+        window
+            .window()
+            .set_size(slint::PhysicalSize::new(size.0, size.1));
+        let mut stats = Stats::default();
+        let today = Date::from_ymd(2026, 11, 10).unwrap();
+        for back in 0..180 {
+            stats.record(today.add_days(-back), 50, Millis(60_000));
+        }
+        let summary = stats.summary(today, HEAT_WEEKS);
+        ipc.deliver(&crate::ipc::Event::Push(oxi_core::ipc::Push::Stats(
+            summary,
+        )));
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+        window
+    }
+
+    fn heatmap(window: &crate::AppWindow) -> i_slint_backend_testing::ElementHandle {
+        i_slint_backend_testing::ElementQuery::from_root(window)
+            .match_accessible_role(i_slint_backend_testing::AccessibleRole::Image)
+            .find_all()
+            .into_iter()
+            .find(|e| {
+                e.accessible_label()
+                    .is_some_and(|l| l.contains("active day"))
+            })
+            .expect("the heatmap")
+    }
+
+    #[test]
+    fn the_page_never_needs_a_scrollbar_in_a_low_window() {
+        i_slint_backend_testing::init_no_event_loop();
+        // The widths of both card layouts and of two-line labels, at and above the window's least.
+        for size in [
+            (1280, 540),
+            (1280, 520),
+            (1280, 860),
+            (1920, 1080),
+            (900, 520),
+            (899, 520),
+            (899, 720),
+            (899, 640),
+            (800, 520),
+            (800, 720),
+            (720, 520),
+            (720, 720),
+        ] {
+            let window = home_at("fits", size);
+            let heat = heatmap(&window);
+            let (at, h) = (heat.absolute_position(), heat.size());
+            // Below the grid: the card's padding and the page's.
+            let pad = if size.0 < 900 { 12.0 } else { 16.0 };
+            let bottom = at.y + h.height + 12.0 + pad;
+            #[allow(clippy::cast_precision_loss, reason = "a window height")]
+            let height = size.1 as f32;
+            assert!(bottom <= height, "{size:?}: the page ends at {bottom}");
+            // Where the height, not the width, limits the cells (one row of cards at 1280 and 899
+            // wide, two rows at 899 x 640, the least window that holds both): the grid fills the room
+            // to within the 8 px that whole-pixel cells leave, so a chrome token that is off by
+            // more than that (`home-chrome`, `home-chrome-row`) fails here. The legend is one 16 px
+            // line, not a cell high, and the page's cell formula still reserves a cell: that
+            // difference (cell - 16) is spare room too (home.slint `cell-high`).
+            // `home-chrome-labels` (two label lines) only comes with a card under 172 px, a width
+            // that never limits by height inside the least window: it is not reachable here.
+            if [(1280, 540), (1280, 520), (899, 520), (899, 640)].contains(&size) {
+                // The heatmap is 20 (months) + 7 x (cell + 3) + 12 + 16 (legend) high.
+                let cell = (h.height - 69.0) / 7.0;
+                let spare = height - bottom - (cell - 16.0);
+                assert!((0.0..8.0).contains(&spare), "{size:?}: {spare} px spare");
+            }
+        }
+    }
+
+    #[test]
+    fn a_locked_stats_file_keeps_the_heatmap_and_its_tips_together() {
+        use slint::{ComponentHandle, Model};
+        i_slint_backend_testing::init_no_event_loop();
+        let layout = crate::testing::layout("home", "locked");
+        let (ipc, _sent) = crate::ipc::Ipc::fake();
+        let window = crate::open_with(layout.clone(), ipc.clone()).unwrap();
+        window.show().unwrap();
+        let today = oxi_platform::stats_store::today();
+        let push = |stats: &Stats| {
+            let summary = stats.summary(today, HEAT_WEEKS);
+            ipc.deliver(&crate::ipc::Event::Push(oxi_core::ipc::Push::Stats(
+                summary,
+            )));
+        };
+        let home = window.global::<crate::generated::HomeState>();
+        let tips = || home.get_day_tips().iter().collect::<Vec<_>>();
+
+        let mut stats = Stats::default();
+        stats.record(today.add_days(-3), 100, Millis(60_000));
+        let file = layout.data_dir.join(oxi_core::stats::FILE);
+        std::fs::write(&file, stats.to_json().unwrap()).unwrap();
+        push(&stats);
+        let (before, levels) = (tips(), home.get_levels().row_count());
+        assert!(
+            before.iter().any(|t| t.contains("1 dictation")),
+            "{before:?}"
+        );
+
+        // The file cannot be read (here: a folder in its place) as a second day lands: the numbers are new, the heatmap
+        // and its tips are still the old read, not a new day with no counts.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        stats.record(today, 7, Millis(60_000));
+        push(&stats);
+        assert_eq!(home.get_dictations(), "2");
+        assert_eq!(tips(), before);
+        assert_eq!(home.get_levels().row_count(), levels);
+
+        // Readable again: both are new.
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::write(&file, stats.to_json().unwrap()).unwrap();
+        push(&stats);
+        assert!(
+            tips().last().unwrap().contains("1 dictation"),
+            "{:?}",
+            tips().last()
+        );
     }
 
     #[test]

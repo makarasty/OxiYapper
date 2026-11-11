@@ -1,5 +1,6 @@
-//! Overlay and System pages under the testing backend, on a temporary Layout. The Preview
-//! request is checked by a unit test in `pages::overlay`: `open` takes no fake daemon link yet.
+//! Overlay and System pages under the testing backend, on a temporary Layout. The preview
+//! request a position click sends is checked by a unit test in `pages::overlay`: `open` takes no
+//! fake daemon link yet.
 
 mod common;
 
@@ -75,7 +76,7 @@ fn overlay_switches_write_the_config() {
     let overlay = config(&l).config.overlay;
     assert!(!overlay.enabled);
     assert!(overlay.hide_over_fullscreen);
-    assert!(has(&window, "Preview"));
+    assert!(!has(&window, "Preview"));
 }
 
 #[test]
@@ -351,8 +352,6 @@ fn the_page_fits_the_minimum_size_with_every_banner() {
         window.set_daemon_text(daemon.into());
         window.set_daemon_start(!daemon.is_empty());
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
-        let preview = with_role(&window, "Preview", AccessibleRole::Button);
-        assert!(whole(&preview), "Preview is cut (banner {banner:?})");
         let top = card(&window, POSITION_CARDS[0]).absolute_position().y;
         for (i, label) in POSITION_CARDS.into_iter().enumerate() {
             let tile = card(&window, label);
@@ -418,19 +417,16 @@ fn the_position_row_names_the_picked_spot() {
     assert!(!shown("Bottom right"));
 }
 
+/// DS-27.1: no Preview row or button; the Position row's "i" says a click shows the overlay.
 #[test]
-fn preview_is_off_without_the_daemon() {
-    let l = layout("preview-offline", None);
+fn there_is_no_preview_row_and_the_position_row_has_the_hint() {
+    let l = layout("preview-gone", None);
     let window = open(&l, Page::Overlay);
-    let preview = with_role(&window, "Preview", AccessibleRole::Button);
-    assert_eq!(preview.accessible_enabled(), Some(false));
-    assert_eq!(
-        preview.accessible_description().as_deref(),
-        Some(oxi_core::strings::PREVIEW_OFFLINE)
-    );
-    // The reason is the button's tooltip; no second sentence beside it (the banner has one).
-    assert!(!has(&window, "Start OxiYapper to preview."));
-    assert!(!has(&window, oxi_core::strings::PREVIEW_OFFLINE));
+    for gone in ["Preview", "Try it on the desktop"] {
+        assert!(!has(&window, gone), "{gone}");
+    }
+    assert!(has(&window, "Click a position to see the overlay there."));
+    assert!(!l.config_file().exists(), "showing it writes nothing");
 }
 
 #[test]
@@ -644,7 +640,7 @@ fn a_foreign_folder_of_our_name_is_refused_and_ours_is_not() {
     fs::write(own.join(oxi_core::history::MARKER), "").unwrap();
     window.set_page(Page::Overlay);
     // The query builds the page; without it the System page would never have gone away.
-    assert!(has(&window, "Preview"));
+    assert!(has(&window, "Show the overlay"));
     window.set_page(Page::System);
     let cleared = (0..100).any(|_| {
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(30));

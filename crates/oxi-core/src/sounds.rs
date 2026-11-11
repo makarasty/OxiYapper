@@ -778,6 +778,85 @@ pub fn decode_custom(bytes: &[u8]) -> Result<Clip, WavError> {
     }
 }
 
+/// A custom file bigger than this is not read (5 s of 96 kHz stereo 24-bit is under 3 MB).
+pub const MAX_FILE: u64 = 8 * 1024 * 1024;
+
+/// Most files a sound folder lists.
+pub const FOLDER_MAX: usize = 200;
+
+/// Reads and decodes the custom sound at `path`.
+///
+/// # Errors
+/// Why the file cannot be used, in words for the settings: a path that could block, not a
+/// regular file, unreadable, over [`MAX_FILE`], or the decoder's [`WavError`].
+pub fn load_custom(path: &Path) -> Result<Clip, String> {
+    load_capped(path, MAX_FILE)
+}
+
+/// [`load_custom`] with the size limit given, so a test needs no file of the real limit.
+fn load_capped(path: &Path, max: u64) -> Result<Clip, String> {
+    use std::io::Read;
+    // Before any open: a pipe or a network path can block the read for ever.
+    if !is_plain_local_path(path) {
+        return Err("not a plain local file path".into());
+    }
+    let cannot = |e: std::io::Error| format!("cannot read the file ({})", e.kind());
+    let meta = std::fs::metadata(path).map_err(cannot)?;
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    // By the size on disk, before a byte is read: a folder of long files is not read whole.
+    let too_big = || Err("the file is bigger than 8 MB".into());
+    if meta.len() > max {
+        return too_big();
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take(max + 1).read_to_end(&mut bytes))
+        .map_err(cannot)?;
+    if bytes.len() as u64 > max {
+        return too_big();
+    }
+    decode_custom(&bytes).map_err(|e| e.to_string())
+}
+
+/// One usable file of a sound folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderSound {
+    pub path: PathBuf,
+    /// The file name without its extension.
+    pub name: String,
+}
+
+/// The `.wav` and `.ogg` files directly in `dir` (not below it) that [`load_custom`] accepts,
+/// by name, at most [`FOLDER_MAX`] files looked at. An unreadable or unsuitable folder gives none.
+#[must_use]
+pub fn scan_folder(dir: &Path) -> Vec<FolderSound> {
+    if dir.as_os_str().is_empty() || !is_plain_local_path(&dir.join("x.wav")) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<FolderSound> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("wav") || x.eq_ignore_ascii_case("ogg"))
+        })
+        .filter_map(|path| {
+            let name = path.file_stem()?.to_string_lossy().into_owned();
+            Some(FolderSound { path, name })
+        })
+        .collect();
+    found.sort_by_cached_key(|f| (f.name.to_lowercase(), f.path.clone()));
+    found.truncate(FOLDER_MAX);
+    found.retain(|f| load_custom(&f.path).is_ok());
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1276,5 +1355,81 @@ mod tests {
             }
             let _ = decode_ogg(&ogg_from(&headers, 50));
         }
+    }
+
+    /// A folder in the temp dir that goes when the test ends, with or without a panic.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("oxi-sounds-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tiny_wav() -> Vec<u8> {
+        wav(1, 16, 1, 8_000, &[0; 160])
+    }
+
+    // The folder lists wav and ogg files by name, case aside, and nothing else: not a folder
+    // below it, not a text file, not a wav that does not decode.
+    #[test]
+    fn a_sound_folder_lists_its_good_wav_and_ogg_files_by_name() {
+        let dir = Scratch::new("list");
+        std::fs::write(dir.0.join("b.WAV"), tiny_wav()).unwrap();
+        std::fs::write(dir.0.join("A.wav"), tiny_wav()).unwrap();
+        std::fs::write(dir.0.join("notes.txt"), b"hi").unwrap();
+        std::fs::write(dir.0.join("broken.wav"), b"not a wav").unwrap();
+        std::fs::create_dir_all(dir.0.join("deeper.wav")).unwrap();
+        std::fs::create_dir_all(dir.0.join("sub")).unwrap();
+        std::fs::write(dir.0.join("sub").join("c.wav"), tiny_wav()).unwrap();
+        let names: Vec<String> = scan_folder(&dir.0).into_iter().map(|f| f.name).collect();
+        assert_eq!(names, ["A", "b"]);
+    }
+
+    #[test]
+    fn a_missing_or_empty_sound_folder_lists_nothing() {
+        let dir = Scratch::new("none");
+        assert_eq!(scan_folder(&dir.0), []);
+        assert_eq!(scan_folder(&dir.0.join("gone")), []);
+        assert_eq!(scan_folder(Path::new("")), []);
+        assert_eq!(scan_folder(Path::new(r"\\nas\share")), []);
+    }
+
+    // A file over the limit is refused by its size, whatever its content.
+    #[test]
+    fn a_file_over_the_limit_is_refused_by_its_size() {
+        let dir = Scratch::new("big");
+        let path = dir.0.join("long.wav");
+        std::fs::write(&path, tiny_wav()).unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(load_capped(&path, size).is_ok());
+        let why = load_capped(&path, size - 1).unwrap_err();
+        assert_eq!(why, "the file is bigger than 8 MB");
+    }
+
+    // 200 files are looked at, the first 200 by name; a file past that is never read.
+    #[test]
+    fn a_sound_folder_stops_at_two_hundred_files() {
+        let dir = Scratch::new("many");
+        for i in 0..FOLDER_MAX + 5 {
+            std::fs::write(dir.0.join(format!("s{i:03}.wav")), tiny_wav()).unwrap();
+        }
+        let found = scan_folder(&dir.0);
+        assert_eq!(found.len(), FOLDER_MAX);
+        assert_eq!(found[0].name, "s000");
+        assert_eq!(
+            found[FOLDER_MAX - 1].name,
+            format!("s{:03}", FOLDER_MAX - 1)
+        );
     }
 }

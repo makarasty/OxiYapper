@@ -422,7 +422,7 @@ fn restore_delay_is_saved_once_the_slider_rests() {
 }
 
 #[test]
-fn duplicate_rule_is_a_toast() {
+fn duplicate_rule_is_refused_without_a_toast() {
     let l = layout("duplicate", None);
     let window = open_tall(&l);
     sub_tab(&window, "Per-app rules");
@@ -430,14 +430,9 @@ fn duplicate_rule_is_a_toast() {
     one(&window, "Add rule").invoke_accessible_default_action();
     one(&window, "New rule app").set_accessible_value("SYNTH.EXE");
     one(&window, "Add rule").invoke_accessible_default_action();
-    let note = "SYNTH.EXE already has a rule: change its mode in the list below.";
-    assert!(has(&window, note), "{:?}", labels(&window, "SYNTH"));
+    // The row of the field says so; the rule flashes instead of a toast saying it again.
+    assert!(!has(&window, "already has a rule: change its mode"));
     assert_eq!(config(&l).config.paste.rules.len(), 2);
-
-    // The first step only lets the toast's clock start.
-    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
-    i_slint_backend_testing::mock_elapsed_time(Duration::from_secs(4));
-    assert!(!has(&window, note), "a toast leaves by itself");
 }
 
 #[test]
@@ -531,6 +526,8 @@ fn mode_thumb_and_rules_write_the_config() {
         one(&window, "New rule app").set_accessible_value("Synth");
         one(&window, "Add rule").invoke_accessible_default_action();
     }
+    // A refused duplicate leaves its text in the field, which filters the list: clear it.
+    one(&window, "New rule app").set_accessible_value("");
     one(&window, "Remove mstsc.exe").invoke_accessible_default_action();
     let rules = config(&l).config.paste.rules;
     assert_eq!(rules.len(), 1, "{rules:?}");
@@ -568,8 +565,15 @@ fn locked_config_keeps_paste_controls_off() {
     let l = layout("locked", Some(original));
     let window = open_tall(&l);
     sub_tab(&window, "Per-app rules");
-    let add = one(&window, "Add rule");
-    assert_eq!(add.accessible_enabled(), Some(false));
+    // The field and the button that opens the apps popup are off, so no rule can be added.
+    assert_eq!(
+        one(&window, "New rule app").accessible_enabled(),
+        Some(false)
+    );
+    assert_eq!(
+        one(&window, "Scan for apps").accessible_enabled(),
+        Some(false)
+    );
     assert_eq!(
         one(&window, "Remove mstsc.exe").accessible_enabled(),
         Some(false)
@@ -587,7 +591,7 @@ fn sub_tabs_show_one_part_of_the_page() {
             "Save dictionary.txt",
             "Save replace.txt",
             "Paste mode",
-            "Add rule",
+            "New rule app",
         ]
         .map(|label| has(&window, label))
     };
@@ -679,7 +683,9 @@ app = \"SynthApp.exe\"
     let window = open(&layout("rule-names", Some(original)), Page::Text);
     sub_tab(&window, "Per-app rules");
     assert!(has(&window, "Synth App"));
-    assert!(!has(&window, "SynthApp.exe"), "the exe is not the title");
+    // The name is the title; the exe stands under it as its caption (DS-28.1), never as the title.
+    assert!(has(&window, "SynthApp.exe"), "the exe is the caption");
+    assert!(has(&window, "Remove SynthApp.exe"));
     let window = common::open_again(&layout("rule-names-default", None), Page::Text);
     sub_tab(&window, "Per-app rules");
     assert!(has(&window, "Remote Desktop Connection"));
@@ -732,7 +738,7 @@ fn every_tab_fits_the_minimum_size_with_long_lists() {
             ("Dictionary", "Save dictionary.txt"),
             ("Replacements", "Save replace.txt"),
             ("Paste", "Restore your copy after"),
-            ("Per-app rules", "Add rule"),
+            ("Per-app rules", "Scan for apps"),
         ] {
             sub_tab(&window, tab);
             i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
@@ -769,13 +775,13 @@ fn a_long_rule_list_scrolls_by_itself() {
         "the list did not scroll"
     );
     assert_eq!(window.get_scroll_y(), 0.0, "the page scrolled");
-    assert!(whole_in_view(&window, "Add rule"));
-    // Scan sits beside Add; the scan itself is tested in `pages::text`, which can point it at
+    assert!(whole_in_view(&window, "New rule app"));
+    // Scan sits beside the field; the scan itself is tested in `pages::text`, which can point it at
     // synthetic shortcuts (this binary would read the real Start menu).
     assert!(whole_in_view(&window, "Scan for apps"));
 }
 
-/// The worst-case list still lets the keyboard reach Add: it sits above the list.
+/// The worst-case list still lets the keyboard reach the field, and Enter adds the typed exe.
 #[test]
 fn add_is_reached_by_keyboard_past_a_long_rule_list() {
     let l = layout("rules-keys", Some(&many_rules(150)));
@@ -806,9 +812,29 @@ fn add_is_reached_by_keyboard_past_a_long_rule_list() {
     for c in ".exe".chars() {
         press(c.to_string().into());
     }
-    press(Key::Tab.into());
-    press(" ".into());
+    // The list under the field offers the typed exe; Enter takes its first row.
+    press(Key::Return.into());
     let rules = config(&l).config.paste.rules;
     assert_eq!(rules.len(), 151);
     assert_eq!(rules[150].app, "q.exe");
+}
+
+/// In a window too short for the tab (200 px) the page scrolls as a whole and its padding gives the scrollbar
+/// gutter back; the apps popup still takes the window's width less 2 x 32 px, not the page's.
+#[test]
+fn apps_popup_is_window_wide_when_the_page_scrolls() {
+    let window = open(&layout("popup-width", None), Page::Text);
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(720.0, 200.0));
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    sub_tab(&window, "Per-app rules");
+    assert!(page_scrolls(&window), "the page must scroll at 720x200");
+    one(&window, "Scan for apps").invoke_accessible_default_action();
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    // Positions inside the popup are its own: it is 720 - 2 x 32 = 656 wide (668 with the old
+    // derived width), and its padding (16 px) sits right of the close button.
+    let close = one(&window, "Close");
+    let right = close.absolute_position().x + close.size().width;
+    assert!((right - 640.0).abs() < 0.5, "close button ends at {right}");
 }

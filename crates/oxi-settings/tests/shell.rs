@@ -1400,17 +1400,14 @@ Over the limit"
     assert!(!has(&window, "All lines valid"));
     assert_nothing_moved(&before, &spots(&window));
 
-    // A refused duplicate rule is a toast.
+    // A refused duplicate rule flashes the existing one: no toast, nothing moves.
     sub_tab(&window, "Per-app rules");
     one(&window, "New rule app").set_accessible_value("synth.exe");
     one(&window, "Add rule").invoke_accessible_default_action();
     let with_rule = spots(&window);
     one(&window, "New rule app").set_accessible_value("SYNTH.EXE");
     one(&window, "Add rule").invoke_accessible_default_action();
-    assert_eq!(
-        window.global::<Toast>().get_text(),
-        "SYNTH.EXE already has a rule: change its mode in the list below."
-    );
+    assert_eq!(window.global::<Toast>().get_text(), "");
     assert_nothing_moved(&with_rule, &spots(&window));
 }
 

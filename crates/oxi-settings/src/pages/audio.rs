@@ -10,16 +10,18 @@ use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use oxi_core::audio::{AudioError, Level, SAMPLE_RATE, db_to_linear};
-use oxi_core::config::{Audio, Config, Sounds};
+use oxi_core::config::{Audio, AudioChannel, Config, Sounds, VadSensitivity};
 use oxi_core::constants::PLAY_TAIL;
 use oxi_core::ipc::{Push, Request};
 use oxi_core::machine::Sound;
 use oxi_core::overlay::{METER_HZ, Meter};
-use oxi_core::sounds::{Builtin, Choice, OFF, is_plain_local_path};
+use oxi_core::sounds::{Builtin, Choice, FolderSound, OFF, is_plain_local_path, scan_folder};
 use oxi_core::strings::{self, NO_MIC};
 use oxi_core::types::Millis;
 use oxi_platform::capture::{
@@ -55,6 +57,8 @@ fn builtin_tile(i: usize) -> usize {
 }
 /// Tile of the own file: after the built-in sounds.
 const OWN_FILE_TILE: usize = Builtin::ALL.len() + 1;
+/// Tile of the first file of the sound folder: after the own file.
+const FOLDER_TILE: usize = OWN_FILE_TILE + 1;
 /// The sounds of the Sounds tab, in the order of its picker: `AudioState.view` 2 to 6.
 const ROLES: [Sound; 5] = [
     Sound::Start,
@@ -67,6 +71,8 @@ const ROLES: [Sound; 5] = [
 const PREVIEW_NEEDS_DAEMON: &str = "Start OxiYapper to hear a preview.";
 /// Toast when the picked sound file is a network, device or stream path.
 const SOUND_PATH_REFUSED: &str = "Pick a WAV or OGG file on a local drive";
+/// Toast when the picked sound folder has no usable `.wav` or `.ogg` file.
+const NO_SOUNDS_IN_FOLDER: &str = "No usable WAV or OGG files in that folder";
 
 /// Opens a capture feeding the meter; the flag is set when the stream stops on its own.
 type Opener<C> = fn(&Audio, LevelMeter, Arc<AtomicBool>) -> Result<Opened<C>, CaptureError>;
@@ -79,6 +85,10 @@ struct Io<C> {
     play: Player,
     /// The file dialog for an own sound; `None` when cancelled.
     pick_file: fn(&Path) -> Option<PathBuf>,
+    /// The folder dialog for the sound folder; `None` when cancelled.
+    pick_folder: fn(&Path) -> Option<PathBuf>,
+    /// Lists the usable files of a sound folder; it runs on a thread of its own.
+    scan: fn(&Path) -> Vec<FolderSound>,
 }
 
 /// Plays a mono clip at the given rate; the handle keeps it playing.
@@ -127,6 +137,17 @@ fn pick_file(_: &Path) -> Option<PathBuf> {
     None
 }
 
+#[cfg(windows)]
+fn pick_folder(start: &Path) -> Option<PathBuf> {
+    rfd::FileDialog::new().set_directory(start).pick_folder()
+}
+
+/// No native dialog on this OS: `can-browse` turns the buttons off.
+#[cfg(not(windows))]
+fn pick_folder(_: &Path) -> Option<PathBuf> {
+    None
+}
+
 /// Where the sound dialog opens: the folder of the sound now set when it is an own file in an
 /// existing folder, else the settings folder.
 fn pick_start(current: &str, fallback: &Path) -> PathBuf {
@@ -150,13 +171,21 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         now: since_start,
         play: play_cpal,
         pick_file,
+        pick_folder,
+        scan: scan_folder,
     };
     bind_with(window, ctx, &io);
 }
 
 fn bind_with<C: Capture + 'static>(window: &AppWindow, ctx: &Ctx, io: &Io<C>) -> Rc<PageState<C>> {
     let state = window.global::<AudioState>();
-    push_config(&state, &ctx.config.borrow().config, &Devices::default());
+    // The sound folder is read when the page is shown, not here.
+    push_config(
+        &state,
+        &ctx.config.borrow().config,
+        &Devices::default(),
+        &[],
+    );
 
     // Shared by the callbacks; replacing them on a rebind drops the old meter with its capture
     // and this subscription.
@@ -180,6 +209,10 @@ fn bind_with<C: Capture + 'static>(window: &AppWindow, ctx: &Ctx, io: &Io<C>) ->
         open: io.open,
         play: io.play,
         pick_file: io.pick_file,
+        pick_folder: io.pick_folder,
+        scan: io.scan,
+        scanning: RefCell::new(None),
+        folder: RefCell::new(Vec::new()),
         test: RefCell::new(None),
     });
     state.set_can_browse(cfg!(windows));
@@ -195,6 +228,10 @@ fn bind_with<C: Capture + 'static>(window: &AppWindow, ctx: &Ctx, io: &Io<C>) ->
     state.on_sound_picked(move |tile| p.sound_picked(tile));
     let p = Rc::clone(&page);
     state.on_choose_file(move || p.choose_file());
+    let p = Rc::clone(&page);
+    state.on_choose_folder(move || p.choose_folder());
+    let p = Rc::clone(&page);
+    state.on_remove_folder(move || p.remove_folder());
     let p = Rc::clone(&page);
     state.on_preview(move || p.preview());
     // Reset to defaults rebinds while the page may be open: its meter must keep running.
@@ -217,7 +254,21 @@ struct PageState<C> {
     open: Opener<C>,
     play: Player,
     pick_file: fn(&Path) -> Option<PathBuf>,
+    pick_folder: fn(&Path) -> Option<PathBuf>,
+    scan: fn(&Path) -> Vec<FolderSound>,
+    /// The folder scan running on its thread: the page is shown at once and the tiles follow
+    /// (decoding up to 200 files is no work for the UI thread). Replacing it drops the older
+    /// scan's answer.
+    scanning: RefCell<Option<Scan>>,
+    /// The usable files of `sounds.folder`, read when the page is shown or the folder is picked.
+    folder: RefCell<Vec<FolderSound>>,
     test: RefCell<Option<MicTest<C>>>,
+}
+
+/// A folder scan under way; `picked`: the folder was just picked, so an empty answer is toasted.
+struct Scan {
+    answer: Receiver<Vec<FolderSound>>,
+    picked: bool,
 }
 
 /// The Test button's run: a recording, then its playback; each step ends at `until`.
@@ -242,7 +293,13 @@ impl<C: Capture + 'static> PageState<C> {
         let state = window.global::<AudioState>();
         let config = self.ctx.config.borrow().config.clone();
         self.relist(&state, &config.audio.device);
-        push_config(&state, &config, &self.devices.borrow());
+        self.rescan(PathBuf::from(&config.sounds.folder), false);
+        push_config(
+            &state,
+            &config,
+            &self.devices.borrow(),
+            &self.folder.borrow(),
+        );
 
         let weak: Weak<Self> = Rc::downgrade(self);
         self.timer.start(
@@ -280,6 +337,7 @@ impl<C: Capture + 'static> PageState<C> {
         let Some(window) = self.window.upgrade() else {
             return;
         };
+        self.take_scan(&window);
         let state = window.global::<AudioState>();
         let mut live = self.live.borrow_mut();
         if window.get_page() == Page::Audio && window.window().is_visible() {
@@ -433,12 +491,96 @@ impl<C: Capture + 'static> PageState<C> {
         if tile == Some(OFF_TILE) {
             return self.set_sound(OFF.to_owned());
         }
+        if let Some(i) = tile.and_then(|t| t.checked_sub(FOLDER_TILE)) {
+            let path = self.folder.borrow().get(i).map(|f| f.path.clone());
+            if let Some(path) = path {
+                self.set_sound(path.to_string_lossy().into_owned());
+            }
+            return;
+        }
         match tile
             .and_then(|i| i.checked_sub(1))
             .and_then(|i| Builtin::ALL.get(i))
         {
             Some(builtin) => self.set_sound(builtin.id().to_owned()),
             None => self.choose_file(),
+        }
+    }
+
+    /// The "Add folder" button: remember the folder, list its files as tiles. Nothing is copied.
+    fn choose_folder(&self) {
+        let config = self.ctx.layout.config_file();
+        let fallback = config.parent().unwrap_or_else(|| Path::new("."));
+        let current = self.ctx.config.borrow().config.sounds.folder.clone();
+        let start = Some(Path::new(&current))
+            .filter(|dir| dir.is_dir())
+            .unwrap_or(fallback)
+            .to_path_buf();
+        let Some(path) = (self.pick_folder)(&start) else {
+            return;
+        };
+        // The daemon never opens these; a folder that could block the listing is refused too.
+        if !is_plain_local_path(&path.join("x.wav")) {
+            if let Some(window) = self.window.upgrade() {
+                toast(&window, SOUND_PATH_REFUSED);
+            }
+            return;
+        }
+        self.ctx.config.borrow_mut().config.sounds.folder = path.to_string_lossy().into_owned();
+        // The old folder's tiles must not pick its files for the new folder.
+        self.folder.borrow_mut().clear();
+        self.rescan(path, true);
+        self.push_sounds();
+        report(&self.window, self.ctx.save());
+    }
+
+    /// The remove button: forget the folder and its tiles; the files are not touched.
+    fn remove_folder(&self) {
+        self.ctx.config.borrow_mut().config.sounds.folder.clear();
+        self.folder.borrow_mut().clear();
+        // A scan under way must not bring the old tiles back.
+        *self.scanning.borrow_mut() = None;
+        self.push_sounds();
+        report(&self.window, self.ctx.save());
+    }
+
+    /// Lists `dir` on a thread; [`Self::tick`] takes the answer.
+    fn rescan(&self, dir: PathBuf, picked: bool) {
+        let (tx, answer) = mpsc::channel();
+        let scan = self.scan;
+        thread::spawn(move || {
+            // The page is gone when the answer has no taker: nothing to do.
+            let _ = tx.send(scan(&dir));
+        });
+        *self.scanning.borrow_mut() = Some(Scan { answer, picked });
+    }
+
+    /// Shows the folder's files once the scan is done.
+    fn take_scan(&self, window: &AppWindow) {
+        let answer = self.scanning.borrow().as_ref().map(|s| s.answer.try_recv());
+        match answer {
+            Some(Ok(found)) => {
+                let picked = self.scanning.take().is_some_and(|s| s.picked);
+                let none = found.is_empty();
+                *self.folder.borrow_mut() = found;
+                self.push_sounds();
+                if picked && none {
+                    toast(window, NO_SOUNDS_IN_FOLDER);
+                }
+            }
+            Some(Err(TryRecvError::Disconnected)) => *self.scanning.borrow_mut() = None,
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    /// Show the sound tiles again from the config and the folder list.
+    fn push_sounds(&self) {
+        if let Some(window) = self.window.upgrade() {
+            push_sounds(
+                &window.global::<AudioState>(),
+                &self.ctx.config.borrow().config.sounds,
+                &self.folder.borrow(),
+            );
         }
     }
 
@@ -476,12 +618,7 @@ impl<C: Capture + 'static> PageState<C> {
         if !(off && self.on_done()) {
             self.with_sound(|sound| *sound = choice);
         }
-        if let Some(window) = self.window.upgrade() {
-            push_sounds(
-                &window.global::<AudioState>(),
-                &self.ctx.config.borrow().config.sounds,
-            );
-        }
+        self.push_sounds();
         report(&self.window, self.ctx.save());
         if !off {
             self.preview();
@@ -517,6 +654,8 @@ impl<C: Capture + 'static> PageState<C> {
             AudioKey::Tail => audio.tail_ms = whole(value),
             AudioKey::MaxMinutes => audio.max_seconds = whole(value).max(1) * 60,
             AudioKey::Volume => config.sounds.volume = f64::from(whole(value).min(100)) / 100.0,
+            AudioKey::Channel => audio.channel = channel_of(whole(value)),
+            AudioKey::Vad => audio.vad_sensitivity = vad_of(whole(value)),
         }
         drop(file);
         report(&self.window, self.ctx.save());
@@ -569,13 +708,23 @@ impl Devices {
 }
 
 /// Push every config value the page shows.
-fn push_config(state: &AudioState<'_>, config: &Config, devices: &Devices) {
+fn push_config(state: &AudioState<'_>, config: &Config, devices: &Devices, folder: &[FolderSound]) {
     let audio = &config.audio;
     state.set_devices(ModelRc::from(Rc::new(VecModel::from(devices.rows()))));
     state.set_device(devices.row_of(&audio.device));
     #[expect(clippy::cast_possible_truncation, reason = "gain is a few dB")]
     state.set_gain_db(audio.gain_db as f32);
     state.set_sensitivity_db(audio.meter_sensitivity_db);
+    state.set_channel(match audio.channel {
+        AudioChannel::Mix => 0,
+        AudioChannel::Left => 1,
+        AudioChannel::Right => 2,
+    });
+    state.set_vad(match audio.vad_sensitivity {
+        VadSensitivity::Low => 0,
+        VadSensitivity::Normal => 1,
+        VadSensitivity::High => 2,
+    });
     state.set_normalize(audio.normalize);
     state.set_trim(audio.trim);
     state.set_denoise(audio.denoise);
@@ -587,7 +736,7 @@ fn push_config(state: &AudioState<'_>, config: &Config, devices: &Devices) {
         state.set_tail_ms(audio.tail_ms as f32);
         state.set_max_minutes(audio.max_seconds as f32 / 60.0);
     }
-    push_sounds(state, &config.sounds);
+    push_sounds(state, &config.sounds, folder);
     let defaults = Config::default();
     #[expect(
         clippy::cast_possible_truncation,
@@ -607,7 +756,7 @@ fn push_config(state: &AudioState<'_>, config: &Config, devices: &Devices) {
 }
 
 /// Push the sound settings: each sound's tiles and pick, and the volume.
-fn push_sounds(state: &AudioState<'_>, sounds: &Sounds) {
+fn push_sounds(state: &AudioState<'_>, sounds: &Sounds, folder: &[FolderSound]) {
     let icons = (
         state.get_sound_icon(),
         state.get_file_icon(),
@@ -620,13 +769,36 @@ fn push_sounds(state: &AudioState<'_>, sounds: &Sounds) {
         .map(|(role, (text, default))| {
             // The text ready sound has its own switch; Off there is that switch.
             let off = role == Sound::Done && !sounds.done_enabled;
-            let (picked, tiles) = sound_tiles(role, text, default, off, &icons);
+            let (picked, tiles) = sound_tiles(role, text, default, off, &icons, folder);
             (ModelRc::from(Rc::new(VecModel::from(tiles))), picked)
         })
         .unzip();
     state.set_role_tiles(ModelRc::from(Rc::new(VecModel::from(tiles))));
     state.set_role_tile(ModelRc::from(Rc::new(VecModel::from(picked))));
     state.set_volume(f32::from(percent(sounds.volume)));
+    let name = Path::new(&sounds.folder).file_name().map_or_else(
+        || sounds.folder.clone(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    state.set_folder_name(name.into());
+}
+
+/// The row of a channel choice of the page's picker.
+fn channel_of(row: u32) -> AudioChannel {
+    match row {
+        1 => AudioChannel::Left,
+        2 => AudioChannel::Right,
+        _ => AudioChannel::Mix,
+    }
+}
+
+/// The row of a speech sensitivity choice of the page's picker.
+fn vad_of(row: u32) -> VadSensitivity {
+    match row {
+        0 => VadSensitivity::Low,
+        2 => VadSensitivity::High,
+        _ => VadSensitivity::Normal,
+    }
 }
 
 /// The settings of [`ROLES`], in its order.
@@ -649,6 +821,7 @@ fn sound_tiles(
     default: &str,
     off: bool,
     (sound_icon, file_icon, off_icon): &(slint::Image, slint::Image, slint::Image),
+    folder: &[FolderSound],
 ) -> (i32, Vec<GalleryTile>) {
     let choice = if off {
         Some(Choice::Off)
@@ -689,10 +862,23 @@ fn sound_tiles(
         disabled: !cfg!(windows),
         ..GalleryTile::default()
     });
+    // The files of the sound folder: tiles after the own file, named by their file.
+    tiles.extend(folder.iter().map(|f| GalleryTile {
+        icon: sound_icon.clone(),
+        title: f.name.as_str().into(),
+        hint: f.path.to_string_lossy().as_ref().into(),
+        ..GalleryTile::default()
+    }));
     let picked = match choice {
         Some(Choice::Off) => Some(OFF_TILE),
         Some(Choice::Builtin(b)) => Builtin::ALL.iter().position(|x| *x == b).map(builtin_tile),
-        Some(Choice::Custom(_)) => Some(OWN_FILE_TILE),
+        // A file of the folder is its own tile; any other path is the own file.
+        Some(Choice::Custom(path)) => Some(
+            folder
+                .iter()
+                .position(|f| f.path == path)
+                .map_or(OWN_FILE_TILE, |i| FOLDER_TILE + i),
+        ),
         // `Sounds::normalise` already replaced anything else.
         None => None,
     };
@@ -793,6 +979,14 @@ struct Live<C> {
     zeros_since: Millis,
 }
 
+/// What the meter's stream depends on: the device, and which channel it keeps.
+fn stream_key(opts: &Audio) -> String {
+    match opts.channel {
+        AudioChannel::Mix => opts.device.clone(),
+        side => format!("{}\u{0}{side:?}", opts.device),
+    }
+}
+
 struct Running<C> {
     _capture: C,
     since: Millis,
@@ -822,13 +1016,13 @@ impl<C> Live<C> {
     }
 
     /// Keep a capture open on `opts` and feed one level into the meter. The stream depends only
-    /// on the device, whose change reopens it once settled; the gain scales the level read.
+    /// on the device and the channel, whose change reopens it once settled; the gain scales the level read.
     fn tick(&mut self, opts: &Audio, now: Millis) {
         if self.sensitivity.to_bits() != opts.meter_sensitivity_db.to_bits() {
             self.sensitivity = opts.meter_sensitivity_db;
             self.meter = Meter::new(BARS, self.sensitivity);
         }
-        let key = &opts.device;
+        let key = &stream_key(opts);
         if self.tried.as_ref() == Some(key) {
             self.changed = None;
         } else if self.changed.as_ref().is_none_or(|(k, _)| k != key) {
@@ -877,7 +1071,7 @@ impl<C> Live<C> {
         // One stream at a time: the old one closes before the new one opens.
         self.capture = None;
         self.fell_back = false;
-        self.tried = Some(opts.device.clone());
+        self.tried = Some(stream_key(opts));
         self.changed = None;
         let dead = Arc::new(AtomicBool::new(false));
         // The meter shows the level before denoise and trim: skip their work. The gain is
@@ -937,6 +1131,8 @@ mod tests {
         static SILENT_CLIP: Cell<bool> = const { Cell::new(false) };
         static PLAYED: Cell<usize> = const { Cell::new(0) };
         static PICKED: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+        /// What the fake folder dialog answers.
+        static PICKED_FOLDER: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
         /// The folder the last file dialog was told to open on.
         static PICK_START: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
         /// `normalize` of the last open through `fake`.
@@ -1047,7 +1243,37 @@ mod tests {
         PICKED.with_borrow(Clone::clone)
     }
 
+    fn fake_pick_folder(_: &Path) -> Option<PathBuf> {
+        PICKED_FOLDER.with_borrow(Clone::clone)
+    }
+
+    /// The folder whose scan waits until a test lets it go (a folder too slow to read).
+    static GATED: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+    /// The real scan, held back while `dir` is the gated folder (at most 5 s, so a failed test
+    /// leaves no thread behind).
+    fn gated_scan(dir: &Path) -> Vec<FolderSound> {
+        let held = Instant::now();
+        while GATED.lock().unwrap().as_deref() == Some(dir)
+            && held.elapsed() < Duration::from_secs(5)
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        scan_folder(dir)
+    }
+
+    /// Ticks until the folder scan has answered.
+    fn settle(page: &PageState<Fake>) {
+        let waited = Instant::now();
+        while page.scanning.borrow().is_some() {
+            assert!(waited.elapsed() < Duration::from_secs(5), "no scan answer");
+            thread::sleep(Duration::from_millis(1));
+            page.tick();
+        }
+    }
+
     fn reset() {
+        PICKED_FOLDER.with_borrow_mut(|p| *p = None);
         OPEN.set(0);
         OPENED.set(0);
         NOW.set(Millis(0));
@@ -1087,6 +1313,8 @@ mod tests {
             now: fake_now,
             play: fake_play,
             pick_file: fake_pick,
+            pick_folder: fake_pick_folder,
+            scan: gated_scan,
         };
         let page = bind_with(&window, &ctx, &io);
         (window, page)
@@ -1437,7 +1665,7 @@ mod tests {
     /// the drawing runs on a thread of its own.
     #[test]
     fn shots_audio() {
-        std::thread::spawn(draw_audio).join().unwrap();
+        thread::spawn(draw_audio).join().unwrap();
     }
 
     /// The window's next frame, `w` x `h` physical pixels, as a pixmap.
@@ -2055,5 +2283,200 @@ device = \"USB Mic\"
         for (v, want) in [(0.0, 0), (2.6, 3), (-4.0, 0), (149.5, 150)] {
             assert_eq!(whole(v), want, "{v}");
         }
+    }
+
+    /// A folder in the temp dir that goes when the test ends, with or without a panic.
+    struct SoundFolder(PathBuf);
+
+    impl SoundFolder {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("oxi-audio-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for SoundFolder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A 10 ms mono 16-bit file.
+    fn tiny_wav() -> Vec<u8> {
+        let data = vec![0_u8; 160];
+        let mut out = b"RIFF\0\0\0\0WAVEfmt ".to_vec();
+        out.extend(16_u32.to_le_bytes());
+        out.extend([1, 0, 1, 0]);
+        out.extend(8_000_u32.to_le_bytes());
+        out.extend(16_000_u32.to_le_bytes());
+        out.extend([2, 0, 16, 0]);
+        out.extend(b"data");
+        out.extend(u32::try_from(data.len()).unwrap().to_le_bytes());
+        out.extend(data);
+        out
+    }
+
+    fn tile_titles(state: &AudioState<'_>, role: usize) -> Vec<String> {
+        let tiles = slint::Model::row_data(&state.get_role_tiles(), role).unwrap();
+        slint::Model::iter(&tiles)
+            .map(|t| t.title.to_string())
+            .collect()
+    }
+
+    // "Add folder": the files of the folder become tiles after the own file, a tile picks its
+    // file by path, and nothing is copied.
+    #[test]
+    fn adding_a_folder_lists_its_files_as_tiles_and_a_tile_picks_its_file() {
+        let dir = SoundFolder::new("tiles");
+        std::fs::write(dir.0.join("b.wav"), tiny_wav()).unwrap();
+        std::fs::write(dir.0.join("a.wav"), tiny_wav()).unwrap();
+        std::fs::write(dir.0.join("notes.txt"), b"x").unwrap();
+        let (window, page) = sounds_page("folder", None);
+        let state = window.global::<AudioState>();
+        state.invoke_choose_folder();
+        assert_eq!(
+            page.ctx.config.borrow().config.sounds.folder,
+            "",
+            "cancelled"
+        );
+        assert_eq!(tile_titles(&state, 0).len(), FOLDER_TILE);
+        PICKED_FOLDER.with_borrow_mut(|p| *p = Some(dir.0.clone()));
+        state.invoke_choose_folder();
+        settle(&page);
+        let folder = dir.0.to_string_lossy().into_owned();
+        assert_eq!(page.ctx.config.borrow().config.sounds.folder, folder);
+        let titles = tile_titles(&state, 0);
+        assert_eq!(&titles[FOLDER_TILE..], ["a", "b"], "sorted, no text file");
+        assert_eq!(
+            state.get_folder_name(),
+            dir.0.file_name().unwrap().to_string_lossy().as_ref()
+        );
+        // The stop sound shown on its own tab picks the second file.
+        state.set_view(3);
+        state.invoke_sound_picked(i32::try_from(FOLDER_TILE + 1).unwrap());
+        assert_eq!(
+            page.ctx.config.borrow().config.sounds.stop,
+            dir.0.join("b.wav").to_string_lossy()
+        );
+        assert_eq!(picked_tile(&state, 1), FOLDER_TILE + 1);
+        let default = Builtin::ALL
+            .iter()
+            .position(|b| *b == Builtin::ApaHit3)
+            .unwrap();
+        assert_eq!(
+            picked_tile(&state, 0),
+            builtin_tile(default),
+            "start is untouched"
+        );
+        // A file that is not in the folder stays the own file tile.
+        PICKED.set(Some(snd("elsewhere.wav").into()));
+        state.invoke_choose_file();
+        assert_eq!(picked_tile(&state, 1), OWN_FILE_TILE);
+        // Remove forgets the folder and its tiles; the files stay.
+        state.invoke_remove_folder();
+        assert_eq!(page.ctx.config.borrow().config.sounds.folder, "");
+        assert_eq!(state.get_folder_name(), "");
+        assert_eq!(tile_titles(&state, 0).len(), FOLDER_TILE);
+        assert!(dir.0.join("a.wav").is_file());
+    }
+
+    // The folder is read when the page is shown: a file added since appears, and a folder that
+    // is gone lists nothing.
+    #[test]
+    fn the_sound_folder_is_read_again_when_the_page_is_shown() {
+        let dir = SoundFolder::new("shown");
+        let config = format!(
+            "version = 2\n[sounds]\nfolder = '{}'\n",
+            dir.0.to_string_lossy()
+        );
+        let (window, page) = sounds_page("folder-shown", Some(&config));
+        let state = window.global::<AudioState>();
+        settle(&page);
+        assert_eq!(tile_titles(&state, 0).len(), FOLDER_TILE, "empty folder");
+        std::fs::write(dir.0.join("new.wav"), tiny_wav()).unwrap();
+        page.shown();
+        settle(&page);
+        assert_eq!(&tile_titles(&state, 0)[FOLDER_TILE..], ["new"]);
+        std::fs::remove_dir_all(&dir.0).unwrap();
+        page.shown();
+        settle(&page);
+        assert_eq!(tile_titles(&state, 0).len(), FOLDER_TILE, "folder gone");
+    }
+
+    // A slow folder never holds the page: it is shown and ticks at once, the tiles come when the
+    // scan is done, and a picked folder without a usable file says so then.
+    #[test]
+    fn a_slow_folder_scan_does_not_hold_the_page() {
+        let dir = SoundFolder::new("slow");
+        std::fs::write(dir.0.join("late.wav"), tiny_wav()).unwrap();
+        let empty = SoundFolder::new("slow-empty");
+        let config = format!(
+            "version = 2
+[sounds]
+folder = '{}'
+",
+            dir.0.to_string_lossy()
+        );
+        *GATED.lock().unwrap() = Some(dir.0.clone());
+        let (window, page) = sounds_page("folder-slow", Some(&config));
+        let state = window.global::<AudioState>();
+        page.tick();
+        assert!(page.scanning.borrow().is_some(), "still reading");
+        assert_eq!(tile_titles(&state, 0).len(), FOLDER_TILE, "no tile yet");
+        *GATED.lock().unwrap() = None;
+        settle(&page);
+        assert_eq!(&tile_titles(&state, 0)[FOLDER_TILE..], ["late"]);
+
+        PICKED_FOLDER.with_borrow_mut(|p| *p = Some(empty.0.clone()));
+        state.invoke_choose_folder();
+        assert_eq!(
+            tile_titles(&state, 0).len(),
+            FOLDER_TILE,
+            "the old files are gone at once"
+        );
+        settle(&page);
+        assert_eq!(
+            window.global::<Toast>().get_text(),
+            NO_SOUNDS_IN_FOLDER,
+            "said when the scan is done"
+        );
+    }
+
+    #[test]
+    fn channel_and_speech_sensitivity_are_saved_and_shown() {
+        i_slint_backend_testing::init_no_event_loop();
+        let (window, page) = window_on("channel", None, fake);
+        window.show().unwrap();
+        show_audio(&window);
+        let state = window.global::<AudioState>();
+        assert_eq!((state.get_channel(), state.get_vad()), (0, 1));
+        state.invoke_edited(AudioKey::Channel, 2.0);
+        state.invoke_edited(AudioKey::Vad, 2.0);
+        let config = page.ctx.config.borrow().config.clone();
+        assert_eq!(config.audio.channel, AudioChannel::Right);
+        assert_eq!(config.audio.vad_sensitivity, VadSensitivity::High);
+        state.invoke_edited(AudioKey::Channel, 1.0);
+        state.invoke_edited(AudioKey::Vad, 0.0);
+        let config = page.ctx.config.borrow().config.clone();
+        assert_eq!(config.audio.channel, AudioChannel::Left);
+        assert_eq!(config.audio.vad_sensitivity, VadSensitivity::Low);
+    }
+
+    // The meter's stream keeps one channel, so a channel change must reopen it; a plain Mix
+    // keeps the device as its key.
+    #[test]
+    fn the_meter_stream_key_follows_the_device_and_the_channel() {
+        let mut opts = Audio {
+            device: "USB Mic".into(),
+            ..Audio::default()
+        };
+        assert_eq!(stream_key(&opts), "USB Mic");
+        opts.channel = AudioChannel::Left;
+        let left = stream_key(&opts);
+        opts.channel = AudioChannel::Right;
+        assert_ne!(left, stream_key(&opts));
+        assert_ne!(left, "USB Mic");
     }
 }

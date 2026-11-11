@@ -11,15 +11,15 @@ use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak as RcWeak};
 use std::time::Duration;
 
-use oxi_core::history::{self, Status};
+use oxi_core::history::{self, DiffKind, Meta, Status, word_diff};
 use oxi_core::ipc::{HistoryItem, HistoryOp, Push, Request, Spoken, TestFailure, TestOutcome};
 use oxi_core::text::decode_text_file;
 use oxi_core::tuning::SettingsSet;
 use oxi_core::types::Language;
 use oxi_platform::capture::{CaptureError, play};
-use slint::{ComponentHandle, ModelRc, Timer, TimerMode, VecModel, Weak};
+use slint::{ComponentHandle, ModelRc, StyledText, Timer, TimerMode, VecModel, Weak};
 
-use crate::generated::{HistoryRow, HistoryState, Toast};
+use crate::generated::{HistoryRow, HistoryState, Theme, Toast};
 use crate::ipc::{Event, Link, Subscription};
 use crate::{AppWindow, Ctx, Error, Page, report};
 
@@ -40,15 +40,18 @@ const DELETE_NEEDS_DAEMON: &str = "Start OxiYapper to delete a recording";
 const RUNNING: &str = "A recording is being transcribed";
 const NOT_FOUND: &str = "The recording file is gone";
 const HISTORY_ON: &str = "History is on. New dictations are kept.";
-const REDONE: &str = "Transcribed again.";
 const NOTHING_HEARD: &str = "Nothing was heard in this recording.";
 const NOT_SAVED: &str = "The new text could not be saved.";
 const NOT_DELETED: &str = "The recording could not be deleted.";
 const BUSY: &str = "OxiYapper is busy. Transcribe again in a moment.";
 const LINK_LOST: &str = "OxiYapper stopped answering, so the transcription ended.";
 const ADDED: &str = "Added to replacements.";
+const WORD_ADDED: &str = "Added to the dictionary.";
+const BAD_WORD: &str = "Select one line to add to the dictionary.";
+const EDIT_NEEDS_DAEMON: &str = "Start OxiYapper to change the text";
 const BAD_RULE: &str = "Write the heard word on one line, without \"=>\".";
 const NOT_TEXT: &str = "The replacements file is not text. Fix it on the Text page.";
+const WORDS_NOT_TEXT: &str = "The dictionary file is not text. Fix it on the Text page.";
 
 pub fn bind(window: &AppWindow, ctx: &Ctx) {
     bind_with(window, ctx, play_cpal);
@@ -84,6 +87,10 @@ pub fn bind_with(window: &AppWindow, ctx: &Ctx, player: Player) {
         play_timer: Timer::default(),
         run: RefCell::new(None),
         next_run: Cell::new(FIRST_RUN),
+        other: RefCell::new(None),
+        restored: Cell::new(false),
+        diff_open: Cell::new(false),
+        edit: RefCell::new(None),
     });
     s.set_items(ModelRc::from(page.rows.clone()));
     s.set_selected(0);
@@ -104,7 +111,21 @@ pub fn bind_with(window: &AppWindow, ctx: &Ctx, player: Player) {
     let p = Rc::clone(&page);
     s.on_turn_on(move || p.turn_on());
     let p = Rc::clone(&page);
-    s.on_add_replacement(move |heard, wanted| p.add_replacement(&heard, &wanted));
+    s.on_show_folder(move || p.show_folder());
+    let p = Rc::clone(&page);
+    s.on_restore(move || p.restore());
+    let p = Rc::clone(&page);
+    s.on_toggle_diff(move || p.toggle_diff());
+    let p = Rc::clone(&page);
+    s.on_restyle(move || p.restyle());
+    let p = Rc::clone(&page);
+    s.on_slice(move |a, b| p.slice(a, b).unwrap_or_default().into());
+    let p = Rc::clone(&page);
+    s.on_always_fix(move |a, b, wanted| p.always_fix(a, b, &wanted));
+    let p = Rc::clone(&page);
+    s.on_fix_here(move |a, b, wanted| p.fix_here(a, b, &wanted));
+    let p = Rc::clone(&page);
+    s.on_add_word(move |a, b| p.add_word(a, b));
 }
 
 /// A Transcribe again that is out.
@@ -138,6 +159,15 @@ struct PageState {
     play_timer: Timer,
     run: RefCell<Option<Run>>,
     next_run: Cell<u32>,
+    /// The other version of the picked entry's text: the one before the last new text, or the one
+    /// a Restore put aside (`Meta::previous`, read from its json when it is picked).
+    other: RefCell<Option<String>>,
+    /// The text shown is the old version.
+    restored: Cell<bool>,
+    /// The text area shows what changed from `other`.
+    diff_open: Cell<bool>,
+    /// An edit that is out: the entry and the whole new text.
+    edit: RefCell<Option<(String, String)>>,
 }
 
 impl PageState {
@@ -185,7 +215,10 @@ impl PageState {
     fn shown(&self) {
         self.fresh.set(true);
         self.list(None);
-        self.state(|s| self.refresh(s));
+        self.state(|s| {
+            self.refresh(s);
+            self.show_versions(s);
+        });
     }
 
     fn list(&self, older_than: Option<String>) {
@@ -252,13 +285,17 @@ impl PageState {
         let id = self.selected_id();
         if *self.shown_id.borrow() != id {
             self.stop_playing();
+            self.load_other(id.as_deref());
             let audio = id.as_deref().and_then(|id| self.read(id));
             self.audible.set(audio.is_some());
             let bars = audio.map_or_else(Vec::new, |(samples, _)| peaks(&samples, BARS));
             self.state(|s| s.set_peaks(ModelRc::from(Rc::new(VecModel::from(bars)))));
             *self.shown_id.borrow_mut() = id;
         }
-        self.state(|s| self.refresh(s));
+        self.state(|s| {
+            self.refresh(s);
+            self.show_versions(s);
+        });
     }
 
     fn folder(&self) -> PathBuf {
@@ -376,7 +413,7 @@ impl PageState {
         self.state(|s| self.refresh(s));
     }
 
-    /// The daemon stored a text or deleted an entry.
+    /// The daemon stored a text, swapped the versions or deleted an entry.
     fn changed(&self, id: &str, op: HistoryOp, ok: bool) {
         match op {
             HistoryOp::SetText => {
@@ -388,19 +425,39 @@ impl PageState {
                     return;
                 };
                 if ok {
-                    if let Some(item) = self.items.borrow_mut().iter_mut().find(|i| i.id == id) {
-                        item.text = Spoken(run.text.unwrap_or_default());
-                        item.status = Status::Done;
+                    self.new_text(id, run.text.unwrap_or_default(), |item| {
                         item.model = run.set.model;
                         run.language.as_str().clone_into(&mut item.language);
-                    }
-                    self.toast(REDONE);
-                    self.show_rows(Some(id), 0);
+                    });
                 } else {
                     self.toast(NOT_SAVED);
                     self.state(|s| self.refresh(s));
                 }
             }
+            HistoryOp::Edit => {
+                let edit = self.edit.borrow_mut().take_if(|(entry, _)| entry == id);
+                match edit {
+                    Some((_, text)) if ok => self.new_text(id, text, |_| {}),
+                    Some(_) => self.toast(NOT_SAVED),
+                    None => {}
+                }
+            }
+            HistoryOp::Restore if ok => {
+                let Some(other) = self.other.borrow_mut().take() else {
+                    return;
+                };
+                let swapped = self
+                    .items
+                    .borrow_mut()
+                    .iter_mut()
+                    .find(|i| i.id == id)
+                    .map(|item| std::mem::replace(&mut item.text, Spoken(other)).0);
+                *self.other.borrow_mut() = swapped;
+                self.restored.set(!self.restored.get());
+                self.diff_open.set(false);
+                self.show_rows(Some(id), 0);
+            }
+            HistoryOp::Restore => self.toast(NOT_SAVED),
             HistoryOp::Delete if ok => {
                 let at = self.items.borrow().iter().position(|i| i.id == id);
                 if let Some(at) = at {
@@ -410,6 +467,171 @@ impl PageState {
                 }
             }
             HistoryOp::Delete => self.toast(NOT_DELETED),
+        }
+    }
+
+    /// Entry `id` got `text`: it is shown at once, the old text becomes the other version and the
+    /// text area shows what changed. `with` sets what else the entry says about the new text.
+    fn new_text(&self, id: &str, text: String, with: impl FnOnce(&mut HistoryItem)) {
+        let old = self
+            .items
+            .borrow_mut()
+            .iter_mut()
+            .find(|i| i.id == id)
+            .map(|item| {
+                with(item);
+                item.status = Status::Done;
+                std::mem::replace(&mut item.text, Spoken(text)).0
+            });
+        *self.other.borrow_mut() = old.filter(|t| !t.trim().is_empty());
+        self.restored.set(false);
+        self.diff_open.set(true);
+        self.show_rows(Some(id), 0);
+    }
+
+    /// The other version of entry `id`, from its json; also resets what the page shows of it.
+    fn load_other(&self, id: Option<&str>) {
+        let folder = self.folder();
+        let kept = id.filter(|id| history::is_id(id)).and_then(|id| {
+            let json = fs::read_to_string(entry_path(&folder, id, history::JSON)).ok()?;
+            Meta::from_json(&json).ok()?.previous
+        });
+        // The record says which version is shown, so a re-pick does not forget a Restore.
+        self.restored.set(kept.as_ref().is_some_and(|p| p.newer));
+        *self.other.borrow_mut() = kept.map(|p| p.text);
+        self.diff_open.set(false);
+    }
+
+    /// What the page says of the versions: the strip, and the diff while it is open.
+    fn show_versions(&self, s: &HistoryState<'_>) {
+        let other = self.other.borrow();
+        s.set_has_other(other.is_some());
+        s.set_restored(self.restored.get());
+        let open = self.diff_open.get() && other.is_some();
+        s.set_diff_open(open);
+        if let (true, Some(other), Some(shown)) = (open, other.as_deref(), self.shown_text()) {
+            let colours = self.window.upgrade().map(|w| {
+                let theme = w.global::<Theme>();
+                (
+                    hex(theme.get_text_secondary()),
+                    hex(theme.get_success_text()),
+                )
+            });
+            let (removed, added) = colours.unwrap_or_default();
+            let markup = diff_markup(other, &shown, &removed, &added);
+            s.set_diff(
+                StyledText::from_markdown(&markup)
+                    .unwrap_or_else(|_| StyledText::from_plain_text(&shown)),
+            );
+        }
+    }
+
+    /// The theme changed: the diff carries colours of its own, so it is made again.
+    fn restyle(&self) {
+        if self.diff_open.get() {
+            self.state(|s| self.show_versions(s));
+        }
+    }
+
+    fn toggle_diff(&self) {
+        self.diff_open.set(!self.diff_open.get());
+        self.state(|s| self.show_versions(s));
+    }
+
+    /// Swap the shown text with its other version (Restore old, Use new).
+    fn restore(&self) {
+        if !self.online() {
+            self.toast(self.ctx.ipc.link().off_reason(EDIT_NEEDS_DAEMON));
+        } else if self.other.borrow().is_some()
+            && let Some(id) = self.selected_id()
+        {
+            self.ctx.ipc.send(Request::HistoryRestore { id });
+        }
+    }
+
+    /// The picked entry's text as the page shows it (what the selection's offsets count in).
+    fn shown_text(&self) -> Option<String> {
+        let window = self.window.upgrade()?;
+        let i = usize::try_from(window.global::<HistoryState>().get_selected()).ok()?;
+        self.items
+            .borrow()
+            .get(i)
+            .map(|item| item.text.0.trim().to_owned())
+    }
+
+    /// The shown text between two byte offsets; `None` for a bad range.
+    fn slice(&self, a: i32, b: i32) -> Option<String> {
+        let (a, b) = (usize::try_from(a).ok()?, usize::try_from(b).ok()?);
+        self.shown_text()?.get(a..b).map(str::to_owned)
+    }
+
+    /// Opens the folder of the picked recording in the file manager.
+    fn show_folder(&self) {
+        let Some(id) = self.selected_id().filter(|id| history::is_id(id)) else {
+            return;
+        };
+        let wav = entry_path(&self.folder(), &id, history::WAV);
+        let opened = oxi_platform::open::open(wav.parent().unwrap_or(&self.folder()));
+        report(&self.window, opened.map_err(Error::from));
+    }
+
+    /// Fix here only: the selected words become `wanted` in this recording's text.
+    fn fix_here(&self, a: i32, b: i32, wanted: &str) -> bool {
+        let (Some(text), Some(id), Some(from)) = (
+            self.shown_text(),
+            self.selected_id(),
+            usize::try_from(a).ok(),
+        ) else {
+            return false;
+        };
+        let Some(to) = usize::try_from(b)
+            .ok()
+            .filter(|to| text.get(from..*to).is_some())
+        else {
+            return false;
+        };
+        let new = format!("{}{}{}", &text[..from], wanted.trim(), &text[to..]);
+        if new == text {
+            return true;
+        }
+        if !self.online() {
+            self.toast(self.ctx.ipc.link().off_reason(EDIT_NEEDS_DAEMON));
+            return false;
+        }
+        self.ctx.ipc.send(Request::HistoryEdit {
+            id: id.clone(),
+            text: Spoken(new.clone()),
+        });
+        *self.edit.borrow_mut() = Some((id, new));
+        true
+    }
+
+    /// Always fix: the selected words become a replacement for every later dictation.
+    fn always_fix(&self, a: i32, b: i32, wanted: &str) -> bool {
+        self.slice(a, b)
+            .is_some_and(|heard| self.add_replacement(&heard, wanted))
+    }
+
+    /// Add to dictionary: the selected words become a line of the dictionary.
+    fn add_word(&self, a: i32, b: i32) -> bool {
+        let word = self.slice(a, b).map(|w| w.trim().to_owned());
+        let Some(word) = word.filter(|w| !w.is_empty() && !w.contains(['\n', '\r'])) else {
+            self.toast(BAD_WORD);
+            return false;
+        };
+        match append_line(&self.ctx.layout.dictionary_file(), &word) {
+            Ok(true) => {
+                self.toast(WORD_ADDED);
+                true
+            }
+            Ok(false) => {
+                self.toast(WORDS_NOT_TEXT);
+                false
+            }
+            Err(e) => {
+                report(&self.window, Err(Error::from(e)));
+                false
+            }
         }
     }
 
@@ -514,11 +736,62 @@ fn status_label(status: Status) -> &'static str {
 
 /// `<folder>/<day>/<stem>.wav` of the id `<day>/<stem>`, with the OS's separators.
 fn wav_path(folder: &Path, id: &str) -> PathBuf {
+    entry_path(folder, id, history::WAV)
+}
+
+/// The file with extension `ext` of entry `id`.
+fn entry_path(folder: &Path, id: &str, ext: &str) -> PathBuf {
     let mut path = id
         .split('/')
         .fold(folder.to_path_buf(), |p, part| p.join(part));
-    path.set_extension("wav");
+    path.set_extension(ext);
     path
+}
+
+/// `#rrggbb` of an opaque colour, as the styled text's `<font color>` reads it.
+fn hex(c: slint::Color) -> String {
+    format!("#{:02X}{:02X}{:02X}", c.red(), c.green(), c.blue())
+}
+
+/// Markdown for the text area while the changes show: words only in `old` struck through in the
+/// `removed` colour, words only in `new` underlined in the `added` colour (so colour is not the
+/// only sign; styled text has no background, so no tint). Every character of the text is escaped,
+/// so dictated text never reads as markup.
+fn diff_markup(old: &str, new: &str, removed: &str, added: &str) -> String {
+    let mut out = String::new();
+    for part in word_diff(old, new) {
+        let core = part.text.trim();
+        let lead = &part.text[..part.text.len() - part.text.trim_start().len()];
+        let trail = &part.text[lead.len() + core.len()..];
+        let (open, close) = match part.kind {
+            DiffKind::Same => (String::new(), ""),
+            DiffKind::Removed => (format!("<font color=\"{removed}\">~~"), "~~</font>"),
+            DiffKind::Added => (format!("<font color=\"{added}\"><u>"), "</u></font>"),
+        };
+        escape_markdown(lead, &mut out);
+        if !core.is_empty() {
+            out.push_str(&open);
+            escape_markdown(core, &mut out);
+            out.push_str(close);
+        }
+        escape_markdown(trail, &mut out);
+    }
+    out
+}
+
+/// `text` as markdown text: punctuation escaped, a line end a hard break.
+fn escape_markdown(text: &str, out: &mut String) {
+    for c in text.chars() {
+        match c {
+            '\r' => {}
+            '\n' => out.push_str("\\\n"),
+            c if c.is_ascii_punctuation() => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
 }
 
 /// Why a run gave no text.
@@ -567,7 +840,6 @@ mod tests {
     use std::sync::mpsc::Receiver;
 
     use oxi_core::ipc::Request;
-    use slint::platform::WindowEvent;
     use slint::{ComponentHandle, Model};
 
     use super::*;
@@ -924,68 +1196,221 @@ enabled = false
     }
 
     #[test]
-    fn copy_and_copy_path_reach_the_clipboard_of_the_test_backend() {
+    fn copy_text_says_so_and_is_off_without_a_text() {
         // The testing backend keeps its clipboard in memory: the real one is never touched.
-        let (window, ipc, _sent, ctx) = page("copy");
+        let (window, ipc, _sent, _ctx) = page("copy");
         window.global::<HistoryState>().invoke_shown();
         listed(
             &ipc,
             vec![item("2026-11-08/134501-123", Status::Done, "one")],
             false,
         );
-        let button = |label: &str| {
-            crate::testing::with_role(
-                &window,
-                label,
-                i_slint_backend_testing::AccessibleRole::Button,
-            )
-        };
-        // Pastes into the Heard field: click it, Ctrl+V, read it back.
-        let paste = || {
-            let field = crate::testing::with_role(
-                &window,
-                "Heard",
-                i_slint_backend_testing::AccessibleRole::TextInput,
-            );
-            field.set_accessible_value("");
-            let (at, size) = (field.absolute_position(), field.size());
-            let position =
-                slint::LogicalPosition::new(at.x + size.width / 2.0, at.y + size.height / 2.0);
-            let w = window.window();
-            let button = slint::platform::PointerEventButton::Left;
-            w.dispatch_event(WindowEvent::PointerPressed { position, button });
-            w.dispatch_event(WindowEvent::PointerReleased { position, button });
-            for key in [slint::platform::Key::Control.into(), "v".into()] {
-                w.dispatch_event(WindowEvent::KeyPressed { text: key });
-            }
-            for key in ["v".into(), slint::platform::Key::Control.into()] {
-                w.dispatch_event(WindowEvent::KeyReleased { text: key });
-            }
-            field.accessible_value().unwrap().to_string()
-        };
-        button("Copy text").invoke_accessible_default_action();
-        assert_eq!(paste(), "one");
-        button("Copy path").invoke_accessible_default_action();
-        assert_eq!(window.global::<Toast>().get_text(), "Path copied.");
-        let path = wav_path(&ctx.layout.history_dir(), "2026-11-08/134501-123");
-        assert_eq!(paste(), path.display().to_string());
+        crate::testing::with_role(
+            &window,
+            "Copy text",
+            i_slint_backend_testing::AccessibleRole::Button,
+        )
+        .invoke_accessible_default_action();
+        assert_eq!(window.global::<Toast>().get_text(), "Copied.");
+        assert!(!has(&window, "Copy path"), "the path button is gone");
+    }
+
+    /// The page on one entry with `text`, picked; what it asked for is drained.
+    fn picked_page(name: &str, text: &str) -> (AppWindow, Ipc, Receiver<Cmd>, Ctx) {
+        let (window, ipc, sent, ctx) = page(name);
+        window.global::<HistoryState>().invoke_shown();
+        listed(
+            &ipc,
+            vec![item("2026-11-08/134501-123", Status::Done, text)],
+            false,
+        );
+        sent_now(&sent);
+        (window, ipc, sent, ctx)
+    }
+
+    fn reply(ipc: &Ipc, op: HistoryOp, ok: bool) {
+        ipc.deliver(&Event::Push(Push::HistoryResult {
+            id: "2026-11-08/134501-123".into(),
+            op,
+            ok,
+        }));
     }
 
     #[test]
-    fn add_to_replacements_appends_one_rule() {
-        let (window, _ipc, _sent, ctx) = page("replace");
+    fn always_fix_appends_one_rule_for_the_selected_words() {
+        let (window, _ipc, sent, ctx) = picked_page("replace", "say oxi yaper now");
         let s = window.global::<HistoryState>();
         let file = ctx.layout.replace_file();
         fs::write(&file, "teh => the").unwrap();
-        assert!(s.invoke_add_replacement(" oxi yaper ".into(), "OxiYapper".into()));
+        assert_eq!(s.invoke_slice(4, 13), "oxi yaper");
+        assert!(s.invoke_always_fix(4, 13, "OxiYapper".into()));
         assert_eq!(
             fs::read_to_string(&file).unwrap(),
             "teh => the\noxi yaper => OxiYapper\n"
         );
-        assert!(!s.invoke_add_replacement("  ".into(), "x".into()));
-        assert!(!s.invoke_add_replacement("a => b".into(), "x".into()));
-        assert!(!s.invoke_add_replacement("a".into(), "x\ny".into()));
+        assert_eq!(sent_now(&sent), [], "the record stays as it is");
+        assert!(!s.invoke_always_fix(3, 4, "x".into()), "a space is no word");
+        assert!(!s.invoke_always_fix(0, 99, "x".into()), "out of range");
+        assert!(!s.invoke_always_fix(0, 3, "x\ny".into()));
         assert_eq!(window.global::<Toast>().get_text(), BAD_RULE);
+    }
+
+    #[test]
+    fn add_to_dictionary_appends_one_line_and_refuses_two() {
+        let (window, _ipc, _sent, ctx) = picked_page("dictionary", "Zhang Wei\nsaid hi");
+        let s = window.global::<HistoryState>();
+        let file = ctx.layout.dictionary_file();
+        assert!(s.invoke_add_word(0, 5));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "Zhang\n");
+        assert!(!s.invoke_add_word(6, 15), "a line break is not one entry");
+        assert_eq!(window.global::<Toast>().get_text(), BAD_WORD);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "Zhang\n");
+    }
+
+    #[test]
+    fn fix_here_edits_the_record_shows_the_changes_and_restore_swaps_back() {
+        let (window, ipc, sent, _ctx) = picked_page("fix-here", "call Anna at noon");
+        let s = window.global::<HistoryState>();
+        assert!(!s.get_has_other());
+        assert!(s.invoke_fix_here(5, 9, "Hanna".into()));
+        assert_eq!(
+            sent_now(&sent),
+            [Request::HistoryEdit {
+                id: "2026-11-08/134501-123".into(),
+                text: Spoken("call Hanna at noon".into()),
+            }]
+        );
+        assert_eq!(
+            rows(&window)[0].text,
+            "call Anna at noon",
+            "not before the answer"
+        );
+        reply(&ipc, HistoryOp::Edit, true);
+        assert_eq!(rows(&window)[0].text, "call Hanna at noon");
+        assert!(s.get_has_other() && s.get_diff_open() && !s.get_restored());
+        assert_eq!(window.global::<Toast>().get_text(), "", "no toast");
+
+        s.invoke_restore();
+        assert_eq!(
+            sent_now(&sent),
+            [Request::HistoryRestore {
+                id: "2026-11-08/134501-123".into()
+            }]
+        );
+        reply(&ipc, HistoryOp::Restore, true);
+        assert_eq!(rows(&window)[0].text, "call Anna at noon");
+        assert!(s.get_restored() && !s.get_diff_open() && s.get_has_other());
+        s.invoke_restore();
+        assert_eq!(sent_now(&sent).len(), 1);
+        reply(&ipc, HistoryOp::Restore, true);
+        assert_eq!(rows(&window)[0].text, "call Hanna at noon", "Use new");
+        assert!(!s.get_restored());
+
+        // The same words change nothing and ask nothing.
+        assert!(s.invoke_fix_here(5, 10, "Hanna".into()));
+        assert_eq!(sent_now(&sent), []);
+        // A failed edit says so and changes nothing.
+        assert!(s.invoke_fix_here(0, 4, "ring".into()));
+        reply(&ipc, HistoryOp::Edit, false);
+        assert_eq!(window.global::<Toast>().get_text(), NOT_SAVED);
+        assert_eq!(rows(&window)[0].text, "call Hanna at noon");
+    }
+
+    #[test]
+    fn a_new_run_shows_its_diff_at_once_and_offline_edits_say_why() {
+        let (window, ipc, sent, _ctx) = picked_page("diff", "one two three");
+        let s = window.global::<HistoryState>();
+        s.invoke_redo();
+        let Some(Request::HistoryRetranscribe { run, .. }) = sent_now(&sent).pop() else {
+            panic!("no run");
+        };
+        ipc.deliver(&Event::Push(Push::TestResult {
+            id: run,
+            outcome: TestOutcome::Heard {
+                text: "one 2 three".into(),
+                ms: 5,
+            },
+        }));
+        sent_now(&sent);
+        reply(&ipc, HistoryOp::SetText, true);
+        assert_eq!(rows(&window)[0].text, "one 2 three", "applied at once");
+        assert!(s.get_has_other() && s.get_diff_open());
+        assert_eq!(
+            window.global::<Toast>().get_text(),
+            "",
+            "no toast over the text"
+        );
+        s.invoke_toggle_diff();
+        assert!(!s.get_diff_open());
+
+        ipc.deliver(&Event::Link(Link::Offline));
+        assert!(!s.invoke_fix_here(0, 3, "1".into()));
+        assert_eq!(window.global::<Toast>().get_text(), EDIT_NEEDS_DAEMON);
+    }
+
+    #[test]
+    fn the_other_version_is_read_from_the_entry_json_when_it_is_picked() {
+        let (window, ipc, _sent, ctx) = page("kept");
+        let s = window.global::<HistoryState>();
+        let id = "2026-11-08/134501-123";
+        let folder = history::folder(
+            &ctx.config.borrow().config.history,
+            &ctx.layout.history_dir(),
+        );
+        fs::create_dir_all(folder.join("2026-11-08")).unwrap();
+        let meta = Meta {
+            version: Meta::VERSION,
+            started: String::new(),
+            duration_ms: 1,
+            status: Status::Done,
+            model: String::new(),
+            language: String::new(),
+            settings: None,
+            previous: Some(history::Previous {
+                text: "earlier".into(),
+                model: String::new(),
+                language: String::new(),
+                settings: None,
+                newer: true,
+            }),
+        };
+        fs::write(entry_path(&folder, id, "json"), meta.to_json().unwrap()).unwrap();
+        s.invoke_shown();
+        listed(
+            &ipc,
+            vec![
+                item(id, Status::Done, "now"),
+                item("2026-11-08/120000-000", Status::Done, "x"),
+            ],
+            false,
+        );
+        assert!(s.get_has_other(), "kept in the record");
+        assert!(s.get_restored(), "the record says the old text is shown");
+        assert!(!s.get_diff_open(), "the changes open on a click");
+        s.invoke_select(1);
+        assert!(!s.get_has_other());
+        assert!(!s.get_restored());
+        s.invoke_select(0);
+        assert!(
+            s.get_restored(),
+            "still the old text after picking it again"
+        );
+    }
+
+    #[test]
+    fn the_changes_are_markdown_with_every_mark_escaped() {
+        let marked = |old, new| diff_markup(old, new, "#111111", "#222222");
+        assert_eq!(
+            marked("a *b* c", "a *B* c"),
+            "a <font color=\"#111111\">~~\\*b\\*~~</font> <font color=\"#222222\"><u>\\*B\\*</u></font> c"
+        );
+        assert_eq!(marked("x\ny", "x\ny"), "x\\\ny");
+        assert!(
+            StyledText::from_markdown(&marked("1. a_b [c](d) <e> ~f~", "1. a_b [c](d) <e> ~g~"))
+                .is_ok()
+        );
+        assert!(StyledText::from_markdown(&marked("one two", "one three")).is_ok());
+        assert_eq!(hex(slint::Color::from_rgb_u8(15, 123, 15)), "#0F7B0F");
     }
 
     #[test]
@@ -1064,8 +1489,18 @@ enabled = false
                 )
             })
             .collect();
-        for state in ["empty", "off", "few", "many"] {
+        for state in ["empty", "off", "few", "many", "changes", "selected"] {
             let layout = crate::testing::layout("history", &format!("shot-{state}"));
+            if state == "changes" {
+                // The first entry was transcribed again: its json keeps the earlier text.
+                let day = layout.history_dir().join("2026-11-08");
+                fs::create_dir_all(&day).unwrap();
+                let kept = "Send the report to Hanna before lunch and ask her about the ticket.";
+                let json = format!(
+                    "{{\"version\":1,\"started\":\"\",\"duration_ms\":4500,\"status\":\"done\",\"model\":\"\",\"language\":\"\",\"settings\":null,\"previous\":{{\"text\":\"{kept}\",\"model\":\"\",\"language\":\"\",\"settings\":null}}}}"
+                );
+                fs::write(day.join("134501-123.json"), json).unwrap();
+            }
             if state == "off" {
                 let off = "version = 2
 [history]
@@ -1090,13 +1525,43 @@ enabled = false
             window.set_page(Page::History);
             has(&window, "History");
             let items = match state {
-                "few" => few.clone(),
+                "few" | "changes" | "selected" => few.clone(),
                 "many" => many.clone(),
                 _ => Vec::new(),
             };
             listed(&ipc, items, false);
             if state == "few" {
                 window.global::<HistoryState>().invoke_select(1);
+            }
+            if state == "changes" {
+                window.global::<HistoryState>().invoke_toggle_diff();
+            }
+            if state == "selected" {
+                // Drag across the first words of the text, as a hand would.
+                CLOCK.set(CLOCK.get() + Duration::from_millis(300));
+                slint::platform::update_timers_and_animations();
+                surface.draw_if_needed(|r| {
+                    r.render(
+                        &mut vec![PremultipliedRgbaColor::default(); 1280 * 860],
+                        1280,
+                    );
+                });
+                let (from, to) = (
+                    slint::LogicalPosition::new(655.0, 185.0),
+                    slint::LogicalPosition::new(780.0, 185.0),
+                );
+                let button = slint::platform::PointerEventButton::Left;
+                let w = window.window();
+                w.dispatch_event(slint::platform::WindowEvent::PointerMoved { position: from });
+                w.dispatch_event(slint::platform::WindowEvent::PointerPressed {
+                    position: from,
+                    button,
+                });
+                w.dispatch_event(slint::platform::WindowEvent::PointerMoved { position: to });
+                w.dispatch_event(slint::platform::WindowEvent::PointerReleased {
+                    position: to,
+                    button,
+                });
             }
             for (w, h) in [(720_u32, 520_u32), (1280, 860), (1920, 1080)] {
                 surface.set_size(slint::PhysicalSize::new(w, h));

@@ -261,6 +261,7 @@ fn meta(id: &str, duration_ms: u64, status: Status, ctx: &Context) -> Meta {
         model: ctx.model.clone(),
         language: ctx.language.clone(),
         settings: ctx.settings.clone(),
+        previous: None,
     }
 }
 
@@ -546,17 +547,67 @@ pub fn audio_16k(dir: &Path, id: &str) -> io::Result<Vec<f32>> {
     resample(&samples, rate, SAMPLE_RATE).map_err(io::Error::other)
 }
 
+/// The text of the entry at `base` and its meta, when it has a readable one.
+fn read_version(base: &Path) -> (String, Option<Meta>) {
+    let text = fs::read_to_string(base.with_extension(TXT)).unwrap_or_default();
+    let meta = fs::read_to_string(base.with_extension(JSON))
+        .ok()
+        .and_then(|json| Meta::from_json(&json).ok());
+    (text, meta)
+}
+
+/// Writes `text` and `meta` of the entry at `base`, the text first.
+fn write_version(base: &Path, text: &str, meta: &Meta) -> io::Result<()> {
+    write_atomic(&base.with_extension(TXT), text.as_bytes())?;
+    write_meta(base, meta)
+}
+
 /// A transcript of recording `id` made again: the text replaces the old one, the meta says it is
-/// done and names the model, language and settings of this run.
+/// done and names the model, language and settings of this run. The old text and its run stay
+/// as the other version (`Meta::previous`), unless there was no text.
 #[allow(dead_code, reason = "wired to IPC by t12")]
 pub fn set_text(dir: &Path, id: &str, text: &str, ctx: &Context) -> io::Result<()> {
     let base = entry_base(dir, id)?;
-    let old = fs::read_to_string(base.with_extension(JSON))
-        .ok()
-        .and_then(|json| Meta::from_json(&json).ok());
-    let duration_ms = old.map_or_else(|| wav_ms(&base.with_extension(WAV)), |m| m.duration_ms);
-    write_atomic(&base.with_extension(TXT), text.as_bytes())?;
-    write_meta(&base, &meta(id, duration_ms, Status::Done, ctx))
+    let (old_text, old) = read_version(&base);
+    let duration_ms = old
+        .as_ref()
+        .map_or_else(|| wav_ms(&base.with_extension(WAV)), |m| m.duration_ms);
+    let mut new = meta(id, duration_ms, Status::Done, ctx);
+    if !old_text.is_empty() {
+        let old = old.unwrap_or_else(|| meta(id, duration_ms, Status::Done, &Context::default()));
+        new.previous = Some(old.as_previous(&old_text));
+    }
+    write_version(&base, text, &new)
+}
+
+/// `text` the user edited replaces the transcript of recording `id`; the run that made it stays
+/// and the old text is kept as the other version. No change (and no write) when it is the same.
+pub fn edit_text(dir: &Path, id: &str, text: &str) -> io::Result<()> {
+    let base = entry_base(dir, id)?;
+    let (old_text, old) = read_version(&base);
+    if old_text == text {
+        return Ok(());
+    }
+    let duration_ms = old
+        .as_ref()
+        .map_or_else(|| wav_ms(&base.with_extension(WAV)), |m| m.duration_ms);
+    let old = old.unwrap_or_else(|| meta(id, duration_ms, Status::Done, &Context::default()));
+    let new = Meta {
+        status: Status::Done,
+        previous: (!old_text.is_empty()).then(|| old.as_previous(&old_text)),
+        ..old
+    };
+    write_version(&base, text, &new)
+}
+
+/// Swaps the transcript of recording `id` with its other version; `NotFound` when none is kept.
+pub fn restore(dir: &Path, id: &str) -> io::Result<()> {
+    let base = entry_base(dir, id)?;
+    let (text, old) = read_version(&base);
+    let (meta, text) = old
+        .and_then(|m| m.swapped(&text))
+        .ok_or(io::ErrorKind::NotFound)?;
+    write_version(&base, &text, &meta)
 }
 
 /// Deletes recording `id` (its wav, text and meta).
@@ -1388,6 +1439,52 @@ mod tests {
         assert!(theirs.is_file());
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&foreign);
+    }
+
+    #[test]
+    fn a_new_text_keeps_the_old_one_as_the_other_version_and_restore_swaps_them() {
+        let dir = owned_temp("versions");
+        let id = "2026-11-08/090000-000";
+        let base = dir.join(id);
+        fs::create_dir_all(base.parent().unwrap()).unwrap();
+        write_wav(&base.with_extension(WAV), &vec![0.5; 16_000]).unwrap();
+        fs::write(base.with_extension(TXT), "first").unwrap();
+        write_meta(&base, &meta(id, 1000, Status::Done, &ctx())).unwrap();
+        let text = || fs::read_to_string(base.with_extension(TXT)).unwrap();
+        assert!(restore(&dir, id).is_err(), "nothing kept yet");
+
+        let other = Context {
+            model: "turbo".into(),
+            ..Context::default()
+        };
+        set_text(&dir, id, "second", &other).unwrap();
+        assert_eq!(text(), "second");
+        let kept = meta_of(&base).previous.unwrap();
+        assert_eq!(
+            (kept.text.as_str(), kept.model.as_str()),
+            ("first", ctx().model.as_str())
+        );
+
+        edit_text(&dir, id, "second fixed").unwrap();
+        let now = meta_of(&base);
+        assert_eq!(now.model, "turbo", "an edit keeps the run");
+        assert_eq!(now.previous.unwrap().text, "second");
+        edit_text(&dir, id, "second fixed").unwrap();
+        assert_eq!(
+            meta_of(&base).previous.unwrap().text,
+            "second",
+            "same text, no write"
+        );
+
+        restore(&dir, id).unwrap();
+        assert_eq!(text(), "second");
+        restore(&dir, id).unwrap();
+        assert_eq!(text(), "second fixed", "the swap undoes itself");
+
+        for bad in ["../x", "2026-11-08/090000-001"] {
+            assert!(edit_text(&dir, bad, "x").is_err() && restore(&dir, bad).is_err());
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A save whose processed audio could not be written after the streamed recording became the

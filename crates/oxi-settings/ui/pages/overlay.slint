@@ -1,7 +1,6 @@
-// Overlay page (SPEC Feedback): the pill on or off, its spot on screen, hiding it over
-// fullscreen apps, and a preview the daemon shows at the picked spot. One card of four rows, like
-// System (owner's direction B, item 17).
-import { Theme, Shell, Icons, Card, Row, Divider, ToggleRow, Button, PositionTiles } from "../theme/index.slint";
+// Overlay page (SPEC Feedback): the pill on or off, its spot on screen (a click on a tile also shows
+// the pill there, DS-27.1) and hiding it over fullscreen apps. One card of three rows, like System.
+import { Shell, Card, Row, Divider, ToggleRow, PositionTiles } from "../theme/index.slint";
 
 // Filled and read by `pages::overlay`.
 export global OverlayState {
@@ -9,14 +8,10 @@ export global OverlayState {
     // Picker order: top left, top centre, top right, then the bottom row the same way.
     in property <int> position;
     in-out property <bool> hide-over-fullscreen;
-    // The daemon link is up: Preview needs it to show the pill.
-    in property <bool> online;
-    // Why Preview is off; empty while online or connecting.
-    in property <string> note;
     callback enabled-toggled(bool);
+    // Also fired for the already picked tile: the daemon shows the pill at that spot.
     callback position-picked(int);
     callback hide-over-fullscreen-toggled(bool);
-    callback preview();
 }
 
 export component OverlayPage inherits VerticalLayout {
@@ -44,6 +39,7 @@ export component OverlayPage inherits VerticalLayout {
         // The picked spot's name is the description, left of the tiles, so it moves nothing.
         Row {
             title: @tr("Position");
+            info: @tr("Click a position to see the overlay there.");
             enabled: !Shell.locked;
             description: OverlayState.position >= 0 && OverlayState.position < root.names.length ? root.names[OverlayState.position] : "";
             VerticalLayout {
@@ -55,22 +51,6 @@ export component OverlayPage inherits VerticalLayout {
                     picked(i) => {
                         OverlayState.position-picked(i);
                     }
-                }
-            }
-        }
-        Divider { }
-        // Why Preview is off is its tooltip (the banner above already says the daemon is off).
-        // The row says what happens, the button names it: one word is not shown twice.
-        Row {
-            title: @tr("Try it on the desktop");
-            Button {
-                text: @tr("Preview");
-                icon: Icons.eye-16;
-                enabled: OverlayState.online;
-                tooltip: OverlayState.note;
-                accessible-description: OverlayState.note;
-                clicked => {
-                    OverlayState.preview();
                 }
             }
         }

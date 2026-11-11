@@ -1,7 +1,7 @@
 //! Recognition test (Test tab): word error rate, ready phrases, scenario profiles, best set.
 //!
-//! A set is what the test may change: the audio switches and the model. `oxi-whisper` has no
-//! tuning parameters to vary yet, so a set has none either. No AI: the set with the fewest word
+//! A set is what the test may change: the audio switches and the model; engine parameters stay
+//! the configured ones. No AI: the set with the fewest word
 //! errors wins, and a tie goes to the set closest to the defaults.
 
 use std::fmt::Write as _;
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization as _;
 
 use crate::audio::SAMPLE_RATE;
-use crate::config::Config;
+use crate::config::{Advanced, AudioCtx, Auto, Config, Decoding};
 use crate::ipc::MAX_LINE;
 use crate::types::Language;
 
@@ -299,4 +299,172 @@ pub fn append_pcm(held: &mut Option<Vec<f32>>, reset: bool, hex: &str) -> bool {
     }
     *held = None;
     false
+}
+
+/// How whisper picks the next words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sampling {
+    Greedy { best_of: u8 },
+    Beam { beam_size: u8 },
+}
+
+/// Every per-run engine parameter, resolved from `model.advanced` (`auto` replaced by what the
+/// build did before the settings existed).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunParams {
+    pub threads: u8,
+    pub sampling: Sampling,
+    pub temperature: f32,
+    /// Whisper retries a failed segment at a higher temperature (step 0.2).
+    pub temperature_fallback: bool,
+    pub no_speech_threshold: f32,
+    pub logprob_threshold: f32,
+    pub entropy_threshold: f32,
+    pub suppress_non_speech: bool,
+    pub audio_ctx: AudioCtx,
+}
+
+/// Decode threads of `auto`. whisper.cpp scales badly past the physical cores, and `std` only
+/// knows logical ones, so halve (SMT assumed). A GPU does the heavy work: 4 is plenty.
+pub fn auto_threads(on_gpu: bool, logical: usize) -> u8 {
+    if on_gpu {
+        4
+    } else {
+        u8::try_from((logical / 2).clamp(1, 8)).unwrap_or(8)
+    }
+}
+
+/// Flash attention of the context: `auto` is on with a GPU (M5 measured -14..-41 % p50), off on
+/// CPU.
+pub fn flash_attn(adv: &Advanced, on_gpu: bool) -> Option<bool> {
+    match adv.flash_attn {
+        Auto::Auto => on_gpu.then_some(true),
+        Auto::Set(v) => Some(v),
+    }
+}
+
+fn or<T: Copy>(value: Auto<T>, auto: T) -> T {
+    match value {
+        Auto::Auto => auto,
+        Auto::Set(v) => v,
+    }
+}
+
+/// `adv` with `auto` replaced; pure, so "all auto equals today" is a test.
+pub fn resolve(adv: &Advanced, on_gpu: bool, logical: usize) -> RunParams {
+    RunParams {
+        threads: or(adv.threads, auto_threads(on_gpu, logical)),
+        sampling: match or(adv.decoding, Decoding::Greedy) {
+            Decoding::Greedy => Sampling::Greedy {
+                best_of: adv.best_of,
+            },
+            Decoding::Beam => Sampling::Beam {
+                beam_size: adv.beam_size,
+            },
+        },
+        temperature: or(adv.temperature, 0.0),
+        temperature_fallback: or(adv.temperature_fallback, true),
+        no_speech_threshold: or(adv.no_speech_threshold, 0.6),
+        logprob_threshold: or(adv.logprob_threshold, -1.0),
+        entropy_threshold: or(adv.entropy_threshold, 2.4),
+        suppress_non_speech: or(adv.suppress_non_speech, false),
+        audio_ctx: or(adv.audio_ctx, AudioCtx::Full),
+    }
+}
+
+/// The prompt of a run: the person's own text first, then the dictionary words.
+pub fn prompt(adv: &Advanced, dictionary: &str) -> String {
+    match (adv.initial_prompt.trim(), dictionary) {
+        ("", d) => d.to_owned(),
+        (p, "") => p.to_owned(),
+        (p, d) => format!("{p} {d}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_threads_table() {
+        // (on_gpu, logical threads, expected)
+        for (gpu, logical, want) in [
+            (false, 1, 1),
+            (false, 2, 1),
+            (false, 8, 4),
+            (false, 16, 8),
+            (false, 64, 8),
+            (true, 1, 4),
+            (true, 32, 4),
+        ] {
+            assert_eq!(
+                auto_threads(gpu, logical),
+                want,
+                "gpu={gpu} logical={logical}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_auto_equals_today() {
+        let adv = Advanced::default();
+        for (gpu, logical) in [(false, 16), (true, 16)] {
+            let r = resolve(&adv, gpu, logical);
+            assert_eq!(r.threads, auto_threads(gpu, logical));
+            assert_eq!(r.sampling, Sampling::Greedy { best_of: 1 });
+            assert!((r.temperature - 0.0).abs() < f32::EPSILON);
+            assert!(r.temperature_fallback);
+            assert!((r.no_speech_threshold - 0.6).abs() < f32::EPSILON);
+            assert!((r.logprob_threshold + 1.0).abs() < f32::EPSILON);
+            assert!((r.entropy_threshold - 2.4).abs() < f32::EPSILON);
+            assert!(!r.suppress_non_speech);
+            assert_eq!(r.audio_ctx, AudioCtx::Full);
+            assert_eq!(flash_attn(&adv, gpu), gpu.then_some(true));
+        }
+    }
+
+    #[test]
+    fn explicit_values_win() {
+        let adv = Advanced {
+            threads: Auto::Set(3),
+            flash_attn: Auto::Set(false),
+            decoding: Auto::Set(Decoding::Beam),
+            beam_size: 4,
+            temperature: Auto::Set(0.3),
+            temperature_fallback: Auto::Set(false),
+            no_speech_threshold: Auto::Set(0.4),
+            logprob_threshold: Auto::Set(-2.0),
+            entropy_threshold: Auto::Set(3.0),
+            suppress_non_speech: Auto::Set(true),
+            ..Advanced::default()
+        };
+        let r = resolve(&adv, true, 16);
+        assert_eq!(r.threads, 3);
+        assert_eq!(r.sampling, Sampling::Beam { beam_size: 4 });
+        assert!((r.temperature - 0.3).abs() < f32::EPSILON);
+        assert!(!r.temperature_fallback && r.suppress_non_speech);
+        assert!((r.no_speech_threshold - 0.4).abs() < f32::EPSILON);
+        assert_eq!(flash_attn(&adv, true), Some(false));
+        let on = Advanced {
+            flash_attn: Auto::Set(true),
+            ..Advanced::default()
+        };
+        assert_eq!(
+            flash_attn(&on, false),
+            Some(true),
+            "explicit on reaches the CPU too"
+        );
+    }
+
+    #[test]
+    fn the_prompt_puts_the_persons_text_before_the_dictionary() {
+        let adv = |p: &str| Advanced {
+            initial_prompt: p.into(),
+            ..Advanced::default()
+        };
+        assert_eq!(prompt(&adv(""), "Oxi, Kubernetes"), "Oxi, Kubernetes");
+        assert_eq!(prompt(&adv(" Meeting notes. "), ""), "Meeting notes.");
+        assert_eq!(prompt(&adv("Notes."), "Oxi"), "Notes. Oxi");
+        assert_eq!(prompt(&adv(""), ""), "");
+    }
 }

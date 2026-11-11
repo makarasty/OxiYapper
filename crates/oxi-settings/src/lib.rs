@@ -31,8 +31,8 @@ mod generated {
 }
 pub use constants::FILE_POLL;
 pub use generated::{
-    AppWindow, AudioState, ChipLevel, ModelState, Page, PathText, Shell, SystemState, TestRow,
-    TestState, TextState, Theme as Tokens, ThemeChoice, Toast,
+    AppWindow, AudioState, ChipLevel, HomeState, ModelState, Page, PathText, Shell, SystemState,
+    TestRow, TestState, TextState, Theme as Tokens, ThemeChoice, Toast,
 };
 pub use pages::test::{Finish, Mic, bind_with as bind_test_page};
 
@@ -699,12 +699,12 @@ mod tests {
     #[test]
     fn resets_leave_one_subscriber_per_page() {
         let (window, ipc, _sent, _) = crate::testing::linked("lib", "resets", super::Page::Hotkey);
-        // The banner, Home, Hotkey, Audio, Model, Overlay, History and Test.
-        assert_eq!(ipc.subscribers(), 8);
+        // The banner, Home, Hotkey, Audio, Model, History and Test (Overlay stopped subscribing in b04).
+        assert_eq!(ipc.subscribers(), 7);
         for _ in 0..3 {
             window.invoke_reset_config();
         }
-        assert_eq!(ipc.subscribers(), 8);
+        assert_eq!(ipc.subscribers(), 7);
     }
 
     #[cfg(windows)]

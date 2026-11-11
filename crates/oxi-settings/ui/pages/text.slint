@@ -1,7 +1,7 @@
 // Text page (SPEC Text), in four sub-tabs: dictionary.txt with its prompt token budget, replace.txt
 // with the lines it ignores, how text is pasted (mode, trailing space, Win+V history, restore
 // delay), and the per-app rules.
-import { Theme, Shell, Icons, Group, Card, Row, Divider, ToggleRow, SliderRow, Combo, TextField, TextArea, TilePicker, Button, ButtonKind, InfoTip, ProgressBar, Note, Severity, SubTabs, SubTabPane, GalleryTile, TileGallery, EmptyState, ScrollView } from "../theme/index.slint";
+import { Theme, Shell, Icons, Group, Card, CardFrame, Caption, Row, Divider, ToggleRow, SliderRow, Combo, TextField, SearchField, TextArea, TilePicker, Button, ButtonKind, IconButton, InfoTip, Tip, ProgressBar, Note, Severity, SubTabs, SubTabPane, GalleryTile, CardGrid, EmptyState, ScrollBox } from "../theme/index.slint";
 import { WarningSlot, Warnings } from "../theme/components/feedback.slint";
 
 export enum TextFile { dictionary, replacements }
@@ -25,11 +25,15 @@ export struct FileInfo {
 }
 
 // One per-app paste rule. `mode`: 0 the global mode, 1 clipboard, 2 type. `name`: the app's name
-// from the last scan, empty when the scan did not find it.
+// from the last scan, empty when the scan did not find it. `icon`: its icon from the scan (none
+// before one ran). `hidden`: the search field filters it out; the row keeps its place in the model so
+// `rule-mode-picked` and `rule-removed` still count from the config's first rule.
 export struct PasteRuleRow {
     app: string,
     name: string,
     mode: int,
+    icon: image,
+    hidden: bool,
 }
 
 // Filled and read by `pages::text`.
@@ -55,12 +59,27 @@ export global TextState {
     in-out property <float> restore-delay-ms;
     in property <float> default-restore-delay-ms;
     in property <[PasteRuleRow]> rules;
+    // How many rules the search field leaves visible.
+    in property <int> rule-matches;
+    // The search field of the rules list: filters the rules, offers the installed apps and a typed exe.
+    in-out property <string> query;
+    // What the field offers under it: installed apps with no rule yet (name as title, exe as caption,
+    // icon as picture), then one row for the typed exe: `hint` "add" to add it, "dup" when it already
+    // has a rule (`caption` says so).
+    in property <[GalleryTile]> suggestions;
     // What the last Scan found: the shortcut's name as title, the exe as caption, its icon as
-    // picture. An app that has a rule is disabled: its mode is changed in the list.
+    // picture; `checked` when the app has a rule.
     in property <[GalleryTile]> found;
+    // `found` filtered by `popup-query`, the apps popup's grid.
+    in property <[GalleryTile]> grid;
+    in-out property <string> popup-query;
+    // The rule a duplicate pick points at, for 600 ms: its row shows the accent tint and scrolls into view.
+    in property <string> flash-app;
     // A scan runs on a worker; `scanned` once one has finished in this window.
     in property <bool> scanning;
     in property <bool> scanned;
+    // The Per-app tab came into view: the first time, the apps are scanned for their icons and names.
+    callback per-app-shown();
     // The page came into view: files with no unsaved edits are read again.
     callback shown();
     callback edited(TextFile, string);
@@ -74,9 +93,13 @@ export global TextState {
     callback restore-delay-changed(float);
     callback rule-mode-picked(int, int);
     callback rule-removed(int);
-    callback rule-added(string);
+    // A row of the field's list: add the rule for this exe (a duplicate is refused: its rule flashes).
+    callback rule-picked(string);
+    callback query-edited(string);
+    callback popup-search(string);
+    // A tile of the popup: its app gets a rule, or loses it. The exe, not the index: the grid is filtered.
+    callback found-toggled(string);
     callback scan();
-    callback found-picked(int);
 }
 
 // An editor for one text file on its card: the text and one status line that never grows: an "i"
@@ -184,7 +207,7 @@ component FileEditor inherits Card {
             Button {
                 text: @tr("Open file");
                 icon: Icons.open-folder-16;
-                kind: ButtonKind.subtle;
+                kind: ButtonKind.soft;
                 accessible-label: @tr("Open {}", root.name);
                 clicked => {
                     TextState.open(root.file);
@@ -208,6 +231,99 @@ component FileEditor inherits Card {
     }
 }
 
+// The apps found by a scan, in a popup: search, close, one tile per app that ticks or unticks its rule
+// (the mode is chosen in the rules list). The grid never resizes: nothing appears below it.
+component AppsPopup inherits PopupWindow {
+    close-policy: close-on-click-outside;
+    init => {
+        // The caret is in the search field at once, the ring never (DS-4.6).
+        field.focus();
+    }
+    CardFrame {
+        background: Theme.bg-control;
+        border-color: Theme.stroke-control;
+        FocusScope {
+            focus-on-click: false;
+            capture-key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    root.close();
+                    return accept;
+                }
+                reject
+            }
+            VerticalLayout {
+                padding: Theme.space-4;
+                spacing: Theme.space-3;
+                HorizontalLayout {
+                    spacing: Theme.control-gap;
+                    FocusScope {
+                        horizontal-stretch: 1;
+                        focus-on-click: false;
+                        capture-key-pressed(event) => {
+                            if (event.text == Key.DownArrow && grid.tiles.length > 0) {
+                                grid.focus-grid();
+                                return accept;
+                            }
+                            reject
+                        }
+                        field := SearchField {
+                            width: 100%;
+                            height: 100%;
+                            no-ring: true;
+                            text <=> TextState.popup-query;
+                            placeholder-text: @tr("Search apps");
+                            accessible-label: @tr("Search apps");
+                        }
+                    }
+                    IconButton {
+                        icon: Icons.close;
+                        label: @tr("Close");
+                        tooltip: @tr("Close");
+                        clicked => {
+                            root.close();
+                        }
+                    }
+                }
+                // The scan's bar has its place from the start, so the grid does not move when a scan begins.
+                Rectangle {
+                    height: Theme.rail-height;
+                    if TextState.scanning: ProgressBar {
+                        width: 100%;
+                        indeterminate: true;
+                        accessible-label: @tr("Looking for apps");
+                    }
+                }
+                Rectangle {
+                    vertical-stretch: 1;
+                    grid := CardGrid {
+                        visible: TextState.grid.length > 0;
+                        width: parent.width;
+                        height: parent.height;
+                        accessible-label: @tr("Installed apps");
+                        tiles: TextState.grid;
+                        fallback-icon: Icons.app-generic;
+                        picked(i) => {
+                            TextState.found-toggled(TextState.grid[i].caption);
+                        }
+                    }
+                    if TextState.grid.length == 0: EmptyState {
+                        icon: Icons.app-generic;
+                        text: TextState.scanning && TextState.found.length == 0 ? @tr("Looking for apps") : TextState.found.length > 0 ? @tr("No app matches") : @tr("No apps found");
+                        if !TextState.scanning && TextState.found.length == 0: Button {
+                            text: @tr("Scan again");
+                            icon: Icons.scan;
+                            enabled: !Shell.locked;
+                            clicked => {
+                                TextState.scan();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // One tab in view, so the page needs no scroll at the minimum size (UI rule 25); the editors and
 // the rule list scroll inside their own area (rule 26).
 export component TextPage inherits VerticalLayout {
@@ -215,26 +331,56 @@ export component TextPage inherits VerticalLayout {
     // rule list share out so a tab fits without the page scrolling.
     in property <length> free-height;
     property <length> room: root.free-height - tabs.preferred-height - Theme.space-4;
-    // Per-app rules: what the found apps and the rule list share under Scan and Add (two gaps: the
-    // hidden gallery keeps its place in the layout). The list keeps up to a third of it (at least an
-    // editor's least height), the gallery takes whole tile rows of the rest, and the list any left.
-    property <length> rules-room: root.room - add.preferred-height - 2 * Theme.card-gap;
-    // The found apps show from the first Scan on, "Looking for apps" while it runs.
-    property <bool> show-found: TextState.scanned || TextState.scanning;
-    // A scan that found nothing says so in one line, not a gallery-high card.
-    property <length> found-height: !root.show-found ? 0 : TextState.found.length == 0 ? gallery.empty-height : root.gallery-height;
-    // One rule row at least stays in view with the gallery shown; when the room is too small for that,
-    // the page scrolls instead.
-    property <length> rules-floor: root.show-found ? 2 * Theme.card-padding-v + Theme.control-height : Theme.editor-min-height;
-    // n whole tile rows are n rows less one gap: the gallery's scroller reaches half a gap past each
-    // edge, so a row more would show its top as a sliver.
-    property <length> tile-row: Theme.tile-height + Theme.tile-gap;
-    property <length> gallery-space: root.rules-room - min(list.preferred-height, max(Theme.editor-min-height, root.rules-room / 3));
-    property <length> gallery-height: max(gallery.min-height, min(gallery.full-height, floor((root.gallery-space + Theme.tile-gap) / root.tile-row) * root.tile-row) - Theme.tile-gap);
+    // Per-app rules: one card, the search bar over the list. The list takes its rows, between three
+    // rows (the empty states) and what the room leaves.
+    property <length> bar-block: Theme.control-height + Theme.space-3;
+    property <length> list-room: max(root.room - 2 * Theme.card-padding-v - root.bar-block, 3 * Theme.row-height);
+    property <length> list-height: min(root.list-room, max(TextState.rule-matches * Theme.row-height, 3 * Theme.row-height));
+    // The row of the field's list under the arrows.
+    property <int> active;
+    // The window's width, from the shell: the page's own width is short of it by the rail and
+    // paddings, and by the scrollbar gutter when the page scrolls as a whole.
+    in property <length> window-width;
+    // Open while there is text and rows for it, until the caret leaves the field; typing, or the
+    // caret coming back, opens it again.
+    property <bool> dismissed;
+    property <bool> suggest-open: TextState.query != "" && TextState.suggestions.length > 0 && !root.dismissed;
+    property <bool> field-focus: search.has-focus;
+    property <string> query: TextState.query;
+    property <string> popup-query: TextState.popup-query;
+    property <int> shown-tab: TextState.tab;
+    changed field-focus => {
+        root.dismissed = !self.field-focus;
+    }
+    changed query => {
+        root.dismissed = false;
+        root.active = 0;
+        TextState.query-edited(self.query);
+    }
+    changed popup-query => {
+        TextState.popup-search(self.popup-query);
+    }
+    changed shown-tab => {
+        if (self.shown-tab == 3) {
+            TextState.per-app-shown();
+        }
+    }
+    function pick-suggestion(i: int) {
+        if (!Shell.locked && i >= 0 && i < TextState.suggestions.length) {
+            TextState.rule-picked(TextState.suggestions[i].caption);
+        }
+    }
+    function open-apps() {
+        TextState.popup-query = "";
+        apps.show();
+    }
     alignment: start;
     spacing: Theme.space-4;
     init => {
         TextState.shown();
+        if (TextState.tab == 3) {
+            TextState.per-app-shown();
+        }
     }
     tabs := SubTabs {
         items: [@tr("Dictionary"), @tr("Replacements"), @tr("Paste"), @tr("Per-app rules")];
@@ -350,35 +496,59 @@ export component TextPage inherits VerticalLayout {
             shown: TextState.tab == 3;
             VerticalLayout {
                 alignment: start;
-                spacing: Theme.card-gap;
-                // Above the list: however long it grows, Add and Scan are a few Tabs from the sub-tabs.
-                // A typed exe is the way for an app with no shortcut.
-                add := Card {
+                card := CardFrame {
+                    height: 2 * Theme.card-padding-v + root.bar-block + root.list-height;
+                    // Search, add and scan in one field: it filters the rules below, lists the installed
+                    // apps that match, and takes a typed exe for an app with no shortcut.
                     HorizontalLayout {
+                        x: Theme.card-padding-h;
+                        y: Theme.card-padding-v;
+                        width: parent.width - 2 * Theme.card-padding-h;
+                        height: Theme.control-height;
                         spacing: Theme.control-gap;
-                        new-app := TextField {
-                            placeholder-text: @tr("app.exe");
-                            enabled: !Shell.locked;
-                            accessible-label: @tr("New rule app");
-                        }
-                        Button {
-                            text: @tr("Add");
-                            icon: Icons.add-16;
-                            accessible-label: @tr("Add rule");
-                            enabled: !Shell.locked && new-app.text != "";
-                            tooltip: Shell.locked ? Shell.locked-tip : @tr("Type an app name first");
-                            clicked => {
-                                TextState.rule-added(new-app.text);
-                                new-app.text = "";
+                        FocusScope {
+                            horizontal-stretch: 1;
+                            focus-on-click: false;
+                            capture-key-pressed(event) => {
+                                if (!root.suggest-open) {
+                                    return reject;
+                                }
+                                if (event.text == Key.DownArrow) {
+                                    root.active = min(root.active + 1, TextState.suggestions.length - 1);
+                                    return accept;
+                                }
+                                if (event.text == Key.UpArrow) {
+                                    root.active = max(root.active - 1, 0);
+                                    return accept;
+                                }
+                                if (event.text == Key.Return) {
+                                    root.pick-suggestion(root.active);
+                                    return accept;
+                                }
+                                reject
+                            }
+                            search := SearchField {
+                                width: 100%;
+                                height: 100%;
+                                text <=> TextState.query;
+                                placeholder-text: @tr("Search or add an app");
+                                enabled: !Shell.locked;
+                                accessible-label: @tr("New rule app");
+                                // At once for a typed letter; `changed query` takes the clear button, Esc and a pick.
+                                edited(text) => {
+                                    root.dismissed = false;
+                                    root.active = 0;
+                                    TextState.query-edited(text);
+                                }
                             }
                         }
                         Button {
                             text: @tr("Scan for apps");
-                            kind: TextState.scanned ? ButtonKind.secondary : ButtonKind.primary;
-                            enabled: !TextState.scanning;
-                            tooltip: @tr("Looking for apps");
+                            icon: Icons.scan;
+                            tooltip: Shell.locked ? Shell.locked-tip : @tr("Choose the apps that get their own rule");
+                            enabled: !Shell.locked;
                             clicked => {
-                                TextState.scan();
+                                root.open-apps();
                             }
                         }
                         VerticalLayout {
@@ -388,60 +558,209 @@ export component TextPage inherits VerticalLayout {
                             }
                         }
                     }
-                }
-                // On the page, not in a card: a tile is a card (UI rule 10).
-                gallery := TileGallery {
-                    visible: root.show-found;
-                    height: root.found-height;
-                    accessible-label: @tr("Found apps");
-                    tiles: TextState.found;
-                    fallback-icon: Icons.app-generic;
-                    empty-text: TextState.scanning ? @tr("Looking for apps") : @tr("No apps found: type the app's .exe name above.");
-                    picked(i) => {
-                        TextState.found-picked(i);
-                    }
-                }
-                rules := ScrollView {
-                    height: min(list.preferred-height, max(root.rules-room - root.found-height, root.rules-floor));
-                    list := VerticalLayout {
-                        spacing: Theme.card-gap;
+                    // The list overhangs the card's padding by the bar's gutter, so the buttons end where
+                    // the search bar does and the thumb sits in the padding.
+                    Rectangle {
+                        x: Theme.card-padding-h;
+                        y: Theme.card-padding-v + root.bar-block;
+                        width: parent.width - 2 * Theme.card-padding-h;
+                        height: root.list-height;
+                        rules-box := ScrollBox {
+                            // Without an x a sized child is centred: pinned, so the overhang is all on the right.
+                            x: 0;
+                            width: parent.width + Theme.scrollbar-gutter;
+                            height: parent.height;
+                            reserve-gutter: true;
+                            content-height: TextState.rule-matches * Theme.row-height;
+                            VerticalLayout {
+                                alignment: start;
+                                width: rules-box.content-width;
+                                for rule[i] in TextState.rules: Rectangle {
+                                    // A pick sets the Combo's index, which ends its binding: a mode changed
+                                    // from outside (Reset) still reaches it through this.
+                                    property <int> mode: rule.mode;
+                                    changed mode => {
+                                        mode-combo.current-index = self.mode;
+                                    }
+                                    // A duplicate pick: the tint for 600 ms (set and cleared by `pages::text`), and the row scrolls into view.
+                                    property <bool> flash: TextState.flash-app != "" && rule.app == TextState.flash-app;
+                                    changed flash => {
+                                        if (self.flash) {
+                                            if (self.y + self.height > -rules-box.viewport-y + rules-box.height) {
+                                                rules-box.viewport-y = rules-box.height - self.y - self.height;
+                                            }
+                                            if (self.y < -rules-box.viewport-y) {
+                                                rules-box.viewport-y = -self.y;
+                                            }
+                                        }
+                                    }
+                                    visible: !rule.hidden;
+                                    height: rule.hidden ? 0px : Theme.row-height;
+                                    background: self.flash ? Theme.accent-tint : transparent;
+                                    border-radius: Theme.radius-control;
+                                    HorizontalLayout {
+                                        spacing: Theme.icon-gap;
+                                        VerticalLayout {
+                                            alignment: center;
+                                            Image {
+                                                source: rule.icon.width > 0 ? rule.icon : Icons.app-generic;
+                                                width: Theme.icon-size;
+                                                height: Theme.icon-size;
+                                                image-fit: contain;
+                                                colorize: rule.icon.width > 0 ? transparent : Theme.text-secondary;
+                                                accessible-role: none;
+                                            }
+                                        }
+                                        Rectangle {
+                                            horizontal-stretch: 1;
+                                            min-width: 0;
+                                            VerticalLayout {
+                                                alignment: center;
+                                                Text {
+                                                    text: rule.name != "" ? rule.name : rule.app;
+                                                    font-size: Theme.body-size;
+                                                    color: Theme.text-primary;
+                                                    overflow: elide;
+                                                }
+                                                if rule.name != "": Caption {
+                                                    text: rule.app;
+                                                    overflow: elide;
+                                                    accessible-role: none;
+                                                }
+                                            }
+                                            name-area := TouchArea { }
+                                            Tip {
+                                                text: rule.name != "" ? rule.name + "\n" + rule.app : rule.app;
+                                                hovered: name-area.has-hover;
+                                            }
+                                        }
+                                        // The mode and Delete are one group, 8 apart (DS-28.1); Delete is rightmost.
+                                        HorizontalLayout {
+                                            spacing: Theme.space-2;
+                                            VerticalLayout {
+                                                alignment: center;
+                                                mode-combo := Combo {
+                                                    min-width: Theme.rule-mode-width;
+                                                    max-width: Theme.rule-mode-width;
+                                                    model: [@tr("Default"), @tr("Clipboard"), @tr("Type")];
+                                                    current-index: rule.mode;
+                                                    accessible-label: @tr("Mode for {}", rule.app);
+                                                    selected => {
+                                                        TextState.rule-mode-picked(i, self.current-index);
+                                                    }
+                                                }
+                                            }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                Button {
+                                                    kind: ButtonKind.icon;
+                                                    destructive: true;
+                                                    icon: Icons.delete-16;
+                                                    text: @tr("Remove {}", rule.app);
+                                                    enabled: !Shell.locked;
+                                                    tooltip: Shell.locked-tip;
+                                                    clicked => {
+                                                        TextState.rule-removed(i);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if TextState.rules.length == 0: EmptyState {
                             icon: Icons.app-generic;
                             text: @tr("No app has a rule of its own");
-                        }
-                        for rule[i] in TextState.rules: Card {
-                            // A pick sets the Combo's index, which ends its binding: a mode changed
-                            // from outside (Reset) still reaches it through this.
-                            property <int> mode: rule.mode;
-                            changed mode => {
-                                mode-combo.current-index = self.mode;
-                            }
-                            Row {
-                                title: rule.name != "" ? rule.name : rule.app;
-                                elide: true;
-                                mode-combo := Combo {
-                                    min-width: Theme.rule-mode-width;
-                                    max-width: Theme.rule-mode-width;
-                                    model: [@tr("Default"), @tr("Clipboard"), @tr("Type")];
-                                    current-index: rule.mode;
-                                    accessible-label: @tr("Mode for {}", rule.app);
-                                    selected => {
-                                        TextState.rule-mode-picked(i, self.current-index);
-                                    }
-                                }
-                                Button {
-                                    kind: ButtonKind.icon;
-                                    destructive: true;
-                                    icon: Icons.delete-16;
-                                    text: @tr("Remove {}", rule.app);
-                                    enabled: !Shell.locked;
-                                    tooltip: Shell.locked-tip;
-                                    clicked => {
-                                        TextState.rule-removed(i);
-                                    }
+                            Button {
+                                text: @tr("Scan for apps");
+                                icon: Icons.scan;
+                                enabled: !Shell.locked;
+                                clicked => {
+                                    root.open-apps();
                                 }
                             }
                         }
+                        if TextState.rules.length > 0 && TextState.rule-matches == 0: EmptyState {
+                            icon: Icons.app-generic;
+                            text: @tr("No rule matches");
+                        }
+                    }
+                    // Under the field, over the list: the installed apps that match, then the typed exe.
+                    if root.suggest-open: CardFrame {
+                        x: Theme.card-padding-h;
+                        y: Theme.card-padding-v + Theme.control-height + Theme.space-1;
+                        width: search.width;
+                        height: TextState.suggestions.length * Theme.control-height + 2 * Theme.space-1;
+                        background: Theme.bg-control;
+                        border-color: Theme.stroke-control;
+                        accessible-role: list;
+                        accessible-label: @tr("Matching apps");
+                        for s[i] in TextState.suggestions: Rectangle {
+                            x: Theme.space-1;
+                            y: Theme.space-1 + i * Theme.control-height;
+                            width: parent.width - 2 * Theme.space-1;
+                            height: Theme.control-height;
+                            border-radius: Theme.radius-control;
+                            background: i == root.active || touch.has-hover ? Theme.bg-subtle-hover : transparent;
+                            accessible-role: list-item;
+                            // The action is what a screen reader names; the exe is in the description.
+                            accessible-label: s.hint != "" ? @tr("Add rule") : s.title;
+                            accessible-description: s.hint == "dup" ? @tr("{} already has a rule", s.caption) : s.caption;
+                            accessible-action-default => {
+                                root.pick-suggestion(i);
+                            }
+                            HorizontalLayout {
+                                padding-left: Theme.space-2;
+                                padding-right: Theme.space-2;
+                                spacing: Theme.space-2;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Image {
+                                        source: s.hint == "add" ? Icons.add : s.hint == "dup" ? Icons.warning : s.picture.width > 0 ? s.picture : Icons.app-generic;
+                                        width: Theme.icon-size-small;
+                                        height: Theme.icon-size-small;
+                                        image-fit: contain;
+                                        colorize: s.hint == "dup" ? Theme.error-text : s.hint == "add" ? Theme.accent-text : s.picture.width > 0 ? transparent : Theme.text-secondary;
+                                        accessible-role: none;
+                                    }
+                                }
+                                Text {
+                                    text: s.hint == "add" ? @tr("Add {}", s.caption) : s.title;
+                                    font-size: Theme.body-size;
+                                    color: Theme.text-primary;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    accessible-role: none;
+                                }
+                                Caption {
+                                    text: s.hint == "dup" ? @tr("already has a rule") : s.hint == "add" ? "" : s.caption;
+                                    color: s.hint == "dup" ? Theme.error-text : Theme.text-secondary;
+                                    horizontal-stretch: 1;
+                                    horizontal-alignment: right;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    accessible-role: none;
+                                }
+                            }
+                            touch := TouchArea {
+                                mouse-cursor: MouseCursor.pointer;
+                                clicked => {
+                                    root.pick-suggestion(i);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Not laid out: the popup takes its own place, centred on the page and in the window.
+                Rectangle {
+                    width: 0;
+                    height: 0;
+                    apps := AppsPopup {
+                        width: min(960px, root.window-width - 4 * Theme.space-4);
+                        height: min(640px, Shell.window-height - 4 * Theme.space-4);
+                        x: (root.window-width - self.width) / 2 - parent.absolute-position.x;
+                        y: (Shell.window-height - self.height) / 2 - parent.absolute-position.y;
                     }
                 }
             }

@@ -117,10 +117,66 @@ pub struct Meta {
     pub language: String,
     /// The audio settings and model of the run that made the text; `None` when unknown.
     pub settings: Option<SettingsSet>,
+    /// The other version of the text: what it was before the last transcribe-again or edit, or
+    /// what a restore put aside. Absent until a text was replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<Previous>,
+}
+
+/// The text an entry had before it was replaced, with the run that made it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Previous {
+    pub text: String,
+    pub model: String,
+    pub language: String,
+    pub settings: Option<SettingsSet>,
+    /// The kept text is the newer version: the current one is an old text a Restore brought back.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub newer: bool,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "the `skip_serializing_if` signature"
+)]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Meta {
     pub const VERSION: u32 = 1;
+
+    /// This entry's current text and run as the "other version" kept beside a new one.
+    #[must_use]
+    pub fn as_previous(&self, text: &str) -> Previous {
+        Previous {
+            text: text.to_owned(),
+            model: self.model.clone(),
+            language: self.language.clone(),
+            settings: self.settings.clone(),
+            newer: false,
+        }
+    }
+
+    /// The entry after Restore (or Use new): the kept version becomes the current one and the
+    /// current one is kept in its place, so the same call undoes it. `text` is the current text;
+    /// the answer is the new meta and the new text. `None` when no other version is kept.
+    #[must_use]
+    pub fn swapped(&self, text: &str) -> Option<(Self, String)> {
+        let kept = self.previous.as_ref()?;
+        let meta = Self {
+            status: Status::Done,
+            model: kept.model.clone(),
+            language: kept.language.clone(),
+            settings: kept.settings.clone(),
+            previous: Some(Previous {
+                newer: !kept.newer,
+                ..self.as_previous(text)
+            }),
+            ..self.clone()
+        };
+        Some((meta, kept.text.clone()))
+    }
 
     /// # Errors
     /// Never in practice: every field serialises.
@@ -133,6 +189,130 @@ impl Meta {
     pub fn from_json(text: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(text)
     }
+}
+
+/// One piece of a word-by-word comparison of two texts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffPart {
+    pub kind: DiffKind,
+    /// The words with the spaces that follow them, as they stand in their text.
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffKind {
+    /// In both texts.
+    Same,
+    /// Only in the old text.
+    Removed,
+    /// Only in the new text.
+    Added,
+}
+
+/// Most cells of the comparison table; above it the middle of two texts is shown as one removed
+/// and one added run.
+const DIFF_CELLS: usize = 4_000_000;
+
+/// A word-by-word comparison of `old` and `new` (longest common subsequence of their words, exact
+/// match including punctuation). The `Same` and `Added` parts joined give `new`; `Same` and
+/// `Removed` give `old` (up to the white space between words). A removed run comes before the
+/// added run that replaces it.
+///
+/// shortcut: two long texts that differ in the middle by more than `DIFF_CELLS` word pairs show
+/// the middle as one removed and one added run; use a linear-space diff if that ever shows.
+#[must_use]
+pub fn word_diff(old: &str, new: &str) -> Vec<DiffPart> {
+    let (old_t, new_t) = (tokens(old), tokens(new));
+    let same = |left: &str, right: &str| left.trim() == right.trim();
+    let head = old_t
+        .iter()
+        .zip(&new_t)
+        .take_while(|(left, right)| same(left, right))
+        .count();
+    let tail = old_t[head..]
+        .iter()
+        .rev()
+        .zip(new_t[head..].iter().rev())
+        .take_while(|(left, right)| same(left, right))
+        .count();
+    let (old_mid, new_mid) = (
+        &old_t[head..old_t.len() - tail],
+        &new_t[head..new_t.len() - tail],
+    );
+    let mut out: Vec<DiffPart> = Vec::new();
+    let mut push = |kind: DiffKind, token: &str| match out.last_mut() {
+        Some(part) if part.kind == kind => part.text.push_str(token),
+        _ => out.push(DiffPart {
+            kind,
+            text: token.to_owned(),
+        }),
+    };
+    for token in &new_t[..head] {
+        push(DiffKind::Same, token);
+    }
+    if (old_mid.len() + 1).saturating_mul(new_mid.len() + 1) > DIFF_CELLS {
+        for token in old_mid {
+            push(DiffKind::Removed, token);
+        }
+        for token in new_mid {
+            push(DiffKind::Added, token);
+        }
+    } else {
+        // `lcs[i * stride + j]`: common words of `old_mid[i..]` and `new_mid[j..]`.
+        let stride = new_mid.len() + 1;
+        let mut lcs = vec![0_u32; (old_mid.len() + 1) * stride];
+        for i in (0..old_mid.len()).rev() {
+            for j in (0..new_mid.len()).rev() {
+                lcs[i * stride + j] = if same(old_mid[i], new_mid[j]) {
+                    lcs[(i + 1) * stride + j + 1] + 1
+                } else {
+                    lcs[(i + 1) * stride + j].max(lcs[i * stride + j + 1])
+                };
+            }
+        }
+        let (mut i, mut j) = (0, 0);
+        while i < old_mid.len() || j < new_mid.len() {
+            if i < old_mid.len() && j < new_mid.len() && same(old_mid[i], new_mid[j]) {
+                push(DiffKind::Same, new_mid[j]);
+                (i, j) = (i + 1, j + 1);
+            } else if i < old_mid.len()
+                && (j == new_mid.len() || lcs[(i + 1) * stride + j] >= lcs[i * stride + j + 1])
+            {
+                push(DiffKind::Removed, old_mid[i]);
+                i += 1;
+            } else {
+                push(DiffKind::Added, new_mid[j]);
+                j += 1;
+            }
+        }
+    }
+    for token in &new_t[new_t.len() - tail..] {
+        push(DiffKind::Same, token);
+    }
+    out
+}
+
+/// The words of `text`, each with the white space after it; leading white space goes with the
+/// first word.
+fn tokens(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let (mut in_space, mut seen_word) = (false, false);
+    for (at, c) in text.char_indices() {
+        if c.is_whitespace() {
+            in_space = true;
+        } else {
+            if in_space && seen_word {
+                out.push(&text[start..at]);
+                start = at;
+            }
+            (in_space, seen_word) = (false, true);
+        }
+    }
+    if start < text.len() {
+        out.push(&text[start..]);
+    }
+    out
 }
 
 /// Bytes of the canonical 16-bit mono PCM wav header the spool writes.
@@ -451,6 +631,7 @@ mod tests {
                 trim: true,
                 model: "small".into(),
             }),
+            previous: None,
         }
     }
 
@@ -557,5 +738,129 @@ mod tests {
             }
             assert!(repaired_header(&bad, 100).is_none(), "byte {at}");
         }
+    }
+
+    fn joined(parts: &[DiffPart], keep: [DiffKind; 2]) -> String {
+        parts
+            .iter()
+            .filter(|p| keep.contains(&p.kind))
+            .map(|p| p.text.as_str())
+            .collect()
+    }
+
+    fn shape(parts: &[DiffPart]) -> Vec<(DiffKind, &str)> {
+        parts.iter().map(|p| (p.kind, p.text.as_str())).collect()
+    }
+
+    #[test]
+    fn the_diff_of_equal_texts_is_one_unchanged_part() {
+        assert_eq!(
+            shape(&word_diff("a b  c", "a b  c")),
+            [(DiffKind::Same, "a b  c")]
+        );
+        assert_eq!(word_diff("", ""), []);
+    }
+
+    #[test]
+    fn the_diff_marks_a_replaced_an_added_and_a_removed_word() {
+        use DiffKind::{Added, Removed, Same};
+        assert_eq!(
+            shape(&word_diff("one two three", "one 2 three")),
+            [
+                (Same, "one "),
+                (Removed, "two "),
+                (Added, "2 "),
+                (Same, "three")
+            ]
+        );
+        assert_eq!(
+            shape(&word_diff("one three", "one two three")),
+            [(Same, "one "), (Added, "two "), (Same, "three")]
+        );
+        assert_eq!(
+            shape(&word_diff("one two three", "one three")),
+            [(Same, "one "), (Removed, "two "), (Same, "three")]
+        );
+        assert_eq!(shape(&word_diff("", "new text")), [(Added, "new text")]);
+        assert_eq!(shape(&word_diff("gone", "")), [(Removed, "gone")]);
+    }
+
+    #[test]
+    fn the_diff_parts_give_both_texts_back() {
+        let pairs = [
+            ("привет мир как дела", "Привет, мир. Как дела"),
+            ("a b c d e f", "f e d c b a"),
+            ("  lead and trail  ", "lead and  trail"),
+            ("x", "x x x"),
+        ];
+        let squeeze = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (old, new) in pairs {
+            let parts = word_diff(old, new);
+            let old_back = joined(&parts, [DiffKind::Same, DiffKind::Removed]);
+            let new_back = joined(&parts, [DiffKind::Same, DiffKind::Added]);
+            assert_eq!(squeeze(&old_back), squeeze(old), "{old:?} -> {new:?}");
+            assert_eq!(squeeze(&new_back), squeeze(new), "{old:?} -> {new:?}");
+        }
+    }
+
+    #[test]
+    fn a_huge_difference_falls_back_to_one_removed_and_one_added_run() {
+        let words = |p: &str| {
+            (0..2500)
+                .map(|i| format!("{p}{i}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let parts = word_diff(&words("a"), &words("b"));
+        assert_eq!(
+            parts.iter().map(|p| p.kind).collect::<Vec<_>>(),
+            [DiffKind::Removed, DiffKind::Added]
+        );
+    }
+
+    #[test]
+    fn the_kept_version_swaps_with_the_current_one_and_back() {
+        assert!(meta(Status::Done).swapped("text").is_none(), "nothing kept");
+        let now = Meta {
+            previous: Some(Previous {
+                text: "old text".into(),
+                model: "turbo".into(),
+                language: "en".into(),
+                settings: None,
+                newer: false,
+            }),
+            ..meta(Status::Done)
+        };
+        let (back, text) = now.swapped("new text").unwrap();
+        assert_eq!(text, "old text");
+        assert_eq!(
+            (back.model.as_str(), back.language.as_str()),
+            ("turbo", "en")
+        );
+        assert!(back.settings.is_none());
+        let kept = back.previous.as_ref().unwrap();
+        assert_eq!(
+            (kept.text.as_str(), kept.model.as_str()),
+            ("new text", "small")
+        );
+        assert!(kept.newer, "the old text is shown, the kept one is newer");
+        let (again, text) = back.swapped(&text).unwrap();
+        assert_eq!(text, "new text");
+        assert_eq!(again.model, "small");
+        let kept = again.previous.unwrap();
+        assert_eq!(kept.text, "old text");
+        assert!(!kept.newer, "the new text is shown again");
+    }
+
+    #[test]
+    fn the_kept_version_is_written_only_when_there_is_one_and_old_files_still_read() {
+        let json = meta(Status::Done).to_json().unwrap();
+        assert!(!json.contains("previous"), "{json}");
+        assert_eq!(Meta::from_json(&json).unwrap().previous, None);
+        let with = Meta {
+            previous: Some(meta(Status::Done).as_previous("before")),
+            ..meta(Status::Done)
+        };
+        assert_eq!(Meta::from_json(&with.to_json().unwrap()).unwrap(), with);
     }
 }

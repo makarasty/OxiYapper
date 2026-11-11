@@ -744,8 +744,17 @@ export component Combo {
     out property <bool> has-focus: fs.has-focus;
     out property <bool> open: root.popup-focused || root.force-open;
     callback selected(string);
+    // The open list closed on a choice: Return, Space or a click on a line. Not arrows, Esc or a
+    // click outside the list.
+    callback committed(string);
+    // The list closed without a choice (Esc, a click outside), or Esc on the closed field: a page
+    // that treats the arrows as a preview puts the previous value back.
+    callback dismissed();
 
     property <bool> live: root.enabled && !root.locked;
+    property <bool> did-commit;
+    // An arrow moved the closed field: leaving it without opening the list is a dismissal.
+    property <bool> walked;
     property <bool> key-focus;
     property <bool> popup-focused;
     property <int> rows: min(Theme.combo-visible-rows, root.model.length);
@@ -763,6 +772,8 @@ export component Combo {
     }
     function show-list() {
         if (root.live && root.model.length > 0) {
+            root.did-commit = false;
+            root.walked = false;
             root.above = root.absolute-position.y + root.height + Theme.space-1 + root.list-h > Shell.window-height && root.absolute-position.y >= root.list-h + Theme.space-1;
             popup.show();
         }
@@ -833,18 +844,30 @@ export component Combo {
                 root.key-focus = KeyFocus.after(reason, root.key-focus);
             }
         }
+        focus-changed-event => {
+            if (!self.has-focus && root.walked) {
+                root.walked = false;
+                root.dismissed();
+            }
+        }
         key-pressed(event) => {
             if (event.text == Key.UpArrow) {
+                root.walked = true;
                 root.select(max(root.current-index - 1, 0));
                 return accept;
             }
             if (event.text == Key.DownArrow) {
+                root.walked = true;
                 root.select(min(root.current-index + 1, root.model.length - 1));
                 return accept;
             }
             if (event.text == " " || event.text == Key.Return) {
                 root.show-list();
                 return accept;
+            }
+            if (event.text == Key.Escape) {
+                root.walked = false;
+                root.dismissed();
             }
             reject
         }
@@ -867,6 +890,10 @@ export component Combo {
         list-fs := FocusScope {
             focus-changed-event => {
                 root.popup-focused = self.has-focus;
+                // The popup has no `closed` callback: its focus going is the close.
+                if (!self.has-focus && !root.did-commit) {
+                    root.dismissed();
+                }
             }
             key-pressed(event) => {
                 if (event.text == Key.UpArrow) {
@@ -877,7 +904,13 @@ export component Combo {
                     root.select(min(root.current-index + 1, root.model.length - 1));
                     return accept;
                 }
-                if (event.text == Key.Return || event.text == Key.Escape || event.text == " ") {
+                if (event.text == Key.Return || event.text == " ") {
+                    root.did-commit = true;
+                    root.committed(root.current-value);
+                    popup.close();
+                    return accept;
+                }
+                if (event.text == Key.Escape) {
                     popup.close();
                     return accept;
                 }
@@ -888,6 +921,8 @@ export component Combo {
                 current: root.current-index;
                 picked(i) => {
                     root.select(i);
+                    root.did-commit = true;
+                    root.committed(root.current-value);
                     popup.close();
                 }
             }

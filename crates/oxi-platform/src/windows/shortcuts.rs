@@ -1,17 +1,29 @@
 //! The apps a person can start: `.lnk` shortcuts in the Start menu and on the desktop, per user and
-//! for all users (item 16). A shortcut's file name is the app's friendly name; its target, or the
-//! app a launcher starts (`Update.exe --processStart Discord.exe`), is the exe a paste rule matches.
+//! for all users (item 16), then what the registry knows (Uninstall keys with an exe icon, App Paths).
+//! A shortcut's file name is the app's friendly name; its target, or the app a launcher starts
+//! (`Update.exe --processStart Discord.exe`, a Store app's package manifest), is the exe a paste
+//! rule matches. A relative target is read from the shortcut's own folder.
 
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use windows::Win32::System::Com::{CoTaskMemFree, IBindCtx};
+use windows::Win32::UI::Shell::{
+    BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem, KF_FLAG_DEFAULT,
+    SHGetKnownFolderItem, SIGDN, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING,
+};
+use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits,
     GetObjectW, ReleaseDC,
 };
 use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
 use windows_sys::Win32::System::Ole::{OleInitialize, OleUninitialize};
+use windows_sys::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_DWORD, RRF_RT_REG_EXPAND_SZ,
+    RRF_RT_REG_SZ, RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW,
+};
 use windows_sys::Win32::UI::Shell::{
     CSIDL_COMMON_DESKTOPDIRECTORY, CSIDL_COMMON_PROGRAMS, CSIDL_DESKTOPDIRECTORY, CSIDL_PROGRAMS,
     ExtractIconExW, SHGetFolderPathW,
@@ -29,6 +41,24 @@ const MAX_DIRS: usize = 1000;
 const DRIVE_FIXED: u32 = 3;
 /// A real `.lnk` is a few KB; anything longer is cut there and fails to parse.
 const MAX_LINK_BYTES: u64 = 64 * 1024;
+/// Registry keys read per list, so a broken hive cannot stall the worker.
+const MAX_KEYS: u32 = 4000;
+/// An `AppxManifest.xml` is a few KB; a longer one is cut there.
+const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
+/// Apps that start other things: a shortcut to one with arguments (Control Panel applets, a folder in
+/// Explorer, a document in Notepad) is not the app itself.
+const HOSTS: [&str; 5] = [
+    "explorer.exe",
+    "control.exe",
+    "rundll32.exe",
+    "mmc.exe",
+    "notepad.exe",
+];
+const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+const UNINSTALL_32: &str = r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall";
+const APP_PATHS: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths";
+const APP_PATHS_32: &str = r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths";
+const PACKAGES: &str = r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
 
 /// One app found by a scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,31 +132,61 @@ fn folder(csidl: u32) -> Option<PathBuf> {
 
 /// [`find`] in `roots`, then each app's icon. Blocking: run it on a worker, never the UI thread.
 pub fn scan(roots: &[PathBuf]) -> Vec<App> {
-    let mut apps = find(roots);
-    // SAFETY: no arguments; the shell needs COM on this thread for icons, undone below.
+    with_icons(find(roots))
+}
+
+/// [`scan`] over the Start menu and desktop folders, plus the apps the registry lists that have no
+/// shortcut. Blocking: run it on a worker.
+pub fn scan_installed() -> Vec<App> {
+    let mut walk = walk_roots(&roots(), &desktops());
+    let store = with_ole(|| store_apps(&mut walk.drives));
+    walk.apps.extend(store);
+    let registry = registry_apps(&mut walk.drives);
+    walk.apps.extend(registry);
+    with_icons(finish(walk.apps))
+}
+
+fn with_icons(mut apps: Vec<App>) -> Vec<App> {
+    with_ole(|| {
+        for app in &mut apps {
+            app.icon = app.icon_source.as_ref().and_then(icon);
+        }
+    });
+    apps
+}
+
+/// `f` with COM initialised on this thread (the shell needs it), undone after.
+fn with_ole<T>(f: impl FnOnce() -> T) -> T {
+    // SAFETY: no arguments.
     let ole = unsafe { OleInitialize(std::ptr::null()) } >= 0;
-    for app in &mut apps {
-        app.icon = app.icon_source.as_ref().and_then(icon);
-    }
+    let out = f();
     if ole {
         // SAFETY: pairs the successful `OleInitialize` above on this thread.
         unsafe { OleUninitialize() };
     }
-    apps
+    out
 }
 
-/// Every app behind a `.lnk` under `roots`, one per exe (case-insensitive, the first found wins),
-/// sorted by name. Uninstallers and shortcuts to anything but an exe are left out. The desktop
-/// folders are read without their subfolders, the rest [`MAX_DEPTH`] deep.
-pub fn find(roots: &[PathBuf]) -> Vec<App> {
-    let desktops: Vec<PathBuf> = [CSIDL_DESKTOPDIRECTORY, CSIDL_COMMON_DESKTOPDIRECTORY]
+fn desktops() -> Vec<PathBuf> {
+    [CSIDL_DESKTOPDIRECTORY, CSIDL_COMMON_DESKTOPDIRECTORY]
         .into_iter()
         .filter_map(folder)
-        .collect();
-    find_in(roots, &desktops)
+        .collect()
+}
+
+/// Every app behind a `.lnk` under `roots`, one per exe (case-insensitive, a shortcut without
+/// arguments before one with, then the first found), sorted by name. Uninstallers and shortcuts to
+/// anything but an exe are left out. The desktop folders are read without their subfolders, the
+/// rest [`MAX_DEPTH`] deep.
+pub fn find(roots: &[PathBuf]) -> Vec<App> {
+    find_in(roots, &desktops())
 }
 
 fn find_in(roots: &[PathBuf], desktops: &[PathBuf]) -> Vec<App> {
+    finish(walk_roots(roots, desktops).apps)
+}
+
+fn walk_roots(roots: &[PathBuf], desktops: &[PathBuf]) -> Walk {
     let mut scan = Walk::default();
     for root in roots {
         let depth = if desktops.contains(root) {
@@ -136,13 +196,20 @@ fn find_in(roots: &[PathBuf], desktops: &[PathBuf]) -> Vec<App> {
         };
         scan.walk(root, 0, depth);
     }
-    dedupe(scan.apps)
+    scan
+}
+
+/// The candidates (`true`: no arguments, the app itself) as one app per exe: a plain one wins.
+fn finish(mut found: Vec<(App, bool)>) -> Vec<App> {
+    found.sort_by_key(|(_, plain)| !plain);
+    dedupe(found.into_iter().map(|(app, _)| app).collect())
 }
 
 /// One [`find`] in progress: what it has found and spent so far.
 #[derive(Default)]
 struct Walk {
-    apps: Vec<App>,
+    /// Each with whether its shortcut has no arguments.
+    apps: Vec<(App, bool)>,
     links: usize,
     dirs: usize,
     drives: Drives,
@@ -186,7 +253,7 @@ impl Walk {
     }
 }
 
-fn app_at(path: &Path, drives: &mut Drives) -> Option<App> {
+fn app_at(path: &Path, drives: &mut Drives) -> Option<(App, bool)> {
     let mut bytes = Vec::new();
     File::open(path)
         .ok()?
@@ -194,19 +261,404 @@ fn app_at(path: &Path, drives: &mut Drives) -> Option<App> {
         .read_to_end(&mut bytes)
         .ok()?;
     let name = path.file_stem()?.to_string_lossy().into_owned();
-    let link = parse(&bytes)?;
-    let exe = app_of(&link)?;
+    let mut link = parse(&bytes)?;
+    let folder = path.parent()?;
+    link.target = absolutize(folder, &link.target);
+    link.icon = absolutize(folder, &link.icon);
+    // `plain`: the shortcut starts the app itself, not a host with arguments.
+    let (exe, plain) = if let Some(aumid) = aumid_of(&link) {
+        // A Store app: the shortcut starts Explorer, the exe lives in the package.
+        let (exe, target) = store_exe(aumid)?;
+        link.target = target;
+        (exe, true)
+    } else {
+        let exe = app_of(&link)?;
+        // A launcher that starts another exe (`--processStart`) is that app's shortcut.
+        let target = link.target.rsplit(['\\', '/']).next().unwrap_or_default();
+        let plain = link.args.is_empty() || !target.eq_ignore_ascii_case(&exe);
+        (exe, plain)
+    };
     let lower = |s: &str| s.to_lowercase();
-    if lower(&name).contains("uninstall") || lower(&exe).starts_with("unins") {
+    if lower(&name).contains("uninstall")
+        || lower(&exe).starts_with("unins")
+        || (!plain && HOSTS.contains(&lower(&exe).as_str()))
+    {
         return None;
     }
     let icon_source = icon_source(&link, &mut |l| drives.fixed(l), Path::is_file);
-    Some(App {
+    let app = App {
         name,
         exe,
         icon_source,
         icon: None,
+    };
+    Some((app, plain))
+}
+
+/// `rel` against `base`, `.` and `..` folded, unless it is empty, absolute (a drive, `\\`, `/`) or
+/// starts with `%` (an environment name, expanded later). A `..` above the drive stops at it.
+fn absolutize(base: &Path, rel: &str) -> String {
+    let drive = matches!(rel.as_bytes(), [l, b':', ..] if l.is_ascii_alphabetic());
+    if rel.is_empty() || drive || rel.starts_with(['\\', '/', '%']) {
+        return rel.to_owned();
+    }
+    let base = base.to_string_lossy();
+    let mut parts: Vec<&str> = base.split(['\\', '/']).filter(|p| !p.is_empty()).collect();
+    for part in rel.split(['\\', '/']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                // The drive (`C:`) stays.
+                if parts.len() > 1 {
+                    parts.pop();
+                }
+            }
+            p => parts.push(p),
+        }
+    }
+    let joined = parts.join("\\");
+    // A bare drive needs its slash.
+    if parts.len() == 1 {
+        joined + "\\"
+    } else {
+        joined
+    }
+}
+
+/// The app id behind a Store shortcut: Explorer started with `shell:AppsFolder\<id>`.
+fn aumid_of(link: &Link) -> Option<&str> {
+    const PREFIX: &str = "shell:AppsFolder\\";
+    let file = link.target.rsplit(['\\', '/']).next()?;
+    if !file.eq_ignore_ascii_case("explorer.exe") {
+        return None;
+    }
+    let args = link.args.trim().trim_matches('"');
+    let (head, id) = args.split_at_checked(PREFIX.len())?;
+    head.eq_ignore_ascii_case(PREFIX)
+        .then_some(id)
+        .filter(|id| !id.is_empty())
+}
+
+/// The exe file name the `Application` with `Id` `app_id` of a package manifest starts.
+fn manifest_exe(xml: &str, app_id: &str) -> Option<String> {
+    // `name="value"` in a tag, the name after a space.
+    fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+        let key = format!(" {name}=\"");
+        let at = tag.find(&key)? + key.len();
+        tag[at..].split('"').next()
+    }
+    xml.split("<Application").skip(1).find_map(|rest| {
+        let tag = &rest[..rest.find('>')?];
+        let exe = attr(tag, "Executable").filter(|_| attr(tag, "Id") == Some(app_id))?;
+        Some(exe.rsplit(['\\', '/']).next().unwrap_or(exe).to_owned())
     })
+}
+
+/// The exe file name and full path of the Store app `aumid` (`Family!AppId`): the package's folder
+/// from the registry, its `AppxManifest.xml` for the exe. `None` when the package is gone.
+fn store_exe(aumid: &str) -> Option<(String, String)> {
+    let (family, app_id) = aumid.split_once('!')?;
+    let (name, publisher) = family.rsplit_once('_')?;
+    let (prefix, suffix) = (format!("{name}_"), format!("__{publisher}"));
+    for package in reg_subkeys(HKEY_CURRENT_USER, PACKAGES) {
+        if !(package.starts_with(&prefix) && package.ends_with(&suffix)) {
+            continue;
+        }
+        let key = format!(r"{PACKAGES}\{package}");
+        let Some(root) = reg_string(HKEY_CURRENT_USER, &key, Some("PackageRootFolder")) else {
+            continue;
+        };
+        let mut xml = String::new();
+        let read = File::open(Path::new(&root).join("AppxManifest.xml"))
+            .and_then(|f| f.take(MAX_MANIFEST_BYTES).read_to_string(&mut xml));
+        if read.is_err() {
+            continue;
+        }
+        if let Some(exe) = manifest_exe(&xml, app_id) {
+            // A desktop-bridge app keeps its exe below `app\`; the icon falls back to the
+            // shortcut's when neither path exists.
+            let top = Path::new(&root).join(&exe);
+            let full = if top.is_file() {
+                top
+            } else {
+                Path::new(&root).join("app").join(&exe)
+            };
+            return Some((exe, full.to_string_lossy().into_owned()));
+        }
+    }
+    None
+}
+
+/// The packaged apps the shell lists in its `AppsFolder` (Windows Terminal, Calculator, a Store
+/// `WhatsApp`), which have no shortcut file: each id with a `!` (`Family!AppId`) is resolved by
+/// [`store_exe`]. Read-only; needs COM on this thread.
+fn store_apps(drives: &mut Drives) -> Vec<(App, bool)> {
+    fn text(item: &IShellItem, kind: SIGDN) -> Option<String> {
+        // SAFETY: `item` is a live shell item; the returned string is ours to free, once.
+        unsafe {
+            let pwstr = item.GetDisplayName(kind).ok()?;
+            let text = pwstr.to_string().ok();
+            CoTaskMemFree(Some(pwstr.0.cast_const().cast()));
+            text
+        }
+    }
+    let mut out = Vec::new();
+    // SAFETY: plain COM calls on live interfaces; the known-folder id outlives the call.
+    let items = unsafe {
+        SHGetKnownFolderItem::<IShellItem>(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, None)
+            .and_then(|f| f.BindToHandler::<_, IEnumShellItems>(None::<&IBindCtx>, &BHID_EnumItems))
+    };
+    let Ok(items) = items else {
+        return out;
+    };
+    for _ in 0..MAX_KEYS {
+        let mut one = [None];
+        let mut got = 0u32;
+        // SAFETY: `one` holds the one item asked for and `got` the count; both outlive the call.
+        let next = unsafe { items.Next(&mut one, Some(&raw mut got)) };
+        let (Ok(()), 1, Some(item)) = (next, got, one[0].take()) else {
+            break;
+        };
+        let (Some(id), Some(name)) = (
+            text(&item, SIGDN_PARENTRELATIVEPARSING),
+            text(&item, SIGDN_NORMALDISPLAY),
+        ) else {
+            continue;
+        };
+        if !id.contains('!') {
+            continue;
+        }
+        let Some((exe, target)) = store_exe(&id) else {
+            continue;
+        };
+        let link = Link {
+            target,
+            ..Link::default()
+        };
+        let icon_source = icon_source(&link, &mut |l| drives.fixed(l), Path::is_file);
+        let app = App {
+            name,
+            exe,
+            icon_source,
+            icon: None,
+        };
+        out.push((app, true));
+    }
+    out
+}
+
+/// Apps the registry lists whose exe exists on a local disk: an Uninstall entry's `DisplayIcon`
+/// (when it is an exe) under the entry's `DisplayName`, and each `App Paths` exe under its file
+/// name. The Start menu is read first, so a name from there wins ([`finish`]).
+fn registry_apps(drives: &mut Drives) -> Vec<(App, bool)> {
+    let mut out = Vec::new();
+    for (root, base) in [
+        (HKEY_LOCAL_MACHINE, UNINSTALL),
+        (HKEY_LOCAL_MACHINE, UNINSTALL_32),
+        (HKEY_CURRENT_USER, UNINSTALL),
+    ] {
+        for sub in reg_subkeys(root, base) {
+            let key = format!(r"{base}\{sub}");
+            if reg_dword(root, &key, "SystemComponent") == Some(1) {
+                continue;
+            }
+            let (Some(name), Some(icon)) = (
+                reg_string(root, &key, Some("DisplayName")),
+                reg_string(root, &key, Some("DisplayIcon")),
+            ) else {
+                continue;
+            };
+            let (file, index) = split_display_icon(&icon);
+            out.extend(registry_app(name, file, index, drives));
+        }
+    }
+    for (root, base) in [
+        (HKEY_LOCAL_MACHINE, APP_PATHS),
+        (HKEY_LOCAL_MACHINE, APP_PATHS_32),
+        (HKEY_CURRENT_USER, APP_PATHS),
+    ] {
+        for sub in reg_subkeys(root, base) {
+            let Some(stem) = sub
+                .strip_suffix(".exe")
+                .or_else(|| sub.strip_suffix(".EXE"))
+            else {
+                continue;
+            };
+            if let Some(path) = reg_string(root, &format!(r"{base}\{sub}"), None) {
+                let (file, _) = split_display_icon(&path);
+                // An App Paths exe with no icon is a helper or a service (winget, a driver tool).
+                out.extend(
+                    registry_app(stem.to_owned(), file, 0, drives)
+                        .filter(|(app, _)| has_icon_resource(app)),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Whether the exe of `app` holds at least one icon (asked of the shell, nothing extracted).
+fn has_icon_resource(app: &App) -> bool {
+    let Some(IconSource::Resource(file, _)) = &app.icon_source else {
+        return false;
+    };
+    let path = shell_path(file);
+    // SAFETY: `path` is NUL-terminated; index -1 with no icon outputs only counts the icons.
+    unsafe {
+        ExtractIconExW(
+            path.as_ptr(),
+            -1,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        ) > 0
+    }
+}
+
+fn registry_app(
+    name: String,
+    file: String,
+    index: i32,
+    drives: &mut Drives,
+) -> Option<(App, bool)> {
+    let exe = file.rsplit(['\\', '/']).next()?.to_owned();
+    let (lower, path) = (exe.to_lowercase(), file.to_lowercase());
+    if Path::new(&lower).extension().is_none_or(|x| x != "exe")
+        || lower.starts_with("unins")
+        || name.to_lowercase().contains("uninstall")
+        || is_installer(&lower, &path)
+        || !is_local_path(&file, &mut |l| drives.fixed(l))
+        || !Path::new(&file).is_file()
+    {
+        return None;
+    }
+    let app = App {
+        name,
+        exe,
+        icon_source: Some(IconSource::Resource(PathBuf::from(file), index)),
+        icon: None,
+    };
+    Some((app, true))
+}
+
+/// Whether the exe (`file`, `path`: both lowercase) is an installer, not the app: it sits in
+/// `Windows\Installer\{id}` or a `Package Cache` (VC++ redistributables, `python-3.x-amd64.exe`),
+/// or its name says so.
+fn is_installer(file: &str, path: &str) -> bool {
+    path.contains(r"\windows\installer\")
+        || path.contains(r"\package cache\")
+        || ["setup", "install", "redist"]
+            .iter()
+            .any(|word| file.contains(word))
+}
+
+/// A `DisplayIcon` or default `App Paths` value, `"C:\a b\a.exe",0` or `C:\a.exe,-3`: the file
+/// and the icon number (0 when there is none).
+fn split_display_icon(value: &str) -> (String, i32) {
+    let value = value.trim();
+    let (file, number) = match value.strip_prefix('"') {
+        Some(quoted) => quoted
+            .split_once('"')
+            .map_or((quoted, ""), |(f, rest)| (f, rest)),
+        None => value.rsplit_once(',').unwrap_or((value, "")),
+    };
+    let index = number.trim_start_matches(',').trim().parse().unwrap_or(0);
+    (file.trim().to_owned(), index)
+}
+
+fn reg_open(root: HKEY, path: &str) -> Option<HKEY> {
+    let path = super::wide(path);
+    let mut key: HKEY = std::ptr::null_mut();
+    // SAFETY: `path` is NUL-terminated and `key` takes the handle; both outlive the call.
+    let status = unsafe { RegOpenKeyExW(root, path.as_ptr(), 0, KEY_READ, &raw mut key) };
+    (status == 0).then_some(key)
+}
+
+/// The names of the subkeys of `path`, at most [`MAX_KEYS`].
+fn reg_subkeys(root: HKEY, path: &str) -> Vec<String> {
+    let Some(key) = reg_open(root, path) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for index in 0..MAX_KEYS {
+        let mut name = [0u16; 256];
+        let mut len = 256u32;
+        // SAFETY: `name` holds `len` units and both outlive the call; the optional outputs are null.
+        let status = unsafe {
+            RegEnumKeyExW(
+                key,
+                index,
+                name.as_mut_ptr(),
+                &raw mut len,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            break;
+        }
+        names.push(String::from_utf16_lossy(&name[..len as usize]));
+    }
+    // SAFETY: `key` came from `RegOpenKeyExW` and is closed once.
+    unsafe { RegCloseKey(key) };
+    names
+}
+
+/// A string value (`None`: the key's default), environment names expanded.
+fn reg_string(root: HKEY, path: &str, value: Option<&str>) -> Option<String> {
+    let (path, value) = (super::wide(path), value.map(super::wide));
+    let mut data = vec![0u16; 512];
+    // The second round has the size the first one asked for (`ERROR_MORE_DATA`).
+    for _ in 0..2 {
+        let mut len = u32::try_from(size_of_val(&data[..])).ok()?;
+        // SAFETY: the names are NUL-terminated and outlive the call; `data` holds `len` bytes.
+        let status = unsafe {
+            RegGetValueW(
+                root,
+                path.as_ptr(),
+                value.as_ref().map_or(std::ptr::null(), Vec::as_ptr),
+                RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+                std::ptr::null_mut(),
+                data.as_mut_ptr().cast(),
+                &raw mut len,
+            )
+        };
+        match status {
+            0 => return utf16_text(&data, usize::try_from(len).ok()?),
+            ERROR_MORE_DATA => data.resize(usize::try_from(len).ok()? / 2 + 1, 0),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The text of a registry value: `bytes` of `data` (never past its end), up to the first NUL;
+/// `None` when empty.
+fn utf16_text(data: &[u16], bytes: usize) -> Option<String> {
+    let text = &data[..(bytes / 2).min(data.len())];
+    let end = text.iter().position(|&c| c == 0).unwrap_or(text.len());
+    (end > 0).then(|| String::from_utf16_lossy(&text[..end]))
+}
+
+fn reg_dword(root: HKEY, path: &str, value: &str) -> Option<u32> {
+    let (path, value) = (super::wide(path), super::wide(value));
+    let mut data = 0u32;
+    let mut len = 4u32;
+    // SAFETY: the names are NUL-terminated and outlive the call; `data` is the 4 bytes of `len`.
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            path.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            (&raw mut data).cast(),
+            &raw mut len,
+        )
+    };
+    (status == 0).then_some(data)
 }
 
 /// Where the icon of the app behind `link` is read from. When the icon file or the target is not
@@ -1047,5 +1499,173 @@ mod tests {
         let apps = find(&[menu]);
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].exe, "first.exe");
+    }
+
+    #[test]
+    fn a_relative_target_is_read_from_the_shortcuts_folder() {
+        let base = Path::new(r"C:\ProgramData\Menu\Programs");
+        assert_eq!(
+            absolutize(base, r"..\..\..\Program Files (x86)\Synth\a.exe"),
+            r"C:\Program Files (x86)\Synth\a.exe"
+        );
+        assert_eq!(
+            absolutize(base, r".\sub\a.exe"),
+            r"C:\ProgramData\Menu\Programs\sub\a.exe"
+        );
+        // Above the drive stops at it.
+        assert_eq!(absolutize(base, r"..\..\..\..\..\..\a.exe"), r"C:\a.exe");
+        for kept in [r"D:\a.exe", r"\\host\s\a.exe", "%SystemRoot%\\a.exe", ""] {
+            assert_eq!(absolutize(base, kept), kept);
+        }
+    }
+
+    #[test]
+    fn a_relative_shortcut_finds_its_exe_and_icon() {
+        let root = dir("relative");
+        fs::create_dir_all(root.join("menu")).unwrap();
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join(r"bin\rel.exe"), b"MZ").unwrap();
+        write(&root.join("menu"), "Synth Rel", r"..\bin\rel.exe", "");
+        let apps = find(&[root.join("menu")]);
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].exe, "rel.exe");
+        let Some(IconSource::Resource(file, 0)) = &apps[0].icon_source else {
+            panic!("no icon source: {:?}", apps[0].icon_source);
+        };
+        assert_eq!(file, &root.join(r"bin\rel.exe"));
+    }
+
+    #[test]
+    fn a_shortcut_with_arguments_to_a_host_is_no_app_and_a_plain_one_wins() {
+        let menu = dir("hosts");
+        write(
+            &menu,
+            "Synth Error log",
+            r"C:\Windows\notepad.exe",
+            r"C:\x\a.err",
+        );
+        write(&menu, "Synth Notepad", r"C:\Windows\notepad.exe", "");
+        write(
+            &menu,
+            "Synth Applet",
+            r"C:\Windows\control.exe",
+            "/name Synth.Applet",
+        );
+        write(
+            &menu,
+            "Synth Folder",
+            r"C:\Windows\explorer.exe",
+            r"C:\Synth\",
+        );
+        write(&menu, "Synth Tool", r"C:\S\tool.exe", "--flag");
+        let names: Vec<_> = find(&[menu]).into_iter().map(|a| a.name).collect();
+        assert_eq!(names, ["Synth Notepad", "Synth Tool"]);
+    }
+
+    #[test]
+    fn a_store_shortcut_names_its_app_id() {
+        let link = |target: &str, args: &str| Link {
+            target: target.into(),
+            args: args.into(),
+            ..Link::default()
+        };
+        let store = link(
+            r"C:\Windows\explorer.exe",
+            r"shell:AppsFolder\Synth_abc123!SynthApp",
+        );
+        assert_eq!(aumid_of(&store), Some("Synth_abc123!SynthApp"));
+        assert_eq!(
+            aumid_of(&link(r"C:\Synth\a.exe", r"shell:AppsFolder\X!Y")),
+            None
+        );
+        assert_eq!(
+            aumid_of(&link(r"C:\Windows\explorer.exe", r"C:\Synth\")),
+            None
+        );
+        assert_eq!(
+            aumid_of(&link(r"C:\Windows\explorer.exe", r"shell:AppsFolder\")),
+            None
+        );
+    }
+
+    #[test]
+    fn the_manifest_gives_the_exe_of_the_application_by_id() {
+        let xml = r#"<Package><Applications>
+            <Application Id="Other" Executable="x\other.exe" EntryPoint="a">
+            <Application Id="SynthApp" Executable="app\Synth.exe" EntryPoint="b">
+            </Applications></Package>"#;
+        assert_eq!(manifest_exe(xml, "SynthApp").as_deref(), Some("Synth.exe"));
+        assert_eq!(manifest_exe(xml, "Other").as_deref(), Some("other.exe"));
+        assert_eq!(manifest_exe(xml, "Missing"), None);
+        assert_eq!(manifest_exe("", "SynthApp"), None);
+    }
+
+    #[test]
+    fn a_long_registry_value_is_cut_at_the_buffer_not_past_it() {
+        let data: Vec<u16> = "Synth App".encode_utf16().chain([0, 7, 7]).collect();
+        assert_eq!(utf16_text(&data, 20).as_deref(), Some("Synth App"));
+        // The size `RegGetValueW` reports for a value longer than the buffer: no panic.
+        assert_eq!(utf16_text(&data[..3], 4000).as_deref(), Some("Syn"));
+        assert_eq!(utf16_text(&data, 0), None);
+        assert_eq!(utf16_text(&[0, 0], 4), None);
+        assert_eq!(utf16_text(&[97; 3000], 6002), Some("a".repeat(3000)));
+    }
+
+    #[test]
+    fn installers_and_package_cache_exes_are_no_apps() {
+        let is = |path: &str| {
+            let path = path.to_lowercase();
+            is_installer(path.rsplit('\\').next().unwrap(), &path)
+        };
+        assert!(is(
+            r"C:\ProgramData\Package Cache\{a}\python-3.14.10-amd64.exe"
+        ));
+        assert!(is(r"C:\Windows\Installer\{a}\icon.exe"));
+        assert!(is(r"C:\x\winsdksetup.exe"));
+        assert!(is(r"C:\x\Docker Desktop Installer.exe"));
+        assert!(is(r"C:\x\vc_redist.x64.exe"));
+        assert!(!is(r"C:\Program Files\Synth\Synth.exe"));
+    }
+
+    #[test]
+    fn the_shell_lists_store_apps_with_an_exe() {
+        // Read-only: the shell's own folder, then each package manifest.
+        let mut drives = Drives::default();
+        with_ole(|| {
+            for (app, _) in store_apps(&mut drives) {
+                assert!(app.exe.to_lowercase().ends_with(".exe"), "{}", app.name);
+                assert_ne!(app.name, "");
+            }
+        });
+    }
+
+    #[test]
+    fn a_display_icon_splits_into_file_and_number() {
+        let split = |s: &str| split_display_icon(s);
+        assert_eq!(split(r"C:\a\a.exe,3"), (r"C:\a\a.exe".to_owned(), 3));
+        assert_eq!(
+            split(r#""C:\a b\a.exe",-5"#),
+            (r"C:\a b\a.exe".to_owned(), -5)
+        );
+        assert_eq!(split(r#""C:\a b\a.exe""#), (r"C:\a b\a.exe".to_owned(), 0));
+        assert_eq!(split(r"C:\a.exe"), (r"C:\a.exe".to_owned(), 0));
+    }
+
+    #[test]
+    fn the_registry_is_read_and_listed_apps_are_real_exes() {
+        // The Windows key is on every machine and its subkeys are many; a missing one is none.
+        assert!(reg_subkeys(HKEY_LOCAL_MACHINE, UNINSTALL).len() > 1);
+        assert_eq!(
+            reg_subkeys(HKEY_LOCAL_MACHINE, r"SOFTWARE\Synth\No\Such\Key").len(),
+            0
+        );
+        let mut drives = Drives::default();
+        for (app, _) in registry_apps(&mut drives) {
+            let Some(IconSource::Resource(file, _)) = &app.icon_source else {
+                panic!("{} has no file", app.name);
+            };
+            assert!(file.is_file(), "{}: {file:?}", app.name);
+            assert!(app.exe.to_lowercase().ends_with(".exe"));
+        }
     }
 }

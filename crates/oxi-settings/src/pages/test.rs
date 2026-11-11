@@ -57,10 +57,8 @@ const MAX_TICKS: usize = MAX_TEST_SAMPLES / SAMPLE_RATE as usize * TICKS_PER_SEC
 /// Playback ends this long after the clip: the device's buffer is still sounding.
 const PLAY_TAIL: Duration = Duration::from_millis(300);
 
-const RECORD_TIP: &str =
-    "A new recording gets a ready phrase to read aloud. Edit its text if you said something else.";
-const NO_READY_PHRASES: &str =
-    "No ready phrases in this language: write what you said next to each recording.";
+const RECORD_TIP: &str = "Recordings here use the microphone settings from Audio. A new one gets a ready phrase to read aloud; edit its text if you said something else.";
+const NO_READY_PHRASES: &str = "No ready phrases in this language: write what you said next to each recording. Recordings here use the microphone settings from Audio.";
 const PICK: &str = "Pick a recording to add";
 const NO_HISTORY: &str = "No recordings in history";
 const PICKED_ALL: &str = "Every history recording is picked";
@@ -375,17 +373,6 @@ impl PageState {
             } else {
                 ""
             }
-            .into(),
-        );
-        let sets = Self::profile(s).sets().len();
-        let plural =
-            |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-        s.set_run_note(
-            format!(
-                "{} · {}",
-                plural(takes.len(), "recording", "recordings"),
-                plural(sets, "set", "sets")
-            )
             .into(),
         );
         let off = if running {

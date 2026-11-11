@@ -380,6 +380,49 @@ fn preview_is_not_in_the_own_file_row() {
     );
 }
 
+/// DS-23.5: Remove folder keeps its slot with no folder (off), so Add folder does not move.
+#[test]
+#[cfg_attr(
+    not(windows),
+    ignore = "Add folder shows only where a file dialog exists (can-browse)"
+)]
+fn remove_folder_keeps_its_slot_with_no_folder() {
+    let window = open(&layout("remove-slot", None), Page::Audio);
+    sounds(&window, 0);
+    let remove = with_role(
+        &window,
+        "Remove folder (its files stay)",
+        AccessibleRole::Button,
+    );
+    assert_eq!(remove.accessible_enabled(), Some(false));
+    let choose = with_role(&window, "Choose file", AccessibleRole::Button);
+    assert!(
+        remove.absolute_position().x >= choose.absolute_position().x + choose.size().width,
+        "Delete is the right-most"
+    );
+}
+
+/// DS-11.4 d: with no folder and a writable config, the off Remove folder says "no folder", not "read-only".
+#[test]
+#[cfg_attr(
+    not(windows),
+    ignore = "Add folder shows only where a file dialog exists (can-browse)"
+)]
+fn remove_folder_off_without_folder_does_not_claim_read_only() {
+    let window = open(&layout("remove-reason", None), Page::Audio);
+    sounds(&window, 0);
+    let remove = with_role(
+        &window,
+        "Remove folder (its files stay)",
+        AccessibleRole::Button,
+    );
+    let locked_tip = window.global::<oxi_settings::Shell>().get_locked_tip();
+    let tip = remove.accessible_description().unwrap_or_default();
+    assert_eq!(remove.accessible_enabled(), Some(false));
+    assert!(!tip.is_empty(), "a disabled button needs a reason");
+    assert_ne!(tip.as_str(), locked_tip.as_str(), "wrong reason: {tip}");
+}
+
 /// Picking a built-in tile writes that sound's own key, plays it, and each sound shows its own.
 #[test]
 fn picking_a_built_in_saves_it_and_plays_it() {

@@ -15,7 +15,7 @@ use oxi_core::audio::{AudioError, Level};
 use oxi_core::config::Audio;
 use thiserror::Error;
 
-pub use play::{Playback, play};
+pub use play::{Output, Playback, play};
 pub use stream::{CpalCapture, list_input_devices};
 
 /// Post-gain peak and RMS of the last 20 ms window, for the overlay meter (ARCHITECTURE section 2).

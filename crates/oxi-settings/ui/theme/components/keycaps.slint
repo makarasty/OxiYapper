@@ -79,6 +79,8 @@ export component KeycapRow {
     in property <bool> warning;
     // The new chord of the hotkey editor: accent-tint fill, accent-text ink.
     in property <bool> fresh;
+    // The old chord beside a new one (DS-28.3): `text-secondary` ink, the cap chrome stays.
+    in property <bool> muted;
     in property <string> empty-text;
     in property <string> label;
     // Pack the caps against the end of the row (the action after them), not its start.
@@ -144,7 +146,7 @@ export component KeycapRow {
             text: root.keys[i];
             font-size: Theme.body-size;
             font-weight: Theme.weight-strong;
-            color: Shell.locked ? Theme.text-disabled : root.warning ? Theme.warning-text : root.fresh ? Theme.accent-text : Theme.text-primary;
+            color: Shell.locked ? Theme.text-disabled : root.warning ? Theme.warning-text : root.fresh ? Theme.accent-text : root.muted ? Theme.text-secondary : Theme.text-primary;
             horizontal-alignment: center;
             vertical-alignment: center;
             accessible-role: none;
@@ -163,7 +165,7 @@ export component KeycapRow {
             text: "+\{root.folded}";
             font-size: Theme.body-size;
             font-weight: Theme.weight-strong;
-            color: Shell.locked ? Theme.text-disabled : root.warning ? Theme.warning-text : Theme.text-primary;
+            color: Shell.locked ? Theme.text-disabled : root.warning ? Theme.warning-text : root.muted ? Theme.text-secondary : Theme.text-primary;
             horizontal-alignment: center;
             vertical-alignment: center;
             accessible-role: none;

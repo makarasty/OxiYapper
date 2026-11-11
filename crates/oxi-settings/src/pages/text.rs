@@ -1,6 +1,6 @@
 //! Text page: `dictionary.txt` against the prompt budget, `replace.txt` with its ignored lines,
 //! and the `[paste]` config (mode, trailing space, Win+V history, restore delay, per-app rules,
-//! with a scan for the apps behind Start menu and desktop shortcuts).
+//! with a scan for the installed apps: Start menu and desktop shortcuts, Store apps, the registry).
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -21,15 +21,17 @@ use slint::{
 };
 
 use crate::debounce::SaveDebounce;
-use crate::generated::{
-    FileInfo, FileState, GalleryTile, PasteRuleRow, TextFile, TextState, Toast,
-};
+use crate::generated::{FileInfo, FileState, GalleryTile, PasteRuleRow, TextFile, TextState};
 use crate::{AppWindow, Ctx, Error, report};
 
 const FILES: [TextFile; 2] = [TextFile::Dictionary, TextFile::Replacements];
 
 /// How often a running scan is asked for its answer.
 const SCAN_POLL: Duration = Duration::from_millis(50);
+/// How long a rule a duplicate pick points at shows the accent tint (DS-28.1).
+const FLASH: Duration = Duration::from_millis(600);
+/// Installed apps the search field lists at most; typing more narrows them.
+const SUGGESTIONS: usize = 6;
 
 /// An app the scan found; the icon is still pixels, as an `Image` cannot leave the UI thread.
 #[cfg_attr(
@@ -159,29 +161,76 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
             }
         });
     });
+    bind_rules(window, ctx);
+}
+
+/// The search field, its list and the apps popup.
+fn bind_rules(window: &AppWindow, ctx: &Ctx) {
+    let s = window.global::<TextState>();
     let (w, c) = (window.as_weak(), ctx.clone());
-    s.on_rule_added(move |app| {
-        let app = exe_name(app.trim());
+    let flash = Rc::new(Timer::default());
+    s.on_rule_picked(move |exe| {
+        let exe = exe_name(exe.trim());
+        if exe.is_empty() {
+            return;
+        }
+        let tile = found_tile(&w, &exe);
+        if let Some(tile) = &tile {
+            remember_name(&c, tile);
+        }
         let mut added = false;
-        apply(&w, &c, |p| added = add_rule(p, &app));
-        if !added && let Some(window) = w.upgrade() {
-            let message = format!("{app} already has a rule: change its mode in the list below.");
-            window.global::<Toast>().invoke_show(message.into());
+        apply(&w, &c, |p| added = add_rule(p, &exe));
+        if added {
+            with(&w, |s| s.set_query(SharedString::new()));
+        } else {
+            // The field's row already said so: the rule itself lights up (DS-28.1).
+            let app = c
+                .config
+                .borrow()
+                .config
+                .paste
+                .rules
+                .iter()
+                .find_map(|r| r.app.eq_ignore_ascii_case(&exe).then(|| r.app.clone()));
+            with(&w, |s| s.set_flash_app(app.unwrap_or_default().into()));
+            let w = w.clone();
+            flash.start(TimerMode::SingleShot, FLASH, move || {
+                with(&w, |s| s.set_flash_app(SharedString::new()));
+            });
         }
     });
     let (w, c) = (window.as_weak(), ctx.clone());
-    s.on_found_picked(move |i| {
-        let tile = w.upgrade().and_then(|window| {
-            let found = window.global::<TextState>().get_found();
-            usize::try_from(i).ok().and_then(|i| found.row_data(i))
-        });
-        // A tile with a rule is disabled, so this adds one.
-        if let Some(tile) = tile {
+    s.on_found_toggled(move |exe| {
+        if has_rule(&c.config.borrow().config.paste.rules, &exe) {
+            forget_exe(&c, &exe);
+            apply(&w, &c, |p| {
+                p.rules.retain(|r| !r.app.eq_ignore_ascii_case(&exe));
+            });
+        } else if let Some(tile) = found_tile(&w, &exe) {
             remember_name(&c, &tile);
             apply(&w, &c, |p| {
                 add_rule(p, &tile.caption);
             });
         }
+    });
+    // The filters read the fields' text from the state: the callbacks only say it changed.
+    let (w, c) = (window.as_weak(), ctx.clone());
+    s.on_query_edited(move |_| redraw(&w, &c));
+    let (w, c) = (window.as_weak(), ctx.clone());
+    s.on_popup_search(move |_| redraw(&w, &c));
+}
+
+/// The scan's tile of the app with this exe.
+fn found_tile(weak: &Weak<AppWindow>, exe: &str) -> Option<GalleryTile> {
+    let window = weak.upgrade()?;
+    let found = window.global::<TextState>().get_found();
+    found.iter().find(|t| t.caption.eq_ignore_ascii_case(exe))
+}
+
+fn redraw(weak: &Weak<AppWindow>, ctx: &Ctx) {
+    with(weak, |s| {
+        let file = ctx.config.borrow();
+        show_rules(&s, &file.config.paste.rules, &file.config.ui.app_names);
     });
 }
 
@@ -196,24 +245,39 @@ fn remember_name(ctx: &Ctx, tile: &GalleryTile) {
 
 /// The saved name of the rule at row `i` goes with the rule.
 fn forget_name(ctx: &Ctx, i: i32) {
-    let mut file = ctx.config.borrow_mut();
-    let app = usize::try_from(i)
-        .ok()
-        .and_then(|i| file.config.paste.rules.get(i))
-        .map(|r| r.app.to_lowercase());
+    let app = usize::try_from(i).ok().and_then(|i| {
+        ctx.config
+            .borrow()
+            .config
+            .paste
+            .rules
+            .get(i)
+            .map(|r| r.app.clone())
+    });
     if let Some(app) = app {
-        file.config.ui.app_names.remove(&app);
+        forget_exe(ctx, &app);
     }
 }
 
+fn forget_exe(ctx: &Ctx, exe: &str) {
+    ctx.config
+        .borrow_mut()
+        .config
+        .ui
+        .app_names
+        .remove(&exe.to_lowercase());
+}
+
 /// Scan runs on a worker and a timer picks up its answer, so the window keeps drawing and taking
-/// input meanwhile. Bound again after Reset, which drops a running scan's answer.
+/// input meanwhile. It starts by itself the first time the Per-app tab shows (the rules want the
+/// apps' icons and names), and again from Scan again. Bound again after Reset, which drops a
+/// running scan's answer.
 fn bind_scan(window: &AppWindow, ctx: &Ctx) {
     let s = window.global::<TextState>();
     s.set_scanning(false);
     let timer = Rc::new(Timer::default());
     let (w, c) = (window.as_weak(), ctx.clone());
-    s.on_scan(move || {
+    let start = Rc::new(move || {
         let Some(window) = w.upgrade() else { return };
         let s = window.global::<TextState>();
         if s.get_scanning() {
@@ -256,6 +320,16 @@ fn bind_scan(window: &AppWindow, ctx: &Ctx) {
             });
         });
     });
+    let again = start.clone();
+    s.on_scan(move || again());
+    let w = window.as_weak();
+    s.on_per_app_shown(move || {
+        if w.upgrade()
+            .is_some_and(|window| !window.global::<TextState>().get_scanned())
+        {
+            start();
+        }
+    });
 }
 
 #[cfg(test)]
@@ -282,16 +356,19 @@ fn scan_roots() -> Option<Vec<PathBuf>> {
 #[cfg(windows)]
 fn find_apps(roots: Option<Vec<PathBuf>>) -> Vec<Found> {
     use oxi_platform::os::shortcuts;
-    shortcuts::scan(&roots.unwrap_or_else(shortcuts::roots))
-        .into_iter()
-        .map(|app| Found {
-            icon: app
-                .icon
-                .map(|i| SharedPixelBuffer::clone_from_slice(&i.rgba, i.width, i.height)),
-            name: app.name,
-            exe: app.exe,
-        })
-        .collect()
+    match roots {
+        Some(roots) => shortcuts::scan(&roots),
+        None => shortcuts::scan_installed(),
+    }
+    .into_iter()
+    .map(|app| Found {
+        icon: app
+            .icon
+            .map(|i| SharedPixelBuffer::clone_from_slice(&i.rgba, i.width, i.height)),
+        name: app.name,
+        exe: app.exe,
+    })
+    .collect()
 }
 
 /// shortcut: no app scan off Windows yet; the typed exe (bundle id, `WM_CLASS`) is the way there.
@@ -350,61 +427,139 @@ fn change(weak: &Weak<AppWindow>, ctx: &Ctx, edit: impl FnOnce(&mut Paste)) {
     });
 }
 
-/// The rule list, each rule named as the scan found its app, and the found apps with a rule
-/// disabled.
+/// Whether `query` (case-insensitive, trimmed) is in the app's name or its exe; an empty one is in all.
+fn matches(query: &str, name: &str, exe: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    q.is_empty() || name.to_lowercase().contains(&q) || exe.to_lowercase().contains(&q)
+}
+
+/// Rows of `old` take `new` in place when the two list the same things in the same order (`same`):
+/// a new model rebuilds every row, and the Combo being arrowed through, or a grid scrolled to the
+/// tile just ticked, would lose its place. `Some`: the model to set instead.
+fn sync<T: Clone + PartialEq + 'static>(
+    old: &ModelRc<T>,
+    new: Vec<T>,
+    same: impl Fn(&T, &T) -> bool,
+) -> Option<ModelRc<T>> {
+    let fits = old.row_count() == new.len()
+        && new
+            .iter()
+            .enumerate()
+            .all(|(i, row)| old.row_data(i).is_some_and(|o| same(&o, row)));
+    if !fits {
+        return Some(ModelRc::from(Rc::new(VecModel::from(new))));
+    }
+    for (i, row) in new.into_iter().enumerate() {
+        if old.row_data(i).as_ref() != Some(&row) {
+            old.set_row_data(i, row);
+        }
+    }
+    None
+}
+
+/// What the Per-app tab shows, from the config and the last scan: the rule list (each rule named
+/// and pictured as the scan found its app, filtered by the search field), the apps ticked in the
+/// popup's grid (filtered by its field) and what the search field offers.
 fn show_rules(s: &TextState<'_>, rules: &[PasteRule], known: &BTreeMap<String, String>) {
     let found = s.get_found();
     // The default rule's app, then the names saved when a rule was picked, then the last scan.
     let mut names: HashMap<String, SharedString> =
         HashMap::from([("mstsc.exe".to_owned(), "Remote Desktop Connection".into())]);
     names.extend(known.iter().map(|(exe, name)| (exe.clone(), name.into())));
+    let mut icons: HashMap<String, Image> = HashMap::new();
     for i in 0..found.row_count() {
         let Some(mut tile) = found.row_data(i) else {
             continue;
         };
-        names.insert(tile.caption.to_lowercase(), tile.title.clone());
+        let key = tile.caption.to_lowercase();
+        names.insert(key.clone(), tile.title.clone());
+        if tile.picture.size().width > 0 {
+            icons.insert(key, tile.picture.clone());
+        }
         let taken = has_rule(rules, &tile.caption);
-        if tile.disabled != taken {
-            tile.disabled = taken;
-            tile.hint = if taken {
-                "Has a rule: change its mode in the list below.".into()
-            } else {
-                SharedString::new()
-            };
+        if tile.checked != taken {
+            tile.checked = taken;
             found.set_row_data(i, tile);
         }
     }
-    let new = rows(rules, &names);
-    let old = s.get_rules();
-    // Same rules: change rows in place. A new model rebuilds every row, and the Combo the user is
-    // arrowing through (each arrow picks a mode) would lose its focus.
-    if old.row_count() == new.len() {
-        for (i, row) in new.into_iter().enumerate() {
-            if old.row_data(i).as_ref() != Some(&row) {
-                old.set_row_data(i, row);
-            }
-        }
-    } else {
-        s.set_rules(ModelRc::from(Rc::new(VecModel::from(new))));
+    let new = rows(rules, &names, &icons, &s.get_query());
+    s.set_rule_matches(int(new.iter().filter(|r| !r.hidden).count()));
+    if let Some(model) = sync(&s.get_rules(), new, |_, _| true) {
+        s.set_rules(model);
+    }
+    let by_exe = |a: &GalleryTile, b: &GalleryTile| a.caption == b.caption && a.hint == b.hint;
+    let grid = grid(&found, &s.get_popup_query());
+    if let Some(model) = sync(&s.get_grid(), grid, by_exe) {
+        s.set_grid(model);
+    }
+    let offered = suggestions(&found, rules, &s.get_query());
+    if let Some(model) = sync(&s.get_suggestions(), offered, by_exe) {
+        s.set_suggestions(model);
     }
 }
 
-fn rows(rules: &[PasteRule], names: &HashMap<String, SharedString>) -> Vec<PasteRuleRow> {
+fn rows(
+    rules: &[PasteRule],
+    names: &HashMap<String, SharedString>,
+    icons: &HashMap<String, Image>,
+    query: &str,
+) -> Vec<PasteRuleRow> {
     rules
         .iter()
-        .map(|r| PasteRuleRow {
-            app: r.app.as_str().into(),
-            name: names
-                .get(&r.app.to_lowercase())
-                .cloned()
-                .unwrap_or_default(),
-            mode: match r.mode {
-                None => 0,
-                Some(PasteMode::Clipboard) => 1,
-                Some(PasteMode::Type) => 2,
-            },
+        .map(|r| {
+            let key = r.app.to_lowercase();
+            let name = names.get(&key).cloned().unwrap_or_default();
+            PasteRuleRow {
+                hidden: !matches(query, &name, &r.app),
+                app: r.app.as_str().into(),
+                name,
+                mode: match r.mode {
+                    None => 0,
+                    Some(PasteMode::Clipboard) => 1,
+                    Some(PasteMode::Type) => 2,
+                },
+                icon: icons.get(&key).cloned().unwrap_or_default(),
+            }
         })
         .collect()
+}
+
+/// The apps popup's tiles: the scan's apps that match `query`.
+fn grid(found: &ModelRc<GalleryTile>, query: &str) -> Vec<GalleryTile> {
+    found
+        .iter()
+        .filter(|t| matches(query, &t.title, &t.caption))
+        .collect()
+}
+
+/// What the search field offers under it: up to [`SUGGESTIONS`] installed apps with no rule yet that
+/// match `query`, the one whose exe is the typed text first, then a row for the typed exe unless
+/// one of those is it. `hint` "add" adds the typed exe, "dup" says it has a rule already.
+fn suggestions(found: &ModelRc<GalleryTile>, rules: &[PasteRule], query: &str) -> Vec<GalleryTile> {
+    let typed = query.trim();
+    if typed.is_empty() {
+        return Vec::new();
+    }
+    let exe = exe_name(typed);
+    let mut apps: Vec<GalleryTile> = found
+        .iter()
+        .filter(|t| !t.checked && matches(typed, &t.title, &t.caption))
+        .collect();
+    apps.sort_by_key(|t| !t.caption.eq_ignore_ascii_case(&exe));
+    apps.truncate(SUGGESTIONS);
+    if !apps
+        .first()
+        .is_some_and(|t| t.caption.eq_ignore_ascii_case(&exe))
+    {
+        let dup = has_rule(rules, &exe);
+        apps.push(GalleryTile {
+            title: exe.clone().into(),
+            caption: exe.into(),
+            hint: if dup { "dup" } else { "add" }.into(),
+            ..GalleryTile::default()
+        });
+    }
+    apps
 }
 
 fn show_dictionary(s: &TextState<'_>, text: &str) {
@@ -582,6 +737,73 @@ fn int(n: usize) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
 }
 
+#[cfg(test)]
+mod filter_tests {
+    use slint::{ModelRc, VecModel};
+
+    use super::*;
+
+    fn tile(title: &str, exe: &str, checked: bool) -> GalleryTile {
+        GalleryTile {
+            title: title.into(),
+            caption: exe.into(),
+            checked,
+            ..GalleryTile::default()
+        }
+    }
+
+    #[test]
+    fn a_query_is_a_trimmed_case_insensitive_part_of_the_name_or_the_exe() {
+        assert!(matches("", "Discord", "Discord.exe"));
+        assert!(matches("  ", "x", "y"));
+        assert!(matches("disc", "Discord", "x.exe"));
+        assert!(matches(" X.EXE", "Name", "x.exe"));
+        assert!(matches("ÄPP", "Mein äpp", "a.exe"));
+        assert!(!matches("zzz", "Discord", "Discord.exe"));
+    }
+
+    #[test]
+    fn suggestions_skip_apps_with_a_rule_cap_at_six_and_end_with_the_typed_exe() {
+        let apps: Vec<GalleryTile> = (0..9)
+            .map(|i| tile(&format!("Synth {i}"), &format!("synth{i}.exe"), i == 0))
+            .collect();
+        let found = ModelRc::from(Rc::new(VecModel::from(apps)));
+        let rules = [PasteRule {
+            app: "synth0.exe".into(),
+            ..PasteRule::default()
+        }];
+        let offered = suggestions(&found, &rules, "synth");
+        // Six apps (synth0 has a rule), then the typed exe.
+        assert_eq!(offered.len(), SUGGESTIONS + 1);
+        assert!(
+            offered[..SUGGESTIONS]
+                .iter()
+                .all(|t| t.caption != "synth0.exe")
+        );
+        assert_eq!(offered[SUGGESTIONS].hint, "add");
+        // Nothing typed: nothing offered.
+        assert_eq!(suggestions(&found, &rules, "  ").len(), 0);
+        // The exe typed in full is its app's row, first, and no other row.
+        let exact = suggestions(&found, &rules, "synth8.exe");
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].caption, "synth8.exe");
+        // A typed app that has a rule is a refused row, not an app.
+        let dup = suggestions(&found, &rules, "SYNTH0.EXE");
+        assert_eq!((dup.len(), dup[0].hint.as_str()), (1, "dup"));
+    }
+
+    #[test]
+    fn sync_changes_rows_in_place_and_replaces_the_model_only_when_the_list_changed() {
+        let old = ModelRc::from(Rc::new(VecModel::from(vec![1, 2, 3])));
+        assert!(sync(&old, vec![1, 9, 3], |a, b| a == b).is_some());
+        assert!(sync(&old, vec![1, 2, 3], |a, b| a == b).is_none());
+        // Same length, same key: updated in place.
+        assert!(sync(&old, vec![5, 6, 7], |_, _| true).is_none());
+        assert_eq!(old.iter().collect::<Vec<_>>(), [5, 6, 7]);
+        assert!(sync(&old, vec![5, 6], |_, _| true).is_some());
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use std::fmt::Write;
@@ -596,7 +818,7 @@ mod tests {
     use slint::{ComponentHandle, LogicalPosition, LogicalSize, Model, SharedString};
 
     use super::{SCAN_POLL, TEST_ROOTS, TextState};
-    use crate::testing::{has, one, with_role};
+    use crate::testing::{assert_nothing_moved, has, one, spots, with_role};
     use crate::{AppWindow, Page};
 
     /// A folder of synthetic shortcuts: name, target, arguments.
@@ -671,7 +893,7 @@ mod tests {
             .global::<TextState>()
             .get_found()
             .iter()
-            .map(|t| (t.title.to_string(), t.caption.to_string(), t.disabled))
+            .map(|t| (t.title.to_string(), t.caption.to_string(), t.checked))
             .collect()
     }
 
@@ -731,52 +953,41 @@ mod tests {
     fn scan_runs_on_a_worker_and_the_ui_thread_stays_free() {
         let (window, layout) = per_app("worker", None, many_apps("worker", 300));
         let s = window.global::<TextState>();
-        one(&window, "Scan for apps").invoke_accessible_default_action();
-        // The click came back before any answer: only the UI thread's timer takes it in.
+        // Opening the tab started it; the answer waits for the UI thread's timer.
         assert!(s.get_scanning());
         assert_eq!(s.get_found().row_count(), 0);
-        assert_eq!(
-            one(&window, "Scan for apps").accessible_enabled(),
-            Some(false)
-        );
-        // A second click while it runs starts nothing.
-        one(&window, "Scan for apps").invoke_accessible_default_action();
         // Meanwhile the page takes a typed rule.
-        one(&window, "New rule app").set_accessible_value("synthtyped.exe");
-        one(&window, "Add rule").invoke_accessible_default_action();
+        s.invoke_rule_picked("synthtyped.exe".into());
         assert!(rules(&layout).contains(&"synthtyped.exe".to_owned()));
         wait_scan(&window);
         assert_eq!(s.get_found().row_count(), 300);
+        assert_eq!(s.get_grid().row_count(), 300);
         assert!(s.get_scanned());
-        assert_eq!(
-            one(&window, "Scan for apps").accessible_enabled(),
-            Some(true)
-        );
+        // A tab that was shown once does not scan again by itself.
+        s.invoke_per_app_shown();
+        assert!(!s.get_scanning());
     }
 
     #[test]
-    fn a_scan_that_finds_nothing_says_so_and_keeps_the_typed_path() {
+    fn a_scan_that_finds_nothing_leaves_the_popup_a_way_to_scan_again() {
         let empty = crate::testing::layout("text-links", "empty").data_dir;
         let (window, _layout) = per_app("empty", None, empty);
-        one(&window, "Scan for apps").invoke_accessible_default_action();
-        assert!(has(&window, "Looking for apps"));
+        let s = window.global::<TextState>();
+        assert!(s.get_scanning());
         wait_scan(&window);
         assert_eq!(found(&window), []);
-        assert!(has(
-            &window,
-            "No apps found: type the app's .exe name above."
-        ));
-        assert!(whole_in_view(&window, "Add rule"));
-        // Said in a line, not a gallery-high empty card that pushes the rules down.
-        let gallery = ElementHandle::find_by_accessible_label(&window, "Found apps")
-            .next()
-            .unwrap();
-        let tile = window.global::<crate::Tokens>().get_tile_height();
-        assert!(gallery.size().height < tile, "{} px", gallery.size().height);
+        assert_eq!(s.get_grid().row_count(), 0);
+        // The popup says so, with the way out beside it.
+        one(&window, "Scan for apps").invoke_accessible_default_action();
+        mock_elapsed_time(Duration::from_millis(1));
+        assert!(has(&window, "No apps found"));
+        one(&window, "Scan again").invoke_accessible_default_action();
+        assert!(s.get_scanning());
+        wait_scan(&window);
     }
 
     #[test]
-    fn a_found_app_becomes_a_rule_for_its_exe_under_its_name() {
+    fn a_found_app_becomes_a_rule_for_its_exe_under_its_name_and_a_second_pick_removes_it() {
         let links = [
             (
                 "Synth Chat".to_owned(),
@@ -791,9 +1002,8 @@ mod tests {
         ];
         let config = "version = 2\n[[paste.rules]]\napp = \"EDITOR.EXE\"\nmode = \"clipboard\"\n";
         let (window, layout) = per_app("pick", Some(config), shortcuts("pick", &links));
-        one(&window, "Scan for apps").invoke_accessible_default_action();
         wait_scan(&window);
-        // The editor already has a rule (the daemon matches case-insensitively).
+        // The editor already has a rule (the daemon matches case-insensitively): ticked.
         assert_eq!(
             found(&window),
             [
@@ -804,21 +1014,27 @@ mod tests {
         let s = window.global::<TextState>();
         assert_eq!(s.get_rules().row_data(0).unwrap().name, "Synth Editor");
 
-        with_role(&window, "Synth Chat", AccessibleRole::RadioButton)
-            .invoke_accessible_default_action();
+        // The grid keeps its model through a tick: it neither rebuilds nor jumps.
+        let grid = s.get_grid();
+        s.invoke_found_toggled("SynthChat.exe".into());
+        assert!(grid == s.get_grid(), "the grid model was replaced");
         assert_eq!(rules(&layout), ["EDITOR.EXE", "SynthChat.exe"]);
-        assert!(found(&window)[0].2, "the picked app is disabled now");
+        assert!(found(&window)[0].2, "the picked app is ticked now");
+        assert!(s.get_grid().row_data(0).unwrap().checked);
         let row = s.get_rules().row_data(1).unwrap();
         assert_eq!((row.name.as_str(), row.mode), ("Synth Chat", 2));
+        mock_elapsed_time(Duration::from_millis(1));
         assert!(has(&window, "Remove SynthChat.exe"));
         // UI rule 30: the name is saved with the rule, so a new window has it without a scan.
-        let saved = saved_names(&layout);
-        assert_eq!(saved["synthchat.exe"], "Synth Chat");
-        // Removing the rule frees the tile again and forgets the name.
-        one(&window, "Remove SynthChat.exe").invoke_accessible_default_action();
+        assert_eq!(saved_names(&layout)["synthchat.exe"], "Synth Chat");
+        // The same tile again takes the rule off and forgets the name.
+        s.invoke_found_toggled("SynthChat.exe".into());
+        assert_eq!(rules(&layout), ["EDITOR.EXE"]);
         assert!(!found(&window)[0].2);
-        let saved = saved_names(&layout);
-        assert!(!saved.contains_key("synthchat.exe"));
+        assert!(!saved_names(&layout).contains_key("synthchat.exe"));
+        // Removing a rule in the list unticks its tile too.
+        s.invoke_rule_removed(0);
+        assert!(!found(&window)[1].2);
     }
 
     #[test]
@@ -848,48 +1064,152 @@ mode = \"clipboard\"
     }
 
     #[test]
-    fn scan_and_a_found_app_are_reached_by_keyboard() {
+    fn the_search_field_filters_the_rules_and_offers_apps_and_a_typed_exe() {
+        let links = [
+            ("Synth Chat", r"C:\S\chat.exe"),
+            ("Synth Editor", r"C:\S\editor.exe"),
+            ("Other Tool", r"C:\S\tool.exe"),
+        ]
+        .map(|(n, t)| (n.to_owned(), t.to_owned(), String::new()));
+        let config = "version = 2\n[[paste.rules]]\napp = \"editor.exe\"\n[[paste.rules]]\napp = \"zeta.exe\"\n";
+        let (window, layout) = per_app("search", Some(config), shortcuts("search", &links));
+        wait_scan(&window);
+        let s = window.global::<TextState>();
+        let hidden = || -> Vec<bool> { s.get_rules().iter().map(|r| r.hidden).collect() };
+        assert_eq!(hidden(), [false, false]);
+        assert_eq!(s.get_rule_matches(), 2);
+        assert_eq!(s.get_suggestions().row_count(), 0);
+
+        // Name and exe, any case; the row keeps its index in the config.
+        s.set_query("ZETA".into());
+        mock_elapsed_time(Duration::from_millis(1));
+        assert_eq!(hidden(), [true, false]);
+        assert_eq!(s.get_rule_matches(), 1);
+        s.invoke_rule_mode_picked(1, 1);
+        mock_elapsed_time(Duration::from_millis(350));
+        let text = fs::read_to_string(layout.config_file()).unwrap();
+        assert!(text.contains("zeta.exe"), "{text}");
+        assert_eq!(
+            oxi_core::config::ConfigFile::parse(&text)
+                .unwrap()
+                .config
+                .paste
+                .rules[1]
+                .mode,
+            Some(oxi_core::config::PasteMode::Clipboard)
+        );
+
+        // Installed apps without a rule that match, then the typed exe.
+        s.set_query("synth".into());
+        mock_elapsed_time(Duration::from_millis(1));
+        let offered = || -> Vec<(String, String)> {
+            s.get_suggestions()
+                .iter()
+                .map(|t| (t.caption.to_string(), t.hint.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            offered(),
+            [
+                ("chat.exe".into(), String::new()),
+                ("synth.exe".into(), "add".into())
+            ]
+        );
+        // An exe that is an installed app is that app's row, first, with no add row.
+        s.set_query("tool.exe".into());
+        mock_elapsed_time(Duration::from_millis(1));
+        assert_eq!(offered(), [("tool.exe".into(), String::new())]);
+        // A duplicate says why in its row.
+        s.set_query("ZETA.EXE".into());
+        mock_elapsed_time(Duration::from_millis(1));
+        assert_eq!(offered(), [("ZETA.EXE".into(), "dup".into())]);
+        // Picking a row adds the rule, clears the field and shows every rule again.
+        s.invoke_rule_picked("tool.exe".into());
+        mock_elapsed_time(Duration::from_millis(1));
+        assert_eq!(s.get_query(), "");
+        assert_eq!(rules(&layout), ["editor.exe", "zeta.exe", "tool.exe"]);
+        assert_eq!(s.get_rule_matches(), 3);
+        assert_eq!(s.get_rules().row_data(2).unwrap().name, "Other Tool");
+        // A duplicate pick adds nothing and lights up the existing rule for 600 ms, no toast.
+        s.invoke_rule_picked("ZETA.EXE".into());
+        assert_eq!(rules(&layout).len(), 3);
+        assert_eq!(s.get_flash_app(), "zeta.exe");
+        assert_eq!(window.global::<crate::generated::Toast>().get_text(), "");
+        mock_elapsed_time(Duration::from_millis(599));
+        assert_eq!(s.get_flash_app(), "zeta.exe");
+        mock_elapsed_time(Duration::from_millis(2));
+        assert_eq!(s.get_flash_app(), "");
+    }
+
+    #[test]
+    fn the_popup_filters_its_grid_by_name_and_exe() {
+        let links = [
+            ("Synth Chat", r"C:\S\chat.exe"),
+            ("Synth Editor", r"C:\S\editor.exe"),
+            ("Other Tool", r"C:\S\tool.exe"),
+        ]
+        .map(|(n, t)| (n.to_owned(), t.to_owned(), String::new()));
+        let (window, _layout) = per_app("grid", None, shortcuts("grid", &links));
+        wait_scan(&window);
+        let s = window.global::<TextState>();
+        let titles =
+            || -> Vec<String> { s.get_grid().iter().map(|t| t.title.to_string()).collect() };
+        assert_eq!(titles(), ["Other Tool", "Synth Chat", "Synth Editor"]);
+        s.set_popup_query("EDITOR".into());
+        mock_elapsed_time(Duration::from_millis(1));
+        assert_eq!(titles(), ["Synth Editor"]);
+        s.set_popup_query("nothing like it".into());
+        mock_elapsed_time(Duration::from_millis(1));
+        assert_eq!(titles(), Vec::<String>::new());
+        // Found apps are all still there for the other field.
+        assert_eq!(s.get_found().row_count(), 3);
+    }
+
+    /// The keyboard reaches the field, a letter lands in it, the arrows and Enter take a row.
+    #[test]
+    fn the_search_field_and_its_list_are_reached_by_keyboard() {
         let links = [(
             "Synth Notes".to_owned(),
             r"C:\Synth\notes.exe".to_owned(),
             String::new(),
         )];
         let (window, layout) = per_app("keys", None, shortcuts("keys", &links));
+        wait_scan(&window);
         let s = window.global::<TextState>();
         let field = || one(&window, "New rule app").accessible_value();
-        // Tab on until a letter lands in the app field, then empty it again.
-        let to_field = || {
-            for _ in 0..16 {
-                press(&window, Key::Tab.into());
-                press(&window, "q".into());
-                if field().as_deref() == Some("q") {
-                    break;
-                }
-            }
-            assert_eq!(field().as_deref(), Some("q"), "Tab never reached the field");
-            one(&window, "New rule app").set_accessible_value("");
-        };
-        to_field();
-        // Past the empty field (Add is off) Scan is the next stop.
-        press(&window, Key::Tab.into());
-        press(&window, " ".into());
-        assert!(s.get_scanning(), "Space on Scan did not start a scan");
-        wait_scan(&window);
-        // Past Scan and its "i" lie the found apps; Enter adds the one under the cursor.
-        to_field();
-        for _ in 0..3 {
+        // Tab on until a letter lands in the field, then empty it again.
+        for _ in 0..16 {
             press(&window, Key::Tab.into());
+            press(&window, "q".into());
+            if field().as_deref() == Some("q") {
+                break;
+            }
         }
+        assert_eq!(field().as_deref(), Some("q"), "Tab never reached the field");
+        one(&window, "New rule app").set_accessible_value("");
+        for letter in ["n", "o", "t"] {
+            press(&window, letter.into());
+        }
+        mock_elapsed_time(Duration::from_millis(1));
+        assert_eq!(s.get_query(), "not");
+        assert_eq!(
+            s.get_suggestions().row_count(),
+            2,
+            "the app and the typed exe"
+        );
+        // Down to the second row, Up back to the first, Enter takes it.
+        press(&window, Key::DownArrow.into());
+        press(&window, Key::UpArrow.into());
         press(&window, Key::Return.into());
         assert_eq!(rules(&layout), ["mstsc.exe", "notes.exe"]);
+        assert_eq!(s.get_query(), "");
     }
 
-    /// UI rule 25 with 300 found apps and 150 rules: Scan and Add stay whole and the page does not
+    /// UI rule 25 with 300 found apps and 150 rules: the bar stays whole and the page does not
     /// scroll at 720 x 520, with no banner, the offline daemon's and a broken config's.
     #[test]
     fn three_hundred_apps_and_150_rules_fit_the_minimum_size() {
         let (window, _layout) = per_app("fit", Some(&many_rules(150)), many_apps("fit", 300));
-        one(&window, "Scan for apps").invoke_accessible_default_action();
         wait_scan(&window);
         for (banner, daemon) in [
             ("", ""),
@@ -900,7 +1220,7 @@ mode = \"clipboard\"
             window.set_daemon_text(daemon.into());
             window.set_daemon_start(!daemon.is_empty());
             mock_elapsed_time(Duration::from_millis(1));
-            for label in ["Scan for apps", "Add rule", "Found apps"] {
+            for label in ["Scan for apps", "New rule app"] {
                 assert!(
                     whole_in_view(&window, label),
                     "{label} is cut (banner {banner:?}, daemon {daemon:?})"
@@ -913,35 +1233,39 @@ mode = \"clipboard\"
         }
     }
 
-    /// Item 12: at 1920 x 1080 the found apps fill the room under Add (more than two tile rows,
-    /// nothing left empty below), and the 150 rules keep their own scrolling list under them.
+    /// The rule row is on the control grid: the mode select and Delete sit where every row's do,
+    /// Delete right-most, and nothing about the bar moves when a rule is added from the popup
+    /// (item 4: picking an app never resizes what is on the page).
     #[test]
-    fn found_apps_fill_a_large_window() {
-        let (window, _layout) = per_app("large", Some(&many_rules(150)), many_apps("large", 300));
-        window.window().set_size(LogicalSize::new(1920.0, 1080.0));
-        one(&window, "Scan for apps").invoke_accessible_default_action();
+    fn the_rule_row_is_on_the_grid_and_adding_a_rule_moves_nothing_above_it() {
+        let links = [(
+            "Synth Notes".to_owned(),
+            r"C:\Synth\notes.exe".to_owned(),
+            String::new(),
+        )];
+        let (window, _layout) = per_app("grid-row", None, shortcuts("grid-row", &links));
         wait_scan(&window);
-        mock_elapsed_time(Duration::from_millis(1));
-        let gallery = ElementHandle::find_by_accessible_label(&window, "Found apps")
-            .next()
-            .unwrap();
-        let tile = window.global::<crate::Tokens>().get_tile_height();
-        assert!(
-            gallery.size().height > 3.0 * tile,
-            "{} px",
-            gallery.size().height
-        );
-        let list = ElementHandle::find_by_element_id(&window, "TextPage::rules")
-            .next()
-            .expect("the rule list");
-        let bottom = list.absolute_position().y + list.size().height;
-        assert!(list.size().height >= 120.0, "{:?}", list.size());
-        assert!(
-            bottom > 1080.0 - 2.0 * tile,
-            "the list ends at {bottom} of 1080"
-        );
-        assert!(bottom <= 1080.0, "the list ends at {bottom} of 1080");
-        assert!(!page_scrolls(&window));
+        let s = window.global::<TextState>();
+        let right = |label: &str| {
+            let e = one(&window, label);
+            (
+                e.absolute_position().x + e.size().width,
+                e.absolute_position().y,
+            )
+        };
+        let (mode_right, mode_y) = right("Mode for mstsc.exe");
+        let (remove_right, remove_y) = right("Remove mstsc.exe");
+        assert!(remove_right > mode_right, "Delete is the right-most");
+        assert_eq!(mode_y + 16.0, remove_y + 16.0, "same row");
+        let height = window.global::<crate::Tokens>().get_control_height();
+        assert_eq!(one(&window, "Mode for mstsc.exe").size().height, height);
+        assert_eq!(one(&window, "Remove mstsc.exe").size().height, height);
+        let before = spots(&window);
+        s.invoke_found_toggled("notes.exe".into());
+        // The bar, the sub-tabs and the first row stay; a row appears below.
+        let after = spots(&window);
+        assert!(has(&window, "Remove notes.exe"));
+        assert_nothing_moved(&before, &after);
     }
 
     /// A mode pick changes the row in place: a new model would rebuild the rows and take the
@@ -995,32 +1319,13 @@ mode = \"type\"
         );
     }
 
-    /// With the gallery shown and both banners (the daemon's and a config's) up at 720 x 520, the
-    /// rule list keeps at least a row; the page scrolls for the rest, the list never goes.
-    #[test]
-    fn the_rule_list_keeps_a_row_with_the_gallery_and_two_banners() {
-        let (window, _layout) = per_app("floor", Some(&many_rules(150)), many_apps("floor", 300));
-        one(&window, "Scan for apps").invoke_accessible_default_action();
-        wait_scan(&window);
-        window.set_banner_text("Synthetic config trouble. ".repeat(30).into());
-        window.set_daemon_text(oxi_core::strings::DAEMON_OFFLINE.into());
-        window.set_daemon_start(true);
-        mock_elapsed_time(Duration::from_millis(1));
-        // The room is short: the page scrolls (its fallback), to the bottom, where the list is.
-        assert!(page_scrolls(&window), "the page does not scroll");
-        let list = ElementHandle::find_by_element_id(&window, "TextPage::rules")
-            .next()
-            .expect("the rule list");
-        assert!(list.size().height >= 56.0, "{:?}", list.size());
-        assert!(has(&window, "Remove synthrule0.exe"));
-    }
-
-    /// The found apps drawn by the software renderer: none found (with the default rule and with
-    /// none), and 300 with 150 rules, at the
+    /// The Per-app tab drawn by the software renderer: none found (with the default rule and with
+    /// none), and 300 with 150 rules, each as the page and with the apps popup open, at the
     /// minimum, two middle and a large size in both themes, into `OXI_SHOTS_DIR` as
-    /// `settings-text-found-<state>-<w>-<theme>.png`. Nothing runs without it: the real Start
-    /// menu is never scanned here, and `tests/shots.rs` cannot point the scan at synthetic links.
-    /// The renderer platform is per thread, so it draws on a thread of its own.
+    /// `settings-text-found-<state>-<w>-<theme>.png` (`-popup` after the state when open). Nothing
+    /// runs without it: the real Start menu is never scanned here, and `tests/shots.rs` cannot point
+    /// the scan at synthetic links. The renderer platform is per thread, so it draws on a thread of
+    /// its own.
     #[test]
     fn shots_found_apps() {
         let Some(dir) = std::env::var_os("OXI_SHOTS_DIR").map(PathBuf::from) else {
@@ -1039,6 +1344,10 @@ mode = \"type\"
             .unwrap();
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one drawing loop over states, themes and sizes"
+    )]
     fn draw_found(dir: &std::path::Path, empty: PathBuf, many: PathBuf) {
         use std::cell::RefCell;
         use std::rc::Rc;
@@ -1094,7 +1403,6 @@ rules = []
                 slint::platform::update_timers_and_animations();
                 with_role(&window, "Per-app rules", AccessibleRole::Tab)
                     .invoke_accessible_default_action();
-                one(&window, "Scan for apps").invoke_accessible_default_action();
                 let s = window.global::<TextState>();
                 let start = Instant::now();
                 while s.get_scanning() {
@@ -1102,22 +1410,57 @@ rules = []
                     std::thread::sleep(Duration::from_millis(5));
                     slint::platform::update_timers_and_animations();
                 }
-                for (w, h) in [(720_u32, 520_u32), (1000, 700), (1280, 860), (1920, 1080)] {
-                    surface.set_size(slint::PhysicalSize::new(w, h));
-                    slint::platform::update_timers_and_animations();
-                    surface.request_redraw();
-                    let mut buffer = vec![PremultipliedRgbaColor::default(); (w * h) as usize];
-                    assert!(surface.draw_if_needed(|r| {
-                        r.render(&mut buffer, w as usize);
-                    }));
-                    let bytes = buffer
-                        .iter()
-                        .flat_map(|p| [p.red, p.green, p.blue, p.alpha])
-                        .collect();
-                    tiny_skia::Pixmap::from_vec(bytes, tiny_skia::IntSize::from_wh(w, h).unwrap())
+                for variant in ["", "-suggest", "-popup"] {
+                    match variant {
+                        "-suggest" => {
+                            // The keyboard puts the caret in the field, and a part of a name in it.
+                            let key = |text: SharedString| {
+                                for event in [
+                                    WindowEvent::KeyPressed { text: text.clone() },
+                                    WindowEvent::KeyReleased { text },
+                                ] {
+                                    surface.dispatch_event(event);
+                                }
+                            };
+                            for _ in 0..16 {
+                                key(Key::Tab.into());
+                                key("q".into());
+                                if one(&window, "New rule app").accessible_value().as_deref()
+                                    == Some("q")
+                                {
+                                    break;
+                                }
+                            }
+                            one(&window, "New rule app").set_accessible_value("synth");
+                        }
+                        "-popup" => {
+                            one(&window, "New rule app").set_accessible_value("");
+                            one(&window, "Scan for apps").invoke_accessible_default_action();
+                        }
+                        _ => {}
+                    }
+                    for (w, h) in [(720_u32, 520_u32), (1000, 700), (1280, 860), (1920, 1080)] {
+                        surface.set_size(slint::PhysicalSize::new(w, h));
+                        slint::platform::update_timers_and_animations();
+                        surface.request_redraw();
+                        let mut buffer = vec![PremultipliedRgbaColor::default(); (w * h) as usize];
+                        assert!(surface.draw_if_needed(|r| {
+                            r.render(&mut buffer, w as usize);
+                        }));
+                        let bytes = buffer
+                            .iter()
+                            .flat_map(|p| [p.red, p.green, p.blue, p.alpha])
+                            .collect();
+                        tiny_skia::Pixmap::from_vec(
+                            bytes,
+                            tiny_skia::IntSize::from_wh(w, h).unwrap(),
+                        )
                         .unwrap()
-                        .save_png(dir.join(format!("settings-text-found-{state}-{w}-{theme}.png")))
+                        .save_png(dir.join(format!(
+                            "settings-text-found-{state}{variant}-{w}-{theme}.png"
+                        )))
                         .unwrap();
+                    }
                 }
                 window.hide().unwrap();
             }
