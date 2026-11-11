@@ -1223,7 +1223,10 @@ fn shot_text_tabs_under_a_banner() {
                 delta_y: -100_000.0,
             });
             slint::platform::update_timers_and_animations();
-            assert_eq!(window.get_scroll_y(), 0.0, "{tab} scrolls at 720 x 520");
+            // The fit is measured in Segoe UI Variable Text, which only Windows has.
+            if cfg!(windows) {
+                assert_eq!(window.get_scroll_y(), 0.0, "{tab} scrolls at 720 x 520");
+            }
         }
     }
 }
@@ -1256,7 +1259,9 @@ fn shot_system() {
 /// their widest, dictated text logged.
 #[test]
 fn shot_system_recordings_warned() {
-    let folder = format!("D:/{}", "a very long folder name/".repeat(6));
+    // An absent drive on Windows; elsewhere a folder whose parents are not there either.
+    let root = if cfg!(windows) { "D:/" } else { "/" };
+    let folder = format!("{root}{}", "a very long folder name/".repeat(6));
     let config = format!(
         "version = 2\n[debug]\nlog_text = true\n[history]\nenabled = true\nmax_days = 999\nmax_bytes = 1072668082176\nfolder = {folder:?}\n"
     );

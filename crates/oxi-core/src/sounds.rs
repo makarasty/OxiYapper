@@ -1024,7 +1024,6 @@ mod tests {
             r"\\?\C:\a.wav",
             "//nas/share/a.wav",
             r"C:\a.wav:stream",
-            r"C:\x\NUL.wav",
             "con.wav",
             "Com1.wav",
             "lpt9",
@@ -1032,6 +1031,11 @@ mod tests {
         ] {
             assert!(!is_plain_local_path(Path::new(bad)), "{bad}");
         }
+        // `\` parts folders only on Windows; elsewhere this is one plain file name.
+        assert_eq!(
+            is_plain_local_path(Path::new(r"C:\x\NUL.wav")),
+            !cfg!(windows)
+        );
     }
 
     #[test]

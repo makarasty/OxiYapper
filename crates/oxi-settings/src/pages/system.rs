@@ -121,7 +121,7 @@ fn whole(value: f32) -> u32 {
 /// Where the folder dialog opens: `path`, the field's text, or the nearest folder of it that
 /// exists (DS-13.4); with none (an empty field) the nearest existing folder of the recordings
 /// folder in use. The dialog never gets a missing path: it would open in its own default.
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn browse_start(path: &str, default: &Path) -> PathBuf {
     Path::new(path.trim())
         .ancestors()

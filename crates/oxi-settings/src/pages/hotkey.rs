@@ -399,8 +399,6 @@ mod tests {
     use slint::ComponentHandle;
     use slint::platform::WindowEvent;
 
-    use std::rc::Rc;
-
     use crate::generated::{HotkeyState, Theme};
     use crate::ipc::{Cmd, Event, Ipc, Link};
     use crate::testing::{linked, one};
@@ -613,6 +611,7 @@ mod tests {
     fn measure_labels() {
         use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
         use slint::platform::{Platform, WindowAdapter};
+        use std::rc::Rc;
 
         slint::slint! {
             export component Measure inherits Window {

@@ -689,10 +689,14 @@ fn a_read_only_config_locks_the_recording_controls() {
         with_role(&window, "Keep recordings for", AccessibleRole::Spinbox).accessible_enabled(),
         Some(false)
     );
-    assert_eq!(
-        with_role(&window, "Change recordings folder", AccessibleRole::Button).accessible_enabled(),
-        Some(false)
-    );
+    // The folder button shows only where a folder dialog exists (can-browse).
+    if cfg!(windows) {
+        assert_eq!(
+            with_role(&window, "Change recordings folder", AccessibleRole::Button)
+                .accessible_enabled(),
+            Some(false)
+        );
+    }
     assert_eq!(fs::read_to_string(l.config_file()).unwrap(), original);
 }
 

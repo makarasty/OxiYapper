@@ -54,7 +54,7 @@ pub fn local_now() -> (Date, u32) {
 /// shortcut: UTC, not local time; switch to the OS local time with `stats_store::today`.
 #[cfg(not(windows))]
 pub fn local_now() -> (Date, u32) {
-    let ms = std::time::SystemTime::now()
+    let ms = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
     let days = i32::try_from(ms / 86_400_000).unwrap_or(0);

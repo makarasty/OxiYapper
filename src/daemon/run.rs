@@ -617,7 +617,7 @@ mod tests {
     fn the_exit_stage_wakes_its_waiters_and_a_wait_within_ends_at_its_limit() {
         let exit = Arc::new(ExitStage::default());
         assert!(!exit.wait_within(WORKERS_DONE, Duration::from_millis(10)));
-        let reacher = {
+        let stages = {
             let exit = Arc::clone(&exit);
             spawn("test-exit", move || {
                 exit.reach(COORDINATOR_DONE);
@@ -627,7 +627,7 @@ mod tests {
         };
         assert!(exit.wait_within(WORKERS_DONE, Duration::from_secs(5)));
         exit.wait(COORDINATOR_DONE); // already past: returns at once
-        reacher.join().unwrap();
+        stages.join().unwrap();
     }
 
     #[test]

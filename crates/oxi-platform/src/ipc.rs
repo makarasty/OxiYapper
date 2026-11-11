@@ -349,7 +349,15 @@ fn timed<R>(
         return crate::os::pipe::with_deadline(pipe.inner().as_handle(), limit, op);
     }
     let _ = (stream, limit);
-    op()
+    // A Unix socket timeout (SO_RCVTIMEO, SO_SNDTIMEO) reads as WouldBlock; callers match the
+    // TimedOut that `set_read_timeout` and `set_write_timeout` promise.
+    op().map_err(|e| {
+        if e.kind() == io::ErrorKind::WouldBlock {
+            io::Error::new(io::ErrorKind::TimedOut, "IPC I/O timed out")
+        } else {
+            e
+        }
+    })
 }
 
 /// Second launch: ask the daemon serving `name` to open settings, then wait until it closes

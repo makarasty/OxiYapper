@@ -707,6 +707,10 @@ fn long_app_name_keeps_its_rule_row_one_line() {
 /// sub-tab has its last control in view at 720 x 520 and the page cannot scroll, with no banner,
 /// the offline daemon's and a broken config's.
 #[test]
+#[cfg_attr(
+    not(windows),
+    ignore = "the fit is measured in Segoe UI Variable Text, which only Windows has"
+)]
 fn every_tab_fits_the_minimum_size_with_long_lists() {
     let l = layout("fit", Some(&many_rules(150)));
     let words: Vec<String> = (0..500).map(|i| format!("synthword{i}")).collect();

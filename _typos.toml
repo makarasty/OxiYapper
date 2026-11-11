@@ -1,3 +1,7 @@
+[default]
+# A model file name cut to 10 characters on purpose (`paths.rs` elide test).
+extend-ignore-re = ["ggml-larg…"]
+
 [files]
 extend-exclude = ["Cargo.lock", "LICENSE-*", "*.svg"]
 

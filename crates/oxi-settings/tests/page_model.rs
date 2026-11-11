@@ -126,11 +126,20 @@ fn use_writes_model_id_and_viewing_does_not() {
     assert!(text.contains("# mine"), "comment lost: {text}");
 }
 
+/// An absolute path that is not there: a drive path is relative off Windows.
+const GONE: &str = if cfg!(windows) {
+    "C:/nowhere/gone.bin"
+} else {
+    "/nowhere/gone.bin"
+};
+
 #[test]
 fn missing_custom_path_shows_an_error() {
     let l = layout(
         "custom",
-        Some("version = 2\n[model]\nid = \"custom\"\ncustom_path = \"C:/nowhere/gone.bin\"\n"),
+        Some(&format!(
+            "version = 2\n[model]\nid = \"custom\"\ncustom_path = \"{GONE}\"\n"
+        )),
     );
     let window = open(&l, Page::Model);
     wait_for(|| has(&window, "File not found"));
@@ -140,7 +149,7 @@ fn missing_custom_path_shows_an_error() {
     fs::write(&notes, b"text").unwrap();
     field.set_accessible_value(notes.to_string_lossy().into_owned());
     assert!(has(&window, "The model file must end in .bin"));
-    assert_eq!(saved(&l).custom_path, "C:/nowhere/gone.bin");
+    assert_eq!(saved(&l).custom_path, GONE);
 
     let model = l.config_dir.join("mine.bin");
     fs::write(&model, b"synthetic").unwrap();
@@ -755,8 +764,11 @@ fn a_state_change_moves_no_column_of_the_card() {
         "Cancel Whisper large-v3 turbo",
         AccessibleRole::Button,
     ));
+    // The column is sized for Segoe UI Variable Text; another OS falls back to a wider font, in
+    // which a label can widen its button past the column.
     assert!(
-        (download.0 - cancel.0).abs() < 0.5 && (download.1 - cancel.1).abs() < 0.5,
+        (download.0 - cancel.0).abs() < 0.5
+            && (!cfg!(windows) || (download.1 - cancel.1).abs() < 0.5),
         "button {download:?} -> {cancel:?}"
     );
 }

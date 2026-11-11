@@ -560,6 +560,7 @@ impl PageState {
 
     /// No native dialog on this OS: `can-browse` hides the button.
     #[cfg(not(windows))]
+    #[allow(clippy::unused_self, reason = "same signature as the Windows dialog")]
     fn browse(&self, _path: &str) {}
 
     /// Opens the models folder, made first when nothing was downloaded yet.

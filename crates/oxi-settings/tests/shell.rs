@@ -1287,8 +1287,10 @@ fn the_warning_is_a_tab_stop_that_opens_its_tooltip() {
     press_switch(&window, "Log dictated text");
     assert_eq!(copies(), 1);
     // The rail, the sub-tabs, the "i" of Keep recordings, its two limits and their switch, the
-    // folder field, the two folder buttons, Settings, Logs, the "!".
-    for _ in 0..12 {
+    // folder field, the two folder buttons, Settings, Logs, the "!". Change folder shows only
+    // where a folder dialog exists (can-browse).
+    let stops = if cfg!(windows) { 12 } else { 11 };
+    for _ in 0..stops {
         press(&window, Key::Tab);
     }
     assert_eq!(copies(), 2, "focus on the \"!\" opens the tooltip");

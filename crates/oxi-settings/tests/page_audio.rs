@@ -362,6 +362,10 @@ fn the_sounds_grid_fills_the_window_height() {
 
 /// Preview plays the picked tile, so it has its own row, not the own-file row's (Choose file).
 #[test]
+#[cfg_attr(
+    not(windows),
+    ignore = "Choose file shows only where a file dialog exists (can-browse)"
+)]
 fn preview_is_not_in_the_own_file_row() {
     let window = open(&layout("preview-row", None), Page::Audio);
     sounds(&window, 0);
@@ -496,6 +500,10 @@ fn a_bad_own_file_is_the_warning_of_the_row() {
 /// UI rule 26: under banners the page scrolls, and the sound gallery then shows every tile, so
 /// the wheel never has a scroll inside a scroll to pick; with no banner the page does not scroll.
 #[test]
+#[cfg_attr(
+    not(windows),
+    ignore = "the fit is measured in Segoe UI Variable Text, which only Windows has"
+)]
 fn sound_tabs_never_scroll_inside_a_scroll() {
     let l = layout("sound-fit", None);
     let window = open(&l, Page::Audio);

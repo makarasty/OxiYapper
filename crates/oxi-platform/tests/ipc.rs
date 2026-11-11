@@ -297,10 +297,9 @@ mod windows {
     #[test]
     fn client_allows_only_identification() {
         let n = name("sqos");
-        let listener = ListenerOptions::new()
-            .name(n.as_str().to_fs_name::<GenericFilePath>().unwrap())
-            .create_sync()
-            .unwrap();
+        // Owner set as the daemon sets it: an elevated process (the CI runner) would otherwise
+        // give the pipe to Administrators and the client would refuse it as foreign.
+        let listener = pipe_with(&n, &owner_only_sddl(&user_sid().unwrap()));
         let level = thread::scope(|s| {
             s.spawn(|| {
                 let mut c = Client::connect(&n).unwrap();
