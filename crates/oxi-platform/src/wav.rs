@@ -349,6 +349,13 @@ pub fn read_wav_mono_f32(path: &Path) -> Result<(Vec<f32>, u32), WavError> {
 #[cfg(test)]
 pub(crate) static SPOOL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// No writer thread still owns a file: a discarded spool's writer may not even have created its
+/// file yet, and two spools begun within one clock tick share a path.
+#[cfg(test)]
+pub(crate) fn spool_idle() -> bool {
+    spool_state().live.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;

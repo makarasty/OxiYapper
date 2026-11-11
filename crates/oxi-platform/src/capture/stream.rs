@@ -696,10 +696,12 @@ mod tests {
             .collect()
     }
 
-    /// The writer thread deletes a discarded spool; it is busy until it is gone.
+    /// The writer thread deletes a discarded spool; it is busy until it is gone. Waits for the
+    /// writer too: one that has not created its file yet would delete the next spool's (same path
+    /// within one clock tick).
     fn wait_until_no_parts(dir: &std::path::Path, why: &str) {
         let start = std::time::Instant::now();
-        while !parts(dir).is_empty() {
+        while !parts(dir).is_empty() || !crate::wav::spool_idle() {
             assert!(start.elapsed() < Duration::from_secs(5), "{why}");
             thread::sleep(Duration::from_millis(5));
         }
