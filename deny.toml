@@ -6,7 +6,10 @@ targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "x86_64-apple-d
 
 [advisories]
 # RustSec advisories fail the check; an ignore needs an id and a reason here.
-ignore = []
+ignore = [
+    # pin-utils is archived (unmaintained, no vulnerability); only slint 1.18 pulls it, via spin_on. Drop once slint does.
+    { id = "RUSTSEC-2026-0441", reason = "unmaintained only, transitive via slint -> spin_on; no fix until slint drops it" },
+]
 
 [licenses]
 confidence-threshold = 0.9

@@ -11,7 +11,13 @@ failure-output = "immediate-final"
 # whisper tests load a model: one at a time, so CI runners do not run out of RAM.
 [test-groups]
 whisper = { max-threads = 1 }
+# The system clipboard is one per session: live clipboard tests open it, so they run one at a time.
+clipboard = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = "package(oxi-whisper)"
 test-group = "whisper"
+
+[[profile.default.overrides]]
+filter = "package(oxi-platform) & binary(clipboard_live)"
+test-group = "clipboard"
