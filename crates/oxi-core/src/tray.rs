@@ -57,7 +57,9 @@ mod tests {
             | Notice::MicFallback
             | Notice::MicSilence
             | Notice::ConfigAdjusted
-            | Notice::HistoryOn => false,
+            | Notice::HistoryOn
+            | Notice::FailedKept
+            | Notice::Recovered => false,
         }
     }
 

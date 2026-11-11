@@ -38,6 +38,8 @@ pub const fn notice(notice: Notice) -> &'static str {
             "Not enough memory to load the speech model. Close other apps or pick a smaller model"
         }
         Notice::HistoryOn => "Recordings are now kept for 30 days. Turn off in Audio.",
+        Notice::FailedKept => "The recording was kept. Find it in History",
+        Notice::Recovered => "Recovered a recording. See History",
     }
 }
 
@@ -135,6 +137,8 @@ pub const fn notice_short(notice: Notice) -> &'static str {
         Notice::MicSilence => "Mic silent",
         Notice::OutOfMemory => "Out of memory",
         Notice::HistoryOn => "History on",
+        Notice::FailedKept => "Recording kept",
+        Notice::Recovered => "Recovered",
     }
 }
 

@@ -39,11 +39,18 @@ export component FocusRing {
     }
 }
 
-// Whether focus came from the keyboard, so a click does not draw the ring. A `FocusScope`
+// Whether focus came from the keyboard, so a click does not draw the ring. Nor do a window
+// coming back to the front (Alt+Tab) and a popup closing: neither is a key press. A `FocusScope`
 // forwards its `focus-gained` reason here.
 export global KeyFocus {
     public pure function from-key(reason: FocusReason) -> bool {
-        return reason != FocusReason.pointer-click;
+        return reason != FocusReason.pointer-click && reason != FocusReason.window-activation && reason != FocusReason.popup-activation;
+    }
+
+    // `from-key` for a control that kept its own answer (`was`): a popup it opened by key and
+    // closed by Esc hands the focus back with `popup-activation`, and the ring must stay.
+    public pure function after(reason: FocusReason, was: bool) -> bool {
+        return reason == FocusReason.popup-activation ? was : KeyFocus.from-key(reason);
     }
 }
 
@@ -166,7 +173,7 @@ export component InfoTip {
     fs := FocusScope {
         focus-on-click: false;
         focus-gained(reason) => {
-            root.key-focus = KeyFocus.from-key(reason);
+            root.key-focus = KeyFocus.after(reason, root.key-focus);
             root.key-open = root.key-focus;
             root.show-key-tip();
         }

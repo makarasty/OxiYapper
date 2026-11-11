@@ -342,8 +342,10 @@ impl Drain<'_> {
             // Read before draining: everything pushed before `stop` is seen by the last pass.
             let stopping = self.shared.stop.load(Ordering::Acquire);
             if stopping && self.shared.cancel.load(Ordering::Relaxed) {
+                // Discarded, also after a failed push: the machine stops (never discards) a
+                // recording with speech, so this one has nothing worth keeping (triage #12).
                 sink.cancel();
-                return Ok(Recorded::default());
+                return failed.map_or(Ok(Recorded::default()), Err);
             }
             if failed.is_some() {
                 if let Ok(chunk) = rx.read_chunk(rx.slots()) {
@@ -619,6 +621,116 @@ mod tests {
         assert!(events.try_recv().is_err(), "one event only");
     }
 
+    /// Fails every push; records whether the drain ended it as cancelled or as failed.
+    struct EndSink(Arc<Mutex<&'static str>>);
+
+    impl Sink for EndSink {
+        fn push(&mut self, _: &[f32]) -> Result<Level, AudioError> {
+            Err(AudioError::Resample("injected".into()))
+        }
+
+        fn finish(self) -> Result<Recorded, AudioError> {
+            *self.0.lock().unwrap() = "finish";
+            Ok(Recorded::default())
+        }
+
+        fn cancel(self) {
+            *self.0.lock().unwrap() = "cancel";
+        }
+
+        fn failed(self) {
+            *self.0.lock().unwrap() = "failed";
+        }
+    }
+
+    /// Pushes until one fails, then stops the drain over `sink` (`cancel`: discarded).
+    fn failed_then_stopped<S: Sink + Send + 'static>(
+        sink: S,
+        cancel: bool,
+    ) -> Result<Recorded, AudioError> {
+        let shared = Arc::new(Shared::default());
+        let (mut tx, rx) = RingBuffer::new(16);
+        let (event_tx, events) = std::sync::mpsc::channel();
+        let worker = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                let drain = Drain {
+                    channels: 1,
+                    window: 4,
+                    shared: &shared,
+                    meter: &LevelMeter::default(),
+                };
+                drain.run(rx, sink, |e| event_tx.send(e).unwrap())
+            })
+        };
+        for _ in 0..4 {
+            tx.push(0.1).unwrap();
+        }
+        let event = events.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(event, CaptureEvent::Failed);
+        shared.cancel.store(cancel, Ordering::Relaxed);
+        shared.stop.store(true, Ordering::Release);
+        worker.thread().unpark();
+        worker.join().unwrap()
+    }
+
+    /// A mic that fails mid-recording: stopped (speech heard) it is kept as failed (triage #12);
+    /// discarded (no speech) it is cancelled, nothing kept.
+    #[test]
+    fn a_failed_push_is_kept_when_stopped_and_dropped_when_discarded() {
+        for (cancel, end) in [(false, "failed"), (true, "cancel")] {
+            let ended = Arc::new(Mutex::new("running"));
+            let result = failed_then_stopped(EndSink(Arc::clone(&ended)), cancel);
+            assert!(matches!(result, Err(AudioError::Resample(_))), "{result:?}");
+            assert_eq!(*ended.lock().unwrap(), end, "cancel {cancel}");
+        }
+    }
+
+    /// Spool files (and the ones still being written) in the day folders of `dir`.
+    fn parts(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flat_map(|day| std::fs::read_dir(day.unwrap().path()).unwrap())
+            .map(|f| f.unwrap().path())
+            .filter(|p| crate::wav::spool_busy(p) || p.is_file())
+            .collect()
+    }
+
+    /// The writer thread deletes a discarded spool; it is busy until it is gone.
+    fn wait_until_no_parts(dir: &std::path::Path, why: &str) {
+        let start = std::time::Instant::now();
+        while !parts(dir).is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(5), "{why}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A push fails before speech, so the machine discards: the spool goes too, never an orphan.
+    #[test]
+    fn a_discard_after_a_failed_push_keeps_no_spool() {
+        let _guard = crate::wav::SPOOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = scratch_dir(&format!("oxi-stream-failspool-{}", std::process::id()));
+        crate::wav::spool_give_up_all();
+        let _ = crate::wav::spool_take_orphans();
+        crate::wav::set_spool_dir(Some(dir.clone()));
+        let sink = Spooled {
+            inner: EndSink(Arc::new(Mutex::new("running"))),
+            spool: WavSpool::begin(RATE),
+        };
+        assert!(sink.spool.is_some());
+        let result = failed_then_stopped(sink, true);
+        assert!(matches!(result, Err(AudioError::Resample(_))), "{result:?}");
+        wait_until_no_parts(&dir, "a discard keeps nothing");
+        assert_eq!(
+            crate::wav::spool_take_orphans(),
+            Vec::<std::path::PathBuf>::new()
+        );
+        crate::wav::set_spool_dir(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Mono 16 kHz tone in, for a drain over a recording that is spooled to `dir`.
     fn spooled_drain(dir: &std::path::Path, cancel: bool) -> Result<Recorded, AudioError> {
         crate::wav::set_spool_dir(Some(dir.to_owned()));
@@ -661,23 +773,7 @@ mod tests {
             crate::wav::spool_take_orphans(),
             Vec::<std::path::PathBuf>::new()
         );
-        let parts = || -> Vec<std::path::PathBuf> {
-            std::fs::read_dir(&dir)
-                .unwrap()
-                .flat_map(|day| std::fs::read_dir(day.unwrap().path()).unwrap())
-                .map(|f| f.unwrap().path())
-                .filter(|p| crate::wav::spool_busy(p) || p.is_file())
-                .collect()
-        };
-        // The writer thread deletes the file; it is busy until it is gone.
-        let start = std::time::Instant::now();
-        while !parts().is_empty() {
-            assert!(
-                start.elapsed() < Duration::from_secs(5),
-                "cancel keeps nothing"
-            );
-            thread::sleep(Duration::from_millis(5));
-        }
+        wait_until_no_parts(&dir, "cancel keeps nothing");
 
         let processed = spooled_drain(&dir, false).unwrap();
         let part = processed.spool.expect("the job carries its stream");

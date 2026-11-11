@@ -622,7 +622,7 @@ mod tests {
     }
 
     fn many_rules(n: usize) -> String {
-        let mut text = String::from("version = 1\n");
+        let mut text = String::from("version = 2\n");
         for i in 0..n {
             writeln!(
                 text,
@@ -788,7 +788,7 @@ mod tests {
                 String::new(),
             ),
         ];
-        let config = "version = 1\n[[paste.rules]]\napp = \"EDITOR.EXE\"\nmode = \"clipboard\"\n";
+        let config = "version = 2\n[[paste.rules]]\napp = \"EDITOR.EXE\"\nmode = \"clipboard\"\n";
         let (window, layout) = per_app("pick", Some(config), shortcuts("pick", &links));
         one(&window, "Scan for apps").invoke_accessible_default_action();
         wait_scan(&window);
@@ -824,7 +824,7 @@ mod tests {
     fn removing_a_rule_deletes_its_name_from_a_file_that_already_has_the_table() {
         let config = concat!(
             "# my note
-version = 1
+version = 2
 [[paste.rules]]
 app = \"a.exe\"
 mode = \"clipboard\"
@@ -947,7 +947,7 @@ mode = \"clipboard\"
     /// focus from the Combo being arrowed through. A mode changed from outside still shows.
     #[test]
     fn a_mode_pick_keeps_the_rule_rows() {
-        let config = "version = 1
+        let config = "version = 2
 [[paste.rules]]
 app = \"a.exe\"
 mode = \"type\"
@@ -972,7 +972,7 @@ mode = \"type\"
     /// the last one.
     #[test]
     fn mode_picks_in_a_row_save_once_they_rest() {
-        let config = "version = 1
+        let config = "version = 2
 [[paste.rules]]
 app = \"a.exe\"
 mode = \"type\"
@@ -982,7 +982,10 @@ mode = \"type\"
         s.invoke_rule_mode_picked(0, 1);
         s.invoke_rule_mode_picked(0, 0);
         let text = fs::read_to_string(layout.config_file()).unwrap();
-        assert!(text.contains("mode = \"type\""), "saved on an arrow: {text}");
+        assert!(
+            text.contains("mode = \"type\""),
+            "saved on an arrow: {text}"
+        );
         mock_elapsed_time(Duration::from_millis(350));
         let text = fs::read_to_string(layout.config_file()).unwrap();
         assert!(
@@ -1066,7 +1069,7 @@ mode = \"type\"
         fs::create_dir_all(dir).unwrap();
         slint::platform::set_platform(Box::new(Shots)).unwrap();
         let rules = many_rules(150);
-        let no_rules = "version = 1
+        let no_rules = "version = 2
 [paste]
 rules = []
 ";

@@ -4,7 +4,7 @@ import { Theme, Shell, Icons, Card, Row, Divider, ToggleRow, SliderRow, Combo, S
 import { Warnings } from "../theme/components/feedback.slint";
 
 // Which control changed; `value` of `AudioState.edited` carries its new value.
-export enum AudioKey { device, gain, sensitivity, normalize, trim, denoise, tail, max-minutes, volume, done-on }
+export enum AudioKey { device, gain, sensitivity, normalize, trim, denoise, tail, max-minutes, volume }
 
 // Filled and read by `pages::audio`.
 export global AudioState {
@@ -43,8 +43,8 @@ export global AudioState {
     in property <string> silence;
     // The Test button: true while it records and plays back (its steps are toasts).
     in property <bool> testing;
-    // Per sound (start, stop, text ready, cancel, error): its tiles, `Builtin::ALL` in order then
-    // the own file, and the tile picked (-1: none).
+    // Per sound (start, stop, text ready, cancel, error): its tiles, Off, `Builtin::ALL` in order
+    // then the own file, and the tile picked (-1: none).
     in property <[[GalleryTile]]> role-tiles;
     in property <[int]> role-tile;
     // The glyphs of the tiles, read by `pages::audio` when it builds them.
@@ -52,8 +52,8 @@ export global AudioState {
     out property <image> file-icon: Icons.folder-open;
     in-out property <float> volume;
     in property <float> default-volume;
-    // `sounds.done_enabled`: the text ready sound plays.
-    in-out property <bool> done-on;
+    // The glyph of the Off tile, the first tile of every sound.
+    out property <image> off-icon: Icons.dismiss-16;
     // Why a sound cannot be used or played, from the daemon's warnings; empty otherwise.
     in property <string> sound-warning;
     // Why the daemon cannot play a preview now; empty when it can.
@@ -200,7 +200,7 @@ export component AudioPage inherits VerticalLayout {
         SliderRow {
             title: @tr("Max length");
             minimum: 1;
-            maximum: 30;
+            maximum: 120;
             unit: "min";
             default-value: AudioState.default-max-minutes;
             value <=> AudioState.max-minutes;
@@ -232,15 +232,6 @@ export component AudioPage inherits VerticalLayout {
                     }
                 }
             }
-            if root.role == 2: Divider { }
-            if root.role == 2: ToggleRow {
-                flat: true;
-                title: @tr("Play when the text is ready");
-                checked <=> AudioState.done-on;
-                toggled(on) => {
-                    AudioState.edited(AudioKey.done-on, on ? 1 : 0);
-                }
-            }
             Divider { }
             Row {
                 title: @tr("Own file");
@@ -260,8 +251,9 @@ export component AudioPage inherits VerticalLayout {
                 Button {
                     text: @tr("Preview");
                     icon: Icons.play;
-                    enabled: AudioState.preview-off == "";
-                    tooltip: AudioState.preview-off;
+                    // Tile 0 is Off: nothing to hear.
+                    enabled: AudioState.preview-off == "" && AudioState.role-tile[root.role] != 0;
+                    tooltip: AudioState.role-tile[root.role] == 0 ? @tr("This sound is off") : AudioState.preview-off;
                     clicked => {
                         AudioState.preview();
                     }
@@ -282,11 +274,11 @@ export component AudioPage inherits VerticalLayout {
         }
         CardGrid {
             accessible-label: @tr("Sounds");
-            // Up to two rows of tiles, at least one; more scroll inside the grid. Under banners not
-            // even one row fits and the page scrolls: then the grid shows every row, so only one
-            // thing scrolls (UI rule 26).
+            // All the room the window leaves, at least one row of tiles; more scroll inside the grid.
+            // Under banners not even one row fits and the page scrolls: then the grid shows every
+            // row, so only one thing scrolls (UI rule 26).
             property <length> room: root.free-height - tabs.preferred-height - sound-card.preferred-height - 2 * Theme.space-4;
-            height: self.room < self.min-height ? self.full-height : clamp(self.room, self.min-height, 2 * self.min-height + Theme.tile-gap);
+            height: self.room < self.min-height ? self.full-height : clamp(self.room, self.min-height, self.full-height);
             tiles: AudioState.role-tiles[root.role];
             selected: AudioState.role-tile[root.role];
             picked(i) => {

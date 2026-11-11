@@ -50,7 +50,7 @@ fn status(ipc: &Ipc, warnings: &[&str]) {
 
 #[test]
 fn every_control_writes_its_key() {
-    let l = layout("controls", Some("version = 1\n# mine\n"));
+    let l = layout("controls", Some("version = 2\n# mine\n"));
     let window = open(&l, Page::Audio);
     // Tall enough for the whole page: the search skips what is scrolled away.
     window
@@ -113,7 +113,7 @@ fn denoise_shows_the_whisper_note() {
 fn config_values_show_on_the_page() {
     let l = layout(
         "values",
-        Some("version = 1\n[audio]\ngain_db = 4.0\ntail_ms = 250\n[model]\nlanguage = \"en\"\n"),
+        Some("version = 2\n[audio]\ngain_db = 4.0\ntail_ms = 250\n[model]\nlanguage = \"en\"\n"),
     );
     let window = open(&l, Page::Audio);
     let gain = with_role(&window, "Gain", AccessibleRole::Slider);
@@ -122,7 +122,7 @@ fn config_values_show_on_the_page() {
     assert_eq!(field("Gain").as_deref(), Some("+4"));
     tab(&window, "Recording");
     assert_eq!(field("Tail after release").as_deref(), Some("250"));
-    assert_eq!(field("Max length").as_deref(), Some("10"));
+    assert_eq!(field("Max length").as_deref(), Some("60"));
 }
 
 /// UI rule 28: a device name too long for the Combo stands in full in a tooltip; a short one has
@@ -132,7 +132,7 @@ fn long_device_name_stands_in_full_on_hover() {
     let long = "Microphone Array (Synth Smart Sound Technology for Digital Microphones)";
     let l = layout(
         "device-long",
-        Some(&format!("version = 1\n[audio]\ndevice = \"{long}\"\n")),
+        Some(&format!("version = 2\n[audio]\ndevice = \"{long}\"\n")),
     );
     let window = open(&l, Page::Audio);
     window
@@ -158,7 +158,7 @@ fn long_device_name_stands_in_full_on_hover() {
 fn missing_device_stays_picked_until_default_is_chosen() {
     let l = layout(
         "device",
-        Some("version = 1\n[audio]\ndevice = \"Test Mic 9\"\n"),
+        Some("version = 2\n[audio]\ndevice = \"Test Mic 9\"\n"),
     );
     let window = open(&l, Page::Audio);
     let picker = with_role(&window, "Device", AccessibleRole::Combobox);
@@ -336,6 +336,30 @@ fn level_row_has_the_edges_of_the_device_select() {
     }
 }
 
+/// The Sounds grid takes the room the window leaves, not two rows (it was 216 px tall at 1000x700,
+/// 200 px short of the window's foot).
+#[test]
+fn the_sounds_grid_fills_the_window_height() {
+    let window = open(&layout("grid-room", None), Page::Audio);
+    sounds(&window, 0);
+    let foot = |width: f32, height: f32| {
+        window
+            .window()
+            .set_size(slint::LogicalSize::new(width, height));
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+        let grid = ElementHandle::find_by_accessible_label(&window, "Sounds")
+            .find(|e| e.accessible_role() != Some(AccessibleRole::Tab))
+            .expect("no Sounds grid");
+        (grid.absolute_position().y, grid.size().height)
+    };
+    let (top, height) = foot(1000.0, 700.0);
+    assert!(
+        top + height > 700.0 - 40.0,
+        "the grid ends at {} in a 700 px window",
+        top + height
+    );
+}
+
 /// Preview plays the picked tile, so it has its own row, not the own-file row's (Choose file).
 #[test]
 fn preview_is_not_in_the_own_file_row() {
@@ -384,17 +408,30 @@ fn picking_a_built_in_saves_it_and_plays_it() {
     assert_eq!(picker().accessible_value().as_deref(), Some("Error"));
 }
 
-/// The text ready sound has its switch, the other sounds have none.
+/// Every sound has an Off tile; on text ready it is the old switch.
 #[test]
-fn the_text_ready_sound_can_be_switched_off() {
-    let l = layout("done-off", None);
-    let window = open(&l, Page::Audio);
+fn every_sound_can_be_switched_off() {
+    let l = layout("sound-off", None);
+    let (ipc, sent) = Ipc::fake();
+    let window = open_linked(&l, Page::Audio, ipc);
+    assert!(
+        !has(&window, "Play when the text is ready"),
+        "the switch is the Off tile now"
+    );
     sounds(&window, 0);
-    let label = "Play when the text is ready";
-    assert!(!has(&window, label));
+    with_role(&window, "Off", AccessibleRole::RadioButton).invoke_accessible_default_action();
+    assert_eq!(saved(&l).sounds.start, "off");
+    assert_eq!(checked(&window, "Off"), Some(true));
+    assert!(
+        !sent
+            .try_iter()
+            .any(|c| matches!(c, Cmd::Send(Request::PreviewSound { .. }))),
+        "an Off pick plays nothing"
+    );
     sounds(&window, 2);
-    with_role(&window, label, AccessibleRole::Switch).invoke_accessible_default_action();
+    with_role(&window, "Off", AccessibleRole::RadioButton).invoke_accessible_default_action();
     assert!(!saved(&l).sounds.done_enabled);
+    assert_eq!(saved(&l).sounds.done, "rx-25");
 }
 
 /// An own file from the config stands on its tile with its name; the whole path is the tooltip.
@@ -402,7 +439,7 @@ fn the_text_ready_sound_can_be_switched_off() {
 fn own_file_shows_on_its_tile() {
     let l = layout(
         "own",
-        Some("version = 1\n[sounds]\nstart = 'C:\\Sounds\\my start.wav'\n"),
+        Some("version = 2\n[sounds]\nstart = 'C:\\Sounds\\my start.wav'\n"),
     );
     let window = open(&l, Page::Audio);
     sounds(&window, 0);
@@ -434,7 +471,7 @@ fn volume_slider_writes_the_fraction() {
 fn a_bad_own_file_is_the_warning_of_the_row() {
     let l = layout(
         "bad-file",
-        Some("version = 1\n[sounds]\nstart = 'C:\\Sounds\\bad.wav'\n"),
+        Some("version = 2\n[sounds]\nstart = 'C:\\Sounds\\bad.wav'\n"),
     );
     let (ipc, _sent) = Ipc::fake();
     let window = open_linked(&l, Page::Audio, ipc.clone());

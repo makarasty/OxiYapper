@@ -7,7 +7,7 @@
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -19,7 +19,7 @@ use oxi_core::constants::PLAY_TAIL;
 use oxi_core::ipc::{Push, Request};
 use oxi_core::machine::Sound;
 use oxi_core::overlay::{METER_HZ, Meter};
-use oxi_core::sounds::{Builtin, Choice, is_plain_local_path};
+use oxi_core::sounds::{Builtin, Choice, OFF, is_plain_local_path};
 use oxi_core::strings::{self, NO_MIC};
 use oxi_core::types::Millis;
 use oxi_platform::capture::{
@@ -47,8 +47,14 @@ const RELIST: Millis = Millis(2_000);
 const NO_SIGNAL: Millis = Millis(3_000);
 /// Length of the Test button's recording.
 const TEST_LENGTH: Millis = Millis(3_000);
+/// Tile of Off, the first of every sound (the Preview button in `audio.slint` knows it is 0).
+const OFF_TILE: usize = 0;
+/// Tile of a built-in: Off is before it.
+fn builtin_tile(i: usize) -> usize {
+    i + 1
+}
 /// Tile of the own file: after the built-in sounds.
-const OWN_FILE_TILE: usize = Builtin::ALL.len();
+const OWN_FILE_TILE: usize = Builtin::ALL.len() + 1;
 /// The sounds of the Sounds tab, in the order of its picker: `AudioState.view` 2 to 6.
 const ROLES: [Sound; 5] = [
     Sound::Start,
@@ -72,7 +78,7 @@ struct Io<C> {
     now: fn() -> Millis,
     play: Player,
     /// The file dialog for an own sound; `None` when cancelled.
-    pick_file: fn() -> Option<PathBuf>,
+    pick_file: fn(&Path) -> Option<PathBuf>,
 }
 
 /// Plays a mono clip at the given rate; the handle keeps it playing.
@@ -108,16 +114,27 @@ fn play_cpal(clip: &[f32], rate: u32) -> Result<Box<dyn Any>, CaptureError> {
 }
 
 #[cfg(windows)]
-fn pick_file() -> Option<PathBuf> {
+fn pick_file(start: &Path) -> Option<PathBuf> {
     rfd::FileDialog::new()
+        .set_directory(start)
         .add_filter("Sound", &["wav", "ogg"])
         .pick_file()
 }
 
 /// No native dialog on this OS: `can-browse` turns the button and the tile off.
 #[cfg(not(windows))]
-fn pick_file() -> Option<PathBuf> {
+fn pick_file(_: &Path) -> Option<PathBuf> {
     None
+}
+
+/// Where the sound dialog opens: the folder of the sound now set when it is an own file in an
+/// existing folder, else the settings folder.
+fn pick_start(current: &str, fallback: &Path) -> PathBuf {
+    Path::new(current)
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty() && dir.is_dir())
+        .unwrap_or(fallback)
+        .to_path_buf()
 }
 
 fn since_start() -> Millis {
@@ -199,7 +216,7 @@ struct PageState<C> {
     timer: Timer,
     open: Opener<C>,
     play: Player,
-    pick_file: fn() -> Option<PathBuf>,
+    pick_file: fn(&Path) -> Option<PathBuf>,
     test: RefCell<Option<MicTest<C>>>,
 }
 
@@ -412,14 +429,24 @@ impl<C: Capture + 'static> PageState<C> {
     }
 
     fn sound_picked(&self, tile: i32) {
-        match usize::try_from(tile).ok().and_then(|i| Builtin::ALL.get(i)) {
+        let tile = usize::try_from(tile).ok();
+        if tile == Some(OFF_TILE) {
+            return self.set_sound(OFF.to_owned());
+        }
+        match tile
+            .and_then(|i| i.checked_sub(1))
+            .and_then(|i| Builtin::ALL.get(i))
+        {
             Some(builtin) => self.set_sound(builtin.id().to_owned()),
             None => self.choose_file(),
         }
     }
 
     fn choose_file(&self) {
-        let Some(path) = (self.pick_file)() else {
+        let config = self.ctx.layout.config_file();
+        let fallback = config.parent().unwrap_or_else(|| Path::new("."));
+        let current = self.with_sound(|sound| sound.clone()).unwrap_or_default();
+        let Some(path) = (self.pick_file)(&pick_start(&current, fallback)) else {
             return;
         };
         // The daemon refuses these at every load; saving one would leave a broken setting.
@@ -432,9 +459,23 @@ impl<C: Capture + 'static> PageState<C> {
         self.set_sound(path.to_string_lossy().into_owned());
     }
 
-    /// Save a sound, show it and play it, so a bad file is found at once.
+    /// Whether the sound shown on the Sounds tab is the text ready one.
+    fn on_done(&self) -> bool {
+        self.window
+            .upgrade()
+            .is_some_and(|w| w.global::<AudioState>().get_view() - 2 == 2)
+    }
+
+    /// Save a sound, show it and play it, so a bad file is found at once. Off on the text ready
+    /// sound only turns `done_enabled` off, so the sound it had comes back with the next pick.
     fn set_sound(&self, choice: String) {
-        self.with_sound(|sound| *sound = choice);
+        let off = choice == OFF;
+        if self.on_done() {
+            self.ctx.config.borrow_mut().config.sounds.done_enabled = !off;
+        }
+        if !(off && self.on_done()) {
+            self.with_sound(|sound| *sound = choice);
+        }
         if let Some(window) = self.window.upgrade() {
             push_sounds(
                 &window.global::<AudioState>(),
@@ -442,12 +483,16 @@ impl<C: Capture + 'static> PageState<C> {
             );
         }
         report(&self.window, self.ctx.save());
-        self.preview();
+        if !off {
+            self.preview();
+        }
     }
 
     fn preview(&self) {
         let volume_percent = percent(self.ctx.config.borrow().config.sounds.volume);
+        let off = self.on_done() && !self.ctx.config.borrow().config.sounds.done_enabled;
         if let Some(choice) = self.with_sound(|sound| sound.clone()) {
+            let choice = if off { OFF.to_owned() } else { choice };
             self.ctx.ipc.send(Request::PreviewSound {
                 choice,
                 volume_percent,
@@ -472,7 +517,6 @@ impl<C: Capture + 'static> PageState<C> {
             AudioKey::Tail => audio.tail_ms = whole(value),
             AudioKey::MaxMinutes => audio.max_seconds = whole(value).max(1) * 60,
             AudioKey::Volume => config.sounds.volume = f64::from(whole(value).min(100)) / 100.0,
-            AudioKey::DoneOn => config.sounds.done_enabled = value != 0.0,
         }
         drop(file);
         report(&self.window, self.ctx.save());
@@ -562,22 +606,27 @@ fn push_config(state: &AudioState<'_>, config: &Config, devices: &Devices) {
     state.set_default_volume(f32::from(percent(defaults.sounds.volume)));
 }
 
-/// Push the sound settings: each sound's tiles and pick, the volume and the text ready switch.
+/// Push the sound settings: each sound's tiles and pick, and the volume.
 fn push_sounds(state: &AudioState<'_>, sounds: &Sounds) {
-    let icons = (state.get_sound_icon(), state.get_file_icon());
+    let icons = (
+        state.get_sound_icon(),
+        state.get_file_icon(),
+        state.get_off_icon(),
+    );
     let defaults = Sounds::default();
     let (tiles, picked): (Vec<_>, Vec<_>) = ROLES
         .into_iter()
         .zip(by_role(sounds).into_iter().zip(by_role(&defaults)))
         .map(|(role, (text, default))| {
-            let (picked, tiles) = sound_tiles(role, text, default, &icons);
+            // The text ready sound has its own switch; Off there is that switch.
+            let off = role == Sound::Done && !sounds.done_enabled;
+            let (picked, tiles) = sound_tiles(role, text, default, off, &icons);
             (ModelRc::from(Rc::new(VecModel::from(tiles))), picked)
         })
         .unzip();
     state.set_role_tiles(ModelRc::from(Rc::new(VecModel::from(tiles))));
     state.set_role_tile(ModelRc::from(Rc::new(VecModel::from(picked))));
     state.set_volume(f32::from(percent(sounds.volume)));
-    state.set_done_on(sounds.done_enabled);
 }
 
 /// The settings of [`ROLES`], in its order.
@@ -591,28 +640,36 @@ fn by_role(sounds: &Sounds) -> [&str; 5] {
     ]
 }
 
-/// The tiles of one sound, `Builtin::ALL` then the own file, and the one its setting `text`
-/// picks (-1: none). The built-in that is the sound's `default` says so.
+/// The tiles of one sound, Off, `Builtin::ALL`, then the own file, and the one its setting `text`
+/// picks (-1: none); `off` picks Off whatever the text is. The built-in that is the sound's
+/// `default` says so.
 fn sound_tiles(
     role: Sound,
     text: &str,
     default: &str,
-    (sound_icon, file_icon): &(slint::Image, slint::Image),
+    off: bool,
+    (sound_icon, file_icon, off_icon): &(slint::Image, slint::Image, slint::Image),
 ) -> (i32, Vec<GalleryTile>) {
-    let choice = Choice::parse_for(role, text).ok();
-    let mut tiles: Vec<GalleryTile> = Builtin::ALL
-        .iter()
-        .map(|b| GalleryTile {
-            icon: sound_icon.clone(),
-            title: title(b.id()).into(),
-            caption: if b.id() == default {
-                "Default".into()
-            } else {
-                SharedString::new()
-            },
-            ..GalleryTile::default()
-        })
-        .collect();
+    let choice = if off {
+        Some(Choice::Off)
+    } else {
+        Choice::parse_for(role, text).ok()
+    };
+    let mut tiles = vec![GalleryTile {
+        icon: off_icon.clone(),
+        title: "Off".into(),
+        ..GalleryTile::default()
+    }];
+    tiles.extend(Builtin::ALL.iter().map(|b| GalleryTile {
+        icon: sound_icon.clone(),
+        title: title(b.id()).into(),
+        caption: if b.id() == default {
+            "Default".into()
+        } else {
+            SharedString::new()
+        },
+        ..GalleryTile::default()
+    }));
     let own = match &choice {
         Some(Choice::Custom(path)) => path.file_name().map_or_else(
             || path.to_string_lossy().into_owned(),
@@ -633,7 +690,8 @@ fn sound_tiles(
         ..GalleryTile::default()
     });
     let picked = match choice {
-        Some(Choice::Builtin(b)) => Builtin::ALL.iter().position(|x| *x == b),
+        Some(Choice::Off) => Some(OFF_TILE),
+        Some(Choice::Builtin(b)) => Builtin::ALL.iter().position(|x| *x == b).map(builtin_tile),
         Some(Choice::Custom(_)) => Some(OWN_FILE_TILE),
         // `Sounds::normalise` already replaced anything else.
         None => None,
@@ -879,6 +937,8 @@ mod tests {
         static SILENT_CLIP: Cell<bool> = const { Cell::new(false) };
         static PLAYED: Cell<usize> = const { Cell::new(0) };
         static PICKED: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+        /// The folder the last file dialog was told to open on.
+        static PICK_START: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
         /// `normalize` of the last open through `fake`.
         static NORMALIZE: Cell<Option<bool>> = const { Cell::new(None) };
     }
@@ -982,7 +1042,8 @@ mod tests {
         NOW.get()
     }
 
-    fn fake_pick() -> Option<PathBuf> {
+    fn fake_pick(start: &Path) -> Option<PathBuf> {
+        PICK_START.set(Some(start.to_path_buf()));
         PICKED.with_borrow(Clone::clone)
     }
 
@@ -995,6 +1056,7 @@ mod tests {
         SILENT_CLIP.set(false);
         PLAYED.set(0);
         PICKED.set(None);
+        PICK_START.set(None);
         NORMALIZE.set(None);
     }
 
@@ -1280,7 +1342,7 @@ mod tests {
 
     #[test]
     fn missing_device_note_and_picker_row() {
-        let config = "version = 1\n[audio]\ndevice = \"USB Mic\"\n";
+        let config = "version = 2\n[audio]\ndevice = \"USB Mic\"\n";
         let window = window("fallback", Some(config), fake_fallback);
         LISTED.set(vec!["Built-in".into()]);
         show_audio(&window);
@@ -1300,7 +1362,7 @@ mod tests {
 
     #[test]
     fn plugged_device_shows_up_and_clears_the_fallback() {
-        let config = "version = 1\n[audio]\ndevice = \"USB Mic\"\n";
+        let config = "version = 2\n[audio]\ndevice = \"USB Mic\"\n";
         let window = window("plug", Some(config), fake_fallback);
         show_audio(&window);
         frame(40);
@@ -1448,7 +1510,7 @@ mod tests {
             (
                 "not-connected",
                 Some(
-                    "version = 1
+                    "version = 2
 [audio]
 device = \"USB Mic\"
 ",
@@ -1660,7 +1722,7 @@ device = \"USB Mic\"
             w.dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
             w.dispatch_event(WindowEvent::KeyReleased { text });
         }
-        assert_eq!(saved().max_seconds, 1800, "105 min clamps to 30 min");
+        assert_eq!(saved().max_seconds, 7200, "605 min clamps to 120 min");
     }
 
     fn press(window: &AppWindow, key: impl Into<SharedString>) {
@@ -1684,7 +1746,7 @@ device = \"USB Mic\"
         use slint::platform::{Key as K, PointerEventButton};
 
         i_slint_backend_testing::init_no_event_loop();
-        let config = "version = 1\n[audio]\ntail_ms = 125\n";
+        let config = "version = 2\n[audio]\ntail_ms = 125\n";
         let (window, page) = window_on("untouched", Some(config), fake);
         window.show().unwrap();
         show_audio(&window);
@@ -1774,11 +1836,41 @@ device = \"USB Mic\"
         state.set_view(3);
         PICKED.set(Some(snd("end.wav").into()));
         state.invoke_choose_file();
-        assert_eq!(
-            page.ctx.config.borrow().config.sounds.stop,
-            snd("end.wav")
-        );
+        assert_eq!(page.ctx.config.borrow().config.sounds.stop, snd("end.wav"));
         assert_eq!(start(), snd("my.wav"));
+    }
+
+    /// The dialog opens in the folder of the own file now set when it exists, else in the settings
+    /// folder.
+    #[test]
+    fn the_file_dialog_opens_on_the_current_sound_folder_or_the_settings_folder() {
+        let (window, page) = sounds_page("pick-start", None);
+        let state = window.global::<AudioState>();
+        let settings = page
+            .ctx
+            .layout
+            .config_file()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        state.invoke_choose_file();
+        assert_eq!(
+            PICK_START.take(),
+            Some(settings.clone()),
+            "a built-in sound"
+        );
+        // An own file whose folder exists: the dialog opens there.
+        let sub = settings.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let here = sub.join("mine.wav").to_string_lossy().into_owned();
+        page.with_sound(|sound| *sound = here);
+        state.invoke_choose_file();
+        assert_eq!(PICK_START.take(), Some(sub));
+        let nested = settings.join("gone").join("a.wav");
+        page.with_sound(|sound| *sound = nested.to_string_lossy().into_owned());
+        state.invoke_choose_file();
+        assert_eq!(PICK_START.take(), Some(settings), "its folder is gone");
+        assert_eq!(pick_start("my.wav", Path::new("x")), Path::new("x"));
     }
 
     /// The tile picked for the sound `role` (an index of [`ROLES`]).
@@ -1802,11 +1894,12 @@ device = \"USB Mic\"
         let defaults = Sounds::default();
         for (role, default) in by_role(&defaults).into_iter().enumerate() {
             let at = Builtin::ALL.iter().position(|b| b.id() == default).unwrap();
-            assert_eq!(picked_tile(&state, role), at, "{default}");
+            assert_eq!(picked_tile(&state, role), builtin_tile(at), "{default}");
         }
         let kill = Builtin::ALL
             .iter()
             .position(|b| *b == Builtin::Kill1)
+            .map(builtin_tile)
             .unwrap();
         for role in 0..ROLES.len() {
             state.set_view(i32::try_from(role).unwrap() + 2);
@@ -1825,8 +1918,42 @@ device = \"USB Mic\"
             "kill-1",
             "the cancel file left the error sound"
         );
-        state.invoke_edited(AudioKey::DoneOn, 0.0);
-        assert!(!sounds().done_enabled);
+    }
+
+    // Off on every role: start, stop, cancel and error write "off"; text ready only turns its
+    // switch off and keeps its sound, which the next pick on it turns back on.
+    #[test]
+    fn off_is_the_first_tile_of_every_sound() {
+        let (window, page) = sounds_page("off-tiles", None);
+        let state = window.global::<AudioState>();
+        let sounds = || page.ctx.config.borrow().config.sounds.clone();
+        for role in 0..ROLES.len() {
+            state.set_view(i32::try_from(role).unwrap() + 2);
+            let tiles = slint::Model::row_data(&state.get_role_tiles(), role).unwrap();
+            assert_eq!(
+                slint::Model::row_data(&tiles, OFF_TILE).unwrap().title,
+                "Off"
+            );
+            state.invoke_sound_picked(i32::try_from(OFF_TILE).unwrap());
+            assert_eq!(picked_tile(&state, role), OFF_TILE, "role {role}");
+        }
+        let s = sounds();
+        assert_eq!(
+            (
+                s.start.as_str(),
+                s.stop.as_str(),
+                s.cancel.as_str(),
+                s.error.as_str()
+            ),
+            ("off", "off", "off", "off")
+        );
+        assert!(!s.done_enabled);
+        assert_eq!(s.done, "rx-25", "the sound it had is kept");
+        // The next pick on text ready switches it back on.
+        state.set_view(4);
+        state.invoke_sound_picked(i32::try_from(builtin_tile(0)).unwrap());
+        assert!(sounds().done_enabled);
+        assert_eq!(picked_tile(&state, 2), builtin_tile(0));
     }
 
     #[test]

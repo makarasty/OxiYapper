@@ -31,7 +31,7 @@ fn on_disk(path: &Path) -> u64 {
 fn a_test_folder_goes_when_its_test_ends() {
     // libtest runs each test on its own thread: the folder lives as long as that thread.
     let dir = thread::spawn(|| {
-        let dir = common::layout("hygiene", Some("version = 1\n")).config_dir;
+        let dir = common::layout("hygiene", Some("version = 2\n")).config_dir;
         assert!(dir.join("config.toml").exists());
         dir
     })
@@ -58,7 +58,9 @@ fn scratch_dir_refuses_anything_but_one_plain_name() {
     let absolute = temp.join("oxi-hygiene-abs");
     for bad in ["", "..", "a/b", ".", absolute.to_str().unwrap()] {
         let name = bad.to_owned();
-        let refused = thread::spawn(move || common::scratch_dir(&name)).join().is_err();
+        let refused = thread::spawn(move || common::scratch_dir(&name))
+            .join()
+            .is_err();
         assert!(refused, "scratch_dir accepted {bad:?}");
     }
     assert!(temp.exists(), "the temp folder is gone");

@@ -154,7 +154,7 @@ normalize = true
 denoise = false
 trim = true
 tail_ms = 100
-max_seconds = 600              # SPEC round 4: 10 min cap
+max_seconds = 3600             # 60 min cap (owner, 2026-11-11; was 10 min in SPEC round 4)
 meter_sensitivity_db = 0.0     # level meter display only (overlay, settings); -20..+20
 [model]
 id = "turbo"                   # registry id, or "custom"
@@ -176,9 +176,9 @@ hide_over_fullscreen = false
 [sounds]
 enabled = true
 volume = 0.5                  # 0 to 1
-start = "apa-hit-3"            # a built-in id (apa-hit-3, apa-hit-2, rx-25, cancel-soft, boop-3, ...) or the path of a .wav or .ogg file; the old ids rise, fall, pop, tick, fault still load
+start = "apa-hit-3"            # a built-in id (apa-hit-3, apa-hit-2, rx-25, cancel-soft, boop-3, ...) or the path of a .wav or .ogg file, or "off" (any sound); the old ids rise, fall, pop, tick, fault still load as the default of their sound
 stop = "apa-hit-2"
-done_enabled = true            # sound when the text is ready and pasted
+done_enabled = true            # false = no sound when the text is ready (the Off tile of that sound)
 done = "rx-25"
 cancel = "cancel-soft"                # sound when a recording is cancelled
 error = "boop-3"
@@ -271,7 +271,7 @@ Recording and hotkey
 2. Double tap (push-to-talk): two presses shorter than 250 ms with a gap under 300 ms lock recording on; audio counts from the second press; the next full press stops it.
 3. Single press under 300 ms: a tap, discarded without transcription (taps produce "Thank you." hallucinations).
 4. Toggle mode: key-up ignored, no double tap; under 300 ms of audio between presses is discarded.
-5. Recording reaches `max_seconds` (default 600, SPEC round 4): the overlay warns 30 s before, then stop and transcribe, never discard. Long audio goes to whisper in chunks so one job never holds minutes of state (chunk length set in M5).
+5. Recording reaches `max_seconds` (default 3600, set by the owner on 2026-11-11): the overlay warns 30 s before, then stop and transcribe, never discard. Long audio goes to whisper in chunks so one job never holds minutes of state (chunk length set in M5).
 6. Esc while recording: cancels and is swallowed only when `hotkey.esc_cancels` is on (default off: Esc may be meant for another app); otherwise it passes through. A cancel after speech is saved to history with the notice of item 7. Esc while transcribing: not ours, passes through.
 7. Another key pressed while the chord is held (Ctrl+Win+D and friends): the key always passes through to the system (R2.1). What happens to the recording is decided by VAD and `hotkey.other_key`. `auto` (default): no speech heard yet, so the user meant a shortcut and the recording is cancelled silently; speech already heard, so the recording goes on (a short phrase is not lost). `never`: never cancels. `always`: always cancels. A cancel after speech saves the audio to history and shows the notice "cancelled, can be restored". The logic is pure, in `oxi-core::machine`, with a test per edge case.
 8. Key-up lost (UAC prompt, Ctrl+Alt+Del, secure desktop): a 100 ms watchdog reads the physical key state while recording; chord not held means key-up.

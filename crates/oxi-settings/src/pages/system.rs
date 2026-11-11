@@ -118,15 +118,28 @@ fn whole(value: f32) -> u32 {
     value.round().max(0.0) as u32
 }
 
-/// The dialog starts at `path`, the field's text, or the nearest folder of it that exists
-/// (DS-13.4); picking the folder it opened on changes nothing.
+/// Where the folder dialog opens: `path`, the field's text, or the nearest folder of it that
+/// exists (DS-13.4); with none (an empty field) the nearest existing folder of the recordings
+/// folder in use. The dialog never gets a missing path: it would open in its own default.
+#[cfg(any(windows, test))]
+fn browse_start(path: &str, default: &Path) -> PathBuf {
+    Path::new(path.trim())
+        .ancestors()
+        .chain(default.ancestors())
+        .find(|d| !d.as_os_str().is_empty() && d.is_dir())
+        .unwrap_or(default)
+        .to_path_buf()
+}
+
+/// Opens the dialog at [`browse_start`]; picking the folder it opened on changes nothing.
 #[cfg(windows)]
 fn browse(weak: &Weak<AppWindow>, ctx: &Ctx, check: &Rc<Timer>, path: &str) {
-    let mut dialog = rfd::FileDialog::new();
-    if let Some(dir) = Path::new(path.trim()).ancestors().find(|d| d.is_dir()) {
-        dialog = dialog.set_directory(dir);
-    }
-    if let Some(path) = dialog.pick_folder() {
+    let default = history::folder(
+        &ctx.config.borrow().config.history,
+        &ctx.layout.history_dir(),
+    );
+    let start = browse_start(path, &default);
+    if let Some(path) = rfd::FileDialog::new().set_directory(start).pick_folder() {
         choose(weak, ctx, check, picked_folder(&path));
     }
 }
@@ -312,5 +325,23 @@ mod tests {
         assert_eq!(picked_folder(&root).unwrap(), root.to_str().unwrap());
         let lone = OsString::from_wide(&[u16::from(b'a'), 0xD800]);
         assert!(picked_folder(&root.join(lone)).is_err());
+    }
+
+    #[test]
+    fn the_folder_dialog_opens_on_the_field_or_the_default_folder() {
+        let root = crate::testing::scratch_dir(&format!("oxi-start-{}", std::process::id()));
+        let default = root.join("default");
+        assert_eq!(
+            browse_start("", &default),
+            root,
+            "default missing: its nearest folder"
+        );
+        assert_eq!(browse_start("  ", &default), root);
+        fs::create_dir_all(&default).unwrap();
+        assert_eq!(browse_start("", &default), default, "an empty field");
+        fs::remove_dir(&default).unwrap();
+        assert_eq!(browse_start(root.to_str().unwrap(), &default), root);
+        let gone = root.join("gone").join("deeper");
+        assert_eq!(browse_start(gone.to_str().unwrap(), &default), root);
     }
 }

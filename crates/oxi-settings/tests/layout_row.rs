@@ -10,7 +10,7 @@ use slint::platform::WindowEvent;
 use slint::{ComponentHandle, LogicalPosition};
 
 slint::slint! {
-    import { Theme, Shell, Card, Row, SliderRow, ToggleRow, Divider, Combo, Switch, Button } from "../ui/theme/index.slint";
+    import { Theme, Shell, Card, Group, Row, SliderRow, ToggleRow, Divider, Combo, Switch, Button } from "../ui/theme/index.slint";
     import { HoverTip } from "../ui/theme/components/base.slint";
 
     export component RowProbe inherits Window {
@@ -35,6 +35,12 @@ slint::slint! {
         out property <length> gain-title-x: gain.title-x;
         out property <length> button-title-x: recordings.title-x;
         out property <length> line-h: line.preferred-height;
+        out property <length> described-mid: described.absolute-position.y + described.height / 2;
+        out property <length> described-h: described.height;
+        out property <length> described-switch-mid: described-switch.absolute-position.y + described-switch.height / 2;
+        out property <length> group-x: group.absolute-position.x;
+        out property <length> group-mid: group.absolute-position.y + 10px;
+        out property <length> group-title-w: group-measure.preferred-width;
         public function set-page(w: length) {
             Shell.page-width = w;
         }
@@ -47,6 +53,12 @@ slint::slint! {
             visible: false;
             text: "X";
             font-size: Theme.body-size;
+        }
+        group-measure := Text {
+            visible: false;
+            text: "Microphone";
+            font-size: Theme.body-size;
+            font-weight: Theme.weight-strong;
         }
         VerticalLayout {
             alignment: start;
@@ -86,6 +98,21 @@ slint::slint! {
                     title: "Keep the microphone open between dictations so the first word is never cut";
                     info: "Uses a little more power.";
                     long-switch := Switch { }
+                }
+                Divider { }
+                described := Row {
+                    title: "Noise suppression";
+                    description: "Cuts steady hiss before Whisper hears it.";
+                    described-switch := Switch { }
+                }
+            }
+            group := Group {
+                title: "Microphone";
+                info: "Group hint.";
+                Card {
+                    Row {
+                        title: "Inside";
+                    }
                 }
             }
         }
@@ -171,7 +198,11 @@ fn info_sits_on_the_first_line_of_a_wrapped_title() {
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(700));
         x += 4.0;
     }
-    assert_eq!(p.get_tip(), "Uses a little more power.", "no i on the title's first line");
+    assert_eq!(
+        p.get_tip(),
+        "Uses a little more power.",
+        "no i on the title's first line"
+    );
     let (long_x, long_tip_y) = (p.get_tip_x(), p.get_tip_y());
     // Calibrate on the one-line Gain row, whose "i" is centred on the row: the tooltip's offset
     // from the middle of the "i" it opens under.
@@ -230,12 +261,61 @@ fn i_is_a_pair_gap_after_the_title_text() {
             i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(700));
             x += 1.0;
         }
-        assert_eq!(p.get_tip(), "What Whisper hears.", "no i on the Gain row at {width} px");
+        assert_eq!(
+            p.get_tip(),
+            "What Whisper hears.",
+            "no i on the Gain row at {width} px"
+        );
         // The tooltip anchors at the middle of the 20 px "i" box: pair-gap 8 + 10 after the title.
         let gap = p.get_tip_x() - (p.get_gain_title_x() + p.get_title_w());
         assert!(
             (gap - 18.0).abs() < 0.5,
             "at {width} px the i is {gap} px after the title, not the 8 px pair gap (18 to its middle)"
+        );
+    }
+}
+
+#[test]
+fn a_described_row_centres_its_controls() {
+    i_slint_backend_testing::init_no_event_loop();
+    for (width, height) in [(720.0, 520.0), (1920.0, 1080.0)] {
+        let p = probe(width, height);
+        assert!(
+            p.get_described_h() > 32.0 + 0.5,
+            "the row is {} px high, not taller than a control",
+            p.get_described_h()
+        );
+        let off = p.get_described_switch_mid() - p.get_described_mid();
+        assert!(
+            off.abs() <= 0.5,
+            "at {width} px the Switch is {off} px off the described row's centre"
+        );
+    }
+}
+
+#[test]
+fn a_group_info_is_an_i_a_pair_gap_after_the_title() {
+    i_slint_backend_testing::init_no_event_loop();
+    for (width, height) in [(720.0, 520.0), (1920.0, 1080.0)] {
+        let p = probe(width, height);
+        let mut x = p.get_group_x();
+        while x < p.get_group_x() + width && p.get_tip() != "Group hint." {
+            p.window().dispatch_event(WindowEvent::PointerMoved {
+                position: LogicalPosition::new(x, p.get_group_mid()),
+            });
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(700));
+            x += 1.0;
+        }
+        assert_eq!(
+            p.get_tip(),
+            "Group hint.",
+            "no i on the Group title at {width} px"
+        );
+        // The tooltip anchors at the middle of the 20 px "i" box: pair-gap 8 + 10 after the title.
+        let gap = p.get_tip_x() - (p.get_group_x() + p.get_group_title_w());
+        assert!(
+            (gap - 18.0).abs() < 0.5,
+            "at {width} px the i is {gap} px after the Group title, not the 8 px pair gap (18 to its middle)"
         );
     }
 }

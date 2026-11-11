@@ -130,15 +130,25 @@ impl Builtin {
         }
     }
 
-    /// The new sound a config written before the pack names: `rise`, `fall`, `pop`, `tick`, and
-    /// `fault` for the error role only.
+    /// The default built-in of `role`.
+    #[must_use]
+    pub const fn default_for(role: Sound) -> Self {
+        match role {
+            Sound::Start => Self::Rise,
+            Sound::Stop => Self::Fall,
+            Sound::Done => Self::Pop,
+            Sound::Cancel => Self::Tick,
+            Sound::Error => Self::Fault,
+        }
+    }
+
+    /// What a config written before the pack names with `rise`, `fall`, `pop`, `tick` (and
+    /// `fault` for the error role only) becomes: the default of `role`, so a file that used one
+    /// old id for start and stop gets two different sounds.
     #[must_use]
     pub fn from_legacy_id(text: &str, role: Sound) -> Option<Self> {
         match text {
-            "rise" => Some(Self::Rise),
-            "fall" => Some(Self::Fall),
-            "pop" => Some(Self::Pop),
-            "tick" => Some(Self::Tick),
+            "rise" | "fall" | "pop" | "tick" => Some(Self::default_for(role)),
             "fault" if role == Sound::Error => Some(Self::Fault),
             _ => None,
         }
@@ -220,10 +230,7 @@ impl Builtin {
             Self::Rx10 => (vec![Part::sine(359.0, 31.0)], 0.5),
             Self::Rx12 => (vec![Part::sine(256.0, 48.0)], 0.5),
             Self::Rx14 => (
-                vec![
-                    Part::sine(1113.0, 26.0),
-                    Part::sine(2226.0, 26.0).gain(0.3),
-                ],
+                vec![Part::sine(1113.0, 26.0), Part::sine(2226.0, 26.0).gain(0.3)],
                 0.25,
             ),
             Self::Rx25 => (vec![Part::sine(2104.0, 91.0)], 0.35),
@@ -396,7 +403,12 @@ impl Part {
 pub enum Choice {
     Builtin(Builtin),
     Custom(PathBuf),
+    /// `off`: the role plays nothing.
+    Off,
 }
+
+/// The config value of [`Choice::Off`].
+pub const OFF: &str = "off";
 
 /// The value is neither a built-in id nor a path to a `.wav` or `.ogg`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -404,14 +416,17 @@ pub enum Choice {
 pub struct UnknownSound(pub String);
 
 impl Choice {
-    /// What `config::Sounds::normalise` accepts for `role`: a built-in id, an id of the sounds
-    /// before the pack ([`Builtin::from_legacy_id`]), or a path (it has a separator or a drive
+    /// What `config::Sounds::normalise` accepts for `role`: [`OFF`], a built-in id, an id of the
+    /// sounds before the pack ([`Builtin::from_legacy_id`]), or a path (it has a separator or a drive
     /// colon, or ends in `.wav` or `.ogg`).
     ///
     /// # Errors
     /// [`UnknownSound`] for any other text.
     pub fn parse_for(role: Sound, text: &str) -> Result<Self, UnknownSound> {
         let text = text.trim();
+        if text.eq_ignore_ascii_case(OFF) {
+            return Ok(Self::Off);
+        }
         let built_in = Builtin::ALL
             .into_iter()
             .find(|b| b.id() == text)
@@ -792,19 +807,29 @@ mod tests {
             }
         }
         assert!(Builtin::PICKABLE.iter().all(|b| Builtin::ALL.contains(b)));
-        assert!(Choice::parse("fault").is_err(), "legacy fault is for errors only");
+        assert!(
+            Choice::parse("fault").is_err(),
+            "legacy fault is for errors only"
+        );
     }
 
     // Configs written before the pack keep working: each old id is the role's new default.
     #[test]
-    fn old_ids_map_to_the_nearest_new_sound() {
-        for (old, new) in [
-            ("rise", Builtin::ApaHit3),
-            ("fall", Builtin::ApaHit2),
-            ("pop", Builtin::Rx25),
-            ("tick", Builtin::CancelSoft),
-        ] {
-            assert_eq!(Choice::parse(old), Ok(Choice::Builtin(new)), "{old}");
+    fn old_ids_map_to_the_default_of_their_role() {
+        for old in ["rise", "fall", "pop", "tick"] {
+            for (role, new) in [
+                (Sound::Start, Builtin::ApaHit3),
+                (Sound::Stop, Builtin::ApaHit2),
+                (Sound::Done, Builtin::Rx25),
+                (Sound::Cancel, Builtin::CancelSoft),
+                (Sound::Error, Builtin::Boop3),
+            ] {
+                assert_eq!(
+                    Choice::parse_for(role, old),
+                    Ok(Choice::Builtin(new)),
+                    "{old}"
+                );
+            }
         }
         assert_eq!(
             Choice::parse_for(Sound::Error, "fault"),
@@ -816,7 +841,10 @@ mod tests {
     // `OXI_SOUND_OUT=<dir> cargo test -p oxi-core render_built_ins -- --ignored`.
     #[test]
     #[ignore = "writes files for listening, only when asked"]
-    #[allow(clippy::cast_possible_truncation, reason = "a sample in -1..1 times 32767")]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "a sample in -1..1 times 32767"
+    )]
     fn render_built_ins_to_wav() {
         let dir = std::env::var_os("OXI_SOUND_OUT").expect("set OXI_SOUND_OUT to a folder");
         for b in Builtin::ALL {

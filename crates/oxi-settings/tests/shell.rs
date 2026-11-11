@@ -16,7 +16,10 @@ use oxi_core::ipc::Push;
 use oxi_settings::ipc::{Cmd, Event, Link};
 use oxi_settings::{AppWindow, ChipLevel, Ipc, Page, Shell, ThemeChoice, Toast, Tokens};
 use slint::ComponentHandle;
-use slint::platform::{Key, PointerEventButton, WindowEvent};
+use slint::platform::software_renderer::{
+    MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
+};
+use slint::platform::{Key, Platform, PointerEventButton, WindowAdapter, WindowEvent};
 
 fn tab(window: &AppWindow, label: &str) -> ElementHandle {
     with_role(window, label, AccessibleRole::Tab)
@@ -72,6 +75,83 @@ fn about_has_made_in_ukraine_and_the_std_slint_widget() {
 fn open_slint_badge(window: &AppWindow) {
     with_role(window, "Slint", AccessibleRole::Button).invoke_accessible_default_action();
     i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(1));
+}
+
+thread_local! {
+    /// The window of the component created last on this thread, drawn by `Soft`.
+    static SURFACE: std::cell::RefCell<Option<std::rc::Rc<MinimalSoftwareWindow>>> = const { std::cell::RefCell::new(None) };
+    static START: std::time::Instant = std::time::Instant::now();
+}
+
+/// A software-rendered platform: the testing backend draws nothing, and the focus ring is a pixel.
+struct Soft;
+
+impl Platform for Soft {
+    fn create_window_adapter(
+        &self,
+    ) -> Result<std::rc::Rc<dyn WindowAdapter>, slint::PlatformError> {
+        let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+        SURFACE.with_borrow_mut(|s| *s = Some(window.clone()));
+        Ok(window)
+    }
+
+    fn duration_since_start(&self) -> std::time::Duration {
+        START.with(std::time::Instant::elapsed)
+    }
+}
+
+/// Whether the 2 px focus ring is drawn on `card`'s top edge: its pixel differs from the page's
+/// just above it.
+fn ring_on_top_edge(card: &ElementHandle) -> bool {
+    slint::platform::update_timers_and_animations();
+    let (width, height) = (1000_usize, 700_usize);
+    let surface = SURFACE.with_borrow(Clone::clone).unwrap();
+    surface.request_redraw();
+    let mut buffer = vec![PremultipliedRgbaColor::default(); width * height];
+    assert!(surface.draw_if_needed(|renderer| {
+        renderer.render(&mut buffer, width);
+    }));
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "whole positive window pixels"
+    )]
+    let (x, y) = {
+        let (at, size) = (card.absolute_position(), card.size());
+        ((at.x + size.width * 0.75) as usize, at.y as usize)
+    };
+    let at = |dy: usize| {
+        let p = buffer[(y - dy) * width + x];
+        [p.red, p.green, p.blue]
+    };
+    // The ring sits 2 to 4 px outside the card.
+    at(3) != at(9)
+}
+
+/// Esc on the Slint badge hands the focus back to the card that opened it, and the keyboard user
+/// keeps the ring (`KeyFocus.after`, not `from-key`).
+#[test]
+fn about_slint_card_keeps_its_ring_when_esc_closes_its_badge() {
+    slint::platform::set_platform(Box::new(Soft)).unwrap();
+    let window = common::open_again(&layout("about-ring", None), Page::About);
+    window
+        .window()
+        .set_size(slint::PhysicalSize::new(1000, 700));
+    let card = with_role(&window, "Slint", AccessibleRole::Button);
+    assert!(!ring_on_top_edge(&card), "a ring before any key");
+    // The rail, Project page, MIT, Apache-2.0, Rust, then Slint.
+    for _ in 0..6 {
+        press(&window, Key::Tab);
+    }
+    assert!(
+        ring_on_top_edge(&card),
+        "Tab draws no ring on the Slint card"
+    );
+    press(&window, Key::Return);
+    assert!(has(&window, "#MadeWithSlint"), "Enter opens no badge");
+    press(&window, Key::Escape);
+    assert!(!has(&window, "#MadeWithSlint"), "Esc leaves the badge open");
+    assert!(ring_on_top_edge(&card), "the ring went with the badge");
 }
 
 #[test]
@@ -219,7 +299,7 @@ fn about_tiles_sit_on_whole_pixels() {
 
 #[test]
 fn theme_pick_writes_ui_theme() {
-    let l = layout("theme", Some("version = 1\n# mine\n"));
+    let l = layout("theme", Some("version = 2\n# mine\n"));
     let window = open(&l, Page::Hotkey);
     window.set_page(Page::System);
     with_role(&window, "Theme", AccessibleRole::RadioGroup);
@@ -262,7 +342,7 @@ fn newer_config_is_read_only() {
 
 #[test]
 fn broken_config_shows_its_line_and_resets_keeping_a_backup() {
-    let original = "version = 1\n[audio]\ngain_db = \n";
+    let original = "version = 2\n[audio]\ngain_db = \n";
     let l = layout("broken", Some(original));
     let window = open(&l, Page::Hotkey);
     let banner = window.get_banner_text();
@@ -282,7 +362,7 @@ fn broken_config_shows_its_line_and_resets_keeping_a_backup() {
 
 #[test]
 fn reset_drops_the_daemons_stale_config_error() {
-    let l = layout("reset-linked", Some("version = 1\n[audio]\ngain_db = \n"));
+    let l = layout("reset-linked", Some("version = 2\n[audio]\ngain_db = \n"));
     let (ipc, _rx) = Ipc::fake();
     let window = open_linked(&l, Page::Hotkey, ipc.clone());
     ipc.deliver(&Event::Push(Push::ConfigError {
@@ -346,7 +426,7 @@ fn banners(window: &AppWindow) -> Vec<String> {
 
 #[test]
 fn failed_reset_keeps_the_parse_banner_and_its_buttons() {
-    let original = "version = 1
+    let original = "version = 2
 [audio]
 gain_db = 
 ";
@@ -369,7 +449,7 @@ fn failed_open_file_keeps_the_parse_banner_and_its_buttons() {
     let l = layout(
         "open-fails",
         Some(
-            "version = 1
+            "version = 2
 [audio]
 gain_db = 
 ",
@@ -524,12 +604,12 @@ fn poll() {
 
 #[test]
 fn a_file_fixed_outside_clears_the_banner_and_refreshes_the_pages() {
-    let l = layout("fixed-outside", Some("version = 1\n[audio]\ngain_db = \n"));
+    let l = layout("fixed-outside", Some("version = 2\n[audio]\ngain_db = \n"));
     let window = open(&l, Page::Hotkey);
     assert!(window.get_banner_text().contains("line 3"));
     assert!(window.global::<Shell>().get_locked());
 
-    fs::write(l.config_file(), "version = 1\n[ui]\ntheme = \"dark\"\n").unwrap();
+    fs::write(l.config_file(), "version = 2\n[ui]\ntheme = \"dark\"\n").unwrap();
     poll();
     assert_eq!(window.get_banner_text(), "");
     assert!(!window.global::<Shell>().get_locked());
@@ -537,7 +617,7 @@ fn a_file_fixed_outside_clears_the_banner_and_refreshes_the_pages() {
     assert!(!has(&window, "Reset to defaults"));
 
     // Broken again: the banner comes back, the hand edit stays on disk.
-    let broken = "version = 1\n[ui]\ntheme = \n";
+    let broken = "version = 2\n[ui]\ntheme = \n";
     fs::write(l.config_file(), broken).unwrap();
     poll();
     assert!(window.get_banner_text().contains("line 3"));
@@ -547,7 +627,7 @@ fn a_file_fixed_outside_clears_the_banner_and_refreshes_the_pages() {
 
 #[test]
 fn a_file_fixed_outside_drops_the_daemons_config_error() {
-    let l = layout("fixed-linked", Some("version = 1\n[audio]\ngain_db = \n"));
+    let l = layout("fixed-linked", Some("version = 2\n[audio]\ngain_db = \n"));
     let (ipc, _rx) = Ipc::fake();
     let window = open_linked(&l, Page::Hotkey, ipc.clone());
     ipc.deliver(&Event::Push(Push::ConfigError {
@@ -561,7 +641,7 @@ fn a_file_fixed_outside_drops_the_daemons_config_error() {
         "the same broken file is reported once"
     );
 
-    fs::write(l.config_file(), "version = 1\n").unwrap();
+    fs::write(l.config_file(), "version = 2\n").unwrap();
     poll();
     assert_eq!(banners(&window), Vec::<String>::new());
 }
@@ -1139,8 +1219,9 @@ fn update_confirm_takes_the_focus_and_gives_it_back() {
             window.window().dispatch_event(event);
         }
     };
-    // The rail, the sub-tabs, the theme tiles, App language, Start at sign-in, Check for updates.
-    for _ in 0..6 {
+    // The rail, the sub-tabs, the theme tiles, the "i" and the box of App language, Start at
+    // sign-in, the "i" of Check for updates and its switch.
+    for _ in 0..8 {
         press(&window, Key::Tab);
     }
     space();
@@ -1205,9 +1286,9 @@ fn the_warning_is_a_tab_stop_that_opens_its_tooltip() {
     };
     press_switch(&window, "Log dictated text");
     assert_eq!(copies(), 1);
-    // The rail, the sub-tabs, the two recording limits and their switch, the folder field, the
-    // two folder buttons, Settings, Logs, the "!".
-    for _ in 0..11 {
+    // The rail, the sub-tabs, the "i" of Keep recordings, its two limits and their switch, the
+    // folder field, the two folder buttons, Settings, Logs, the "!".
+    for _ in 0..12 {
         press(&window, Key::Tab);
     }
     assert_eq!(copies(), 2, "focus on the \"!\" opens the tooltip");

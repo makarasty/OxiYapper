@@ -74,12 +74,7 @@ fn rect(e: &ElementHandle) -> [f32; 4] {
 fn insets(outer: [f32; 4], inner: [f32; 4]) -> [f32; 4] {
     let [ox, oy, ow, oh] = outer;
     let [ix, iy, iw, ih] = inner;
-    [
-        ix - ox,
-        ox + ow - (ix + iw),
-        iy - oy,
-        oy + oh - (iy + ih),
-    ]
+    [ix - ox, ox + ow - (ix + iw), iy - oy, oy + oh - (iy + ih)]
 }
 
 fn spread(v: &[f32]) -> f32 {

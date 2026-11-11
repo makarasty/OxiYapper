@@ -39,8 +39,8 @@ All measured against the 8 owner reference phrases before becoming defaults.
 - `dictionary.txt` words go into the whisper prompt. whisper.cpp keeps only the last ~224 tokens: show the token count and warn past the limit.
 - `replace.txt` lines `heard => wanted`, whole word, case-insensitive, applied after transcription, never in the prompt.
 - Strip `\n` from whisper output without adding spaces (it wraps mid-word).
-- Paste: save clipboard, set text, synthetic Ctrl/Cmd+V, restore clipboard after a delay. Paste always pastes, except in Type mode and when the clipboard is locked by another program; there is no automatic typing of short texts (owner 2026-11-08). What can be restored is restored; a complex clipboard object may be lost (accepted).
-- Windows clipboard history (Win+V): setting "keep dictation in Win+V history", default on (owner 2026-11-08). Ctrl+V returns the previous clipboard. Order in Win+V (owner 2026-11-10): the user's own copy stays current and on top, the dictation is second, and the previous dictation of ours is removed from the history. The dictated text is never uploaded to the cloud clipboard, whatever the setting. Elevated target window (UIPI): say "press Ctrl+V" instead of failing silently.
+- Paste: save clipboard, set text, synthetic Ctrl/Cmd+V, restore clipboard after a delay. Paste always pastes, except in Type mode; there is no automatic typing of short texts (owner 2026-11-08). The user's copy is never lost (owner 2026-11-10): when the clipboard cannot be saved whole (too big, slow or hung owner) or is locked by another program, the text is typed instead and the clipboard is left alone.
+- Windows clipboard history (Win+V): setting "keep dictation in Win+V history", default on (owner 2026-11-08). Ctrl+V returns the previous clipboard. Order in Win+V (owner 2026-11-10): the target is that the user's own copy stays on top and the dictation is second; until the probe in ROADMAP's deferred list is done, Win+V shows the dictation on top, Ctrl+V still returns the user's copy, and the previous dictation of ours is removed from the history. The dictated text is never uploaded to the cloud clipboard, whatever the setting. Elevated target window (UIPI): say "press Ctrl+V" instead of failing silently.
 
 ## Models
 
@@ -89,7 +89,7 @@ All measured against the 8 owner reference phrases before becoming defaults.
 
 - Theme follows the OS, with a visual picker (System, Light, Dark; Windows order).
 - Sounds: a set of 3-4 own synthesised sounds (no third-party rights), volume slider, preview in settings, custom wav allowed.
-- Recording cap: 10 minutes, configurable; the overlay warns 30 s before; long audio is transcribed in chunks.
+- Recording cap: 60 minutes by default (owner decision #50, `max_seconds = 3600`), configurable up to 120 minutes in settings; the overlay warns 30 s before; long audio is transcribed in chunks.
 - Moving from the previous tool (owner's machine, never in the repo): copy the 59-word `C:\Users\mky\Desktop\dictionary.txt` into the local config; reuse the podlodka model already on disk (SHA256 checked, no 3 GB re-download); import its history (transcriptions.db + audio) as an app feature or a one-off script.
 
 ## OPEN

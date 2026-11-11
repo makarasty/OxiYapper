@@ -83,7 +83,7 @@ entries out again.
 | desktop | desktop bold | GPU |
 | book-letter | book-open-text bold | dictionary |
 | app-generic | app-window bold | per-app rule |
-| code | code bold | About Claude Code tile (or `claude-mark`) |
+| code | code bold | Model > Advanced, Decoding row |
 | person-voice | user-sound bold | About whisper.cpp tile |
 | plug-connected | plugs-connected bold | About whisper-rs tile |
 | sound-wave-circle | waveform bold | About nnnoiseless tile |

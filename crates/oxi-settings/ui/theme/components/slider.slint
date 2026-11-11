@@ -123,7 +123,7 @@ export component Slider {
         enabled: root.live;
         focus-on-click: false;
         focus-gained(reason) => {
-            root.key-focus = KeyFocus.from-key(reason);
+            root.key-focus = KeyFocus.after(reason, root.key-focus);
         }
         key-pressed(event) => {
             if (event.text == Key.RightArrow || event.text == Key.UpArrow) {

@@ -102,8 +102,8 @@ export component SystemPage inherits VerticalLayout {
             // No icon: no other System row has one, and titles start at one x (UI rule 9).
             Row {
                 title: @tr("App language");
-                description: @tr("Menus and labels of this window. It does not change the language you dictate in.");
-                // Centred: the description wraps at narrow widths, and a Combo would fill the row.
+                info: @tr("Menus and labels of this window. It does not change the language you dictate in.");
+                // Centred: a Combo would fill the row.
                 VerticalLayout {
                     alignment: center;
                     horizontal-stretch: 1;
@@ -138,7 +138,7 @@ export component SystemPage inherits VerticalLayout {
                     visible: !root.confirm-update-off;
                     flat: true;
                     title: @tr("Check for updates");
-                    description: @tr("Once a day OxiYapper asks GitHub for the latest version. Nothing installs on its own.");
+                    info: @tr("Once a day OxiYapper asks GitHub for the latest version. Nothing installs on its own.");
                     checked <=> SystemState.update-check;
                     toggled(on) => {
                         if (on) {
@@ -156,7 +156,6 @@ export component SystemPage inherits VerticalLayout {
                         keep.take-focus(root.confirm-by-key);
                     }
                     title: @tr("Update checks tell you when a fix is out.");
-                    description: @tr("Once a day OxiYapper asks GitHub for the latest version. Nothing installs on its own.");
                     Button {
                         text: @tr("Turn off");
                         kind: ButtonKind.subtle;
@@ -199,7 +198,7 @@ export component SystemPage inherits VerticalLayout {
                 title: @tr("Keep recordings");
                 // Limits act on the folder below, saving on or off; an earlier folder is never touched
                 // (SPEC History, owner 2026-11-10).
-                description: @tr("Keeps audio and text in the folder below up to these limits. Older ones are deleted, even while off.");
+                info: @tr("Keeps audio and text in the folder below up to these limits. Older ones are deleted, even while off.");
                 warning: SystemState.history-limit-note;
                 NumberField {
                     value <=> SystemState.history-days;
@@ -233,18 +232,19 @@ export component SystemPage inherits VerticalLayout {
                 }
             }
             Divider { }
-            Row {
-                title: @tr("Recordings folder");
-                warning: SystemState.history-problem;
-                // DS-3.1: the path fills the control column; under it Browse and Open, both labelled
-                // (items 7, 44): three controls do not fit one 240 px column.
-                fill-controls: true;
-                // Moving focus to another control (Tab, a click on a limit field, a button or switch)
-                // with the field unsaved puts the saved path back; Enter is the only save. Buttons and
-                // switches take no focus on a click, so they put it back themselves. The field losing
-                // focus alone (Alt+Tab away) keeps the typed text.
-                VerticalLayout {
-                    spacing: Theme.space-2;
+            // Browse and Open under the field, outside the Row: its title sits on the field's line.
+            VerticalLayout {
+                spacing: Theme.space-2;
+                Row {
+                    title: @tr("Recordings folder");
+                    warning: SystemState.history-problem;
+                    // DS-3.1: the path fills the control column; under it Browse and Open, both labelled
+                    // (items 7, 44): three controls do not fit one 240 px column.
+                    fill-controls: true;
+                    // Moving focus to another control (Tab, a click on a limit field, a button or switch)
+                    // with the field unsaved puts the saved path back; Enter is the only save. Buttons and
+                    // switches take no focus on a click, so they put it back themselves. The field losing
+                    // focus alone (Alt+Tab away) keeps the typed text.
                     PathField {
                         path <=> SystemState.history-path;
                         display: SystemState.history-folder == "" ? @tr("Default folder") : "";
@@ -262,31 +262,31 @@ export component SystemPage inherits VerticalLayout {
                             root.put-back-path();
                         }
                     }
-                    HorizontalLayout {
-                        alignment: end;
-                        spacing: Theme.control-gap;
-                        if SystemState.can-browse: Button {
-                            text: @tr("Browse");
-                            accessible-label: @tr("Change recordings folder");
-                            enabled: !Shell.locked;
-                            tooltip: Shell.locked-tip;
-                            clicked => {
-                                root.path-typed = false;
-                                SystemState.history-browse(SystemState.history-path);
-                                // The dialog blocks: a cancel leaves the typed text, put the saved path back.
-                                SystemState.history-check();
-                            }
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: Theme.control-gap;
+                    if SystemState.can-browse: Button {
+                        text: @tr("Browse");
+                        accessible-label: @tr("Change recordings folder");
+                        enabled: !Shell.locked;
+                        tooltip: Shell.locked-tip;
+                        clicked => {
+                            root.path-typed = false;
+                            SystemState.history-browse(SystemState.history-path);
+                            // The dialog blocks: a cancel leaves the typed text, put the saved path back.
+                            SystemState.history-check();
                         }
-                        // Only opens Explorer: live while the config is locked.
-                        Button {
-                            text: @tr("Open");
-                            kind: ButtonKind.subtle;
-                            icon: Icons.folder-open-16;
-                            accessible-label: @tr("Open recordings folder");
-                            clicked => {
-                                root.put-back-path();
-                                HomeState.open-history();
-                            }
+                    }
+                    // Only opens Explorer: live while the config is locked.
+                    Button {
+                        text: @tr("Open");
+                        kind: ButtonKind.subtle;
+                        icon: Icons.folder-open-16;
+                        accessible-label: @tr("Open recordings folder");
+                        clicked => {
+                            root.put-back-path();
+                            HomeState.open-history();
                         }
                     }
                 }

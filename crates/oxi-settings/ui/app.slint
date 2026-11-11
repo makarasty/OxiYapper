@@ -1,7 +1,7 @@
 // Settings window (redesign spec sections 2 and 3): a nav rail with icons on the left (icons only
 // under 960 px), the page on the right in a scrolling column as wide as the window allows, banners above it.
-import { Palette, ScrollView } from "std-widgets.slint";
-import { Theme, Shell, Icons, KeyFocus, Tip, Button, Banner, Severity, HeaderRow, StatusChip, MonthLabel, PathText } from "theme/index.slint";
+import { Palette } from "std-widgets.slint";
+import { Theme, Shell, Icons, KeyFocus, Tip, Button, Banner, Severity, HeaderRow, StatusChip, MonthLabel, PathText, ScrollView } from "theme/index.slint";
 import { KeyTipHost, Toast, ToastHost } from "theme/components/feedback.slint";
 import { HomePage, HomeState } from "pages/home.slint";
 import { HotkeyPage, HotkeyState } from "pages/hotkey.slint";
@@ -73,6 +73,7 @@ component NavItem inherits Rectangle {
         accessible-role: none;
     }
     touch := TouchArea {
+        mouse-cursor: pointer;
         clicked => {
             root.activated();
         }
@@ -117,7 +118,7 @@ export component AppWindow inherits Window {
     // Why the last daemon start failed; shown under the notice.
     in property <string> spawn-error;
     // How far the open page is scrolled (0 at the top, negative below).
-    out property <length> scroll-y: scroll.content-y;
+    out property <length> scroll-y: scroll.viewport-y;
     // The display scale the window opens at, set once before the OS window exists. Slint gives
     // every later icon change to the taskbar too, as ICON_BIG, in place of the exe's oxi.ico; so a
     // window moved to another display keeps this size.
@@ -192,7 +193,7 @@ export component AppWindow inherits Window {
     changed page => {
         // The rail follows a page opened by Ctrl+Tab; the page opens at its top.
         nav.cursor = root.index-of(root.page);
-        scroll.content-y = 0;
+        scroll.viewport-y = 0;
         if (root.page == Page.home) {
             HomeState.shown();
         }
@@ -228,7 +229,7 @@ export component AppWindow inherits Window {
             property <bool> key-focus;
             focus-gained(reason) => {
                 self.cursor = root.index-of(root.page);
-                self.key-focus = KeyFocus.from-key(reason);
+                self.key-focus = KeyFocus.after(reason, self.key-focus);
             }
             // Up and Down move the focus between pages; Enter or Space opens one.
             key-pressed(event) => {
@@ -319,61 +320,63 @@ export component AppWindow inherits Window {
             }
 
             // One scroll area for the open page (back at the top on a page change); the scrollbar sits at the window edge, right of the cards.
-            scroll := ScrollView {
+            Rectangle {
                 vertical-stretch: 1;
-                content-width: self.visible-width;
-                content-height: max(self.visible-height, column.preferred-height);
-                // The page gets the full height left under the header row, so its lists can
-                // stretch (UI rule 26); a page taller than that scrolls as a whole.
-                column := VerticalLayout {
+                clip: true;
+                scroll := ScrollView {
                     x: 0;
                     y: 0;
-                    // Not `visible-width`: the 14 px scrollbar sits in the page padding, so the
-                    // cards keep their width whether or not it shows.
-                    width: scroll.width;
-                    height: scroll.content-height;
-                    padding-left: root.pad;
-                    padding-right: root.pad;
-                    padding-top: root.top;
-                    padding-bottom: root.pad;
-                    spacing: Theme.header-bottom;
-                    if !root.tabbed: HeaderRow {
-                        title: root.rail[root.index-of(root.page)].label;
-                    }
-                    if root.page == Page.home: HomePage {
-                        window-width: root.width;
-                        content-width: root.page-width;
-                        free-height: root.free-height;
-                    }
-                    if root.page == Page.hotkey: HotkeyPage {
-                        free-height: root.free-height;
-                    }
-                    if root.page == Page.audio: AudioPage {
-                        free-height: root.free-height;
-                    }
-                    if root.page == Page.model: ModelPage { }
-                    if root.page == Page.text: TextPage {
-                        free-height: root.free-height;
-                    }
-                    if root.page == Page.overlay: OverlayPage { }
-                    if root.page == Page.history: HistoryPage {
-                        free-height: root.free-height;
-                    }
-                    if root.page == Page.test: TestPage { }
-                    if root.page == Page.system: SystemPage {
-                        free-height: root.free-height;
-                        theme: root.theme;
-                        theme-picked(choice) => {
-                            root.theme = choice;
-                            root.theme-changed(choice);
+                    width: parent.width;
+                    height: parent.height;
+                    // The page gets the full height left under the header row, so its lists can
+                    // stretch (UI rule 26); a page taller than that scrolls as a whole.
+                    column := VerticalLayout {
+                        min-height: scroll.visible-height;
+                        // The bar takes its gutter from the content; the page padding gives it
+                        // back, so the cards keep their width whether or not the bar shows.
+                        padding-left: root.pad;
+                        padding-right: scroll.overflows ? max(0px, root.pad - Theme.scrollbar-gutter) : root.pad;
+                        padding-top: root.top;
+                        padding-bottom: root.pad;
+                        spacing: Theme.header-bottom;
+                        if !root.tabbed: HeaderRow {
+                            title: root.rail[root.index-of(root.page)].label;
                         }
-                    }
-                    if root.page == Page.about: AboutPage {
-                        free-height: root.free-height;
-                        app-name: root.app-name;
-                        version: root.version;
-                        licence: root.licence;
-                        repository: root.repository;
+                        if root.page == Page.home: HomePage {
+                            window-width: root.width;
+                            content-width: root.page-width;
+                            free-height: root.free-height;
+                        }
+                        if root.page == Page.hotkey: HotkeyPage {
+                            free-height: root.free-height;
+                        }
+                        if root.page == Page.audio: AudioPage {
+                            free-height: root.free-height;
+                        }
+                        if root.page == Page.model: ModelPage { }
+                        if root.page == Page.text: TextPage {
+                            free-height: root.free-height;
+                        }
+                        if root.page == Page.overlay: OverlayPage { }
+                        if root.page == Page.history: HistoryPage {
+                            free-height: root.free-height;
+                        }
+                        if root.page == Page.test: TestPage { }
+                        if root.page == Page.system: SystemPage {
+                            free-height: root.free-height;
+                            theme: root.theme;
+                            theme-picked(choice) => {
+                                root.theme = choice;
+                                root.theme-changed(choice);
+                            }
+                        }
+                        if root.page == Page.about: AboutPage {
+                            free-height: root.free-height;
+                            app-name: root.app-name;
+                            version: root.version;
+                            licence: root.licence;
+                            repository: root.repository;
+                        }
                     }
                 }
                 // Right of the header row, over a page's own SubTabs too; it scrolls with them.
@@ -381,7 +384,7 @@ export component AppWindow inherits Window {
                     x: scroll.width - root.pad - self.width;
                     // Its text centres on the header's: the page name (centred in the row) or the
                     // SubTabs labels (between the tab paddings, over the 1 px tab line).
-                    y: column.padding-top + floor(((root.tabbed ? Theme.tab-padding-top + (Theme.header-row-height - 1px - Theme.tab-padding-top - Theme.tab-padding-bottom) / 2 : Theme.header-row-height / 2) - self.height / 2) / 1px) * 1px;
+                    y: scroll.viewport-y + column.padding-top + floor(((root.tabbed ? Theme.tab-padding-top + (Theme.header-row-height - 1px - Theme.tab-padding-top - Theme.tab-padding-bottom) / 2 : Theme.header-row-height / 2) - self.height / 2) / 1px) * 1px;
                     width: self.preferred-width;
                     text: root.chip-text;
                     tooltip: root.chip-tooltip;

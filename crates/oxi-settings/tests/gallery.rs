@@ -11,6 +11,78 @@ mod gallery {
 
 mod common;
 
+// Probes for the shared controls, built here so the gallery sheet stays the page-task's file.
+// Slint's generated code trips the workspace `unused_qualifications` lint; it is not ours to fix.
+#[allow(unused_qualifications)]
+mod controls {
+    slint::slint! {
+        import { Palette } from "std-widgets.slint";
+        import { Theme, Button, PathField, PositionTiles, TilePicker } from "../ui/theme/index.slint";
+
+        export component PathProbe inherits Window {
+            in property <string> display;
+            out property <color> ink: f.shown-color;
+            out property <color> secondary: Theme.text-secondary;
+            out property <bool> browse-icon: f.browse-icon.width > 0;
+            width: 400px;
+            height: 100px;
+            f := PathField {
+                width: 240px;
+                path: "C:/models/a.bin";
+                display: root.display;
+                browse-text: "Browse";
+            }
+        }
+
+        export component TilesProbe inherits Window {
+            out property <length> next-x: Theme.position-tile-height * 1.5 + Theme.space-1;
+            width: 400px;
+            height: 100px;
+            init => {
+                Palette.color-scheme = ColorScheme.dark;
+            }
+            PositionTiles {
+                x: 0;
+                y: 0;
+                names: ["a", "b", "c", "d", "e", "f"];
+                selected: 0;
+            }
+        }
+
+        export component FocusProbe inherits Window {
+            out property <bool> ring: b.key-focused;
+            width: 200px;
+            height: 100px;
+            b := Button {
+                text: "One";
+            }
+        }
+
+        // A tile row that opens a PopupWindow when a tile is picked, as About's Slint tile does.
+        export component PopupProbe inherits Window {
+            out property <bool> ring: t.ring;
+            width: 400px;
+            height: 100px;
+            t := TilePicker {
+                tiles: [{ title: "a" }, { title: "b" }];
+                selected: 0;
+                picked(i) => {
+                    pop.show();
+                }
+            }
+            pop := PopupWindow {
+                x: 0;
+                y: 60px;
+                width: 100px;
+                height: 30px;
+                Rectangle {
+                    background: Palette.background;
+                }
+            }
+        }
+    }
+}
+
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -811,7 +883,9 @@ fn tile_pick_fades_the_check_badge_in() {
         (top..top + 30)
             .flat_map(|y| (right - 40..right).map(move |x| buffer[y * 480 + x]))
             .filter(|p| {
-                near(p.red, accent.red()) && near(p.green, accent.green()) && near(p.blue, accent.blue())
+                near(p.red, accent.red())
+                    && near(p.green, accent.green())
+                    && near(p.blue, accent.blue())
             })
             .count()
     };
@@ -834,7 +908,11 @@ fn tile_pick_fades_the_check_badge_in() {
 /// Item 16 (dark): pressing an unselected tile goes hover -> tint; the pressed fill is darker than
 /// the card, so showing it made the pick blink dark between two brighter fills.
 #[test]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)] // whole positive pixels
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)] // whole positive pixels
 fn tile_press_never_dips_below_the_rest_fill_in_dark() {
     use slint::private_unstable_api::re_exports::{ColorScheme, WindowInner};
 
@@ -880,7 +958,10 @@ fn tile_press_never_dips_below_the_rest_fill_in_dark() {
     window.dispatch_event(WindowEvent::PointerReleased { position, button });
     step(&mut lowest);
     assert_eq!(probe.get_picked(), 1, "the click hit the second tile");
-    assert!(lowest >= rest, "the fill dipped to {lowest}, rest is {rest}");
+    assert!(
+        lowest >= rest,
+        "the fill dipped to {lowest}, rest is {rest}"
+    );
 }
 
 /// UI rule 16: Remove turns red under the pointer, also as an icon-only button.
@@ -917,4 +998,92 @@ fn sub_tab_click_picks_without_a_focus_ring() {
         1,
         "the click left the keys on the bar"
     );
+}
+
+fn shown_path(display: &str) -> controls::PathProbe {
+    let _ = slint::platform::set_platform(Box::new(Shots));
+    let probe = controls::PathProbe::new().unwrap();
+    probe.set_display(display.into());
+    probe.show().unwrap();
+    slint::platform::update_timers_and_animations();
+    probe
+}
+
+/// DS-13.3: a shown default reads as a default (secondary ink); a real path stays primary.
+#[test]
+fn path_field_default_is_secondary_ink() {
+    let default = shown_path("Default folder");
+    assert_eq!(default.get_ink(), default.get_secondary());
+    assert_ne!(default.get_ink(), shown_path("").get_ink());
+}
+
+/// DS-7.4: Browse is a Button with the folder-open glyph.
+#[test]
+fn path_field_browse_has_the_folder_glyph() {
+    assert!(shown_path("").get_browse_icon(), "Browse has no glyph");
+}
+
+/// In dark the accent is near-white ink: the picked spot must differ from the others by its
+/// stroke too, not by the faint tint alone.
+#[test]
+fn position_tiles_selected_stroke_differs_in_dark() {
+    let _ = slint::platform::set_platform(Box::new(Shots));
+    let probe = controls::TilesProbe::new().unwrap();
+    let surface = LAST.with_borrow(Clone::clone).unwrap();
+    surface.set_size(PhysicalSize::new(400, 100));
+    probe.show().unwrap();
+    slint::platform::update_timers_and_animations();
+    // Tile 0 is picked, tile 1 is not: the pixel under each one's left edge, at y 10.
+    surface.request_redraw();
+    let mut buffer = vec![PremultipliedRgbaColor::default(); 400 * 100];
+    assert!(surface.draw_if_needed(|renderer| {
+        renderer.render(&mut buffer, 400);
+    }));
+    let at = |x: usize| {
+        let p = buffer[10 * 400 + x];
+        [p.red, p.green, p.blue]
+    };
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a small positive tile pitch in pixels"
+    )]
+    let next = probe.get_next_x().round() as usize;
+    assert_ne!(at(0), at(next), "picked and plain tiles share one stroke");
+}
+
+/// A window coming back to the front (Alt+Tab) is not a key press: no ring. Tab still draws it.
+#[test]
+fn window_activation_draws_no_focus_ring() {
+    let _ = slint::platform::set_platform(Box::new(Shots));
+    let probe = controls::FocusProbe::new().unwrap();
+    probe.show().unwrap();
+    slint::platform::update_timers_and_animations();
+    probe
+        .window()
+        .dispatch_event(WindowEvent::WindowActiveChanged(true));
+    press(&probe, Key::Tab);
+    assert!(probe.get_ring(), "Tab draws no ring");
+    probe
+        .window()
+        .dispatch_event(WindowEvent::WindowActiveChanged(false));
+    probe
+        .window()
+        .dispatch_event(WindowEvent::WindowActiveChanged(true));
+    slint::platform::update_timers_and_animations();
+    assert!(!probe.get_ring(), "the ring came back with the window");
+}
+
+/// Closing a popup with Esc hands the focus back to the opener: a keyboard user keeps the ring.
+#[test]
+fn popup_closed_by_keyboard_keeps_the_focus_ring() {
+    let _ = slint::platform::set_platform(Box::new(Shots));
+    let probe = controls::PopupProbe::new().unwrap();
+    probe.show().unwrap();
+    slint::platform::update_timers_and_animations();
+    press(&probe, Key::Tab);
+    assert!(probe.get_ring(), "Tab draws no ring");
+    press(&probe, Key::RightArrow);
+    press(&probe, Key::Escape);
+    assert!(probe.get_ring(), "the ring went with the popup");
 }

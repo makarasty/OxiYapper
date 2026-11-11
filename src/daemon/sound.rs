@@ -114,13 +114,14 @@ pub fn spawn(rx: Receiver<SoundCmd>, inbox: Sender<Inbox>) -> io::Result<JoinHan
 struct Player {
     enabled: bool,
     volume: f64,
-    start: Clip,
-    stop: Clip,
-    done: Clip,
+    /// `None`: the sound is Off and plays nothing.
+    start: Option<Clip>,
+    stop: Option<Clip>,
+    done: Option<Clip>,
     /// `sounds.done_enabled`: the done sound has its own switch.
     done_enabled: bool,
-    cancel: Clip,
-    error: Clip,
+    cancel: Option<Clip>,
+    error: Option<Clip>,
     /// Warnings for the sounds of the last config.
     config_warnings: Vec<SoundWarning>,
     /// Why the last preview played nothing; cleared by the next good preview or config.
@@ -143,12 +144,12 @@ impl Player {
         Self {
             enabled: false,
             volume: 0.0,
-            start: Clip::builtin(Builtin::Rise),
-            stop: Clip::builtin(Builtin::Fall),
-            done: Clip::builtin(Builtin::Pop),
+            start: Some(Clip::builtin(Builtin::default_for(Sound::Start))),
+            stop: Some(Clip::builtin(Builtin::default_for(Sound::Stop))),
+            done: Some(Clip::builtin(Builtin::default_for(Sound::Done))),
             done_enabled: true,
-            cancel: Clip::builtin(Builtin::Tick),
-            error: Clip::builtin(Builtin::Fault),
+            cancel: Some(Clip::builtin(Builtin::default_for(Sound::Cancel))),
+            error: Some(Clip::builtin(Builtin::default_for(Sound::Error))),
             config_warnings: Vec::new(),
             preview_warning: None,
             play_warning: None,
@@ -171,19 +172,19 @@ impl Player {
     /// its default.
     fn configure(&mut self, sounds: &Sounds) -> Vec<SoundWarning> {
         let mut lines = Vec::new();
-        let mut get = |key: &str, text: &str, role: Sound, default: Builtin| {
-            let (clip, warning) = load(key, text, role, default);
+        let mut get = |key: &str, text: &str, role: Sound| {
+            let (clip, warning) = load(key, text, role, Builtin::default_for(role));
             lines.extend(warning.map(|line| SoundWarning {
                 kind: Kind::Unused(role),
                 line,
             }));
             clip
         };
-        self.start = get("start", &sounds.start, Sound::Start, Builtin::Rise);
-        self.stop = get("stop", &sounds.stop, Sound::Stop, Builtin::Fall);
-        self.done = get("done", &sounds.done, Sound::Done, Builtin::Pop);
-        self.cancel = get("cancel", &sounds.cancel, Sound::Cancel, Builtin::Tick);
-        self.error = get("error", &sounds.error, Sound::Error, Builtin::Fault);
+        self.start = get("start", &sounds.start, Sound::Start);
+        self.stop = get("stop", &sounds.stop, Sound::Stop);
+        self.done = get("done", &sounds.done, Sound::Done);
+        self.cancel = get("cancel", &sounds.cancel, Sound::Cancel);
+        self.error = get("error", &sounds.error, Sound::Error);
         self.enabled = sounds.enabled;
         self.done_enabled = sounds.done_enabled;
         self.volume = sounds.volume;
@@ -198,7 +199,9 @@ impl Player {
         // The preview has no role: `fault` is the error role's, and it may be previewed.
         self.preview_warning = match try_load(text, Sound::Error) {
             Ok(clip) => {
-                self.play_samples(&clip.scaled(volume), clip.rate);
+                if let Some(clip) = clip {
+                    self.play_samples(&clip.scaled(volume), clip.rate);
+                }
                 None
             }
             Err(why) => Some(warning(Kind::Preview, format!("sounds.preview: {why}"))),
@@ -216,6 +219,10 @@ impl Player {
             Sound::Done => &self.done,
             Sound::Cancel => &self.cancel,
             Sound::Error => &self.error,
+        };
+        // Off: nothing to play, and the output is not opened.
+        let Some(clip) = clip else {
+            return;
         };
         let samples = clip.scaled(self.volume);
         self.play_samples(&samples, clip.rate);
@@ -279,23 +286,24 @@ fn warning(kind: Kind, line: String) -> SoundWarning {
     SoundWarning { kind, line }
 }
 
-/// The clip for the setting `text` of `key`. A custom file that cannot be used, or an id that
-/// is not known, gives the `default` built-in and a warning line.
-fn load(key: &str, text: &str, role: Sound, default: Builtin) -> (Clip, Option<String>) {
+/// The clip for the setting `text` of `key`, `None` for Off. A custom file that cannot be used,
+/// or an id that is not known, gives the `default` built-in and a warning line.
+fn load(key: &str, text: &str, role: Sound, default: Builtin) -> (Option<Clip>, Option<String>) {
     match try_load(text, role) {
         Ok(clip) => (clip, None),
         Err(why) => {
             let line = format!("sounds.{key}: {why}, using {}", default.id());
-            (Clip::builtin(default), Some(line))
+            (Some(Clip::builtin(default)), Some(line))
         }
     }
 }
 
-/// The clip for the setting `text` of `role`, or why it cannot be used.
-fn try_load(text: &str, role: Sound) -> Result<Clip, String> {
+/// The clip for the setting `text` of `role` (`None`: Off), or why it cannot be used.
+fn try_load(text: &str, role: Sound) -> Result<Option<Clip>, String> {
     match Choice::parse_for(role, text) {
-        Ok(Choice::Builtin(b)) => Ok(Clip::builtin(b)),
-        Ok(Choice::Custom(path)) => read_custom(&path),
+        Ok(Choice::Builtin(b)) => Ok(Some(Clip::builtin(b))),
+        Ok(Choice::Custom(path)) => read_custom(&path).map(Some),
+        Ok(Choice::Off) => Ok(None),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -347,7 +355,11 @@ mod tests {
     #[test]
     fn a_built_in_loads_without_a_warning() {
         let (clip, warning) = load("start", "pop", Sound::Start, Builtin::Rise);
-        assert_eq!(clip, Clip::builtin(Builtin::Pop));
+        assert_eq!(
+            clip,
+            Some(Clip::builtin(Builtin::Rise)),
+            "legacy pop is the start default"
+        );
         assert_eq!(warning, None);
     }
 
@@ -360,7 +372,7 @@ mod tests {
         let (_, warning) = load("done", path.to_str().unwrap(), Sound::Done, Builtin::Pop);
         assert!(warning.unwrap().contains("Ogg Vorbis"), "judged by content");
         let (clip, warning) = load("error", "fault", Sound::Error, Builtin::Fault);
-        assert_eq!((clip, warning), (Clip::builtin(Builtin::Fault), None));
+        assert_eq!((clip, warning), (Some(Clip::builtin(Builtin::Fault)), None));
         let _ = std::fs::remove_file(path);
     }
 
@@ -465,6 +477,48 @@ mod tests {
         assert_eq!(player.warnings(), [] as [SoundWarning; 0]);
     }
 
+    // Off per role: nothing is loaded, nothing is played and the output is not opened.
+    #[test]
+    fn an_off_sound_plays_nothing_and_never_opens_the_output() {
+        let mut player = Player::with_open(no_device);
+        let off = || String::from("off");
+        let sounds = Sounds {
+            start: off(),
+            stop: off(),
+            done: off(),
+            cancel: off(),
+            error: off(),
+            ..Sounds::default()
+        };
+        assert_eq!(player.configure(&sounds), [] as [SoundWarning; 0]);
+        for sound in [
+            Sound::Start,
+            Sound::Stop,
+            Sound::Done,
+            Sound::Cancel,
+            Sound::Error,
+        ] {
+            player.play_sound(sound);
+        }
+        assert_eq!(
+            player.warnings(),
+            [] as [SoundWarning; 0],
+            "no open was tried"
+        );
+        assert!(player.playing.is_empty());
+        assert_eq!(player.preview("off", 0.5), [] as [SoundWarning; 0]);
+        // Only the Off role is silent: the others still reach the output.
+        let sounds = Sounds {
+            stop: off(),
+            ..Sounds::default()
+        };
+        player.configure(&sounds);
+        player.play_sound(Sound::Stop);
+        assert_eq!(player.warnings(), [] as [SoundWarning; 0]);
+        player.play_sound(Sound::Start);
+        assert_eq!(player.warnings()[0].kind, Kind::NotPlayed);
+    }
+
     // The start sound dropped on a slow open: the stream was due to be dropped from the moment
     // the open began, so a slow open ate the clip. It is due from the moment the open ended.
     #[test]
@@ -510,9 +564,10 @@ mod tests {
             ..Sounds::default()
         };
         assert_eq!(player.configure(&sounds), [] as [SoundWarning; 0]);
-        assert_eq!(player.done, Clip::builtin(Builtin::Tick));
-        assert_eq!(player.cancel, Clip::builtin(Builtin::Pop));
-        assert_eq!(player.error, Clip::builtin(Builtin::Rise));
+        // The old ids are the default of the role they stand in.
+        assert_eq!(player.done, Some(Clip::builtin(Builtin::Pop)));
+        assert_eq!(player.cancel, Some(Clip::builtin(Builtin::Tick)));
+        assert_eq!(player.error, Some(Clip::builtin(Builtin::Fault)));
     }
 
     #[test]
@@ -520,6 +575,7 @@ mod tests {
         let path = temp("good.wav");
         std::fs::write(&path, tiny_wav()).unwrap();
         let (clip, warning) = load("stop", path.to_str().unwrap(), Sound::Stop, Builtin::Fall);
+        let clip = clip.unwrap();
         assert_eq!((clip.rate, clip.samples.len()), (8_000, 80));
         assert_eq!(warning, None);
         let _ = std::fs::remove_file(path);
@@ -538,7 +594,7 @@ mod tests {
             "no-such-id",
         ] {
             let (clip, warning) = load("start", setting, Sound::Start, Builtin::Rise);
-            assert_eq!(clip, Clip::builtin(Builtin::Rise), "{setting}");
+            assert_eq!(clip, Some(Clip::builtin(Builtin::Rise)), "{setting}");
             let warning = warning.unwrap_or_else(|| panic!("no warning for {setting}"));
             assert!(warning.starts_with("sounds.start: "), "{warning}");
             let using = format!(", using {}", Builtin::Rise.id());
@@ -587,8 +643,8 @@ mod tests {
         let warnings = player.configure(&sounds);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert_eq!(warnings[0].kind, Kind::Unused(Sound::Start));
-        assert_eq!(player.stop, Clip::builtin(Builtin::Tick));
-        assert_eq!(player.start, Clip::builtin(Builtin::Rise));
+        assert_eq!(player.stop, Some(Clip::builtin(Builtin::Fall)));
+        assert_eq!(player.start, Some(Clip::builtin(Builtin::Rise)));
         assert_eq!(
             player.configure(&Sounds::default()),
             [] as [SoundWarning; 0]

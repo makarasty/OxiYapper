@@ -31,10 +31,14 @@ export component PageHeader inherits VerticalLayout {
 export component Group inherits VerticalLayout {
     in property <string> title;
     in property <image> icon;
+    // A hint about the group: the "i" `pair-gap` after the title, this text its tooltip (UI rule
+    // 35). Empty shows none.
+    in property <string> info;
     spacing: Theme.card-gap;
     if root.title != "": HorizontalLayout {
         padding-bottom: Theme.header-gap - Theme.card-gap;
         spacing: Theme.pair-gap;
+        alignment: start;
         if root.icon.width > 0: Image {
             source: root.icon;
             width: Theme.icon-size;
@@ -47,7 +51,11 @@ export component Group inherits VerticalLayout {
             font-size: Theme.body-size;
             font-weight: Theme.weight-strong;
             color: Theme.text-primary;
-            horizontal-stretch: 1;
+            // Centred in the icon's 20 px cell, so the icon and the text share one centre.
+            vertical-alignment: center;
+        }
+        if root.info != "": InfoTip {
+            text: root.info;
         }
     }
     @children
@@ -106,7 +114,7 @@ export component ClickCard inherits CardFrame {
         enabled: root.enabled;
         focus-on-click: false;
         focus-gained(reason) => {
-            root.key-focus = KeyFocus.from-key(reason);
+            root.key-focus = KeyFocus.after(reason, root.key-focus);
         }
         key-pressed(event) => {
             if (event.text == " " || event.text == Key.Return) {
@@ -247,10 +255,14 @@ export component Row inherits HorizontalLayout {
         // A parent TouchArea sees the hover and still hands the pointer to the controls.
         hover := TouchArea {
             enabled: root.full-text != "" && !Shell.locked;
-            controls := HorizontalLayout {
-                alignment: root.fill-controls ? LayoutAlignment.stretch : LayoutAlignment.end;
-                spacing: Theme.control-gap;
-                @children
+            // A row taller than its controls (title + description) centres them (DS-3.4).
+            VerticalLayout {
+                alignment: center;
+                controls := HorizontalLayout {
+                    alignment: root.fill-controls ? LayoutAlignment.stretch : LayoutAlignment.end;
+                    spacing: Theme.control-gap;
+                    @children
+                }
             }
             Tip {
                 text: measure.preferred-width > hover.width - Theme.control-height - Theme.space-3 ? root.full-text : "";
@@ -504,7 +516,7 @@ export component StatusChip {
         enabled: root.actionable;
         focus-on-click: false;
         focus-gained(reason) => {
-            root.key-focus = KeyFocus.from-key(reason);
+            root.key-focus = KeyFocus.after(reason, root.key-focus);
         }
         key-pressed(event) => {
             if (event.text == " " || event.text == Key.Return) {

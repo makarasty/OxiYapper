@@ -63,7 +63,6 @@ export component HotkeyPage inherits VerticalLayout {
             Row {
                 icon: Icons.keyboard;
                 title: @tr("Keys");
-                description: HotkeyState.esc-cancels ? @tr("Hold these keys to talk. Esc cancels a recording.") : @tr("Hold these keys to talk.");
                 Rectangle {
                     preferred-width: chord.preferred-width;
                     chord := KeycapRow {
@@ -75,13 +74,13 @@ export component HotkeyPage inherits VerticalLayout {
                     }
                     chord-area := TouchArea {
                         enabled: !Shell.locked && !HotkeyState.keyboard-open;
+                        mouse-cursor: self.enabled ? pointer : default;
                         clicked => {
                             HotkeyState.change();
                         }
                     }
                 }
-                // Row tops its controls in a row taller than 32 (the caption makes this one 35): centre
-                // it on the keycaps (DS-3.4).
+                // Centre the button on the keycaps (DS-3.4).
                 VerticalLayout {
                     alignment: center;
                     IconButton {

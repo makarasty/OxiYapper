@@ -1,8 +1,7 @@
 // Text page (SPEC Text), in four sub-tabs: dictionary.txt with its prompt token budget, replace.txt
 // with the lines it ignores, how text is pasted (mode, trailing space, Win+V history, restore
 // delay), and the per-app rules.
-import { ScrollView } from "std-widgets.slint";
-import { Theme, Shell, Icons, Group, Card, Row, Divider, ToggleRow, SliderRow, Combo, TextField, TextArea, TilePicker, Button, ButtonKind, InfoTip, ProgressBar, Note, Severity, SubTabs, SubTabPane, GalleryTile, TileGallery, EmptyState } from "../theme/index.slint";
+import { Theme, Shell, Icons, Group, Card, Row, Divider, ToggleRow, SliderRow, Combo, TextField, TextArea, TilePicker, Button, ButtonKind, InfoTip, ProgressBar, Note, Severity, SubTabs, SubTabPane, GalleryTile, TileGallery, EmptyState, ScrollView } from "../theme/index.slint";
 import { WarningSlot, Warnings } from "../theme/components/feedback.slint";
 
 export enum TextFile { dictionary, replacements }
@@ -313,7 +312,7 @@ export component TextPage inherits VerticalLayout {
                         ToggleRow {
                             flat: true;
                             title: @tr("Trailing space");
-                            description: @tr("Adds a space after the pasted text.");
+                            info: @tr("Adds a space after the pasted text.");
                             checked <=> TextState.trailing-space;
                             toggled(on) => {
                                 TextState.trailing-space-toggled(on);
@@ -323,7 +322,7 @@ export component TextPage inherits VerticalLayout {
                         ToggleRow {
                             flat: true;
                             title: @tr("Keep the last dictation in Win+V");
-                            description: @tr("A new dictation replaces the one before.");
+                            info: @tr("A new dictation replaces the one before.");
                             checked <=> TextState.keep-history;
                             toggled(on) => {
                                 TextState.keep-history-toggled(on);
@@ -332,7 +331,7 @@ export component TextPage inherits VerticalLayout {
                         Divider { }
                         SliderRow {
                             title: @tr("Restore your copy after");
-                            description: @tr("How long the dictation stays on Ctrl+V after it is pasted.");
+                            info: @tr("How long the dictation stays on Ctrl+V after it is pasted.");
                             minimum: 0;
                             maximum: 1000;
                             step: 25;
@@ -404,10 +403,7 @@ export component TextPage inherits VerticalLayout {
                 }
                 rules := ScrollView {
                     height: min(list.preferred-height, max(root.rules-room - root.found-height, root.rules-floor));
-                    content-width: self.visible-width;
-                    content-height: list.preferred-height;
                     list := VerticalLayout {
-                        width: rules.visible-width;
                         spacing: Theme.card-gap;
                         if TextState.rules.length == 0: EmptyState {
                             icon: Icons.app-generic;

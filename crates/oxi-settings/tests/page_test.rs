@@ -276,7 +276,7 @@ fn a_new_recording_gets_a_ready_phrase_and_shows_its_length() {
 
 #[test]
 fn a_language_with_no_ready_phrases_asks_for_the_text() {
-    let f = Fixture::new("auto", Some("version = 1\n[model]\nlanguage = \"auto\"\n"));
+    let f = Fixture::new("auto", Some("version = 2\n[model]\nlanguage = \"auto\"\n"));
     let s = f.state();
     assert!(s.get_record_tip().starts_with("No ready phrases"));
     f.record_and_stop();
@@ -507,7 +507,10 @@ fn add_button_fits_at_720x520() {
     );
     assert!(right(&add) <= 720.0, "Add ends at {}", right(&add));
     let picker = with_role(&f.window, "From history", AccessibleRole::Combobox);
-    assert!(right(&picker) <= card_right + 0.5, "the picker stays inside too");
+    assert!(
+        right(&picker) <= card_right + 0.5,
+        "the picker stays inside too"
+    );
 }
 
 #[test]
@@ -724,7 +727,7 @@ fn an_outside_config_edit_keeps_the_recordings_and_the_run() {
     let f = Fixture::new("reload", None);
     let s = f.state();
     s.invoke_record();
-    fs::write(f.layout.config_file(), "version = 1\n# one\n").unwrap();
+    fs::write(f.layout.config_file(), "version = 2\n# one\n").unwrap();
     mock_elapsed_time(oxi_settings::FILE_POLL);
     assert!(s.get_recording(), "an open recording goes on");
     s.invoke_record();
@@ -735,7 +738,7 @@ fn an_outside_config_edit_keeps_the_recordings_and_the_run() {
     let Some(Request::TestTranscribe { id, .. }) = sent.last() else {
         panic!("first set");
     };
-    fs::write(f.layout.config_file(), "version = 1\n# one and two\n").unwrap();
+    fs::write(f.layout.config_file(), "version = 2\n# one and two\n").unwrap();
     mock_elapsed_time(oxi_settings::FILE_POLL);
     assert_eq!(s.get_view(), 1, "the results stay open");
     assert_eq!(f.errors()[0], "Running…");

@@ -135,7 +135,7 @@ export component Segmented {
         focus-gained(reason) => {
             // Back from a popup the segment opened: as it was before, so a click draws no ring.
             if (reason != FocusReason.popup-activation) {
-                root.key-focus = KeyFocus.from-key(reason);
+                root.key-focus = KeyFocus.after(reason, root.key-focus);
             }
         }
         key-pressed(event) => {
@@ -156,7 +156,7 @@ export component Segmented {
         focus-on-click: false;
         focus-gained(reason) => {
             if (reason != FocusReason.popup-activation) {
-                root.key-focus = KeyFocus.from-key(reason);
+                root.key-focus = KeyFocus.after(reason, root.key-focus);
             }
         }
         key-pressed(event) => {
@@ -492,6 +492,9 @@ export component PathField {
     out property <bool> has-focus: field.has-focus;
     // The text at rest; read by `tests/gallery.rs`.
     out property <string> shown: root.display != "" ? root.display : root.elided != "" ? root.elided : root.path;
+    // A shown default is secondary ink (DS-13.3), a real path primary; `tests/gallery.rs` reads both.
+    out property <color> shown-color: !root.live ? Theme.text-disabled : root.display != "" ? Theme.text-secondary : Theme.text-primary;
+    out property <image> browse-icon: Icons.folder-open-16;
     property <bool> live: root.enabled && !root.locked;
     property <bool> focused: field.has-focus || root.force-focus;
     property <length> room: field.width - 2 * Theme.space-3;
@@ -576,7 +579,7 @@ export component PathField {
                     height: 100%;
                     text: root.shown;
                     font-size: Theme.body-size;
-                    color: root.live ? Theme.text-primary : Theme.text-disabled;
+                    color: root.shown-color;
                     vertical-alignment: center;
                     // A name too long alone, or no `PathText` wired: cut at the end.
                     overflow: elide;
@@ -590,6 +593,7 @@ export component PathField {
         }
         if root.browse-text != "": Button {
             text: root.browse-text;
+            icon: root.browse-icon;
             enabled: root.live;
             clicked => {
                 root.browse(root.path);
@@ -750,7 +754,7 @@ export component Combo {
         focus-gained(reason) => {
             // Back from the list: as it was before, so a click draws no ring.
             if (reason != FocusReason.popup-activation) {
-                root.key-focus = KeyFocus.from-key(reason);
+                root.key-focus = KeyFocus.after(reason, root.key-focus);
             }
         }
         key-pressed(event) => {

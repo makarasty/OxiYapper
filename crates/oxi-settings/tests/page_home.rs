@@ -18,8 +18,8 @@ use oxi_settings::{AppWindow, FILE_POLL, Ipc, Page};
 use slint::platform::{Key, WindowEvent};
 use slint::{ComponentHandle, SharedString};
 
-const CHORD: &str = "version = 1\n[hotkey]\nchord = [\"LCtrl\", \"F13\"]\n";
-const TOGGLE: &str = "version = 1
+const CHORD: &str = "version = 2\n[hotkey]\nchord = [\"LCtrl\", \"F13\"]\n";
+const TOGGLE: &str = "version = 2
 [hotkey]
 chord = [\"LCtrl\", \"F13\"]
 mode = \"toggle\"
@@ -241,7 +241,7 @@ fn the_first_dictation_moves_nothing_below_the_heatmap() {
 
 #[test]
 fn the_chord_reads_as_the_hotkey_page_shows_it() {
-    let chord = "version = 1\n[hotkey]\nchord = [\"LCtrl\", \"BracketLeft\"]\n";
+    let chord = "version = 2\n[hotkey]\nchord = [\"LCtrl\", \"BracketLeft\"]\n";
     let window = open(&layout("empty-label", Some(chord)), Page::Home);
     assert!(has(&window, &format!("Hold Ctrl + [ and speak. {FIRST}")));
 }
@@ -680,13 +680,13 @@ const ON_NOTE: &str = "Statistics keep only dates, word and dictation counts and
 #[test]
 fn the_disclaimer_follows_history() {
     i_slint_backend_testing::init_no_event_loop();
-    // History is on by default, and a v1 file migrates to on (R1.3).
+    // History is on by default, so the off case writes `enabled = false` explicitly (R1.3).
     let off = "version = 2\n[history]\nenabled = false\n";
     let window = common::open_again(&layout("disclaimer", Some(off)), Page::Home);
     assert!(has(&window, OFF_NOTE));
     assert!(!has(&window, ON_NOTE));
 
-    let config = "version = 1\n[history]\nenabled = true\n";
+    let config = "version = 2\n[history]\nenabled = true\n";
     let window = common::open_again(&layout("disclaimer-on", Some(config)), Page::Home);
     assert!(has(&window, ON_NOTE));
     assert!(!has(&window, OFF_NOTE));
@@ -723,7 +723,7 @@ fn the_folder_button_creates_nothing_for_the_chosen_folder() {
     fs::write(
         l.config_file(),
         format!(
-            "version = 1\n[history]\nfolder = {:?}\n",
+            "version = 2\n[history]\nfolder = {:?}\n",
             chosen.display().to_string()
         ),
     )

@@ -16,6 +16,7 @@ use std::thread::{self, JoinHandle};
 use oxi_core::audio::{SAMPLE_RATE, resample};
 use oxi_core::config::{ConfigFile, History};
 use oxi_core::history::{self, EXTENSIONS, Entry, JSON, Meta, Status, TXT, WAV};
+use oxi_core::machine::Notice;
 use oxi_core::stats::Date;
 use oxi_core::tuning::SettingsSet;
 use oxi_platform::fs::{local_now, write_atomic};
@@ -59,16 +60,23 @@ impl Context {
 }
 
 /// `default_dir` is the folder used while `[history] folder` is not set; the model, language and
-/// settings of each entry are read from `config_file` when it is saved.
+/// settings of each entry are read from `config_file` when it is saved. `notify` gets
+/// [`Notice::Recovered`] when the start finds recordings a crash left behind.
 pub fn spawn(
     rx: Receiver<HistoryCmd>,
     inbox: Sender<Inbox>,
     default_dir: PathBuf,
     config_file: PathBuf,
+    notify: impl Fn(Notice) + Send + 'static,
 ) -> io::Result<JoinHandle<()>> {
-    spawn_with(rx, inbox, default_dir, local_now, move || {
-        Context::from_config_file(&config_file)
-    })
+    spawn_with(
+        rx,
+        inbox,
+        default_dir,
+        local_now,
+        move || Context::from_config_file(&config_file),
+        notify,
+    )
 }
 
 fn spawn_with(
@@ -77,16 +85,28 @@ fn spawn_with(
     default_dir: PathBuf,
     clock: fn() -> (Date, u32),
     context: impl Fn() -> Context + Send + 'static,
+    notify: impl Fn(Notice) + Send + 'static,
 ) -> io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("history".into())
         .spawn(move || {
             let mut shown = None;
             let mut last = None;
+            let mut first = true;
             for cmd in rx {
                 let (HistoryCmd::Config(cfg) | HistoryCmd::Save { cfg, .. }) = &cmd;
                 last = Some(cfg.clone());
-                let warning = handle(cmd, &default_dir, clock(), &context);
+                let mut pass = Pass::default();
+                let warning = handle_in(cmd, &default_dir, clock(), &context, &mut pass);
+                // Only the first pass that searched finds what a crash left; later ones file this
+                // run's own failed recordings, which had their notice already (triage #14). A pass
+                // that never reached the folder (refused, not owned) does not use up the notice.
+                if first && pass.searched {
+                    first = false;
+                    if !pass.recovered.is_empty() {
+                        notify(Notice::Recovered);
+                    }
+                }
                 if warning != shown {
                     shown.clone_from(&warning);
                     if inbox.send(Inbox::HistoryWarning(warning)).is_err() {
@@ -118,7 +138,17 @@ fn handle(
     now: (Date, u32),
     context: &impl Fn() -> Context,
 ) -> Option<String> {
-    let mut pass = Pass::default();
+    handle_in(cmd, default_dir, now, context, &mut Pass::default())
+}
+
+/// [`handle`] in `pass`, which tells what it recovered.
+fn handle_in(
+    cmd: HistoryCmd,
+    default_dir: &Path,
+    now: (Date, u32),
+    context: &impl Fn() -> Context,
+    pass: &mut Pass,
+) -> Option<String> {
     let (cfg, dictation) = match cmd {
         HistoryCmd::Config(cfg) => (cfg, None),
         HistoryCmd::Save {
@@ -157,10 +187,10 @@ fn handle(
             if !owned(&dir) {
                 return None;
             }
-            recover(&dir, &mut pass, context);
+            recover(&dir, pass, context);
         }
     }
-    prune(&dir, &cfg, now.0, &mut pass);
+    prune(&dir, &cfg, now.0, pass);
     pass.failed
         .map(|kind| format!("Old history not removed ({kind:?})"))
 }
@@ -172,6 +202,8 @@ struct Pass {
     /// Entries this pass recovered: the limits leave them for a later pass, so a recording is
     /// never brought back and deleted unseen in one go.
     recovered: HashSet<String>,
+    /// The pass looked for recordings to recover.
+    searched: bool,
 }
 
 impl Pass {
@@ -330,6 +362,7 @@ fn day_files(day: &Path, pass: &mut Pass) -> Vec<fs::DirEntry> {
 /// an entry marked interrupted, or failed when it was finished. One this process is still writing
 /// or has not handed to a save is left alone.
 fn recover(dir: &Path, pass: &mut Pass, context: &impl Fn() -> Context) {
+    pass.searched = true;
     let orphans: HashSet<PathBuf> = spool_take_orphans().into_iter().collect();
     for day in day_dirs(dir, pass) {
         for file in day_files(&day, pass) {
@@ -571,6 +604,7 @@ mod tests {
     use std::cell::RefCell;
     use std::sync::mpsc::channel;
     use std::sync::{Mutex, MutexGuard, PoisonError};
+    use std::time::Duration;
 
     use oxi_platform::wav::WavSpool;
 
@@ -626,7 +660,7 @@ mod tests {
     fn run(dir: &Path, cmds: Vec<HistoryCmd>) -> Vec<Option<String>> {
         let (tx, rx) = channel();
         let (inbox, replies) = channel();
-        let worker = spawn_with(rx, inbox, dir.to_owned(), clock, ctx).unwrap();
+        let worker = spawn_with(rx, inbox, dir.to_owned(), clock, ctx, |_| {}).unwrap();
         for cmd in cmds {
             tx.send(cmd).unwrap();
         }
@@ -1060,6 +1094,60 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Triage #14: the start says once that it recovered something; a start with nothing to
+    /// recover, and the passes after the first, say nothing.
+    #[test]
+    fn the_start_tells_once_when_it_recovered_a_recording() {
+        let dir = owned_temp("told");
+        killed_part(&dir.join("2026-11-08/090000-000.wav.part"), 16_000, 0, 3200);
+        let (tx, rx) = channel();
+        let (inbox, _replies) = channel();
+        let (seen_tx, seen) = channel();
+        let notify = move |n| seen_tx.send(n).unwrap();
+        let worker = spawn_with(rx, inbox, dir.clone(), clock, ctx, notify).unwrap();
+        tx.send(HistoryCmd::Config(cfg(true))).unwrap();
+        let wait = Duration::from_secs(10);
+        assert_eq!(seen.recv_timeout(wait), Ok(Notice::Recovered));
+        // A second pass that also recovers something stays quiet: only the start tells.
+        killed_part(&dir.join("2026-11-08/100000-000.wav.part"), 16_000, 0, 3200);
+        tx.send(HistoryCmd::Config(cfg(true))).unwrap();
+        drop(tx);
+        worker.join().unwrap();
+        assert!(
+            dir.join("2026-11-08/100000-000.wav").is_file(),
+            "pass 2 recovered"
+        );
+        assert_eq!(seen.try_iter().collect::<Vec<_>>(), []);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A start that could not reach the folder has not looked: the first pass that does recovers
+    /// and tells.
+    #[test]
+    fn a_start_without_the_folder_tells_at_the_first_pass_that_recovers() {
+        // Someone else's folder (no marker, not empty) is refused.
+        let dir = temp("told-late");
+        killed_part(&dir.join("2026-11-08/090000-000.wav.part"), 16_000, 0, 3200);
+        let (tx, rx) = channel();
+        let (inbox, replies) = channel();
+        let (seen_tx, seen) = channel();
+        let notify = move |n| seen_tx.send(n).unwrap();
+        let worker = spawn_with(rx, inbox, dir.clone(), clock, ctx, notify).unwrap();
+        tx.send(HistoryCmd::Config(cfg(true))).unwrap();
+        let wait = Duration::from_secs(10);
+        assert!(matches!(
+            replies.recv_timeout(wait),
+            Ok(Inbox::HistoryWarning(Some(_)))
+        ));
+        fs::write(dir.join(history::MARKER), "").unwrap();
+        tx.send(HistoryCmd::Config(cfg(true))).unwrap();
+        drop(tx);
+        worker.join().unwrap();
+        assert!(dir.join("2026-11-08/090000-000.wav").is_file(), "recovered");
+        assert_eq!(seen.try_iter().collect::<Vec<_>>(), [Notice::Recovered]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_recording_is_recovered_with_saving_off_too_and_is_never_deleted_by_the_sweep() {
         let dir = owned_temp("killed-off");
@@ -1102,7 +1190,7 @@ mod tests {
         let start = std::time::Instant::now();
         while !done() {
             assert!(start.elapsed().as_secs() < 5, "spool writer stuck");
-            thread::sleep(std::time::Duration::from_millis(5));
+            thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -1150,7 +1238,7 @@ mod tests {
         let mut first = WavSpool::begin(48_000).unwrap();
         first.push(&vec![0.1; 4800]);
         let first_part = first.finish();
-        thread::sleep(std::time::Duration::from_millis(3)); // the next one gets its own name
+        thread::sleep(Duration::from_millis(3)); // the next one gets its own name
         let mut second = WavSpool::begin(48_000).unwrap();
         second.push(&vec![0.2; 9600]);
         let second_part = second.finish();
@@ -1198,7 +1286,7 @@ mod tests {
         let dir = owned_temp("quit");
         let (tx, rx) = channel();
         let (inbox, _replies) = channel();
-        let worker = spawn_with(rx, inbox, dir.clone(), clock, ctx).unwrap();
+        let worker = spawn_with(rx, inbox, dir.clone(), clock, ctx, |_| {}).unwrap();
         tx.send(HistoryCmd::Config(cfg(true))).unwrap();
         // The worker sets the spool folder; a recording can start once it did.
         wait_until(|| {

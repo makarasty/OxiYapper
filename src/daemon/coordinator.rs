@@ -12,8 +12,8 @@ use std::time::Duration;
 use oxi_core::config::{Config, History};
 use oxi_core::ipc::{DeleteResult, Push, SoundWarning, TestFailure, TestOutcome};
 use oxi_core::machine::{
-    self, Effect, EngineWarning, Event, JobId, MachineConfig, ModelFailure, Notice, OverlayState,
-    Phase, PhaseCell, State,
+    self, Effect, EmptyAudio, EngineWarning, Event, JobId, MachineConfig, ModelFailure, Notice,
+    OverlayState, Phase, PhaseCell, State,
 };
 use oxi_core::paste::{ClipboardOnlyWhy, PasteOutcome};
 use oxi_core::tray::{self, TrayBadge};
@@ -186,25 +186,7 @@ impl<H: ChordHook> Coordinator<H> {
 
     fn dispatch(&mut self, msg: Inbox, now: Millis) {
         match msg {
-            Inbox::Event(event) => {
-                if let Event::PasteDone { job, outcome } = event {
-                    self.count(job, outcome);
-                    self.keep_last_text(job);
-                    // A failed paste raises its notice again in `feed`.
-                    self.failed.clear();
-                }
-                match event {
-                    Event::ModelFailed(why) => self.model_failure = Some(why),
-                    Event::ModelLoaded => self.model_failure = None,
-                    _ => {}
-                }
-                if event == Event::ModelLoaded {
-                    self.clear_failed(|n, _| {
-                        matches!(n, Notice::NoModel | Notice::ModelBad | Notice::OutOfMemory)
-                    });
-                }
-                self.feed(event, now);
-            }
+            Inbox::Event(event) => self.event(event, now),
             Inbox::Capture { session, event } => {
                 if session == self.capture {
                     self.feed(event, now);
@@ -216,6 +198,8 @@ impl<H: ChordHook> Coordinator<H> {
                 spool,
             } => self.job_audio(job, samples, spool, now),
             Inbox::Transcribed { job, text: None } => {
+                // The reason kind only: a model failure, else whisper itself.
+                tracing::info!(?job, model_failure = ?self.model_failure, "transcription failed");
                 self.spoken.remove(&job);
                 self.no_transcript(job);
                 self.feed(Event::TranscriptionFailed(job), now);
@@ -225,6 +209,10 @@ impl<H: ChordHook> Coordinator<H> {
                 text: Some(text),
             } => {
                 self.clear_failed(|n, _| n == Notice::TranscriptionFailed);
+                // Counts only: dictated text never goes into the log (AGENTS.md rule 5).
+                let words = text.split_whitespace().count();
+                let audio_ms = self.spoken.get(&job).map_or(0, |m| m.0);
+                tracing::info!(?job, words, audio_ms, "transcription done");
                 let empty = text.trim().is_empty();
                 if empty {
                     self.spoken.remove(&job);
@@ -286,6 +274,36 @@ impl<H: ChordHook> Coordinator<H> {
             }
             Inbox::Shutdown => {} // `run` ends the loop before it gets here
         }
+    }
+
+    /// A hook, worker or session event: the coordinator's own part, then the machine's.
+    fn event(&mut self, event: Event, now: Millis) {
+        if let Event::PasteDone { job, outcome } = event {
+            tracing::info!(?job, ?outcome, "paste done");
+            self.count(job, outcome);
+            self.keep_last_text(job);
+            // A failed paste raises its notice again in `feed`.
+            self.failed.clear();
+        }
+        match event {
+            Event::ModelFailed(why) => self.model_failure = Some(why),
+            Event::ModelLoaded => self.model_failure = None,
+            // A broken capture kept what it streamed as failed: file it now.
+            Event::JobAudioEmpty {
+                why: EmptyAudio::Failed,
+                ..
+            } => send(
+                &self.workers.history,
+                HistoryCmd::Config(self.latest_history()),
+            ),
+            _ => {}
+        }
+        if event == Event::ModelLoaded {
+            self.clear_failed(|n, _| {
+                matches!(n, Notice::NoModel | Notice::ModelBad | Notice::OutOfMemory)
+            });
+        }
+        self.feed(event, now);
     }
 
     fn job_audio(&mut self, job: JobId, samples: Vec<f32>, spool: Option<PathBuf>, now: Millis) {

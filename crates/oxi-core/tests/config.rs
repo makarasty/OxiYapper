@@ -44,7 +44,7 @@ fn defaults_round_trip() {
 #[test]
 fn default_values_match_the_spec() {
     let c = Config::default();
-    assert_eq!(c.audio.max_seconds, 600);
+    assert_eq!(c.audio.max_seconds, 3600);
     assert_eq!(c.model.language, Language::RU);
     assert_eq!(c.model.id, "turbo");
     assert_eq!(c.hotkey.chord, ["Ctrl", "Win"]);
@@ -358,7 +358,7 @@ fn minimal_file_stays_minimal() {
 #[test]
 fn new_file_has_every_default() {
     let out = ConfigFile::default().to_toml_string().unwrap();
-    assert!(out.contains("max_seconds = 600"), "{out}");
+    assert!(out.contains("max_seconds = 3600"), "{out}");
     assert!(out.contains("app = \"mstsc.exe\""), "{out}");
 }
 
@@ -620,7 +620,10 @@ fn v1_idle_unload_zero_stays_never_and_immediately_is_explicit() {
 #[test]
 fn sound_defaults_and_values_load() {
     let s = Config::default().sounds;
-    assert_eq!((s.start.as_str(), s.stop.as_str()), ("apa-hit-3", "apa-hit-2"));
+    assert_eq!(
+        (s.start.as_str(), s.stop.as_str()),
+        ("apa-hit-3", "apa-hit-2")
+    );
     assert_eq!(s.volume.to_bits(), 0.5_f64.to_bits());
     let file = ConfigFile::parse(FULL).unwrap();
     assert_eq!(file.config.sounds.start, "pop");
@@ -686,8 +689,8 @@ fn history_defaults_and_values_load() {
 
 #[test]
 fn v1_history_off_becomes_on_and_is_reported() {
-    let file = ConfigFile::parse("version = 1\n[history]\nenabled = false # old\nmax_days = 7\n")
-        .unwrap();
+    let file =
+        ConfigFile::parse("version = 1\n[history]\nenabled = false # old\nmax_days = 7\n").unwrap();
     assert!(file.config.history.enabled);
     assert!(file.history_turned_on);
     let out = file.to_toml_string().unwrap();
@@ -702,9 +705,16 @@ fn v1_history_off_becomes_on_and_is_reported() {
 
 #[test]
 fn v1_file_without_an_explicit_off_reports_nothing() {
-    for text in ["", "version = 1\n", "version = 1\n[history]\nenabled = true\n"] {
+    for text in [
+        "",
+        "version = 1\n",
+        "version = 1\n[history]\nenabled = true\n",
+    ] {
         let file = ConfigFile::parse(text).unwrap();
-        assert!(file.config.history.enabled && !file.history_turned_on, "{text}");
+        assert!(
+            file.config.history.enabled && !file.history_turned_on,
+            "{text}"
+        );
     }
 }
 

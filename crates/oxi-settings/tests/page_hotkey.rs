@@ -26,7 +26,7 @@ fn click(window: &AppWindow, label: &str) {
 
 #[test]
 fn clicked_keys_apply_as_the_new_chord() {
-    let l = layout("apply", Some("version = 1\n[hotkey]\nchord = [\"F13\"]\n"));
+    let l = layout("apply", Some("version = 2\n[hotkey]\nchord = [\"F13\"]\n"));
     let window = open(&l);
     assert!(has(&window, "F13"));
     assert!(
@@ -113,7 +113,7 @@ fn cancel_keeps_the_saved_chord() {
 
 #[test]
 fn mode_thumb_writes_toggle() {
-    let l = layout("mode", Some("version = 1\n# mine\n"));
+    let l = layout("mode", Some("version = 2\n# mine\n"));
     let window = open(&l);
     let card = |label: &str| {
         ElementHandle::find_by_accessible_label(&window, label)
@@ -131,17 +131,44 @@ fn mode_thumb_writes_toggle() {
     );
 }
 
+/// The Keys row has no caption: the mode tiles and the Esc row already say it.
+#[test]
+fn the_keys_row_has_no_caption() {
+    let plain = layout(
+        "keys-caption",
+        Some(
+            "version = 2
+",
+        ),
+    );
+    let esc = layout(
+        "keys-caption-esc",
+        Some(
+            "version = 2
+[hotkey]
+esc_cancels = true
+",
+        ),
+    );
+    for window in [open(&plain), common::open_again(&esc, Page::Hotkey)] {
+        assert!(has(&window, "Change hotkey"), "the page is shown");
+        assert!(!has(&window, "Hold these keys to talk."));
+        assert!(!has(
+            &window,
+            "Hold these keys to talk. Esc cancels a recording."
+        ));
+    }
+}
+
 /// R2.1: "Another key while holding" and "Esc cancels a recording" start from the file and
-/// write it back; the Keys caption names Esc only while it cancels.
+/// write it back.
 #[test]
 fn other_key_and_esc_round_trip() {
-    const WITH_ESC: &str = "Hold these keys to talk. Esc cancels a recording.";
     let fresh = open(&layout("recording-default", None));
     let esc = |w: &AppWindow| with_role(w, "Esc cancels a recording", AccessibleRole::Switch);
     let other = |w: &AppWindow| with_role(w, "Another key while holding", AccessibleRole::Combobox);
     assert_eq!(esc(&fresh).accessible_checked(), Some(false));
     assert_eq!(other(&fresh).accessible_value().as_deref(), Some("Auto"));
-    assert!(has(&fresh, "Hold these keys to talk.") && !has(&fresh, WITH_ESC));
     // The Auto hint is the "i" after the title (Row.info), not text on the page.
     assert!(has(
         &fresh,
@@ -150,7 +177,7 @@ fn other_key_and_esc_round_trip() {
 
     let l = layout(
         "recording",
-        Some("version = 1\n# mine\n[hotkey]\nesc_cancels = true\nother_key = \"always\"\n"),
+        Some("version = 2\n# mine\n[hotkey]\nesc_cancels = true\nother_key = \"always\"\n"),
     );
     let window = common::open_again(&l, Page::Hotkey);
     assert_eq!(esc(&window).accessible_checked(), Some(true));
@@ -158,11 +185,9 @@ fn other_key_and_esc_round_trip() {
         other(&window).accessible_value().as_deref(),
         Some("Always cancel")
     );
-    assert!(has(&window, WITH_ESC));
 
     esc(&window).invoke_accessible_default_action();
     assert!(!config(&l).config.hotkey.esc_cancels);
-    assert!(has(&window, "Hold these keys to talk.") && !has(&window, WITH_ESC));
 
     other(&window).invoke_accessible_expand_action();
     with_role(&window, "Never cancel", AccessibleRole::ListItem).invoke_accessible_default_action();
@@ -259,7 +284,7 @@ fn apply_tooltip_follows_the_link() {
 }
 
 /// The owner's chord plus one: 15 keys.
-const LONG: &str = "version = 1\n[hotkey]\nchord = [\"Shift\", \"W\", \"E\", \"R\", \"I\", \"O\", \"BracketLeft\", \"A\", \"S\", \"D\", \"F\", \"J\", \"K\", \"Quote\", \"Z\"]\n";
+const LONG: &str = "version = 2\n[hotkey]\nchord = [\"Shift\", \"W\", \"E\", \"R\", \"I\", \"O\", \"BracketLeft\", \"A\", \"S\", \"D\", \"F\", \"J\", \"K\", \"Quote\", \"Z\"]\n";
 const LONG_TEXT: &str =
     "Shift + W + E + R + I + O + Bracket Left + A + S + D + F + J + K + Quote + Z";
 const SIZES: [(f32, f32); 3] = [(720.0, 520.0), (1000.0, 700.0), (1280.0, 860.0)];
@@ -286,7 +311,7 @@ fn a_long_chord_stays_inside_the_keys_row_at_every_size() {
     let window = open(&l);
     let short = layout(
         "long-short",
-        Some("version = 1\n[hotkey]\nchord = [\"F13\"]\n"),
+        Some("version = 2\n[hotkey]\nchord = [\"F13\"]\n"),
     );
     let single = common::open_again(&short, Page::Hotkey);
     let tile = |win: &AppWindow| {
@@ -327,7 +352,7 @@ fn a_long_chord_stays_inside_the_keys_row_at_every_size() {
 fn a_short_chord_is_not_folded_and_reads_as_a_person_says_it() {
     let l = layout(
         "short",
-        Some("version = 1\n[hotkey]\nchord = [\"Ctrl\", \"BracketLeft\", \"Home\"]\n"),
+        Some("version = 2\n[hotkey]\nchord = [\"Ctrl\", \"BracketLeft\", \"Home\"]\n"),
     );
     let window = open(&l);
     assert!(has(&window, "Ctrl + Bracket Left + Home"));
@@ -339,7 +364,7 @@ fn a_short_chord_is_not_folded_and_reads_as_a_person_says_it() {
 fn twin_keys_of_a_saved_chord_read_apart() {
     let saved = |keys: &str| {
         format!(
-            "version = 1
+            "version = 2
 [hotkey]
 chord = [{keys}]
 "

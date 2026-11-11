@@ -687,7 +687,11 @@ mod tests {
         let none: [Attention; 0] = [];
         let table = [
             (Link::Online, strings::HEALTH_RUNNING, Level::Ok),
-            (Link::Mismatch { daemon_proto: 1 }, strings::HEALTH_RUNNING, Level::Ok),
+            (
+                Link::Mismatch { daemon_proto: 1 },
+                strings::HEALTH_RUNNING,
+                Level::Ok,
+            ),
             (Link::Offline, strings::HEALTH_NOT_RUNNING, Level::Down),
             (Link::Connecting, strings::HEALTH_NOT_RUNNING, Level::Down),
             (Link::Busy, strings::HEALTH_NOT_ANSWERING, Level::Down),
@@ -698,7 +702,7 @@ mod tests {
         for (link, text, level) in table {
             let c = chip(link, &none);
             assert_eq!((c.text, c.level, c.target), (text, level, None), "{link:?}");
-            assert!(c.tooltip.is_empty());
+            assert_eq!(c.tooltip, "");
         }
     }
 
@@ -714,9 +718,12 @@ mod tests {
             (target.page, target.tab),
             (SettingsPage::Audio, Some(SettingsTab::Microphone))
         );
-        assert!(!c.tooltip.is_empty());
+        assert_ne!(c.tooltip, "");
         // The list is stale once the daemon is gone.
-        assert_eq!(chip(Link::Offline, &items).text, strings::HEALTH_NOT_RUNNING);
+        assert_eq!(
+            chip(Link::Offline, &items).text,
+            strings::HEALTH_NOT_RUNNING
+        );
         assert_eq!(chip(Link::Busy, &items).target, None);
     }
 
@@ -735,7 +742,11 @@ mod tests {
         }));
         ipc.deliver(&Event::Link(Link::Offline));
         ipc.deliver(&Event::Link(Link::Online));
-        assert_eq!(ipc.chip().text, strings::HEALTH_RUNNING, "cleared by the drop");
+        assert_eq!(
+            ipc.chip().text,
+            strings::HEALTH_RUNNING,
+            "cleared by the drop"
+        );
     }
 
     #[test]

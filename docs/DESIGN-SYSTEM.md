@@ -69,7 +69,8 @@ Tokens: `focus-ring` (new colour: the accent, softened; hex by t20), `focus-ring
 |---|---|---|---|---|
 | framed (Button, fields) | `bg-control` | `bg-control-hover` | `bg-control-pressed` | n/a |
 | subtle (IconButton, tab, list row) | transparent | `bg-subtle-hover` | `bg-subtle-selected` | `bg-subtle-selected` |
-| card (ClickCard, Tile) | `bg-card` | `bg-control-hover` | `bg-card-pressed` | `accent-tint` |
+| card (ClickCard) | `bg-card` | `bg-control-hover` | `bg-card-pressed` | `accent-tint` |
+| card (Tile) | `bg-card` | `bg-control-hover` | = hover fill (no darker press, DS-5.5; `tiles.slint`) | `accent-tint` |
 
 Motion tokens: `motion-quick` 100 ms (hover, pressed, selected, knob), `motion-open` 160 ms (popup, tooltip). Both read 0 under `Shell.reduced-motion`.
 

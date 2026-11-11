@@ -288,7 +288,7 @@ fn fixed_file_is_read_again_when_the_page_is_shown_or_on_reload() {
 
 #[test]
 fn reset_keeps_unsaved_text_and_reloads_clean_files() {
-    let l = layout("reset", Some("version = 1\n[audio]\ngain_db = \n"));
+    let l = layout("reset", Some("version = 2\n[audio]\ngain_db = \n"));
     fs::write(l.dictionary_file(), "synthalpha").unwrap();
     fs::write(l.replace_file(), "a => b").unwrap();
     let window = open_tall(&l);
@@ -483,7 +483,7 @@ fn dirty_editor_names_the_read_error_of_its_file() {
 
 #[test]
 fn mode_thumb_and_rules_write_the_config() {
-    let l = layout("paste", Some("version = 1\n# mine\n"));
+    let l = layout("paste", Some("version = 2\n# mine\n"));
     let window = open_tall(&l);
     sub_tab(&window, "Paste");
     with_role(&window, "Paste mode", AccessibleRole::RadioGroup);
@@ -622,7 +622,7 @@ fn win_v_history_is_on_by_default_and_saved_off() {
 
 /// A config with `n` synthetic per-app rules.
 fn many_rules(n: usize) -> String {
-    let mut text = String::from("version = 1\n");
+    let mut text = String::from("version = 2\n");
     for i in 0..n {
         let _ = write!(
             text,
@@ -670,7 +670,7 @@ fn page_scrolls(window: &AppWindow) -> bool {
 /// UI rule 30: a rule keeps its app's name between windows, and the default rule has one.
 #[test]
 fn rule_rows_are_named_without_a_scan() {
-    let original = "version = 1
+    let original = "version = 2
 [ui.app_names]
 \"synthapp.exe\" = \"Synth App\"
 [[paste.rules]]
@@ -690,7 +690,7 @@ app = \"SynthApp.exe\"
 fn long_app_name_keeps_its_rule_row_one_line() {
     let long = "Synth Application With A Very Long Name That Goes On And On Past The Column";
     let original = format!(
-        "version = 1\n[ui.app_names]\n\"synthlong.exe\" = \"{long}\"\n\
+        "version = 2\n[ui.app_names]\n\"synthlong.exe\" = \"{long}\"\n\
          [[paste.rules]]\napp = \"synthlong.exe\"\n[[paste.rules]]\napp = \"synthshort.exe\"\n"
     );
     let window = open_min(&layout("rule-long-name", Some(&original)));

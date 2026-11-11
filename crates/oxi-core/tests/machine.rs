@@ -316,7 +316,7 @@ fn edge_05_a_locked_recording_warns_30_s_before_the_cap_and_stays_locked() {
     s.at(1100, Event::ChordUp);
     s.at(1200, Event::ChordDown);
     assert_eq!(s.core(1300, Event::ChordUp), [Effect::Play(Sound::Start)]);
-    let warn = 1200 + 570_000;
+    let warn = 1200 + 3_570_000;
     assert_eq!(s.at(warn - 1, Event::Tick), Effects::new());
     assert_eq!(
         s.at(warn, Event::Tick),
@@ -332,10 +332,10 @@ fn edge_05_warns_30_s_before_the_cap_then_stops_and_keeps_the_audio() {
     let mut s = Sim::toggle();
     s.at(1000, Event::ChordDown);
     s.at(1050, Event::ChordUp);
-    assert_eq!(s.0.next_deadline(), Some(Millis(1000 + 570_000)));
+    assert_eq!(s.0.next_deadline(), Some(Millis(1000 + 3_570_000)));
 
     assert_eq!(s.at(1000 + 569_999, Event::Tick), Effects::new());
-    let fx = s.at(1000 + 570_000, Event::Tick);
+    let fx = s.at(1000 + 3_570_000, Event::Tick);
     assert_eq!(
         fx,
         [Effect::Overlay(OverlayState::Recording {
@@ -343,10 +343,10 @@ fn edge_05_warns_30_s_before_the_cap_then_stops_and_keeps_the_audio() {
             ending_soon: true
         })]
     );
-    assert_eq!(s.0.next_deadline(), Some(Millis(1000 + 600_000)));
+    assert_eq!(s.0.next_deadline(), Some(Millis(1000 + 3_600_000)));
 
     // At the cap: stop and transcribe, never discard.
-    let fx = s.core(1000 + 600_000, Event::Tick);
+    let fx = s.core(1000 + 3_600_000, Event::Tick);
     assert_eq!(fx, stop(J0));
     assert_eq!(s.phase(), Phase::Transcribing);
 }
@@ -356,8 +356,8 @@ fn edge_05_push_cap_stop_ignores_the_later_key_up() {
     let mut s = Sim::loaded();
     s.at(0, Event::ChordDown);
     // Polls come every 100 ms; jump straight to the cap.
-    assert_eq!(s.core(600_000, Event::Tick), stop(J0));
-    assert_eq!(s.core(600_500, Event::ChordUp), []);
+    assert_eq!(s.core(3_600_000, Event::Tick), stop(J0));
+    assert_eq!(s.core(3_600_500, Event::ChordUp), []);
     assert_eq!(s.phase(), Phase::Transcribing);
 }
 
@@ -847,6 +847,136 @@ fn mic_open_failure_gives_error_and_no_whisper_call() {
     assert_eq!(s.phase(), Phase::Idle);
 }
 
+// Triage #12: a mic that fails after speech keeps its audio, as a job whisper never sees.
+#[test]
+fn mic_failure_after_speech_keeps_the_audio() {
+    let mut s = Sim::loaded();
+    s.at(0, Event::ChordDown);
+    s.at(500, Event::SpeechHeard);
+    let fx = s.core(2000, Event::CaptureFailed);
+    assert_eq!(
+        fx,
+        [
+            Effect::StopCapture(J0),
+            Effect::Play(Sound::Error),
+            Effect::Notify(Notice::CaptureFailed)
+        ]
+    );
+    assert_eq!(s.phase(), Phase::Idle);
+}
+
+// Triage #12: the model failing to load says nothing about the audio, which is kept.
+#[test]
+fn model_failure_after_speech_keeps_the_audio() {
+    let mut s = Sim::loaded();
+    s.at(100, Event::Suspend); // unloads: the model loads on the next press
+    s.at(200, Event::ChordDown);
+    s.at(500, Event::SpeechHeard);
+    let fx = s.core(900, Event::ModelFailed(ModelFailure::Bad));
+    assert_eq!(
+        fx,
+        [
+            Effect::StopCapture(J0),
+            Effect::Play(Sound::Error),
+            Effect::Notify(Notice::ModelBad)
+        ]
+    );
+    assert_eq!(s.phase(), Phase::Idle);
+}
+
+// The kept audio of a failure is filed as failed (no transcript), and the overlay says it is kept.
+#[test]
+fn a_failure_kept_job_is_dropped_to_the_history_and_says_kept() {
+    let mut s = Sim::loaded();
+    s.at(0, Event::ChordDown);
+    s.at(500, Event::SpeechHeard);
+    s.at(2000, Event::CaptureFailed);
+    // The broken capture filed its stream itself: its stop answers with no audio.
+    let fx = s.at(
+        2050,
+        Event::JobAudioEmpty {
+            job: J0,
+            why: EmptyAudio::Failed,
+        },
+    );
+    assert_eq!(
+        fx,
+        [Effect::Overlay(OverlayState::Text(Notice::FailedKept))]
+    );
+
+    let mut s = Sim::loaded();
+    s.at(100, Event::Suspend);
+    s.at(200, Event::ChordDown);
+    s.at(500, Event::SpeechHeard);
+    s.at(900, Event::ModelFailed(ModelFailure::Bad));
+    let fx = s.at(950, Event::JobAudioReady(J0));
+    assert_eq!(
+        fx,
+        [
+            Effect::DropJob(J0),
+            Effect::Overlay(OverlayState::Text(Notice::FailedKept))
+        ]
+    );
+    assert_eq!(s.phase(), Phase::Idle);
+    assert!(!s.0.busy());
+}
+
+// Before speech, or with history off, a failure still throws the recording away.
+#[test]
+fn a_failure_without_speech_or_history_discards() {
+    let no_history = MachineConfig {
+        keep_history: false,
+        ..untailed()
+    };
+    for (cfg, speech) in [(untailed(), false), (no_history.clone(), true)] {
+        let mut s = Sim::with(cfg.clone());
+        s.at(0, Event::ChordDown);
+        if speech {
+            s.at(500, Event::SpeechHeard);
+        }
+        let fx = s.core(2000, Event::CaptureFailed);
+        assert_eq!(fx[0], Effect::DiscardCapture, "speech {speech}");
+
+        let mut s = Sim::with(cfg);
+        s.at(100, Event::Suspend);
+        s.at(200, Event::ChordDown);
+        if speech {
+            s.at(500, Event::SpeechHeard);
+        }
+        let fx = s.core(900, Event::ModelFailed(ModelFailure::Bad));
+        assert_eq!(
+            fx,
+            [
+                Effect::DiscardCapture,
+                Effect::Play(Sound::Error),
+                Effect::Notify(Notice::ModelBad)
+            ],
+            "speech {speech}"
+        );
+        assert_eq!(s.phase(), Phase::Idle);
+    }
+}
+
+// Triage #69: with history off nothing is written, so a cancel after speech does not say "kept".
+#[test]
+fn a_cancel_after_speech_with_history_off_says_cancelled() {
+    let mut s = Sim::with(MachineConfig {
+        keep_history: false,
+        ..untailed()
+    });
+    s.at(0, Event::ChordDown);
+    s.at(300, Event::SpeechHeard);
+    s.at(500, Event::Esc);
+    let fx = s.at(550, Event::JobAudioReady(J0));
+    assert_eq!(
+        fx,
+        [
+            Effect::KeepCancelled(J0),
+            Effect::Overlay(OverlayState::Text(Notice::Cancelled))
+        ]
+    );
+}
+
 #[test]
 fn empty_transcript_pastes_nothing_and_says_so() {
     let mut s = Sim::loaded();
@@ -1067,9 +1197,9 @@ fn typing_during_a_toggle_tail_keeps_the_job() {
 fn max_recording_stops_at_once_without_a_tail() {
     let mut s = tailed(Mode::Push, 100);
     s.at(0, Event::ChordDown);
-    assert_eq!(s.core(600_000, Event::Tick), stop(J0));
+    assert_eq!(s.core(3_600_000, Event::Tick), stop(J0));
     // A release inside what would have been the tail changes nothing.
-    assert_eq!(s.core(600_050, Event::ChordUp), []);
+    assert_eq!(s.core(3_600_050, Event::ChordUp), []);
     assert_eq!(s.phase(), Phase::Transcribing);
 }
 
@@ -1081,7 +1211,7 @@ fn machine_config_maps_the_file_settings() {
         (d.mode, d.max_recording, d.idle_unload, d.release_tail),
         (
             Mode::Push,
-            Millis::from_secs(600),
+            Millis::from_secs(3600),
             Millis::from_secs(300),
             Millis(100)
         )

@@ -743,7 +743,10 @@ enabled = false
         )
         .invoke_accessible_default_action();
         assert!(!ctx.config.borrow().config.history.enabled);
-        assert_eq!(fs::read_to_string(ctx.layout.config_file()).unwrap(), config);
+        assert_eq!(
+            fs::read_to_string(ctx.layout.config_file()).unwrap(),
+            config
+        );
         assert!(!s.get_history_on());
         assert_eq!(sent_now(&sent), [], "nothing listed again");
         assert_ne!(window.global::<Toast>().get_text(), HISTORY_ON);
@@ -946,10 +949,8 @@ enabled = false
             );
             field.set_accessible_value("");
             let (at, size) = (field.absolute_position(), field.size());
-            let position = slint::LogicalPosition::new(
-                at.x + size.width / 2.0,
-                at.y + size.height / 2.0,
-            );
+            let position =
+                slint::LogicalPosition::new(at.x + size.width / 2.0, at.y + size.height / 2.0);
             let w = window.window();
             let button = slint::platform::PointerEventButton::Left;
             w.dispatch_event(WindowEvent::PointerPressed { position, button });

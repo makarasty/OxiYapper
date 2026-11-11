@@ -24,6 +24,8 @@ param(
   [int]$TimeoutSec = 30
 )
 $ErrorActionPreference = 'Stop'
+# Any failure prints its reason on stderr and exits 1 (under -File a bare throw was silent).
+trap { [Console]::Error.WriteLine("real-shot: $_"); exit 1 }
 $Out = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Out)
 $tmp = [System.IO.Path]::GetTempPath()  # the same call Rust's env::temp_dir makes
 $root = Split-Path -Parent $PSScriptRoot
@@ -32,7 +34,15 @@ if (-not $env:LIBCLANG_PATH) { $env:LIBCLANG_PATH = 'C:/Program Files/LLVM/bin' 
 
 if (-not $NoBuild) {
   Push-Location $root
-  try { cargo build -q -p oxi-settings --example real_window; if ($LASTEXITCODE) { throw 'cargo build failed' } }
+  # Windows PowerShell 5.1 turns any native stderr line into a terminating error under 'Stop'
+  # (cargo prints warnings there); let cargo talk and judge by its exit code alone.
+  try {
+    $ErrorActionPreference = 'Continue'
+    cargo build -q -p oxi-settings --example real_window 2>&1 | ForEach-Object { "$_" } | Out-Host
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($code) { throw "cargo build failed (exit $code)" }
+  }
   finally { Pop-Location }
 }
 $exe = Join-Path $env:CARGO_TARGET_DIR 'debug/examples/real_window.exe'

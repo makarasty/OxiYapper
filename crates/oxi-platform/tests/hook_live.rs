@@ -46,6 +46,8 @@ fn spawn() -> Live {
     let (tx, events) = mpsc::channel();
     let (captured, _) = mpsc::channel();
     let handle = Hook::spawn(chord, phase.clone(), tx, captured).unwrap();
+    // Esc cancel is off by default (t07); the Esc tests below assume it is on.
+    handle.set_esc_cancels(true);
     Live {
         handle,
         phase,

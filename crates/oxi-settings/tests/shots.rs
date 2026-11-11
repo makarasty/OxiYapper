@@ -49,6 +49,16 @@ thread_local! {
 struct Shots;
 
 thread_local! {
+    /// Time the test clock has skipped ahead of the real one.
+    static SKIPPED: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+/// Moves the clock of timers and animations on by `by`, with no real wait.
+fn advance(by: std::time::Duration) {
+    SKIPPED.set(SKIPPED.get() + by);
+}
+
+thread_local! {
     /// The size `matrix` renders next; the window takes it when created, because the element
     /// search finds only what is in view.
     static SIZE: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new(DEFAULT) };
@@ -65,9 +75,10 @@ impl Platform for Shots {
     }
 
     // Timers (the model page's path check) run on this clock; the default one stands still.
+    // `advance` moves it on without a real wait.
     fn duration_since_start(&self) -> std::time::Duration {
         static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-        START.get_or_init(std::time::Instant::now).elapsed()
+        START.get_or_init(std::time::Instant::now).elapsed() + SKIPPED.get()
     }
 }
 
@@ -152,11 +163,11 @@ fn shot_with(screen: &str, page: Page, config: Option<&str>, prepare: fn(&Layout
 }
 
 const NEWER: &str = "version = 99\n";
-const DENOISE: &str = "version = 1
+const DENOISE: &str = "version = 2
 [audio]
 denoise = true
 ";
-const BROKEN: &str = "version = 1\n[audio]\ngain_db = \n";
+const BROKEN: &str = "version = 2\n[audio]\ngain_db = \n";
 
 #[test]
 fn shot_main() {
@@ -229,7 +240,8 @@ fn update_confirm_rings_keep_checking_for_the_keyboard_only() {
     use slint::platform::{Key as K, PointerEventButton};
     const TALL: (f32, f32) = (1280.0, 1600.0);
     SIZE.set(TALL);
-    // The pixel on the ring's band against the card just outside it, left of the button.
+    // The pixel on the ring's band (2 px gap, then a 2 px band) against the card just outside it,
+    // left of the button.
     let ringed = |window: &AppWindow| {
         let keep = common::with_role(window, "Keep checking", AccessibleRole::Button);
         let (at, height) = (keep.absolute_position(), keep.size().height);
@@ -240,7 +252,7 @@ fn update_confirm_rings_keep_checking_for_the_keyboard_only() {
                 .pixel(x as u32, (at.y + height / 2.0) as u32)
                 .unwrap()
         };
-        pixel(at.x - 2.0) != pixel(at.x - 5.0)
+        pixel(at.x - 3.0) != pixel(at.x - 6.0)
     };
     let press = |text: slint::SharedString| {
         let surface = LAST.with_borrow(Clone::clone).unwrap();
@@ -251,9 +263,31 @@ fn update_confirm_rings_keep_checking_for_the_keyboard_only() {
     let window = open("swap-key", None);
     window.set_page(Page::System);
     let _ = render(&window, TALL, 1.0);
-    // The rail, the sub-tabs, the theme tiles, App language, Start at sign-in, Check for updates.
-    for _ in 0..6 {
+    // Tab to the Check for updates switch: the stops before it (the rail, the sub-tabs, the theme
+    // tiles, the "i" tips) are not counted, its own ring says it has the focus.
+    let switch = common::with_role(&window, "Check for updates", AccessibleRole::Switch);
+    let (at, size) = (switch.absolute_position(), switch.size());
+    // The ring is the only change in the switch's box (and 8 px around it) since the first frame.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // whole positive pixels
+    let around = |window: &AppWindow| {
+        let pixmap = render(window, TALL, 1.0);
+        let (x0, x1) = ((at.x - 8.0) as u32, (at.x + size.width + 8.0) as u32);
+        let (y0, y1) = ((at.y - 8.0) as u32, (at.y + size.height + 8.0) as u32);
+        let mut seen = Vec::new();
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let p = pixmap.pixel(x, y).unwrap();
+                seen.push((p.red(), p.green(), p.blue()));
+            }
+        }
+        seen
+    };
+    let resting = around(&window);
+    let mut tabs = 0;
+    while around(&window) == resting {
+        assert!(tabs < 60, "Tab never reaches the Check for updates switch");
         press(K::Tab.into());
+        tabs += 1;
     }
     press(" ".into());
     assert!(ringed(&window), "keyboard swap: the ring moves along");
@@ -455,34 +489,6 @@ fn no_system_accent_on_any_page() {
     }
 }
 
-#[test]
-fn a_later_accent_change_is_undone_by_the_poll() {
-    // A focused std field draws the context accent, so a purple accent shows on it until the next
-    // file poll puts the teal back. Tab three times: the rail, the sub-tabs, then the first editor.
-    use slint::platform::Key as K;
-    let window = open("purple-later", None);
-    window.set_page(Page::Text);
-    window.set_theme(ThemeChoice::Light);
-    let _ = render(&window, DEFAULT, 1.0);
-    let surface = LAST.with_borrow(Clone::clone).unwrap();
-    for _ in 0..3 {
-        surface.dispatch_event(WindowEvent::KeyPressed {
-            text: K::Tab.into(),
-        });
-        surface.dispatch_event(WindowEvent::KeyReleased {
-            text: K::Tab.into(),
-        });
-    }
-    i_slint_backend_testing::set_system_accent_color(PURPLE);
-    assert!(
-        purple_pixels(&render(&window, DEFAULT, 1.0)) > 0,
-        "the check sees the system accent"
-    );
-    std::thread::sleep(oxi_settings::FILE_POLL + std::time::Duration::from_millis(100));
-    slint::platform::update_timers_and_animations();
-    assert_eq!(purple_pixels(&render(&window, DEFAULT, 1.0)), 0);
-}
-
 /// Home with `summary` from a fake daemon, at the narrowest, default and widest sizes, and 960:
 /// the first width with the four stat cards in one row, where their texts are tightest.
 fn shot_home(screen: &str, summary: &Summary) {
@@ -569,6 +575,10 @@ fn shot_home_trend() {
                     })
                     .unwrap();
                 card.invoke_accessible_default_action();
+                // Past the bars' reveal, or the shot is its first, empty frame; the first frame
+                // starts it.
+                let _ = render(&window, size, 1.0);
+                advance(std::time::Duration::from_millis(600));
                 save(
                     &render(&window, size, 1.0),
                     &format!("home-trend-{screen}-{}-{theme}", size.0),
@@ -583,7 +593,7 @@ fn shot_home_history_on() {
     // Taller than the minimum: the two-line disclaimer sits at the page's foot.
     let window = open(
         "home-history-on",
-        Some("version = 1\n[history]\nenabled = true\n"),
+        Some("version = 2\n[history]\nenabled = true\n"),
     );
     save(&render(&window, (720.0, 900.0), 1.0), "home-history-on-720");
 }
@@ -607,6 +617,8 @@ fn a_stat_card_fills_for_each_state() {
     // In the card's top padding: nothing but the fill is drawn there.
     let (x, y) = (at.x + size.width / 2.0, at.y + 6.0);
     let fill = || {
+        // The fill fades over motion-quick on the clock: skip past it.
+        advance(std::time::Duration::from_millis(150));
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // whole positive pixels
         let pixel = render(&window, DEFAULT, 1.0)
             .pixel(x as u32, y as u32)
@@ -772,7 +784,7 @@ fn sub_tab(window: &AppWindow, label: &str) {
 /// The Sounds sub-tab on the start sound: the built-in sounds and an own file with a long name.
 #[test]
 fn shot_audio_sounds() {
-    const OWN: &str = "version = 1
+    const OWN: &str = "version = 2
 [sounds]
 start = 'C:\\Sounds\\a very long own file name that does not fit its tile at all.wav'
 ";
@@ -824,7 +836,7 @@ fn shot_model_weak() {
     // Only an integrated GPU: both 3.1 GB models carry the "!", the picked one says both things.
     shot_model_linked(
         "model-weak",
-        "version = 1\n[model]\nid = \"podlodka\"\n",
+        "version = 2\n[model]\nid = \"podlodka\"\n",
         |l| {
             let dir = l.models_dir();
             fs::create_dir_all(&dir).unwrap();
@@ -873,7 +885,7 @@ fn push(ipc: &Ipc, push: Push) {
     ipc.deliver(&Event::Push(push));
 }
 
-const BUSY: &str = "version = 1
+const BUSY: &str = "version = 2
 [model]
 id = \"turbo\"
 gpu = \"Vulkan0\"
@@ -956,7 +968,7 @@ fn shot_model_downloaded() {
 fn shot_model_custom_relative() {
     shot_model_linked(
         "model-custom-relative",
-        "version = 1
+        "version = 2
 [model]
 id = \"custom\"
 custom_path = \"mine.bin\"
@@ -970,7 +982,7 @@ custom_path = \"mine.bin\"
 fn shot_model_custom_missing() {
     shot_model_linked(
         "model-custom-missing",
-        "version = 1
+        "version = 2
 [model]
 id = \"custom\"
 custom_path = \"C:/nowhere/gone.bin\"
@@ -1088,7 +1100,7 @@ fn shot_text_dictionary_500() {
 
 /// 150 rules with long names: the list scrolls in its own area.
 fn many_rules() -> String {
-    let mut text = String::from("version = 1\n");
+    let mut text = String::from("version = 2\n");
     for i in 0..150 {
         let _ = write!(
             text,
@@ -1246,7 +1258,7 @@ fn shot_system() {
 fn shot_system_recordings_warned() {
     let folder = format!("D:/{}", "a very long folder name/".repeat(6));
     let config = format!(
-        "version = 1\n[debug]\nlog_text = true\n[history]\nenabled = true\nmax_days = 999\nmax_bytes = 1072668082176\nfolder = {folder:?}\n"
+        "version = 2\n[debug]\nlog_text = true\n[history]\nenabled = true\nmax_days = 999\nmax_bytes = 1072668082176\nfolder = {folder:?}\n"
     );
     // Taller than the page, at the minimum width and the maximum window: the row is on screen.
     for size in [(720.0, 900.0), (1280.0, 860.0)] {

@@ -123,6 +123,7 @@ fn serve(layout: &oxi_core::paths::Layout) -> anyhow::Result<()> {
             inbox.clone(),
             layout.history_dir(),
             layout.config_file(),
+            notifier(&ui_tx, &waker),
         )?,
     ];
     let pushes = Pushes::default();

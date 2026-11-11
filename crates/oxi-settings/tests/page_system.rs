@@ -171,12 +171,18 @@ fn typed_folder_text_survives_the_window_losing_focus() {
         .window()
         .dispatch_event(WindowEvent::WindowActiveChanged(false));
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
-    assert_eq!(field(&window).accessible_value().as_deref(), Some(typed.as_str()));
+    assert_eq!(
+        field(&window).accessible_value().as_deref(),
+        Some(typed.as_str())
+    );
     window
         .window()
         .dispatch_event(WindowEvent::WindowActiveChanged(true));
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
-    assert_eq!(field(&window).accessible_value().as_deref(), Some(typed.as_str()));
+    assert_eq!(
+        field(&window).accessible_value().as_deref(),
+        Some(typed.as_str())
+    );
     assert!(!l.config_file().exists(), "deactivating saved the text");
 }
 
@@ -191,7 +197,8 @@ fn a_switch_click_restores_the_saved_path() {
         let f = field(&window);
         f.mock_single_click(PointerEventButton::Left);
         f.set_accessible_value(typed.clone());
-        with_role(&window, name, AccessibleRole::Switch).mock_single_click(PointerEventButton::Left);
+        with_role(&window, name, AccessibleRole::Switch)
+            .mock_single_click(PointerEventButton::Left);
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
         assert_eq!(
             field(&window).accessible_value().as_deref(),
@@ -230,7 +237,7 @@ fn a_gone_folder_still_shows_its_whole_path() {
     fs::write(
         l.config_file(),
         format!(
-            "version = 1\n[history]\nfolder = {:?}\n",
+            "version = 2\n[history]\nfolder = {:?}\n",
             gone.display().to_string()
         ),
     )

@@ -28,7 +28,7 @@ fn text(l: &Layout) -> String {
 
 #[test]
 fn position_click_writes_the_kebab_value() {
-    let l = layout("position", Some("version = 1\n# mine\n"));
+    let l = layout("position", Some("version = 2\n# mine\n"));
     let window = open(&l, Page::Overlay);
     assert_eq!(
         card(&window, "Bottom right").accessible_checked(),
@@ -170,7 +170,7 @@ fn the_warning_and_the_folder_name_sit_beside_their_controls() {
     let l = layout(
         "warning-beside",
         Some(
-            "version = 1
+            "version = 2
 [debug]
 log_text = true
 ",
@@ -196,7 +196,7 @@ log_text = true
 fn log_text_on_in_the_file_shows_the_warning() {
     let l = layout(
         "log-text-file",
-        Some("version = 1\n[debug]\nlog_text = true\n"),
+        Some("version = 2\n[debug]\nlog_text = true\n"),
     );
     let window = open_recordings(&l);
     assert_eq!(
@@ -461,7 +461,7 @@ const FOLDER_REFUSED: &str = "The \"OxiYapper history\" folder here holds other 
 
 fn history_config(folder: &std::path::Path) -> String {
     format!(
-        "version = 1\n[history]\nfolder = {:?}\n",
+        "version = 2\n[history]\nfolder = {:?}\n",
         folder.display().to_string()
     )
 }
@@ -537,7 +537,7 @@ fn retention_fields_show_the_defaults_and_write_what_is_typed() {
 
 #[test]
 fn a_size_limit_under_a_gigabyte_is_not_shown_as_no_limit_and_stays_unwritten() {
-    let original = "version = 1\n[history]\nmax_bytes = 5\n";
+    let original = "version = 2\n[history]\nmax_bytes = 5\n";
     let l = layout("history-small-cap", Some(original));
     let window = open_recordings(&l);
     let size = with_role(&window, "Recordings size limit", AccessibleRole::Spinbox);
@@ -553,7 +553,7 @@ fn a_size_limit_under_a_gigabyte_is_not_shown_as_no_limit_and_stays_unwritten() 
 
 #[test]
 fn a_stored_limit_above_the_field_maximum_is_never_lowered_by_a_step() {
-    let original = "version = 1\n[history]\nmax_days = 1500\nmax_bytes = 2147483648000\n";
+    let original = "version = 2\n[history]\nmax_days = 1500\nmax_bytes = 2147483648000\n";
     let l = layout("history-over-max", Some(original));
     let window = open_recordings(&l);
     let days = with_role(&window, "Keep recordings for", AccessibleRole::Spinbox);

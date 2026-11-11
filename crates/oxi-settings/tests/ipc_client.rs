@@ -198,7 +198,10 @@ fn attention_push_arrives_and_names_its_page() {
         let mut conn = server.accept().unwrap();
         ack(&mut conn, PROTO);
         conn.send(&Push::Attention {
-            items: vec![Attention::OutOfMemory { cpu: true }, Attention::NoMicrophone],
+            items: vec![
+                Attention::OutOfMemory { cpu: true },
+                Attention::NoMicrophone,
+            ],
         })
         .unwrap();
         drain(&mut conn);

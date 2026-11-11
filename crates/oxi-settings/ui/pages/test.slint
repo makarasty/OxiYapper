@@ -429,14 +429,15 @@ export component TestPage inherits VerticalLayout {
         }
         Divider { }
         // Pick, then Add: the Combo picks on every arrow key, so picking alone must not add.
-        if TestState.history-on: Row {
-            title: @tr("From history");
-            fill-controls: true;
-            enabled: TestState.add-off == "";
-            off-tip: TestState.add-off;
-            // Add under the picker: beside it, the two overflow the 240 px column of a narrow window.
-            VerticalLayout {
-                spacing: Theme.space-2;
+        // Add under the picker: beside it, the two overflow the 240 px column of a narrow window.
+        // Outside the Row, so its title sits on the picker's line, not between the two.
+        if TestState.history-on: VerticalLayout {
+            spacing: Theme.space-2;
+            Row {
+                title: @tr("From history");
+                fill-controls: true;
+                enabled: TestState.add-off == "";
+                off-tip: TestState.add-off;
                 Combo {
                     locked: false;
                     enabled: TestState.add-off == "";
@@ -444,16 +445,16 @@ export component TestPage inherits VerticalLayout {
                     current-index <=> TestState.history-pick;
                     accessible-label: @tr("From history");
                 }
-                HorizontalLayout {
-                    alignment: end;
-                    Button {
-                        text: @tr("Add");
-                        kind: ButtonKind.secondary;
-                        enabled: TestState.add-off == "" && TestState.history-pick > 0;
-                        tooltip: TestState.add-off != "" ? TestState.add-off : TestState.history-pick > 0 ? "" : @tr("Pick a recording first");
-                        clicked => {
-                            TestState.add-history();
-                        }
+            }
+            HorizontalLayout {
+                alignment: end;
+                Button {
+                    text: @tr("Add");
+                    kind: ButtonKind.secondary;
+                    enabled: TestState.add-off == "" && TestState.history-pick > 0;
+                    tooltip: TestState.add-off != "" ? TestState.add-off : TestState.history-pick > 0 ? "" : @tr("Pick a recording first");
+                    clicked => {
+                        TestState.add-history();
                     }
                 }
             }

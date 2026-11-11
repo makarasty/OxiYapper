@@ -92,7 +92,7 @@ fn rows_show_size_and_status_from_the_files() {
 
 #[test]
 fn use_writes_model_id_and_viewing_does_not() {
-    let l = layout("pick", Some("version = 1\n# mine\n"));
+    let l = layout("pick", Some("version = 2\n# mine\n"));
     // Every model on disk at its registry size (sparse): ready, so each card offers Use.
     fs::create_dir_all(l.models_dir()).unwrap();
     for m in MODELS.iter().filter(|m| m.id != "tiny") {
@@ -130,7 +130,7 @@ fn use_writes_model_id_and_viewing_does_not() {
 fn missing_custom_path_shows_an_error() {
     let l = layout(
         "custom",
-        Some("version = 1\n[model]\nid = \"custom\"\ncustom_path = \"C:/nowhere/gone.bin\"\n"),
+        Some("version = 2\n[model]\nid = \"custom\"\ncustom_path = \"C:/nowhere/gone.bin\"\n"),
     );
     let window = open(&l, Page::Model);
     wait_for(|| has(&window, "File not found"));
@@ -200,7 +200,7 @@ fn gpu_picker_shows_the_configured_choice() {
         // No daemon to list the GPUs: the name is shown, not called missing.
         ("gpu = \"Vulkan7\"", "Vulkan7"),
     ] {
-        let l = layout("gpu", Some(&format!("version = 1\n[model]\n{config}\n")));
+        let l = layout("gpu", Some(&format!("version = 2\n[model]\n{config}\n")));
         let window = open_again(&l, Page::Model);
         sub_tab(&window, "Settings");
         let picker = with_role(&window, "GPU", AccessibleRole::Combobox);
@@ -230,7 +230,7 @@ unload_immediately = true",
         let l = layout(
             "unload",
             Some(&format!(
-                "version = 1
+                "version = 2
 [model]
 {config}
 "
@@ -538,7 +538,7 @@ fn a_language_in_a_segment_stays_there_when_the_one_in_use_leaves() {
     // zh was set by hand: it is shown first, and not yet one of the last used.
     let l = layout(
         "language-stay",
-        Some("version = 1\n[model]\nlanguage = \"zh\"\nrecent_languages = [\"ru\", \"en\"]\n"),
+        Some("version = 2\n[model]\nlanguage = \"zh\"\nrecent_languages = [\"ru\", \"en\"]\n"),
     );
     let window = open(&l, Page::Model);
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
@@ -575,7 +575,7 @@ fn a_language_code_says_its_name_in_a_tooltip() {
         let l = layout(
             &format!("language-tip-{code}"),
             Some(&format!(
-                "version = 1\n[model]\nlanguage = \"{code}\"\nrecent_languages = [\"{code}\", \"ru\"]\n"
+                "version = 2\n[model]\nlanguage = \"{code}\"\nrecent_languages = [\"{code}\", \"ru\"]\n"
             )),
         );
         let window = open_again(&l, Page::Model);
@@ -629,7 +629,7 @@ fn the_models_tab_does_not_scroll_at_the_minimum_size() {
 fn a_language_set_by_hand_is_shown() {
     let l = layout(
         "language-hand",
-        Some("version = 1\n[model]\nlanguage = \"zh\"\n"),
+        Some("version = 2\n[model]\nlanguage = \"zh\"\n"),
     );
     let window = open(&l, Page::Model);
     assert_eq!(segment(&window, "Chinese").accessible_checked(), Some(true));

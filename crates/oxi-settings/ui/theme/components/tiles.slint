@@ -142,7 +142,7 @@ export component TilePicker {
         enabled: !root.locked;
         focus-on-click: false;
         focus-gained(reason) => {
-            root.key-focus = KeyFocus.from-key(reason);
+            root.key-focus = KeyFocus.after(reason, root.key-focus);
         }
         key-pressed(event) => {
             if (event.text == Key.LeftArrow) {
@@ -230,7 +230,7 @@ export component PositionTiles {
         enabled: !Shell.locked;
         focus-on-click: false;
         focus-gained(reason) => {
-            root.key-focus = KeyFocus.from-key(reason);
+            root.key-focus = KeyFocus.after(reason, root.key-focus);
         }
         key-pressed(event) => {
             if (event.text == Key.LeftArrow && mod(root.selected, 3) > 0) {
@@ -260,7 +260,7 @@ export component PositionTiles {
             width: root.tile-height * 1.5;
             height: root.tile-height;
             border-radius: Theme.radius-control;
-            border-color: Theme.stroke-control;
+            border-color: self.on ? Theme.accent : Theme.stroke-control;
             background: self.on ? Theme.accent-tint : self.hover ? Theme.bg-control-hover : Theme.bg-control;
             animate background { duration: Theme.motion-quick; easing: ease-out; }
             opacity: Shell.locked ? 0.4 : 1;

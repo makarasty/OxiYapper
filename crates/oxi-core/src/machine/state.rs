@@ -62,6 +62,8 @@ struct Job {
     stage: Stage,
     /// Cancelled after speech: the audio goes to the history, never to whisper. Not a phase.
     cancelled: bool,
+    /// Ended by a mic or model failure (`cancelled` too): its audio is kept as failed.
+    failed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,7 +216,7 @@ impl State {
             }
             Event::CaptureFailed => {
                 if self.rec.is_some() {
-                    self.discard_recording(&mut fx);
+                    self.end_failed_recording(&mut fx);
                     self.fail(Notice::CaptureFailed, now, &mut fx);
                 }
             }
@@ -266,7 +268,7 @@ impl State {
             Event::ModelFailed(why) => {
                 self.model = ModelStatus::Failed(why);
                 self.model_for = None;
-                self.discard_recording(&mut fx);
+                self.end_failed_recording(&mut fx);
                 self.fail(model_notice(why), now, &mut fx);
             }
             Event::ConfigChanged(cfg) => self.pending_cfg = Some(cfg),
@@ -320,10 +322,21 @@ impl State {
         let Some(job) = self.job_in(id, Stage::AwaitingAudio) else {
             return;
         };
-        if job.cancelled {
+        if job.failed {
+            // No transcript will come: the coordinator files the audio as failed.
+            self.jobs.retain(|j| j.id != id);
+            fx.push(Effect::DropJob(id));
+            self.show_unless_recording(Notice::FailedKept, now);
+        } else if job.cancelled {
             self.jobs.retain(|j| j.id != id);
             fx.push(Effect::KeepCancelled(id));
-            self.show_unless_recording(Notice::CancelledKept, now);
+            // With history off nothing is written: "kept" would be false (triage #69).
+            let notice = if self.cfg.keep_history {
+                Notice::CancelledKept
+            } else {
+                Notice::Cancelled
+            };
+            self.show_unless_recording(notice, now);
         } else {
             job.stage = Stage::Queued;
         }
@@ -334,8 +347,15 @@ impl State {
         let Some(found) = self.job_in(job, Stage::AwaitingAudio) else {
             return;
         };
-        let cancelled = found.cancelled;
+        let (cancelled, failed) = (found.cancelled, found.failed);
         self.jobs.retain(|j| j.id != job);
+        if failed {
+            // A broken capture still filed what it streamed; otherwise the failure notice stands.
+            if why == EmptyAudio::Failed {
+                self.show_unless_recording(Notice::FailedKept, now);
+            }
+            return;
+        }
         if cancelled {
             // Nothing to keep after all: the cancel stands, whatever the audio side says.
             return self.show_unless_recording(Notice::Cancelled, now);
@@ -390,6 +410,31 @@ impl State {
         }
     }
 
+    /// A mic or model failure ends the recording. With speech and history on its audio is
+    /// kept, as a job whisper never sees (triage #12); otherwise it is thrown away.
+    fn end_failed_recording(&mut self, fx: &mut Effects) {
+        let Some(r) = self.rec.take() else { return };
+        if r.speech && self.cfg.keep_history {
+            let id = self.push_job(true, true);
+            fx.push(Effect::StopCapture(id));
+        } else {
+            fx.push(Effect::DiscardCapture);
+        }
+    }
+
+    /// A new job awaiting the audio of the recording that just ended.
+    fn push_job(&mut self, cancelled: bool, failed: bool) -> JobId {
+        let id = JobId(self.next_job);
+        self.next_job += 1;
+        self.jobs.push_back(Job {
+            id,
+            stage: Stage::AwaitingAudio,
+            cancelled,
+            failed,
+        });
+        id
+    }
+
     /// Cancel the recording in progress. After speech the audio is kept as a cancelled job
     /// (R2.1) and the notice comes with it; before speech it is thrown away. `explicit`: the
     /// user asked for it (Esc, or a key that always cancels): sound, and the overlay text when
@@ -397,13 +442,7 @@ impl State {
     fn cancel_recording(&mut self, now: Millis, explicit: bool, fx: &mut Effects) {
         let Some(r) = self.rec.take() else { return };
         if r.speech {
-            let id = JobId(self.next_job);
-            self.next_job += 1;
-            self.jobs.push_back(Job {
-                id,
-                stage: Stage::AwaitingAudio,
-                cancelled: true,
-            });
+            let id = self.push_job(true, false);
             fx.push(Effect::StopCapture(id));
         } else {
             fx.push(Effect::DiscardCapture);
@@ -546,13 +585,7 @@ impl State {
             fx.push(Effect::DiscardCapture);
             return;
         }
-        let id = JobId(self.next_job);
-        self.next_job += 1;
-        self.jobs.push_back(Job {
-            id,
-            stage: Stage::AwaitingAudio,
-            cancelled: false,
-        });
+        let id = self.push_job(false, false);
         fx.push(Effect::StopCapture(id));
         fx.push(Effect::Play(Sound::Stop));
     }

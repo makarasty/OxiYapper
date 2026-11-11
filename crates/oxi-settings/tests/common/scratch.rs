@@ -25,7 +25,10 @@ pub fn scratch_dir(name: &str) -> PathBuf {
     // Anything but one plain name would make the guard delete the temp dir itself or a path outside it.
     let mut parts = Path::new(name).components();
     assert!(
-        matches!((parts.next(), parts.next()), (Some(Component::Normal(_)), None)),
+        matches!(
+            (parts.next(), parts.next()),
+            (Some(Component::Normal(_)), None)
+        ),
         "scratch_dir needs one plain folder name, got {name:?}"
     );
     let dir = std::env::temp_dir().join(name);

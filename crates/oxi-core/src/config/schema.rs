@@ -111,7 +111,7 @@ impl Default for Audio {
             denoise: false,
             trim: true,
             tail_ms: 100,
-            max_seconds: 600,
+            max_seconds: 3600,
             meter_sensitivity_db: 0.0,
         }
     }
@@ -269,7 +269,7 @@ pub struct Sounds {
     pub enabled: bool,
     /// 0 to 1.
     pub volume: f64,
-    /// A built-in id (`Builtin::id`) or the path of a `.wav` or `.ogg` file. Same for the
+    /// A built-in id (`Builtin::id`), the path of a `.wav` or `.ogg` file, or `off`. Same for the
     /// other sound keys below.
     pub start: String,
     pub stop: String,

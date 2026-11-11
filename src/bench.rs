@@ -356,7 +356,7 @@ mod tests {
             &["--record", "1e30", "a.wav"],
             &["--record", "inf", "a.wav"],
             &["--record", "NaN", "a.wav"],
-            &["--record", "600.5", "a.wav"],
+            &["--record", "3600.5", "a.wav"],
             &["--record", "3", "a.WAV"],
             &["--record", "3", "a.txt"],
             &["--record", "3", "a"],

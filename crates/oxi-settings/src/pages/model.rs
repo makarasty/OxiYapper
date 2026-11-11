@@ -395,21 +395,23 @@ impl PageState {
     }
 
     /// Asks the daemon to delete the model's files (and its `.part`); the card asked first. The
-    /// ready model in use is refused here too: its card offers no Delete.
-    fn delete(&self, i: i32) {
+    /// ready model in use is refused here too: its card offers no Delete. True when the request
+    /// went out.
+    fn delete(&self, i: i32) -> bool {
         let Some((i, entry)) = self.entry(i) else {
-            return;
+            return false;
         };
         let off = delete_off(self.ctx.ipc.link());
         let ready = self.rows.row_data(i).is_some_and(|r| r.ready);
         if !off.is_empty() || (ready && self.in_use() == Some(i)) {
             self.update(i, |r| r.error = off.into());
-            return;
+            return false;
         }
         self.update(i, |r| r.error = SharedString::new());
         self.ctx.ipc.send(Request::DeleteModel {
             id: entry.id.to_owned(),
         });
+        true
     }
 
     fn deleted(&self, id: &str, result: &DeleteResult) {
@@ -1670,6 +1672,38 @@ mod tests {
         assert_eq!(requests(&sent), [], "the focus was taken to Download");
     }
 
+    /// A Delete refused at once (the daemon went away while the question was open) ends the wait
+    /// too, also when the refusal repeats the card's last "!" word for word.
+    #[test]
+    fn a_refused_delete_does_not_steal_the_focus_later() {
+        let (window, ipc, sent, layout) = window("delete-refused-focus");
+        let file = on_disk(&layout, large().file_name, large().size);
+        window.global::<ModelState>().invoke_shown();
+        view(&window, "Whisper large-v3");
+        slint::platform::update_timers_and_animations();
+        for _ in 0..2 {
+            ipc.deliver(&Event::Link(Link::Online));
+            click(&window, "Delete Whisper large-v3");
+            ipc.deliver(&Event::Link(Link::Offline));
+            click(&window, "Confirm: delete Whisper large-v3");
+            slint::platform::update_timers_and_animations();
+        }
+        ipc.deliver(&Event::Link(Link::Online));
+        fs::remove_file(&file).unwrap();
+        push(
+            &ipc,
+            Push::Devices {
+                mics: Vec::new(),
+                gpus: Vec::new(),
+            },
+        );
+        assert!(has(&window, "Whisper large-v3: Not downloaded"));
+        slint::platform::update_timers_and_animations();
+        let _ = requests(&sent);
+        enter(&window);
+        assert_eq!(requests(&sent), [], "the focus was taken to Download");
+    }
+
     /// Draws the card's states the other shots miss: paused (Resume, Delete), ready and not in use
     /// (Use, Delete), and the delete question; each frame non-empty and not one colour. With
     /// `OXI_SHOTS_DIR` set they land in `settings-model-card-<state>-<w>-<theme>.png`. The renderer
@@ -1806,7 +1840,7 @@ mod tests {
         );
         // The callback refuses it too.
         let _ = requests(&sent);
-        s.invoke_delete(1);
+        assert!(!s.invoke_delete(1));
         assert_eq!(requests(&sent), []);
         assert_eq!(s.get_tiles().row_data(1).unwrap().caption, IN_USE);
         assert_eq!(s.get_tiles().row_data(0).unwrap().caption, "Not downloaded");

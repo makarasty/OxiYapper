@@ -19,7 +19,10 @@
 
 use std::{env, fs, path::PathBuf, process, time::Duration};
 
+use oxi_core::history::Status;
+use oxi_core::ipc::{HistoryItem, Push, Request, Spoken};
 use oxi_core::paths::Layout;
+use oxi_settings::ipc::{Cmd, Event};
 use oxi_settings::{
     AppWindow, AudioState, Ipc, ModelState, Page, SystemState, TestState, TextState, ThemeChoice,
 };
@@ -206,8 +209,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let skia = oxi_settings::use_skia();
-    let (ipc, _daemon_side) = Ipc::fake();
-    let window = oxi_settings::open_with(layout, ipc)?;
+    let (ipc, daemon_side) = Ipc::fake();
+    let window = oxi_settings::open_with(layout, ipc.clone())?;
     window.set_page(page);
     if let Some(tab) = &tab
         && let Err(e) = open_tab(&window, page, tab)
@@ -234,6 +237,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     Timer::single_shot(idle.map_or(DEADLINE, Duration::from_secs), || {
         let _ = slint::quit_event_loop();
+    });
+    // The daemon's side: the History page asks for its list and waits for the answer.
+    let daemon = Timer::default();
+    daemon.start(TimerMode::Repeated, Duration::from_millis(50), move || {
+        while let Ok(cmd) = daemon_side.try_recv() {
+            if let Cmd::Send(Request::HistoryList { .. }) = cmd {
+                ipc.deliver(&Event::Push(Push::History {
+                    items: sample_history(),
+                    more: false,
+                }));
+            }
+        }
     });
     let shooter = Timer::default();
     let weak = window.as_weak();
@@ -276,4 +291,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let result = window.run();
     Ok(result?)
+}
+
+/// Synthetic dictations for the History page (no real person's text).
+fn sample_history() -> Vec<HistoryItem> {
+    let item = |id: &str, status: Status, text: &str| HistoryItem {
+        id: id.into(),
+        status,
+        duration_ms: 4_500,
+        model: String::new(),
+        language: String::new(),
+        text: Spoken(text.into()),
+    };
+    vec![
+        item(
+            "2026-11-10/120000-000",
+            Status::Done,
+            "Sample dictation one",
+        ),
+        item(
+            "2026-11-10/115000-000",
+            Status::Done,
+            "Sample dictation two",
+        ),
+        item("2026-11-09/090000-000", Status::Cancelled, ""),
+        item(
+            "2026-11-09/085500-000",
+            Status::Done,
+            "Sample dictation three",
+        ),
+    ]
 }

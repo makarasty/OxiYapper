@@ -100,9 +100,12 @@ pub fn look(state: OverlayState) -> Look {
 
 fn notice_look(notice: Notice) -> (Rgba, Icon) {
     match notice {
-        Notice::Cancelled | Notice::CancelledKept | Notice::NothingHeard | Notice::HistoryOn => {
-            (palette::INFO, Icon::Info)
-        }
+        Notice::Cancelled
+        | Notice::CancelledKept
+        | Notice::NothingHeard
+        | Notice::HistoryOn
+        | Notice::FailedKept
+        | Notice::Recovered => (palette::INFO, Icon::Info),
         Notice::PressPaste | Notice::AdminWindow => (palette::WARN, Icon::Paste),
         Notice::RestoreSkipped
         | Notice::MicFallback

@@ -50,6 +50,8 @@ pub struct MachineConfig {
     pub release_tail: Millis,
     /// What a load depends on: a change unloads the loaded model, the next use loads the new one.
     pub model: ModelIdentity,
+    /// `[history] enabled`: a recording with speech is kept when it is cancelled or fails.
+    pub keep_history: bool,
 }
 
 /// The settings a model load depends on.
@@ -87,6 +89,7 @@ impl From<&Config> for MachineConfig {
                 },
                 gpu: cfg.model.gpu.clone(),
             },
+            keep_history: cfg.history.enabled,
         }
     }
 }
@@ -281,6 +284,10 @@ pub enum Notice {
     OutOfMemory,
     /// The config migration turned history on; shown once, when the migrated file is written.
     HistoryOn,
+    /// A mic or model failure ended a recording with speech: its audio is in the history.
+    FailedKept,
+    /// The start found recordings a crash left behind and put them in the history.
+    Recovered,
 }
 
 /// What the overlay shows; emitted only when it changes.

@@ -82,8 +82,8 @@ export global ModelState {
     callback picked(int);
     callback download(int);
     callback cancel(int);
-    // Deletes the model's files; its card asked first.
-    callback delete(int);
+    // Deletes the model's files; its card asked first. False: refused at once, nothing was sent.
+    callback delete(int) -> bool;
     callback custom-edited(string);
     // The dialog starts at the folder of this path (DS-13.4).
     callback browse(string);
@@ -306,8 +306,9 @@ component ModelCard inherits VerticalLayout {
                             accessible-label: @tr("Confirm: delete {}", root.data.name);
                             clicked => {
                                 root.refocus = true;
-                                root.deleting = true;
-                                ModelState.delete(root.index);
+                                // A refusal may repeat the last "!" word for word, so `failure`
+                                // would not change: the wait starts only for a sent request.
+                                root.deleting = ModelState.delete(root.index);
                                 root.confirming = false;
                             }
                         }
@@ -539,7 +540,7 @@ export component ModelPage inherits VerticalLayout {
                         Row {
                             icon: Icons.timer;
                             title: @tr("Unload after idle");
-                            description: @tr("Frees the memory while you are not dictating.");
+                            info: @tr("Frees the memory while you are not dictating.");
                             fill-controls: true;
                             Combo {
                                 model: ModelState.unload-options;
@@ -559,9 +560,12 @@ export component ModelPage inherits VerticalLayout {
                         Row {
                             icon: Icons.folder-open-16;
                             title: @tr("Models folder");
-                            description: @tr("Where the downloaded models are kept.");
+                            info: @tr("Where the downloaded models are kept.");
+                            // The look of every open-folder button (System, Home): subtle, folder glyph.
                             Button {
                                 text: @tr("Open");
+                                kind: ButtonKind.subtle;
+                                icon: Icons.folder-open-16;
                                 accessible-label: @tr("Open models folder");
                                 clicked => {
                                     ModelState.open-folder();
@@ -572,7 +576,7 @@ export component ModelPage inherits VerticalLayout {
                         Row {
                             icon: Icons.delete;
                             title: @tr("Partial downloads");
-                            description: @tr("Unfinished downloads, kept so they can resume.");
+                            info: @tr("Unfinished downloads, kept so they can resume.");
                             Button {
                                 text: @tr("Delete");
                                 accessible-label: @tr("Delete partial downloads");
@@ -600,29 +604,53 @@ export component ModelPage inherits VerticalLayout {
                         Row {
                             icon: Icons.top-speed;
                             title: @tr("Processor threads");
-                            text-only: true;
-                            description: @tr("4 with a GPU; without one, half the processor's threads, at most 8.");
+                            info: @tr("4 with a GPU; without one, half the processor's threads, at most 8.");
+                            Text {
+                                text: @tr("Auto");
+                                font-size: Theme.body-size;
+                                color: Theme.text-secondary;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                            }
                         }
                         Divider { }
                         Row {
                             icon: Icons.fire;
                             title: @tr("Flash attention");
-                            text-only: true;
-                            description: @tr("On with a GPU that supports it, off on the processor.");
+                            info: @tr("On with a GPU that supports it, off on the processor.");
+                            Text {
+                                text: @tr("With GPU");
+                                font-size: Theme.body-size;
+                                color: Theme.text-secondary;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                            }
                         }
                         Divider { }
                         Row {
                             icon: Icons.code;
                             title: @tr("Decoding");
-                            text-only: true;
-                            description: @tr("Greedy, no beam search. A segment Whisper doubts is retried at a higher temperature.");
+                            info: @tr("Greedy, no beam search. A segment Whisper doubts is retried at a higher temperature.");
+                            Text {
+                                text: @tr("Greedy");
+                                font-size: Theme.body-size;
+                                color: Theme.text-secondary;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                            }
                         }
                         Divider { }
                         Row {
                             icon: Icons.book-letter;
                             title: @tr("Prompt");
-                            text-only: true;
-                            description: @tr("Your dictionary on the Text page, so names come out spelled your way.");
+                            info: @tr("Your dictionary on the Text page, so names come out spelled your way.");
+                            Text {
+                                text: @tr("Your dictionary");
+                                font-size: Theme.body-size;
+                                color: Theme.text-secondary;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                            }
                         }
                     }
                 }

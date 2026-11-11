@@ -39,6 +39,8 @@ notices! {
     MicSilence,
     OutOfMemory,
     HistoryOn,
+    FailedKept,
+    Recovered,
 }
 
 #[test]
