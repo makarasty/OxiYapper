@@ -35,7 +35,7 @@ mod controls {
         }
 
         export component TilesProbe inherits Window {
-            out property <length> next-x: Theme.position-tile-height * 1.5 + Theme.space-1;
+            out property <length> next-x: Theme.position-tile-width + Theme.position-tile-gap;
             width: 400px;
             height: 100px;
             init => {
@@ -44,6 +44,8 @@ mod controls {
             PositionTiles {
                 x: 0;
                 y: 0;
+                width: 360px;
+                height: 72px;
                 names: ["a", "b", "c", "d", "e", "f"];
                 selected: 0;
             }
@@ -90,7 +92,8 @@ use std::time::{Duration, Instant};
 
 use common::purple;
 use gallery::{
-    ClickRingProbe, Contrast, GalleryShot, GalleryTile, IconDangerProbe, PathFieldProbe, PathText,
+    ClickRingProbe, Contrast, DotProbe, GalleryShot, GalleryTile, HeatProbe, HoverTip,
+    IconDangerProbe, InvalidFieldProbe, MeterProbe, PathFieldProbe, PathText, PickProbe,
     SubTabsProbe, Theme, TileGalleryProbe, TipFadeProbe,
 };
 use slint::platform::software_renderer::{
@@ -208,7 +211,7 @@ fn save(pixmap: &Pixmap, name: &str) {
 #[test]
 fn purple_classifier_catches_the_accent() {
     assert!(purple(0x87, 0x64, 0xB8)); // Windows purple accent
-    assert!(!purple(0x1C, 0x1B, 0x19)); // our ink accent
+    assert!(!purple(0xD9, 0x3A, 0x3F)); // our default Red accent
     assert!(!purple(0x0F, 0x76, 0x6E)); // the old teal
     assert!(!purple(0x80, 0x80, 0x80)); // grey
     assert!(!purple(0xC4, 0x2B, 0x1C)); // error red
@@ -278,6 +281,60 @@ fn tooltip_bubble_fades_in() {
     }
 }
 
+/// DS-8.7: the reason shows on the field body and on the glyph, with the glyph in the field or not.
+#[test]
+fn invalid_field_exposes_its_tip() {
+    let _ = slint::platform::set_platform(Box::new(Shots));
+    let probe = InvalidFieldProbe::new().unwrap();
+    probe.show().unwrap();
+    advance(0);
+    let window = probe.window();
+    let hover = |x: f32, y: f32| {
+        let position = LogicalPosition::new(x, y);
+        window.dispatch_event(WindowEvent::PointerMoved { position });
+        advance(700);
+        probe.global::<HoverTip>().get_text()
+    };
+    let away = |x: f32, y: f32| {
+        let position = LogicalPosition::new(x, y);
+        window.dispatch_event(WindowEvent::PointerMoved { position });
+        advance(20);
+        probe.global::<HoverTip>().get_text()
+    };
+    // (x, y, what): body of the field, then its glyph (right edge 240, 4 px inset, 24 px wide); the clearable row sits at y 80.
+    for (x, y, what) in [
+        (30.0, 16.0, "body, glyph in the field"),
+        (224.0, 16.0, "the glyph"),
+        (30.0, 56.0, "body, glyph in the Row"),
+    ] {
+        assert_eq!(hover(x, y), "Not a colour", "{what}");
+        assert_eq!(
+            away(300.0, 90.0),
+            "",
+            "{what}: closes when the pointer leaves"
+        );
+    }
+    // Body -> clear "x" -> body: the "x" says "Clear", the body shows the reason again.
+    assert_eq!(hover(30.0, 96.0), "Not a colour", "clearable body");
+    assert_eq!(hover(228.0, 96.0), "Clear", "the clear button");
+    assert_eq!(hover(30.0, 96.0), "Not a colour", "back on the body");
+    // Click the "x" while its Tip shows: the text empties and the "x" goes away under the pointer.
+    // A new invalid value must show its reason on the body again.
+    assert_eq!(hover(228.0, 96.0), "Clear", "the clear button again");
+    let position = LogicalPosition::new(228.0, 96.0);
+    let button = PointerEventButton::Left;
+    window.dispatch_event(WindowEvent::PointerPressed { position, button });
+    window.dispatch_event(WindowEvent::PointerReleased { position, button });
+    advance(0);
+    assert_eq!(probe.get_clearable_text(), "", "the click cleared the text");
+    probe.set_clearable_text("#12G4".into());
+    assert_eq!(
+        hover(30.0, 96.0),
+        "Not a colour",
+        "body after clear and retype"
+    );
+}
+
 #[test]
 fn pressed_danger_fill_differs_from_hover_and_reaches_aa() {
     let shot = sheet(false);
@@ -298,7 +355,7 @@ fn pressed_danger_fill_differs_from_hover_and_reaches_aa() {
 }
 
 /// The swatch ratios are computed by `Contrast.ratio` from the tokens; they must match the
-/// concept C palette (DESIGN-SYSTEM section 19, two decimals).
+/// concept C neutrals (DESIGN-SYSTEM section 19) and the default Red accent (section 20), two decimals.
 #[test]
 fn contrast_matches_spec() {
     let shot = sheet(false);
@@ -323,22 +380,22 @@ fn contrast_matches_spec() {
             ),
             ("text-secondary/card", text2, card, Some(6.84), Some(7.72)),
             ("text-secondary/page", text2, page, Some(6.50), Some(8.47)),
-            ("accent/control", accent, control, Some(17.06), Some(13.54)),
-            ("accent/page", accent, page, Some(15.80), Some(16.18)),
-            ("accent/card", accent, card, Some(16.63), Some(14.74)),
+            ("accent/control", accent, control, Some(4.50), Some(3.33)),
+            ("accent/page", accent, page, Some(4.17), Some(3.99)),
+            ("accent/card", accent, card, Some(4.39), Some(3.63)),
             (
                 "on-accent/accent",
                 t.get_on_accent(),
                 accent,
-                Some(16.63),
-                Some(16.18),
+                Some(4.54),
+                Some(4.54),
             ),
             (
                 "accent-text/tint",
                 t.get_accent_text(),
                 tint,
-                Some(14.19),
-                Some(12.15),
+                Some(4.59),
+                Some(4.72),
             ),
             ("error/card", error, card, Some(5.98), Some(8.12)),
             (
@@ -448,12 +505,16 @@ fn light_theme_is_concept_c() {
         ("text-primary", t.get_text_primary(), 0xFF1C_1B19),
         ("text-secondary", t.get_text_secondary(), 0xFF5C_5850),
         ("text-disabled", t.get_text_disabled(), 0xFFA3_9F97),
-        ("focus-ring", t.get_focus_ring(), 0xFF5C_5850),
-        ("accent", t.get_accent(), 0xFF1C_1B19),
-        ("on-accent", t.get_on_accent(), 0xFFFC_FBF8),
-        ("accent-tint", t.get_accent_tint(), 0xFFEC_E9E2),
-        ("accent-badge", t.get_accent_badge(), 0xFFEC_E9E2),
-        ("recording", t.get_recording(), 0xFFE5_484D),
+        ("focus-ring", t.get_focus_ring(), 0xFFD9_3A3F),
+        ("accent", t.get_accent(), 0xFFD9_3A3F),
+        ("on-accent", t.get_on_accent(), 0xFFFF_FFFF),
+        ("accent-tint", t.get_accent_tint(), 0xFFF8_E4E2),
+        ("accent-badge", t.get_accent_badge(), 0xFFF8_E4E2),
+        // Deprecated alias of the accent (DS-21.5).
+        ("recording", t.get_recording(), 0xFFD9_3A3F),
+        ("accent-hover", t.get_accent_hover(), 0xFFC3_3439),
+        ("accent-pressed", t.get_accent_pressed(), 0xFFAE_2E32),
+        ("accent-text", t.get_accent_text(), 0xFFBF_3337),
         ("error-text", t.get_error_text(), 0xFFB9_291A),
         ("error-fill", t.get_error_fill(), 0xFFFB_EAE6),
         (
@@ -1017,16 +1078,16 @@ fn path_field_default_is_secondary_ink() {
     assert_ne!(default.get_ink(), shown_path("").get_ink());
 }
 
-/// DS-7.4: Browse is a Button with the folder-open glyph.
+/// DS-7.4: Browse is a Button with the `browse-folder` glyph (DS section 24).
 #[test]
 fn path_field_browse_has_the_folder_glyph() {
     assert!(shown_path("").get_browse_icon(), "Browse has no glyph");
 }
 
-/// In dark the accent is near-white ink: the picked spot must differ from the others by its
-/// stroke too, not by the faint tint alone.
+/// DS-20.6: the picked spot is the tint plus the accent mark, never a coloured outline: its stroke
+/// is the same as a plain tile's.
 #[test]
-fn position_tiles_selected_stroke_differs_in_dark() {
+fn position_tiles_selected_has_no_coloured_outline() {
     let _ = slint::platform::set_platform(Box::new(Shots));
     let probe = controls::TilesProbe::new().unwrap();
     let surface = LAST.with_borrow(Clone::clone).unwrap();
@@ -1049,7 +1110,7 @@ fn position_tiles_selected_stroke_differs_in_dark() {
         reason = "a small positive tile pitch in pixels"
     )]
     let next = probe.get_next_x().round() as usize;
-    assert_ne!(at(0), at(next), "picked and plain tiles share one stroke");
+    assert_eq!(at(0), at(next), "the picked tile has a stroke of its own");
 }
 
 /// A window coming back to the front (Alt+Tab) is not a key press: no ring. Tab still draws it.
@@ -1086,4 +1147,122 @@ fn popup_closed_by_keyboard_keeps_the_focus_ring() {
     press(&probe, Key::RightArrow);
     press(&probe, Key::Escape);
     assert!(probe.get_ring(), "the ring went with the popup");
+}
+
+/// Renders `probe`'s window once at `size`; the returned closure reads the pixel at (x, y) as [r, g, b].
+fn pixels(probe: &impl ComponentHandle, size: (u32, u32)) -> impl Fn(u32, u32) -> [u8; 3] {
+    let surface = LAST.with_borrow(Clone::clone).unwrap();
+    surface.set_size(PhysicalSize::new(size.0, size.1));
+    probe.show().unwrap();
+    slint::platform::update_timers_and_animations();
+    surface.request_redraw();
+    let mut buffer = vec![PremultipliedRgbaColor::default(); (size.0 * size.1) as usize];
+    assert!(surface.draw_if_needed(|renderer| {
+        renderer.render(&mut buffer, size.0 as usize);
+    }));
+    move |x, y| {
+        let p = buffer[(y * size.0 + x) as usize];
+        [p.red, p.green, p.blue]
+    }
+}
+
+fn rgb(c: Color) -> [u8; 3] {
+    [c.red(), c.green(), c.blue()]
+}
+
+/// DS-28.4, 02:8: tiles are 112 x 32, 12 apart across and 8 down; a click on the picked tile fires.
+#[test]
+fn position_tiles_fire_on_the_picked_tile_and_keep_the_grid() {
+    let _ = slint::platform::set_platform(Box::new(Shots));
+    let probe = PickProbe::new().unwrap();
+    probe.show().unwrap();
+    slint::platform::update_timers_and_animations();
+    // Tile 0 is the picked one.
+    click_at(&probe, 56.0, 16.0);
+    assert_eq!((probe.get_count(), probe.get_last()), (1, 0), "picked tile");
+    // The 12 px gap and the 8 px row gap are no tile.
+    click_at(&probe, 118.0, 16.0);
+    click_at(&probe, 56.0, 36.0);
+    assert_eq!(probe.get_count(), 1, "a gap fired");
+    // Tile 1 starts at x 124, tile 5 at (248, 40) and ends at (360, 72).
+    click_at(&probe, 125.0, 1.0);
+    assert_eq!((probe.get_count(), probe.get_last()), (2, 1), "tile 1");
+    click_at(&probe, 359.0, 71.0);
+    assert_eq!((probe.get_count(), probe.get_last()), (3, 5), "tile 5");
+}
+
+/// DS-21.3, 02:9: overloaded, the Meter has the 2 px clip line at its top edge and error-coloured
+/// bars; at rest it has neither.
+#[test]
+fn meter_overload_draws_the_clip_line_and_error_bars() {
+    let _ = slint::platform::set_platform(Box::new(Shots));
+    for overloaded in [false, true] {
+        let probe = MeterProbe::new().unwrap();
+        probe.set_overloaded(overloaded);
+        let at = pixels(&probe, (300, 32));
+        let (error, accent) = (rgb(probe.get_error()), rgb(probe.get_accent()));
+        let row = |y: u32, colour: [u8; 3]| (0..300).any(|x| at(x, y) == colour);
+        assert_eq!(row(0, error) && row(1, error), overloaded, "clip line");
+        assert!(!row(2, error), "the line is 2 px");
+        assert_eq!(row(16, error), overloaded, "bars in the error colour");
+        assert_eq!(row(16, accent), !overloaded, "bars in the accent");
+    }
+}
+
+/// DS-28.6, 02:10: a live day outlines on hover, shows its tip and reports a click; an empty one
+/// and the gap between cells do nothing.
+#[test]
+fn heatmap_days_hover_and_click() {
+    let _ = slint::platform::set_platform(Box::new(Shots));
+    let probe = HeatProbe::new().unwrap();
+    probe.show().unwrap();
+    advance(0);
+    let window = probe.window();
+    let top = probe.get_top().round();
+    let hover = |x: f32, y: f32| {
+        window.dispatch_event(WindowEvent::PointerMoved {
+            position: LogicalPosition::new(x, y),
+        });
+        advance(700);
+        (probe.get_hot(), probe.global::<HoverTip>().get_text())
+    };
+    // Day i of week w, row r: x 32 + 20 w, y top + 20 r.
+    let tip_at = || {
+        let tip = probe.global::<HoverTip>();
+        (tip.get_x(), tip.get_y())
+    };
+    assert_eq!(hover(40.0, top + 28.0), (1, "one".into()), "day 1");
+    let (x1, y1) = tip_at();
+    assert_eq!(hover(40.0, top + 48.0), (2, "two".into()), "day 2");
+    // The open tip follows the cell when the pointer hops to the next live day.
+    assert_eq!(tip_at(), (x1, y1 + 20.0), "tip moves one row down");
+    assert_eq!(hover(60.0, top + 8.0), (7, "week two".into()), "day 7");
+    assert_eq!(tip_at(), (x1 + 20.0, y1 - 20.0), "tip moves one week right");
+    assert_eq!(
+        hover(40.0, top + 8.0),
+        (-1, SharedString::new()),
+        "empty day"
+    );
+    assert_eq!(hover(49.0, top + 28.0).0, -1, "the gap between cells");
+    assert_eq!(hover(10.0, top + 28.0).0, -1, "the day labels");
+    hover(40.0, top + 28.0);
+    click_at(&probe, 40.0, top + 8.0);
+    assert_eq!(probe.get_clicked_day(), -1, "an empty day is inert");
+    click_at(&probe, 40.0, top + 28.0);
+    assert_eq!(probe.get_clicked_day(), 1, "a live day reports itself");
+}
+
+/// DS-28.3, 02:11: the kept-draft dot is the accent, inside the button's top-right corner.
+#[test]
+fn icon_button_kept_dot_is_the_accent_in_the_corner() {
+    let _ = slint::platform::set_platform(Box::new(Shots));
+    for kept in [false, true] {
+        let probe = DotProbe::new().unwrap();
+        probe.set_kept(kept);
+        let at = pixels(&probe, (32, 32));
+        let accent = rgb(probe.get_accent());
+        // The 6 px dot spans x 22..28, y 4..10.
+        assert_eq!(at(25, 7) == accent, kept, "dot centre");
+        assert_ne!(at(30, 2), accent, "outside the dot");
+    }
 }

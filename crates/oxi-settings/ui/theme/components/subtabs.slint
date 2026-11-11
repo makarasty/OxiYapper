@@ -4,7 +4,8 @@
 import { Theme } from "../tokens.slint";
 import { FocusRing, KeyFocus } from "base.slint";
 
-// Text tabs on one divider; the open one is semibold with a 3 px accent underline. Left/Right
+// Text tabs on one divider (DS-14): no fill, the first label at x 0 and every label's centre at y 20,
+// 24 px apart; the open one is semibold with a 2 px accent underline flush with the bar's bottom. Left/Right
 // and Home/End switch at once, Tab leaves the bar. One-way like the pickers: `picked` fires, the
 // owner updates `selected`. Navigation only, so a locked config does not lock it.
 export component SubTabs {
@@ -31,6 +32,8 @@ export component SubTabs {
 
     // As tall as the header row of a page without tabs, so both line up with the first rail item.
     height: Theme.header-row-height;
+    // Pages read `tabs.preferred-height` to size what is under the bar: it is the bar's height.
+    preferred-height: Theme.header-row-height;
     vertical-stretch: 0;
     // The tab line spans the whole content width, card edge to card edge (DS-14.2 [24]).
     horizontal-stretch: 1;
@@ -43,21 +46,20 @@ export component SubTabs {
         background: Theme.divider;
     }
     HorizontalLayout {
-        // Clear of the 1 px tab line.
-        padding-bottom: 1px;
-        spacing: Theme.space-1;
+        // Each tab's hit area is its label plus `space-3` each side (DS-14), so labels are `tab-gap`
+        // apart; shifted left by the first tab's lead, its text is at x 0.
+        x: -Theme.space-3;
+        spacing: 0;
         alignment: start;
         for item[i] in root.items: item-box := Rectangle {
             property <bool> on: i == root.selected;
             property <bool> hover: touch.has-hover || root.force-hover == i;
             property <bool> down: touch.pressed || root.force-pressed == i;
-            // Short of room, the side padding goes first; the labels stay whole.
-            min-width: content.preferred-width + 2 * Theme.space-1;
-            preferred-width: content.preferred-width + 2 * Theme.space-3;
-            border-top-left-radius: Theme.radius-control;
-            border-top-right-radius: Theme.radius-control;
-            background: self.down ? Theme.bg-subtle-selected : self.hover ? Theme.bg-subtle-hover : transparent;
-            animate background { duration: Theme.motion-quick; easing: ease-out; }
+            // The 12 px hit area left of the label; the first tab's overhangs the bar (below).
+            property <length> lead: Theme.space-3;
+            // Short of room the labels stay whole; the side padding is part of the box.
+            min-width: content.preferred-width;
+            preferred-width: content.preferred-width;
             accessible-role: tab;
             accessible-label: item;
             // The count, so a screen reader hears it too.
@@ -68,14 +70,17 @@ export component SubTabs {
                 root.pick(i);
             }
             content := HorizontalLayout {
-                padding-top: Theme.tab-padding-top;
-                padding-bottom: Theme.tab-padding-bottom;
+                padding-left: item-box.lead;
+                // Label centre at y 20 of the 40 px bar (DS-14).
+                padding-right: Theme.space-3;
                 spacing: Theme.tab-count-gap;
-                alignment: center;
+                alignment: start;
                 // Always as wide as the semibold label, so opening a tab moves nothing.
                 Rectangle {
                     width: strong.preferred-width;
                     strong := Text {
+                        height: 100%;
+                        vertical-alignment: center;
                         text: item;
                         font-size: Theme.body-size;
                         font-weight: Theme.weight-strong;
@@ -86,6 +91,8 @@ export component SubTabs {
                     }
                     Text {
                         width: 100%;
+                        height: 100%;
+                        vertical-alignment: center;
                         text: item;
                         font-size: Theme.body-size;
                         color: item-box.hover ? Theme.text-primary : Theme.text-secondary;
@@ -110,9 +117,10 @@ export component SubTabs {
             Rectangle {
                 opacity: parent.on ? 1 : 0;
                 animate opacity { duration: Theme.motion-quick; easing: ease-out; }
-                x: Theme.whole((parent.width - self.width) / 2);
-                y: parent.height - Theme.tab-underline + 1px;
-                width: content.preferred-width;
+                // Exactly the label's width, not its count's (DS-14), flush with the bottom.
+                x: item-box.lead;
+                y: parent.height - Theme.tab-underline;
+                width: strong.preferred-width;
                 height: Theme.tab-underline;
                 border-radius: Theme.radius-small;
                 background: Theme.accent;

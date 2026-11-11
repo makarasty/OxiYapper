@@ -1,6 +1,6 @@
 // System page (SPEC System). The shell owns the theme picker (config `ui.theme`); the rest is
 // `[system]`, `[history]` and `debug.log_text`, filled and read by `pages::system`.
-import { Theme, Shell, Icons, Group, Card, Row, Divider, ToggleRow, TilePicker, Combo, Button, ButtonKind, NumberField, PathField, SubTabs } from "../theme/index.slint";
+import { Theme, Shell, Icons, Group, Card, Row, Divider, ToggleRow, TilePicker, Combo, Button, ButtonKind, NumberField, PathField, SubTabs, TextField, FocusRing, KeyFocus, Tip } from "../theme/index.slint";
 import { HomeState } from "home.slint";
 
 export enum ThemeChoice { system, dark, light }
@@ -11,6 +11,23 @@ export global SystemState {
     in-out property <bool> autostart;
     in-out property <bool> update-check;
     in-out property <bool> log-text;
+    // The accent picker (DS-20.7). The presets in both themes (derived in Rust, nothing here
+    // computes a colour), the preset the seed equals (-1: a custom one) and the field's text.
+    in property <[string]> swatch-names;
+    in property <[color]> swatch-fill-dark;
+    in property <[color]> swatch-ink-dark;
+    in property <[color]> swatch-fill-light;
+    in property <[color]> swatch-ink-light;
+    in property <int> accent-selected: -1;
+    in-out property <string> accent-hex;
+    // The seed in use, as `accent-hex` shows it when nothing is being typed: unconfirmed text goes back to it.
+    in property <string> accent-saved;
+    // Why the typed hex is refused (the field's error state, cleared by the next edit), and the
+    // close-to-error notice: the Accent row's "!".
+    in-out property <string> accent-error;
+    in property <string> accent-notice;
+    callback accent-picked(int);
+    callback accent-typed(string);
     // Names of the app languages (`pages::system::APP_LANGUAGES`) and the one in use.
     in property <[string]> app-languages;
     in-out property <int> app-language;
@@ -45,6 +62,130 @@ export global SystemState {
     callback history-check();
 }
 
+// DS-20.7: ten 20 px swatches 6 px apart and the seed's hex field, packed to the column's right
+// edge (DS-3.7). Arrow keys move through the swatches, Space or Enter picks.
+component AccentPicker inherits Rectangle {
+    callback picked(int);
+    callback typed(string);
+    property <[color]> fills: Theme.dark ? SystemState.swatch-fill-dark : SystemState.swatch-fill-light;
+    property <[color]> inks: Theme.dark ? SystemState.swatch-ink-dark : SystemState.swatch-ink-light;
+    property <length> swatch-size: 20px;
+    property <length> pitch: 26px;
+    property <length> strip-width: SystemState.swatch-names.length * root.pitch - (root.pitch - root.swatch-size);
+    property <int> cursor;
+    property <bool> key-focus;
+    // The column's width, contents laid from its right edge: in the narrow column (240) the
+    // swatches reach left over the Row's free title space instead of past the card.
+    min-width: Theme.control-column;
+    preferred-width: Theme.control-column;
+    height: Theme.control-height;
+    accessible-role: radio-group;
+    accessible-label: @tr("Accent");
+
+    // The cells are the full control height and half a gap wider than the swatch each side.
+    strip := Rectangle {
+        x: root.width - Theme.control-side - Theme.control-gap - root.strip-width;
+        width: root.strip-width;
+        height: 100%;
+        for name[i] in SystemState.swatch-names: Rectangle {
+            x: i * root.pitch;
+            width: root.swatch-size;
+            height: root.swatch-size;
+            circle := Rectangle {
+                background: root.fills[i];
+                border-radius: Theme.radius-round;
+                if SystemState.accent-selected == i: Image {
+                    width: 12px;
+                    height: 12px;
+                    source: Icons.checkmark-12;
+                    colorize: root.inks[i];
+                    accessible-role: none;
+                }
+                FocusRing {
+                    radius: Theme.radius-round;
+                    shown: root.key-focus && strip-fs.has-focus && root.cursor == i;
+                }
+            }
+            // Hover: a 2 px ring 2 px outside the swatch, drawn over the row's own free space.
+            Rectangle {
+                visible: touch.has-hover && !Shell.locked;
+                x: -4px;
+                y: -4px;
+                width: parent.width + 8px;
+                height: parent.height + 8px;
+                border-width: 2px;
+                border-color: Theme.stroke-keycap;
+                border-radius: Theme.radius-round;
+            }
+            touch := TouchArea {
+                x: -(root.pitch - root.swatch-size) / 2;
+                y: -(Theme.control-height - root.swatch-size) / 2;
+                width: root.pitch;
+                height: Theme.control-height;
+                enabled: !Shell.locked;
+                mouse-cursor: pointer;
+                clicked => {
+                    root.cursor = i;
+                    root.picked(i);
+                }
+                Tip {
+                    text: name;
+                    hovered: touch.has-hover;
+                }
+            }
+            accessible-role: radio-button;
+            accessible-label: name;
+            accessible-checked: SystemState.accent-selected == i;
+        }
+        strip-fs := FocusScope {
+            enabled: !Shell.locked;
+            focus-on-click: false;
+            focus-gained(reason) => {
+                root.key-focus = KeyFocus.after(reason, root.key-focus);
+                root.cursor = max(0, SystemState.accent-selected);
+            }
+            key-pressed(event) => {
+                if (event.text == Key.LeftArrow) {
+                    root.cursor = max(0, root.cursor - 1);
+                    return accept;
+                }
+                if (event.text == Key.RightArrow) {
+                    root.cursor = min(SystemState.swatch-names.length - 1, root.cursor + 1);
+                    return accept;
+                }
+                if (event.text == " " || event.text == "\n") {
+                    root.picked(root.cursor);
+                    return accept;
+                }
+                reject
+            }
+        }
+    }
+    field := TextField {
+        x: root.width - Theme.control-side;
+        width: Theme.control-side;
+        text <=> SystemState.accent-hex;
+        accessible-label: @tr("Accent colour as hex");
+        invalid: SystemState.accent-error != "";
+        invalid-tip: SystemState.accent-error;
+        // Only Enter applies: text left behind is neither applied nor saved, so it does not stay.
+        // shortcut: Alt+Tab away also puts it back (a 7-character seed; the folder field keeps its text),
+        // keep it unless owners miss the typed text.
+        changed has-focus => {
+            if (!self.has-focus) {
+                SystemState.accent-hex = SystemState.accent-saved;
+                SystemState.accent-error = "";
+            }
+        }
+        edited(text) => {
+            SystemState.accent-error = "";
+        }
+        accepted(text) => {
+            root.typed(text);
+        }
+    }
+}
+
 export component SystemPage inherits VerticalLayout {
     in property <ThemeChoice> theme;
     callback theme-picked(ThemeChoice);
@@ -66,7 +207,8 @@ export component SystemPage inherits VerticalLayout {
         }
     }
     alignment: start;
-    spacing: Theme.space-4;
+    // DS-1.3: the first group sits `header-bottom` under the tab line, as on every page.
+    spacing: Theme.header-bottom;
     init => {
         SystemState.history-check();
     }
@@ -99,21 +241,32 @@ export component SystemPage inherits VerticalLayout {
             }
         }
         Card {
+            Row {
+                title: @tr("Accent");
+                // A refused hex shows in the field itself (DS-8.7); the row's "!" is the notice.
+                warning: SystemState.accent-notice;
+                AccentPicker {
+                    picked(i) => {
+                        SystemState.accent-picked(i);
+                    }
+                    typed(text) => {
+                        SystemState.accent-typed(text);
+                    }
+                }
+            }
+            Divider { }
             // No icon: no other System row has one, and titles start at one x (UI rule 9).
             Row {
                 title: @tr("App language");
                 info: @tr("Menus and labels of this window. It does not change the language you dictate in.");
-                // Centred: a Combo would fill the row.
-                VerticalLayout {
-                    alignment: center;
-                    horizontal-stretch: 1;
-                    Combo {
-                        model: SystemState.app-languages;
-                        current-index <=> SystemState.app-language;
-                        accessible-label: @tr("App language");
-                        selected => {
-                            SystemState.app-language-picked(self.current-index);
-                        }
+                // The Combo spans the column (DS-3.1), as on Audio.
+                fill-controls: true;
+                Combo {
+                    model: SystemState.app-languages;
+                    current-index <=> SystemState.app-language;
+                    accessible-label: @tr("App language");
+                    selected => {
+                        SystemState.app-language-picked(self.current-index);
                     }
                 }
             }
@@ -158,7 +311,7 @@ export component SystemPage inherits VerticalLayout {
                     title: @tr("Update checks tell you when a fix is out.");
                     Button {
                         text: @tr("Turn off");
-                        kind: ButtonKind.subtle;
+                        kind: ButtonKind.soft;
                         // The risky choice the confirmation guards turns red under the pointer (UI rule 16).
                         destructive: true;
                         accessible-label: @tr("Turn off update checks");
@@ -281,8 +434,8 @@ export component SystemPage inherits VerticalLayout {
                     // Only opens Explorer: live while the config is locked.
                     Button {
                         text: @tr("Open");
-                        kind: ButtonKind.subtle;
-                        icon: Icons.folder-open-16;
+                        kind: ButtonKind.soft;
+                        icon: Icons.folder-open;
                         accessible-label: @tr("Open recordings folder");
                         clicked => {
                             root.put-back-path();
@@ -296,8 +449,8 @@ export component SystemPage inherits VerticalLayout {
                 title: @tr("Open a folder");
                 Button {
                     text: @tr("Settings");
-                    kind: ButtonKind.subtle;
-                    icon: Icons.folder-open-16;
+                    kind: ButtonKind.soft;
+                    icon: Icons.folder-open;
                     accessible-label: @tr("Open settings folder");
                     clicked => {
                         root.put-back-path();
@@ -306,8 +459,8 @@ export component SystemPage inherits VerticalLayout {
                 }
                 Button {
                     text: @tr("Logs");
-                    kind: ButtonKind.subtle;
-                    icon: Icons.folder-open-16;
+                    kind: ButtonKind.soft;
+                    icon: Icons.folder-open;
                     accessible-label: @tr("Open logs folder");
                     clicked => {
                         root.put-back-path();

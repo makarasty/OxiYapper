@@ -1,6 +1,6 @@
 // Home dashboard pieces: stat cards and the speaking-activity heatmap.
 import { Theme } from "../tokens.slint";
-import { Caption } from "base.slint";
+import { Caption, Tip } from "base.slint";
 import { ClickCard } from "layout.slint";
 
 // One number on a card: icon + label, the big value ("299.9K"), a caption ("All time"). A click
@@ -140,11 +140,23 @@ export struct MonthLabel {
 // GitHub-style activity grid: weeks as columns, seven day rows, month labels on top,
 // five levels from empty to full accent, a Less..More legend, today's cell outlined.
 // `levels` is one 0..4 per day, week by week (index = week * 7 + row, rows as in `day-labels`);
-// the last week may be partial. `today` is the index of today's cell (-1: none).
+// the last week may be partial. `today` is the index of today's cell (-1: none). A day with a
+// level above 0 is live (DS-28.6): a 1 px outline and the tip `day-tips[i]` on hover, `day-clicked(i)`
+// on a click (the page decides what a day opens); empty days are inert.
 export component ActivityHeatmap {
     in property <[int]> levels;
     in property <[MonthLabel]> months;
     in property <int> today: -1;
+    // Parallel to `levels`: the tooltip of each day ("12 Nov · 34 dictations · 1,240 words").
+    in property <[string]> day-tips;
+    callback day-clicked(int);
+    // The live day under the pointer (-1: none); read by tests.
+    out property <int> hot: touch.has-hover && root.gx >= 0px && root.gy >= 0px && mod(root.gx / 1px, root.pitch / 1px) < root.cell / 1px && mod(root.gy / 1px, root.pitch / 1px) < root.cell / 1px && root.day-row < 7 && root.cand < root.levels.length && root.levels[root.cand] > 0 ? root.cand : -1;
+    // The pointer in grid coordinates, and the day index of the cell or gap it is over.
+    property <length> gx: touch.mouse-x - root.label-w;
+    property <length> gy: touch.mouse-y - root.top;
+    property <int> day-row: floor(root.gy / root.pitch);
+    property <int> cand: floor(root.gx / root.pitch) * 7 + root.day-row;
     // Spoken summary of the grid (the cells are drawn, not readable).
     in property <string> summary;
     in property <[string]> day-labels: [@tr("Mon"), @tr("Tue"), @tr("Wed"), @tr("Thu"), @tr("Fri"), @tr("Sat"), @tr("Sun")];
@@ -163,7 +175,7 @@ export component ActivityHeatmap {
     property <length> top: Theme.heat-top;
 
     public pure function level-color(level: int) -> color {
-        return level <= 0 ? Theme.bg-inset : level == 1 ? Theme.accent.transparentize(0.75) : level == 2 ? Theme.accent.transparentize(0.5) : level == 3 ? Theme.accent.transparentize(0.25) : Theme.accent;
+        return level <= 0 ? Theme.bg-inset : level == 1 ? Theme.heat-1 : level == 2 ? Theme.heat-2 : level == 3 ? Theme.heat-3 : Theme.heat-4;
     }
 
     accessible-role: image;
@@ -206,6 +218,34 @@ export component ActivityHeatmap {
                 border-width: 1.5px;
                 border-color: Theme.text-primary;
             }
+        }
+        // The hover outline, one element for the whole grid: 1 px, inside the cell.
+        Rectangle {
+            visible: root.hot >= 0;
+            x: root.label-w + floor(root.hot / 7) * root.pitch;
+            y: root.top + mod(root.hot, 7) * root.pitch;
+            width: root.cell;
+            height: root.cell;
+            border-radius: Theme.radius-small;
+            border-width: 1px;
+            border-color: Theme.stroke-keycap;
+        }
+        touch := TouchArea {
+            mouse-cursor: root.hot >= 0 ? MouseCursor.pointer : MouseCursor.default;
+            clicked => {
+                if (root.hot >= 0) {
+                    root.day-clicked(root.hot);
+                }
+            }
+        }
+        // One tip for the grid, over the hovered cell: it follows the cell, not a Tip per cell.
+        Tip {
+            x: root.label-w + floor(max(root.hot, 0) / 7) * root.pitch;
+            y: root.top + mod(max(root.hot, 0), 7) * root.pitch;
+            width: root.cell;
+            height: root.cell;
+            text: root.hot >= 0 && root.hot < root.day-tips.length ? root.day-tips[root.hot] : "";
+            hovered: root.hot >= 0;
         }
     }
     legend := HorizontalLayout {

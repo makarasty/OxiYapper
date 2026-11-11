@@ -7,13 +7,16 @@ use std::rc::Rc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::{fs, thread};
 
-use oxi_core::config::{AppLanguage, Config};
+use oxi_core::config::{Accent, AppLanguage, Config, Rgb};
 use oxi_core::history;
+use oxi_core::overlay::{
+    AccentTheme, PRESETS, close_to_error, derive, hex, parse_seed, preset_index, seed,
+};
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, Weak};
 
 use crate::constants::FOLDER_POLL;
 use crate::generated::SystemState;
-use crate::{AppWindow, Ctx, Error, report};
+use crate::{AccentColors, AppWindow, Ctx, Error, report, set_accent};
 
 /// The languages of the app's own text: config value and the name in that language. A new
 /// language is one row here plus the translation of the `@tr` strings.
@@ -27,9 +30,76 @@ const FOLDER_READ_ONLY: &str =
 const FOLDER_IS_A_FILE: &str = "This is a file, not a folder. Nothing is saved: choose a folder.";
 const FOLDER_REFUSED: &str = "The \"OxiYapper history\" folder here holds other files. Nothing is saved: choose another one.";
 
+const HEX_REFUSED: &str = "Use six hex digits, like #D93A3F";
+const CLOSE_TO_ERROR: &str = "Close to the error colour. Errors keep their icon and text.";
+
+/// The window's colours for one theme of a derived accent.
+fn colors(t: &AccentTheme) -> AccentColors {
+    let v = |c: Rgb| u32::from_be_bytes([0, c.0, c.1, c.2]);
+    AccentColors {
+        accent: v(t.accent),
+        hover: v(t.hover),
+        pressed: v(t.pressed),
+        on_accent: v(t.on_accent),
+        text: v(t.text),
+        tint: v(t.tint),
+        heat: t.heat.map(v),
+    }
+}
+
+/// Shows `seed` everywhere in the window: both themes recolour at once and the picker follows.
+fn show_accent(window: &AppWindow, seed: Rgb) {
+    set_accent(
+        window,
+        colors(&derive(seed, true)),
+        colors(&derive(seed, false)),
+    );
+    let s = window.global::<SystemState>();
+    s.set_accent_selected(
+        preset_index(seed)
+            .and_then(|i| i32::try_from(i).ok())
+            .unwrap_or(-1),
+    );
+    s.set_accent_hex(hex(seed).into());
+    s.set_accent_saved(hex(seed).into());
+    s.set_accent_error(SharedString::new());
+    s.set_accent_notice(
+        if close_to_error(seed) {
+            CLOSE_TO_ERROR
+        } else {
+            ""
+        }
+        .into(),
+    );
+}
+
+/// The presets as the picker draws them: in both themes, the derived `accent` and the ink of the
+/// check on it.
+fn bind_swatches(s: &SystemState<'_>) {
+    let c = |v: Rgb| slint::Color::from_rgb_u8(v.0, v.1, v.2);
+    let column = |dark: bool, pick: fn(&AccentTheme) -> Rgb| {
+        ModelRc::from(PRESETS.map(|p| c(pick(&derive(p.seed, dark)))))
+    };
+    s.set_swatch_names(ModelRc::from(PRESETS.map(|p| SharedString::from(p.name))));
+    s.set_swatch_fill_dark(column(true, |t| t.accent));
+    s.set_swatch_ink_dark(column(true, |t| t.on_accent));
+    s.set_swatch_fill_light(column(false, |t| t.accent));
+    s.set_swatch_ink_light(column(false, |t| t.on_accent));
+}
+
+/// Saves a picked or typed seed and shows it at once (the live preview is the app itself).
+fn apply_accent(weak: &Weak<AppWindow>, ctx: &Ctx, seed: Rgb) {
+    apply(weak, ctx, |cfg| cfg.ui.accent = Accent::Hex(seed));
+    if let Some(window) = weak.upgrade() {
+        show_accent(&window, seed);
+    }
+}
+
 pub fn bind(window: &AppWindow, ctx: &Ctx) {
     let s = window.global::<SystemState>();
     let file = ctx.config.borrow();
+    bind_swatches(&s);
+    show_accent(window, seed(file.config.ui.accent));
     s.set_autostart(file.config.system.autostart);
     s.set_update_check(file.config.system.update_check);
     s.set_log_text(file.config.debug.log_text);
@@ -58,6 +128,24 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     s.on_app_language_picked(move |row| {
         if let Some((language, _)) = usize::try_from(row).ok().and_then(|r| APP_LANGUAGES.get(r)) {
             apply(&w, &c, |cfg| cfg.ui.language = *language);
+        }
+    });
+    let (w, c) = (window.as_weak(), ctx.clone());
+    s.on_accent_picked(move |row| {
+        if let Some(preset) = usize::try_from(row).ok().and_then(|r| PRESETS.get(r)) {
+            apply_accent(&w, &c, preset.seed);
+        }
+    });
+    let (w, c) = (window.as_weak(), ctx.clone());
+    s.on_accent_typed(move |text| match parse_seed(&text) {
+        Some(rgb) => apply_accent(&w, &c, rgb),
+        // Nothing is saved: the field keeps what was typed and says why.
+        None => {
+            if let Some(window) = w.upgrade() {
+                window
+                    .global::<SystemState>()
+                    .set_accent_error(HEX_REFUSED.into());
+            }
         }
     });
     let (w, dir) = (window.as_weak(), ctx.layout.config_dir.clone());
@@ -343,5 +431,20 @@ mod tests {
         assert_eq!(browse_start(root.to_str().unwrap(), &default), root);
         let gone = root.join("gone").join("deeper");
         assert_eq!(browse_start(gone.to_str().unwrap(), &default), root);
+    }
+}
+
+#[cfg(test)]
+mod accent_tests {
+    use super::*;
+
+    /// The window's built-in Red equals what the derivation gives for the default seed, so a fresh
+    /// config and a picked Red look the same.
+    #[test]
+    fn the_default_seed_derives_the_built_in_red() {
+        let red = seed(Accent::Default);
+        assert_eq!(colors(&derive(red, true)), AccentColors::RED_DARK);
+        assert_eq!(colors(&derive(red, false)), AccentColors::RED_LIGHT);
+        assert_eq!(preset_index(red), Some(0));
     }
 }

@@ -329,6 +329,7 @@ fn add_rule(paste: &mut Paste, app: &str) -> bool {
             mode: Some(PasteMode::Type),
             chord: None,
             restore_delay_ms: None,
+            ..PasteRule::default()
         });
     }
     true

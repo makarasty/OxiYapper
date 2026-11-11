@@ -1,7 +1,7 @@
 // Settings window (redesign spec sections 2 and 3): a nav rail with icons on the left (icons only
 // under 960 px), the page on the right in a scrolling column as wide as the window allows, banners above it.
 import { Palette } from "std-widgets.slint";
-import { Theme, Shell, Icons, KeyFocus, Tip, Button, Banner, Severity, HeaderRow, StatusChip, MonthLabel, PathText, ScrollView } from "theme/index.slint";
+import { Theme, Shell, AccentSet, Icons, KeyFocus, Tip, Button, Banner, Severity, HeaderRow, StatusChip, MonthLabel, PathText, ScrollView } from "theme/index.slint";
 import { KeyTipHost, Toast, ToastHost } from "theme/components/feedback.slint";
 import { HomePage, HomeState } from "pages/home.slint";
 import { HotkeyPage, HotkeyState } from "pages/hotkey.slint";
@@ -16,15 +16,15 @@ import { AboutPage } from "pages/about.slint";
 import { HistoryPage, HistoryState, HistoryRow } from "pages/history.slint";
 
 export { GalleryTile } from "theme/index.slint";
-export { Shell, Theme, Toast, PathText, ThemeChoice, HomeState, MonthLabel, HotkeyState, KeyCap, AudioState, AudioKey, ModelState, ModelRow, TextState, PasteRuleRow, FileState, FileInfo, TextFile, OverlayState, SystemState, TestState, TestRow, HistoryState, HistoryRow }
+export { Shell, Theme, AccentSet, Toast, PathText, ThemeChoice, HomeState, MonthLabel, HotkeyState, KeyCap, AudioState, AudioKey, ModelState, ModelRow, TextState, PasteRuleRow, FileState, FileInfo, TextFile, OverlayState, SystemState, TestState, TestRow, HistoryState, HistoryRow }
 
 export enum Page { home, hotkey, audio, model, text, overlay, history, test, system, about }
 
 // The status chip right of the header row (`ipc::Level`); `hidden` when the window follows no daemon.
 export enum ChipLevel { hidden, ok, attention, down }
 
-// One page of the rail. Selected: neutral fill, 3x16 accent pill, filled icon in accent; the label
-// keeps its weight so nothing moves. The rail owns focus; `focused` draws the ring inside.
+// One page of the rail. Selected: `accent-tint` fill, 3x16 accent pill, filled icon in `accent-text`;
+// the label keeps its weight so nothing moves. The rail owns focus; `focused` draws the ring inside.
 component NavItem inherits Rectangle {
     in property <string> label;
     in property <image> icon;
@@ -36,7 +36,8 @@ component NavItem inherits Rectangle {
     // The label starts past the icon: the rail inset, the icon, one sibling gap.
     property <length> text-x: Theme.space-3 + Theme.icon-size + Theme.space-2;
     border-radius: Theme.radius-control;
-    background: root.selected ? Theme.bg-subtle-selected : touch.has-hover ? Theme.bg-subtle-hover : transparent;
+    background: root.selected ? Theme.accent-tint : touch.has-hover ? Theme.bg-subtle-hover : transparent;
+    animate background { duration: Theme.motion-quick; easing: ease-out; }
     accessible-role: tab;
     accessible-label: root.label;
     accessible-item-selectable: true;
@@ -85,7 +86,7 @@ component NavItem inherits Rectangle {
     Rectangle {
         visible: root.focused;
         border-width: Theme.focus-ring-width;
-        border-color: Theme.focus-outer;
+        border-color: Theme.focus-ring;
         border-radius: Theme.radius-control;
     }
 }
@@ -183,6 +184,10 @@ export component AppWindow inherits Window {
     init => {
         root.apply-theme();
         Shell.page-width = root.page-width;
+        Shell.window-height = root.height;
+    }
+    changed height => {
+        Shell.window-height = root.height;
     }
     changed theme => {
         root.apply-theme();
@@ -382,9 +387,8 @@ export component AppWindow inherits Window {
                 // Right of the header row, over a page's own SubTabs too; it scrolls with them.
                 if root.chip-level != ChipLevel.hidden: StatusChip {
                     x: scroll.width - root.pad - self.width;
-                    // Its text centres on the header's: the page name (centred in the row) or the
-                    // SubTabs labels (between the tab paddings, over the 1 px tab line).
-                    y: scroll.viewport-y + column.padding-top + floor(((root.tabbed ? Theme.tab-padding-top + (Theme.header-row-height - 1px - Theme.tab-padding-top - Theme.tab-padding-bottom) / 2 : Theme.header-row-height / 2) - self.height / 2) / 1px) * 1px;
+                    // Its centre is the header row's: title or tabs, both centred at y 20 (DS-14).
+                    y: scroll.viewport-y + column.padding-top + floor(((Theme.header-row-height - self.height) / 2) / 1px) * 1px;
                     width: self.preferred-width;
                     text: root.chip-text;
                     tooltip: root.chip-tooltip;

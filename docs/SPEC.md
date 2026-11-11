@@ -52,7 +52,7 @@ All measured against the 8 owner reference phrases before becoming defaults.
 ## History
 
 - Recording storage is a setting, on by default (30 days / 2 GB; owner 2026-11-10, replaces the off-by-default rule of 2026-11-08) and can be turned off. Each dictation saves wav + text + json meta to a folder the person chooses, with retention limits by size and by age (see History in round 3). The audio is written to disk while recording, so a crash or power loss keeps it. The entry format (wav + txt + json) is stable and documented, so other tools can read it.
-- Usage stats for the Home page (owner request 2026-11-07), always on: per local day only the number of dictations, their word count and audio length. Never the text, app names or a time finer than the day; nothing of it goes to logs or the network.
+- Usage stats for the Home page (owner request 2026-11-07), always on: per local day only the number of dictations, their word count, audio length and the length of the voiced part of that audio (for the speech rate and the share of pauses on Home, owner 2026-11-11). Never the text, app names or a time finer than the day; nothing of it goes to logs or the network.
 
 ## Settings UI
 
@@ -91,6 +91,23 @@ All measured against the 8 owner reference phrases before becoming defaults.
 - Sounds: a set of 3-4 own synthesised sounds (no third-party rights), volume slider, preview in settings, custom wav allowed.
 - Recording cap: 60 minutes by default (owner decision #50, `max_seconds = 3600`), configurable up to 120 minutes in settings; the overlay warns 30 s before; long audio is transcribed in chunks.
 - Moving from the previous tool (owner's machine, never in the repo): copy the 59-word `C:\Users\mky\Desktop\dictionary.txt` into the local config; reuse the podlodka model already on disk (SHA256 checked, no 3 GB re-download); import its history (transcriptions.db + audio) as an app feature or a one-off script.
+
+## Decided in round 5 (2026-11-11)
+
+- Owner rule: anything that changes the dictated text, or that people may disagree about, is a setting and is off by default.
+- Accent colour: a set of presets plus a custom hex, with one brand accent as the default. It colours the settings window and the overlay; red is only for errors and overload. This replaces "the accent is the ink of the theme" and "red only for recording now" in Settings UI above.
+- Hold mode, re-press gap: a release followed by a new press within the gap continues the same dictation. On by default, 400 ms, adjustable 100-1500 ms, can be turned off.
+- Model > Advanced: the engine parameters (threads, flash attention, decoding, temperature, prompt, audio context, thresholds) can be changed; each has Auto, and "Reset all to Auto" exists. Auto is the behaviour before this round.
+- Microphone: input channel and voice-detection sensitivity are settings. The Test page records with the same microphone settings as dictation.
+- Sounds: a folder of sound files can be added.
+- Text, all off by default: punctuation and paragraphs from pauses, a filler-word filter with an editable list, voice commands (new line, new paragraph, delete that), snippets (a whole phrase that inserts a stored text), a confidence filter (it holds back a part the model is unsure of, or a doubtful part from a stretch the model hears as probably no speech; the stretch alone never holds anything; every part it holds back stays in the history, so it works only while recording storage is on).
+- Per-app rules can also set the language, the model and the text switches for an app. A model per language can be set. Both do nothing until filled in.
+- To-file mode: dictations are also, or only, appended to a daily file in a chosen folder. Off by default.
+- Typing speed: fast or safe (the pace before this round), global and per app. An app with a rule that forces typing, and remote desktop, keep the safe pace unless a rule sets the speed.
+- Transcribe a file: wav, ogg, mp3, m4a/mp4 (AAC) and flac (owner 2026-11-11; the new decoder must pass the licence check). The result is a history entry.
+- History player: long pauses can be skipped during playback. Off by default; the recording itself is never changed.
+- The model can be loaded at start. Off by default.
+- Home shows the speech rate (see History).
 
 ## OPEN
 

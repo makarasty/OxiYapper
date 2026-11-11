@@ -7,7 +7,8 @@ use oxi_core::audio::Level;
 use oxi_core::config::OverlayPosition;
 use oxi_core::machine::{Notice, OverlayState, Phase};
 use oxi_core::overlay::{
-    CARD_RADIUS, CLIP_HOLD, LOCK_HINT, Meter, PILL_H_DIP, Rect, Rgba, palette, place,
+    CARD_RADIUS, LOCK_HINT, Meter, OVERLOAD_HOLD, PILL_H_DIP, PRESETS, Rect, Rgba, palette,
+    pill_accent, place, tray_colour,
 };
 use oxi_core::tray::TrayBadge;
 use oxi_core::types::Millis;
@@ -81,6 +82,12 @@ fn speech(peak: f32) -> (Meter, Millis) {
     (m, Millis(t))
 }
 
+/// The pill's default accent (Red lifted on the pill) and the exe icon's fixed record dot.
+fn accent() -> Rgba {
+    pill_accent(PRESETS[0].seed)
+}
+const ICON_DOT: Rgba = Rgba(0xE5, 0x48, 0x4D, 0xFF);
+
 fn alpha(pm: &Pixmap, x: u32, y: u32) -> u8 {
     pm.pixel(x, y).unwrap().alpha()
 }
@@ -125,7 +132,7 @@ fn hidden_is_fully_transparent() {
 }
 
 #[test]
-fn clipping_turns_the_bars_red_until_the_hold_ends() {
+fn overload_swaps_the_accent_for_the_error_colour_and_a_clip_line_until_the_hold_ends() {
     let rec = OverlayState::Recording {
         locked: false,
         ending_soon: false,
@@ -133,13 +140,45 @@ fn clipping_turns_the_bars_red_until_the_hold_ends() {
     let (calm, now) = speech(0.5);
     let (clipped, _) = speech(1.0);
     let normal = pill(rec, &calm, now, rect(1.0), None).unwrap();
-    let red = pill(rec, &clipped, now, rect(1.0), None).unwrap();
-    let after = pill(rec, &clipped, now + CLIP_HOLD, rect(1.0), None).unwrap();
+    let loud = pill(rec, &clipped, now, rect(1.0), None).unwrap();
+    let after = pill(rec, &clipped, now + OVERLOAD_HOLD, rect(1.0), None).unwrap();
 
-    assert_eq!(count(&normal, palette::CLIP), 0);
-    assert!(count(&red, palette::CLIP) > 50, "bars are not red");
-    assert!(count(&red, palette::RECORDING) < count(&normal, palette::RECORDING));
-    assert_eq!(count(&after, palette::CLIP), 0);
+    assert_eq!(count(&normal, palette::ERROR), 0);
+    assert!(
+        count(&loud, palette::ERROR) > 50,
+        "bars and line are not in the error colour"
+    );
+    assert!(count(&loud, accent()) < count(&normal, accent()));
+    assert_eq!(count(&after, palette::ERROR), 0);
+    // The clip line is the mark that survives greyscale: a full-width row of ERROR.
+    let row = (0..loud.height())
+        .map(|y| {
+            (0..loud.width())
+                .filter(|&x| {
+                    let p = loud.pixel(x, y).unwrap();
+                    (p.red(), p.green(), p.blue())
+                        == (palette::ERROR.0, palette::ERROR.1, palette::ERROR.2)
+                })
+                .count()
+        })
+        .max()
+        .unwrap();
+    assert!(row > 60, "no clip line: widest ERROR row is {row} px");
+}
+
+#[test]
+fn the_accent_recolours_the_wave_on_the_next_frame() {
+    let rec = OverlayState::Recording {
+        locked: false,
+        ending_soon: false,
+    };
+    let (meter, now) = speech(0.5);
+    let blue = pill_accent(PRESETS[6].seed);
+    let mut c = PillCanvas::new(None);
+    assert!(count(c.draw(rec, &meter, now, rect(1.0)).unwrap(), accent()) > 0);
+    c.set_accent(blue);
+    let f = c.draw(rec, &meter, now, rect(1.0)).unwrap();
+    assert!(count(f, blue) > 0 && count(f, accent()) == 0);
 }
 
 #[test]
@@ -152,7 +191,7 @@ fn loud_bars_are_taller_than_silence() {
     let (loud, now) = speech(0.5);
     let q = pill(rec, &quiet, now, rect(1.0), None).unwrap();
     let l = pill(rec, &loud, now, rect(1.0), None).unwrap();
-    assert!(count(&l, palette::RECORDING) > 2 * count(&q, palette::RECORDING));
+    assert!(count(&l, accent()) > 2 * count(&q, accent()));
 }
 
 #[test]
@@ -326,7 +365,7 @@ fn bgra_swaps_red_and_blue() {
     let out = bgra(&pm);
     // Inside the bubble, left of the bars.
     let i = (7 * 16 + 2) * 4;
-    let c = palette::RECORDING;
+    let c = tray_colour(Rgba(0xD9, 0x3A, 0x3F, 0xFF), false);
     assert_eq!(&out[i..i + 4], &[c.2, c.1, c.0, c.3]);
 }
 
@@ -339,7 +378,7 @@ fn the_logo_is_an_ink_mark_and_red_dot_on_a_paper_tile_with_clear_corners() {
         let (paper, ink, red) = (
             count(&pm, palette::PAPER),
             count(&pm, palette::MARK),
-            count(&pm, palette::RECORDING),
+            count(&pm, ICON_DOT),
         );
         let area = (size * size) as usize;
         assert!(
@@ -374,7 +413,10 @@ fn in_band(pm: &Pixmap, (cx, cy): (f32, f32), lo: f32, hi: f32, c: Rgba) -> usiz
 /// and dark red on a light one: red and orange alone are under 3:1 on #005FB8 and #8764B8.
 #[test]
 fn the_record_dot_and_the_error_badge_have_a_rim_on_every_taskbar() {
-    for (light, rim) in [(false, palette::WHITE), (true, palette::RECORDING_RIM)] {
+    for (light, rim) in [
+        (false, palette::WHITE),
+        (true, Rgba(0x8F, 0x1D, 0x22, 0xFF)),
+    ] {
         for size in TRAY_SIZES {
             let n = size as f32;
             // Error badge, bottom right: radius 3 units, the rim just inside its edge.
@@ -383,7 +425,13 @@ fn the_record_dot_and_the_error_badge_have_a_rim_on_every_taskbar() {
             let rims = in_band(&badge, (n - r, n - r), r - 1.0, r, rim);
             assert!(rims >= 4, "badge {size} light={light}: {rims} rim pixels");
             assert!(
-                in_band(&badge, (n - r, n - r), 0.0, r - 1.0, palette::ERROR) > 0,
+                in_band(
+                    &badge,
+                    (n - r, n - r),
+                    0.0,
+                    r - 1.0,
+                    tray_colour(palette::ERROR, light)
+                ) > 0,
                 "badge {size}: no orange core"
             );
             // Record dot, top right on the tray's 200-unit crop: the rim just outside its edge.
@@ -770,7 +818,7 @@ fn transcribing_shows_its_percent_and_a_track() {
         c.set_progress(progress);
         c.draw(t, &meter, Millis(now), r).unwrap().clone()
     };
-    let busy = palette::BUSY;
+    let busy = accent();
     let (none, quarter, half, full) = (
         frame(Some(0), 0),
         frame(Some(25), 0),
@@ -971,4 +1019,53 @@ fn paint(grey: u8) -> tiny_skia::Paint<'static> {
     let mut p = tiny_skia::Paint::default();
     p.set_color_rgba8(grey, grey, grey, 255);
     p
+}
+
+/// The first column where the pill with a loud meter differs from one with a silent meter: the
+/// left edge of the wave (the icon and the label are the same in both).
+fn wave_left(state: OverlayState, font: &FontRef<'_>, scale: f32) -> u32 {
+    let mut loud = Meter::new(40, 0.0);
+    for i in 0..60u16 {
+        loud.push(
+            Level {
+                peak: 0.5,
+                rms: 0.3,
+            },
+            Millis(u64::from(i) * 34),
+        );
+    }
+    let now = Millis(60 * 34);
+    let quiet = Meter::new(40, 0.0);
+    let a = pill(state, &loud, now, rect(scale), Some(font)).unwrap();
+    let b = pill(state, &quiet, now, rect(scale), Some(font)).unwrap();
+    (0..a.width())
+        .find(|&x| (0..a.height()).any(|y| a.pixel(x, y) != b.pixel(x, y)))
+        .expect("the wave differs from silence")
+}
+
+/// Locking a recording or reaching its last minute swaps the label; the wave must not move
+/// (DS-21.3, DS-25).
+#[test]
+fn the_wave_box_does_not_move_across_recording_states() {
+    let Some(bytes) = font_bytes() else {
+        eprintln!("skip: no {FONT}");
+        return;
+    };
+    let font = FontRef::try_from_slice(&bytes).unwrap();
+    for scale in SCALES {
+        let at = |locked, ending_soon| {
+            wave_left(
+                OverlayState::Recording {
+                    locked,
+                    ending_soon,
+                },
+                &font,
+                scale,
+            )
+        };
+        let first = at(false, false);
+        for (l, e) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(at(l, e), first, "locked {l}, ending soon {e} @{scale}");
+        }
+    }
 }

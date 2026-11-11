@@ -206,6 +206,11 @@ component Adornment inherits Rectangle {
     in property <image> icon;
     in property <string> tip;
     callback clicked;
+    callback hover-changed(bool);
+    property <bool> hover: touch.has-hover;
+    changed hover => {
+        root.hover-changed(self.hover);
+    }
     width: Theme.adornment-size;
     height: Theme.adornment-size;
     border-radius: Theme.radius-control;
@@ -245,6 +250,15 @@ export component TextField {
     in property <bool> locked: Shell.locked;
     in property <InputType> input-type <=> input.input-type;
     in property <bool> clearable;
+    // Inside a popup the field takes the caret and shows only its 1 px editing border, never the ring
+    // (DS-4.6), whether the popup opened by mouse or by key.
+    in property <bool> no-ring;
+    // A value the app refuses (DS-8.7): a 1 px `error-text` border and the `error` glyph in the
+    // right adornment slot, `invalid-tip` (the reason) the tooltip of the field and the glyph. The size never changes. Set
+    // `invalid-glyph` false when the field's Row shows the glyph in its `WarningSlot` instead.
+    in property <bool> invalid;
+    in property <string> invalid-tip;
+    in property <bool> invalid-glyph: true;
     // Gallery: forced hover, editing (accent border) and keyboard ring.
     in property <bool> force-hover;
     in property <bool> force-editing;
@@ -271,8 +285,19 @@ export component TextField {
         }
     }
     property <bool> show-clear: root.clearable && root.text != "" && root.live && !root.read-only;
+    // The clear "x" has its own Tip; the field's Tip closes while it is hovered. Left open, it would
+    // not redraw its reason after the "x" Tip, destroyed with the "x", clears the shared bubble.
+    property <bool> clear-hover;
+    // The "x" is destroyed under the pointer when the text empties, so it never reports hover end.
+    changed show-clear => {
+        if (!self.show-clear) {
+            self.clear-hover = false;
+        }
+    }
     property <length> text-left: Theme.space-3;
-    property <length> text-right: root.show-clear ? Theme.adornment-size + 2 * Theme.space-1 : Theme.space-3;
+    property <bool> show-glyph: root.invalid && root.invalid-glyph;
+    property <length> glyph-slot: root.show-glyph ? Theme.adornment-size : 0px;
+    property <length> text-right: (root.show-clear ? Theme.adornment-size + 2 * Theme.space-1 : Theme.space-3) + root.glyph-slot;
 
     forward-focus: input;
     height: Theme.control-height;
@@ -292,11 +317,17 @@ export component TextField {
     hover-area := TouchArea {
         enabled: root.live;
         mouse-cursor: MouseCursor.text;
+        // The reason of an invalid value, on the whole field and the glyph, in both glyph modes.
+        Tip {
+            text: root.invalid ? root.invalid-tip : "";
+            hovered: hover-area.has-hover && !(root.show-clear && root.clear-hover);
+        }
         FieldFrame {
             live: root.live;
             hover: hover-area.has-hover || root.force-hover;
             editing: root.force-editing || input.has-focus;
-            ring: root.force-focus || (root.key-focus && input.has-focus);
+            invalid: root.invalid;
+            ring: root.force-focus || (root.key-focus && !root.no-ring && input.has-focus);
             Rectangle {
                 x: root.text-left;
                 width: parent.width - root.text-left - root.text-right;
@@ -348,11 +379,33 @@ export component TextField {
                     }
                 }
             }
+            if root.show-glyph: Rectangle {
+                // Left of the clear "x" when both show.
+                x: parent.width - self.width - Theme.space-1 - (root.show-clear ? Theme.adornment-size : 0px);
+                y: (parent.height - self.height) / 2;
+                width: Theme.adornment-size;
+                height: Theme.adornment-size;
+                accessible-role: none;
+                Image {
+                    source: Icons.error;
+                    width: Theme.icon-size-small;
+                    height: Theme.icon-size-small;
+                    colorize: Theme.error-text;
+                    accessible-role: none;
+                }
+                // The field's own Tip below covers the glyph; this only keeps the arrow cursor.
+                TouchArea {
+                    mouse-cursor: MouseCursor.default;
+                }
+            }
             if root.show-clear: Adornment {
                 x: parent.width - self.width - Theme.space-1;
                 y: (parent.height - self.height) / 2;
                 icon: Icons.dismiss-16;
                 tip: @tr("Clear");
+                hover-changed(h) => {
+                    root.clear-hover = h;
+                }
                 clicked => {
                     root.text = "";
                     root.edited("");
@@ -417,6 +470,8 @@ export component TextArea {
             editing: root.force-editing || input.has-focus;
             ring: root.force-focus || (root.key-focus && input.has-focus);
             view := ScrollBox {
+                thin: true;
+                inset: Theme.space-1;
                 x: Theme.space-3;
                 y: Theme.space-2;
                 width: parent.width - Theme.space-3 - Theme.space-1;
@@ -494,7 +549,7 @@ export component PathField {
     out property <string> shown: root.display != "" ? root.display : root.elided != "" ? root.elided : root.path;
     // A shown default is secondary ink (DS-13.3), a real path primary; `tests/gallery.rs` reads both.
     out property <color> shown-color: !root.live ? Theme.text-disabled : root.display != "" ? Theme.text-secondary : Theme.text-primary;
-    out property <image> browse-icon: Icons.folder-open-16;
+    out property <image> browse-icon: Icons.browse-folder;
     property <bool> live: root.enabled && !root.locked;
     property <bool> focused: field.has-focus || root.force-focus;
     property <length> room: field.width - 2 * Theme.space-3;
@@ -615,6 +670,9 @@ component ComboList inherits Rectangle {
     border-color: Theme.stroke-control;
     border-radius: Theme.radius-card;
     ScrollBox {
+        thin: true;
+        // The list's own padding: the thumb starts at the first row's top (DS-18.4).
+        inset: 0px;
         x: Theme.space-1;
         y: Theme.space-1;
         width: parent.width - 2 * Theme.space-1;
@@ -622,7 +680,7 @@ component ComboList inherits Rectangle {
         content-height: root.model.length * root.row-h;
         // Opens on the current row.
         viewport-y: -max(0, (root.current + 1) * root.row-h - self.height);
-        for item[i] in root.model: Rectangle {
+        for item[i] in root.model: row := Rectangle {
             property <bool> on: i == root.current;
             property <bool> hover: row-touch.has-hover || root.force-hover == i;
             y: i * root.row-h;
@@ -639,12 +697,23 @@ component ComboList inherits Rectangle {
             }
             Text {
                 x: Theme.space-2;
-                width: parent.width - 2 * Theme.space-2;
+                // Room for the mark on every row, so no text moves when the current row changes.
+                width: parent.width - 3 * Theme.space-2 - Theme.check-glyph-size;
                 text: item;
                 font-size: Theme.body-size;
-                color: parent.on ? Theme.accent-text : Theme.text-primary;
+                color: Theme.text-primary;
                 vertical-alignment: center;
                 overflow: elide;
+                accessible-role: none;
+            }
+            // The current row's mark (DS-20.6, DS-21.1): a tint is never the only cue.
+            if row.on: Image {
+                x: row.width - self.width - Theme.space-2;
+                y: (row.height - self.height) / 2;
+                source: Icons.checkmark-12;
+                width: Theme.check-glyph-size;
+                height: Theme.check-glyph-size;
+                colorize: Theme.accent-text;
                 accessible-role: none;
             }
             row-touch := TouchArea {
@@ -658,9 +727,10 @@ component ComboList inherits Rectangle {
 }
 
 // A closed list in the input shape with the `caret-down` chevron. Click, Space or Enter opens the
-// list over the field (DS-4.4: same x and width, it covers the field); Up/Down pick while closed and
-// while open; Enter, Space or Esc closes. No ring while the list is open (DS-4.3). As the std
-// ComboBox: `current-index` changes, then `selected` fires.
+// list below the field (DS-4.4, DS-8.6: same x and width, `space-1` under it, so it never covers the
+// field and the field's text does not move); Up/Down pick while closed and while open; Enter,
+// Space or Esc closes. No ring while the list is open (DS-4.3). As the std ComboBox:
+// `current-index` changes, then `selected` fires.
 export component Combo {
     in property <[string]> model;
     in-out property <int> current-index: 0;
@@ -680,6 +750,10 @@ export component Combo {
     property <bool> popup-focused;
     property <int> rows: min(Theme.combo-visible-rows, root.model.length);
     property <length> list-h: root.rows * Theme.control-height + 2 * Theme.space-1;
+    // Decided when the list opens, so it never jumps while open (DS-8.6): above the field when the
+    // window has no room below it and has room above.
+    property <bool> above;
+    property <length> list-y: root.above ? -root.list-h - Theme.space-1 : root.height + Theme.space-1;
 
     public function select(i: int) {
         if (root.live && i >= 0 && i < root.model.length) {
@@ -689,12 +763,14 @@ export component Combo {
     }
     function show-list() {
         if (root.live && root.model.length > 0) {
+            root.above = root.absolute-position.y + root.height + Theme.space-1 + root.list-h > Shell.window-height && root.absolute-position.y >= root.list-h + Theme.space-1;
             popup.show();
         }
     }
 
     forward-focus: fs;
     height: Theme.control-height;
+    // Stretches over its row's control column (DS-3.1); a Combo outside a Row sets its own width.
     min-width: Theme.control-column-min;
     max-width: Theme.control-column-max;
     horizontal-stretch: 1;
@@ -774,7 +850,7 @@ export component Combo {
         }
     }
     if root.force-open: ComboList {
-        y: 0;
+        y: root.list-y;
         width: root.width;
         height: root.list-h;
         model: root.model;
@@ -783,7 +859,7 @@ export component Combo {
     }
     popup := PopupWindow {
         x: 0;
-        y: 0;
+        y: root.list-y;
         width: root.width;
         height: root.list-h;
         close-policy: close-on-click-outside;

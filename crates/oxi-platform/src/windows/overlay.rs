@@ -13,7 +13,9 @@ use std::time::Instant;
 use ab_glyph::FontRef;
 use oxi_core::config::Config;
 use oxi_core::machine::OverlayState;
-use oxi_core::overlay::{METER_HZ, Meter, PILL_W_DIP, Quns, Rect, place, visible};
+use oxi_core::overlay::{
+    METER_HZ, Meter, PILL_W_DIP, Quns, Rect, pill_accent, place, seed, visible,
+};
 use oxi_core::types::Millis;
 use thiserror::Error;
 use windows_sys::Win32::Foundation::{
@@ -258,6 +260,8 @@ impl Inner<'_> {
             return Ok(());
         }
         let (work, dpi) = foreground_monitor()?;
+        // The config comes with every show, so a changed accent lands on the next one (no poll).
+        self.canvas.set_accent(pill_accent(seed(cfg.ui.accent)));
         let recording = matches!(state, OverlayState::Recording { .. });
         if recording && !matches!(self.state, OverlayState::Recording { .. }) {
             self.meter = Meter::new(BARS, cfg.audio.meter_sensitivity_db);

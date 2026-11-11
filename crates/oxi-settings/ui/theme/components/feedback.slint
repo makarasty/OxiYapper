@@ -1,5 +1,5 @@
 // Messages and status: window banner, inline note, level meter, progress bar, badge.
-import { Theme } from "../tokens.slint";
+import { Theme, Shell } from "../tokens.slint";
 import { Icons } from "../icons.slint";
 import { Caption, FocusRing, HoverTip, Tip, TipBubble } from "base.slint";
 
@@ -252,7 +252,8 @@ export component ToastHost {
 
 // Live level: 24 px inset track with 3 px accent bars 2 px apart, newest at the right; the bars
 // that fit are centred on the track, so both ends keep the same inset. A bar marked in `clipped`
-// goes error red, as does one at 1.0. With `live` off the track shows `empty-text` ("No
+// goes error red, as does one at 1.0. `overloaded` (DS-21.3, the oxi-core rule) draws the clip
+// line, 2 px across the top edge inside the box, and turns every bar error red. With `live` off the track shows `empty-text` ("No
 // microphone"); live with no bar yet (silence so far) it shows `idle-text`, so an open, quiet
 // mic does not look like a dead meter.
 export component Meter inherits Rectangle {
@@ -260,6 +261,8 @@ export component Meter inherits Rectangle {
     in property <[float]> bars;
     // Parallel to `bars`: the ones that clipped.
     in property <[bool]> clipped;
+    // The microphone is overloaded: the page passes the oxi-core state.
+    in property <bool> overloaded;
     in property <bool> live: true;
     in property <string> empty-text;
     in property <string> idle-text;
@@ -284,9 +287,18 @@ export component Meter inherits Rectangle {
             // A silent bar keeps a 2 px stub (radius-small); the tallest leaves 3 px above and below.
             height: max(Theme.radius-small, clamp(level, 0, 1) * (root.height - 2 * root.bar-width));
             border-radius: Theme.radius-round;
-            background: root.clipped[i] || level >= 1 ? Theme.error-text : Theme.accent;
+            background: root.overloaded || root.clipped[i] || level >= 1 ? Theme.error-text : Theme.accent;
             visible: root.bars.length - i <= root.fit;
         }
+    }
+    // The mark that holds without colour: a line, nothing moves.
+    if root.live && root.overloaded: Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: Theme.meter-clip-line;
+        background: Theme.error-text;
+        accessible-role: none;
     }
     if !root.live || root.bars.length == 0: Caption {
         text: root.live ? root.idle-text : root.empty-text;
@@ -296,36 +308,68 @@ export component Meter inherits Rectangle {
     }
 }
 
-// 4 px rail with the accent fill; `error` turns the fill red (token budget exceeded). `label`
-// ("0.7 of 1.6 GB") sits right of the rail.
+// The one progress bar (DS-26): a 4 px `bg-inset` rail with an `accent` fill that draws the `value`
+// it is given, 0..1. `value` is the `shown` of the progress model (oxi-core's `Smooth`, driven from
+// Rust by the page that owns the job); the bar eases nothing itself, so it never runs a timer of its
+// own. `error` stops it and turns the fill `error-text` (the page shows the `error` glyph and the
+// reason, DS-21.1). `indeterminate` is the fallback when the job has no estimate and no real
+// fraction (DS-26.3): a segment 30 % of the rail wide runs left to right in 1200 ms, looping; under
+// reduced motion a still segment sits at the centre. `label` ("42 %", "0.7 of 1.6 GB") sits right
+// of the rail in a slot at least as wide as "100 %", right-aligned, so a ticking number moves
+// nothing (DS-25.7); an empty label shows no slot, unless the bar is `indeterminate` or sets
+// `reserve-label`: then the slot is there from the start, so the rail does not shrink when a
+// percent arrives (DS-25.2).
 export component ProgressBar inherits HorizontalLayout {
     in property <float> value;
     in property <bool> error;
+    in property <bool> indeterminate;
     in property <string> label;
+    in property <bool> reserve-label;
     spacing: Theme.space-2;
     accessible-role: progress-indicator;
-    accessible-value: round(clamp(root.value, 0, 1) * 100) + " %";
+    accessible-value: root.indeterminate ? "" : round(clamp(root.value, 0, 1) * 100) + " %";
     VerticalLayout {
         alignment: center;
         horizontal-stretch: 1;
-        Rectangle {
+        rail := Rectangle {
             height: Theme.rail-height;
             min-width: Theme.progress-min-width;
             border-radius: Theme.radius-round;
             background: Theme.bg-inset;
-            Rectangle {
+            clip: true;
+            if !root.indeterminate: Rectangle {
                 x: 0;
                 width: parent.width * clamp(root.value, 0, 1);
                 border-radius: Theme.radius-round;
                 background: root.error ? Theme.error-text : Theme.accent;
             }
+            if root.indeterminate && Shell.reduced-motion: Rectangle {
+                width: parent.width * Theme.progress-sweep;
+                x: (parent.width - self.width) / 2;
+                border-radius: Theme.radius-round;
+                background: root.error ? Theme.error-text : Theme.accent;
+            }
+            if root.indeterminate && !Shell.reduced-motion: Rectangle {
+                // 0 to 1 over the sweep time, looping; the segment enters at the left and leaves at the right.
+                property <float> t: 0;
+                animate t { duration: Theme.progress-sweep-time; easing: linear; iteration-count: -1; }
+                init => {
+                    self.t = 1;
+                }
+                width: parent.width * Theme.progress-sweep;
+                x: -self.width + self.t * (parent.width + self.width);
+                border-radius: Theme.radius-round;
+                background: root.error ? Theme.error-text : Theme.accent;
+            }
         }
     }
-    if root.label != "": Text {
+    if root.label != "" || root.indeterminate || root.reserve-label: Text {
         text: root.label;
         font-size: Theme.caption-size;
         color: root.error ? Theme.error-text : Theme.text-secondary;
+        horizontal-alignment: right;
         vertical-alignment: center;
+        min-width: Theme.progress-label-width;
     }
 }
 

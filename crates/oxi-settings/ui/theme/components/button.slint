@@ -1,8 +1,12 @@
-// Buttons (DS-6, DS-7). Our own, because std `Button { primary }` paints the system accent.
+// Buttons (DS-5 to DS-7). Our own, because std `Button { primary }` paints the system accent. Every
+// button has a fill at rest (DS-7.5): `secondary` and `danger` are framed, `soft` and the icon
+// button sit on the soft surface.
 import { Theme } from "../tokens.slint";
 import { FocusRing, KeyFocus, Tip } from "base.slint";
 
-export enum ButtonKind { primary, secondary, subtle, danger, icon }
+// `soft` is the low-weight button with a rest fill; `subtle` is its deprecated alias (it used to be
+// bare text) and draws the same, so pages that still say `subtle` get the fill too.
+export enum ButtonKind { primary, secondary, subtle, danger, icon, soft }
 
 // Height 32, radius 4, padding 12, min width 88 so action rows align. Icon and label are one group
 // centred at whole pixels, 8 px apart (DS-7.1, crisp text [22]). `icon` buttons are 32x32 with
@@ -16,6 +20,10 @@ export component Button {
     in property <string> tooltip;
     // A Remove that is an `icon` button turns red under the pointer as `danger` does (UI rule 16).
     in property <bool> destructive;
+    // A toggled icon button (the Hotkey pencil while its panel is open): tint fill, accent glyph (DS-6.5).
+    in property <bool> toggled;
+    // A kept draft behind the button (the Hotkey pencil, DS-28.3): a 6 px accent dot in the top-right corner of its box.
+    in property <bool> kept-dot;
     // Static shots have no mouse: the gallery forces the states.
     in property <bool> force-hover;
     in property <bool> force-pressed;
@@ -36,7 +44,7 @@ export component Button {
     out property <bool> red: (root.kind == ButtonKind.danger || root.destructive) && (root.hover || root.down);
     property <bool> key-focus;
     out property <bool> key-focused: root.key-focus && fs.has-focus;
-    property <color> ink: !root.enabled && root.kind == ButtonKind.primary ? Theme.bg-card : !root.enabled ? Theme.text-disabled : root.kind == ButtonKind.primary ? Theme.on-accent : root.red ? Theme.error-text : Theme.text-primary;
+    property <color> ink: !root.enabled && root.kind == ButtonKind.primary ? Theme.bg-card : !root.enabled ? Theme.text-disabled : root.kind == ButtonKind.primary ? Theme.on-accent : root.red ? Theme.error-text : root.toggled ? Theme.accent-text : Theme.text-primary;
     property <bool> has-icon: root.icon.width > 0;
     property <bool> has-label: !root.is-icon && root.text != "";
     // The icon+label group, laid out by hand so both land on whole pixels.
@@ -68,7 +76,7 @@ export component Button {
 
     face := Rectangle {
         border-radius: Theme.radius-control;
-        background: root.kind == ButtonKind.primary ? (!root.enabled ? Theme.text-disabled : root.down ? Theme.accent-pressed : root.hover ? Theme.accent-hover : Theme.accent) : root.red ? (root.down ? Theme.error-fill-pressed : Theme.error-fill) : root.framed ? (!root.enabled ? Theme.bg-control.transparentize(0.5) : root.down ? Theme.bg-control-pressed : root.hover ? Theme.bg-control-hover : Theme.bg-control) : (root.down ? Theme.bg-subtle-selected : root.hover ? Theme.bg-subtle-hover : transparent);
+        background: root.kind == ButtonKind.primary ? (!root.enabled ? Theme.text-disabled : root.down ? Theme.accent-pressed : root.hover ? Theme.accent-hover : Theme.accent) : root.red ? (root.down ? Theme.error-fill-pressed : Theme.error-fill) : root.toggled ? Theme.accent-tint : root.framed ? (!root.enabled ? Theme.bg-control.transparentize(0.5) : root.down ? Theme.bg-control-pressed : root.hover ? Theme.bg-control-hover : Theme.bg-control) : (root.down ? Theme.bg-soft-pressed : root.hover ? Theme.bg-soft-hover : Theme.bg-soft);
         // 1 px hairline: the framed button's stroke.
         border-width: root.framed ? 1px : 0;
         border-color: root.red ? Theme.error-text.transparentize(0.7) : Theme.stroke-control;
@@ -104,6 +112,15 @@ export component Button {
         accessible-role: none;
         animate color { duration: Theme.motion-quick; easing: ease-out; }
     }
+    if root.kept-dot: Rectangle {
+        x: root.width - self.width - Theme.space-1;
+        y: Theme.space-1;
+        width: Theme.draft-dot-size;
+        height: Theme.draft-dot-size;
+        border-radius: Theme.radius-round;
+        background: Theme.accent;
+        accessible-role: none;
+    }
     // Enabled even on a disabled button: its tooltip says why.
     touch := TouchArea {
         mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
@@ -136,8 +153,8 @@ export component Button {
     }
 }
 
-// The one icon-only button (DS-6): a 32x32 box that takes hover and click everywhere, a subtle
-// surface, the 16 px glyph at (8, 8). `label` is its tooltip and accessible name; `destructive`
+// The one icon-only button (DS-6): a 32x32 box that takes hover and click everywhere, the soft
+// surface (visible at rest, so the hit area is seen), the 16 px glyph at (8, 8). `label` is its tooltip and accessible name; `destructive`
 // turns it red under the pointer. Replaces `ButtonKind.icon` and every page-local icon button.
 export component IconButton inherits Button {
     in property <string> label;

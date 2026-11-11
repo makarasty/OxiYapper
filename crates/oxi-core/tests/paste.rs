@@ -480,6 +480,7 @@ fn shift_insert_rule_sends_that_chord() {
         mode: None,
         chord: Some(vec!["Shift".into(), "Insert".into()]),
         restore_delay_ms: None,
+        ..PasteRule::default()
     });
     let (out, calls) = run(
         &Case {
@@ -519,6 +520,7 @@ fn plan_takes_each_field_from_the_rule_or_the_default() {
         mode: None,
         chord: Some(vec!["NoSuchKey".into()]),
         restore_delay_ms: Some(800),
+        ..PasteRule::default()
     });
     let fg = |app: &str| Foreground {
         app: app.into(),

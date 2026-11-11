@@ -40,11 +40,12 @@ export component FocusRing {
 }
 
 // Whether focus came from the keyboard, so a click does not draw the ring. Nor do a window
-// coming back to the front (Alt+Tab) and a popup closing: neither is a key press. A `FocusScope`
-// forwards its `focus-gained` reason here.
+// coming back to the front (Alt+Tab), a popup closing and `.focus()` in code: none is a key press
+// (DS-4.2). A `FocusScope` forwards its `focus-gained` reason here; a control that hands focus on
+// passes its own answer along (`take-focus(ring)`).
 export global KeyFocus {
     public pure function from-key(reason: FocusReason) -> bool {
-        return reason != FocusReason.pointer-click && reason != FocusReason.window-activation && reason != FocusReason.popup-activation;
+        return reason == FocusReason.tab-navigation;
     }
 
     // `from-key` for a control that kept its own answer (`was`): a popup it opened by key and
@@ -134,6 +135,9 @@ export component Tip {
     changed text => {
         if (self.open) {
             HoverTip.text = self.text;
+            // A moved host (the heatmap's one Tip hopping cells) must take the bubble along.
+            HoverTip.x = root.absolute-position.x;
+            HoverTip.y = root.absolute-position.y + root.height + Theme.space-1;
         }
     }
 }
@@ -213,18 +217,22 @@ export component InfoTip {
     }
 }
 
-// The thumb of a vertical scroller; drag it, or click the track to page.
+// The thumb of a vertical scroller; drag it, or click the track to page. The track is the Bar's own
+// height (a `ScrollBox` insets it, DS-18.4); `page` is the visible height of what it scrolls.
 export component Bar {
     in property <length> total;
+    in property <length> page: root.height;
+    in property <bool> thin;
     in-out property <length> position;
-    property <length> page: root.height;
     property <length> travel: max(0, root.total - root.page);
-    property <length> thumb-h: max(Theme.scrollbar-min-thumb, root.height * root.page / max(root.total, 1px));
+    property <length> thumb-h: min(root.height, max(Theme.scrollbar-min-thumb, root.height * root.page / max(root.total, 1px)));
     property <length> thumb-y: root.travel <= 0 ? 0 : (root.height - root.thumb-h) * (-root.position / root.travel);
     property <length> grab-y;
     property <length> grab-pos;
     accessible-role: none;
     thumb := Rectangle {
+        // The same rect in every state (DS-18.1): only the colour changes.
+        width: 100%;
         y: root.thumb-y;
         height: root.thumb-h;
         border-radius: Theme.radius-small;
@@ -251,15 +259,24 @@ export component Bar {
     }
 }
 
-// Scrolls its children vertically with the design-system bar (DS-18): while the content overflows
-// it leaves exactly `scrollbar-gutter` on the right and draws a 6 px thumb `bar-inset` from the
-// right edge (centred in the gutter by default), `text-disabled` at rest and `text-secondary` on
-// hover or drag, same rect in every state. The owner sets `content-height`; the children take
-// `content-width`.
+// The one scroller of the app (DS-18): scrolls its children vertically with the design-system bar.
+// While the content overflows (or always, with `reserve-gutter`) it leaves exactly `scrollbar-gutter`
+// on the right and draws the thumb centred in that gutter, `text-disabled` at rest and
+// `text-secondary` on hover or drag, same rect in every state. `thin` (4 px) is for a bar inside a
+// control. `inset` is the container's own padding: the bar's track starts and ends that far inside
+// the box, so the thumb never touches the container's edge when the content does not. The owner sets
+// `content-height`; the children take `content-width`.
 export component ScrollBox {
     in-out property <length> viewport-y <=> fl.content-y;
     in property <length> content-height;
-    in property <length> bar-inset: (Theme.scrollbar-gutter - Theme.scrollbar-width) / 2;
+    // Control-inside scrollers (Combo list, SearchPopup, TextArea): the 4 px bar.
+    in property <bool> thin;
+    // Lists whose length changes while shown keep the gutter with and without the bar (DS-18.6).
+    in property <bool> reserve-gutter;
+    // The container's padding (4 in a list, 8 in a popup, 12 in a card, 0 for a page).
+    in property <length> inset;
+    // Where the thumb sits from the right edge; the default centres it in the gutter.
+    in property <length> bar-inset: (Theme.scrollbar-gutter - (root.thin ? Theme.scrollbar-width-thin : Theme.scrollbar-width)) / 2;
     out property <length> content-width: fl.width;
     // Set from `changed`, not bound: the content's height depends on the width the gutter leaves,
     // so a binding would loop. Stable both ways: narrower content is never shorter.
@@ -284,17 +301,20 @@ export component ScrollBox {
         // A sized child without `x` is centred: pinned left, so the content does not shift half the
         // gutter when the bar comes.
         x: 0;
-        width: root.width - (root.overflows ? Theme.scrollbar-gutter : 0);
+        width: root.width - (root.overflows || root.reserve-gutter ? Theme.scrollbar-gutter : 0);
         height: root.height;
         content-width: self.width;
         content-height: root.content-height;
         @children
     }
     if root.overflows: Bar {
+        width: root.thin ? Theme.scrollbar-width-thin : Theme.scrollbar-width;
         x: root.width - self.width - root.bar-inset;
-        width: Theme.scrollbar-width;
-        height: root.height;
+        y: root.inset;
+        height: root.height - 2 * root.inset;
+        thin: root.thin;
         total: root.content-height;
+        page: root.height;
         position <=> fl.content-y;
     }
 }

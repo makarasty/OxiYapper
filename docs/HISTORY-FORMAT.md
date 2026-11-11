@@ -66,6 +66,14 @@ stopped after the audio, for example on a full disk).
   Transcribing again from the History page replaces `model`, `language`, `settings` and sets
   `status` to `done`.
 
+Optional fields (added 2026-11-11; `version` stays 1, and an entry without them is complete):
+
+- `app`: file name of the program whose window got the text (`Code.exe`); empty or absent when unknown.
+- `delivered`: how the text reached the user: `pasted`, `typed`, `clipboard` (left on the clipboard), `file` (to-file mode), `filtered` (the confidence filter held all of it back, nothing was inserted; the `.txt` still has it), `failed`, `unknown`.
+- `held`: the parts of the dictation the confidence filter held back, in order, each `{ "text": "...", "t0": 5200, "t1": 6900, "why": "no_speech" }`. `t0` and `t1` are milliseconds from the start of the `.wav` (the audio whisper got is what the `.wav` holds, so no offset applies); `why` is `low_confidence` or `no_speech`. When only some parts were held, the `.txt` has the inserted text and `held` the rest; when all were held, the `.txt` has them too and `delivered` is `filtered`. Absent when nothing was held.
+- `words`: the words of the recording in order, each `{ "w": "hello", "p": 0.93, "t0": 120, "t1": 480 }`. `p` is the confidence of the model in the word, 0 to 1. `t0` and `t1` are its start and end in milliseconds from the start of the `.wav`; they are absent until the times were computed (on demand, when the recording is opened in the History page). The words come from a pass of the model over the audio and can differ from the `.txt`, which also holds replacements and edits.
+- `timings`: present when `words` carry times: `{ "by": "dtw", "preset": "large-v3", "model": "podlodka" }`; `by` is `dtw` or `tokens`.
+
 ## While recording
 
 The audio is written to disk as it is recorded, so a crash or a power cut keeps what was said:

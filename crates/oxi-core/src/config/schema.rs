@@ -1,6 +1,10 @@
 //! Config schema v1 (ARCHITECTURE section 6). Every field has a default, so a partial
 //! or empty file loads. Unknown keys are not rejected here; `ConfigFile` keeps them.
 
+use super::extra::{
+    Accent, Advanced, AudioChannel, FileMode, LanguageKey, Output, Text, TypeSpeed, VadSensitivity,
+    clamp_int,
+};
 use crate::device::DeviceChoice;
 use crate::machine::{Mode, Sound};
 use crate::sounds::{Builtin, Choice};
@@ -22,6 +26,8 @@ pub struct Config {
     pub system: System,
     pub debug: Debug,
     pub ui: Ui,
+    pub text: Text,
+    pub output: Output,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +40,26 @@ pub struct Hotkey {
     pub esc_cancels: bool,
     /// What a key that is not part of the chord does while recording.
     pub other_key: OtherKey,
+    /// A press this soon after a hold ended continues it. 0 means off.
+    pub hold_gap_ms: u32,
+}
+
+impl Hotkey {
+    pub const HOLD_GAP_MS: RangeInclusive<u32> = 100..=1500;
+
+    /// Puts a non-zero `hold_gap_ms` back in range and says so.
+    pub(crate) fn clamp_hold_gap(&mut self) -> Vec<String> {
+        let mut said = Vec::new();
+        if self.hold_gap_ms != 0 {
+            clamp_int(
+                "hotkey.hold_gap_ms",
+                &mut self.hold_gap_ms,
+                Self::HOLD_GAP_MS,
+                &mut said,
+            );
+        }
+        said
+    }
 }
 
 impl Default for Hotkey {
@@ -43,6 +69,7 @@ impl Default for Hotkey {
             mode: Mode::Push,
             esc_cancels: false,
             other_key: OtherKey::Auto,
+            hold_gap_ms: 400,
         }
     }
 }
@@ -76,6 +103,8 @@ pub struct Audio {
     pub max_seconds: u32,
     /// Scales only the level meter shown (overlay, settings), never the audio whisper gets.
     pub meter_sensitivity_db: f32,
+    pub channel: AudioChannel,
+    pub vad_sensitivity: VadSensitivity,
 }
 
 impl Audio {
@@ -113,11 +142,13 @@ impl Default for Audio {
             tail_ms: 100,
             max_seconds: 3600,
             meter_sensitivity_db: 0.0,
+            channel: AudioChannel::Mix,
+            vad_sensitivity: VadSensitivity::Normal,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Model {
     /// Registry id, or "custom".
@@ -131,6 +162,12 @@ pub struct Model {
     pub idle_unload_minutes: u32,
     /// Unload as soon as a dictation ends; wins over `idle_unload_minutes`.
     pub unload_immediately: bool,
+    /// Load the model when the daemon starts instead of at the first dictation.
+    pub preload_at_start: bool,
+    /// Model per dictation language: a registry id or "custom". Empty means one model for all.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_language: BTreeMap<LanguageKey, String>,
+    pub advanced: Advanced,
 }
 
 impl Default for Model {
@@ -143,6 +180,9 @@ impl Default for Model {
             recent_languages: [Language::RU, Language::EN],
             idle_unload_minutes: 5,
             unload_immediately: false,
+            preload_at_start: false,
+            by_language: BTreeMap::new(),
+            advanced: Advanced::default(),
         }
     }
 }
@@ -187,7 +227,7 @@ pub enum PasteMode {
 }
 
 /// Per-app override. App identity: exe name on Windows, bundle id on macOS, `WM_CLASS` on X11.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PasteRule {
     pub app: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -196,11 +236,45 @@ pub struct PasteRule {
     pub chord: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_delay_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_speed: Option<TypeSpeed>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<Language>,
+    /// A registry id or "custom".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_file: Option<FileMode>,
+    /// `false` means no dictionary prompt in this app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dictionary: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacements: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_commands: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filler_filter: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_punctuation: Option<bool>,
 }
 
 impl PasteRule {
     /// Every key a rule can have; a save drops the optional ones a rule no longer sets.
-    pub(crate) const KEYS: [&str; 4] = ["app", "mode", "chord", "restore_delay_ms"];
+    pub(crate) const KEYS: [&str; 13] = [
+        "app",
+        "mode",
+        "chord",
+        "restore_delay_ms",
+        "type_speed",
+        "language",
+        "model",
+        "to_file",
+        "dictionary",
+        "replacements",
+        "voice_commands",
+        "filler_filter",
+        "pause_punctuation",
+    ];
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +285,8 @@ pub struct Paste {
     pub trailing_space: bool,
     /// Dictated text stays in the OS clipboard history (Win+V). Cloud upload is never allowed.
     pub keep_in_clipboard_history: bool,
+    /// Pace of typed output; a rule can set its own.
+    pub type_speed: TypeSpeed,
     pub rules: Vec<PasteRule>,
 }
 
@@ -221,12 +297,12 @@ impl Default for Paste {
             restore_delay_ms: 300,
             trailing_space: true,
             keep_in_clipboard_history: true,
+            type_speed: TypeSpeed::Fast,
             // Remote desktop drops a synthetic Ctrl+V, so type there.
             rules: vec![PasteRule {
                 app: "mstsc.exe".into(),
                 mode: Some(PasteMode::Type),
-                chord: None,
-                restore_delay_ms: None,
+                ..PasteRule::default()
             }],
         }
     }
@@ -280,6 +356,8 @@ pub struct Sounds {
     pub cancel: String,
     /// Played on an error; `boop-3` is the built-in error sound (`fault` in older files).
     pub error: String,
+    /// Absolute path of a folder of `.wav` or `.ogg` files the sound pickers list.
+    pub folder: String,
 }
 
 impl Sounds {
@@ -331,6 +409,7 @@ impl Default for Sounds {
             done: Builtin::Rx25.id().into(),
             cancel: Builtin::CancelSoft.id().into(),
             error: Builtin::Boop3.id().into(),
+            folder: String::new(),
         }
     }
 }
@@ -347,6 +426,8 @@ pub struct History {
     /// Absolute path of a folder (may be another drive) to keep the app's `OxiYapper history`
     /// subfolder in; empty or relative means `history/` in the data directory.
     pub folder: String,
+    /// The History player jumps over pauses.
+    pub skip_pauses: bool,
 }
 
 impl Default for History {
@@ -356,6 +437,7 @@ impl Default for History {
             max_bytes: 2_147_483_648,
             max_days: 30,
             folder: String::new(),
+            skip_pauses: false,
         }
     }
 }
@@ -407,6 +489,7 @@ pub enum AppLanguage {
 pub struct Ui {
     pub theme: Theme,
     pub language: AppLanguage,
+    pub accent: Accent,
     /// Human names of apps with a per-app rule, by lowercase exe: what the settings window shows
     /// for a rule picked from a scan, so the name outlives the window (UI rule 30). Display only.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -415,7 +498,7 @@ pub struct Ui {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, Hotkey, OtherKey, PasteMode, PasteRule};
+    use super::{Config, FileMode, Hotkey, Language, OtherKey, PasteMode, PasteRule, TypeSpeed};
 
     #[test]
     fn an_old_file_gets_the_new_defaults() {
@@ -475,6 +558,15 @@ mod tests {
             mode: Some(PasteMode::Type),
             chord: Some(Vec::new()),
             restore_delay_ms: Some(0),
+            type_speed: Some(TypeSpeed::Safe),
+            language: Some(Language::RU),
+            model: Some(String::new()),
+            to_file: Some(FileMode::Also),
+            dictionary: Some(false),
+            replacements: Some(false),
+            voice_commands: Some(false),
+            filler_filter: Some(false),
+            pause_punctuation: Some(false),
         };
         let table = toml::Table::try_from(&full).unwrap();
         let keys: Vec<&str> = table.keys().map(String::as_str).collect();

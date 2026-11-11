@@ -35,7 +35,7 @@ entries of `assets/oxi.ico`, which `regen_icons` (`crates/oxi-platform/tests/dra
 `oxi_platform::draw::logo`. After a change of the mark, run `regen_icons` and copy those four
 entries out again.
 
-## Icons (61 files)
+## Icons (74 files)
 
 | `Icons.` name (aliases) | File | Use |
 |---|---|---|
@@ -48,7 +48,7 @@ entries out again.
 | settings, settings-filled | gear-six bold, fill | nav System |
 | info, info-16, info-filled | info bold, fill | nav About, info tip, note |
 | warning, warning-16 | warning bold | warning banner/note |
-| warning-circle | warning-circle bold | the "!" slot (DS-19.6) |
+| warning-circle | warning-circle bold | kept for old call sites; the "!" slot uses `warning` (DESIGN-SYSTEM section 24) |
 | error-circle, error-circle-16 | x-circle bold | error banner/note |
 | checkmark-circle, -16 | check-circle bold | success note |
 | checkmark-12 | check bold | check badge |
@@ -89,3 +89,28 @@ entries out again.
 | sound-wave-circle | waveform bold | About nnnoiseless tile |
 | icons | shapes bold | About icon set tile |
 | paint-brush | paint-brush bold | About tiny-skia tile |
+
+## Icon semantics (DESIGN-SYSTEM section 24)
+
+`Icons` has one constant per meaning. These thirteen files were added for them, copied unchanged from
+the `@phosphor-icons/core@2.1.1` package (`assets/bold/<name>-bold.svg`, only `<svg>` and `<path>`
+elements checked, same licence):
+
+| `Icons.` name | File | Meaning |
+|---|---|---|
+| copy | copy bold | copy to the clipboard |
+| browse-folder | folder bold | choose a folder |
+| browse-file | file bold | choose a file |
+| revert | arrow-counter-clockwise bold | restore the old version |
+| record | record bold | record |
+| scan | scan bold | scan for installed apps, scan again |
+| search | magnifying-glass bold | the SearchField's own glyph |
+| becomes | arrow-right bold | current to new |
+| model-fast | lightning bold | model class: fast |
+| model-language | translate bold | model class: tuned for one language |
+| model-small | feather bold | model class: small |
+| model-own | folder-user bold | own model file |
+| replace | swap bold | always replace (History selection) |
+
+The other constants of the table (`open-external`, `retry`, `edit`, `close`, `error`, `done`,
+`download`, `preview`, `model-accurate`, `dictionary`) name files that were already vendored.

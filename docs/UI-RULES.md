@@ -15,8 +15,8 @@ How to look:
    Two exceptions. (a) Window banners (daemon offline, config error, `app.slint:313`) are rare whole-window errors above the page: they may push the content down. Rule 1, rule 8 and the check of rule 27 do not apply to them. (b) A panel the user opens on purpose (the hotkey keyboard, `hotkey.slint:81`) may move the content below it; rule 1 covers rows that change on their own or from events. Rule 6 still holds for the panel's width.
 2. **A persistent warning is a "!" icon in a reserved slot of the row, with the text in a hover tooltip.** The slot keeps its width when empty. No warning line under the row. This covers warnings only: status badges (Ready, Not downloaded) and the model card's size and removal date stay as text on the row.
    Check: shot with and without the state: the row's other parts do not move. Hover shows the full text. The text is not on the row.
-3. **Short events are a toast at the bottom of the window.** The toast lies over the content, pushes nothing and leaves by itself.
-   Check: shot with and without the toast: outside the toast's own area the two match.
+3. **Short events are a toast in the header row, between the tabs and the status chip** (owner item 23, 2026-11-11: the bottom toast covered History's fields; `docs/DESIGN-SYSTEM.md` DS-25.9). The toast covers no field, no button, no tab and not the status chip, pushes nothing and leaves by itself. A result that has a place on the page is shown there, not in a toast.
+   Check: shot with and without the toast: outside the toast's own area the two match, and the toast's rect lies inside the header row and overlaps neither a tab nor the chip.
 4. **A caption tied to a value goes inside the control** (for example "Never" inside the field). A caption must not shift a control off its centre.
    Check: set the value to its edge cases (0, minimum, maximum): the control's position and height do not change.
 5. **Edge cases are designed in, not added on top.** A row, card or page has a place for all its states before it is built.
@@ -45,8 +45,8 @@ How to look:
     Check: the `Badge` component's `border-radius`, and a zoomed shot of Ready, Downloading and Not downloaded.
 14. **Sharp corners are minimal.** Blocks and icons have softened corners. Only window edges, full-bleed panels and 1 px dividers may be square.
     Check: a real shot zoomed 2x on each page shows no other square corner; no `border-radius: 0` in `crates/oxi-settings/ui`.
-15. **Own ink accent (brand "white minimal"), never the Windows accent.**
-    Check: `no_system_accent_on_any_page` in `crates/oxi-settings/tests/shots.rs` passes; `rg "Palette\.accent" crates/oxi-settings/ui` prints nothing.
+15. **The accent is the user's pick, a preset or a hex (owner 2026-11-11; `docs/DESIGN-SYSTEM.md` section 20), red by default, on the "white minimal" neutral base; never the Windows accent. The accent may be red, amber or green, so no state is told by colour alone: an error, a warning, "done" and microphone overload each show their glyph or shape and their words (`docs/DESIGN-SYSTEM.md` section 21). Recording shows the accent.**
+    Check: `no_system_accent_on_any_page` in `crates/oxi-settings/tests/shots.rs` passes; `rg "Palette\.accent" crates/oxi-settings/ui` prints nothing; a greyscale copy of each state's shot still tells the state.
 16. **Danger and cancel buttons turn red on hover** (Cancel, Remove, Delete, Stop and the like).
     Check: each such button uses the danger variant; a forced-hover shot in the gallery shows the `error-*` colours.
 17. **Selected means filled, never an outline ring.** A focus ring appears only for keyboard focus.
@@ -86,7 +86,7 @@ How to look:
 
 | Screen | Few, empty | Many, long |
 |---|---|---|
-| Home | no dictations yet | very large numbers, a full year of activity |
+| Home | no dictations yet | very large numbers, a full six months (26 weeks) of activity |
 | Hotkey | one key, no key picked | 15 keys in the chord: chips stay in the Keys row |
 | Audio | no microphone, saved device unplugged | many microphones, a very long device name |
 | Language popup | search finds nothing | every whisper language |

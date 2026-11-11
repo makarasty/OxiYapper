@@ -7,6 +7,8 @@ use crate::machine::OverlayState;
 use crate::strings;
 use crate::types::Millis;
 
+use super::look::TOO_LOUD;
+
 /// Pill width in device-independent pixels (1 DIP = 1 px at 96 dpi).
 pub const PILL_W_DIP: i32 = 168;
 pub const PILL_H_DIP: i32 = 40;
@@ -110,6 +112,28 @@ pub fn pill_label(
         }
         _ => out.push_str(label),
     }
+}
+
+/// Every text the pill can show beside the wave: the `state`'s label, the label of every
+/// recording state (recording, locked, ending soon), the overload warning and the longest `m:ss`
+/// clock. The wave box starts after the widest, so nothing moves when the label swaps or the
+/// recording changes state (DS-21.3, DS-25).
+#[must_use]
+pub fn label_variants(state: OverlayState) -> [&'static str; 6] {
+    let rec = |locked, ending_soon| {
+        strings::overlay_label(OverlayState::Recording {
+            locked,
+            ending_soon,
+        })
+    };
+    [
+        strings::overlay_label(state),
+        rec(false, false),
+        rec(true, false),
+        rec(true, true),
+        TOO_LOUD,
+        "00:00",
+    ]
 }
 
 /// Left edge of a status label `text_w` wide in a pill `pill_w` wide: its box centred on the

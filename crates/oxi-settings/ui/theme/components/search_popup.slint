@@ -1,9 +1,9 @@
 // A popup with a search field over a list. The owner filters: `search` fires on every edit and it
 // answers with new `items`. Up/Down walk the matches, Enter takes the lit one, Esc closes. The size
 // is fixed and smaller than the smallest window, and Slint keeps a popup inside its window.
-import { ListView } from "std-widgets.slint";
 import { Theme } from "../tokens.slint";
-import { CardFrame, Caption } from "base.slint";
+import { Icons } from "../icons.slint";
+import { CardFrame, Caption, ScrollBox } from "base.slint";
 import { TextField } from "fields.slint";
 
 export component SearchPopup inherits PopupWindow {
@@ -30,10 +30,10 @@ export component SearchPopup inherits PopupWindow {
     function walk(i: int) {
         root.active = clamp(i, 0, max(root.items.length - 1, 0));
         let top = root.active * root.row-height;
-        if (top < -list.content-y) {
-            list.content-y = -top;
-        } else if (top + root.row-height > list.visible-height - list.content-y) {
-            list.content-y = list.visible-height - top - root.row-height;
+        if (top < -list.viewport-y) {
+            list.viewport-y = -top;
+        } else if (top + root.row-height > list.height - list.viewport-y) {
+            list.viewport-y = list.height - top - root.row-height;
         }
     }
 
@@ -41,7 +41,10 @@ export component SearchPopup inherits PopupWindow {
     init => {
         field.focus();
     }
-    width: Theme.control-column-max;
+    // The width of the control column a field sits in (DS-4.4): 360, 240 on a page under 720 px.
+    width: Theme.control-column;
+    // shortcut: the geometry is final in the first frame (DS-25.4) because it follows the column,
+    // not the field; a field that is not a full column wide sets `width` from its owner.
     // The field and seven rows.
     height: Theme.control-height * 8 + Theme.space-2 * 3;
 
@@ -73,25 +76,34 @@ export component SearchPopup inherits PopupWindow {
                 padding: Theme.space-2;
                 spacing: Theme.space-2;
                 field := TextField {
+                    // The caret is in it at once, the ring never (DS-4.6).
+                    no-ring: true;
                     placeholder-text: root.placeholder;
                     accessible-label: root.placeholder;
                     edited(text) => {
                         root.active = 0;
-                        list.content-y = 0;
+                        list.viewport-y = 0;
                         root.search(text);
                     }
                 }
                 Rectangle {
                     vertical-stretch: 1;
-                    list := ListView {
+                    list := ScrollBox {
+                        thin: true;
+                        // The popup's own padding is outside; the list is 8 px from its edges.
+                        inset: 0px;
+                        reserve-gutter: true;
                         width: 100%;
                         height: 100%;
+                        content-height: root.items.length * root.row-height;
                         for item[i] in root.items: Rectangle {
                             property <bool> on: i == root.current;
                             property <bool> lit: touch.has-hover || i == root.active;
+                            y: i * root.row-height;
                             height: root.row-height;
                             border-radius: Theme.radius-control;
-                            background: self.on ? Theme.accent : self.lit ? Theme.bg-subtle-hover : transparent;
+                            background: self.on ? Theme.accent-tint : self.lit ? Theme.bg-subtle-hover : transparent;
+                            animate background { duration: Theme.motion-quick; easing: ease-out; }
                             accessible-role: list-item;
                             accessible-label: item;
                             accessible-item-selectable: true;
@@ -106,18 +118,30 @@ export component SearchPopup inherits PopupWindow {
                                 Text {
                                     text: item;
                                     font-size: Theme.body-size;
-                                    color: i == root.current ? Theme.on-accent : Theme.text-primary;
+                                    color: Theme.text-primary;
                                     vertical-alignment: center;
                                     accessible-role: none;
                                 }
                                 Caption {
                                     text: root.notes[i];
-                                    color: i == root.current ? Theme.on-accent : Theme.text-secondary;
+                                    color: Theme.text-secondary;
                                     horizontal-stretch: 1;
                                     horizontal-alignment: right;
                                     vertical-alignment: center;
                                     overflow: elide;
                                     accessible-role: none;
+                                }
+                                // The mark of the value in use (DS-20.6): a slot on every row, so
+                                // no note moves when `current` changes.
+                                Rectangle {
+                                    width: Theme.check-glyph-size;
+                                    if i == root.current: Image {
+                                        source: Icons.checkmark-12;
+                                        width: Theme.check-glyph-size;
+                                        height: Theme.check-glyph-size;
+                                        colorize: Theme.accent-text;
+                                        accessible-role: none;
+                                    }
                                 }
                             }
                             touch := TouchArea {

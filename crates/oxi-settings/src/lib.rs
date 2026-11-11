@@ -190,7 +190,79 @@ fn placement(area: Rect, scale: f32) -> (LogicalSize, PhysicalPosition) {
     (size, position)
 }
 
-/// Puts our accent token (the theme's ink, DS-19.1) where Slint keeps the system accent, which the
+/// The colours the accent takes in one theme, each `0xRRGGBB` (DESIGN-SYSTEM section 20). The
+/// derivation from a seed is pure colour maths elsewhere (oxi-core); this is what the window shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccentColors {
+    pub accent: u32,
+    pub hover: u32,
+    pub pressed: u32,
+    pub on_accent: u32,
+    pub text: u32,
+    pub tint: u32,
+    /// Heat scale levels 1 to 4 of the Home heatmap.
+    pub heat: [u32; 4],
+}
+
+impl AccentColors {
+    /// The brand Red (seed #D93A3F) in the dark theme: the default of a fresh or invalid config,
+    /// and the values `Theme.accent-dark` holds before Rust sets anything.
+    pub const RED_DARK: Self = Self {
+        accent: 0x00D9_3A3F,
+        hover: 0x00C3_3439,
+        pressed: 0x00AE_2E32,
+        on_accent: 0x00FF_FFFF,
+        text: 0x00E4_7175,
+        tint: 0x003D_2324,
+        heat: [0x004E_2627, 0x0073_2B2D, 0x00A1_3235, 0x00D9_3A3F],
+    };
+    /// The brand Red in the light theme.
+    pub const RED_LIGHT: Self = Self {
+        accent: 0x00D9_3A3F,
+        hover: 0x00C3_3439,
+        pressed: 0x00AE_2E32,
+        on_accent: 0x00FF_FFFF,
+        text: 0x00BF_3337,
+        tint: 0x00F8_E4E2,
+        heat: [0x00F3_CBCA, 0x00EC_A4A5, 0x00E4_7477, 0x00D9_3A3F],
+    };
+
+    fn to_set(self) -> generated::AccentSet {
+        let c = |v: u32| {
+            let [_, r, g, b] = v.to_be_bytes();
+            slint::Color::from_rgb_u8(r, g, b)
+        };
+        generated::AccentSet {
+            accent: c(self.accent),
+            hover: c(self.hover),
+            pressed: c(self.pressed),
+            on_accent: c(self.on_accent),
+            text: c(self.text),
+            tint: c(self.tint),
+            heat_1: c(self.heat[0]),
+            heat_2: c(self.heat[1]),
+            heat_3: c(self.heat[2]),
+            heat_4: c(self.heat[3]),
+        }
+    }
+}
+
+/// Sets the accent of both themes; the open window recolours at once, no restart (DS-20.3). The
+/// theme in use picks its own set, so a change of theme needs nothing more. The std widgets that
+/// still tint from Slint's system accent follow too.
+pub fn set_accent(window: &AppWindow, dark: AccentColors, light: AccentColors) {
+    let tokens = window.global::<Tokens>();
+    tokens.set_accent_dark(dark.to_set());
+    tokens.set_accent_light(light.to_set());
+    own_accent(window);
+}
+
+/// Back to the brand Red.
+pub fn reset_accent(window: &AppWindow) {
+    set_accent(window, AccentColors::RED_DARK, AccentColors::RED_LIGHT);
+}
+
+/// Puts our accent token (the user's accent, DS-20) where Slint keeps the system accent, which the
 /// std widgets still in use tint from; never the Windows accent (redesign spec 7.3).
 // shortcut: private Slint API, safe only while `slint` is pinned `=1.18.1`; re-check it on every
 // Slint bump. The backend writes the system accent back when it creates the window and on a theme
@@ -526,6 +598,76 @@ mod tests {
         i_slint_backend_testing::init_no_event_loop();
         let window = AppWindow::new().expect("window builds");
         assert!(window.show().is_ok());
+    }
+
+    fn blue() -> super::AccentColors {
+        super::AccentColors {
+            accent: 0x0000_8AF5,
+            hover: 0x0000_7CDD,
+            pressed: 0x0000_6EC4,
+            on_accent: 0x0000_0000,
+            text: 0x0000_6FC8,
+            tint: 0x0020_3A55,
+            heat: [0x0020_3A55, 0x0010_5E99, 0x0000_7ACF, 0x0000_8AF5],
+        }
+    }
+
+    /// DS-20.3: the Rust defaults are the values the tokens start with, and a new accent recolours
+    /// the open window (the theme in use) with no restart.
+    #[test]
+    fn accent_defaults_match_the_tokens_and_a_change_recolours() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = AppWindow::new().expect("window builds");
+        window.show().unwrap();
+        let tokens = window.global::<super::Tokens>();
+        let rgb = |c: slint::Color| u32::from_be_bytes([0, c.red(), c.green(), c.blue()]);
+        let (d, l) = (tokens.get_accent_dark(), tokens.get_accent_light());
+        assert_eq!(rgb(d.accent), super::AccentColors::RED_DARK.accent);
+        assert_eq!(rgb(d.text), super::AccentColors::RED_DARK.text);
+        assert_eq!(rgb(d.heat_2), super::AccentColors::RED_DARK.heat[1]);
+        assert_eq!(rgb(l.tint), super::AccentColors::RED_LIGHT.tint);
+        assert_eq!(rgb(l.text), super::AccentColors::RED_LIGHT.text);
+        assert_eq!(rgb(tokens.get_accent()), 0x00D9_3A3F);
+
+        super::set_accent(&window, blue(), blue());
+        assert_eq!(rgb(tokens.get_accent()), blue().accent);
+        assert_eq!(rgb(tokens.get_accent_hover()), blue().hover);
+        assert_eq!(rgb(tokens.get_on_accent()), 0);
+        assert_eq!(rgb(tokens.get_heat_4()), blue().heat[3]);
+        assert_eq!(rgb(tokens.get_focus_ring()), blue().accent);
+
+        super::reset_accent(&window);
+        assert_eq!(rgb(tokens.get_accent()), 0x00D9_3A3F);
+    }
+
+    /// DS-3: the control column is one of two widths, cut the same way in every row.
+    #[test]
+    fn control_column_has_two_steps_and_one_side_slot() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = AppWindow::new().expect("window builds");
+        window.show().unwrap();
+        let (shell, tokens) = (
+            window.global::<super::Shell>(),
+            window.global::<super::Tokens>(),
+        );
+        for (page, column, main) in [
+            (1028.0, 360.0, 264.0),
+            (720.0, 360.0, 264.0),
+            (640.0, 240.0, 144.0),
+        ] {
+            shell.set_page_width(page);
+            assert!(
+                (tokens.get_control_column() - column).abs() < 0.01,
+                "column at {page}"
+            );
+            assert!(
+                (tokens.get_control_main() - main).abs() < 0.01,
+                "main at {page}"
+            );
+        }
+        assert!((tokens.get_control_side() - 88.0).abs() < 0.01);
+        assert!((tokens.get_number_field_width() - tokens.get_control_side()).abs() < 0.01);
+        assert!((tokens.get_meter_height() - tokens.get_control_height()).abs() < 0.01);
     }
 
     #[test]

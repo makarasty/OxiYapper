@@ -5,27 +5,7 @@ import { FocusRing, KeyFocus, CardFrame, Caption, Tip, InfoTip, ScrollBox } from
 import { Switch } from "switch.slint";
 import { Slider, NumberField } from "slider.slint";
 import { WarningSlot } from "feedback.slint";
-
-export component PageHeader inherits VerticalLayout {
-    in property <string> title;
-    in property <string> caption;
-    padding-top: Theme.title-top;
-    padding-bottom: Theme.title-bottom;
-    spacing: Theme.space-1;
-    heading := Text {
-        text: root.title;
-        font-size: Theme.title-size;
-        font-weight: Theme.weight-strong;
-        color: Theme.text-primary;
-        accessible-role: none;
-    }
-    if root.caption != "": Text {
-        text: root.caption;
-        font-size: Theme.body-size;
-        color: Theme.text-secondary;
-        wrap: word-wrap;
-    }
-}
+import { Button, ButtonKind } from "button.slint";
 
 // An optional header 8 px above its cards; the cards (children) 4 px apart. No box of its own.
 export component Group inherits VerticalLayout {
@@ -34,11 +14,18 @@ export component Group inherits VerticalLayout {
     // A hint about the group: the "i" `pair-gap` after the title, this text its tooltip (UI rule
     // 35). Empty shows none.
     in property <string> info;
+    // The trailing action at the title row's right end (DS-28.6): a soft Button, its `action-tip`
+    // the tooltip. Empty `action-text` shows none and the row keeps its height.
+    in property <string> action-text;
+    in property <image> action-icon;
+    in property <string> action-tip;
+    in property <bool> action-enabled: true;
+    callback action;
     spacing: Theme.card-gap;
     if root.title != "": HorizontalLayout {
         padding-bottom: Theme.header-gap - Theme.card-gap;
         spacing: Theme.pair-gap;
-        alignment: start;
+        alignment: stretch;
         if root.icon.width > 0: Image {
             source: root.icon;
             width: Theme.icon-size;
@@ -56,6 +43,19 @@ export component Group inherits VerticalLayout {
         }
         if root.info != "": InfoTip {
             text: root.info;
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+        }
+        if root.action-text != "": Button {
+            kind: ButtonKind.soft;
+            text: root.action-text;
+            icon: root.action-icon;
+            tooltip: root.action-tip;
+            enabled: root.action-enabled;
+            clicked => {
+                root.action();
+            }
         }
     }
     @children
@@ -134,9 +134,9 @@ export component ClickCard inherits CardFrame {
 }
 
 // `[icon 20?] [title + description, both wrap] .... [!] [control column]` inside a Card. The control
-// column (children, right-aligned) is 36 % of the card, 240 to 360 px, the same in every row of a
-// page (the wrapping of the text on the left must not move it); the "!" sits just left of the
-// packed controls; an `info` hint is an "i" `pair-gap` after the title.
+// column (children, right-aligned) is `control-column` wide: 360 px, 240 under a 720 px page (DS-3),
+// the same in every row of every page (the wrapping of the text on the left must not move it); the
+// "!" sits just left of the packed controls; an `info` hint is an "i" `pair-gap` after the title.
 export component Row inherits HorizontalLayout {
     in property <image> icon;
     in property <string> title;
@@ -228,7 +228,7 @@ export component Row inherits HorizontalLayout {
     }
     Rectangle {
         horizontal-stretch: 0;
-        preferred-width: root.text-only ? 0 : clamp((Shell.page-width - 2 * Theme.card-padding-h) * 0.36, Theme.control-column-min, Theme.control-column-max);
+        preferred-width: root.text-only ? 0 : Theme.control-column;
         min-width: self.preferred-width;
         max-width: self.preferred-width;
         min-height: controls.min-height;

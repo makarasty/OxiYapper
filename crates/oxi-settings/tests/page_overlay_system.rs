@@ -330,7 +330,7 @@ fn positions_are_one_group_with_one_checked_and_arrows_cross_rows() {
 }
 
 /// UI rule 25: at 720 x 520 the one card fits whole, with no banner, the offline daemon's and a
-/// broken config's, and the six tiles stay one row inside the window.
+/// broken config's, and the six tiles stay inside the window as the 3 x 2 grid of DS-28.4.
 #[test]
 fn the_page_fits_the_minimum_size_with_every_banner() {
     let l = layout("position-fit", None);
@@ -353,13 +353,15 @@ fn the_page_fits_the_minimum_size_with_every_banner() {
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
         let preview = with_role(&window, "Preview", AccessibleRole::Button);
         assert!(whole(&preview), "Preview is cut (banner {banner:?})");
-        let row = card(&window, POSITION_CARDS[0]).absolute_position().y;
-        for label in POSITION_CARDS {
+        let top = card(&window, POSITION_CARDS[0]).absolute_position().y;
+        for (i, label) in POSITION_CARDS.into_iter().enumerate() {
             let tile = card(&window, label);
             assert!(whole(&tile), "{label} is cut (banner {banner:?})");
+            // Two rows of 32, 8 apart (DS-28.4); three tiles to a row.
+            let want = top + if i < 3 { 0.0 } else { 40.0 };
             assert!(
-                (tile.absolute_position().y - row).abs() < 0.5,
-                "{label} left the row"
+                (tile.absolute_position().y - want).abs() < 0.5,
+                "{label} left its row"
             );
         }
         let at = switch(&window, "Show the overlay").absolute_position();

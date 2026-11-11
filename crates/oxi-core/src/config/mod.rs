@@ -1,8 +1,13 @@
 //! Config: load with migrations, unknown keys kept, newer version read-only
 //! (ARCHITECTURE section 6). The atomic file write is I/O and lives in the settings process.
 
+mod extra;
 mod schema;
 
+pub use extra::{
+    Accent, Advanced, AudioChannel, AudioCtx, Auto, BadAccent, Decoding, FileFormat, FileMode,
+    LanguageKey, Output, Rgb, Snippet, Text, TypeSpeed, VadSensitivity,
+};
 pub use schema::{
     AppLanguage, Audio, Config, Debug, History, Hotkey, Model, OtherKey, Overlay, OverlayPosition,
     Paste, PasteMode, PasteRule, Sounds, System, Theme, Ui,
@@ -32,6 +37,15 @@ fn history_on(doc: &mut DocumentMut) {
     {
         put(h, "enabled", &toml_edit::value(true));
     }
+}
+
+/// `ui.accent` loads leniently (a bad string is `default`); this is where the file's text is
+/// checked, so the bad value is reported.
+fn accent_warning(doc: &DocumentMut) -> Option<String> {
+    let text = doc.get("ui")?.as_table_like()?.get("accent")?.as_str()?;
+    text.parse::<Accent>()
+        .is_err()
+        .then(|| format!("ui.accent = {text:?} is neither \"default\" nor #RRGGBB, using default"))
 }
 
 fn history_enabled(doc: &DocumentMut) -> Option<bool> {
@@ -150,14 +164,24 @@ impl ConfigFile {
         } else {
             Cow::Owned(raw.to_string())
         };
-        let mut config = toml::from_str::<Config>(&migrated)
-            .map_err(|e| located(&migrated, e.span(), e.message()))?;
+        let mut config = toml::from_str::<Config>(&migrated).map_err(|e| {
+            located(
+                &migrated,
+                e.span(),
+                &keyed(&migrated, e.span(), e.message()),
+            )
+        })?;
         let warnings = config
             .audio
             .clamp_meter_sensitivity()
             .into_iter()
             .chain(config.model.normalise_recent_languages())
             .chain(config.sounds.normalise())
+            .chain(config.hotkey.clamp_hold_gap())
+            .chain(config.model.advanced.normalise())
+            .chain(config.text.normalise())
+            .chain(config.output.warning())
+            .chain(accent_warning(&raw))
             .collect();
         if !read_only {
             put(raw.as_table_mut(), "version", &toml_edit::value(current));
@@ -210,7 +234,9 @@ fn typed_doc(config: &Config) -> Result<DocumentMut, ConfigError> {
 
 /// Tables whose keys are user data (a map), not a fixed set: a key the typed config lacks is
 /// removed from the file. Any other table keeps the keys this build does not know.
-const MAP_TABLES: [&str; 1] = ["app_names"];
+/// Each is `(parent table, map key)`: a map is pruned only under its own parent, never inside
+/// a rule that happens to carry an unknown key of the same name.
+const MAP_TABLES: [(&str, &str); 2] = [("ui", "app_names"), ("model", "by_language")];
 
 /// Writes every key of `src` into `dst`: tables merge key by key, arrays of tables merge
 /// element by element on `app`, values replace only when they differ and keep their decor.
@@ -233,7 +259,13 @@ fn merge(dst: &mut dyn TableLike, src: &dyn TableLike, default: Option<&dyn Tabl
             }
         } else if let (Some(o), Some(n)) = (old.as_table_like_mut(), new.as_table_like()) {
             merge(o, n, fallback.and_then(Item::as_table_like));
-            if MAP_TABLES.contains(&key) {
+            // An empty map is not serialised, so its table is missing from `n`: drop the file's copy.
+            for &(parent, map) in &MAP_TABLES {
+                if key == parent && !n.contains_key(map) {
+                    o.remove(map);
+                }
+            }
+            if MAP_TABLES.iter().any(|&(_, map)| map == key) {
                 let gone: Vec<String> = o
                     .iter()
                     .map(|(k, _)| k.to_owned())
@@ -410,6 +442,18 @@ fn unplace(t: &mut Table) {
     }
 }
 
+/// `message` led by the key on the span's line (`threads: ...`): a typed error names the bad
+/// value but not the key.
+fn keyed(text: &str, span: Option<Range<usize>>, message: &str) -> String {
+    let at = span.map_or(0, |s| s.start).min(text.len());
+    let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+    let line = text[start..].lines().next().unwrap_or_default();
+    match line.split_once('=') {
+        Some((key, _)) if !key.trim().is_empty() => format!("{}: {message}", key.trim()),
+        _ => message.to_owned(),
+    }
+}
+
 fn located(text: &str, span: Option<Range<usize>>, message: &str) -> ConfigError {
     let at = span.map_or(0, |s| s.start).min(text.len());
     let before = text.get(..at).unwrap_or_default();
@@ -464,3 +508,6 @@ unknown = 2
         );
     }
 }
+
+#[cfg(test)]
+mod overhaul_tests;

@@ -67,7 +67,8 @@ export component Keycap {
     }
 }
 
-// A chord as inline keycaps (PowerToys KeyVisual): accent caps of one width, gap 4. The row never
+// A chord as inline keycaps (PowerToys KeyVisual): neutral caps of one width, gap 4 (the accent
+// never colours a cap at rest, DS-20.5); `fresh` caps, the ones being typed, wear the tint (DS-28.3). The row never
 // grows: caps past its width fold into a "+N" cap with the whole chord in its tooltip, on hover and
 // on keyboard focus (a Tab stop only while keys are folded). `warning`
 // draws them on the warning fill; with no keys, `empty-text` shows instead. `label` is the
@@ -76,6 +77,8 @@ export component KeycapRow {
     in property <[string]> keys;
     in property <length> cap-height: Theme.control-height;
     in property <bool> warning;
+    // The new chord of the hotkey editor: accent-tint fill, accent-text ink.
+    in property <bool> fresh;
     in property <string> empty-text;
     in property <string> label;
     // Pack the caps against the end of the row (the action after them), not its start.
@@ -133,15 +136,15 @@ export component KeycapRow {
         height: root.cap-height;
         border-radius: Theme.radius-control;
         // Locked greys the fill, not the layer, so the label stays crisp (DS-8.3 [22]).
-        background: Shell.locked ? Theme.text-disabled : root.warning ? Theme.warning-fill : Theme.accent;
-        // 1 px hairline: the warning cap's stroke.
-        border-width: root.warning && !Shell.locked ? 1px : 0;
-        border-color: Theme.warning-text.transparentize(0.7);
+        background: Shell.locked ? Theme.bg-control : root.warning ? Theme.warning-fill : root.fresh ? Theme.accent-tint : Theme.bg-control;
+        // 1 px hairline: the cap's stroke (none on a fresh cap, the tint is its edge).
+        border-width: root.fresh && !root.warning && !Shell.locked ? 0 : 1px;
+        border-color: Shell.locked ? Theme.stroke-control : root.warning ? Theme.warning-text.transparentize(0.7) : Theme.stroke-keycap;
         Text {
             text: root.keys[i];
             font-size: Theme.body-size;
             font-weight: Theme.weight-strong;
-            color: root.warning && !Shell.locked ? Theme.warning-text : Theme.on-accent;
+            color: Shell.locked ? Theme.text-disabled : root.warning ? Theme.warning-text : root.fresh ? Theme.accent-text : Theme.text-primary;
             horizontal-alignment: center;
             vertical-alignment: center;
             accessible-role: none;

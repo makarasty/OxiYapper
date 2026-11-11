@@ -130,6 +130,8 @@ Framing: one JSON object per line (`serde_json`), max 1 MiB per line, tagged enu
 
 Versioning: `proto` is an integer, starting at 1. Adding an optional field (serde default) does not bump it; renaming or removing a field or changing meaning does, and so does a new request (an older daemon drops a connection that sends one). Proto 2 added `Stats`. Proto 3 added `PreviewSound`. Proto 4 added `TestAudio` and `TestTranscribe`. `Hello`, `HelloAck` and `Shutdown` never change shape. On a mismatch (exe updated while the old daemon runs) settings shows "Restart OxiYapper to finish the update" and a button that sends `Shutdown` and relaunches the daemon.
 
+Live updates (planned, run 2026-11-11, task c04; proto 6): the daemon pushes what changed, and the settings window does not poll. Pushed unasked while a settings connection exists: `HistoryAdded { item }`, `HistoryChanged { item }`, `HistoryRemoved { ids }` from the history worker after the files are on disk; `Stats` after each rewrite of `stats.json`; `Status` and `Attention` when the phase, the model load state, the backend or the warnings change; `FileChanged { file }` (config, dictionary, replace) from the config watcher; `Woke` on resume and unlock. With no connection a push is dropped at no cost. The 1 s timer of the window (file stats, redraw) goes away: file checks follow `FileChanged`, and the whole-frame redraw that repairs pixels the OS dropped follows window focus, un-occlusion, resize, theme change, pointer entry and `Woke`. Devices are listed again when their page is shown. `HistoryList` pages come from an in-memory id list built by one directory listing; only the files of the page are read. Proto 5 added `Attention`, the history requests, `DeleteModel` and `TestProgress`.
+
 Live meter: the settings Audio page does not read `LEVEL` over IPC. While the page is shown, settings opens its own capture (`CpalCapture`) and polls its `LevelMeter` at 30 Hz; the capture closes when the page goes away. The daemon's mic is still opened only on key-down. Settings reopens the stream every 60 s to bound the memory the capture keeps.
 
 Hotkey capture: while `CaptureHotkey { on: true }` the daemon pauses the chord, forwards raw key events and swallows them only while the settings window is foreground. Capture ends when settings sends `on: false`, loses focus, or the connection drops. This is the one place keystrokes leave the hook, which is why the socket is owner-only.
@@ -197,6 +199,62 @@ theme = "system"               # system | dark | light
 ```
 
 `audio.meter_sensitivity_db` scales only the meter that is drawn, never the audio whisper gets. A value outside -20..+20 is clamped (NaN becomes 0.0) and the load adds a message to `ConfigFile.warnings`. `[ui] theme` is the colour scheme of the settings window: `system` follows the OS light/dark setting. Both keys are optional, and an older file without them loads with the defaults.
+
+Keys added by the 2026-11-11 run (planned, task a04; `version` stays 2, every key is optional):
+
+```toml
+[hotkey]
+hold_gap_ms = 400              # push mode: a re-press this soon after a release continues the dictation; 0 = off, else 100..1500
+[audio]
+channel = "mix"                # mix | left | right
+vad_sensitivity = "normal"     # low | normal | high: how quiet a sound still counts as voice for the trim
+[model]
+preload_at_start = false       # load the model when the daemon starts
+[model.by_language]            # empty = off; an explicit dictation language picks its model
+# ru = "podlodka"
+[model.advanced]               # "auto" keeps the engine's own choice
+threads = "auto"               # or 1..32
+flash_attn = "auto"            # or true | false
+decoding = "auto"              # or "greedy" | "beam"
+best_of = 1                    # greedy, 1..5
+beam_size = 5                  # beam, 2..8
+temperature = "auto"           # or 0.0..1.0
+temperature_fallback = "auto"  # or true | false
+initial_prompt = ""            # put before the dictionary words
+audio_ctx = "auto"             # or "full" | "fit" (encoder window fitted to the clip)
+no_speech_threshold = "auto"   # or 0.0..1.0
+logprob_threshold = "auto"     # or -5.0..0.0
+entropy_threshold = "auto"     # or 0.0..10.0
+suppress_non_speech = "auto"   # or true | false
+[paste]
+type_speed = "fast"            # fast (16 units per call, 2 ms apart) | safe (one character, 5 ms apart)
+# a rule may also set: type_speed, language, model, to_file, dictionary, replacements,
+# voice_commands, filler_filter, pause_punctuation
+# pace of an app: the rule's type_speed; else safe when a rule for the app (the user's, or the
+# built-in mstsc.exe one) has mode = "type"; else the type_speed above. No file is migrated.
+[text]                         # everything here changes the text and is off by default
+pause_punctuation = false
+pause_sentence_ms = 800        # 300..3000
+pause_paragraph_ms = 0         # 0 = off, else 1000..10000
+filler_filter = false
+fillers = ["э", "ээ", "эм", "мм", "um", "uh", "erm"]
+voice_commands = false
+confidence_filter = false      # holds a segment back when its mean word confidence is under confidence_min, or is
+                               # under 0.6 while its 30 s window got 0.6 or more for "no speech" (the model scores
+                               # a window, not a segment, so the window alone never holds anything); held text stays in the history
+confidence_min = 0.35          # 0.05..0.95
+# [[text.snippets]] with trigger = "..." and text = "..."
+[output]
+file_mode = "off"              # off | also | only: append each dictation to a daily file
+file_folder = ""
+file_format = "md"             # md | txt
+[history]
+skip_pauses = false            # the History player jumps over pauses of 1 s or more (playback only)
+[sounds]
+folder = ""                    # a folder of .wav/.ogg files offered as sounds
+[ui]
+accent = "default"             # default | "#RRGGBB"
+```
 
 Per-app paste rules answer "games, terminals, remote desktop" without a toggle the user flips by hand. App identity: exe name on Windows, bundle id on macOS, `WM_CLASS` on X11.
 
@@ -388,3 +446,14 @@ All in `.github/workflows/ci.yml`. Branch protection requires one check, `ci-ok`
 | build-cuda | Windows CUDA | no, until M5 decides to keep CUDA |
 
 Release (`release.yml`, on a `v*` tag): builds, packages, SHA256SUMS, provenance attestation, GitHub release. Packaging with cargo-packager arrives in ROADMAP M11.
+
+## 15. Progress (planned, run 2026-11-11)
+
+One model for every progress the user sees (overlay pill, downloads, test and history runs): `oxi-core::overlay::progress::Smooth`. Its rules and constants are `docs/DESIGN-SYSTEM.md` section 26. It is fed an estimate of the whole job and, when they exist, real fractions, and answers the value to draw: it moves from the first frames, never goes back, never jumps, and runs to 100 % on finish. Transcription: the estimate is a fixed cost plus a rate per audio second, learned per model and backend during the run (first guess 282 ms + 88 ms per second of audio); the percent whisper reports per 30 s window is a real fraction. Typing: the real fraction is the units typed. A clipboard paste has no bar. The paste worker reports "landed" as soon as the text is in the field, before the clipboard restore, and the pill shows done then. Animation never delays work. The overlay reads the value on its 33 ms timer, which runs only while the pill animates; the settings window drives its bars with one 33 ms timer that runs only while a job is shown.
+
+## 16. Word data in the history (planned, run 2026-11-11)
+
+- At dictation time each word gets a probability (the lowest of its tokens), stored in the json of the entry. No extra whisper work.
+- Word times are computed only when a recording is opened or exported, never during dictation: DTW needs a context without flash attention. The whisper worker runs the saved wav through a second context (flash attention off, the DTW preset of the model) in the slot that test and history runs use, so a dictation always goes first; the context is dropped 60 s after the last request. The result is cached in the json (`docs/HISTORY-FORMAT.md`).
+- The timing pass is its own transcription, so its words are lined up with the shown text by a word diff (`oxi-core::history::align`); a word with no partner gets an interpolated time.
+- Before any UI is built on it, the times are checked on Russian recordings against the voice gate (monotone, inside the clip, 85 % of word time voiced, pause edges within 150 ms median). If DTW fails the check, plain token timestamps are tried; if both fail, the player works per segment.

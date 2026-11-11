@@ -30,6 +30,9 @@ export component Slider {
     property <float> span: max(root.maximum - root.minimum, 0.000001);
     property <length> thumb-x: (clamp(root.value, root.minimum, root.maximum) - root.minimum) / root.span * root.travel;
     property <length> origin-x: root.bipolar ? (clamp(0, root.minimum, root.maximum) - root.minimum) / root.span * root.travel : 0;
+    // The fill runs between the thumb's centre and the origin's; without `bipolar` from the rail's
+    // left end, which is the slot's left x (DS-3.6).
+    property <length> fill-from: root.bipolar ? Theme.slider-thumb / 2 + root.origin-x : 0;
 
     public function set(v: float) {
         if (!root.live) {
@@ -61,16 +64,18 @@ export component Slider {
         root.set(root.value - root.step);
     }
 
+    // The rail spans the whole slot: its ends are the slot's ends; only the thumb's centre travels
+    // from 10 px inside each end (DS-3.6).
     Rectangle {
-        x: Theme.slider-thumb / 2;
-        width: root.travel;
+        x: 0;
+        width: root.width;
         height: Theme.rail-height;
         border-radius: Theme.radius-round;
         background: Theme.bg-inset;
     }
     Rectangle {
-        x: Theme.slider-thumb / 2 + min(root.origin-x, root.thumb-x);
-        width: abs(root.thumb-x - root.origin-x);
+        x: min(root.fill-from, Theme.slider-thumb / 2 + root.thumb-x);
+        width: abs(Theme.slider-thumb / 2 + root.thumb-x - root.fill-from);
         height: Theme.rail-height;
         border-radius: Theme.radius-round;
         background: root.live ? Theme.accent : Theme.text-disabled;

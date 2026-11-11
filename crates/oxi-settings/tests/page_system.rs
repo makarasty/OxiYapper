@@ -300,3 +300,30 @@ fn the_folder_field_fills_the_control_column() {
         assert!(f.size().width >= 240.0 - 0.5, "{w}x{h}: {}", f.size().width);
     }
 }
+
+/// 02:13: hex text that Enter never confirmed does not stay in the Accent field when focus leaves:
+/// the saved seed is put back, and nothing is applied or written.
+#[test]
+fn unconfirmed_accent_hex_goes_back_when_focus_leaves() {
+    let l = layout("accent-blur", None);
+    let window = open(&l, Page::System);
+    let hex = || with_role(&window, "Accent colour as hex", AccessibleRole::TextInput);
+    let saved = hex().accessible_value();
+    assert_eq!(saved.as_deref(), Some("#D93A3F"), "the default Red");
+    hex().mock_single_click(PointerEventButton::Left);
+    hex().set_accessible_value("#00A2C7".to_owned());
+    assert_eq!(hex().accessible_value().as_deref(), Some("#00A2C7"));
+    for event in [
+        WindowEvent::KeyPressed {
+            text: Key::Tab.into(),
+        },
+        WindowEvent::KeyReleased {
+            text: Key::Tab.into(),
+        },
+    ] {
+        window.window().dispatch_event(event);
+    }
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    assert_eq!(hex().accessible_value(), saved, "the typed text stayed");
+    assert!(!l.config_file().exists(), "an unconfirmed seed was saved");
+}

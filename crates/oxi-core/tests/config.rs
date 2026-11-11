@@ -251,6 +251,7 @@ fn rules_merge_by_app_not_by_index() {
         mode: Some(PasteMode::Type),
         chord: None,
         restore_delay_ms: Some(10),
+        ..PasteRule::default()
     });
     let out = file.to_toml_string().unwrap();
     let again = ConfigFile::parse(&out).unwrap();
@@ -310,6 +311,7 @@ fn default_paste_rule_types_into_remote_desktop() {
             mode: Some(PasteMode::Type),
             chord: None,
             restore_delay_ms: None,
+            ..PasteRule::default()
         }]
     );
 }

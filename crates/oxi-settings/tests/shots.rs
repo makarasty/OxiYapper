@@ -344,7 +344,7 @@ fn update_confirm_turn_off_turns_red_on_hover() {
 #[test]
 fn overlay_tile_ring_is_for_the_keyboard_only() {
     use slint::platform::PointerEventButton;
-    // The band just above the tile against the card two steps further out.
+    // The ring's band just above the tile (2 px out, 2 px wide) against the row gap beyond it.
     let ringed = |window: &AppWindow| {
         let tile = common::with_role(window, "Bottom right", AccessibleRole::RadioButton);
         let (at, size) = (tile.absolute_position(), tile.size());
@@ -355,7 +355,7 @@ fn overlay_tile_ring_is_for_the_keyboard_only() {
                 .pixel((at.x + size.width / 2.0) as u32, y as u32)
                 .unwrap()
         };
-        pixel(at.y - 2.0) != pixel(at.y - 6.0)
+        pixel(at.y - 3.0) != pixel(at.y - 6.0)
     };
     let surface = || LAST.with_borrow(Clone::clone).unwrap();
 
@@ -469,6 +469,7 @@ fn purple_pixels(pixmap: &Pixmap) -> usize {
 }
 
 const PURPLE: Color = Color::from_rgb_u8(0x87, 0x64, 0xB8);
+const GREEN: Color = Color::from_rgb_u8(0x2E, 0x7D, 0x32);
 
 #[test]
 fn no_system_accent_on_any_page() {
@@ -484,7 +485,19 @@ fn no_system_accent_on_any_page() {
             let pixmap = render(&window, DEFAULT, 1.0);
             save(&pixmap, &format!("purple-{screen}-{theme}"));
             let leaks = purple_pixels(&pixmap);
-            assert_eq!(leaks, 0, "{leaks} purple pixels on {screen} ({theme})");
+            // The accent picker's Iris and Purple swatches (DS-20.7) are purple on purpose: a leak
+            // is a purple count that follows the system accent, so compare with a green one.
+            i_slint_backend_testing::set_system_accent_color(GREEN);
+            let window = open("purple", None);
+            window.set_page(page);
+            window.set_theme(choice);
+            let baseline = purple_pixels(&render(&window, DEFAULT, 1.0));
+            assert_eq!(
+                leaks,
+                baseline,
+                "{} purple pixels follow the system accent on {screen} ({theme})",
+                leaks.abs_diff(baseline)
+            );
         }
     }
 }

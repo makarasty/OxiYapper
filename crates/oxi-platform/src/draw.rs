@@ -14,7 +14,8 @@ use oxi_core::overlay::{
     CARD_RADIUS, Icon, Meter, PILL_BAR_GAP as BAR_GAP, PILL_BAR_MAX as BAR_MAX,
     PILL_BAR_W as BAR_W, PILL_EM as EM, PILL_EM_MIN as EM_MIN, PILL_GAP as GAP, PILL_H_DIP,
     PILL_ICON as ICON, PILL_METER_MIN as METER_MIN, PILL_PAD as PAD, PILL_TRACK, PILL_TRACK_BOTTOM,
-    RecClock, Rect, Rgba, label_x, look, palette, pill_label, progress_span,
+    RecClock, Rect, Rgba, TOO_LOUD, label_variants, label_x, look_with, palette, pill_accent,
+    pill_label, pill_rim, progress_span, tray_colour,
 };
 use oxi_core::tray::TrayBadge;
 use oxi_core::types::Millis;
@@ -52,6 +53,8 @@ pub struct PillCanvas<'f> {
     clock: RecClock,
     /// The label of the frame being drawn, reused.
     text: String,
+    /// The user's accent on the pill ([`pill_accent`]): live work and the wave.
+    accent: Rgba,
 }
 
 struct Cache {
@@ -64,6 +67,13 @@ struct Cache {
     track: Option<Track>,
 }
 
+/// The 1 px rim of the coloured tray shapes on a light taskbar (a dark red; white on a dark one).
+const TRAY_RIM: Rgba = Rgba(0x8F, 0x1D, 0x22, 0xFF);
+/// The record dot of the exe icon and its files: fixed, a file cannot follow a setting (DS-20.8).
+const ICON_DOT: Rgba = Rgba(0xE5, 0x48, 0x4D, 0xFF);
+/// The record dot of the in-app mark and tray recording state before a user accent: Red (DS-20).
+const DEFAULT_DOT: Rgba = Rgba(0xD9, 0x3A, 0x3F, 0xFF);
+
 impl<'f> PillCanvas<'f> {
     /// Without a font the pill shows its icon and meter only.
     #[must_use]
@@ -74,6 +84,15 @@ impl<'f> PillCanvas<'f> {
             progress: None,
             clock: RecClock::default(),
             text: String::new(),
+            accent: pill_accent(oxi_core::overlay::PRESETS[0].seed),
+        }
+    }
+
+    /// The accent of the next frames: the seed's [`pill_accent`]. A change redraws the pill.
+    pub fn set_accent(&mut self, accent: Rgba) {
+        if self.accent != accent {
+            self.accent = accent;
+            self.cache = None;
         }
     }
 
@@ -100,6 +119,11 @@ impl<'f> PillCanvas<'f> {
         let size = (u32::try_from(rect.w).ok()?, u32::try_from(rect.h).ok()?);
         self.clock.see(state, now);
         pill_label(&mut self.text, state, self.progress, self.clock, now);
+        // Overloaded: the label says why the wave changed (DS-21.3); a change is a new cache.
+        if matches!(state, OverlayState::Recording { .. }) && meter.clipping(now) {
+            self.text.clear();
+            self.text.push_str(TOO_LOUD);
+        }
         let sized = |c: &Cache| (c.base.width(), c.base.height()) == size;
         if self
             .cache
@@ -115,7 +139,13 @@ impl<'f> PillCanvas<'f> {
                 ),
             };
             base.fill(Color::TRANSPARENT);
-            let (bars, track) = surface(&mut base, state, self.font.as_ref(), &self.text);
+            let (bars, track) = surface(
+                &mut base,
+                state,
+                self.font.as_ref(),
+                &self.text,
+                self.accent,
+            );
             label.clone_from(&self.text);
             self.cache = Some(Cache {
                 state,
@@ -146,8 +176,9 @@ fn surface(
     state: OverlayState,
     font: Option<&FontRef<'_>>,
     label: &str,
+    accent: Rgba,
 ) -> (Option<Bars>, Option<Track>) {
-    let look = look(state);
+    let look = look_with(state, accent);
     if state == OverlayState::Hidden {
         return (None, None);
     }
@@ -172,7 +203,13 @@ fn surface(
         h - 2.0 * rim,
         radius - rim,
     );
-    fill_eo(pm, edge.finish().as_ref(), EDGE);
+    // A recording pill's rim is the accent halfway into the surface (DS-21.2).
+    let rim_colour = if look.meter && look.accent == accent {
+        pill_rim(accent)
+    } else {
+        EDGE
+    };
+    fill_eo(pm, edge.finish().as_ref(), rim_colour);
 
     let (pad, icon, gap) = ((PAD * h).round(), (ICON * h).round(), (GAP * h).round());
     let right = w - pad;
@@ -187,10 +224,23 @@ fn surface(
     // The icon starts at the left padding in every state, so it never jumps.
     let x0 = pad;
     let text_x = x0 + icon + gap;
+    // The wave box starts after the widest text the label can become (the overload warning, the
+    // clock), so a swap of the label never moves it (DS-21.3, DS-25).
+    let slot = match font {
+        Some(f) if look.meter => {
+            let room = right - text_x - gap - METER_MIN * h;
+            label_variants(state)
+                .iter()
+                .map(|s| Label::new(f, s, EM * h).width)
+                .fold(0.0, f32::max)
+                .min(room)
+        }
+        _ => 0.0,
+    };
     if look.meter
         && let Some(t) = text.as_mut()
     {
-        t.fit(right - text_x - gap - METER_MIN * h);
+        t.fit(slot);
     }
     let cy = h / 2.0;
     draw_icon(
@@ -210,10 +260,14 @@ fn surface(
             label_x(w, text_x, right, t.width)
         };
         t.draw(pm, at, cy, right);
-        x = at + t.width + gap;
+        x = if look.meter {
+            text_x + slot + gap
+        } else {
+            at + t.width + gap
+        };
     }
     let bars = if look.meter {
-        Bars::new(look.accent, x.round(), right, cy, h)
+        Bars::new(look.accent, x.round(), right, cy, h, dip)
     } else {
         None
     };
@@ -286,13 +340,14 @@ pub fn tray_icon(phase: Phase, size: u32, light_taskbar: bool, badge: TrayBadge)
             fill(&mut pm, m.dot().as_ref(), ink, id);
         }
         Phase::Recording => {
-            fill(&mut pm, m.disc(0.0).as_ref(), palette::RECORDING, id);
+            let red = tray_colour(DEFAULT_DOT, light_taskbar);
+            fill(&mut pm, m.disc(0.0).as_ref(), red, id);
             fill(&mut pm, m.hole().as_ref(), palette::WHITE, id);
             // A 1 px rim on every taskbar: red alone is under 3:1 against accent taskbars
             // (#8764B8, #005FB8), and a dark or white edge holds on any colour.
             let rim = tray_rim(light_taskbar);
             stroke(&mut pm, m.disc(0.5).as_ref(), rim, 1.0, id);
-            fill(&mut pm, m.dot().as_ref(), palette::RECORDING, id);
+            fill(&mut pm, m.dot().as_ref(), red, id);
             // The dot gets the same rim, outside its edge: inside it would leave a 1 px red
             // core at 16 px. It fits the pixmap at every tray size.
             let dot_rim = PathBuilder::from_circle(m.dot_x, m.dot_y, m.dot_r + 0.5);
@@ -329,7 +384,12 @@ pub fn tray_icon(phase: Phase, size: u32, light_taskbar: bool, badge: TrayBadge)
         TrayBadge::None => {}
         // The record dot's rim: orange alone is under 2:1 on accent taskbars (#005FB8,
         // #8764B8). Inside the edge, so the clear ring around the badge stays.
-        TrayBadge::Error => dot(6.0, true, palette::ERROR, Some(tray_rim(light_taskbar))),
+        TrayBadge::Error => dot(
+            6.0,
+            true,
+            tray_colour(palette::ERROR, light_taskbar),
+            Some(tray_rim(light_taskbar)),
+        ),
         TrayBadge::Update => dot(5.0, false, palette::UPDATE, None),
     }
     Some(pm)
@@ -339,7 +399,7 @@ pub fn tray_icon(phase: Phase, size: u32, light_taskbar: bool, badge: TrayBadge)
 /// taskbar, white on a dark or accent one.
 fn tray_rim(light_taskbar: bool) -> Rgba {
     if light_taskbar {
-        palette::RECORDING_RIM
+        TRAY_RIM
     } else {
         palette::WHITE
     }
@@ -349,6 +409,12 @@ fn tray_rim(light_taskbar: bool) -> Rgba {
 /// tile with a hairline edge, so it holds on light and dark backgrounds. `None` for size 0.
 #[must_use]
 pub fn logo(size: u32) -> Option<Pixmap> {
+    logo_with(size, ICON_DOT)
+}
+
+/// [`logo`] with the record dot in `dot`: the window icon follows the accent (DS-20.8).
+#[must_use]
+pub fn logo_with(size: u32, dot: Rgba) -> Option<Pixmap> {
     let mut pm = Pixmap::new(size, size)?;
     let id = Transform::identity();
     let logo = Logo::new(size);
@@ -361,13 +427,19 @@ pub fn logo(size: u32) -> Option<Pixmap> {
         id,
     );
     fill_eo(&mut pm, logo.mark.ring().as_ref(), palette::MARK);
-    fill(&mut pm, logo.mark.dot().as_ref(), palette::RECORDING, id);
+    fill(&mut pm, logo.mark.dot().as_ref(), dot, id);
     Some(pm)
 }
 
 /// [`logo`] at 256 px as SVG for the settings window: the same paths, so the two never drift.
 #[must_use]
 pub fn logo_svg() -> String {
+    logo_svg_with(DEFAULT_DOT)
+}
+
+/// [`logo_svg`] with the record dot in `dot`.
+#[must_use]
+pub fn logo_svg_with(dot: Rgba) -> String {
     use std::fmt::Write;
     const SIZE: u32 = 256;
     let logo = Logo::new(SIZE);
@@ -409,10 +481,7 @@ pub fn logo_svg() -> String {
         logo.mark.ring().as_ref(),
         &format!("fill=\"{}\" fill-rule=\"evenodd\"", hex(palette::MARK)),
     );
-    path(
-        logo.mark.dot().as_ref(),
-        &format!("fill=\"{}\"", hex(palette::RECORDING)),
-    );
+    path(logo.mark.dot().as_ref(), &format!("fill=\"{}\"", hex(dot)));
     svg.push_str("</svg>\n");
     svg
 }
@@ -655,6 +724,8 @@ struct Bars {
     pitch: f32,
     tall: f32,
     accent: Rgba,
+    /// Thickness of the clip line, 2 DIP.
+    line: f32,
     /// Height of the first sprite.
     lo: usize,
     /// Coverage (the alpha) of every bar height from `lo`.
@@ -662,7 +733,7 @@ struct Bars {
 }
 
 impl Bars {
-    fn new(accent: Rgba, x0: f32, right: f32, cy: f32, h: f32) -> Option<Self> {
+    fn new(accent: Rgba, x0: f32, right: f32, cy: f32, h: f32, dip: f32) -> Option<Self> {
         let bar = (BAR_W * h).round().max(1.0);
         let pitch = bar + (BAR_GAP * h).round().max(1.0);
         let tall = (BAR_MAX * h).round();
@@ -687,6 +758,7 @@ impl Bars {
             pitch,
             tall,
             accent,
+            line: (2.0 * dip).round().max(1.0),
             lo,
             sprites: (lo..=hi).map(sprite).collect::<Option<_>>()?,
         })
@@ -701,7 +773,17 @@ impl Bars {
         let len = meter.bars().len();
         let shown = fit.min(len);
         let mut x = self.right - bar - (shown.max(1) - 1) as f32 * pitch;
-        let colour = if clipping { palette::CLIP } else { self.accent };
+        let colour = if clipping {
+            palette::ERROR
+        } else {
+            self.accent
+        };
+        if clipping {
+            // The mark of overload (DS-21.3): a line across the whole wave box, at its top edge.
+            let top = (self.cy - self.tall / 2.0).round();
+            let path = rounded(self.x0, top, self.right - self.x0, self.line, 0.0);
+            fill(pm, path.as_ref(), palette::ERROR, Transform::identity());
+        }
         for v in meter.bars().skip(len - shown) {
             // Odd or even height to match the bar width, so the bar centres on the dot row.
             let h = (bar + v * (self.tall - bar)).round();
@@ -948,5 +1030,44 @@ fn stroke(pm: &mut Pixmap, path: Option<&Path>, c: Rgba, width: f32, at: Transfo
             ..Stroke::default()
         };
         pm.stroke_path(path, &paint(c), &s, at, None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxi_core::config::OverlayPosition;
+    use oxi_core::overlay::place;
+
+    /// The wave box starts at one x whatever the label is (DS-21.3 "nothing moves").
+    #[test]
+    fn the_wave_box_does_not_move_when_the_label_swaps() {
+        let Ok(bytes) = std::fs::read("C:/Windows/Fonts/segoeui.ttf") else {
+            eprintln!("skip: no font");
+            return;
+        };
+        let font = FontRef::try_from_slice(&bytes).unwrap();
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            w: 10_000,
+            h: 10_000,
+        };
+        let state = OverlayState::Recording {
+            locked: true,
+            ending_soon: false,
+        };
+        for scale in [1.0, 1.5, 2.0] {
+            let r = place(OverlayPosition::TopLeft, screen, scale);
+            let starts: Vec<u32> = ["Recording", "1:05", TOO_LOUD]
+                .into_iter()
+                .map(|label| {
+                    let mut pm = Pixmap::new(r.w.cast_unsigned(), r.h.cast_unsigned()).unwrap();
+                    let (bars, _) = surface(&mut pm, state, Some(&font), label, Rgba(1, 2, 3, 255));
+                    bars.unwrap().x0.to_bits()
+                })
+                .collect();
+            assert!(starts.windows(2).all(|w| w[0] == w[1]), "{starts:?}");
+        }
     }
 }

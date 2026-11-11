@@ -1,6 +1,7 @@
 // Every vendored icon by name (see ../icons/SOURCE.md): Phosphor 2.1.1, Bold weight, one drawing
 // on a 256 grid scaled to any box. Pages and components never write icon paths. The `-16`, `-24`
-// and `-12` names of the earlier set stay as aliases of the same file so pages keep compiling;
+// and `-12` names of the earlier set stay as aliases of the same file so pages keep compiling (and
+// `path`, `redo`, `open-16` and the like until the wave B pages move to the names of DS section 24);
 // `-filled` is Phosphor's Fill weight, only for a selected item's glyph (DS-19.7). Icons keep
 // their own fill (currentColor, black); users set `colorize`.
 export global Icons {
@@ -32,6 +33,45 @@ export global Icons {
     out property <image> person-voice: @image-url("../icons/user-sound-bold.svg");
     out property <image> plug-connected: @image-url("../icons/plugs-connected-bold.svg");
     out property <image> sound-wave-circle: @image-url("../icons/waveform-bold.svg");
+    // Icon semantics (DESIGN-SYSTEM section 24): one constant per meaning, the only names a page
+    // uses for an action. A meaning never takes another glyph and a glyph never carries another
+    // meaning; nouns (rail and row icons) are not here and never go on a button (DS-7.9).
+    // copy to the clipboard (the clipboard glyph stays for the Paste mode tile only)
+    out property <image> copy: @image-url("../icons/copy-bold.svg");
+    // choose a folder or a file in a dialog
+    out property <image> browse-folder: @image-url("../icons/folder-bold.svg");
+    out property <image> browse-file: @image-url("../icons/file-bold.svg");
+    // open a file or a link in another app
+    out property <image> open-external: @image-url("../icons/arrow-square-out-bold.svg");
+    // retry, transcribe again
+    out property <image> retry: @image-url("../icons/arrow-clockwise-bold.svg");
+    // scan for installed apps, scan again: never `search` or `retry`
+    out property <image> scan: @image-url("../icons/scan-bold.svg");
+    // revert, restore the old version
+    out property <image> revert: @image-url("../icons/arrow-counter-clockwise-bold.svg");
+    out property <image> record: @image-url("../icons/record-bold.svg");
+    out property <image> edit: @image-url("../icons/pencil-simple-bold.svg");
+    // the SearchField's own glyph only, never on a button
+    out property <image> search: @image-url("../icons/magnifying-glass-bold.svg");
+    // close a popup, clear a field
+    out property <image> close: @image-url("../icons/x-bold.svg");
+    // error, invalid value; done
+    out property <image> error: @image-url("../icons/x-circle-bold.svg");
+    out property <image> done: @image-url("../icons/check-circle-bold.svg");
+    out property <image> download: @image-url("../icons/download-simple-bold.svg");
+    out property <image> preview: @image-url("../icons/eye-bold.svg");
+    // "becomes": current to new
+    out property <image> becomes: @image-url("../icons/arrow-right-bold.svg");
+    // model classes: no two classes share a glyph
+    out property <image> model-accurate: @image-url("../icons/brain-bold.svg");
+    out property <image> model-fast: @image-url("../icons/lightning-bold.svg");
+    out property <image> model-language: @image-url("../icons/translate-bold.svg");
+    out property <image> model-small: @image-url("../icons/feather-bold.svg");
+    // own model file: a folder, as the owner asked
+    out property <image> model-own: @image-url("../icons/folder-user-bold.svg");
+    // always replace (History selection), add to dictionary
+    out property <image> replace: @image-url("../icons/swap-bold.svg");
+    out property <image> dictionary: @image-url("../icons/book-open-text-bold.svg");
     // Everything else, by meaning. One glyph per meaning (DS-19.6): `folder-open` (and its old
     // names) for every open-folder action, `caret-down`/`dots-three` for "more".
     out property <image> add-16: @image-url("../icons/plus-bold.svg");

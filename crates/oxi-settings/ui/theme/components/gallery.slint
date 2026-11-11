@@ -58,10 +58,10 @@ export component CardGrid {
     // own rule and width: rows at full width that overflow it still overflow once narrowed.
     property <bool> overflows: list.overflow-for(ceil(root.tiles.length / root.fit(root.width)) * root.row-height);
     property <length> usable: root.width - (root.overflows ? Theme.scrollbar-gutter : 0);
-    // Never more columns than tiles: a short gallery stretches its tiles over the row instead of
-    // leaving empty columns that cut every title (t21b).
+    // Never more columns than tiles, so a short gallery has no empty columns that cut every title
+    // (t21b); the cells share the width up to `tile-max-width`, then pack left (DS-15.2).
     property <int> cols: min(root.fit(root.usable), max(1, root.tiles.length));
-    property <length> cell: (root.usable - (root.cols - 1) * root.gap) / root.cols;
+    property <length> cell: min(Theme.tile-max-width, (root.usable - (root.cols - 1) * root.gap) / root.cols);
     property <int> rows: ceil(root.tiles.length / root.cols);
     property <int> raw-cursor;
     property <bool> key-focus;

@@ -1220,8 +1220,9 @@ fn update_confirm_takes_the_focus_and_gives_it_back() {
         }
     };
     // The rail, the sub-tabs, the theme tiles, the "i" and the box of App language, Start at
-    // sign-in, the "i" of Check for updates and its switch.
-    for _ in 0..8 {
+    // sign-in, the swatch strip and the hex field of the Accent row (DS-20.7), the "i" of Check for
+    // updates and its switch.
+    for _ in 0..10 {
         press(&window, Key::Tab);
     }
     space();

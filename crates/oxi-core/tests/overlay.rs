@@ -2,9 +2,9 @@ use oxi_core::audio::Level;
 use oxi_core::config::{Overlay, OverlayPosition as P};
 use oxi_core::machine::{Notice, OverlayState, Phase};
 use oxi_core::overlay::{
-    CARD_RADIUS, CLIP_HOLD, Icon, LOCK_HINT, MARGIN_DIP, METER_HZ, Meter, PILL_EM, PILL_GAP,
-    PILL_H_DIP, PILL_ICON, PILL_PAD, PILL_W_DIP, Quns, RecClock, Rect, SWEEP, label_x, look,
-    palette, pill_label, place, progress_span, visible,
+    CARD_RADIUS, Icon, LOCK_HINT, MARGIN_DIP, METER_HZ, Meter, OVERLOAD_HOLD, PILL_EM, PILL_GAP,
+    PILL_H_DIP, PILL_ICON, PILL_PAD, PILL_W_DIP, Quns, RecClock, Rect, SWEEP, TOO_LOUD,
+    label_variants, label_x, look, palette, pill_label, place, progress_span, visible,
 };
 use oxi_core::strings;
 use oxi_core::types::Millis;
@@ -179,15 +179,18 @@ fn meter_keeps_30_hz_when_polled_every_32_ms() {
 }
 
 #[test]
-fn meter_clipping_on_then_off_after_500_ms() {
+fn meter_clipping_is_overload_not_one_hot_sample() {
     let mut m = Meter::new(4, 0.0);
     assert!(!m.clipping(Millis(0)));
-    m.push(level(0.98, 0.5), Millis(100));
+    m.push(level(0.88, 0.5), Millis(100));
     assert!(!m.clipping(Millis(100)));
     m.push(level(1.0, 0.5), Millis(200));
-    assert!(m.clipping(Millis(200)));
-    assert!(m.clipping(Millis(200) + CLIP_HOLD - Millis(1)));
-    assert!(!m.clipping(Millis(200) + CLIP_HOLD));
+    assert!(!m.clipping(Millis(200)), "one hot frame is not overload");
+    m.push(level(1.0, 0.5), Millis(233));
+    m.push(level(1.0, 0.5), Millis(266));
+    assert!(m.clipping(Millis(266)));
+    assert!(m.clipping(Millis(266) + OVERLOAD_HOLD - Millis(1)));
+    assert!(!m.clipping(Millis(266) + OVERLOAD_HOLD));
 }
 
 #[test]
@@ -253,13 +256,6 @@ fn every_state_has_a_look_and_every_phase_a_tooltip() {
     });
     assert_eq!(locked_ending.icon, Icon::Lock);
     assert_eq!(locked_ending.label, "Ending soon");
-    // Clipping must be visible against the normal meter colour.
-    let (a, b) = (palette::RECORDING, palette::CLIP);
-    let dist = [(a.0, b.0), (a.1, b.1), (a.2, b.2)]
-        .map(|(x, y)| u32::from(x.abs_diff(y)))
-        .iter()
-        .sum::<u32>();
-    assert!(dist >= 300, "meter and clip colours too close: {dist}");
     let hidden = look(OverlayState::Hidden);
     assert_eq!(
         (hidden.label, hidden.icon, hidden.meter),
@@ -469,4 +465,56 @@ fn a_locked_recording_says_how_to_stop_then_shows_its_length() {
         label(rec(true, false), None, c, 150_000 + LOCK_HINT.0),
         "0:03"
     );
+}
+
+/// The wave box is placed after the widest text the label can become, so it never moves.
+#[test]
+fn the_label_slot_covers_the_warning_and_the_clock() {
+    let rec = OverlayState::Recording {
+        locked: false,
+        ending_soon: false,
+    };
+    let v = label_variants(rec);
+    assert!(v.contains(&TOO_LOUD) && v.contains(&strings::overlay_label(rec)));
+    let mut clock = RecClock::default();
+    let locked = OverlayState::Recording {
+        locked: true,
+        ending_soon: false,
+    };
+    clock.see(locked, Millis(0));
+    let mut out = String::new();
+    pill_label(
+        &mut out,
+        locked,
+        None,
+        clock,
+        Millis(LOCK_HINT.0 + 59 * 60_000),
+    );
+    assert!(out.len() <= v[5].len(), "{out} fits the clock slot");
+}
+
+/// Every recording state gets the same set, so the wave box is the same in all of them.
+#[test]
+fn the_label_slot_is_the_same_in_every_recording_state() {
+    let set = |locked, ending_soon| {
+        let mut v = label_variants(OverlayState::Recording {
+            locked,
+            ending_soon,
+        });
+        v.sort_unstable();
+        v
+    };
+    let first = set(false, false);
+    for (l, e) in [(true, false), (true, true), (false, true)] {
+        assert_eq!(set(l, e), first);
+    }
+    for s in [
+        "Recording",
+        "Press to stop",
+        "Ending soon",
+        TOO_LOUD,
+        "00:00",
+    ] {
+        assert!(first.contains(&s), "{s}");
+    }
 }

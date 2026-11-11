@@ -3,6 +3,21 @@
 // colour scheme the window maps system/dark/light onto.
 import { Palette } from "std-widgets.slint";
 
+// The colours one seed gives in one theme (DESIGN-SYSTEM section 20). The settings window sets the
+// derived values from Rust (`set_accent`); nothing in `ui/` computes a colour.
+export struct AccentSet {
+    accent: color,
+    hover: color,
+    pressed: color,
+    on-accent: color,
+    text: color,
+    tint: color,
+    heat-1: color,
+    heat-2: color,
+    heat-3: color,
+    heat-4: color,
+}
+
 // Window-wide state every control reads.
 export global Shell {
     // The config cannot be written (newer version, or a parse error until Reset): controls go grey.
@@ -10,6 +25,8 @@ export global Shell {
     // Width of the page column (cards included), set by the window: a Row sizes its control
     // column from it, not from its own text, so controls start at one x in every card.
     in-out property <length> page-width: 880px;
+    // Height of the window, set by it: a popup flips above its field when there is no room below.
+    in-out property <length> window-height: 860px;
     // The one tooltip of a control that is off because of `locked`.
     out property <string> locked-tip: @tr("The config is read-only");
     // Windows "Animation effects" is off (SPI_GETCLIENTAREAANIMATION): every `Theme.motion-*`
@@ -60,16 +77,26 @@ export global Theme {
     out property <length> tile-gap: 8px;
     out property <length> keycap-gap: 4px;
     out property <length> control-height: 32px;
+    // The right column of every row (DS-3): two steps, never fluid. `control-column-min/-max` are the
+    // old names, kept so pages compile; read `control-column`.
+    out property <length> control-column: Shell.page-width >= 720px ? 360px : 240px;
     out property <length> control-column-min: 240px;
     out property <length> control-column-max: 360px;
+    // The narrow slot beside a main control (NumberField, Test, Browse) and the rest of the column.
+    out property <length> control-side: 88px;
+    out property <length> control-main: self.control-column - self.control-gap - self.control-side;
+    // A settings row: a control plus 8 above and below; with a description line (DS-1.5).
+    out property <length> row-height: 48px;
+    out property <length> row-height-tall: 56px;
+    out property <length> card-padding-rows: 4px;
     // Icon boxes: the 20 px master (rows, banners, rail), the 16 px one (buttons, fields, tips)
     // and the 32 px one (tiles, empty states).
     out property <length> icon-size: 20px;
     out property <length> icon-size-small: 16px;
     out property <length> icon-size-large: 32px;
     // 1.1b Component geometry (DS-6 to DS-18): one job each, so components hold no px.
-    out property <length> button-min-width: 88px;
-    out property <length> number-field-width: 80px;
+    out property <length> button-min-width: self.control-side;
+    out property <length> number-field-width: self.control-side;
     // A field's own clear "x" or chevron: its square hover box.
     out property <length> adornment-size: 24px;
     out property <length> switch-track-width: 40px;
@@ -100,20 +127,31 @@ export global Theme {
     out property <length> tab-padding-top: 8px;
     out property <length> tab-padding-bottom: 12px;
     out property <length> tab-count-gap: 6px;
-    out property <length> tab-underline: 3px;
+    out property <length> tab-underline: 2px;
+    // Label to label in a tab bar (DS-14).
+    out property <length> tab-gap: 24px;
     // Meter: track height, bar width and pitch, the least width.
-    out property <length> meter-height: 24px;
+    out property <length> meter-height: self.control-height;
+    // The Meter's overload line across its top edge (DS-21.3).
+    out property <length> meter-clip-line: 2px;
+    // The kept-draft dot on an icon button (DS-28.3).
+    out property <length> draft-dot-size: 6px;
     out property <length> meter-bar: 3px;
     out property <length> meter-pitch: 5px;
     out property <length> meter-min-width: 120px;
     out property <length> progress-min-width: 80px;
+    // Progress (DS-26): the slot that holds "100 %", the indeterminate segment (share of the rail)
+    // and one sweep of it.
+    out property <length> progress-label-width: 40px;
+    out property <float> progress-sweep: 0.3;
+    out property <duration> progress-sweep-time: 1200ms;
     // The widest a tooltip line runs before it wraps.
     out property <length> tooltip-max-width: 320px;
     // Banner: least width, and the width under which its text goes above the buttons.
     out property <length> banner-min-width: 280px;
     out property <length> banner-narrow: 560px;
     // A row's least height without and with a description.
-    out property <length> row-min-height: 24px;
+    out property <length> row-min-height: self.control-height;
     out property <length> keycap-width: 44px;
     // The fallback min width of a Combo outside a Row (the Per-app mode column sets its own).
     out property <length> combo-min-width: 160px;
@@ -121,10 +159,13 @@ export global Theme {
     out property <int> combo-visible-rows: 6;
     // Scrollbar (DS-18): thumb width and the gutter content leaves while it overflows.
     out property <length> scrollbar-width: 6px;
+    // `thin`: inside a control (Combo list, SearchPopup, TextArea).
+    out property <length> scrollbar-width-thin: 4px;
     out property <length> scrollbar-gutter: 12px;
     out property <length> scrollbar-min-thumb: 24px;
     // Card grid (DS-15): the narrowest column.
     out property <length> tile-min-width: 160px;
+    out property <length> tile-max-width: 320px;
     // Home heatmap and trend defaults (the page passes its own).
     out property <length> heat-cell-default: 12px;
     out property <length> heat-gap: 3px;
@@ -156,8 +197,12 @@ export global Theme {
     out property <length> tile-height: 104px;
     out property <length> tile-height-short: 76px;
     out property <length> system-tight-height: 480px;
-    // The Overlay position tiles: two steps under a control's height.
-    out property <length> position-tile-height: self.control-height - self.space-2;
+    // The Overlay position tiles (DS-28.4): 112 x 32 in the 360 column, 12 apart across, `tile-gap` down.
+    out property <length> position-tile-width: 112px;
+    out property <length> position-tile-height: self.control-height;
+    out property <length> position-tile-gap: self.space-3;
+    // The Overlay position row (DS-1.5, DS-28.4): the 72 px grid of two 32 px rows plus 8, and 16.
+    out property <length> position-row-height: 88px;
     // A model card's fixed columns: the widest badge ("Not downloaded") and button ("Download").
     out property <length> model-badge-column: 108px;
     out property <length> model-action-column: 112px;
@@ -176,7 +221,7 @@ export global Theme {
     // to a year), the cap for a history shorter than a year, and the cap in a low window. A full
     // year (`heat-year-weeks`, oxi-core's HEAT_WEEKS) has no cap: it fills the card at any width.
     out property <length> heat-cell-fit: 18px;
-    out property <length> heat-cell-max: 30px;
+    out property <length> heat-cell-max: 36px;
     out property <int> heat-year-weeks: 53;
     out property <length> heat-cell-tight: 14px;
     out property <length> capture-keycap-height: 40px;
@@ -248,26 +293,44 @@ export global Theme {
     out property <color> text-primary: dark ? #F4F2EE : #1C1B19;
     out property <color> text-secondary: dark ? #B5B1AA : #5C5850;
     out property <color> text-disabled: dark ? #75726D : #A39F97;
-    // The one keyboard-focus ring (DS-4): the ink softened to the secondary text, never white or
-    // black; 3:1 or more on every surface. `focus-outer` is the old name app.slint's rail still
-    // reads (its task moves it to `focus-ring`); `focus-inner` draws nothing.
-    out property <color> focus-ring: dark ? #B5B1AA : #5C5850;
+    // The soft surface (DS-5): the rest fill of a soft Button and an IconButton, so the hit area
+    // is seen. Pressed is a step under rest.
+    out property <color> bg-soft: dark ? #FFFFFF14 : #1C1B190F;
+    out property <color> bg-soft-hover: dark ? #FFFFFF1F : #1C1B191A;
+    out property <color> bg-soft-pressed: dark ? #FFFFFF0F : #1C1B1907;
+
+    // 1.4b The accent (DS-20): the user's seed, derived per theme in Rust and set here at run time
+    // (`set_accent` in lib.rs). The defaults are the brand Red (seed #D93A3F) and the first test
+    // vectors of DS-20; an invalid or missing config value lands on them. Never `Palette.accent`
+    // (UI rule 15: that name is the Windows accent).
+    in-out property <AccentSet> accent-dark: {
+        accent: #D93A3F, hover: #C33439, pressed: #AE2E32, on-accent: #FFFFFF, text: #E47175, tint: #3D2324,
+        heat-1: #4E2627, heat-2: #732B2D, heat-3: #A13235, heat-4: #D93A3F,
+    };
+    in-out property <AccentSet> accent-light: {
+        accent: #D93A3F, hover: #C33439, pressed: #AE2E32, on-accent: #FFFFFF, text: #BF3337, tint: #F8E4E2,
+        heat-1: #F3CBCA, heat-2: #ECA4A5, heat-3: #E47477, heat-4: #D93A3F,
+    };
+    out property <color> accent: dark ? accent-dark.accent : accent-light.accent;
+    out property <color> accent-hover: dark ? accent-dark.hover : accent-light.hover;
+    out property <color> accent-pressed: dark ? accent-dark.pressed : accent-light.pressed;
+    out property <color> on-accent: dark ? accent-dark.on-accent : accent-light.on-accent;
+    out property <color> accent-text: dark ? accent-dark.text : accent-light.text;
+    // Selected fills: the tint, opaque, so `accent-text` and the primary inks keep 4.5:1 on it.
+    out property <color> accent-tint: dark ? accent-dark.tint : accent-light.tint;
+    out property <color> accent-badge: self.accent-tint;
+    // The heat scale of Home: level 0 is `bg-inset`, levels 1 to 4 the accent mixes.
+    out property <color> heat-1: dark ? accent-dark.heat-1 : accent-light.heat-1;
+    out property <color> heat-2: dark ? accent-dark.heat-2 : accent-light.heat-2;
+    out property <color> heat-3: dark ? accent-dark.heat-3 : accent-light.heat-3;
+    out property <color> heat-4: dark ? accent-dark.heat-4 : accent-light.heat-4;
+    // The one keyboard-focus ring (DS-4): the accent, 3:1 or more on every surface. `focus-outer` is
+    // the old name; `focus-inner` draws nothing. Both go when no page reads them.
+    out property <color> focus-ring: self.accent;
     out property <color> focus-outer: self.focus-ring;
     out property <color> focus-inner: transparent;
-
-    // Accent: the ink itself (DS-19.1), never the Windows accent. Hover and pressed step toward
-    // the paper; on-accent is the paper.
-    out property <color> accent: dark ? #F4F2EE : #1C1B19;
-    out property <color> accent-hover: dark ? #FFFEFA : #34322E;
-    out property <color> accent-pressed: dark ? #D9D6D0 : #4A4740;
-    out property <color> on-accent: dark ? #161616 : #FCFBF8;
-    out property <color> accent-text: dark ? #F4F2EE : #1C1B19;
-    // Selected fills: neutral steps, opaque, so accent-text keeps AA on a card and a hovered card.
-    // Concept C has one neutral step for both (its "badge").
-    out property <color> accent-badge: dark ? #2E2E2E : #ECE9E2;
-    out property <color> accent-tint: self.accent-badge;
-    // Red means "recording now" only (DS-19.2): the record dot and live states. Errors use error-*.
-    out property <color> recording: #E5484D;
+    // Deprecated (DS-21.5: the token is deleted when no page reads it): recording shows the accent.
+    out property <color> recording: self.accent;
 
     // Status.
     out property <color> error-text: dark ? #FF99A4 : #B9291A;
