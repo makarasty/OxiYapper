@@ -100,6 +100,7 @@ mod tests {
             model: String::new(),
             language: String::new(),
             text: Spoken(text.into()),
+            held: Vec::new(),
         };
         assert_eq!(
             history_label(&item(" hello ")),

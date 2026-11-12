@@ -5,22 +5,26 @@
 //! never reach a log: only lengths, kinds and model names do.
 
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use oxi_core::audio::{self, AudioError};
-use oxi_core::config::{Advanced, Audio, Config};
+use oxi_core::config::{Advanced, Audio, Config, PasteMode};
 use oxi_core::device::DeviceChoice;
-use oxi_core::ipc::{DeleteResult, Push, TestFailure, TestOutcome};
+use oxi_core::ipc::{
+    DeleteResult, Push, TestFailure, TestOutcome, Words, WordsFailure, WordsResult,
+};
 use oxi_core::machine::{
     EngineWarning, Event, JobId, MachineConfig, ModelFailure, ModelIdentity, Phase, PhaseCell,
 };
 use oxi_core::models;
 use oxi_core::overlay::{learn, transcribe_est};
+use oxi_core::paste::Profile;
 use oxi_core::paths::Layout;
 use oxi_core::strings;
-use oxi_core::text::Outcome;
+use oxi_core::text::{Outcome, TextOptions};
 use oxi_core::tuning::{self, SettingsSet};
 use oxi_core::types::Language;
 use oxi_whisper::{Cancel, Engine, LoadInfo, Transcript};
@@ -29,6 +33,18 @@ use super::cmd::{Inbox, TestJob, WhisperCmd};
 use super::io;
 use super::ipc::Pushes;
 use crate::pipeline::{self, TextAssets};
+
+/// A dictation of at least this long (ms) with fewer characters per second than [`SPARSE_CPS`]
+/// logs a warning: whisper may have dropped most of it (counts only).
+const SPARSE_MIN_MS: u64 = 5000;
+const SPARSE_CPS: u64 = 5;
+
+/// A finished dictation: the text, whisper's words, the parts held back.
+type Transcribed = (
+    String,
+    Vec<oxi_core::history::Word>,
+    Vec<oxi_core::history::HeldPart>,
+);
 
 /// What a run reports and obeys: whisper's progress, and a check that stops it.
 struct Hooks<'a> {
@@ -41,6 +57,8 @@ trait Recognizer {
     fn info(&self) -> &LoadInfo;
     /// Takes the per-run engine parameters for the next run.
     fn set_advanced(&mut self, _: &Advanced) {}
+    /// Makes the next runs give word times (whisper's token timestamps), or stops that.
+    fn set_token_times(&mut self, _: bool) {}
     fn transcribe(
         &mut self,
         samples: &[f32],
@@ -85,6 +103,10 @@ impl Recognizer for Engine {
 
     fn set_advanced(&mut self, adv: &Advanced) {
         Engine::set_advanced(self, adv);
+    }
+
+    fn set_token_times(&mut self, on: bool) {
+        Engine::set_token_times(self, on);
     }
 
     fn transcribe(
@@ -160,6 +182,29 @@ struct Worker<R, L> {
     /// How much slower (or faster) than the first-guess fit this machine ran the last tests,
     /// for the estimate a test run starts its bar with.
     test_speed: f32,
+    /// The run in hand is a word-times run ([`Worker::word_times`]); a dictation never is.
+    want_times: bool,
+    /// The model the next `Preload` loads (`UseModel`, from the app in front at key-down).
+    next_model: Option<String>,
+    /// What the dictation in hand uses of the user's text files (its profile).
+    uses: Uses,
+    /// App or language models that failed to load since the last `Config`: the main model
+    /// stands in without trying them again at every dictation (d04-fix 1).
+    failed: Vec<String>,
+}
+
+/// Which of the user's text files a dictation uses; a test uses both.
+#[derive(Debug, Clone, Copy)]
+struct Uses {
+    dictionary: bool,
+    replacements: bool,
+}
+
+impl Uses {
+    const ALL: Self = Self {
+        dictionary: true,
+        replacements: true,
+    };
 }
 
 impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<R>> Worker<R, L> {
@@ -181,6 +226,10 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<
             reported: None,
             tap: Tap::None,
             test_speed: 1.0,
+            want_times: false,
+            next_model: None,
+            uses: Uses::ALL,
+            failed: Vec::new(),
         }
     }
 
@@ -204,9 +253,35 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<
 
     fn handle(&mut self, cmd: WhisperCmd) {
         match cmd {
+            WhisperCmd::UseModel(id) => {
+                self.adopt_test_model();
+                // A model not on disk never drops the loaded one: the job falls back to it.
+                let id = self.usable(id);
+                if self.loaded.is_some() && self.holds_other(&id) {
+                    // Another model is in memory: load this one now, while the user speaks
+                    // (arch-plan 9.2). The machine counts a model as loaded already; a failure
+                    // is the dictation's, told at its transcription.
+                    if self.on_model(&id, |w| w.ensure_loaded(None)).is_err() {
+                        self.remember_failed(&id);
+                    }
+                } else {
+                    self.next_model = Some(id);
+                }
+            }
             WhisperCmd::Preload => {
                 self.adopt_test_model();
-                let event = match self.ensure_loaded(None) {
+                let id = self
+                    .next_model
+                    .take()
+                    .map_or_else(|| self.cfg.model.id.clone(), |id| self.usable(id));
+                let mut loaded = self.on_model(&id, |w| w.ensure_loaded(None));
+                if loaded.is_err() && id != self.cfg.model.id {
+                    // An app's model that cannot load is that app's problem: the machine counts
+                    // the configured model, and the job tells the fallback (`transcribe`).
+                    self.remember_failed(&id);
+                    loaded = self.ensure_loaded(None);
+                }
+                let event = match loaded {
                     Ok(()) => Event::ModelLoaded,
                     Err(failure) => Event::ModelFailed(failure),
                 };
@@ -225,6 +300,11 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<
                     samples,
                     reply,
                 } = job;
+                if let Some(record) = reply.words_for().map(str::to_owned) {
+                    // The player's word times: its own answer, no `TestResult`.
+                    self.words_run(id, &record, &samples, &reply);
+                    return;
+                }
                 let outcome = if self.phase.load() == Phase::Idle {
                     self.tap = Tap::Test {
                         id,
@@ -246,30 +326,11 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<
                     self.unload();
                 }
             }
-            WhisperCmd::Transcribe { job, samples } => {
-                self.tap = Tap::Job(job);
-                let started = Instant::now();
-                let text = self.transcribe(&samples);
-                self.tap = Tap::None;
-                // Lengths only, never the text (AGENTS.md rule 5).
-                let audio_ms = oxi_core::stats::audio_length(samples.len()).0;
-                let took_ms = started.elapsed().as_millis();
-                match &text {
-                    Ok(Some(t)) => {
-                        let chars = t.chars().count();
-                        tracing::info!(?job, audio_ms, took_ms, chars, "transcription done");
-                    }
-                    Ok(None) => tracing::info!(?job, took_ms, "transcription failed or cut"),
-                    Err(why) => tracing::info!(?job, ?why, "transcription had no model"),
-                }
-                let text = text.unwrap_or_else(|failure| {
-                    // First, so the machine leaves Loaded before this job ends: the jobs queued
-                    // behind it are not dispatched to a model that is not there, one notice.
-                    let _ = self.inbox.send(Inbox::Event(Event::ModelFailed(failure)));
-                    None
-                });
-                let _ = self.inbox.send(Inbox::Transcribed { job, text });
-            }
+            WhisperCmd::Transcribe {
+                job,
+                samples,
+                profile,
+            } => self.dictate(job, &samples, &profile),
             WhisperCmd::Config(cfg) => {
                 if MachineConfig::from(&*cfg).model != self.identity() {
                     self.cpu_reason = None;
@@ -290,9 +351,46 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<
                 }
                 self.cfg = *cfg;
                 self.assets = TextAssets::load(&self.layout);
+                // A new config may fix a model (re-downloaded, another device): try them again.
+                self.failed.clear();
             }
             WhisperCmd::ReloadAssets => self.assets = TextAssets::load(&self.layout),
         }
+    }
+
+    /// One dictation job, as its profile says; answers `Inbox::Transcribed`.
+    fn dictate(&mut self, job: JobId, samples: &[f32], profile: &Profile) {
+        self.tap = Tap::Job(job);
+        let started = Instant::now();
+        let text = self.transcribe(samples, profile);
+        self.tap = Tap::None;
+        // Lengths only, never the text (AGENTS.md rule 5).
+        let audio_ms = oxi_core::stats::audio_length(samples.len()).0;
+        let took_ms = started.elapsed().as_millis();
+        match &text {
+            Ok(Some((t, _, _))) => {
+                let chars = t.chars().count();
+                tracing::info!(?job, audio_ms, took_ms, chars, "transcription done");
+            }
+            Ok(None) => tracing::info!(?job, took_ms, "transcription failed or cut"),
+            Err(why) => tracing::info!(?job, ?why, "transcription had no model"),
+        }
+        let (text, words, held) = text
+            .unwrap_or_else(|failure| {
+                // First, so the machine leaves Loaded before this job ends: the jobs queued
+                // behind it are not dispatched to a model that is not there, one notice.
+                let _ = self.inbox.send(Inbox::Event(Event::ModelFailed(failure)));
+                None
+            })
+            .map_or((None, None, None), |(t, w, h)| (Some(t), Some(w), Some(h)));
+        let words = words.unwrap_or_default();
+        let held = held.unwrap_or_default();
+        let _ = self.inbox.send(Inbox::Transcribed {
+            job,
+            text,
+            words,
+            held,
+        });
     }
 
     /// Deletes the files of registry model `id`. A model this worker holds is unloaded first,
@@ -306,6 +404,8 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<
         if self.loaded_for.as_ref().is_some_and(|i| i.file == id) {
             self.unload();
         }
+        // A deleted file is not a failed one: the next download starts clean.
+        self.failed.retain(|f| f != id);
         let result = io::delete_model(&self.layout.models_dir(), entry);
         if matches!(result, DeleteResult::Done { .. }) && self.cfg.model.id == id {
             // The machine still counts the model as loaded: without this a dictation records,
@@ -433,14 +533,118 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<
         let transcript = self.recognise(clip);
         let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         match transcript {
-            Ok(Some(transcript)) => TestOutcome::Heard {
-                text: self.final_text(&transcript, false),
-                ms,
-            },
+            Ok(Some(transcript)) => {
+                // A Transcribe again keeps these words with its text (`HistorySetText`).
+                let again = matches!(&self.tap, Tap::Test { reply, .. } if reply.is_from_history());
+                if let Tap::Test { id, reply } = &self.tap
+                    && again
+                {
+                    reply.send(Push::HistoryRunWords {
+                        id: *id,
+                        words: Words(super::history::words_of(&transcript)),
+                    });
+                }
+                // Transcribe again is the user asking for this clip: the hallucination checks
+                // take nothing out of it.
+                let mut opts = self.text_options(false, clip.len());
+                opts.again = again;
+                TestOutcome::Heard {
+                    text: self.final_text(&transcript, &opts).0,
+                    ms,
+                }
+            }
             Ok(None) => TestOutcome::Failed {
                 why: TestFailure::Failed,
             },
             Err(failure) => model_failed(failure),
+        }
+    }
+
+    /// The word-times run of History record `record` (`clip` is its audio): the times go into the
+    /// record, and the window gets the words with them, or why it gets none.
+    fn words_run(&mut self, run: u32, record: &str, clip: &[f32], reply: &Pushes) {
+        // As a test run: a model loaded for it is a test's, dropped after the idle limit (arch-plan
+        // 8.3); a model a dictation or a test left loaded keeps what it was.
+        if self.loaded_for != Some(self.identity()) {
+            self.loaded = None;
+        }
+        self.test_loaded |= self.loaded.is_none();
+        self.tap = Tap::Test {
+            id: run,
+            reply: reply.clone(),
+        };
+        let ran = if reply.words_stopped() {
+            Err(TestFailure::Busy)
+        } else {
+            self.word_times(clip)
+        };
+        self.tap = Tap::None;
+        self.last_test = Instant::now();
+        let unavailable = |why| WordsResult::Unavailable { why };
+        let result = match ran {
+            Ok(transcript) => self.store_words(record, &transcript),
+            Err(TestFailure::Busy) => WordsResult::Busy,
+            Err(TestFailure::ModelMissing | TestFailure::ModelBad) => {
+                unavailable(WordsFailure::ModelMissing)
+            }
+            Err(TestFailure::NoAudio) => unavailable(WordsFailure::NoAudio),
+            Err(TestFailure::Failed) => unavailable(WordsFailure::Failed),
+        };
+        reply.send(Push::HistoryWords {
+            run,
+            id: record.to_owned(),
+            result,
+        });
+    }
+
+    /// Writes the timed words of `transcript` into record `record`; no times is a failure.
+    fn store_words(&self, record: &str, transcript: &Transcript) -> WordsResult {
+        let words = super::history::words_of(transcript);
+        let failed = WordsResult::Unavailable {
+            why: WordsFailure::Failed,
+        };
+        if !words.iter().any(|w| w.t0.is_some()) {
+            return failed;
+        }
+        let dir = oxi_core::history::folder(&self.cfg.history, &self.layout.history_dir());
+        let how = super::history::timings_of(oxi_whisper::Timing::Tokens, &self.cfg.model.id);
+        match super::history::store_timed_words(&dir, record, words.clone(), how) {
+            Ok(()) => WordsResult::Ready {
+                words: Words(words),
+                timed: true,
+            },
+            Err(e) => {
+                tracing::warn!(kind = ?e.kind(), "word times not stored");
+                failed
+            }
+        }
+    }
+
+    /// Word times of `clip`, a stored (already processed) recording, from token timestamps of
+    /// the configured model, in the slot of a test: the live engine, flash attention as it is.
+    /// The times are on for this run only, so a dictation after it never pays for them. A
+    /// dictation goes first (arch-plan 8.3): one under way, or one that starts during the
+    /// run (which then stops), answers `Busy`.
+    fn word_times(&mut self, clip: &[f32]) -> Result<Transcript, TestFailure> {
+        if self.phase.load() != Phase::Idle {
+            return Err(TestFailure::Busy);
+        }
+        self.want_times = true;
+        let ran = self.ensure_loaded(None).map(|()| self.recognise(clip));
+        self.want_times = false;
+        if let Some(engine) = self.loaded.as_mut() {
+            engine.set_token_times(false);
+        }
+        let stopped = matches!(&self.tap, Tap::Test { reply, .. } if reply.words_stopped());
+        match ran {
+            Ok(Ok(Some(transcript))) => Ok(transcript),
+            Ok(Ok(None)) if stopped || self.phase.load() != Phase::Idle => Err(TestFailure::Busy),
+            Ok(Ok(None)) => Err(TestFailure::Failed),
+            Ok(Err(failure)) | Err(failure) => Err(match failure {
+                ModelFailure::Missing => TestFailure::ModelMissing,
+                ModelFailure::Bad => TestFailure::ModelBad,
+                ModelFailure::OutOfMemory => TestFailure::Failed,
+            }),
         }
     }
 
@@ -527,13 +731,136 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<
         }
     }
 
-    /// `Ok(Some(""))` is nothing heard, `Ok(None)` a whisper failure, `Err` no model to run.
-    fn transcribe(&mut self, samples: &[f32]) -> Result<Option<String>, ModelFailure> {
+    /// Runs `f` with model `id` as the configured one: a model loaded for another file is
+    /// dropped first (the unload policy is the machine's and is not touched), and `id` is put
+    /// back after. What stays loaded is what `loaded_for` says.
+    fn on_model<T>(&mut self, id: &str, f: impl FnOnce(&mut Self) -> T) -> T {
+        if self.loaded.is_some() && self.holds_other(id) {
+            self.loaded = None;
+        }
+        let active = std::mem::replace(&mut self.cfg.model.id, id.to_owned());
+        let pin = self.cpu_reason.clone();
+        let out = f(self);
+        // A GPU failure of an app's model says nothing about the configured one: its CPU pin
+        // goes, like a test's (review d04 #2).
+        if active != id {
+            self.cpu_reason = pin;
+        }
+        self.cfg.model.id = active;
+        out
+    }
+
+    /// `id`, or the configured model when `id` is another model that is not on disk (no hash,
+    /// no load: a stamp and a file check). A rule or language entry naming a model that was
+    /// never downloaded must not stop dictation (review d04-profiles item 1).
+    fn usable(&self, id: String) -> String {
+        if id == self.cfg.model.id {
+            return id;
+        }
+        if self.failed.contains(&id) {
+            return self.cfg.model.id.clone();
+        }
+        let model = oxi_core::config::Model {
+            id: id.clone(),
+            ..self.cfg.model.clone()
+        };
+        let dir = self.layout.models_dir();
+        let on_disk = pipeline::resolve_model(&model, &dir).is_ok_and(|m| {
+            m.entry.is_none_or(|e| {
+                matches!(
+                    models::status(e, &dir),
+                    models::ModelStatus::Ready | models::ModelStatus::NeedsHash
+                )
+            })
+        });
+        if on_disk {
+            id
+        } else {
+            tracing::warn!(model = %id, main = %self.cfg.model.id, "app model not on disk, using the main model");
+            self.cfg.model.id.clone()
+        }
+    }
+
+    /// Model `id` (not the configured one) failed to load: [`Worker::usable`] skips it until
+    /// the next `Config`.
+    fn remember_failed(&mut self, id: &str) {
+        if id != self.cfg.model.id && !self.failed.iter().any(|f| f == id) {
+            self.failed.push(id.to_owned());
+        }
+    }
+
+    /// What is loaded is another file than model `id` would be.
+    fn holds_other(&mut self, id: &str) -> bool {
+        let active = std::mem::replace(&mut self.cfg.model.id, id.to_owned());
+        let file = self.identity().file;
+        self.cfg.model.id = active;
+        self.loaded_for.as_ref().is_some_and(|l| l.file != file)
+    }
+
+    /// Runs `f` as the dictation's `profile` says: `model`, its language, dictionary, replace
+    /// rules and pause punctuation stand in for the configured ones, and are put back after.
+    fn with_profile<T>(
+        &mut self,
+        profile: &Profile,
+        model: &str,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let language = std::mem::replace(&mut self.cfg.model.language, profile.language);
+        let pause = std::mem::replace(
+            &mut self.cfg.text.pause_punctuation,
+            profile.text.pause_punctuation,
+        );
+        self.uses = Uses {
+            dictionary: profile.dictionary,
+            replacements: profile.replacements,
+        };
+        let out = self.on_model(model, f);
+        self.uses = Uses::ALL;
+        self.cfg.text.pause_punctuation = pause;
+        self.cfg.model.language = language;
+        out
+    }
+
+    /// `Ok(Some(""))` is nothing heard, `Ok(None)` a whisper failure, `Err` no model to run. The
+    /// text comes with whisper's words and their confidence, and the parts the confidence filter
+    /// held back, for the history entry. A profile model that cannot be used gives way to the
+    /// configured one, and the machine hears of it (`Event::ModelFellBack`), never `ModelFailed`.
+    fn transcribe(
+        &mut self,
+        samples: &[f32],
+        profile: &Profile,
+    ) -> Result<Option<Transcribed>, ModelFailure> {
         self.adopt_test_model();
-        let trailing_space = self.cfg.paste.trailing_space;
-        Ok(self
-            .recognise(samples)?
-            .map(|t| self.final_text(&t, trailing_space)))
+        let main = self.cfg.model.id.clone();
+        let model = self.usable(profile.model.clone());
+        let run = |w: &mut Self| {
+            Ok(w.recognise(samples)?.map(|t| {
+                let mut opts = profile.text.clone();
+                opts.clip_ms = Some(oxi_core::stats::audio_length(samples.len()).0);
+                // A held part needs a history entry to live in. This config waits for idle, so
+                // an invention is always held: the coordinator drops it when no entry is written.
+                opts.can_hold = w.cfg.history.enabled;
+                opts.hold_invented = true;
+                let (text, held) = w.final_text(&t, &opts);
+                (text, super::history::words_of(&t), held)
+            }))
+        };
+        let mut out = self.with_profile(profile, &model, run);
+        let mut fell_back = model != profile.model;
+        if let Err(why) = &out
+            && model != main
+        {
+            tracing::warn!(model = %model, ?why, "app model failed to load, using the main model");
+            self.remember_failed(&model);
+            out = self.with_profile(profile, &main, run);
+            fell_back = true;
+        }
+        if fell_back {
+            let _ = self
+                .inbox
+                .send(Inbox::Event(Event::ModelFellBack(profile.model.clone())));
+        }
+        out
     }
 
     /// `Ok(None)` is a whisper failure, `Err` no model to run.
@@ -566,11 +893,64 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<
         Ok(Some(transcript))
     }
 
+    /// The `[text]` options for a clip of `samples`; nothing held (`can_hold` false).
+    fn text_options(&self, trailing_space: bool, samples: usize) -> TextOptions {
+        let mut opts = TextOptions::from_config(&self.cfg.text, trailing_space);
+        // A typed line break would send a message; the clipboard keeps it. A clipboard paste
+        // that ends up typed (an app rule, a clipboard that cannot be saved) turns it into a
+        // space in the paste worker (`paste::type_text`), never an Enter.
+        opts.newlines_allowed = self.cfg.paste.mode == PasteMode::Clipboard;
+        opts.clip_ms = Some(oxi_core::stats::audio_length(samples).0);
+        opts
+    }
+
     /// Empty when nothing is left to paste.
-    fn final_text(&self, transcript: &Transcript, trailing_space: bool) -> String {
-        match pipeline::finish(transcript, &self.assets, trailing_space) {
-            Outcome::Text(text) => text,
-            Outcome::NothingHeard => String::new(),
+    fn final_text(
+        &self,
+        transcript: &Transcript,
+        opts: &TextOptions,
+    ) -> (String, Vec<oxi_core::history::HeldPart>) {
+        let text = &self.cfg.text;
+        let audio_ms = opts.clip_ms.unwrap_or(0);
+        let bare;
+        let assets = if self.uses.replacements {
+            &self.assets
+        } else {
+            // No replace rules for this app: the same assets without them.
+            bare = TextAssets::default();
+            &bare
+        };
+        let done = pipeline::finish_with(transcript, assets, text, opts);
+        let chars = match &done.outcome {
+            Outcome::Text(t) => t.chars().count(),
+            Outcome::NothingHeard => 0,
+        };
+        // Counts only, never the text (AGENTS.md rule 5).
+        tracing::info!(
+            segments = transcript.segments.len(),
+            dropped_hallucination = done.dropped_hallucination,
+            dropped_implausible = done.dropped_implausible,
+            held = done.held.len(),
+            chars,
+            "text pipeline"
+        );
+        if audio_ms >= SPARSE_MIN_MS && (chars as u64) * 1000 < audio_ms * SPARSE_CPS {
+            tracing::warn!(audio_ms, chars, "sparse transcript");
+        }
+        let ms = |t: oxi_core::types::Millis| u32::try_from(t.0).unwrap_or(u32::MAX);
+        let held = done
+            .held
+            .iter()
+            .map(|h| oxi_core::history::HeldPart {
+                text: h.text.clone(),
+                t0: ms(h.t0),
+                t1: ms(h.t1),
+                why: h.why,
+            })
+            .collect();
+        match done.outcome {
+            Outcome::Text(text) => (text, held),
+            Outcome::NothingHeard => (String::new(), held),
         }
     }
 
@@ -605,15 +985,36 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<
                 });
             }
         };
-        // Every job cancelled leaves the phase Idle; a test only runs while it is Idle already.
+        // Every job cancelled leaves the phase Idle; a test only runs while it is Idle already. A
+        // timing run stops for a dictation (it leaves Idle) and when the window stops it.
         let is_job = matches!(self.tap, Tap::Job(_));
-        let cancel = move || is_job && phase.load() == Phase::Idle;
+        let timing = self.want_times;
+        let stop = match &tap {
+            Tap::Test { reply, .. } => reply.words_stop().cloned(),
+            _ => None,
+        };
+        let cancel = move || {
+            let idle = phase.load() == Phase::Idle;
+            let stopped = stop.as_ref().is_some_and(|s| s.load(Ordering::Acquire));
+            if is_job {
+                idle
+            } else {
+                timing && (!idle || stopped)
+            }
+        };
         let hooks = Hooks {
             progress: &mut progress,
             cancel: Some(&cancel),
         };
         engine.set_advanced(&self.cfg.model.advanced);
-        let prompt = tuning::prompt(&self.cfg.model.advanced, &self.assets.prompt);
+        // Pause punctuation reads the word times; they cost nothing while it is off.
+        engine.set_token_times(self.want_times || self.cfg.text.pause_punctuation);
+        let dictionary = if self.uses.dictionary {
+            self.assets.prompt.as_str()
+        } else {
+            ""
+        };
+        let prompt = tuning::prompt(&self.cfg.model.advanced, dictionary);
         let started = Instant::now();
         let transcript = engine.transcribe(samples, self.cfg.model.language, &prompt, hooks);
         if matches!(tap, Tap::Test { .. }) && transcript.is_ok() {
@@ -640,7 +1041,7 @@ mod tests {
 
     use super::*;
     use crate::daemon::ipc::Origin;
-    use crate::log::scratch::scratch_dir;
+    use crate::log::scratch::{fake_model, scratch_dir};
 
     /// What a fake load was asked for, and what its engine does.
     #[derive(Clone)]
@@ -652,6 +1053,10 @@ mod tests {
         calls: Rc<RefCell<Vec<DeviceChoice>>>,
         /// Loads on any device other than CPU fail.
         gpu_load_fails: bool,
+        /// Loads of this model file on any device other than CPU fail.
+        gpu_fails_on: Option<&'static str>,
+        /// Loads of this model file fail on every device.
+        fails_on: Option<&'static str>,
         /// Loads on CPU fail.
         cpu_load_fails: bool,
         /// Loads on CPU fail the way whisper says memory ran out.
@@ -666,6 +1071,10 @@ mod tests {
         no_gpu: bool,
         /// The samples every fake engine was handed, in order.
         heard: Rc<RefCell<Vec<Vec<f32>>>>,
+        /// A dictation starts (this phase leaves Idle) in the middle of every run.
+        overtake: Rc<RefCell<Option<PhaseCell>>>,
+        /// What every fake engine hears.
+        said: &'static str,
     }
 
     type Loader = Box<dyn FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<Fake>>;
@@ -676,11 +1085,18 @@ mod tests {
         info: LoadInfo,
         fail_run: bool,
         heard: Rc<RefCell<Vec<Vec<f32>>>>,
+        /// Word times are on.
+        times: bool,
+        overtake: Rc<RefCell<Option<PhaseCell>>>,
+        said: &'static str,
     }
 
     impl Recognizer for Fake {
         fn info(&self) -> &LoadInfo {
             &self.info
+        }
+        fn set_token_times(&mut self, on: bool) {
+            self.times = on;
         }
         fn transcribe(
             &mut self,
@@ -691,6 +1107,9 @@ mod tests {
         ) -> anyhow::Result<Transcript> {
             self.heard.borrow_mut().push(samples.to_vec());
             (hooks.progress)(40);
+            if let Some(phase) = &*self.overtake.borrow() {
+                phase.store(Phase::Recording);
+            }
             if hooks.cancel.is_some_and(|cancel| cancel()) {
                 return Err(oxi_whisper::Error::Cancelled.into());
             }
@@ -699,10 +1118,16 @@ mod tests {
             }
             Ok(Transcript {
                 segments: vec![Segment {
-                    text: " hello ".into(),
+                    text: format!(" {} ", self.said),
                     t0: Millis(0),
                     t1: Millis(1),
                     no_speech_prob: 0.0,
+                    words: vec![oxi_whisper::Word {
+                        text: "hello".into(),
+                        p: 0.9,
+                        t0: self.times.then_some(Millis(100)),
+                        t1: self.times.then_some(Millis(400)),
+                    }],
                 }],
             })
         }
@@ -713,6 +1138,8 @@ mod tests {
             Self {
                 calls: Rc::default(),
                 gpu_load_fails: false,
+                gpu_fails_on: None,
+                fails_on: None,
                 cpu_load_fails: false,
                 cpu_oom: false,
                 load_warning: None,
@@ -720,25 +1147,33 @@ mod tests {
                 silent_cpu: false,
                 no_gpu: false,
                 heard: Rc::default(),
+                overtake: Rc::default(),
+                said: "hello",
             }
         }
 
         fn loader(&self) -> Loader {
             let s = self.clone();
-            Box::new(move |_, choice, _| {
+            Box::new(move |path, choice, _| {
                 s.calls.borrow_mut().push(choice.clone());
                 let asked_gpu = *choice != DeviceChoice::Cpu;
                 let cpu = !asked_gpu || s.silent_cpu || s.no_gpu;
                 if cpu && s.cpu_oom {
                     return Err(oxi_whisper::Error::OutOfMemory.into());
                 }
-                if !cpu && s.gpu_load_fails || cpu && s.cpu_load_fails {
+                let gpu_fails =
+                    s.gpu_load_fails || s.gpu_fails_on.is_some_and(|f| path.ends_with(f));
+                let file_fails = s.fails_on.is_some_and(|f| path.ends_with(f));
+                if !cpu && gpu_fails || cpu && s.cpu_load_fails || file_fails {
                     anyhow::bail!("out of memory");
                 }
                 Ok(Fake {
                     gpu: !cpu,
                     fail_run: s.gpu_run_fails,
                     heard: s.heard.clone(),
+                    times: false,
+                    overtake: s.overtake.clone(),
+                    said: s.said,
                     info: LoadInfo {
                         device: (!cpu).then(|| "Vulkan0".into()),
                         warning: if asked_gpu && s.silent_cpu {
@@ -846,7 +1281,215 @@ mod tests {
         w.handle(WhisperCmd::Transcribe {
             job: JobId(1),
             samples: vec![0.0; 16],
+            profile: Box::new(oxi_core::paste::profile(&w.cfg, "")),
         });
+    }
+
+    #[test]
+    fn a_profile_picks_the_model_per_dictation_and_the_configured_one_comes_back() {
+        let (r, s) = (rig("profile"), Script::new());
+        let (mut w, rx) = worker(&s, &r);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(event(&rx), Event::ModelLoaded);
+        // A rule naming "tiny", which is not on disk: the press keeps the loaded model, the job
+        // runs on it and says so; never `ModelFailed`, which would refuse every press (d04-fix 1).
+        w.handle(WhisperCmd::UseModel("tiny".into()));
+        let other = profile_for(&w, "tiny");
+        w.phase.store(Phase::Transcribing);
+        w.handle(WhisperCmd::Transcribe {
+            job: JobId(1),
+            samples: vec![0.0; 16],
+            profile: Box::new(other),
+        });
+        assert_eq!(event(&rx), Event::ModelFellBack("tiny".into()));
+        assert_eq!(text(&rx).as_deref(), Some("hello "));
+        assert_eq!(s.calls().len(), 1, "the configured model stayed loaded");
+        assert_eq!(w.cfg.model.id, "custom", "the configured model is put back");
+        job(&mut w);
+        assert_eq!(text(&rx).as_deref(), Some("hello "));
+        assert_eq!(next(&rx).map(|_| ()), None, "no fallback without a rule");
+        // Nothing loaded: the key-down preload of the missing model loads the configured one.
+        w.handle(WhisperCmd::Unload);
+        w.handle(WhisperCmd::UseModel("tiny".into()));
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(event(&rx), Event::ModelLoaded);
+        assert!(w.next_model.is_none());
+        assert_eq!(
+            w.loaded_for.as_ref().unwrap().file,
+            r.cfg(DeviceChoice::Cpu).model.custom_path
+        );
+    }
+
+    /// d04-fix 1: an app's model on disk that fails to load gives way to the configured one, at
+    /// the preload and in the job, and the machine hears a fallback, not a model failure.
+    #[test]
+    fn an_apps_model_that_fails_to_load_falls_back_to_the_configured_one() {
+        let (r, mut s) = (rig("rulebad"), Script::new());
+        s.fails_on = Some(on_disk(&r, "tiny"));
+        let (mut w, rx) = worker(&s, &r);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        w.handle(WhisperCmd::UseModel("tiny".into()));
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(event(&rx), Event::ModelLoaded);
+        assert_eq!(w.loaded_for.as_ref().unwrap().file, w.cfg.model.custom_path);
+        w.phase.store(Phase::Transcribing);
+        let profile = Box::new(profile_for(&w, "tiny"));
+        w.handle(WhisperCmd::Transcribe {
+            job: JobId(1),
+            samples: vec![0.0; 16],
+            profile,
+        });
+        assert_eq!(event(&rx), Event::ModelFellBack("tiny".into()));
+        assert_eq!(text(&rx).as_deref(), Some("hello "));
+        assert_eq!(w.cfg.model.id, "custom");
+        // d04-fix review 1: the next dictation in that app does not try the broken file again
+        // (no load at key-down, none in the job), until a new config.
+        let loads = s.calls().len();
+        let dictate = |w: &mut TestWorker| {
+            w.handle(WhisperCmd::UseModel("tiny".into()));
+            w.handle(WhisperCmd::Preload);
+            assert_eq!(event(&rx), Event::ModelLoaded);
+            let profile = Box::new(profile_for(w, "tiny"));
+            w.handle(WhisperCmd::Transcribe {
+                job: JobId(2),
+                samples: vec![0.0; 16],
+                profile,
+            });
+            assert_eq!(event(&rx), Event::ModelFellBack("tiny".into()));
+            assert_eq!(text(&rx).as_deref(), Some("hello "));
+        };
+        dictate(&mut w);
+        assert_eq!(
+            s.calls().len(),
+            loads,
+            "the failed model is not loaded again"
+        );
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        dictate(&mut w);
+        assert!(s.calls().len() > loads, "a new config tries it once more");
+    }
+
+    /// d04-fix re-review: deleting a model that failed to load takes it off the failed list, so
+    /// the download after it is tried at once.
+    #[test]
+    fn deleting_a_failed_model_takes_it_off_the_failed_list() {
+        let (r, s) = (rig("faildel"), Script::new());
+        on_disk(&r, "tiny");
+        let (mut w, _rx) = worker(&s, &r);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        w.remember_failed("tiny");
+        assert_eq!(
+            w.usable("tiny".into()),
+            w.cfg.model.id,
+            "skipped while failed"
+        );
+        let _ = w.delete_model("tiny");
+        assert_eq!(w.failed, Vec::<String>::new());
+    }
+
+    /// Registry model `id` on disk as a sparse fake with its stamp, so it loads.
+    fn on_disk(r: &Rig, id: &str) -> &'static str {
+        let entry = models::find(id).unwrap();
+        let dir = r.layout().models_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(entry.file_name);
+        fake_model(&file, entry.size);
+        models::write_stamp(&file).unwrap();
+        entry.file_name
+    }
+
+    fn profile_for(w: &TestWorker, model: &str) -> Profile {
+        let mut p = oxi_core::paste::profile(&w.cfg, "");
+        p.model = model.into();
+        p
+    }
+
+    /// Review d04 #1: an app's model is loaded at key-down while the user speaks, not after the
+    /// release; its jobs then run on it with no load, and the configured one comes back the
+    /// same way.
+    #[test]
+    fn the_apps_model_loads_at_key_down_and_its_job_loads_nothing() {
+        let (r, s) = (rig("usemodel"), Script::new());
+        on_disk(&r, "tiny");
+        let (mut w, rx) = worker(&s, &r);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(event(&rx), Event::ModelLoaded);
+        w.handle(WhisperCmd::UseModel("tiny".into()));
+        assert_eq!(s.calls().len(), 2, "loaded at the press");
+        assert_eq!(w.loaded_for.as_ref().unwrap().file, "tiny");
+        w.phase.store(Phase::Transcribing);
+        let profile = Box::new(profile_for(&w, "tiny"));
+        w.handle(WhisperCmd::Transcribe {
+            job: JobId(1),
+            samples: vec![0.0; 16],
+            profile,
+        });
+        assert_eq!(text(&rx).as_deref(), Some("hello "));
+        assert_eq!(s.calls().len(), 2, "the job found it loaded");
+        // The same model again: nothing to load. The configured one: loaded at its press.
+        w.handle(WhisperCmd::UseModel("tiny".into()));
+        assert_eq!(s.calls().len(), 2);
+        w.handle(WhisperCmd::UseModel("custom".into()));
+        assert_eq!(s.calls().len(), 3);
+        job(&mut w);
+        assert_eq!(text(&rx).as_deref(), Some("hello "));
+        assert_eq!(s.calls().len(), 3);
+        // Nothing loaded (idle unload): the machine's preload loads the app's model.
+        w.handle(WhisperCmd::Unload);
+        w.handle(WhisperCmd::UseModel("tiny".into()));
+        assert_eq!(s.calls().len(), 3, "the preload does it");
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(event(&rx), Event::ModelLoaded);
+        assert_eq!(w.loaded_for.as_ref().unwrap().file, "tiny");
+    }
+
+    /// Review d04 #2: an app's model that ran out of GPU memory falls back to the CPU for itself;
+    /// the configured model loads on the GPU again afterwards.
+    #[test]
+    fn an_apps_model_on_the_cpu_leaves_the_configured_one_on_the_gpu() {
+        let (r, mut s) = (rig("rulepin"), Script::new());
+        s.gpu_fails_on = Some(on_disk(&r, "tiny"));
+        let (mut w, rx) = worker(&s, &r);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Auto)));
+        w.handle(WhisperCmd::Preload);
+        assert_eq!(event(&rx), Event::ModelLoaded);
+        w.handle(WhisperCmd::UseModel("tiny".into()));
+        assert_eq!(
+            s.calls()[1..],
+            [DeviceChoice::Auto, DeviceChoice::Cpu],
+            "tiny went to the CPU"
+        );
+        assert!(w.cpu_reason.is_none(), "the pin was tiny's alone");
+        w.handle(WhisperCmd::UseModel("custom".into()));
+        assert_eq!(s.calls().last(), Some(&DeviceChoice::Auto));
+        assert!(w.loaded.as_ref().unwrap().info().device.is_some());
+    }
+
+    #[test]
+    fn a_rule_can_turn_the_replace_rules_off_for_one_app() {
+        let (r, s) = (rig("noreplace"), Script::new());
+        fs::create_dir_all(r.layout().config_dir).unwrap();
+        fs::write(r.layout().replace_file(), "hello => bye\n").unwrap();
+        let (mut w, rx) = worker(&s, &r);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        job(&mut w);
+        assert_eq!(text(&rx).as_deref(), Some("bye "));
+        let mut bare = oxi_core::paste::profile(&w.cfg, "");
+        bare.replacements = false;
+        w.handle(WhisperCmd::Transcribe {
+            job: JobId(2),
+            samples: vec![0.0; 16],
+            profile: Box::new(bare),
+        });
+        assert_eq!(text(&rx).as_deref(), Some("hello "));
+        job(&mut w);
+        assert_eq!(
+            text(&rx).as_deref(),
+            Some("bye "),
+            "the next app has them again"
+        );
     }
 
     #[test]
@@ -892,6 +1535,7 @@ mod tests {
         w.handle(WhisperCmd::Transcribe {
             job: JobId(2),
             samples: vec![0.0; 16],
+            profile: Box::new(oxi_core::paste::profile(&w.cfg, "")),
         });
         assert_eq!(text(&rx), None);
         assert_eq!(s.calls().len(), 1, "no reload after a cancel");
@@ -948,6 +1592,9 @@ mod tests {
             },
             fail_run: false,
             heard: Rc::default(),
+            times: false,
+            overtake: Rc::default(),
+            said: "hello",
         });
         w.loaded_for = Some(w.identity());
         assert_eq!(w.delete_model("tiny"), DeleteResult::Done { freed: 6 });
@@ -1220,8 +1867,134 @@ mod tests {
         cfg.paste.trailing_space = false;
         w.handle(WhisperCmd::Config(cfg));
         job(&mut w);
-        assert_eq!(text(&rx).as_deref(), Some("bye"));
+        // The words for the history entry are whisper's, before the replace rules, with no times.
+        let Some(Inbox::Transcribed { text, words, .. }) = next(&rx) else {
+            panic!("expected Transcribed");
+        };
+        assert_eq!(text.as_deref(), Some("bye"));
+        assert_eq!(
+            words,
+            [oxi_core::history::Word {
+                w: "hello".into(),
+                p: 0.9,
+                t0: None,
+                t1: None,
+            }]
+        );
         assert_eq!(s.calls().len(), 1);
+    }
+
+    #[test]
+    fn the_text_settings_reach_the_pipeline_and_word_times_follow_pause_punctuation() {
+        let (r, s) = (rig("text-settings"), Script::new());
+        let (mut w, rx) = worker(&s, &r);
+        let mut cfg = r.cfg(DeviceChoice::Cpu);
+        cfg.paste.trailing_space = false;
+        w.handle(WhisperCmd::Config(cfg.clone()));
+        job(&mut w);
+        let Some(Inbox::Transcribed {
+            text: first, words, ..
+        }) = next(&rx)
+        else {
+            panic!("expected Transcribed");
+        };
+        assert_eq!((first.as_deref(), words[0].t0), (Some("hello"), None));
+
+        // A snippet is the whole text; the filler filter removes the whole text.
+        cfg.text.snippets = vec![oxi_core::config::Snippet {
+            trigger: "Hello".into(),
+            text: "hi there".into(),
+        }];
+        w.handle(WhisperCmd::Config(cfg.clone()));
+        job(&mut w);
+        assert_eq!(text(&rx).as_deref(), Some("hi there"));
+        cfg.text.snippets.clear();
+        cfg.text.filler_filter = true;
+        cfg.text.fillers = vec!["hello".into()];
+        w.handle(WhisperCmd::Config(cfg.clone()));
+        job(&mut w);
+        assert_eq!(text(&rx).as_deref(), Some(""));
+
+        // Word times are made for a dictation only while pause punctuation is on.
+        cfg.text.filler_filter = false;
+        cfg.text.pause_punctuation = true;
+        w.handle(WhisperCmd::Config(cfg));
+        job(&mut w);
+        let Some(Inbox::Transcribed { words, .. }) = next(&rx) else {
+            panic!("expected Transcribed");
+        };
+        assert_eq!(words[0].t0, Some(100));
+    }
+
+    #[test]
+    fn the_confidence_filter_holds_a_part_only_with_history_on() {
+        let (r, s) = (rig("held"), Script::new());
+        let (mut w, rx) = worker(&s, &r);
+        let mut cfg = r.cfg(DeviceChoice::Cpu);
+        cfg.paste.trailing_space = false;
+        cfg.text.confidence_filter = true;
+        cfg.text.confidence_min = 0.95; // the fake word has p 0.9
+        cfg.history.enabled = true;
+        w.handle(WhisperCmd::Config(cfg.clone()));
+        job(&mut w);
+        let Some(Inbox::Transcribed { text, held, .. }) = next(&rx) else {
+            panic!("expected Transcribed");
+        };
+        assert_eq!(text.as_deref(), Some(""), "all of it was held");
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].text, "hello");
+        // No history entry to keep it in: nothing is held, the text is pasted.
+        cfg.history.enabled = false;
+        w.handle(WhisperCmd::Config(cfg));
+        job(&mut w);
+        let Some(Inbox::Transcribed { text, held, .. }) = next(&rx) else {
+            panic!("expected Transcribed");
+        };
+        assert_eq!((text.as_deref(), held.len()), (Some("hello"), 0));
+    }
+
+    /// Review d03 #1, #2: a listed hallucination is held (the coordinator drops it with history
+    /// off), and a Transcribe again of the clip gives it back as heard.
+    #[test]
+    fn a_likely_hallucination_is_held_and_transcribe_again_keeps_it() {
+        let (r, mut s) = (rig("halluc"), Script::new());
+        s.said = "Thanks for watching";
+        let (mut w, rx) = worker(&s, &r);
+        let mut cfg = r.cfg(DeviceChoice::Cpu);
+        cfg.paste.trailing_space = false;
+        cfg.history.enabled = true;
+        w.handle(WhisperCmd::Config(cfg.clone()));
+        job(&mut w);
+        let Some(Inbox::Transcribed { text, held, .. }) = next(&rx) else {
+            panic!("expected Transcribed");
+        };
+        assert_eq!(text.as_deref(), Some(""));
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].why, oxi_core::text::HeldWhy::Hallucination);
+        cfg.history.enabled = false;
+        w.handle(WhisperCmd::Config(cfg));
+        job(&mut w);
+        let Some(Inbox::Transcribed { text, held, .. }) = next(&rx) else {
+            panic!("expected Transcribed");
+        };
+        // Review d03-fix #3: this config may be stale (it waits for idle), so the invention is
+        // still held; the coordinator drops it when no entry is written.
+        assert_eq!((text.as_deref(), held.len()), (Some(""), 1));
+        // Transcribe again: the user asked for this clip, nothing is taken out.
+        w.phase.store(Phase::Idle);
+        let pushes = Pushes::default();
+        let (_, prx) = pushes.claim(1);
+        w.handle(test_job(&pushes.with_origin(Origin::History), "custom"));
+        let TestOutcome::Heard { text, .. } = outcome(&prx) else {
+            panic!("expected a text");
+        };
+        assert_eq!(text, "Thanks for watching");
+        // The Test page's run keeps the check.
+        w.handle(test_job(&pushes, "custom"));
+        let TestOutcome::Heard { text, .. } = outcome(&prx) else {
+            panic!("expected a text");
+        };
+        assert_eq!(text, "");
     }
 
     #[test]
@@ -1319,7 +2092,7 @@ mod tests {
     fn outcome(rx: &Receiver<Push>) -> TestOutcome {
         match rx
             .try_iter()
-            .find(|p| !matches!(p, Push::TestProgress { .. }))
+            .find(|p| !matches!(p, Push::TestProgress { .. } | Push::HistoryRunWords { .. }))
         {
             Some(Push::TestResult { id: 9, outcome }) => outcome,
             _ => panic!("expected TestResult"),
@@ -1670,11 +2443,249 @@ mod tests {
         w.handle(WhisperCmd::Transcribe {
             job: JobId(7),
             samples,
+            profile: Box::new(oxi_core::paste::profile(&w.cfg, "")),
         });
         let got = text(&rx).unwrap().to_lowercase();
         assert!(
             got.contains("ask not what your country can do for you"),
             "{got}"
         );
+    }
+
+    /// A record with `audio` in the history folder of `cfg`; its id.
+    fn history_record(r: &Rig, cfg: &Config) -> (PathBuf, &'static str) {
+        let dir = oxi_core::history::folder(&cfg.history, &r.layout().history_dir());
+        let id = "2026-11-08/134501-123";
+        fs::create_dir_all(dir.join("2026-11-08")).unwrap();
+        fs::write(dir.join(oxi_core::history::MARKER), b"x").unwrap();
+        let base = dir.join(id);
+        oxi_platform::wav::write_wav(&base.with_extension("wav"), &[0.1; 1600]).unwrap();
+        let meta = oxi_core::history::Meta {
+            version: oxi_core::history::Meta::VERSION,
+            started: String::new(),
+            duration_ms: 100,
+            status: oxi_core::history::Status::Done,
+            model: String::new(),
+            language: String::new(),
+            settings: None,
+            previous: None,
+            words: Vec::new(),
+            timings: None,
+            raw: false,
+            held: Vec::new(),
+            delivered: None,
+        };
+        fs::write(base.with_extension("json"), meta.to_json().unwrap()).unwrap();
+        (dir, id)
+    }
+
+    #[test]
+    fn a_words_run_stores_the_times_in_its_record_and_answers_with_them() {
+        let (r, s) = (rig("words-run"), Script::new());
+        let (mut w, _inbox) = worker(&s, &r);
+        let cfg = r.cfg(DeviceChoice::Cpu);
+        let (dir, id) = history_record(&r, &cfg);
+        w.handle(WhisperCmd::Config(cfg));
+        let pushes = Pushes::default();
+        let (_, rx) = pushes.claim(1);
+        let reply = pushes.with_origin(Origin::History).with_words_for(id);
+        let job = WhisperCmd::Test(TestJob {
+            id: 9,
+            set: SettingsSet::defaults(),
+            language: Language::AUTO,
+            samples: vec![0.1; 1600],
+            reply,
+        });
+        w.handle(job);
+        let answer = rx
+            .try_iter()
+            .find(|p| !matches!(p, Push::TestProgress { .. }))
+            .unwrap();
+        let Push::HistoryWords {
+            run: 9,
+            result: WordsResult::Ready { words, timed: true },
+            ..
+        } = answer
+        else {
+            panic!("expected Ready words");
+        };
+        assert_eq!((words.0[0].t0, words.0[0].t1), (Some(100), Some(400)));
+        let (stored, how) = crate::daemon::history::read_words(&dir, id).unwrap();
+        assert_eq!(stored, words.0, "the record holds what the window got");
+        assert_eq!(how.unwrap().by, oxi_core::history::TimingBy::Tokens);
+        // A dictation under way: nothing runs, nothing is stored over the timed words.
+        w.phase.store(Phase::Recording);
+        let busy = pushes.with_origin(Origin::History).with_words_for(id);
+        w.handle(WhisperCmd::Test(TestJob {
+            id: 10,
+            set: SettingsSet::defaults(),
+            language: Language::AUTO,
+            samples: vec![0.1; 1600],
+            reply: busy,
+        }));
+        assert!(matches!(
+            rx.try_iter().last(),
+            Some(Push::HistoryWords {
+                run: 10,
+                result: WordsResult::Busy,
+                ..
+            })
+        ));
+        // A record that is gone: the run still answers.
+        w.phase.store(Phase::Idle);
+        let gone = pushes
+            .with_origin(Origin::History)
+            .with_words_for("2026-11-08/000000-000");
+        w.handle(WhisperCmd::Test(TestJob {
+            id: 11,
+            set: SettingsSet::defaults(),
+            language: Language::AUTO,
+            samples: vec![0.1; 1600],
+            reply: gone,
+        }));
+        assert!(matches!(
+            rx.try_iter().last(),
+            Some(Push::HistoryWords {
+                run: 11,
+                result: WordsResult::Unavailable {
+                    why: WordsFailure::Failed
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_words_run_model_is_a_tests_and_goes_after_the_idle_limit() {
+        let (r, s) = (rig("words-idle"), Script::new());
+        let (mut w, _inbox) = worker(&s, &r);
+        let cfg = r.cfg(DeviceChoice::Cpu);
+        let (_dir, id) = history_record(&r, &cfg);
+        w.handle(WhisperCmd::Config(cfg));
+        let pushes = Pushes::default();
+        let (_, rx) = pushes.claim(1);
+        let words = |run| {
+            WhisperCmd::Test(TestJob {
+                id: run,
+                set: SettingsSet::defaults(),
+                language: Language::AUTO,
+                samples: vec![0.1; 1600],
+                reply: pushes.with_origin(Origin::History).with_words_for(id),
+            })
+        };
+        // Nothing loaded (an idle unload went before): the run's model goes after the limit.
+        w.handle(words(1));
+        assert!(w.loaded.is_some());
+        assert_eq!(w.test_deadline(), Some(w.last_test + TEST_MODEL_IDLE));
+        // A model a Test page run left stays a test's.
+        w.handle(WhisperCmd::Unload);
+        w.handle(test_job(&pushes, "custom"));
+        w.handle(words(2));
+        assert_eq!(w.test_deadline(), Some(w.last_test + TEST_MODEL_IDLE));
+        // A model a dictation loaded stays the dictation's.
+        w.handle(WhisperCmd::Preload);
+        w.handle(words(3));
+        assert_eq!(w.test_deadline(), None);
+        assert!(w.loaded.is_some());
+        let _ = rx.try_iter().count();
+    }
+
+    #[test]
+    fn a_stopped_words_run_answers_busy_and_stores_nothing() {
+        let (r, s) = (rig("words-stopped"), Script::new());
+        let (mut w, _inbox) = worker(&s, &r);
+        let cfg = r.cfg(DeviceChoice::Cpu);
+        let (dir, id) = history_record(&r, &cfg);
+        w.handle(WhisperCmd::Config(cfg));
+        let pushes = Pushes::default();
+        let (_, rx) = pushes.claim(1);
+        let reply = pushes.with_origin(Origin::History).with_words_for(id);
+        reply.words_stop().unwrap().store(true, Ordering::Release);
+        w.handle(WhisperCmd::Test(TestJob {
+            id: 4,
+            set: SettingsSet::defaults(),
+            language: Language::AUTO,
+            samples: vec![0.1; 1600],
+            reply,
+        }));
+        assert!(matches!(
+            rx.try_iter().last(),
+            Some(Push::HistoryWords {
+                run: 4,
+                result: WordsResult::Busy,
+                ..
+            })
+        ));
+        assert!(w.loaded.is_none(), "nothing was loaded for it");
+        let (stored, _) = crate::daemon::history::read_words(&dir, id).unwrap();
+        assert!(stored.iter().all(|w| w.t0.is_none()));
+    }
+
+    #[test]
+    fn a_history_run_sends_its_words_before_its_text() {
+        let (r, s) = (rig("run-words"), Script::new());
+        let (mut w, _inbox) = worker(&s, &r);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        let pushes = Pushes::default();
+        let (_, rx) = pushes.claim(1);
+        w.handle(test_job(&pushes.with_origin(Origin::History), "custom"));
+        let sent: Vec<Push> = rx
+            .try_iter()
+            .filter(|p| !matches!(p, Push::TestProgress { .. }))
+            .collect();
+        let [
+            Push::HistoryRunWords { id: 9, words },
+            Push::TestResult { id: 9, .. },
+        ] = &sent[..]
+        else {
+            panic!("expected the words, then the result: {} pushes", sent.len());
+        };
+        assert_eq!((words.0[0].w.as_str(), words.0[0].t0), ("hello", None));
+        // The Test page's run has no use for them.
+        w.handle(test_job(&pushes, "custom"));
+        assert!(
+            !rx.try_iter()
+                .any(|p| matches!(p, Push::HistoryRunWords { .. }))
+        );
+    }
+
+    #[test]
+    fn word_times_are_on_for_that_run_only() {
+        let (r, s) = (rig("wordtimes"), Script::new());
+        let (mut w, _inbox) = worker(&s, &r);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        let clip = [0.1_f32; 1600];
+        let timed = w.word_times(&clip).unwrap();
+        let word = &timed.segments[0].words[0];
+        assert_eq!((word.t0, word.t1), (Some(Millis(100)), Some(Millis(400))));
+        assert!((word.p - 0.9).abs() < f32::EPSILON);
+        // The model stays loaded, and the next run (a dictation) makes no times.
+        let plain = w.recognise(&clip).unwrap().unwrap();
+        assert_eq!(plain.segments[0].words[0].t0, None);
+        assert_eq!(s.calls().len(), 1, "one load served both");
+    }
+
+    #[test]
+    fn a_dictation_goes_before_a_timing_run_and_stops_it() {
+        let (r, s) = (rig("wordtimes-busy"), Script::new());
+        let (mut w, _inbox) = worker(&s, &r);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        let clip = [0.1_f32; 1600];
+        // A dictation under way: the run does not start.
+        w.phase.store(Phase::Recording);
+        assert!(matches!(w.word_times(&clip), Err(TestFailure::Busy)));
+        assert!(s.heard.borrow().is_empty());
+        // One that starts during the run stops it.
+        w.phase.store(Phase::Idle);
+        *s.overtake.borrow_mut() = Some(w.phase.clone());
+        assert!(matches!(w.word_times(&clip), Err(TestFailure::Busy)));
+        assert_eq!(
+            s.heard.borrow().len(),
+            1,
+            "stopped, not run again on another device"
+        );
+        // A test is not a timing run: a dictation starting during it does not stop it.
+        w.phase.store(Phase::Idle);
+        assert!(w.recognise(&clip).unwrap().is_some());
     }
 }

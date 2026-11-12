@@ -35,6 +35,9 @@ rtrb = "0.4"
 rubato = "5"
 hound = "3.5"
 lewton = "0.10.2"
+# File transcription decoders (MPL-2.0, per-crate exception in deny.toml): mp3, aac, mp4, flac only;
+# wav and ogg stay on hound and lewton.
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "isomp4", "flac"] }
 # lewton's own Ogg reader, used to check the Vorbis headers before lewton reads them.
 ogg = "0.8"
 earshot = "1.2"

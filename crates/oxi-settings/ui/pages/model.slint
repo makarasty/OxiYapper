@@ -64,6 +64,12 @@ export global ModelState {
     // "Right away", the minutes, "Never".
     in property <[string]> unload-options;
     in-out property <int> unload;
+    // Model by language (`model.by_language`): the languages, those with a model of their own
+    // first; the models, "Default" (the one in use) first; the language shown and its model.
+    in property <[string]> by-language-names;
+    in property <[string]> by-language-models;
+    in-out property <int> by-language;
+    in-out property <int> by-language-model;
     // The daemon's Status warnings ("running on CPU: ..."); empty hides the "!" of the GPU row.
     in property <string> warning;
     // Why Download is off; empty while the daemon is online.
@@ -97,6 +103,10 @@ export global ModelState {
     callback delete-partials();
     callback gpu-picked(int);
     callback unload-picked(int);
+    // A language of the by-language row was picked: show its model.
+    callback by-language-shown(int);
+    // (language, model) of the by-language row; model 0 is Default, which removes the language.
+    callback by-language-picked(int, int);
     // Advanced: per parameter (0 threads, 1 flash attention, 2 decoding, 3 temperature, 4 retry,
     // 5 silence, 6 confidence, 7 repetition, 8 non-speech) its choice (0 is Auto)
     // and its number.
@@ -622,6 +632,38 @@ export component ModelPage inherits VerticalLayout {
                                 accessible-label: @tr("Unload after idle");
                                 selected => {
                                     ModelState.unload-picked(self.current-index);
+                                }
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.model-language;
+                            title: @tr("Model by language");
+                            info: @tr("A language chosen here or by an app's rule runs its own model. With Auto the model in use runs: finding the language first would take a pass of another model.");
+                            fill-controls: true;
+                            HorizontalLayout {
+                                spacing: Theme.control-gap;
+                                Combo {
+                                    // Two share the column: half of it each, not a column each.
+                                    min-width: 0;
+                                    horizontal-stretch: 1;
+                                    model: ModelState.by-language-names;
+                                    current-index <=> ModelState.by-language;
+                                    accessible-label: @tr("Language with its own model");
+                                    selected => {
+                                        ModelState.by-language-shown(self.current-index);
+                                    }
+                                }
+                                Combo {
+                                    // Two share the column: half of it each, not a column each.
+                                    min-width: 0;
+                                    horizontal-stretch: 1;
+                                    model: ModelState.by-language-models;
+                                    current-index <=> ModelState.by-language-model;
+                                    accessible-label: @tr("Model for the language");
+                                    selected => {
+                                        ModelState.by-language-picked(ModelState.by-language, self.current-index);
+                                    }
                                 }
                             }
                         }

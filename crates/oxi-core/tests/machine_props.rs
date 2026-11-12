@@ -3,7 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use oxi_core::machine::{
-    Effect, EmptyAudio, Event, JobId, MachineConfig, Mode, ModelFailure, Phase, Sound, State, step,
+    BOUNCE, Effect, EmptyAudio, Event, JobId, MachineConfig, Mode, ModelFailure, Phase, Sound,
+    State, step,
 };
 use oxi_core::paste::{ClipboardOnlyWhy, PasteOutcome};
 use oxi_core::types::Millis;
@@ -113,6 +114,8 @@ struct Keyboard {
     now: u64,
     down: bool,
     released_at: Option<u64>,
+    /// Every effect so far, the answered polls' too.
+    seen: Vec<Effect>,
 }
 
 impl Keyboard {
@@ -124,18 +127,21 @@ impl Keyboard {
             now: 0,
             down: false,
             released_at: None,
+            seen: Vec::new(),
         }
     }
 
     fn send(&mut self, event: Event) -> Vec<Effect> {
         let fx = step(&mut self.state, event, Millis(self.now));
+        self.seen.extend(fx.iter().cloned());
         if fx.contains(&Effect::PollChord) {
             let held = self.down;
-            step(
+            let polled = step(
                 &mut self.state,
                 Event::ChordPolled { held },
                 Millis(self.now),
             );
+            self.seen.extend(polled);
         }
         fx
     }
@@ -425,5 +431,55 @@ proptest! {
                 );
             }
         }
+    }
+
+    /// Held keys mean dictation (owner, 2026-11-12): a held push chord that bounces (up and
+    /// down again within `BOUNCE`) any number of times, early (a tap so far) or late, with or
+    /// without a tail or a hold gap, is one capture and one job. In toggle mode the start and
+    /// the stop press bounce the same way: one capture, one job, and the microphone ends off.
+    #[test]
+    fn a_bouncing_chord_is_one_dictation(
+        toggle in any::<bool>(),
+        tail in 0..300u64,
+        gap in prop_oneof![Just(0u64), 100..1500u64],
+        start in prop::collection::vec((1..2000u64, 0..BOUNCE.0), 0..8),
+        stop in prop::collection::vec((1..2000u64, 0..BOUNCE.0), 0..8),
+        last in 300..5000u64,
+    ) {
+        let mut kb = Keyboard::new(MachineConfig {
+            mode: if toggle { Mode::Toggle } else { Mode::Push },
+            release_tail: Millis(tail),
+            hold_gap: Millis(gap),
+            ..MachineConfig::default()
+        });
+        let press = |kb: &mut Keyboard, bounces: Vec<(u64, u64)>, held: u64| {
+            kb.down = true;
+            kb.send(Event::ChordDown);
+            for (held, off) in bounces {
+                kb.advance(held);
+                kb.down = false;
+                kb.send(Event::ChordUp);
+                kb.advance(off);
+                kb.down = true;
+                kb.send(Event::ChordDown);
+            }
+            kb.advance(held);
+            kb.down = false;
+            kb.send(Event::ChordUp);
+        };
+        if toggle {
+            press(&mut kb, start, 50);
+            kb.advance(last);
+            press(&mut kb, stop, 50);
+        } else {
+            press(&mut kb, start, last);
+        }
+        kb.advance(10_000);
+        let starts = kb.seen.iter().filter(|e| **e == Effect::StartCapture).count();
+        let stops: Vec<_> = kb.seen.iter().filter(|e| matches!(e, Effect::StopCapture(_))).collect();
+        prop_assert_eq!(starts, 1, "{:?}", kb.seen);
+        prop_assert_eq!(stops, [&Effect::StopCapture(JobId(0))], "{:?}", kb.seen);
+        prop_assert!(!kb.seen.contains(&Effect::DiscardCapture), "{:?}", kb.seen);
+        prop_assert_ne!(kb.state.phase(), Phase::Recording);
     }
 }

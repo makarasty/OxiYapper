@@ -2,7 +2,7 @@
 //! the activity heatmap (SPEC, History).
 //!
 //! What is kept, for each local calendar day: the number of finished dictations, their word
-//! count and the length of their audio. Never the text, an app name, or a time finer than the
+//! count, the length of their audio and the length of its voiced part. Never the text, an app name, or a time finer than the
 //! day. The caller supplies "today" as a local [`Date`], so this module needs no clock.
 
 use std::fmt;
@@ -10,7 +10,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::audio::SAMPLE_RATE;
+use crate::audio::{EdgeStats, SAMPLE_RATE, Trim};
 use crate::constants::MAX_CLOCK_JUMP;
 use crate::types::Millis;
 
@@ -144,13 +144,51 @@ pub struct Totals {
     pub words: u64,
     /// Length of the dictations' audio.
     pub speech_ms: u64,
+    /// Length of the part of that audio the gate scored as voice (the rest is pauses). 0 for a
+    /// row counted before this was kept, or by a build that could not tell: such a row is
+    /// left out of the pause share and its rate falls back to `speech_ms`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub voiced_ms: u64,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // reason: serde's `skip_serializing_if` passes a reference
+const fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl Totals {
     fn add(&mut self, other: Self) {
+        // When only one side knows its voiced time, the other's audio counts as voice: a day that
+        // mixes such rows must not divide all its words by part of its time, nor call the rest pauses.
+        let (mine, theirs) = match (self.voiced_ms, other.voiced_ms) {
+            (0, 0) => (0, 0),
+            (0, v) => (self.speech_ms, v),
+            (v, 0) => (v, other.speech_ms),
+            both => both,
+        };
         self.dictations = self.dictations.saturating_add(other.dictations);
         self.words = self.words.saturating_add(other.words);
         self.speech_ms = self.speech_ms.saturating_add(other.speech_ms);
+        self.voiced_ms = mine.saturating_add(theirs);
+    }
+
+    /// Words and the milliseconds their rate is measured over: the voiced time when it is known,
+    /// else the audio length (rows from before the voiced time was kept).
+    const fn pace(&self) -> (u64, u64) {
+        let ms = if self.voiced_ms > 0 {
+            self.voiced_ms
+        } else {
+            self.speech_ms
+        };
+        (self.words, ms)
+    }
+
+    /// Share of the audio that is pauses, 0..=100; `None` when the voiced time is not known.
+    pub fn pause_pct(&self) -> Option<u32> {
+        (self.voiced_ms > 0 && self.speech_ms > 0).then(|| {
+            let voiced = self.voiced_ms.min(self.speech_ms);
+            u32::try_from((self.speech_ms - voiced) * 100 / self.speech_ms).unwrap_or(100)
+        })
     }
 }
 
@@ -225,8 +263,25 @@ impl Stats {
         self.version <= VERSION
     }
 
-    /// One finished dictation on `today`, then rows older than [`KEEP_DAYS`] fold away.
+    /// The voiced time to count for one recording, 0 when it is not known: with the trim off no
+    /// gate ran; when the gate scored less than [`MIN_VOICED`](crate::audio::MIN_VOICED) but the level heard speech
+    /// ([`Trim::Skipped`]) its few frames say nothing of the pauses, so all of the audio counts.
+    pub const fn voiced_time(trim: Trim, edge: &EdgeStats) -> Millis {
+        Millis(match trim {
+            Trim::Cut => edge.voiced_ms,
+            Trim::Skipped => edge.audio_ms,
+            Trim::Off => 0,
+        })
+    }
+
+    /// One finished dictation on `today` whose voiced time is not known.
     pub fn record(&mut self, today: Date, words: u64, speech: Millis) {
+        self.record_voiced(today, words, speech, Millis(0));
+    }
+
+    /// One finished dictation on `today`, `voiced` of its `speech` audio being voice; then rows
+    /// older than [`KEEP_DAYS`] fold away.
+    pub fn record_voiced(&mut self, today: Date, words: u64, speech: Millis, voiced: Millis) {
         let newest = self.days.iter().rev().map(|d| d.date).find(|&d| d <= today);
         let jumped = newest.is_some_and(|n| today > n.add_days(MAX_CLOCK_JUMP));
         self.add(Day {
@@ -235,6 +290,8 @@ impl Stats {
                 dictations: 1,
                 words,
                 speech_ms: speech.0,
+                // Voice cannot outlast the audio it sits in.
+                voiced_ms: voiced.0.min(speech.0),
             },
         });
         if jumped {
@@ -259,11 +316,13 @@ impl Stats {
     /// What the Home page shows on `today`, with a heatmap of `weeks` weeks.
     pub fn summary(&self, today: Date, weeks: u16) -> Summary {
         let mut all = self.before;
-        let mut spoken = Totals::default();
+        let (mut words, mut ms) = (0_u64, 0_u64);
         for day in &self.days {
             all.add(day.n);
-            if day.n.speech_ms > 0 {
-                spoken.add(day.n);
+            let (w, m) = day.n.pace();
+            if m > 0 {
+                words = words.saturating_add(w);
+                ms = ms.saturating_add(m);
             }
         }
         let (streak, longest_streak) = streaks(&self.days, today);
@@ -271,12 +330,22 @@ impl Stats {
         Summary {
             dictations: all.dictations,
             words: all.words,
-            wpm: wpm(spoken.words, spoken.speech_ms),
+            wpm: wpm(words, ms),
             streak,
             longest_streak,
             heat_start,
             heat,
         }
+    }
+
+    /// Share of the kept days' audio that is pauses, 0..=100; `None` while no day has a voiced
+    /// time (all rows older than that, or nothing dictated).
+    pub fn pause_pct(&self) -> Option<u32> {
+        let mut known = Totals::default();
+        for day in self.days.iter().filter(|d| d.n.voiced_ms > 0) {
+            known.add(day.n);
+        }
+        known.pause_pct()
     }
 
     /// `metric` by day up to `today`, from the first day with a dictation, at most
@@ -307,7 +376,10 @@ impl Stats {
             };
             values[i] = match metric {
                 Metric::Words => day.n.words,
-                Metric::Wpm => u64::from(wpm(day.n.words, day.n.speech_ms)),
+                Metric::Wpm => {
+                    let (w, ms) = day.n.pace();
+                    u64::from(wpm(w, ms))
+                }
                 Metric::Dictations => day.n.dictations,
                 Metric::Streak => run,
             };
@@ -360,7 +432,8 @@ pub struct Summary {
     pub dictations: u64,
     /// All time.
     pub words: u64,
-    /// Words per minute of audio over the kept days with audio; 0 before the first one.
+    /// Words per minute of voiced speech over the kept days with audio (of the audio's length
+    /// for days without a voiced time); 0 before the first one.
     pub wpm: u32,
     /// Consecutive days with a dictation, ending today, or yesterday if today has none yet.
     pub streak: u32,

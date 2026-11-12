@@ -7,13 +7,17 @@
 use std::cell::RefCell;
 use std::io;
 use std::ptr;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
-use oxi_core::hotkey::{Chord, Ctx, Key, KeyInput, Tracker};
+use oxi_core::hotkey::{Chord, Ctx, Key, KeyId, KeyInput, Tracker};
 use oxi_core::machine::{Event, Phase, PhaseCell};
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::SystemInformation::GetTickCount;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, PM_NOREMOVE,
@@ -21,10 +25,64 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_APP, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
 };
 
+use super::input::MODIFIERS;
 use super::keys;
 
 /// `dwExtraInfo` of every key `OxiYapper` injects ("OXIY"): the hook passes such keys untracked.
 pub const INJECT_TAG: usize = 0x4F58_4959;
+
+/// The person's own key-downs the hook saw (see [`own_key`]); only compared, never a key.
+static OWN_KEYS: AtomicU64 = AtomicU64::new(0);
+/// The hook is installed: while it is not, [`own_keys`] cannot tell and answers `None`.
+static HOOKED: AtomicBool = AtomicBool::new(false);
+
+/// When the last `ChordDown` was pressed, by the key event's own time (d11).
+static CHORD_DOWN_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// When the chord went down for the last `ChordDown`, once: the key event's own time, so the
+/// wait before the hook ran counts too (within the 10-16 ms tick). `None` once taken.
+pub fn take_chord_down() -> Option<Instant> {
+    CHORD_DOWN_AT.lock().ok()?.take()
+}
+
+/// `now` moved back by the age of a key event stamped `event_ms`, `now_ms` being the tick count
+/// (`GetTickCount`, the base of the hook's `time`) at `now`. The count wraps every 49.7 days; an
+/// age past a minute is no real key-down, so it gives `now`.
+fn pressed_at(now: Instant, now_ms: u32, event_ms: u32) -> Instant {
+    let age = Duration::from_millis(u64::from(now_ms.wrapping_sub(event_ms)));
+    if age > Duration::from_secs(60) {
+        return now;
+    }
+    now.checked_sub(age).unwrap_or(now)
+}
+
+/// How many of the person's own key-downs the hook has seen, for the optional Enter's "field
+/// edited" check; `None` while no hook is installed. Windows may drop a hook that answered too
+/// slowly without telling: then the count stands still.
+pub fn own_keys() -> Option<u64> {
+    HOOKED
+        .load(Ordering::Relaxed)
+        .then(|| OWN_KEYS.load(Ordering::Relaxed))
+}
+
+/// A key-down of the person's own that may edit a field: not injected by us, not a modifier
+/// alone, not a chord key pressed while the rest of the chord is `held` (its re-press in the
+/// hold gap, its auto-repeat). A chord key alone types (Space of Ctrl+Space): it counts.
+/// Unknown keys count (ISO `<>` types), so does Esc.
+fn own_key(input: KeyInput, chord: &Chord, held: impl Fn(Key) -> bool) -> bool {
+    if !input.down || input.ours {
+        return false;
+    }
+    match input.key {
+        KeyId::Known(k) => {
+            // `is_held` with every key down but this one is false only when it is a chord key.
+            let chord_key = !chord.is_held(|c| c != k);
+            let dictation = chord_key && chord.is_held(|c| c == k || held(c));
+            !MODIFIERS.contains(&k) && !dictation
+        }
+        KeyId::Other(_) => true,
+    }
+}
 
 /// Posted to the hook thread when [`Command`]s wait in its channel.
 const WM_HOOK_COMMAND: u32 = WM_APP;
@@ -169,6 +227,7 @@ fn run(state: State, commands: &Receiver<Command>, ready: &Sender<io::Result<u32
             return;
         }
     };
+    HOOKED.store(true, Ordering::Relaxed);
     // SAFETY: no arguments, no preconditions.
     let _ = ready.send(Ok(unsafe { GetCurrentThreadId() }));
     // SAFETY: `msg` is a valid MSG; a null window takes every message of this thread.
@@ -179,6 +238,7 @@ fn run(state: State, commands: &Receiver<Command>, ready: &Sender<io::Result<u32
             }
         }
     }
+    HOOKED.store(false, Ordering::Relaxed);
     uninstall(hook);
 }
 
@@ -189,6 +249,7 @@ fn apply(command: Command, hook: &mut HHOOK) {
             tracing::error!(error = %e, "hotkey hook reinstall failed");
             ptr::null_mut()
         });
+        HOOKED.store(!hook.is_null(), Ordering::Relaxed);
     }
     STATE.with_borrow_mut(|state| {
         let Some(s) = state.as_mut() else { return };
@@ -269,10 +330,20 @@ fn on_key(event: &KBDLLHOOKSTRUCT, wparam: WPARAM) -> bool {
             recording: s.phase.load() == Phase::Recording,
             capture_swallow: s.capture_swallow,
         };
+        if own_key(input, s.tracker.chord(), keys::key_held) {
+            OWN_KEYS.fetch_add(1, Ordering::Relaxed);
+        }
         #[cfg_attr(not(test), expect(unused_mut))]
         let mut verdict = s.tracker.on_key(input, ctx);
         #[cfg(test)]
         tests::seam(input, &mut verdict);
+        if verdict.event == Some(Event::ChordDown)
+            && let Ok(mut at) = CHORD_DOWN_AT.lock()
+        {
+            // SAFETY: no arguments; reads the tick count.
+            let now_ms = unsafe { GetTickCount() };
+            *at = Some(pressed_at(Instant::now(), now_ms, event.time));
+        }
         if let Some(event) = verdict.event {
             let _ = s.on_event.send(event);
         }
@@ -311,6 +382,46 @@ mod tests {
         } else if !input.down && FORCE_START_BLOCKER.load(Ordering::Relaxed) {
             verdict.suppress_start = true;
         }
+    }
+
+    /// d11 review #3: the key-down time comes from the event's own tick, across the wrap.
+    #[test]
+    fn a_key_down_is_dated_by_its_own_tick() {
+        let now = Instant::now() + Duration::from_secs(120);
+        let at = |now_ms, event_ms| now - pressed_at(now, now_ms, event_ms);
+        assert_eq!(at(5_000, 4_700), Duration::from_millis(300));
+        assert_eq!(at(100, u32::MAX - 199), Duration::from_millis(300));
+        assert_eq!(at(5_000, 5_000), Duration::ZERO);
+        // A stamp from the future or a minute old is no key-down of this press.
+        assert_eq!(at(5_000, 5_001), Duration::ZERO);
+        assert_eq!(at(70_000, 1_000), Duration::ZERO);
+    }
+
+    /// Review d08 #4: what counts as the person's own key for the optional Enter.
+    #[test]
+    fn own_keys_are_untagged_downs_other_than_modifiers_and_the_chord() {
+        let chord = Chord::parse(&["Ctrl".into(), "Space".into()]).unwrap();
+        let key = |key, down, ours| KeyInput { key, down, ours };
+        let a = KeyId::Known(Key::A);
+        let ctrl_down = |k: Key| k == Key::LCtrl;
+        for (input, want) in [
+            (key(a, true, false), true),
+            (key(KeyId::Known(Key::Esc), true, false), true),
+            (key(KeyId::Other(0xE2), true, false), true),
+            (key(a, false, false), false),
+            (key(a, true, true), false),
+            (key(KeyId::Known(Key::Space), true, false), false),
+            (key(KeyId::Known(Key::RCtrl), true, false), false),
+            (key(KeyId::Known(Key::LShift), true, false), false),
+        ] {
+            assert_eq!(own_key(input, &chord, ctrl_down), want, "{input:?}");
+        }
+        // Review d08 re-review: a bare Space with Ctrl up types a space into the field.
+        let space = key(KeyId::Known(Key::Space), true, false);
+        assert!(own_key(space, &chord, |_| false));
+        // Typing while the whole chord is held still counts.
+        let held = |k: Key| matches!(k, Key::LCtrl | Key::Space);
+        assert!(own_key(key(a, true, false), &chord, held));
     }
 
     // Live: needs OXI_HOOK_TEST=1 and `--test-threads=1`; injects F13 chords and a swallowed Esc.

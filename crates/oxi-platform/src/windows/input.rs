@@ -6,7 +6,7 @@ use std::thread;
 use std::time::Duration;
 
 use oxi_core::hotkey::Key;
-use oxi_core::paste::{Foreground, Input, InputBlocked};
+use oxi_core::paste::{Focus, Foreground, Input, InputBlocked};
 use oxi_core::types::Millis;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM};
 use windows_sys::Win32::Security::{
@@ -18,14 +18,15 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, GetForegroundWindow, GetWindowThreadProcessId,
+    EnumChildWindows, GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo,
+    GetWindowThreadProcessId,
 };
 use windows_sys::core::BOOL;
 
 use super::keys;
 
 /// Ctrl, Shift, Alt and Win, both sides: the keys step 2 waits on.
-const MODIFIERS: [Key; 8] = [
+pub(super) const MODIFIERS: [Key; 8] = [
     Key::LCtrl,
     Key::RCtrl,
     Key::LShift,
@@ -55,6 +56,10 @@ impl Input for Keyboard {
         foreground()
     }
 
+    fn focus(&mut self) -> Option<Focus> {
+        focus()
+    }
+
     fn send_chord(&mut self, keys: &[Key]) -> Result<(), InputBlocked> {
         keys::send_keys(&chord_events(keys)).map_err(|_| InputBlocked)
     }
@@ -74,6 +79,33 @@ fn chord_events(keys: &[Key]) -> Vec<(Key, bool)> {
     let downs = keys.iter().map(|&k| (k, true));
     let ups = keys.iter().rev().map(|&k| (k, false));
     downs.chain(ups).collect()
+}
+
+/// The foreground window, its focused control and the hook's count of the person's own keys.
+/// `None` without a foreground window (the lock screen, a UAC prompt and other secure desktops
+/// have none for us), when its GUI thread cannot be read, or with no key hook installed. Handles
+/// and a counter only: nothing of the field's text is touched.
+fn focus() -> Option<Focus> {
+    let keys = super::hook::own_keys()?;
+    // SAFETY: no arguments.
+    let window = unsafe { GetForegroundWindow() };
+    if window.is_null() {
+        return None;
+    }
+    // SAFETY: a live local out parameter; a null pid pointer is allowed.
+    let thread = unsafe { GetWindowThreadProcessId(window, ptr::null_mut()) };
+    // SAFETY: all-zero is a valid GUITHREADINFO; `cbSize` is set as the call requires.
+    let mut info: GUITHREADINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = size_of::<GUITHREADINFO>().try_into().unwrap_or(u32::MAX);
+    // SAFETY: `info` is a live local with its size set.
+    if thread == 0 || unsafe { GetGUIThreadInfo(thread, &raw mut info) } == 0 {
+        return None;
+    }
+    Some(Focus {
+        window: window as usize,
+        control: info.hwndFocus as usize,
+        keys,
+    })
 }
 
 fn foreground() -> Foreground {

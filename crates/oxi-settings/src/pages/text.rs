@@ -10,11 +10,17 @@ use std::sync::mpsc;
 use std::time::Duration;
 use std::{fs, io, thread};
 
-use oxi_core::config::{Paste, PasteMode, PasteRule};
+use oxi_core::config::{FileFormat, FileMode, Output, Paste, PasteMode, PasteRule, Text};
 use oxi_core::dictionary::{BUDGET, build_prompt, token_count};
+use oxi_core::languages::LANGUAGES;
+use oxi_core::models::{self, MODELS, ModelStatus};
 use oxi_core::paths::Layout;
 use oxi_core::strings;
-use oxi_core::text::{ReplaceRules, decode_text_file};
+use oxi_core::text::{
+    ReplaceRules, decode_text_file, fillers_from_lines, fillers_to_lines, snippets_from_lines,
+    snippets_to_lines,
+};
+use oxi_core::types::Language;
 use slint::{
     ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, Timer,
     TimerMode, VecModel, Weak,
@@ -51,6 +57,7 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     let s = window.global::<TextState>();
     s.set_budget(int(BUDGET));
     bind_paste(window, ctx);
+    bind_processing(window, ctx);
     for file in FILES {
         refresh(&s, &ctx.layout, file);
     }
@@ -87,6 +94,99 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     });
 }
 
+/// Change `[text]` and save at once.
+fn apply_text(weak: &Weak<AppWindow>, ctx: &Ctx, edit: impl FnOnce(&mut Text)) {
+    edit(&mut ctx.config.borrow_mut().config.text);
+    report(weak, ctx.save());
+}
+
+/// The Processing tab: `[text]`. Switches save at once; sliders and the two line editors save once
+/// they rest, like the restore delay.
+fn bind_processing(window: &AppWindow, ctx: &Ctx) {
+    let s = window.global::<TextState>();
+    let file = ctx.config.borrow();
+    let text = &file.config.text;
+    s.set_pause_punctuation(text.pause_punctuation);
+    s.set_pause_sentence_ms(to_f32(text.pause_sentence_ms));
+    s.set_pause_paragraph_ms(to_f32(text.pause_paragraph_ms));
+    s.set_filler_filter(text.filler_filter);
+    s.set_fillers(fillers_to_lines(&text.fillers).into());
+    s.set_voice_commands(text.voice_commands);
+    s.set_snippets(snippets_to_lines(&text.snippets).into());
+    s.set_confidence_filter(text.confidence_filter);
+    s.set_confidence_min(text.confidence_min);
+    drop(file);
+
+    let (w, c) = (window.as_weak(), ctx.clone());
+    s.on_pause_punctuation_toggled(move |on| apply_text(&w, &c, |t| t.pause_punctuation = on));
+    let (w, c) = (window.as_weak(), ctx.clone());
+    s.on_filler_filter_toggled(move |on| apply_text(&w, &c, |t| t.filler_filter = on));
+    let (w, c) = (window.as_weak(), ctx.clone());
+    s.on_voice_commands_toggled(move |on| apply_text(&w, &c, |t| t.voice_commands = on));
+    let (w, c) = (window.as_weak(), ctx.clone());
+    s.on_confidence_filter_toggled(move |on| apply_text(&w, &c, |t| t.confidence_filter = on));
+
+    let (w, c) = (window.as_weak(), ctx.clone());
+    let save = Rc::new(SaveDebounce::new(w, c.clone()));
+    let rest = |save: &Rc<SaveDebounce>, c: &Ctx, edit: Box<dyn FnOnce(&mut Text)>| {
+        edit(&mut c.config.borrow_mut().config.text);
+        save.touch();
+    };
+    let (c2, s2) = (c.clone(), save.clone());
+    s.on_pause_sentence_changed(move |ms| {
+        let ms = to_u32(ms).clamp(
+            *Text::PAUSE_SENTENCE_MS.start(),
+            *Text::PAUSE_SENTENCE_MS.end(),
+        );
+        rest(&s2, &c2, Box::new(move |t| t.pause_sentence_ms = ms));
+    });
+    let (c2, s2) = (c.clone(), save.clone());
+    s.on_pause_paragraph_changed(move |ms| {
+        // 0 is off; anything else is at least the range's start.
+        let ms = to_u32(ms);
+        let ms = if ms == 0 {
+            0
+        } else {
+            ms.clamp(
+                *Text::PAUSE_PARAGRAPH_MS.start(),
+                *Text::PAUSE_PARAGRAPH_MS.end(),
+            )
+        };
+        rest(&s2, &c2, Box::new(move |t| t.pause_paragraph_ms = ms));
+    });
+    let (c2, s2) = (c.clone(), save.clone());
+    s.on_confidence_min_changed(move |v| {
+        let v = v.clamp(0.05, 0.95);
+        rest(&s2, &c2, Box::new(move |t| t.confidence_min = v));
+    });
+    let (c2, s2) = (c.clone(), save.clone());
+    s.on_fillers_edited(move |lines| {
+        let fillers = fillers_from_lines(&lines);
+        rest(&s2, &c2, Box::new(move |t| t.fillers = fillers));
+    });
+    s.on_snippets_edited(move |lines| {
+        let snippets = snippets_from_lines(&lines);
+        rest(&save, &c, Box::new(move |t| t.snippets = snippets));
+    });
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "a delay in ms is far below 2^24"
+)]
+fn to_f32(ms: u32) -> f32 {
+    ms as f32
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "clamped to 0..=10000 first"
+)]
+fn to_u32(v: f32) -> u32 {
+    v.round().clamp(0.0, 10_000.0) as u32
+}
+
 fn bind_paste(window: &AppWindow, ctx: &Ctx) {
     let s = window.global::<TextState>();
     let file = ctx.config.borrow();
@@ -94,6 +194,7 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
     s.set_paste_mode(i32::from(paste.mode == PasteMode::Type));
     s.set_trailing_space(paste.trailing_space);
     s.set_keep_history(paste.keep_in_clipboard_history);
+    s.set_press_enter(paste.press_enter);
     #[allow(
         clippy::cast_precision_loss,
         reason = "a delay in ms is far below 2^24"
@@ -122,6 +223,8 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
     s.on_trailing_space_toggled(move |on| apply(&w, &c, |p| p.trailing_space = on));
     let (w, c) = (window.as_weak(), ctx.clone());
     s.on_keep_history_toggled(move |on| apply(&w, &c, |p| p.keep_in_clipboard_history = on));
+    let (w, c) = (window.as_weak(), ctx.clone());
+    s.on_press_enter_toggled(move |on| apply(&w, &c, |p| p.press_enter = on));
     let (w, c) = (window.as_weak(), ctx.clone());
     let save = SaveDebounce::new(w, c.clone());
     s.on_restore_delay_changed(move |ms| {
@@ -162,6 +265,279 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
         });
     });
     bind_rules(window, ctx);
+    bind_profiles(window, ctx);
+}
+
+/// The profile editor of a rule and the to-file settings. Profile fields in the order of
+/// `TextState::profile_values`: language, model, to file, dictionary, replacements, voice
+/// commands, filler words, pause punctuation.
+fn bind_profiles(window: &AppWindow, ctx: &Ctx) {
+    let s = window.global::<TextState>();
+    s.set_profile_rule(-1);
+    s.set_language_names(shared(language_names()));
+    show_output(&s, &ctx.config.borrow().config.output);
+    // What each row of the model Combo writes, as the open profile listed them.
+    let listed: Rc<std::cell::RefCell<Vec<Option<String>>>> = Rc::default();
+
+    let (w, c, shown) = (window.as_weak(), ctx.clone(), listed.clone());
+    s.on_profile_opened(move |i| {
+        let file = c.config.borrow();
+        let Some(rule) = usize::try_from(i)
+            .ok()
+            .and_then(|i| file.config.paste.rules.get(i))
+        else {
+            return;
+        };
+        let dir = c.layout.models_dir();
+        let ids = profile_models(&dir, &file.config.model.custom_path, rule.model.as_deref());
+        let values = profile_values(rule, &ids);
+        let names = ids
+            .iter()
+            .map(|id| model_name(id.as_deref(), &dir))
+            .collect();
+        *shown.borrow_mut() = ids;
+        with(&w, |s| {
+            s.set_model_names(shared(names));
+            if let Some(row) = s
+                .get_rules()
+                .row_data(usize::try_from(i).unwrap_or_default())
+            {
+                s.set_profile_name(row.name);
+                s.set_profile_icon(row.icon);
+            }
+            s.set_profile_app(rule.app.as_str().into());
+            s.set_profile_values(ModelRc::from(Rc::new(VecModel::from(values))));
+            s.set_profile_rule(i);
+        });
+    });
+    let (w, c) = (window.as_weak(), ctx.clone());
+    // Arrowing through a Combo picks on every step: save once it rests, like the mode Combo.
+    let save = SaveDebounce::new(w.clone(), c.clone());
+    s.on_profile_picked(move |field, index| {
+        let Some(i) = w
+            .upgrade()
+            .and_then(|win| usize::try_from(win.global::<TextState>().get_profile_rule()).ok())
+        else {
+            return;
+        };
+        change(&w, &c, |p| {
+            if let Some(rule) = p.rules.get_mut(i) {
+                set_profile_field(rule, field, index, &listed.borrow());
+            }
+        });
+        save.touch();
+    });
+
+    let (w, c) = (window.as_weak(), ctx.clone());
+    s.on_file_mode_picked(move |i| {
+        c.config.borrow_mut().config.output.file_mode = match i {
+            1 => FileMode::Also,
+            2 => FileMode::Only,
+            _ => FileMode::Off,
+        };
+        report(&w, c.save());
+    });
+    let (w, c) = (window.as_weak(), ctx.clone());
+    s.on_file_format_picked(move |i| {
+        c.config.borrow_mut().config.output.file_format = if i == 1 {
+            FileFormat::Txt
+        } else {
+            FileFormat::Md
+        };
+        report(&w, c.save());
+    });
+    // The daemon's to-file warning comes through the Model page, which hears every Status
+    // already (one subscriber per page).
+    s.set_file_warning(SharedString::new());
+    let (w, c) = (window.as_weak(), ctx.clone());
+    s.on_file_folder_choose(move || {
+        let current = c.config.borrow().config.output.file_folder.clone();
+        let start = Some(PathBuf::from(&current))
+            .filter(|dir| dir.is_dir())
+            .unwrap_or_default();
+        let Some(path) = pick_folder(&start) else {
+            return;
+        };
+        c.config.borrow_mut().config.output.file_folder = path.to_string_lossy().into_owned();
+        with(&w, |s| show_output(&s, &c.config.borrow().config.output));
+        report(&w, c.save());
+    });
+}
+
+/// The paste worker's to-file line among the daemon's warnings; empty when there is none.
+pub(super) fn file_warning(warnings: &[String]) -> String {
+    warnings
+        .iter()
+        .find(|w| w.starts_with(oxi_core::paste::file::WRITE_FAILED))
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[cfg(windows)]
+fn pick_folder(start: &Path) -> Option<PathBuf> {
+    rfd::FileDialog::new().set_directory(start).pick_folder()
+}
+
+/// No native dialog on this OS: the folder is set in the file.
+#[cfg(not(windows))]
+fn pick_folder(_: &Path) -> Option<PathBuf> {
+    None
+}
+
+fn show_output(s: &TextState<'_>, out: &Output) {
+    s.set_file_mode(match out.file_mode {
+        FileMode::Off => 0,
+        FileMode::Also => 1,
+        FileMode::Only => 2,
+    });
+    s.set_file_format(i32::from(out.file_format == FileFormat::Txt));
+    s.set_file_folder(out.file_folder.as_str().into());
+    let name = Path::new(&out.file_folder)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    s.set_file_folder_name(name.into());
+}
+
+fn shared(names: Vec<String>) -> ModelRc<SharedString> {
+    ModelRc::from(Rc::new(VecModel::from(
+        names
+            .into_iter()
+            .map(SharedString::from)
+            .collect::<Vec<_>>(),
+    )))
+}
+
+/// "Default", "Auto", then every language of the table.
+fn language_names() -> Vec<String> {
+    ["Default", "Auto"]
+        .into_iter()
+        .map(String::from)
+        .chain(LANGUAGES.iter().map(|l| l.english.to_owned()))
+        .collect()
+}
+
+/// What each row of a rule's model Combo writes: Default, the downloaded models, the own file
+/// when one is set, and the rule's model when it is none of these (shown, so it can be seen and
+/// changed; the daemon falls back from it).
+fn profile_models(dir: &Path, custom_path: &str, current: Option<&str>) -> Vec<Option<String>> {
+    let mut ids: Vec<Option<String>> = std::iter::once(None)
+        .chain(
+            MODELS
+                .iter()
+                .filter(|m| downloaded(m, dir))
+                .map(|m| Some(m.id.to_owned())),
+        )
+        .chain((!custom_path.trim().is_empty()).then(|| Some("custom".to_owned())))
+        .collect();
+    let current = current.map(str::to_owned);
+    if current.is_some() && !ids.contains(&current) {
+        ids.push(current);
+    }
+    ids
+}
+
+fn downloaded(m: &models::ModelEntry, dir: &Path) -> bool {
+    matches!(
+        models::status(m, dir),
+        ModelStatus::Ready | ModelStatus::NeedsHash
+    )
+}
+
+/// The Combo row of model `id` (`None` is Default); a registry model not on disk says so.
+fn model_name(id: Option<&str>, dir: &Path) -> String {
+    let missing = strings::model_badge(ModelStatus::Missing);
+    match id {
+        None => "Default".to_owned(),
+        Some("custom") => "Own model file".to_owned(),
+        Some(id) => match models::find(id) {
+            Some(m) if downloaded(m, dir) => m.display_name.to_owned(),
+            Some(m) => format!("{}: {missing}", m.display_name),
+            None => format!("{id}: {missing}"),
+        },
+    }
+}
+
+fn language_at(i: i32) -> Option<Language> {
+    match usize::try_from(i).ok()? {
+        0 => None,
+        1 => Some(Language::AUTO),
+        n => LANGUAGES.get(n - 2).and_then(|l| l.code.parse().ok()),
+    }
+}
+
+fn language_index(lang: Option<Language>) -> i32 {
+    let Some(lang) = lang else { return 0 };
+    if lang == Language::AUTO {
+        return 1;
+    }
+    LANGUAGES
+        .iter()
+        .position(|l| l.code == lang.as_str())
+        .map_or(0, |p| int(p + 2))
+}
+
+/// The model row `i` of `ids` writes; past the list is Default.
+fn model_at(i: i32, ids: &[Option<String>]) -> Option<String> {
+    usize::try_from(i)
+        .ok()
+        .and_then(|i| ids.get(i).cloned().flatten())
+}
+
+fn model_index(id: Option<&str>, ids: &[Option<String>]) -> i32 {
+    ids.iter().position(|m| m.as_deref() == id).map_or(0, int)
+}
+
+/// 0 default, 1 on, 2 off.
+fn tri(v: Option<bool>) -> i32 {
+    v.map_or(0, |on| if on { 1 } else { 2 })
+}
+
+fn from_tri(i: i32) -> Option<bool> {
+    match i {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
+fn profile_values(r: &PasteRule, models: &[Option<String>]) -> Vec<i32> {
+    vec![
+        language_index(r.language),
+        model_index(r.model.as_deref(), models),
+        match r.to_file {
+            None => 0,
+            Some(FileMode::Off) => 1,
+            Some(FileMode::Also) => 2,
+            Some(FileMode::Only) => 3,
+        },
+        tri(r.dictionary),
+        tri(r.replacements),
+        tri(r.voice_commands),
+        tri(r.filler_filter),
+        tri(r.pause_punctuation),
+    ]
+}
+
+fn set_profile_field(r: &mut PasteRule, field: i32, i: i32, models: &[Option<String>]) {
+    match field {
+        0 => r.language = language_at(i),
+        1 => r.model = model_at(i, models),
+        2 => {
+            r.to_file = match i {
+                1 => Some(FileMode::Off),
+                2 => Some(FileMode::Also),
+                3 => Some(FileMode::Only),
+                _ => None,
+            }
+        }
+        3 => r.dictionary = from_tri(i),
+        4 => r.replacements = from_tri(i),
+        5 => r.voice_commands = from_tri(i),
+        6 => r.filler_filter = from_tri(i),
+        7 => r.pause_punctuation = from_tri(i),
+        _ => {}
+    }
 }
 
 /// The search field, its list and the apps popup.
@@ -949,6 +1325,25 @@ mod tests {
             .dispatch_event(WindowEvent::KeyReleased { text });
     }
 
+    /// Review d03 #9: "Hold doubtful words back" follows History saving switched after the page
+    /// was bound, without reopening the window.
+    #[test]
+    fn hold_back_follows_history_saving_switched_later() {
+        i_slint_backend_testing::init_no_event_loop();
+        let layout = crate::testing::layout("text", "hold-follow");
+        let config = "version = 2\n[history]\nenabled = false\n";
+        fs::write(layout.config_file(), config).unwrap();
+        let window = crate::open(layout).unwrap();
+        let t = window.global::<TextState>();
+        assert!(!t.get_history_on());
+        // What the System page's switch (and History's "Turn on") write.
+        let system = window.global::<crate::generated::SystemState>();
+        system.set_history_on(true);
+        assert!(t.get_history_on());
+        system.set_history_on(false);
+        assert!(!t.get_history_on());
+    }
+
     #[test]
     fn scan_runs_on_a_worker_and_the_ui_thread_stays_free() {
         let (window, layout) = per_app("worker", None, many_apps("worker", 300));
@@ -1344,6 +1739,85 @@ mode = \"type\"
             .unwrap();
     }
 
+    /// Review d08-fix #4: the Processing tab with "Press Enter after pasting" on in Clipboard mode
+    /// (its "!") and off, drawn by the software renderer at 720x520 and 1280x860 in both themes,
+    /// into `OXI_SHOTS_DIR` as `settings-text-<enter|words>-<on|off>-<w>-<theme>.png` (Processing,
+    /// then Words). Nothing runs without it.
+    #[test]
+    fn shots_press_enter() {
+        let Some(dir) = std::env::var_os("OXI_SHOTS_DIR").map(PathBuf::from) else {
+            return;
+        };
+        std::thread::spawn(move || draw_press_enter(&dir))
+            .join()
+            .unwrap();
+    }
+
+    fn draw_press_enter(dir: &std::path::Path) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use slint::platform::software_renderer::{
+            MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
+        };
+        use slint::platform::{Platform, WindowAdapter};
+
+        use crate::ThemeChoice;
+
+        thread_local! {
+            static LAST: RefCell<Option<Rc<MinimalSoftwareWindow>>> = const { RefCell::new(None) };
+        }
+        struct Shots;
+        impl Platform for Shots {
+            fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
+                let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+                LAST.with_borrow_mut(|last| *last = Some(window.clone()));
+                Ok(window)
+            }
+        }
+
+        fs::create_dir_all(dir).unwrap();
+        slint::platform::set_platform(Box::new(Shots)).unwrap();
+        for (state, on) in [("on", true), ("off", false)] {
+            for (theme, choice) in [("light", ThemeChoice::Light), ("dark", ThemeChoice::Dark)] {
+                let layout =
+                    crate::testing::layout("text-enter-shots", &format!("{state}-{theme}"));
+                let config = format!("version = 2\n[paste]\npress_enter = {on}\n");
+                fs::write(layout.config_file(), config).unwrap();
+                let window = crate::open(layout).unwrap();
+                window.set_page(Page::Text);
+                window.set_theme(choice);
+                window.show().unwrap();
+                let surface = LAST.with_borrow(Clone::clone).unwrap();
+                // 4: Processing, 5: Words (`real_window` has no name for the second).
+                for (tab, name) in [(4, "enter"), (5, "words")] {
+                    window.global::<TextState>().set_tab(tab);
+                    for (w, h) in [(720_u32, 520_u32), (1280, 860)] {
+                        surface.set_size(slint::PhysicalSize::new(w, h));
+                        slint::platform::update_timers_and_animations();
+                        surface.request_redraw();
+                        let mut buffer = vec![PremultipliedRgbaColor::default(); (w * h) as usize];
+                        assert!(surface.draw_if_needed(|r| {
+                            r.render(&mut buffer, w as usize);
+                        }));
+                        let bytes = buffer
+                            .iter()
+                            .flat_map(|p| [p.red, p.green, p.blue, p.alpha])
+                            .collect();
+                        tiny_skia::Pixmap::from_vec(
+                            bytes,
+                            tiny_skia::IntSize::from_wh(w, h).unwrap(),
+                        )
+                        .unwrap()
+                        .save_png(dir.join(format!("settings-text-{name}-{state}-{w}-{theme}.png")))
+                        .unwrap();
+                    }
+                }
+                window.hide().unwrap();
+            }
+        }
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "one drawing loop over states, themes and sizes"
@@ -1464,6 +1938,145 @@ rules = []
                 }
                 window.hide().unwrap();
             }
+        }
+    }
+    #[test]
+    fn a_rules_profile_opens_in_the_card_edits_its_fields_and_saves() {
+        let config = "version = 2
+[[paste.rules]]
+app = \"a.exe\"
+mode = \"type\"
+voice_commands = true
+";
+        let (window, layout) = per_app("profile", Some(config), shortcuts("profile", &[]));
+        let turbo = oxi_core::models::find("turbo").unwrap();
+        fs::create_dir_all(layout.models_dir()).unwrap();
+        crate::testing::fake_model(&layout.models_dir().join(turbo.file_name), turbo.size);
+        let s = window.global::<TextState>();
+        assert_eq!(s.get_profile_rule(), -1);
+        s.invoke_profile_opened(0);
+        // d04-fix 1: only what is on disk is offered.
+        let names: Vec<SharedString> = s.get_model_names().iter().collect();
+        assert_eq!(names, ["Default", turbo.display_name]);
+        assert_eq!(s.get_profile_rule(), 0);
+        assert_eq!(s.get_profile_app(), "a.exe");
+        // The rule's own values show, the rest read Default.
+        let values: Vec<i32> = s.get_profile_values().iter().collect();
+        assert_eq!(values, [0, 0, 0, 0, 0, 1, 0, 0]);
+        let ru = super::language_names()
+            .iter()
+            .position(|n| n == "Russian")
+            .unwrap();
+        s.invoke_profile_picked(0, i32::try_from(ru).unwrap());
+        s.invoke_profile_picked(1, 1);
+        s.invoke_profile_picked(2, 3);
+        s.invoke_profile_picked(3, 2);
+        s.invoke_profile_picked(5, 0);
+        mock_elapsed_time(Duration::from_millis(350));
+        let text = fs::read_to_string(layout.config_file()).unwrap();
+        let rule = oxi_core::config::ConfigFile::parse(&text)
+            .unwrap()
+            .config
+            .paste
+            .rules
+            .remove(0);
+        assert_eq!(rule.language, Some(oxi_core::types::Language::RU));
+        assert_eq!(rule.model.as_deref(), Some("turbo"));
+        assert_eq!(rule.to_file, Some(oxi_core::config::FileMode::Only));
+        assert_eq!(rule.dictionary, Some(false));
+        assert_eq!(rule.voice_commands, None, "Default drops the key");
+        assert_eq!(
+            rule.mode,
+            Some(oxi_core::config::PasteMode::Type),
+            "the mode is untouched"
+        );
+    }
+
+    #[test]
+    fn the_to_file_settings_save_to_output() {
+        let (window, layout) = per_app("tofile", None, shortcuts("tofile", &[]));
+        let s = window.global::<TextState>();
+        assert_eq!((s.get_file_mode(), s.get_file_format()), (0, 0));
+        s.invoke_file_mode_picked(2);
+        s.invoke_file_format_picked(1);
+        let text = fs::read_to_string(layout.config_file()).unwrap();
+        let out = oxi_core::config::ConfigFile::parse(&text)
+            .unwrap()
+            .config
+            .output;
+        assert_eq!(
+            (out.file_mode, out.file_format),
+            (
+                oxi_core::config::FileMode::Only,
+                oxi_core::config::FileFormat::Txt
+            )
+        );
+    }
+
+    /// Review d04 #5: a failed to-file write shows on the file row until the daemon clears it,
+    /// and goes with the daemon.
+    #[test]
+    fn a_failed_file_write_warns_on_the_file_row() {
+        use crate::ipc::{Event, Link};
+        use oxi_core::ipc::Push;
+        let (window, ipc, _sent, _layout) = crate::testing::linked("text", "filewarn", Page::Text);
+        let s = window.global::<TextState>();
+        let line = format!("{}: entity not found", oxi_core::paste::file::WRITE_FAILED);
+        let status = |warnings: Vec<String>| {
+            Event::Push(Push::Status {
+                phase: oxi_core::machine::Phase::Idle,
+                model: "turbo".into(),
+                device: oxi_core::device::DeviceChoice::Auto,
+                backend: "cpu".into(),
+                loaded: true,
+                warnings,
+            })
+        };
+        ipc.deliver(&status(vec![
+            "sounds.start: empty, using rise".into(),
+            line.clone(),
+        ]));
+        assert_eq!(s.get_file_warning(), line.as_str(), "its own line only");
+        let gpu_row = window
+            .global::<crate::generated::ModelState>()
+            .get_warning();
+        assert_eq!(gpu_row, "", "not a model warning");
+        ipc.deliver(&status(Vec::new()));
+        assert_eq!(s.get_file_warning(), "");
+        ipc.deliver(&status(vec![line]));
+        ipc.deliver(&Event::Link(Link::Offline));
+        assert_eq!(s.get_file_warning(), "");
+    }
+
+    #[test]
+    fn the_profile_lists_map_both_ways() {
+        use super::{
+            from_tri, language_at, language_index, language_names, model_at, model_index,
+            profile_models, tri,
+        };
+        for (i, name) in language_names().iter().enumerate() {
+            let lang = language_at(i32::try_from(i).unwrap());
+            assert_eq!(lang.is_none(), name == "Default");
+            assert_eq!(language_index(lang), i32::try_from(i).unwrap());
+        }
+        // d04-fix 1: nothing downloaded lists Default, the own file and the rule's own model.
+        let nowhere = std::path::Path::new("oxi-no-models-here");
+        let ids = profile_models(nowhere, "C:/m/mine.bin", Some("tiny"));
+        assert_eq!(ids, [None, Some("custom".into()), Some("tiny".into())]);
+        for i in 0..ids.len() {
+            let i = i32::try_from(i).unwrap();
+            assert_eq!(model_index(model_at(i, &ids).as_deref(), &ids), i);
+        }
+        assert_eq!(model_at(999, &ids), None, "past the list is Default");
+        assert_eq!(model_index(Some("nope"), &ids), 0);
+        assert_eq!(
+            profile_models(nowhere, " ", None),
+            [None],
+            "no file, no own row"
+        );
+        assert_eq!(language_at(999), None);
+        for v in [None, Some(true), Some(false)] {
+            assert_eq!(from_tri(tri(v)), v);
         }
     }
 }

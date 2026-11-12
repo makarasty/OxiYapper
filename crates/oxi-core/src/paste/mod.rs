@@ -5,7 +5,12 @@ use crate::config::{Paste, PasteMode, PasteRule, TypeSpeed};
 use crate::hotkey::{Chord, Key};
 use crate::types::Millis;
 
+mod enter;
+pub mod file;
+mod profile;
 mod typing;
+pub use enter::{EnterSkip, Focus, enter_after, enter_decision};
+pub use profile::{Profile, profile};
 pub use typing::chunk_end;
 
 #[cfg(test)]
@@ -27,6 +32,9 @@ pub enum PasteOutcome {
     /// Nothing landed: `SendInput` inserted no events, a secure desktop, or setting the
     /// clipboard failed. The coordinator keeps the text for "Copy last text" (item 42).
     Failed,
+    /// To-file only: the text was for the file alone and its write failed. Kept for "Copy last
+    /// text" like [`Self::Failed`].
+    FileFailed,
 }
 
 /// Why the paste worker did not send the paste chord itself.
@@ -197,6 +205,19 @@ pub trait Clipboard {
     /// Puts `text` on the clipboard, never uploaded to the cloud clipboard and in the OS
     /// clipboard history (Win+V) only if `in_history`; returns the new sequence number.
     fn set_text(&mut self, text: &str, in_history: bool) -> Result<u32, ClipError>;
+    /// [`set_text`](Self::set_text) for the text a paste chord follows at once ([`paste_with`]
+    /// only). A clipboard may put it so it sees who reads it (Windows: delayed rendering, the
+    /// optional Enter's proof); then [`settle`](Self::settle) must put it plainly.
+    fn set_pasted(&mut self, text: &str, in_history: bool) -> Result<u32, ClipError> {
+        self.set_text(text, in_history)
+    }
+    /// After the paste chord and the restore delay, before the history wait and the restore: a
+    /// clipboard whose [`set_pasted`](Self::set_pasted) put the text its own way writes it plainly
+    /// now (in history as asked there) and answers that write's number. `None`: nothing to do, or
+    /// someone else wrote since (theirs stays). The default does nothing.
+    fn settle(&mut self) -> Option<u32> {
+        None
+    }
     /// The current clipboard sequence number (`changeCount` on macOS).
     fn sequence(&self) -> u32;
     /// Puts saved data back, never uploaded to the cloud clipboard and in history only if
@@ -267,6 +288,12 @@ pub trait Input {
     /// Whether any of Ctrl, Shift, Alt, Win (either side) is physically down.
     fn modifiers_held(&self) -> bool;
     fn foreground(&self) -> Foreground;
+    /// The foreground window, its focused control and the person's own key-down count; `None`
+    /// when the OS gives none (a locked or secure desktop, no key hook) or this input cannot tell
+    /// (the default), which stops the optional Enter.
+    fn focus(&mut self) -> Option<Focus> {
+        None
+    }
     /// Presses `keys` in order and releases them in reverse.
     fn send_chord(&mut self, keys: &[Key]) -> Result<(), InputBlocked>;
     /// One input batch: key-down and key-up for each UTF-16 unit, in order. No sleep inside.
@@ -886,7 +913,7 @@ pub fn paste_with<C: Clipboard>(
         };
         saved = newer;
     }
-    let Ok(seq) = clip.set_text(text, room.in_history(keep)) else {
+    let Ok(seq) = clip.set_pasted(text, room.in_history(keep)) else {
         // The set may have emptied the clipboard: put the user's data back.
         let _ = clip.restore(&saved, false);
         return PasteOutcome::Failed;
@@ -896,6 +923,9 @@ pub fn paste_with<C: Clipboard>(
         report(PasteStep::Landed);
         input.sleep(plan.restore_delay);
     }
+    // Owner 2026-11-12, option A: a text put for the Enter's proof goes on plainly now, so the
+    // history wait and the restore judge by this write (a delayed render may move the number).
+    let seq = clip.settle().unwrap_or(seq);
     // Before the restore: the history reads the clipboard late, and a restore before it saw
     // the dictation would lose the entry. Usually registered within the restore delay: one look.
     if let Room::Free(base) = room {
@@ -959,6 +989,10 @@ fn type_text(
     report: &mut dyn FnMut(PasteStep),
 ) -> PasteOutcome {
     report(PasteStep::Typed(why));
+    // SPEC: no auto-Enter but the opt-in `paste.press_enter` after the whole text (`enter.rs`). A
+    // typed line break is an Enter key (sends a message, runs a command), so on every typed path
+    // (mode, app rule, clipboard fallback) it goes as one space.
+    let text = crate::text::flatten(&text.replace("\r\n", "\n").replace('\r', "\n"));
     let units: Vec<u16> = text.encode_utf16().collect();
     let total = units.len();
     let mut from = 0;

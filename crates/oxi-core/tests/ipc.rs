@@ -129,6 +129,7 @@ fn pushes() -> Vec<Push> {
                 model: "turbo".into(),
                 language: "auto".into(),
                 text: Spoken("test".into()),
+                held: Vec::new(),
             },
         },
         Push::HistoryRemoved {

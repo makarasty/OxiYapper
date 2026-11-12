@@ -6,7 +6,7 @@
 //! A failed write comes back as a warning and never reaches the paste. The text is written to
 //! the files and nowhere else: no log line, no error string carries it.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ use std::thread::{self, JoinHandle};
 use oxi_core::audio::{SAMPLE_RATE, resample};
 use oxi_core::config::{ConfigFile, History};
 use oxi_core::history::{self, EXTENSIONS, Entry, JSON, Meta, Status, TXT, WAV};
-use oxi_core::ipc::{HistoryItem, Push, Spoken};
+use oxi_core::ipc::{HeldText, HistoryItem, Push, Spoken};
 use oxi_core::machine::Notice;
 use oxi_core::stats::Date;
 use oxi_core::tuning::SettingsSet;
@@ -167,10 +167,20 @@ fn handle_in(
         HistoryCmd::Save {
             samples,
             text,
+            words,
+            held,
+            delivered,
             cfg,
             spool,
             carried,
-        } => (cfg, Some((samples, text, spool, carried))),
+        } => {
+            let heard = Heard {
+                words,
+                held,
+                delivered,
+            };
+            (cfg, Some((samples, text, heard, spool, carried)))
+        }
     };
     let dir = history::folder(&cfg, default_dir);
     let claimed = if cfg.enabled { claim(&dir) } else { Ok(()) };
@@ -180,9 +190,18 @@ fn handle_in(
         Some(format!("History not saved ({:?})", e.kind()))
     };
     match dictation {
-        Some((samples, text, spool, carried)) if cfg.enabled => {
-            let saved = claimed
-                .and_then(|()| save(&dir, &samples, &text, spool.as_deref(), now, &context()));
+        Some((samples, text, heard, spool, carried)) if cfg.enabled => {
+            let saved = claimed.and_then(|()| {
+                save_with(
+                    &dir,
+                    &samples,
+                    &text,
+                    &heard,
+                    spool.as_deref(),
+                    now,
+                    &context(),
+                )
+            });
             match saved {
                 Ok(item) => {
                     pass.added.push(item);
@@ -200,7 +219,7 @@ fn handle_in(
         }
         _ => {
             // Saving was turned off during the dictation: its streamed recordings go too.
-            if let Some((_, _, spool, carried)) = dictation {
+            if let Some((_, _, _, spool, carried)) = dictation {
                 remove_spools(spool.iter().chain(&carried));
             }
             if let Err(e) = &claimed {
@@ -287,14 +306,8 @@ fn id_of(dir: &Path, base: &Path) -> Option<String> {
 
 fn meta(id: &str, duration_ms: u64, status: Status, ctx: &Context) -> Meta {
     Meta {
-        version: Meta::VERSION,
-        started: history::started(id).unwrap_or_default(),
-        duration_ms,
-        status,
-        model: ctx.model.clone(),
-        language: ctx.language.clone(),
         settings: ctx.settings.clone(),
-        previous: None,
+        ..Meta::basic(id, duration_ms, status, &ctx.model, &ctx.language)
     }
 }
 
@@ -310,16 +323,43 @@ fn wav_error(e: WavError) -> io::Error {
     }
 }
 
+/// What the whisper worker and the text pipeline made besides the text, for the entry's json.
+struct Heard {
+    words: Vec<history::Word>,
+    held: Vec<history::HeldPart>,
+    delivered: Option<history::Delivered>,
+}
+
+/// [`save_with`] for a text with only words.
+#[cfg(test)]
+fn save(
+    dir: &Path,
+    samples: &[f32],
+    text: &str,
+    words: &[history::Word],
+    spool: Option<&Path>,
+    now: (Date, u32),
+    ctx: &Context,
+) -> io::Result<HistoryItem> {
+    let heard = Heard {
+        words: words.to_vec(),
+        held: Vec::new(),
+        delivered: None,
+    };
+    save_with(dir, samples, text, &heard, spool, now, ctx)
+}
+
 /// Writes `<dir>/<day>/<time>.wav`, then `.txt`, then `.json`; a failure removes what was written,
 /// so an entry is all three files or none. The recording that streamed to disk while `samples`
 /// were recorded (`spool`, carried by the job) gives the entry its name (the time it started): it becomes the `.wav` first and
 /// is then replaced by the processed audio, so the audio is on disk at every step. If a later
 /// step fails that audio stays, since it may be all there is of the recording; with no `.txt` it
 /// lists as failed. An empty text means a cancelled recording that was kept.
-fn save(
+fn save_with(
     dir: &Path,
     samples: &[f32],
     text: &str,
+    heard: &Heard,
     spool: Option<&Path>,
     (date, ms): (Date, u32),
     ctx: &Context,
@@ -348,7 +388,17 @@ fn save(
     let duration_ms = samples.len() as u64 * 1000 / u64::from(SAMPLE_RATE);
     let id = id_of(dir, &base).unwrap_or_default();
     write_atomic(&base.with_extension(TXT), text.as_bytes())
-        .and_then(|()| write_meta(&base, &meta(&id, duration_ms, status, ctx)))
+        .and_then(|()| {
+            write_meta(
+                &base,
+                &Meta {
+                    words: heard.words.clone(),
+                    held: heard.held.clone(),
+                    delivered: heard.delivered,
+                    ..meta(&id, duration_ms, status, ctx)
+                },
+            )
+        })
         .map(|()| HistoryItem {
             id: id.clone(),
             status,
@@ -356,6 +406,7 @@ fn save(
             model: ctx.model.clone(),
             language: ctx.language.clone(),
             text: Spoken(text.to_owned()),
+            held: heard.held.iter().map(HeldText::from).collect(),
         })
         .inspect_err(|_| {
             let written = if spooled.is_some() {
@@ -467,7 +518,12 @@ fn recover_part(
     let duration_ms = fixed.data_bytes / 2 * 1000 / u64::from(fixed.sample_rate);
     let id = id_of(dir, &base).unwrap_or_default();
     write_atomic(&base.with_extension(TXT), b"")?;
-    write_meta(&base, &meta(&id, duration_ms, status, ctx))?;
+    // The recovered audio is the raw microphone audio, whatever its rate.
+    let raw = Meta {
+        raw: true,
+        ..meta(&id, duration_ms, status, ctx)
+    };
+    write_meta(&base, &raw)?;
     Ok(Some(HistoryItem {
         id,
         status,
@@ -475,12 +531,23 @@ fn recover_part(
         model: ctx.model.clone(),
         language: ctx.language.clone(),
         text: Spoken(String::new()),
+        held: Vec::new(),
     }))
 }
 
 /// Every entry of `dir`: the `.wav`, `.txt` and `.json` files named `HHMMSS-mmm` in day folders.
 fn scan(dir: &Path, pass: &mut Pass) -> Vec<Entry> {
-    let mut sizes: BTreeMap<String, u64> = BTreeMap::new();
+    scan_stamped(dir, pass)
+        .into_iter()
+        .map(|(stem, (bytes, _))| Entry { stem, bytes })
+        .collect()
+}
+
+/// [`scan`] with a stamp of each entry's files (their sizes and change times, as the folder
+/// listing gives them): a new stamp means a file of the entry was written.
+fn scan_stamped(dir: &Path, pass: &mut Pass) -> BTreeMap<String, (u64, u64)> {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    let mut sizes: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     for day in day_dirs(dir, pass) {
         let day_name = day.file_name().map(|n| n.to_string_lossy().into_owned());
         for file in day_files(&day, pass) {
@@ -498,14 +565,19 @@ fn scan(dir: &Path, pass: &mut Pass) -> Vec<Entry> {
             if let Some(meta) = pass.check("size a file", file.metadata())
                 && meta.is_file()
             {
-                *sizes.entry(format!("{day_name}/{stem}")).or_default() += meta.len();
+                let stamp = BuildHasherDefault::<DefaultHasher>::default().hash_one((
+                    path.extension(),
+                    meta.len(),
+                    meta.modified().ok(),
+                ));
+                let entry = sizes.entry(format!("{day_name}/{stem}")).or_default();
+                entry.0 += meta.len();
+                // A sum: the order the folder lists the files in does not matter.
+                entry.1 = entry.1.wrapping_add(stamp);
             }
         }
     }
     sizes
-        .into_iter()
-        .map(|(stem, bytes)| Entry { stem, bytes })
-        .collect()
 }
 
 /// Removes the files of the entry `stem` and its day folder when that ends up empty. Only regular
@@ -540,6 +612,7 @@ fn prune(dir: &Path, cfg: &History, today: Date, pass: &mut Pass) {
 // (`crates/oxi-core/src/ipc.rs`); until they are wired the daemon never calls them.
 
 /// One saved recording as the History page shows it.
+#[derive(Clone)]
 pub struct Recording {
     /// `YYYY-MM-DD/HHMMSS-mmm`, the id every call below takes.
     pub id: String,
@@ -612,6 +685,100 @@ pub fn list(dir: &Path) -> Vec<Recording> {
     list_from(dir, None).collect()
 }
 
+/// The entries a search has read (arch-plan 7.5): each with the stamp its files had then and its
+/// folded text. Kept by the settings connection, so a query reads only what is new or changed
+/// since the last.
+#[derive(Default)]
+pub struct SearchCache {
+    dir: PathBuf,
+    read: HashMap<String, (u64, String, Recording)>,
+}
+
+/// The recordings in `dir` that pass `filter` and hold every word of `query`, newest first,
+/// older than `older_than`. The folder is listed each time (no file opened); an entry is read
+/// only when `cache` has no copy of it with the same stamp, so an entry saved, edited or deleted
+/// since is seen at once and the rest is not read again. A day filter skips the other days
+/// without reading them. shortcut: the stamp is the files' size and change time, so a rewrite
+/// to the same size within one tick of the file clock (FAT: 2 s) is missed until the next change.
+pub fn search<'a>(
+    dir: &'a Path,
+    query: &'a str,
+    filter: &'a history::Filter,
+    older_than: Option<&'a str>,
+    cache: &'a mut SearchCache,
+) -> impl Iterator<Item = Recording> + 'a {
+    search_with(dir, query, filter, older_than, cache, read_recording)
+}
+
+/// [`search`] with the reader of one entry given.
+fn search_with<'a>(
+    dir: &'a Path,
+    query: &'a str,
+    filter: &'a history::Filter,
+    older_than: Option<&'a str>,
+    cache: &'a mut SearchCache,
+    mut read: impl FnMut(&Path, String) -> Option<Recording> + 'a,
+) -> impl Iterator<Item = Recording> + 'a {
+    let entries = if owned(dir) {
+        scan_stamped(dir, &mut Pass::default())
+    } else {
+        BTreeMap::new()
+    };
+    if cache.dir != dir {
+        dir.clone_into(&mut cache.dir);
+        cache.read.clear();
+    }
+    cache.read.retain(|id, _| entries.contains_key(id));
+    let day = filter.day.map(|d| d.to_string());
+    entries
+        .into_iter()
+        .rev()
+        // Ids are `YYYY-MM-DD/HHMMSS-mmm`: text order is time order.
+        .filter(move |(id, _)| older_than.is_none_or(|o| id.as_str() < o))
+        .filter(move |(id, _)| day.as_deref().is_none_or(|d| id.starts_with(d)))
+        .filter_map(move |(id, (_, stamp))| {
+            if cache.read.get(&id).is_none_or(|(at, ..)| *at != stamp) {
+                let rec = read(dir, id.clone())?;
+                let folded = history::fold(&rec.text);
+                cache.read.insert(id.clone(), (stamp, folded, rec));
+            }
+            let (_, folded, rec) = cache.read.get(&id)?;
+            let searched = history::Searched {
+                text_lower: folded,
+                day: history::day_dir(id.get(..10)?)?,
+                duration_ms: rec.meta.duration_ms,
+            };
+            history::matches(query, filter, &searched).then(|| rec.clone())
+        })
+}
+
+/// The run context of a transcribed file: the model and audio settings of `config_file` and the
+/// language the file was transcribed in.
+pub fn file_context(config_file: &Path, language: &str) -> Context {
+    Context {
+        language: language.to_owned(),
+        ..Context::from_config_file(config_file)
+    }
+}
+
+/// Saves a transcribed file as a new record: `samples` are the 16 kHz mono copy, `text` the
+/// result. Delivered nowhere (`unknown`). Not pruned here: the next dictation's pass does it.
+pub fn save_transcribed(
+    dir: &Path,
+    samples: &[f32],
+    text: &str,
+    ctx: &Context,
+    now: (Date, u32),
+) -> io::Result<HistoryItem> {
+    claim(dir)?;
+    let heard = Heard {
+        words: Vec::new(),
+        held: Vec::new(),
+        delivered: Some(history::Delivered::Unknown),
+    };
+    save_with(dir, samples, text, &heard, None, now, ctx)
+}
+
 /// The audio of recording `id` as 16 kHz mono samples, ready for whisper (a recovered one is at
 /// the device rate and is resampled).
 #[allow(dead_code, reason = "wired to IPC by t12")]
@@ -642,14 +809,41 @@ fn write_version(base: &Path, text: &str, meta: &Meta) -> io::Result<()> {
 /// A transcript of recording `id` made again: the text replaces the old one, the meta says it is
 /// done and names the model, language and settings of this run. The old text and its run stay
 /// as the other version (`Meta::previous`), unless there was no text.
-#[allow(dead_code, reason = "wired to IPC by t12")]
+#[cfg(test)]
 pub fn set_text(dir: &Path, id: &str, text: &str, ctx: &Context) -> io::Result<()> {
+    set_text_with_words(dir, id, text, ctx, Vec::new())
+}
+
+/// [`set_text`] that also stores the words of the new run (their confidences; times only when the
+/// run made them). Words a timing pass made (`timings` set) stay: they describe the audio, which a
+/// new run does not change. Only a confidence-only list is replaced by the new run's.
+pub fn set_text_with_words(
+    dir: &Path,
+    id: &str,
+    text: &str,
+    ctx: &Context,
+    words: Vec<history::Word>,
+) -> io::Result<()> {
     let base = entry_base(dir, id)?;
     let (old_text, old) = read_version(&base);
     let duration_ms = old
         .as_ref()
         .map_or_else(|| wav_ms(&base.with_extension(WAV)), |m| m.duration_ms);
     let mut new = meta(id, duration_ms, Status::Done, ctx);
+    // The audio does not change with the text: raw stays raw. What was held back and how the
+    // dictation arrived belong to the dictation, not to one version of its text.
+    if let Some(old) = &old {
+        new.raw = old.raw;
+        new.held.clone_from(&old.held);
+        new.delivered = old.delivered;
+    }
+    match old.as_ref().filter(|m| m.timings.is_some()) {
+        Some(timed) => {
+            new.words.clone_from(&timed.words);
+            new.timings.clone_from(&timed.timings);
+        }
+        None => new.words = words,
+    }
     if !old_text.is_empty() {
         let old = old.unwrap_or_else(|| meta(id, duration_ms, Status::Done, &Context::default()));
         new.previous = Some(old.as_previous(&old_text));
@@ -675,6 +869,76 @@ pub fn edit_text(dir: &Path, id: &str, text: &str) -> io::Result<()> {
         ..old
     };
     write_version(&base, text, &new)
+}
+
+/// The words of a transcript for the record: the confidence of each, and the times when the
+/// engine that ran was a timing one. Empty text never becomes a word.
+pub fn words_of(transcript: &oxi_whisper::Transcript) -> Vec<history::Word> {
+    let ms = |t: Option<oxi_core::types::Millis>| t.map(|m| u32::try_from(m.0).unwrap_or(u32::MAX));
+    transcript
+        .segments
+        .iter()
+        .flat_map(|s| &s.words)
+        .map(|w| history::Word {
+            w: w.text.clone(),
+            // NaN would break the equality `Meta` has, and 0 reads as "doubtful".
+            p: if w.p.is_nan() {
+                0.0
+            } else {
+                w.p.clamp(0.0, 1.0)
+            },
+            t0: ms(w.t0),
+            t1: ms(w.t1),
+        })
+        .collect()
+}
+
+/// How the times of a pass were made, for `timings` in the record.
+pub fn timings_of(timing: oxi_whisper::Timing, model: &str) -> history::Timings {
+    match timing {
+        oxi_whisper::Timing::Dtw(preset) => history::Timings {
+            by: history::TimingBy::Dtw,
+            preset: preset.name().to_owned(),
+            model: model.to_owned(),
+        },
+        oxi_whisper::Timing::Tokens => history::Timings {
+            by: history::TimingBy::Tokens,
+            preset: String::new(),
+            model: model.to_owned(),
+        },
+    }
+}
+
+/// The stored words of recording `id` and how their times were made (`None` while they have
+/// none). Empty for a record from before words were kept.
+pub fn read_words(
+    dir: &Path,
+    id: &str,
+) -> io::Result<(Vec<history::Word>, Option<history::Timings>)> {
+    let base = entry_base(dir, id)?;
+    let (_, meta) = read_version(&base);
+    Ok(meta.map_or_else(Default::default, |m| (m.words, m.timings)))
+}
+
+/// Stores the words a timing pass made as the words of recording `id`, with how they were made.
+/// Only the meta file is written; `NotFound` when the entry has none to put them in.
+pub fn store_timed_words(
+    dir: &Path,
+    id: &str,
+    words: Vec<history::Word>,
+    timings: history::Timings,
+) -> io::Result<()> {
+    let base = entry_base(dir, id)?;
+    let (_, meta) = read_version(&base);
+    let meta = meta.ok_or(io::ErrorKind::NotFound)?;
+    write_meta(
+        &base,
+        &Meta {
+            words,
+            timings: Some(timings),
+            ..meta
+        },
+    )
 }
 
 /// Swaps the transcript of recording `id` with its other version; `NotFound` when none is kept.
@@ -780,6 +1044,9 @@ pub(crate) mod tests {
         HistoryCmd::Save {
             samples: vec![0.25; 1600],
             text: TEXT.into(),
+            words: vec![word("hello", 0.3, None)],
+            held: Vec::new(),
+            delivered: None,
             cfg,
             spool,
             carried: Vec::new(),
@@ -1139,6 +1406,9 @@ pub(crate) mod tests {
         let cmd = HistoryCmd::Save {
             samples: vec![0.25; 1600],
             text: String::new(),
+            words: Vec::new(),
+            held: Vec::new(),
+            delivered: None,
             cfg: cfg(true),
             spool: None,
             carried: Vec::new(),
@@ -1378,6 +1648,9 @@ pub(crate) mod tests {
         HistoryCmd::Save {
             samples: vec![0.25; 1600],
             text: TEXT.into(),
+            words: Vec::new(),
+            held: Vec::new(),
+            delivered: None,
             cfg: cfg(true),
             spool,
             carried: vec![carried.to_owned()],
@@ -1787,5 +2060,360 @@ pub(crate) mod tests {
         assert_eq!(sorted, seen, "newest first, no duplicate");
         assert!(!seen.contains(&gone.unwrap()), "a deleted entry is skipped");
         assert_eq!(seen.len(), 1999, "no gap");
+    }
+
+    fn word(w: &str, p: f32, t: Option<(u32, u32)>) -> history::Word {
+        history::Word {
+            w: w.into(),
+            p,
+            t0: t.map(|t| t.0),
+            t1: t.map(|t| t.1),
+        }
+    }
+
+    #[test]
+    fn a_save_keeps_the_words_and_a_retranscribe_keeps_timed_ones() {
+        let dir = owned_temp("words");
+        let id = "2026-11-08/090000-000";
+        let base = dir.join(id);
+        fs::create_dir_all(base.parent().unwrap()).unwrap();
+        write_wav(&base.with_extension(WAV), &vec![0.5; 16_000]).unwrap();
+        save(
+            &dir,
+            &vec![0.5; 16_000],
+            "hello world",
+            &[word("hello", 0.9, None), word("world", 0.3, None)],
+            None,
+            (Date::from_ymd(2026, 11, 8).unwrap(), 9 * 3_600_000),
+            &ctx(),
+        )
+        .unwrap();
+        let (words, timings) = read_words(&dir, id).unwrap();
+        assert_eq!(words.len(), 2);
+        assert!(words[1].is_doubtful() && timings.is_none());
+
+        // The timing pass stores its own list.
+        let timed = vec![
+            word("hello", 0.9, Some((0, 400))),
+            word("world", 0.3, Some((500, 900))),
+        ];
+        let how = timings_of(
+            oxi_whisper::Timing::Dtw(oxi_whisper::DtwPreset::LargeV3),
+            "podlodka",
+        );
+        store_timed_words(&dir, id, timed.clone(), how.clone()).unwrap();
+        assert_eq!(
+            read_words(&dir, id).unwrap(),
+            (timed.clone(), Some(how.clone()))
+        );
+        // A text edit keeps them: they describe the audio.
+        edit_text(&dir, id, "hello there").unwrap();
+        assert_eq!(read_words(&dir, id).unwrap().0, timed);
+        // Transcribe again keeps the timed list and its timings: the audio is the same.
+        set_text_with_words(&dir, id, "again", &ctx(), vec![word("again", 0.8, None)]).unwrap();
+        assert_eq!(
+            read_words(&dir, id).unwrap(),
+            (timed.clone(), Some(how.clone()))
+        );
+        set_text(&dir, id, "third", &ctx()).unwrap();
+        assert_eq!(read_words(&dir, id).unwrap(), (timed, Some(how)));
+        // An id that is not an owned entry has none to give or take.
+        assert!(read_words(&dir, "2026-11-08/110000-000").is_err());
+        assert!(
+            store_timed_words(
+                &dir,
+                "../x",
+                Vec::new(),
+                timings_of(oxi_whisper::Timing::Tokens, "")
+            )
+            .is_err()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_save_keeps_the_held_parts_and_how_it_was_delivered() {
+        let dir = owned_temp("held");
+        let held = vec![history::HeldPart {
+            text: "doubtful".into(),
+            t0: 100,
+            t1: 900,
+            why: oxi_core::text::HeldWhy::NoSpeech,
+        }];
+        let mut cmd = save_cmd(cfg(true));
+        if let HistoryCmd::Save {
+            held: h,
+            delivered: d,
+            ..
+        } = &mut cmd
+        {
+            h.clone_from(&held);
+            *d = Some(history::Delivered::Filtered);
+        }
+        assert_eq!(handle(cmd, &dir, clock(), &ctx), None);
+        let base = dir.join("2026-11-08/130000-123");
+        let meta = meta_of(&base);
+        assert_eq!(meta.held, held);
+        assert_eq!(meta.delivered, Some(history::Delivered::Filtered));
+        let json = fs::read_to_string(base.with_extension(JSON)).unwrap();
+        assert!(json.contains("\"why\": \"no_speech\""), "{json}");
+        // Nothing held, nothing written: the plain entry has neither key.
+        assert_eq!(
+            handle(
+                save_cmd(cfg(true)),
+                &dir,
+                (clock().0, clock().1 + 1000),
+                &ctx
+            ),
+            None
+        );
+        let plain = fs::read_to_string(dir.join("2026-11-08/130001-123.json")).unwrap();
+        assert!(!plain.contains("held") && !plain.contains("delivered") && !plain.contains("raw"));
+        // Review d03 #11: Transcribe again, an edit and a restore keep the held parts.
+        let id = "2026-11-08/130000-123";
+        set_text(&dir, id, "again", &ctx()).unwrap();
+        assert_eq!(meta_of(&base).held, held);
+        assert_eq!(meta_of(&base).delivered, Some(history::Delivered::Filtered));
+        edit_text(&dir, id, "edited").unwrap();
+        restore(&dir, id).unwrap();
+        assert_eq!(meta_of(&base).held, held);
+        assert_eq!(meta_of(&base).delivered, Some(history::Delivered::Filtered));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_recovered_recording_is_marked_raw_and_stays_so() {
+        let dir = owned_temp("raw-marker");
+        let id = "2026-11-08/090000-000";
+        killed_part(&dir.join(format!("{id}.wav.part")), 16_000, 0, 3200);
+        let mut pass = Pass::default();
+        recover(&dir, &mut pass, &ctx);
+        let base = dir.join(id);
+        assert!(meta_of(&base).raw, "recovered audio is raw");
+        // A retranscribe and an edit rewrite the status, not the audio.
+        set_text(&dir, id, "again", &ctx()).unwrap();
+        assert!(meta_of(&base).raw && meta_of(&base).status == Status::Done);
+        edit_text(&dir, id, "edited").unwrap();
+        assert!(meta_of(&base).raw);
+        // A dictation the app saved is processed audio.
+        assert_eq!(handle(save_cmd(cfg(true)), &dir, clock(), &ctx), None);
+        assert!(!meta_of(&dir.join("2026-11-08/130000-123")).raw);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_saved_dictation_keeps_the_words_it_came_with() {
+        let dir = owned_temp("save-words");
+        assert_eq!(handle(save_cmd(cfg(true)), &dir, clock(), &ctx), None);
+        let base = dir.join("2026-11-08/130000-123");
+        assert_eq!(meta_of(&base).words, [word("hello", 0.3, None)]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_retranscribe_replaces_a_confidence_only_list() {
+        let dir = owned_temp("words-plain");
+        let id = "2026-11-08/100000-000";
+        save(
+            &dir,
+            &vec![0.5; 16_000],
+            "hello world",
+            &[word("hello", 0.9, None), word("world", 0.3, None)],
+            None,
+            (Date::from_ymd(2026, 11, 8).unwrap(), 10 * 3_600_000),
+            &ctx(),
+        )
+        .unwrap();
+        set_text_with_words(&dir, id, "again", &ctx(), vec![word("again", 0.8, None)]).unwrap();
+        assert_eq!(
+            read_words(&dir, id).unwrap(),
+            (vec![word("again", 0.8, None)], None)
+        );
+        // Without a list (the plain call) there are no words, never the old ones.
+        set_text(&dir, id, "third", &ctx()).unwrap();
+        assert_eq!(read_words(&dir, id).unwrap().0.len(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn words_of_a_transcript_keep_the_confidence_and_the_times_when_there_are_any() {
+        use oxi_core::types::Millis;
+        let w = |text: &str, p: f32, t: Option<(u64, u64)>| oxi_whisper::Word {
+            text: text.into(),
+            p,
+            t0: t.map(|t| Millis(t.0)),
+            t1: t.map(|t| Millis(t.1)),
+        };
+        let seg = |words| oxi_whisper::Segment {
+            text: String::new(),
+            t0: Millis(0),
+            t1: Millis(1),
+            no_speech_prob: 0.0,
+            words,
+        };
+        let transcript = oxi_whisper::Transcript {
+            segments: vec![
+                seg(vec![w("a", 0.5, Some((10, 20))), w("b", f32::NAN, None)]),
+                seg(vec![w("c", 1.5, None)]),
+            ],
+        };
+        assert_eq!(
+            words_of(&transcript),
+            [
+                word("a", 0.5, Some((10, 20))),
+                word("b", 0.0, None),
+                word("c", 1.0, None)
+            ]
+        );
+    }
+
+    /// `entries` as (id, text, duration ms) written the way a save writes them.
+    fn seeded(dir: &Path, entries: &[(&str, &str, u64)]) {
+        for (id, text, ms) in entries {
+            let base = dir.join(id);
+            fs::create_dir_all(base.parent().unwrap()).unwrap();
+            fs::write(base.with_extension(WAV), [0; 8]).unwrap();
+            fs::write(base.with_extension(TXT), text).unwrap();
+            let ctx = Context::default();
+            write_meta(&base, &meta(id, *ms, Status::Done, &ctx)).unwrap();
+        }
+    }
+
+    fn found(
+        dir: &Path,
+        query: &str,
+        filter: &history::Filter,
+        older: Option<&str>,
+    ) -> Vec<String> {
+        search(dir, query, filter, older, &mut SearchCache::default())
+            .map(|r| r.id)
+            .collect()
+    }
+
+    #[test]
+    fn a_search_reads_each_text_once_and_then_only_what_changed() {
+        let dir = owned_temp("search-cache");
+        let ids = many(&dir, 2000);
+        let mut cache = SearchCache::default();
+        let none = history::Filter::default();
+        let walk = |query: &str, cache: &mut SearchCache| {
+            let mut reads = 0;
+            let ids: Vec<String> = search_with(&dir, query, &none, None, cache, |d, id| {
+                reads += 1;
+                read_recording(d, id)
+            })
+            .map(|r| r.id)
+            .collect();
+            (reads, ids)
+        };
+        assert_eq!(
+            walk("zz", &mut cache),
+            (2000, vec![]),
+            "the first reads each once"
+        );
+        assert_eq!(walk("zz", &mut cache), (0, vec![]), "a second reads none");
+        // A new entry, an edited one, one rewritten to the same size and a deleted one: only
+        // the first three are read again.
+        let new = "2026-12-01/100000-000";
+        fs::create_dir_all(dir.join("2026-12-01")).unwrap();
+        fs::write(dir.join(new).with_extension(WAV), [0; 8]).unwrap();
+        fs::write(dir.join(new).with_extension(TXT), "zz new").unwrap();
+        let edited = &ids[10];
+        edit_text(&dir, edited, "zz").unwrap();
+        let same = &ids[20];
+        let txt = dir.join(same).with_extension(TXT);
+        fs::write(&txt, "z").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&txt)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
+        delete(&dir, &ids[30]).unwrap();
+        let (reads, found) = walk("z", &mut cache);
+        assert_eq!(reads, 3);
+        let mut want = vec![new.to_owned(), edited.clone(), same.clone()];
+        want.sort_by(|a, b| b.cmp(a));
+        assert_eq!(found, want);
+        // The deleted one is gone from the answers, with nothing read.
+        let (reads, found) = walk("t", &mut cache);
+        assert_eq!(reads, 0);
+        assert!(!found.contains(&ids[30]));
+        assert_eq!(found.len(), 1997);
+    }
+
+    #[test]
+    fn a_search_lists_the_matches_newest_first_and_the_filters_narrow_it() {
+        let dir = owned_temp("search");
+        seeded(
+            &dir,
+            &[
+                ("2026-11-08/100000-000", "Привет мир", 1000),
+                ("2026-11-09/100000-000", "привет всем", 5000),
+                ("2026-11-09/110000-000", "Ёж пришёл", 9000),
+                ("2026-11-10/100000-000", "ничего", 2000),
+            ],
+        );
+        let none = history::Filter::default();
+        assert_eq!(
+            found(&dir, "ПРИВЕТ", &none, None),
+            ["2026-11-09/100000-000", "2026-11-08/100000-000"]
+        );
+        assert_eq!(
+            found(&dir, "еж пришел", &none, None),
+            ["2026-11-09/110000-000"]
+        );
+        assert_eq!(found(&dir, "", &none, None).len(), 4, "no words: all");
+        assert_eq!(found(&dir, "нет такого", &none, None), Vec::<String>::new());
+        let nov9 = history::Filter {
+            day: history::day_dir("2026-11-09"),
+            ..none.clone()
+        };
+        assert_eq!(found(&dir, "", &nov9, None).len(), 2);
+        let long = history::Filter {
+            min_ms: Some(5000),
+            max_ms: Some(9000),
+            ..none
+        };
+        assert_eq!(found(&dir, "", &long, None).len(), 2);
+        assert_eq!(
+            found(&dir, "привет", &long, None),
+            ["2026-11-09/100000-000"]
+        );
+        // Paging: the same walk as the plain list.
+        assert_eq!(
+            found(
+                &dir,
+                "привет",
+                &history::Filter::default(),
+                Some("2026-11-09/100000-000")
+            ),
+            ["2026-11-08/100000-000"]
+        );
+    }
+
+    #[test]
+    fn a_new_entry_is_found_and_an_edited_one_by_its_new_text_with_nothing_to_rebuild() {
+        let dir = owned_temp("search-fresh");
+        let none = history::Filter::default();
+        seeded(&dir, &[("2026-11-08/100000-000", "alpha", 1000)]);
+        assert_eq!(found(&dir, "beta", &none, None), Vec::<String>::new());
+        seeded(&dir, &[("2026-11-08/110000-000", "beta", 1000)]);
+        assert_eq!(found(&dir, "beta", &none, None), ["2026-11-08/110000-000"]);
+        edit_text(&dir, "2026-11-08/110000-000", "gamma").unwrap();
+        assert_eq!(found(&dir, "beta", &none, None), Vec::<String>::new());
+        assert_eq!(found(&dir, "gamma", &none, None).len(), 1);
+    }
+
+    #[test]
+    fn a_transcribed_file_is_saved_as_a_done_record_delivered_nowhere() {
+        let dir = temp("file-save");
+        let ctx = file_context(&dir.join("none.toml"), "ru");
+        let item = save_transcribed(&dir, &[0.25; 1600], "from a file", &ctx, clock()).unwrap();
+        assert_eq!((item.status, item.duration_ms), (Status::Done, 100));
+        assert_eq!(item.language, "ru");
+        let rec = list_from(&dir, None).next().unwrap();
+        assert_eq!(rec.text, "from a file");
+        assert_eq!(rec.meta.delivered, Some(history::Delivered::Unknown));
     }
 }

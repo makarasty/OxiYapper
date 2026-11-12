@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
+use oxi_core::config::FileMode;
 use oxi_core::config::{Config, History, TypeSpeed};
 use oxi_core::ipc::{DeleteResult, Push, SoundWarning, TestFailure, TestOutcome};
 use oxi_core::machine::{
@@ -16,14 +17,14 @@ use oxi_core::machine::{
     Notice, OverlayState, Phase, PhaseCell, State,
 };
 use oxi_core::overlay;
-use oxi_core::paste::{ClipboardOnlyWhy, PasteOutcome};
+use oxi_core::paste::{ClipboardOnlyWhy, Focus, PasteOutcome, Profile};
 use oxi_core::tray::{self, TrayBadge};
 use oxi_core::types::Millis;
 use oxi_core::{stats, strings};
 
 use super::cmd::{
-    AudioCmd, ChordHook, HistoryCmd, Inbox, IpcAsk, PasteCmd, SoundCmd, StatusReport, UiCmd,
-    WhisperCmd, Workers,
+    AudioCmd, ChordHook, HistoryCmd, Inbox, IpcAsk, PasteCmd, SoundCmd, StatusReport, ToFile,
+    UiCmd, WhisperCmd, Workers,
 };
 use super::stats::Recorder;
 
@@ -112,21 +113,61 @@ pub struct Coordinator<H> {
     capture: u64,
     /// Samples of stopped jobs, until whisper gets them.
     audio: HashMap<JobId, Vec<f32>>,
+    /// The app in front at key-down, now: the exe name (`Input::foreground`). A field so a test
+    /// can name an app without a window.
+    foreground: Box<dyn Fn() -> String>,
+    /// Where input goes now (`Input::focus`), asked at key-down while `paste.press_enter` is on.
+    /// A field so a test can move the focus.
+    focus: Box<dyn Fn() -> Option<Focus>>,
+    /// The session is locked or asleep (`Event::Lock`, `Suspend`, until `Unlock`, `Resume`): a
+    /// recording started now gets no focus, so no Enter (review d08 #5).
+    locked: bool,
+    /// The profile of the recording that is running; goes to its job at `StopCapture`.
+    next_profile: Option<Profile>,
+    /// The profile each job runs with, until its paste (or its end without one).
+    profiles: HashMap<JobId, Profile>,
+    /// Jobs whose text goes to the file only: their entry says `File`, not a paste.
+    file_only: HashSet<JobId>,
+    /// What the pill says instead of the machine's plain end of this step (d03 review #5): the
+    /// machine does not know the confidence filter or to-file mode. Gone when the step ends.
+    cue: Option<OverlayState>,
     /// Text of transcribed jobs, until their paste is done.
     text: HashMap<JobId, String>,
+    /// Whisper's words of transcribed jobs (with their confidence), until the history entry.
+    words: HashMap<JobId, Vec<oxi_core::history::Word>>,
+    /// Parts the confidence filter held back, until the history entry (never pasted, never lost).
+    held: HashMap<JobId, Vec<oxi_core::history::HeldPart>>,
+    /// The held parts of a job with text, joined, until its paste: "Copy last text" gets them
+    /// after the text, so they are not lost when the entry is not written (arch-plan 9.1).
+    held_copy: HashMap<JobId, String>,
     /// Job -> the jobs whose audio goes in front of its own (`Effect::Merge`), until its audio
     /// arrives.
     merges: HashMap<JobId, Vec<JobId>>,
     /// For "Copy last text". Memory only: never written to disk or logs.
     last_text: Option<String>,
-    /// Audio length of each job from its audio to its paste, for the usage stats.
-    spoken: HashMap<JobId, Millis>,
+    /// Audio length of each job, and the voiced part of it, from its audio to its paste, for the
+    /// usage stats.
+    spoken: HashMap<JobId, (Millis, Millis)>,
     /// Counts of finished dictations go here; never their text.
     stats: Option<Recorder>,
     workers: Workers,
     hook: H,
     /// Quit is waiting for the dictation in flight: its text goes to the clipboard, not pasted.
     quitting: bool,
+    /// When the quit grace ends: a to-file write at quit gives up then.
+    quit_by: Option<std::time::Instant>,
+    /// The paste worker's to-file warning (arch-plan 9.4); `None` once a write worked again.
+    file_warning: Option<String>,
+    /// To-file writes sent to the paste worker whose `Inbox::FileWarning` has not come back, by
+    /// job: each write answers exactly one. `true`: a write next to a paste, whose success the
+    /// pill tells ("Also saved", d03-label review #1).
+    file_writes: HashMap<JobId, bool>,
+    /// Writes of a folder no longer written (the folder changed or file mode went off while they
+    /// waited): their warnings are dropped (d04-fix 2).
+    stale_file_writes: HashSet<JobId>,
+    /// The model the newest recording runs with: a recording that starts while jobs still wait
+    /// for whisper keeps it (arch-plan 9.2, no switch mid-queue).
+    model: String,
 }
 
 impl<H: ChordHook> Coordinator<H> {
@@ -170,7 +211,23 @@ impl<H: ChordHook> Coordinator<H> {
             pending: None,
             capture: 0,
             audio: HashMap::new(),
+            foreground: Box::new(|| {
+                use oxi_core::paste::Input;
+                oxi_platform::os::input::Keyboard.foreground().app
+            }),
+            focus: Box::new(|| {
+                use oxi_core::paste::Input;
+                oxi_platform::os::input::Keyboard.focus()
+            }),
+            locked: false,
+            next_profile: None,
+            profiles: HashMap::new(),
+            file_only: HashSet::new(),
+            cue: None,
             text: HashMap::new(),
+            words: HashMap::new(),
+            held: HashMap::new(),
+            held_copy: HashMap::new(),
             merges: HashMap::new(),
             last_text: None,
             spoken: HashMap::new(),
@@ -178,6 +235,11 @@ impl<H: ChordHook> Coordinator<H> {
             workers,
             hook,
             quitting: false,
+            quit_by: None,
+            file_warning: None,
+            file_writes: HashMap::new(),
+            stale_file_writes: HashSet::new(),
+            model: String::new(),
         };
         c.send_config();
         c.sync_warnings();
@@ -209,6 +271,7 @@ impl<H: ChordHook> Coordinator<H> {
     fn shutdown(mut self, inbox: &Receiver<Inbox>, now: &impl Fn() -> Millis, grace: Millis) {
         tracing::info!(phase = ?self.state.phase(), "shutdown requested");
         self.quitting = true;
+        self.quit_by = Some(std::time::Instant::now() + Duration::from_millis(grace.0));
         self.handle(Inbox::Event(Event::Lock), now());
         let end = now() + grace;
         while self.state.busy() {
@@ -217,6 +280,13 @@ impl<H: ChordHook> Coordinator<H> {
                 // Whisper's cancel check reads the phase: Idle ends its run.
                 self.phase.store(Phase::Idle);
                 tracing::warn!("shutdown: a dictation was cut short; a saved recording is kept");
+                // Text in its paste or waiting for one: its `PasteDone` will not come, so the
+                // entry is filed now, delivered unknown (review d03-fix #1: it was lost).
+                let mut texts: Vec<JobId> = self.text.keys().copied().collect();
+                texts.sort_unstable();
+                for job in texts {
+                    self.file_entry(job, Some(oxi_core::history::Delivered::Unknown));
+                }
                 // Earlier parts still waiting for the merge: kept as failed, or deleted when
                 // saving was turned off since.
                 let jobs: Vec<JobId> = self.carried_spools.keys().copied().collect();
@@ -285,11 +355,14 @@ impl<H: ChordHook> Coordinator<H> {
                 job,
                 samples,
                 spool,
-            } => self.job_audio(job, samples, spool, now),
+                voiced_ms,
+            } => self.job_audio(job, samples, spool, Millis(voiced_ms), now),
             // A job merged into a longer dictation: whatever whisper made of it is not used. Its
             // audio may still wait for the merge.
             Inbox::Transcribed { job, .. } if self.state.superseded(job).is_none() => {}
-            Inbox::Transcribed { job, text: None } => {
+            Inbox::Transcribed {
+                job, text: None, ..
+            } => {
                 // The reason kind only: a model failure, else whisper itself.
                 tracing::info!(?job, model_failure = ?self.model_failure, "transcription failed");
                 self.no_text(job);
@@ -298,22 +371,43 @@ impl<H: ChordHook> Coordinator<H> {
             Inbox::Transcribed {
                 job,
                 text: Some(text),
+                words: heard,
+                mut held,
             } => {
+                // Whisper holds every invention (its config waits for idle): kept only when this
+                // job's entry is written with history on now, else dropped as a count (d03-fix #3).
+                if !(self.history_wanted.contains(&job) && self.latest_history().enabled) {
+                    let before = held.len();
+                    held.retain(|h| h.why != oxi_core::text::HeldWhy::Hallucination);
+                    let dropped = before - held.len();
+                    if dropped > 0 {
+                        tracing::info!(?job, dropped, "inventions dropped, no history entry");
+                    }
+                }
                 self.clear_failed(|n, _| n == Notice::TranscriptionFailed);
                 // Counts only: dictated text never goes into the log (AGENTS.md rule 5).
                 let words = text.split_whitespace().count();
-                let audio_ms = self.spoken.get(&job).map_or(0, |m| m.0);
+                let audio_ms = self.spoken.get(&job).map_or(0, |m| m.0.0);
                 tracing::info!(?job, words, audio_ms, "transcription done");
                 let empty = text.trim().is_empty();
-                if empty {
+                if empty && !held.is_empty() && self.state.superseded(job) == Some(true) {
+                    // A newer press carries it on: its audio goes in front of the merged one,
+                    // which is transcribed again. Kept for a give-back (`DropJob`).
+                    self.words.insert(job, heard);
+                    self.held.insert(job, held);
+                } else if empty && !held.is_empty() {
+                    self.file_filtered(job, heard, held);
+                } else if empty {
                     self.no_text(job);
                 } else {
-                    self.text.insert(job, text);
-                    // With the hold gap a longer dictation may still carry this one on: the
-                    // entry is filed when the text is pasted.
-                    if !self.hold_gap_on() {
-                        self.file_history(job);
+                    if !held.is_empty() {
+                        self.held_copy.insert(job, joined(&held));
                     }
+                    self.text.insert(job, text);
+                    self.words.insert(job, heard);
+                    self.held.insert(job, held);
+                    // The entry is filed once the paste says how the text arrived (`delivered`);
+                    // with the hold gap a longer dictation may still carry this one on till then.
                 }
                 self.feed(Event::TranscriptionDone { job, empty }, now);
             }
@@ -330,6 +424,7 @@ impl<H: ChordHook> Coordinator<H> {
             Inbox::EngineWarning(warning) => self.engine_warning = warning,
             Inbox::SoundWarnings(lines) => self.sound_warnings = lines,
             Inbox::HistoryWarning(line) => self.history_warning = line,
+            Inbox::FileWarning { job, line } => self.file_answered(job, line),
             Inbox::Backend(device) => self.backend = device,
             Inbox::Progress { job, percent } => self.progress_report(job, percent),
             Inbox::ModelDownloaded(id) => self.model_downloaded(&id, now),
@@ -354,8 +449,7 @@ impl<H: ChordHook> Coordinator<H> {
     fn event(&mut self, event: Event, now: Millis) {
         if let Event::PasteDone { job, outcome } = event {
             // Logged once, with its reason, by the paste worker.
-            self.count(job, outcome);
-            self.keep_last_text(job);
+            self.landed(job, outcome);
             // A failed paste raises its notice again in `feed`.
             self.failed.clear();
         }
@@ -371,17 +465,29 @@ impl<H: ChordHook> Coordinator<H> {
             }
             // Nothing after the trim, but the earlier parts of the dictation are there.
             if self.merges.contains_key(&job) {
-                let merged = self.take_merged(job, Vec::new());
+                let (merged, voiced) = self.take_merged(job, Vec::new());
                 if !merged.is_empty() {
-                    return self.job_audio(job, merged, None, now);
+                    return self.job_audio(job, merged, None, voiced, now);
                 }
             }
+            // The job ends here: its profile must not hold the next recording's model (d04-fix 2).
+            self.profiles.remove(&job);
         }
         match event {
             Event::ModelFailed(why) => self.model_failure = Some(why),
             Event::ModelLoaded => self.model_failure = None,
+            // The lock screen may hold the focus at both reads, and what was typed meanwhile is
+            // unseen: every dictation of before sends no Enter (review d08 #5).
+            Event::Lock | Event::Suspend => {
+                self.locked = true;
+                let profiles = self.profiles.values_mut().chain(&mut self.next_profile);
+                profiles.for_each(|p| p.focus_at_start = None);
+            }
             // What the window drew may be stale after a sleep or a lock.
-            Event::Resume | Event::Unlock => super::ipc::announce(Push::Woke),
+            Event::Resume | Event::Unlock => {
+                self.locked = false;
+                super::ipc::announce(Push::Woke);
+            }
             _ => {}
         }
         if event == Event::ModelLoaded {
@@ -396,12 +502,46 @@ impl<H: ChordHook> Coordinator<H> {
         self.active.hotkey.hold_gap_ms > 0
     }
 
-    /// The text of `job` is final: its recording and text go to the history worker.
-    fn file_history(&mut self, job: JobId) {
+    /// The paste of `job` ended with `outcome`: the stats, the entry with how the text arrived,
+    /// and "Copy last text".
+    fn landed(&mut self, job: JobId, outcome: PasteOutcome) {
+        use oxi_core::history::Delivered;
+        let only = self.file_only.remove(&job);
+        self.count(job, outcome);
+        if matches!(
+            outcome,
+            PasteOutcome::Pasted | PasteOutcome::PastedNoRestore | PasteOutcome::Typed
+        ) {
+            // One cue: the file first, then the part held back. The file next to a paste is told
+            // when its write answers (`Inbox::FileWarning`), not here: it may still fail.
+            let some_held = self.held.get(&job).is_some_and(|h| confidence_held(h));
+            self.cue = if only {
+                Some(OverlayState::SavedToFile { also: false })
+            } else {
+                some_held.then_some(OverlayState::HeldBack { all: false })
+            };
+        }
+        let delivered = match outcome {
+            PasteOutcome::Pasted if only => Delivered::File,
+            PasteOutcome::Pasted | PasteOutcome::PastedNoRestore => Delivered::Pasted,
+            PasteOutcome::Typed => Delivered::Typed,
+            PasteOutcome::ClipboardOnly(_) => Delivered::Clipboard,
+            PasteOutcome::Failed => Delivered::Failed,
+            PasteOutcome::FileFailed => Delivered::FileFailed,
+        };
+        self.file_entry(job, Some(delivered));
+        self.keep_last_text(job);
+    }
+
+    /// The text of `job` is final: its recording and text go to the history worker, with how
+    /// the text reached the user.
+    fn file_entry(&mut self, job: JobId, delivered: Option<oxi_core::history::Delivered>) {
         let cfg = self.latest_history();
         let spool = self.spools.remove(&job);
         let samples = self.history_audio.remove(&job);
         let text = self.text.get(&job).cloned();
+        let words = self.words.remove(&job).unwrap_or_default();
+        let held = self.held.remove(&job).unwrap_or_default();
         match (samples, text) {
             (Some(samples), Some(text)) if self.history_wanted.remove(&job) => {
                 let carried = self.carried_spools.remove(&job).unwrap_or_default();
@@ -410,6 +550,9 @@ impl<H: ChordHook> Coordinator<H> {
                     HistoryCmd::Save {
                         samples,
                         text,
+                        words,
+                        held,
+                        delivered,
                         cfg,
                         spool,
                         carried,
@@ -424,13 +567,41 @@ impl<H: ChordHook> Coordinator<H> {
         }
     }
 
+    /// The confidence filter held back all of `job`: nothing is pasted, but the entry keeps the
+    /// held text as its own (`delivered` filtered), so the dictation is not lost.
+    fn file_filtered(
+        &mut self,
+        job: JobId,
+        words: Vec<oxi_core::history::Word>,
+        held: Vec<oxi_core::history::HeldPart>,
+    ) {
+        self.profiles.remove(&job);
+        if confidence_held(&held) {
+            self.cue = Some(OverlayState::HeldBack { all: true });
+        }
+        self.text.insert(job, joined(&held));
+        self.words.insert(job, words);
+        self.held.insert(job, held);
+        self.file_entry(job, Some(oxi_core::history::Delivered::Filtered));
+        // Nothing was inserted: "Copy last text" is where it can be had at once.
+        self.keep_last_text(job);
+        self.spoken.remove(&job);
+    }
+
     /// `samples` is the audio of `job`; when a press inside the hold gap carried earlier jobs
     /// on, their audio goes in front. Their results are dropped; their recordings on disk go with
-    /// the merged save (`carried_spools`).
-    fn take_merged(&mut self, job: JobId, samples: Vec<f32>) -> Vec<f32> {
+    /// the merged save (`carried_spools`). Also returns their voiced time, to add to the job's.
+    fn take_merged(&mut self, job: JobId, samples: Vec<f32>) -> (Vec<f32>, Millis) {
         let Some(from) = self.merges.remove(&job) else {
-            return samples;
+            return (samples, Millis(0));
         };
+        // The Enter checks against where the whole dictation started: its first part.
+        let first = from.first().and_then(|j| self.profiles.get(j));
+        let start = first.and_then(|p| p.focus_at_start);
+        if let Some(p) = self.profiles.get_mut(&job) {
+            p.focus_at_start = p.focus_at_start.and(start);
+        }
+        let mut voiced = 0;
         tracing::info!(?job, parts = from.len(), "recording continued");
         let mut all = Vec::new();
         for j in from {
@@ -441,7 +612,12 @@ impl<H: ChordHook> Coordinator<H> {
                 .or_else(|| self.history_audio.remove(&j));
             all.extend(part.unwrap_or_default());
             self.text.remove(&j);
-            self.spoken.remove(&j);
+            self.words.remove(&j);
+            self.held.remove(&j);
+            self.held_copy.remove(&j);
+            // Its profile too: it ends here, with no paste and no `no_text` (review d04 #3).
+            self.profiles.remove(&j);
+            voiced += self.spoken.remove(&j).map_or(0, |(_, v)| v.0);
             self.history_wanted.remove(&j);
             // Its own carried parts too. They stay waiting in the spool registry, so a crash or
             // a quit before the merged save keeps them as failed; the history worker deletes
@@ -451,7 +627,7 @@ impl<H: ChordHook> Coordinator<H> {
             self.carried_spools.entry(job).or_default().extend(carried);
         }
         all.extend(samples);
-        all
+        (all, Millis(voiced))
     }
 
     /// No merged audio of `job` will be written: the recordings of its earlier parts are kept as
@@ -467,6 +643,9 @@ impl<H: ChordHook> Coordinator<H> {
                 let save = HistoryCmd::Save {
                     samples,
                     text,
+                    words: Vec::new(),
+                    held: Vec::new(),
+                    delivered: None,
                     cfg,
                     spool,
                     carried,
@@ -482,8 +661,16 @@ impl<H: ChordHook> Coordinator<H> {
         any
     }
 
-    fn job_audio(&mut self, job: JobId, samples: Vec<f32>, spool: Option<PathBuf>, now: Millis) {
-        let samples = self.take_merged(job, samples);
+    fn job_audio(
+        &mut self,
+        job: JobId,
+        samples: Vec<f32>,
+        spool: Option<PathBuf>,
+        voiced: Millis,
+        now: Millis,
+    ) {
+        let (samples, merged_voiced) = self.take_merged(job, samples);
+        let voiced = Millis(voiced.0.saturating_add(merged_voiced.0));
         if let Some(spool) = spool {
             self.spools.insert(job, spool);
         }
@@ -493,7 +680,8 @@ impl<H: ChordHook> Coordinator<H> {
         self.clear_failed(|n, session| {
             matches!(n, Notice::DeviceLost | Notice::CaptureFailed) && session < capture
         });
-        self.spoken.insert(job, stats::audio_length(samples.len()));
+        self.spoken
+            .insert(job, (stats::audio_length(samples.len()), voiced));
         self.audio.insert(job, samples);
         self.feed(Event::JobAudioReady(job), now);
     }
@@ -550,6 +738,7 @@ impl<H: ChordHook> Coordinator<H> {
     /// merge; if that press fails, the machine gives the job back and drops it (`DropJob`).
     fn no_text(&mut self, job: JobId) {
         if self.state.superseded(job) != Some(true) {
+            self.profiles.remove(&job);
             self.spoken.remove(&job);
             self.no_transcript(job);
         }
@@ -578,6 +767,12 @@ impl<H: ChordHook> Coordinator<H> {
     /// bad file), the machine tries it again instead of refusing every dictation until a config
     /// change, and the failure's tray badge goes at once.
     fn model_downloaded(&mut self, id: &str, now: Millis) {
+        // Whisper keeps a list of per-app models that failed to load; its `Config` clears it, so
+        // a model downloaded again (any, not only the configured one) is tried once more.
+        send(
+            &self.workers.whisper,
+            WhisperCmd::Config(Box::new(self.active.clone())),
+        );
         let config = self.pending.as_ref().map_or(&self.active, |(c, _)| c);
         if config.model.id == id && self.model_failure.is_some() {
             let machine = MachineConfig::from(config);
@@ -707,6 +902,79 @@ impl<H: ChordHook> Coordinator<H> {
                 queue.extend(self.execute(&effect));
             }
         }
+        // A cue no step showed: the next queued dictation runs on under the same pill. The cue
+        // goes up now and that pill after it, once the cue had its time (d03-label review #2).
+        if let Some(cue) = self.cue.take() {
+            self.ui(UiCmd::Overlay(cue));
+            self.ui(UiCmd::Overlay(self.pill));
+        }
+    }
+
+    /// The pill the machine asks for, with the cue of the dictation that just ended.
+    fn overlay(&mut self, state: OverlayState) {
+        let shown = self.cued(state);
+        match self.cue.take() {
+            // Shown in its place, or a new press: that is the news now.
+            Some(_) if shown != state || matches!(state, OverlayState::Recording { .. }) => {}
+            // The next queued dictation goes on at once: the cue of this one goes first, and the
+            // pill keeps it for its time (d03-label review #2).
+            Some(cue) => self.ui(UiCmd::Overlay(cue)),
+            None => {}
+        }
+        self.overlay_progress(shown);
+        self.ui(UiCmd::Overlay(shown));
+    }
+
+    /// The to-file write of `job` answered: its warning, and "Also saved" for a write next to a
+    /// paste that worked (d03-label review #1). By job: a write the full queue refuses answers
+    /// before the writes ahead of it.
+    fn file_answered(&mut self, job: JobId, line: Option<String>) {
+        let also = self.file_writes.remove(&job).unwrap_or(false);
+        // Only on a pill with nothing else to say: a dictation running or a part held back is
+        // the news.
+        if also && line.is_none() && self.pill == OverlayState::Hidden {
+            let cue = OverlayState::SavedToFile { also: true };
+            self.overlay_progress(cue);
+            self.ui(UiCmd::Overlay(cue));
+        }
+        if !self.stale_file_writes.remove(&job) {
+            self.file_warning = line;
+        }
+    }
+
+    /// `state` the machine asks for, or the cue that takes its place: the end of a dictation
+    /// (the pill would hide) or its "nothing heard" when the filter held back all of it.
+    fn cued(&self, state: OverlayState) -> OverlayState {
+        match (state, self.cue) {
+            (
+                OverlayState::Text(Notice::NothingHeard),
+                Some(c @ OverlayState::HeldBack { all: true }),
+            )
+            | (
+                OverlayState::Hidden,
+                Some(
+                    c @ (OverlayState::HeldBack { all: false } | OverlayState::SavedToFile { .. }),
+                ),
+            ) => c,
+            _ => state,
+        }
+    }
+
+    /// The machine gave `job` back with no text to paste: its recording is kept as failed, or,
+    /// when all of it was held, filed like any all-held dictation.
+    fn drop_job(&mut self, job: JobId) {
+        self.profiles.remove(&job);
+        self.audio.remove(&job);
+        self.text.remove(&job);
+        self.held_copy.remove(&job);
+        let words = self.words.remove(&job).unwrap_or_default();
+        match self.held.remove(&job) {
+            Some(held) if !held.is_empty() => self.file_filtered(job, words, held),
+            _ => {
+                self.spoken.remove(&job);
+                self.no_transcript(job);
+            }
+        }
     }
 
     /// Runs one effect; returns the event it answers with, if any.
@@ -715,11 +983,15 @@ impl<H: ChordHook> Coordinator<H> {
             Effect::StartCapture => {
                 self.capture += 1;
                 let session = self.capture;
+                // The microphone first: the profile asks the OS for the app in front (d11).
+                let pressed = self.hook.take_pressed();
+                send(&self.workers.audio, AudioCmd::Start { session, pressed });
                 tracing::info!(session, "recording started");
-                send(&self.workers.audio, AudioCmd::Start { session });
+                self.start_profile();
             }
             Effect::StopCapture(job) => {
                 tracing::info!(?job, "recording stopped");
+                self.stop_profile(job);
                 send(&self.workers.audio, AudioCmd::Stop(job));
             }
             Effect::DiscardCapture => {
@@ -732,13 +1004,9 @@ impl<H: ChordHook> Coordinator<H> {
             Effect::Merge { ref from, into } => {
                 self.merges.insert(into, from.clone());
             }
-            Effect::DropJob(job) => {
-                self.audio.remove(&job);
-                self.text.remove(&job);
-                self.spoken.remove(&job);
-                self.no_transcript(job);
-            }
+            Effect::DropJob(job) => self.drop_job(job),
             Effect::KeepCancelled(job) => {
+                self.profiles.remove(&job);
                 self.spoken.remove(&job);
                 if let Some(samples) = self.audio.remove(&job) {
                     // Interim route until t10's history API has a cancelled entry: the audio is
@@ -752,6 +1020,9 @@ impl<H: ChordHook> Coordinator<H> {
                         HistoryCmd::Save {
                             samples,
                             text,
+                            words: Vec::new(),
+                            held: Vec::new(),
+                            delivered: None,
                             cfg,
                             spool,
                             carried,
@@ -765,10 +1036,12 @@ impl<H: ChordHook> Coordinator<H> {
             Effect::Unload => send(&self.workers.whisper, WhisperCmd::Unload),
             Effect::Transcribe(job) => return self.transcribe(job),
             Effect::Paste(job) => {
-                if self.hold_gap_on() {
-                    self.file_history(job);
+                let answer = self.paste(job);
+                // Answered here (quit, no text), not by the paste worker: the same steps.
+                if let Some(Event::PasteDone { job, outcome }) = answer {
+                    self.landed(job, outcome);
                 }
-                return self.paste(job);
+                return answer;
             }
             Effect::PollChord => {
                 return Some(Event::ChordPolled {
@@ -781,6 +1054,7 @@ impl<H: ChordHook> Coordinator<H> {
                     if config.model.id != self.active.model.id {
                         self.model_failure = None; // another model: not tried yet
                     }
+                    self.file_output_changed(&config.output);
                     self.active = config;
                     self.warnings = warnings;
                     self.send_config();
@@ -795,8 +1069,7 @@ impl<H: ChordHook> Coordinator<H> {
                 {
                     tracing::info!("recording locked");
                 }
-                self.overlay_progress(state);
-                self.ui(UiCmd::Overlay(state));
+                self.overlay(state);
             }
             Effect::Notify(notice) => {
                 if tray::is_error(notice) {
@@ -807,6 +1080,35 @@ impl<H: ChordHook> Coordinator<H> {
             }
         }
         None
+    }
+
+    /// The app in front now decides the language, model and text switches of this recording.
+    /// Whisper hears the model at once: it loads it while the user speaks, or its preload does
+    /// (arch-plan 9.2). While earlier jobs still wait for whisper the recording keeps their
+    /// model: a busy machine never switches mid-queue; language and text switches still apply.
+    fn start_profile(&mut self) {
+        let mut profile = oxi_core::paste::profile(&self.active, &(self.foreground)());
+        let queued = self.profiles.keys().any(|job| !self.text.contains_key(job));
+        if queued && !self.model.is_empty() {
+            profile.model.clone_from(&self.model);
+        }
+        self.model.clone_from(&profile.model);
+        send(
+            &self.workers.whisper,
+            WhisperCmd::UseModel(profile.model.clone()),
+        );
+        // Asked only for the optional Enter: no OS call on the default path.
+        if self.active.paste.press_enter && !self.locked {
+            profile.focus_at_start = (self.focus)();
+        }
+        self.next_profile = Some(profile);
+    }
+
+    /// The recording `job` ended with the profile it started with.
+    fn stop_profile(&mut self, job: JobId) {
+        let profile = self.next_profile.take();
+        let profile = profile.unwrap_or_else(|| oxi_core::paste::profile(&self.active, ""));
+        self.profiles.insert(job, profile);
     }
 
     /// Sends the audio of `job` to whisper; the event when the job fails here.
@@ -845,50 +1147,100 @@ impl<H: ChordHook> Coordinator<H> {
         if wanted || self.hold_gap_on() {
             self.history_audio.insert(job, samples.clone());
         }
+        let profile = self.profiles.get(&job).cloned();
+        let profile = profile.unwrap_or_else(|| oxi_core::paste::profile(&self.active, ""));
         send(
             &self.workers.whisper,
-            WhisperCmd::Transcribe { job, samples },
+            WhisperCmd::Transcribe {
+                job,
+                samples,
+                profile: Box::new(profile),
+            },
         );
         None
     }
 
     /// Hands the text of `job` to the paste worker; the event when the paste is answered here.
-    fn paste(&self, job: JobId) -> Option<Event> {
+    fn paste(&mut self, job: JobId) -> Option<Event> {
+        let profile = self.profiles.remove(&job);
+        let focus_at_start = profile.as_ref().and_then(|p| p.focus_at_start);
+        let to_file = profile.map(|p| p.to_file);
         // Cannot happen (empty text is never pasted); fail the job, not the machine.
         let Some(text) = self.text.get(&job) else {
             let outcome = PasteOutcome::Failed;
             return Some(Event::PasteDone { job, outcome });
         };
         let text = text.clone();
+        let out = &self.active.output;
+        // No folder means no file (`effective_mode`): a rule's mode counts only when one is set.
+        let file = match to_file.unwrap_or(FileMode::Off) {
+            FileMode::Off => None,
+            _ if out.file_folder.trim().is_empty() => None,
+            mode => Some(ToFile {
+                folder: PathBuf::from(out.file_folder.trim()),
+                format: out.file_format,
+                only: mode == FileMode::Only,
+            }),
+        };
         if self.quitting {
             // At quit the focus is the tray or a closing window: the text waits on the
-            // clipboard, and the notice says so ("press Ctrl+V").
+            // clipboard, and the notice says so ("press Ctrl+V"). Its file still gets it, within
+            // the quit grace (review d04 #7).
             let in_history = self.active.paste.keep_in_clipboard_history;
-            send(&self.workers.paste, PasteCmd::CopyOnly { text, in_history });
+            let copy = PasteCmd::CopyOnly {
+                text: text.clone(),
+                in_history,
+            };
+            send(&self.workers.paste, copy);
+            if let Some(to) = file {
+                let until = self.quit_by.unwrap_or_else(std::time::Instant::now);
+                send(&self.workers.paste, PasteCmd::File { text, to, until });
+            }
             let outcome = PasteOutcome::ClipboardOnly(ClipboardOnlyWhy::ModifiersHeld);
             return Some(Event::PasteDone { job, outcome });
         }
+        if let Some(f) = &file {
+            if f.only {
+                self.file_only.insert(job);
+            }
+            self.file_writes.insert(job, !f.only);
+        }
         let cfg = self.active.paste.clone();
-        send(&self.workers.paste, PasteCmd::Paste { job, text, cfg });
+        send(
+            &self.workers.paste,
+            PasteCmd::Paste {
+                job,
+                text,
+                cfg,
+                file,
+                focus_at_start,
+            },
+        );
         None
     }
 
     /// A dictation that reached the field or the clipboard adds its word count and audio length
     /// to the usage stats.
     fn count(&mut self, job: JobId, outcome: PasteOutcome) {
-        let speech = self.spoken.remove(&job).unwrap_or_default();
+        // `voiced` 0 is "not known" (`stats::Stats::voiced_time`): the row stays out of the pause share.
+        let (speech, voiced) = self.spoken.remove(&job).unwrap_or_default();
         if let (Some(stats), Some(text)) = (&self.stats, self.text.get(&job))
-            && outcome != PasteOutcome::Failed
+            && !matches!(outcome, PasteOutcome::Failed | PasteOutcome::FileFailed)
         {
-            stats.add(stats::word_count(text), speech);
+            stats.add_voiced(stats::word_count(text), speech, voiced);
         }
     }
 
     /// Every outcome keeps the text, a failed paste too: "Copy last text" still has it (item 42).
     fn keep_last_text(&mut self, job: JobId) {
-        if let Some(text) = self.text.remove(&job)
-            && self.last_text.replace(text).is_none()
-        {
+        let held = self.held_copy.remove(&job);
+        let Some(mut text) = self.text.remove(&job) else {
+            return;
+        };
+        if let Some(held) = held {
+            text = format!("{} {held}", text.trim_end());
+        }
+        if self.last_text.replace(text).is_none() {
             self.ui(UiCmd::CanCopy);
         }
     }
@@ -935,8 +1287,22 @@ impl<H: ChordHook> Coordinator<H> {
             .chain(self.engine_warning.as_ref().map(strings::engine_warning))
             .chain(self.sound_warnings.iter().map(|w| w.line.clone()))
             .chain(self.history_warning.clone())
+            .chain(self.file_warning.clone())
             .chain(self.config_error.clone())
             .collect()
+    }
+
+    /// The to-file warning goes when the failing folder is no longer written to: file mode
+    /// turned off or another folder (d04-fix 3). A later failure says so again.
+    fn file_output_changed(&mut self, new: &oxi_core::config::Output) {
+        let old = &self.active.output;
+        let off = new.effective_mode() == FileMode::Off;
+        if old.file_folder.trim() != new.file_folder.trim()
+            || off && old.effective_mode() != FileMode::Off
+        {
+            self.file_warning = None;
+            self.stale_file_writes.extend(self.file_writes.keys());
+        }
     }
 
     /// Tells the tray when the warnings changed.
@@ -973,6 +1339,21 @@ impl<H: ChordHook> Coordinator<H> {
     }
 }
 
+/// Whether the confidence filter held something back; inventions kept for the history do not
+/// count: the user never heard those.
+fn confidence_held(held: &[oxi_core::history::HeldPart]) -> bool {
+    held.iter()
+        .any(|h| h.why != oxi_core::text::HeldWhy::Hallucination)
+}
+
+/// The texts of held parts joined with a space.
+fn joined(held: &[oxi_core::history::HeldPart]) -> String {
+    held.iter()
+        .map(|h| h.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// A worker that is gone (panicked) loses the command; the daemon keeps running.
 fn send<T>(tx: &Sender<T>, cmd: T) {
     if tx.send(cmd).is_err() {
@@ -998,7 +1379,7 @@ mod tests {
     use std::sync::mpsc::channel;
 
     use oxi_core::config::{ConfigError, Hotkey};
-    use oxi_core::machine::{EmptyAudio, ModelFailure, Notice, OverlayState, Sound};
+    use oxi_core::machine::{BOUNCE, EmptyAudio, ModelFailure, Notice, OverlayState, Sound};
     use oxi_core::tuning::SettingsSet;
     use oxi_core::types::Language;
 
@@ -1013,6 +1394,7 @@ mod tests {
         held: Cell<bool>,
         polls: Cell<u32>,
         hotkeys: RefCell<Vec<Hotkey>>,
+        pressed: Cell<Option<std::time::Instant>>,
     }
 
     impl ChordHook for Rc<FakeHook> {
@@ -1023,6 +1405,9 @@ mod tests {
         fn reinstall(&self) {}
         fn set_hotkey(&self, hotkey: &Hotkey) {
             self.hotkeys.borrow_mut().push(hotkey.clone());
+        }
+        fn take_pressed(&self) -> Option<std::time::Instant> {
+            self.pressed.take()
         }
     }
 
@@ -1075,7 +1460,9 @@ mod tests {
                 ..FakeHook::default()
             });
             let phase = PhaseCell::default();
-            let c = Coordinator::new(config, Vec::new(), workers, Rc::clone(&hook), phase.clone());
+            let mut c =
+                Coordinator::new(config, Vec::new(), workers, Rc::clone(&hook), phase.clone());
+            c.foreground = Box::new(|| "notepad.exe".into());
             let rig = Self {
                 c,
                 hook,
@@ -1105,6 +1492,12 @@ mod tests {
             self.c.handle(Inbox::Event(event), Millis(at));
         }
 
+        /// The paste worker's answer: `job` was pasted (the entry is filed now).
+        fn land(&mut self, job: JobId, at: u64) {
+            let outcome = PasteOutcome::Pasted;
+            self.event(Event::PasteDone { job, outcome }, at);
+        }
+
         /// Holds the chord from 0 to 1000 ms; returns the stopped job.
         fn record(&mut self) -> JobId {
             self.event(Event::ChordDown, 0);
@@ -1130,6 +1523,7 @@ mod tests {
                     job,
                     samples: vec![0.5; 4],
                     spool: None,
+                    voiced_ms: 0,
                 },
                 Millis(2100),
             );
@@ -1137,6 +1531,8 @@ mod tests {
                 Inbox::Transcribed {
                     job,
                     text: Some(text.to_owned()),
+                    words: Vec::new(),
+                    held: Vec::new(),
                 },
                 Millis(2500),
             );
@@ -1181,6 +1577,7 @@ mod tests {
                 job,
                 samples: vec![0.5; 4],
                 spool: None,
+                voiced_ms: 0,
             },
             Millis(2100),
         );
@@ -1206,6 +1603,8 @@ mod tests {
             Inbox::Transcribed {
                 job,
                 text: Some("x".into()),
+                words: Vec::new(),
+                held: Vec::new(),
             },
             Millis(2500),
         );
@@ -1266,6 +1665,7 @@ mod tests {
                 job,
                 samples: vec![0.5; 4],
                 spool: None,
+                voiced_ms: 0,
             },
             Millis(2100),
         );
@@ -1382,7 +1782,13 @@ mod tests {
         let mut rig = Rig::new();
         rig.event(Event::ChordDown, 0);
 
-        assert_eq!(drain(&rig.audio), [AudioCmd::Start { session: 1 }]);
+        assert_eq!(
+            drain(&rig.audio),
+            [AudioCmd::Start {
+                session: 1,
+                pressed: None
+            }]
+        );
         assert!(
             drain(&rig.whisper)
                 .iter()
@@ -1407,13 +1813,14 @@ mod tests {
                 job,
                 samples: vec![0.25, -0.5],
                 spool: None,
+                voiced_ms: 0,
             },
             Millis(2100),
         );
         let transcribe: Vec<_> = drain(&rig.whisper)
             .into_iter()
             .filter_map(|c| match c {
-                WhisperCmd::Transcribe { job, samples } => Some((job, samples)),
+                WhisperCmd::Transcribe { job, samples, .. } => Some((job, samples)),
                 _ => None,
             })
             .collect();
@@ -1423,11 +1830,18 @@ mod tests {
             Inbox::Transcribed {
                 job,
                 text: Some("hello".into()),
+                words: Vec::new(),
+                held: Vec::new(),
             },
             Millis(2500),
         );
         let pastes = drain(&rig.paste);
-        let [PasteCmd::Paste { job: j, text, cfg }] = pastes.as_slice() else {
+        let [
+            PasteCmd::Paste {
+                job: j, text, cfg, ..
+            },
+        ] = pastes.as_slice()
+        else {
             panic!("expected one Paste");
         };
         assert_eq!((*j, text.as_str()), (job, "hello"));
@@ -1497,12 +1911,22 @@ mod tests {
                 .into_iter()
                 .filter_map(|c| match c {
                     HistoryCmd::Save {
-                        samples, text, cfg, ..
-                    } => Some((samples.len(), text, cfg)),
+                        samples,
+                        text,
+                        words,
+                        cfg,
+                        ..
+                    } => Some((samples.len(), text, words, cfg)),
                     HistoryCmd::Config(_) => None,
                 })
                 .collect::<Vec<_>>()
         };
+        let heard = vec![oxi_core::history::Word {
+            w: "hello".into(),
+            p: 0.3,
+            t0: None,
+            t1: None,
+        }];
         let dictate = |rig: &mut Rig, text: Option<&str>| {
             rig.event(Event::ModelLoaded, 0);
             let job = rig.record();
@@ -1512,11 +1936,26 @@ mod tests {
                     job,
                     samples,
                     spool: None,
+                    voiced_ms: 0,
                 },
                 Millis(2100),
             );
+            let pasted = text.is_some_and(|t| !t.trim().is_empty());
             let text = text.map(str::to_owned);
-            rig.c.handle(Inbox::Transcribed { job, text }, Millis(2500));
+            let words = heard.clone();
+            let held = Vec::new();
+            rig.c.handle(
+                Inbox::Transcribed {
+                    job,
+                    text,
+                    words,
+                    held,
+                },
+                Millis(2500),
+            );
+            if pasted {
+                rig.land(job, 2600);
+            }
         };
         let mut config = Config::default();
         config.history.enabled = false;
@@ -1529,9 +1968,10 @@ mod tests {
         config.history.enabled = true;
         let mut on = Rig::with(config);
         dictate(&mut on, Some("hello"));
-        let [(len, text, cfg)] = saves(&on).try_into().unwrap();
+        let [(len, text, words, cfg)] = saves(&on).try_into().unwrap();
         assert_eq!((len, text.as_str(), cfg.enabled), (16_000, "hello", true));
-        assert!(on.c.history_audio.is_empty());
+        assert_eq!(words, heard, "whisper's words go into the entry");
+        assert!(on.c.history_audio.is_empty() && on.c.words.is_empty());
 
         for text in [None, Some("  ")] {
             let mut rig = Rig::with(on.c.active.clone());
@@ -1539,6 +1979,221 @@ mod tests {
             assert!(saves(&rig).is_empty(), "nothing heard is not saved");
             assert!(rig.c.history_audio.is_empty(), "no audio kept for it");
         }
+    }
+
+    #[test]
+    fn held_parts_go_to_the_entry_and_an_all_held_dictation_is_filed_unpasted() {
+        use oxi_core::history::{Delivered, HeldPart};
+        use oxi_core::text::HeldWhy;
+        let part = |text: &str| HeldPart {
+            text: text.into(),
+            t0: 100,
+            t1: 900,
+            why: HeldWhy::LowConfidence,
+        };
+        let dictate = |text: &str, held: Vec<HeldPart>| {
+            let mut config = Config::default();
+            config.history.enabled = true;
+            let mut rig = Rig::with(config);
+            rig.event(Event::ModelLoaded, 0);
+            let job = rig.record();
+            rig.c.handle(
+                Inbox::JobAudio {
+                    job,
+                    samples: vec![0.1; 16_000],
+                    spool: None,
+                    voiced_ms: 0,
+                },
+                Millis(2100),
+            );
+            rig.c.handle(
+                Inbox::Transcribed {
+                    job,
+                    text: Some(text.into()),
+                    words: Vec::new(),
+                    held,
+                },
+                Millis(2500),
+            );
+            if !text.is_empty() {
+                rig.land(job, 2600);
+            }
+            let saves: Vec<_> = drain(&rig.history)
+                .into_iter()
+                .filter_map(|c| match c {
+                    HistoryCmd::Save {
+                        text,
+                        held,
+                        delivered,
+                        ..
+                    } => Some((text, held, delivered)),
+                    HistoryCmd::Config(_) => None,
+                })
+                .collect();
+            (rig, saves)
+        };
+        // Some held: the entry gets them beside the inserted text, filed once pasted; "Copy last
+        // text" has both, so the held part outlives a failed write (review d03 #3).
+        let (rig, saves) = dictate("kept", vec![part("doubtful")]);
+        let pasted = Some(Delivered::Pasted);
+        assert_eq!(saves, [("kept".to_owned(), vec![part("doubtful")], pasted)]);
+        assert_eq!(rig.c.last_text.as_deref(), Some("kept doubtful"));
+        // All held: nothing is pasted, the entry's text is the held parts, filed as filtered.
+        let (rig, saves) = dictate("", vec![part("first"), part("second")]);
+        assert_eq!(
+            saves,
+            [(
+                "first second".to_owned(),
+                vec![part("first"), part("second")],
+                Some(Delivered::Filtered)
+            )]
+        );
+        assert!(rig.c.text.is_empty() && rig.c.held.is_empty() && rig.c.history_audio.is_empty());
+        assert_eq!(rig.c.state.phase(), Phase::Idle, "no paste follows");
+        assert_eq!(
+            rig.c.last_text.as_deref(),
+            Some("first second"),
+            "review d03 #3"
+        );
+    }
+
+    /// The `Save`s sent since the last look: audio length, text, how it arrived.
+    fn saved(rig: &Rig) -> Vec<(usize, String, Option<oxi_core::history::Delivered>)> {
+        drain(&rig.history)
+            .into_iter()
+            .filter_map(|c| match c {
+                HistoryCmd::Save {
+                    samples,
+                    text,
+                    delivered,
+                    ..
+                } => Some((samples.len(), text, delivered)),
+                HistoryCmd::Config(_) => None,
+            })
+            .collect()
+    }
+
+    /// Review d03 #7: an all-held part a press inside the gap carries on is not filed alone (that
+    /// took its audio from the merge); given back by a failed continuation, it is filed then.
+    #[test]
+    fn an_all_held_part_carried_on_waits_for_the_merge() {
+        use oxi_core::history::{Delivered, HeldPart};
+        let held = || {
+            vec![HeldPart {
+                text: "maybe".into(),
+                t0: 0,
+                t1: 500,
+                why: oxi_core::text::HeldWhy::Hallucination,
+            }]
+        };
+        for give_back in [false, true] {
+            let mut config = Config::default();
+            config.history.enabled = true;
+            let mut rig = Rig::with(config);
+            rig.event(Event::ModelLoaded, 0);
+            rig.event(Event::ChordDown, 0);
+            rig.event(Event::ChordUp, 1000);
+            rig.event(Event::Tick, 1100); // job 0, its gap lasts until 1400
+            let audio = Inbox::JobAudio {
+                job: JobId(0),
+                samples: vec![0.1; 8000],
+                spool: None,
+                voiced_ms: 0,
+            };
+            rig.c.handle(audio, Millis(1150));
+            rig.event(Event::ChordDown, 1300); // inside the gap: carries job 0 on
+            let all_held = Inbox::Transcribed {
+                job: JobId(0),
+                text: Some(String::new()),
+                words: Vec::new(),
+                held: held(),
+            };
+            rig.c.handle(all_held, Millis(1350));
+            assert_eq!(saved(&rig), [], "not filed alone");
+            assert!(rig.c.history_audio.contains_key(&JobId(0)), "audio kept");
+            if give_back {
+                let fail = Inbox::Event(Event::ModelFailed(ModelFailure::Bad));
+                rig.c.handle(fail, Millis(1500));
+                let want = (8000, "maybe".to_owned(), Some(Delivered::Filtered));
+                assert_eq!(saved(&rig), [want]);
+                assert_eq!(rig.c.last_text.as_deref(), Some("maybe"));
+                continue;
+            }
+            rig.event(Event::ChordUp, 2000);
+            rig.event(Event::Tick, 2100);
+            let audio = Inbox::JobAudio {
+                job: JobId(1),
+                samples: vec![0.1; 4000],
+                spool: None,
+                voiced_ms: 0,
+            };
+            rig.c.handle(audio, Millis(2150));
+            rig.c
+                .handle(transcribed(JobId(1), Some("one two")), Millis(2200));
+            rig.event(Event::Tick, 2600);
+            rig.land(JobId(1), 2700);
+            let want = (12_000, "one two".to_owned(), Some(Delivered::Pasted));
+            assert_eq!(saved(&rig), [want], "one entry with both parts' audio");
+            assert!(rig.c.held.is_empty() && rig.c.words.is_empty());
+        }
+    }
+
+    /// Review d03 (e): the entry says how the text reached the user, typed and pasted alike;
+    /// History turned off before the paste ends is off at the save, and the held part is still
+    /// in "Copy last text" (review d03 #4).
+    #[test]
+    fn the_entry_says_how_the_text_arrived() {
+        use oxi_core::history::{Delivered, HeldPart};
+        let outcomes = [
+            (PasteOutcome::Typed, Delivered::Typed),
+            (PasteOutcome::PastedNoRestore, Delivered::Pasted),
+            (
+                PasteOutcome::ClipboardOnly(ClipboardOnlyWhy::ModifiersHeld),
+                Delivered::Clipboard,
+            ),
+            (PasteOutcome::Failed, Delivered::Failed),
+            (PasteOutcome::FileFailed, Delivered::FileFailed),
+        ];
+        for (outcome, want) in outcomes {
+            let mut config = Config::default();
+            config.history.enabled = true;
+            let mut rig = Rig::with(config);
+            let job = rig.transcribed("hi");
+            rig.event(Event::PasteDone { job, outcome }, 3000);
+            assert_eq!(saved(&rig), [(4, "hi".to_owned(), Some(want))]);
+        }
+        let mut config = Config::default();
+        config.history.enabled = true;
+        let mut rig = Rig::with(config.clone());
+        rig.event(Event::ModelLoaded, 0);
+        let job = rig.record();
+        let audio = Inbox::JobAudio {
+            job,
+            samples: vec![0.5; 4],
+            spool: None,
+            voiced_ms: 0,
+        };
+        rig.c.handle(audio, Millis(2100));
+        config.history.enabled = false;
+        let config = Box::new(config);
+        let warnings = Vec::new();
+        rig.c
+            .handle(Inbox::Config { config, warnings }, Millis(2200));
+        let part = HeldPart {
+            text: "maybe".into(),
+            t0: 0,
+            t1: 1,
+            why: oxi_core::text::HeldWhy::LowConfidence,
+        };
+        let heard = Inbox::Transcribed {
+            job,
+            text: Some("hi".into()),
+            words: Vec::new(),
+            held: vec![part],
+        };
+        rig.c.handle(heard, Millis(2500));
+        rig.land(job, 3000);
+        assert_eq!(rig.c.last_text.as_deref(), Some("hi maybe"));
     }
 
     #[test]
@@ -1554,11 +2209,21 @@ mod tests {
                 job,
                 samples,
                 spool: None,
+                voiced_ms: 0,
             },
             Millis(2100),
         );
         let text = Some("hello".to_owned());
-        rig.c.handle(Inbox::Transcribed { job, text }, Millis(2500));
+        rig.c.handle(
+            Inbox::Transcribed {
+                job,
+                text,
+                words: Vec::new(),
+                held: Vec::new(),
+            },
+            Millis(2500),
+        );
+        rig.land(job, 2600);
         let sent = drain(&rig.history);
         let [HistoryCmd::Config(cfg)] = sent.as_slice() else {
             panic!("expected one prune, got {} commands", sent.len());
@@ -1579,10 +2244,13 @@ mod tests {
             job,
             samples: vec![0.1; len],
             spool: None,
+            voiced_ms: 0,
         };
         let done = |job, text: &str| Inbox::Transcribed {
             job,
             text: Some(text.to_owned()),
+            words: Vec::new(),
+            held: Vec::new(),
         };
         rig.c.handle(audio(JobId(0), 8000), Millis(1150));
         rig.c.handle(done(JobId(0), "one"), Millis(1200));
@@ -1597,7 +2265,7 @@ mod tests {
         let lens: Vec<_> = drain(&rig.whisper)
             .into_iter()
             .filter_map(|c| match c {
-                WhisperCmd::Transcribe { job, samples } => Some((job, samples.len())),
+                WhisperCmd::Transcribe { job, samples, .. } => Some((job, samples.len())),
                 _ => None,
             })
             .collect();
@@ -1606,10 +2274,11 @@ mod tests {
             .into_iter()
             .filter_map(|c| match c {
                 PasteCmd::Paste { job, text, .. } => Some((job, text)),
-                PasteCmd::CopyOnly { .. } => None,
+                PasteCmd::CopyOnly { .. } | PasteCmd::File { .. } => None,
             })
             .collect();
         assert_eq!(pasted, [(JobId(1), "one two".to_owned())], "one paste");
+        rig.land(JobId(1), 5000);
         let saves: Vec<_> = drain(&rig.history)
             .into_iter()
             .filter_map(|c| match c {
@@ -1620,6 +2289,8 @@ mod tests {
         assert_eq!(saves, [(12_000, "one two".to_owned())], "one history entry");
         assert!(rig.c.history_audio.is_empty() && rig.c.audio.is_empty());
         assert!(rig.c.merges.is_empty());
+        // Review d04 #3: the carried part's profile ends with the merge.
+        assert!(rig.c.profiles.is_empty(), "{:?}", rig.c.profiles.keys());
     }
 
     /// Whisper answers the first part with no text (a short word, a filtered hallucination) or
@@ -1640,12 +2311,21 @@ mod tests {
                 job,
                 samples: vec![0.1; len],
                 spool: None,
+                voiced_ms: 0,
             };
             rig.c.handle(audio(JobId(0), 8000), Millis(1150)); // job 0 goes to whisper
             rig.event(Event::ChordDown, 1300); // carries job 0 on while whisper has it
             rig.drain_all();
             let job = JobId(0);
-            rig.c.handle(Inbox::Transcribed { job, text }, Millis(1350));
+            rig.c.handle(
+                Inbox::Transcribed {
+                    job,
+                    text,
+                    words: Vec::new(),
+                    held: Vec::new(),
+                },
+                Millis(1350),
+            );
             assert!(drain(&rig.sound).is_empty(), "{case}");
             let said = drain(&rig.ui)
                 .into_iter()
@@ -1657,7 +2337,7 @@ mod tests {
             let sent: Vec<_> = drain(&rig.whisper)
                 .into_iter()
                 .filter_map(|c| match c {
-                    WhisperCmd::Transcribe { job, samples } => Some((job, samples.len())),
+                    WhisperCmd::Transcribe { job, samples, .. } => Some((job, samples.len())),
                     _ => None,
                 })
                 .collect();
@@ -1667,10 +2347,13 @@ mod tests {
                 Inbox::Transcribed {
                     job: JobId(1),
                     text,
+                    words: Vec::new(),
+                    held: Vec::new(),
                 },
                 Millis(2200),
             );
             rig.event(Event::Tick, 2600);
+            rig.land(JobId(1), 2700);
             let saves: Vec<_> = drain(&rig.history)
                 .into_iter()
                 .filter_map(|c| match c {
@@ -1700,11 +2383,20 @@ mod tests {
                 job,
                 samples: vec![0.1; len],
                 spool: None,
+                voiced_ms: 0,
             };
             rig.c.handle(audio(JobId(0), 8000), Millis(1150));
             let text = Some("one".to_owned());
             let job = JobId(0);
-            rig.c.handle(Inbox::Transcribed { job, text }, Millis(1200));
+            rig.c.handle(
+                Inbox::Transcribed {
+                    job,
+                    text,
+                    words: Vec::new(),
+                    held: Vec::new(),
+                },
+                Millis(1200),
+            );
             rig.event(Event::ChordDown, 1300);
             rig.event(event.clone(), 1500);
             rig.c.handle(audio(JobId(1), 4000), Millis(1600));
@@ -1746,6 +2438,7 @@ mod tests {
                 job: JobId(0),
                 samples: vec![0.1; 8000],
                 spool: None,
+                voiced_ms: 0,
             };
             rig.c.handle(audio, Millis(1150));
             let text = Some("one".to_owned());
@@ -1753,6 +2446,8 @@ mod tests {
                 Inbox::Transcribed {
                     job: JobId(0),
                     text,
+                    words: Vec::new(),
+                    held: Vec::new(),
                 },
                 Millis(1200),
             );
@@ -1764,6 +2459,7 @@ mod tests {
                 job: JobId(1),
                 samples: vec![0.1; 4000],
                 spool: None,
+                voiced_ms: 0,
             };
             rig.c.handle(audio, Millis(1600));
 
@@ -1771,10 +2467,11 @@ mod tests {
                 .into_iter()
                 .filter_map(|c| match c {
                     PasteCmd::Paste { job, text, .. } => Some((job, text)),
-                    PasteCmd::CopyOnly { .. } => None,
+                    PasteCmd::CopyOnly { .. } | PasteCmd::File { .. } => None,
                 })
                 .collect();
             assert_eq!(pasted, [(JobId(0), "one".to_owned())]);
+            rig.land(JobId(0), 5000);
             let saves: Vec<_> = drain(&rig.history)
                 .into_iter()
                 .filter_map(|c| match c {
@@ -1818,12 +2515,13 @@ mod tests {
             job: JobId(0),
             samples: vec![0.1; 8000],
             spool: None,
+            voiced_ms: 0,
         };
         rig.c.handle(audio, Millis(1500));
         let sent: Vec<_> = drain(&rig.whisper)
             .into_iter()
             .filter_map(|c| match c {
-                WhisperCmd::Transcribe { job, samples } => Some((job, samples.len())),
+                WhisperCmd::Transcribe { job, samples, .. } => Some((job, samples.len())),
                 _ => None,
             })
             .collect();
@@ -1833,6 +2531,8 @@ mod tests {
             Inbox::Transcribed {
                 job: JobId(0),
                 text,
+                words: Vec::new(),
+                held: Vec::new(),
             },
             Millis(1600),
         );
@@ -1871,6 +2571,62 @@ mod tests {
         );
     }
 
+    /// Review d03-fix #3: History turned on during a dictation; the whisper worker still has the
+    /// old config, so the invention it holds is filed in the entry, not dropped. With History off
+    /// it is dropped (a count only).
+    #[test]
+    fn an_invention_is_filed_when_history_was_turned_on_during_the_dictation() {
+        use oxi_core::history::{Delivered, HeldPart};
+        let run = |turn_on: bool| {
+            let mut config = Config::default();
+            config.history.enabled = false;
+            let mut rig = Rig::with(config.clone());
+            rig.event(Event::ModelLoaded, 0);
+            let job = rig.record();
+            if turn_on {
+                config.history.enabled = true;
+                let config = Box::new(config);
+                let warnings = Vec::new();
+                rig.c
+                    .handle(Inbox::Config { config, warnings }, Millis(2050));
+            }
+            rig.c.handle(
+                Inbox::JobAudio {
+                    job,
+                    samples: vec![0.5; 4],
+                    spool: None,
+                    voiced_ms: 0,
+                },
+                Millis(2100),
+            );
+            let held = vec![HeldPart {
+                text: "Thanks for watching".into(),
+                t0: 0,
+                t1: 500,
+                why: oxi_core::text::HeldWhy::Hallucination,
+            }];
+            let text = Some(String::new());
+            let words = Vec::new();
+            rig.c.handle(
+                Inbox::Transcribed {
+                    job,
+                    text,
+                    words,
+                    held,
+                },
+                Millis(2500),
+            );
+            saved(&rig)
+        };
+        let filed = (
+            4,
+            "Thanks for watching".to_owned(),
+            Some(Delivered::Filtered),
+        );
+        assert_eq!(run(true), [filed]);
+        assert_eq!(run(false), []);
+    }
+
     #[test]
     fn history_turned_off_during_a_job_is_off_at_its_save() {
         let mut config = Config::default();
@@ -1884,6 +2640,7 @@ mod tests {
                 job,
                 samples,
                 spool: None,
+                voiced_ms: 0,
             },
             Millis(2100),
         );
@@ -1896,7 +2653,16 @@ mod tests {
             Millis(2200),
         );
         let text = Some("hello".to_owned());
-        rig.c.handle(Inbox::Transcribed { job, text }, Millis(2500));
+        rig.c.handle(
+            Inbox::Transcribed {
+                job,
+                text,
+                words: Vec::new(),
+                held: Vec::new(),
+            },
+            Millis(2500),
+        );
+        rig.land(job, 2600);
         let saves: Vec<_> = drain(&rig.history)
             .into_iter()
             .filter_map(|c| match c {
@@ -1934,11 +2700,20 @@ mod tests {
                     job,
                     samples,
                     spool: None,
+                    voiced_ms: 800,
                 },
                 Millis(2100),
             );
             let text = Some("Привет, мир".to_owned());
-            rig.c.handle(Inbox::Transcribed { job, text }, Millis(2500));
+            rig.c.handle(
+                Inbox::Transcribed {
+                    job,
+                    text,
+                    words: Vec::new(),
+                    held: Vec::new(),
+                },
+                Millis(2500),
+            );
             rig.event(Event::PasteDone { job, outcome }, 3000);
             drop(rig.c.stats.take()); // waits for the write
             assert!(rig.c.spoken.is_empty());
@@ -1949,16 +2724,58 @@ mod tests {
         let sum = crate::daemon::stats::summary(Some(&path), today());
         assert_eq!(
             (sum.dictations, sum.words, sum.wpm, sum.streak),
-            (1, 2, 120, 1)
+            (1, 2, 150, 1),
+            "2 words over the 800 ms of voice, not the 1 s of audio"
         );
+        let file = oxi_platform::stats_store::read(&path).unwrap();
+        assert_eq!(file.pause_pct(), Some(20));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dictation_without_a_voiced_time_is_stored_without_one() {
+        // `audio.trim` off: no gate ran, so no pauses were measured and none may be shown.
+        let dir = scratch_dir(&format!("oxi-coord-stats-unknown-{}", std::process::id()));
+        let path = dir.join(stats::FILE);
+        let today = || stats::Date::from_ymd(2026, 11, 7).unwrap();
+        let mut rig = Rig::new();
+        rig.c.stats = Some(Recorder::spawn(path.clone(), today).unwrap());
+        rig.event(Event::ModelLoaded, 0);
+        let job = rig.record();
+        let samples = vec![0.1; 16_000]; // 1 s
+        let audio = Inbox::JobAudio {
+            job,
+            samples,
+            spool: None,
+            voiced_ms: 0,
+        };
+        rig.c.handle(audio, Millis(2100));
+        let text = Some("Привет, мир".to_owned());
+        let (words, held) = (Vec::new(), Vec::new());
+        let done = Inbox::Transcribed {
+            job,
+            text,
+            words,
+            held,
+        };
+        rig.c.handle(done, Millis(2500));
+        let outcome = PasteOutcome::Pasted;
+        rig.event(Event::PasteDone { job, outcome }, 3000);
+        drop(rig.c.stats.take()); // waits for the write
+        let file = oxi_platform::stats_store::read(&path).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            (file.days[0].n.speech_ms, file.days[0].n.voiced_ms),
+            (1000, 0)
+        );
+        assert_eq!(file.pause_pct(), None);
     }
 
     #[test]
     fn a_job_without_audio_leaves_no_spoken_entry() {
         let mut rig = Rig::new();
         let job = JobId(9);
-        rig.c.spoken.insert(job, Millis(500));
+        rig.c.spoken.insert(job, (Millis(500), Millis(0)));
         let answer = rig.c.execute(&Effect::Transcribe(job));
         assert_eq!(answer, Some(Event::TranscriptionFailed(job)));
         assert!(rig.c.spoken.is_empty());
@@ -1975,10 +2792,19 @@ mod tests {
                     job,
                     samples: vec![0.0],
                     spool: None,
+                    voiced_ms: 0,
                 },
                 Millis(2100),
             );
-            rig.c.handle(Inbox::Transcribed { job, text }, Millis(2500));
+            rig.c.handle(
+                Inbox::Transcribed {
+                    job,
+                    text,
+                    words: Vec::new(),
+                    held: Vec::new(),
+                },
+                Millis(2500),
+            );
             assert!(drain(&rig.paste).is_empty());
             assert_eq!(rig.phase.load(), Phase::Idle);
         }
@@ -2015,12 +2841,32 @@ mod tests {
         }
     }
 
+    /// d11 review #3: the capture gets the key-down time, so its latency counts from the press.
+    #[test]
+    fn the_start_carries_the_key_down_time() {
+        let mut rig = Rig::new();
+        let t = std::time::Instant::now();
+        rig.hook.pressed.set(Some(t));
+        rig.event(Event::ChordDown, 0);
+        let start = AudioCmd::Start {
+            session: 1,
+            pressed: Some(t),
+        };
+        assert_eq!(drain(&rig.audio), [start]);
+    }
+
     #[test]
     fn stale_capture_event_does_not_touch_the_next_recording() {
         let mut rig = Rig::new();
         rig.record(); // session 1
         rig.event(Event::ChordDown, 3000); // session 2
-        assert_eq!(drain(&rig.audio), [AudioCmd::Start { session: 2 }]);
+        assert_eq!(
+            drain(&rig.audio),
+            [AudioCmd::Start {
+                session: 2,
+                pressed: None
+            }]
+        );
 
         let lost = |session| Inbox::Capture {
             session,
@@ -2087,6 +2933,7 @@ mod tests {
                 job,
                 samples,
                 spool: None,
+                voiced_ms: 0,
             },
             Millis(600),
         );
@@ -2306,6 +3153,7 @@ mod tests {
                     job,
                     samples,
                     spool: None,
+                    voiced_ms: 0,
                 },
                 Millis(at),
             );
@@ -2340,7 +3188,15 @@ mod tests {
         // Jobs run in order: answer each with silence so the next one can be asked.
         let silence = |rig: &mut Rig, job, at| {
             let text = Some(String::new());
-            rig.c.handle(Inbox::Transcribed { job, text }, Millis(at));
+            rig.c.handle(
+                Inbox::Transcribed {
+                    job,
+                    text,
+                    words: Vec::new(),
+                    held: Vec::new(),
+                },
+                Millis(at),
+            );
         };
         silence(&mut rig, job, 450);
         let job = rig.record();
@@ -2355,14 +3211,27 @@ mod tests {
         // Failed transcription: the next one that works clears it, before any paste.
         let job = rig.record();
         audio(&mut rig, job, 2100);
-        let failed = Inbox::Transcribed { job, text: None };
+        let failed = Inbox::Transcribed {
+            job,
+            text: None,
+            words: Vec::new(),
+            held: Vec::new(),
+        };
         rig.c.handle(failed, Millis(2200));
         assert_eq!(badges(&rig), [TrayBadge::Error], "transcription failed");
         let job = rig.record();
         audio(&mut rig, job, 2100);
         assert!(badges(&rig).is_empty(), "sound alone does not fix it");
         let text = Some("three".to_owned());
-        rig.c.handle(Inbox::Transcribed { job, text }, Millis(2300));
+        rig.c.handle(
+            Inbox::Transcribed {
+                job,
+                text,
+                words: Vec::new(),
+                held: Vec::new(),
+            },
+            Millis(2300),
+        );
         assert_eq!(badges(&rig), [TrayBadge::None], "a transcription worked");
     }
 
@@ -2386,9 +3255,19 @@ mod tests {
             job,
             samples,
             spool: Some(spool.clone()),
+            voiced_ms: 0,
         };
         rig.c.handle(audio, Millis(2100));
-        rig.c.handle(Inbox::Transcribed { job, text }, Millis(2500));
+        rig.c.handle(
+            Inbox::Transcribed {
+                job,
+                text,
+                words: Vec::new(),
+                held: Vec::new(),
+            },
+            Millis(2500),
+        );
+        rig.land(job, 2600);
         let saves: Vec<_> = drain(&rig.history)
             .into_iter()
             .filter_map(|cmd| match cmd {
@@ -2421,6 +3300,12 @@ mod tests {
         assert_eq!(rig.c.badge, TrayBadge::Error);
         rig.c
             .handle(Inbox::ModelDownloaded("another-model".into()), Millis(200));
+        assert!(
+            drain(&rig.whisper)
+                .iter()
+                .any(|c| matches!(c, WhisperCmd::Config(_))),
+            "any download clears whisper's failed-model list"
+        );
         assert_eq!(rig.c.status().model_failure, Some(ModelFailure::Missing));
         rig.c.handle(
             Inbox::ModelDownloaded("t10b-downloaded-again".into()),
@@ -2473,6 +3358,8 @@ mod tests {
         rig.event(Event::ChordDown, 0);
         rig.drain_all();
         rig.event(Event::Tick, 1000);
+        // A held release waits out a bounce even with no tail: the stop comes at its end.
+        rig.event(Event::Tick, 1000 + BOUNCE.0);
         let overlays: Vec<_> = drain(&rig.ui)
             .into_iter()
             .filter(|c| matches!(c, UiCmd::Overlay(_)))
@@ -2495,7 +3382,13 @@ mod tests {
         // Quit stops the recording; nothing was heard, so nothing is kept.
         assert_eq!(
             drain(&rig.audio),
-            [AudioCmd::Start { session: 1 }, AudioCmd::Discard]
+            [
+                AudioCmd::Start {
+                    session: 1,
+                    pressed: None
+                },
+                AudioCmd::Discard
+            ]
         );
     }
 
@@ -2550,6 +3443,7 @@ mod tests {
                 job,
                 samples: vec![0.5; 4],
                 spool: None,
+                voiced_ms: 0,
             },
             Millis(2100),
         );
@@ -2559,6 +3453,8 @@ mod tests {
             Inbox::Transcribed {
                 job,
                 text: Some("hello".into()),
+                words: Vec::new(),
+                held: Vec::new(),
             },
         ];
         let q = quit(rig, msgs, 60_000);
@@ -2573,6 +3469,7 @@ mod tests {
             .map(|c| match c {
                 PasteCmd::CopyOnly { text, .. } => text,
                 PasteCmd::Paste { .. } => panic!("pasted at quit"),
+                PasteCmd::File { .. } => panic!("no to-file mode"),
             })
             .collect();
         assert_eq!(pastes, ["hello"]);
@@ -2592,6 +3489,7 @@ mod tests {
                 job,
                 samples: vec![0.5; 4],
                 spool: None,
+                voiced_ms: 0,
             },
             Millis(2100),
         );
@@ -2600,6 +3498,41 @@ mod tests {
         assert!(q.took >= Duration::from_millis(50), "{:?}", q.took);
         assert_eq!(q.phase.load(), Phase::Idle, "whisper is told to stop");
         assert!(q.paste.is_empty());
+    }
+
+    // Review d03-fix #1: a paste (typing ~400 chars, Win+V work) still running when the grace
+    // ends never answers PasteDone; its entry was only filed there, so the text was lost.
+    #[test]
+    fn a_paste_that_outlives_the_quit_grace_still_files_its_entry() {
+        use oxi_core::history::Delivered;
+        let mut config = Config::default();
+        config.history.enabled = true;
+        let mut rig = Rig::with(config);
+        rig.transcribed("typed at quit");
+        assert_eq!(rig.phase.load(), Phase::Pasting);
+        assert!(saved(&rig).is_empty(), "filed at PasteDone, not before");
+        // A fake clock: every look is one grace later, so the grace is over at once.
+        let at = Cell::new(3000);
+        let clock = || {
+            at.set(at.get() + SHUTDOWN_GRACE.0);
+            Millis(at.get())
+        };
+        let (_tx, rx) = channel();
+        let Rig { c, history, .. } = rig;
+        c.shutdown(&rx, &clock, SHUTDOWN_GRACE);
+        let sent: Vec<_> = drain(&history)
+            .into_iter()
+            .filter_map(|c| match c {
+                HistoryCmd::Save {
+                    text, delivered, ..
+                } => Some((text, delivered)),
+                HistoryCmd::Config(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            [("typed at quit".to_owned(), Some(Delivered::Unknown))]
+        );
     }
 
     // t15: a quit while recording after speech keeps the audio, as a session lock does.
@@ -2621,6 +3554,7 @@ mod tests {
             job: JobId(0),
             samples: vec![0.1; 800],
             spool: None,
+            voiced_ms: 0,
         }];
         let q = quit(rig, msgs, 60_000);
         assert!(q.audio.contains(&AudioCmd::Stop(JobId(0))));
@@ -2775,6 +3709,7 @@ mod tests {
             job,
             samples: vec![0.1; 4000],
             spool,
+            voiced_ms: 0,
         }
     }
 
@@ -2782,6 +3717,8 @@ mod tests {
         Inbox::Transcribed {
             job,
             text: text.map(str::to_owned),
+            words: Vec::new(),
+            held: Vec::new(),
         }
     }
 
@@ -2811,7 +3748,8 @@ mod tests {
         drain(&rig.history);
         rig.c
             .handle(transcribed(JobId(1), Some("one two")), Millis(2200));
-        rig.event(Event::Tick, 2600); // the gap ends: pasted and filed
+        rig.event(Event::Tick, 2600); // the gap ends: pasted
+        rig.land(JobId(1), 2700); // and filed
         let carried = drain(&rig.history).into_iter().find_map(|c| match c {
             HistoryCmd::Save { text, carried, .. } if text == "one two" => Some(carried),
             _ => None,
@@ -2881,6 +3819,7 @@ mod tests {
         rig.c
             .handle(transcribed(JobId(1), Some("two")), Millis(2200));
         rig.event(Event::Tick, 2600);
+        rig.land(JobId(1), 2700);
         let carried = drain(&rig.history).into_iter().find_map(|c| match c {
             HistoryCmd::Save { carried, cfg, .. } if !cfg.enabled => Some(carried),
             _ => None,
@@ -2965,6 +3904,7 @@ mod tests {
                 job: JobId(0),
                 samples: vec![0.1; 8000],
                 spool: None,
+                voiced_ms: 0,
             },
             Millis(1150),
         );
@@ -2972,6 +3912,8 @@ mod tests {
             Inbox::Transcribed {
                 job: JobId(0),
                 text: Some("one".to_owned()),
+                words: Vec::new(),
+                held: Vec::new(),
             },
             Millis(1200),
         );
@@ -2992,10 +3934,611 @@ mod tests {
                 WhisperCmd::Transcribe {
                     job: JobId(1),
                     samples,
+                    ..
                 } => Some(samples.len()),
                 _ => None,
             })
             .collect();
         assert_eq!(sent, [8000], "the earlier parts go on as the dictation");
+    }
+    fn profile_rig(to_file: FileMode, folder: &str) -> Rig {
+        use oxi_core::config::PasteRule;
+        let mut config = Config::default();
+        config.history.enabled = true;
+        config.output.file_folder = folder.into();
+        config.paste.rules = vec![PasteRule {
+            app: "notepad.exe".into(),
+            language: Some(Language::EN),
+            model: Some("tiny".into()),
+            to_file: Some(to_file),
+            dictionary: Some(false),
+            ..PasteRule::default()
+        }];
+        Rig::with(config)
+    }
+
+    /// The last overlay state sent to the UI since the last look.
+    fn last_overlay(rig: &Rig) -> Option<OverlayState> {
+        drain(&rig.ui)
+            .into_iter()
+            .filter_map(|c| match c {
+                UiCmd::Overlay(s) => Some(s),
+                _ => None,
+            })
+            .next_back()
+    }
+
+    /// d03-label: the pill tells a dictation the filter held back, and the file it went to.
+    #[test]
+    fn the_pill_says_held_back_and_saved_to_file() {
+        use oxi_core::history::HeldPart;
+        use oxi_core::text::HeldWhy;
+        let part = |why| HeldPart {
+            text: "x".into(),
+            t0: 0,
+            t1: 100,
+            why,
+        };
+        // The dictation ends in the pill: what it shows once the text came (or did not).
+        let end = |mut rig: Rig, text: &str, held: Vec<HeldPart>| {
+            rig.event(Event::ModelLoaded, 0);
+            let job = rig.record();
+            let audio = Inbox::JobAudio {
+                job,
+                samples: vec![0.5; 4],
+                spool: None,
+                voiced_ms: 0,
+            };
+            rig.c.handle(audio, Millis(2100));
+            let done = Inbox::Transcribed {
+                job,
+                text: Some(text.into()),
+                words: Vec::new(),
+                held,
+            };
+            rig.c.handle(done, Millis(2500));
+            if text.is_empty() {
+                return last_overlay(&rig);
+            }
+            drain(&rig.ui);
+            rig.land(job, 3000);
+            rig.event(Event::Tick, 6000);
+            last_overlay(&rig)
+        };
+        let low = || vec![part(HeldWhy::LowConfidence)];
+        let nothing = Some(OverlayState::Text(Notice::NothingHeard));
+        let plain = || profile_rig(FileMode::Off, "");
+        let all = Some(OverlayState::HeldBack { all: true });
+        assert_eq!(end(plain(), "", low()), all, "all held: its own label");
+        // An invention kept for the history was never heard: still "nothing heard".
+        assert_eq!(
+            end(plain(), "", vec![part(HeldWhy::Hallucination)]),
+            nothing
+        );
+        assert_eq!(end(plain(), "", Vec::new()), nothing);
+        let some = Some(OverlayState::HeldBack { all: false });
+        assert_eq!(end(plain(), "kept", low()), some, "some held: a cue");
+        assert_eq!(end(plain(), "kept", Vec::new()), Some(OverlayState::Hidden));
+        let file = "C:/synthetic/notes";
+        let saved = |also| Some(OverlayState::SavedToFile { also });
+        assert_eq!(
+            end(profile_rig(FileMode::Only, file), "hi", Vec::new()),
+            saved(false)
+        );
+        // Next to a paste the file is told once its write answers: see the test below.
+        assert_eq!(
+            end(profile_rig(FileMode::Also, file), "hi", Vec::new()),
+            Some(OverlayState::Hidden)
+        );
+        // Held text is the news when the file only repeats the paste.
+        assert_eq!(end(profile_rig(FileMode::Also, file), "hi", low()), some);
+        assert_eq!(
+            end(profile_rig(FileMode::Only, file), "hi", low()),
+            saved(false)
+        );
+    }
+
+    /// d03-label review #1: "Also saved" only for a write that worked, never for one that failed
+    /// or before it answered.
+    #[test]
+    fn also_saved_waits_for_the_write_and_a_failed_write_says_nothing() {
+        let saved = Some(OverlayState::SavedToFile { also: true });
+        for (answer, want) in [(None, saved), (Some("failed".to_owned()), None)] {
+            let mut rig = profile_rig(FileMode::Also, "C:/synthetic/notes");
+            let job = rig.transcribed("hi");
+            rig.land(job, 3000);
+            assert_eq!(last_overlay(&rig), Some(OverlayState::Hidden), "not yet");
+            rig.c
+                .handle(Inbox::FileWarning { job, line: answer }, Millis(3010));
+            assert_eq!(last_overlay(&rig), want);
+        }
+        // A part held back is the news: the file does not replace it.
+        let mut rig = profile_rig(FileMode::Also, "C:/synthetic/notes");
+        rig.event(Event::ModelLoaded, 0);
+        let job = rig.record();
+        let audio = Inbox::JobAudio {
+            job,
+            samples: vec![0.5; 4],
+            spool: None,
+            voiced_ms: 0,
+        };
+        rig.c.handle(audio, Millis(2100));
+        rig.c.handle(low_held(job), Millis(2500));
+        rig.land(job, 3000);
+        assert_eq!(
+            last_overlay(&rig),
+            Some(OverlayState::HeldBack { all: false })
+        );
+        rig.c
+            .handle(Inbox::FileWarning { job, line: None }, Millis(3010));
+        assert_eq!(last_overlay(&rig), None);
+    }
+
+    /// `job` transcribed to "kept" with one part the confidence filter held back.
+    fn low_held(job: JobId) -> Inbox {
+        Inbox::Transcribed {
+            job,
+            text: Some("kept".into()),
+            words: Vec::new(),
+            held: vec![oxi_core::history::HeldPart {
+                text: "x".into(),
+                t0: 0,
+                t1: 100,
+                why: oxi_core::text::HeldWhy::LowConfidence,
+            }],
+        }
+    }
+
+    /// d03-label review #2: a dictation queued behind one with a part held back starts at its
+    /// paste; the cue still goes to the pill, before the next step.
+    #[test]
+    fn a_held_back_cue_is_not_lost_to_the_next_queued_dictation() {
+        let mut rig = Rig::new();
+        rig.event(Event::ModelLoaded, 0);
+        let first = rig.record();
+        let audio = |job| Inbox::JobAudio {
+            job,
+            samples: vec![0.5; 4],
+            spool: None,
+            voiced_ms: 0,
+        };
+        rig.c.handle(audio(first), Millis(2100));
+        rig.event(Event::ChordDown, 2200);
+        rig.event(Event::ChordUp, 3200);
+        rig.event(Event::Tick, 4200);
+        let second = drain(&rig.audio)
+            .into_iter()
+            .find_map(|cmd| match cmd {
+                AudioCmd::Stop(job) => Some(job),
+                _ => None,
+            })
+            .expect("the second recording stopped");
+        rig.c.handle(audio(second), Millis(4300));
+        rig.c.handle(low_held(first), Millis(4400));
+        drain(&rig.ui);
+        rig.land(first, 5000);
+        let shown: Vec<_> = drain(&rig.ui)
+            .into_iter()
+            .filter_map(|c| match c {
+                UiCmd::Overlay(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                OverlayState::HeldBack { all: false },
+                OverlayState::Transcribing
+            ]
+        );
+    }
+
+    #[test]
+    fn the_app_in_front_at_key_down_sets_the_model_and_the_dictation_runs_with_its_profile() {
+        let mut rig = profile_rig(FileMode::Off, "");
+        let job = rig.transcribed("hi");
+        let sent = drain(&rig.whisper);
+        assert!(
+            matches!(sent.first(), Some(WhisperCmd::UseModel(m)) if m == "tiny"),
+            "the model goes before the preload"
+        );
+        let profile = sent.iter().find_map(|c| match c {
+            WhisperCmd::Transcribe {
+                job: j, profile, ..
+            } if *j == job => Some(profile),
+            _ => None,
+        });
+        let p = profile.expect("a Transcribe with its profile");
+        assert_eq!((p.model.as_str(), p.language), ("tiny", Language::EN));
+        assert!(!p.dictionary && p.replacements);
+        // Another app in front: the globals.
+        let mut rig = profile_rig(FileMode::Off, "");
+        rig.c.foreground = Box::new(|| "other.exe".into());
+        rig.transcribed("hi");
+        let sent = drain(&rig.whisper);
+        assert!(matches!(sent.first(), Some(WhisperCmd::UseModel(m)) if m == "turbo"));
+    }
+
+    #[test]
+    fn to_file_also_pastes_and_writes_and_only_files_the_entry_as_a_file() {
+        for (mode, only) in [(FileMode::Also, false), (FileMode::Only, true)] {
+            let mut rig = profile_rig(mode, "C:/synthetic/notes");
+            let job = rig.transcribed("hi");
+            let pastes = drain(&rig.paste);
+            let [PasteCmd::Paste { file: Some(f), .. }] = pastes.as_slice() else {
+                panic!("expected one Paste with a file");
+            };
+            assert_eq!(
+                (f.only, f.folder.to_str()),
+                (only, Some("C:/synthetic/notes"))
+            );
+            rig.land(job, 3000);
+            let want = if only {
+                oxi_core::history::Delivered::File
+            } else {
+                oxi_core::history::Delivered::Pasted
+            };
+            assert_eq!(saved(&rig), [(4, "hi".to_owned(), Some(want))]);
+        }
+        // No folder: no file, whatever the rule says.
+        let mut rig = profile_rig(FileMode::Only, " ");
+        rig.transcribed("hi");
+        let pastes = drain(&rig.paste);
+        assert!(matches!(
+            pastes.as_slice(),
+            [PasteCmd::Paste { file: None, .. }]
+        ));
+    }
+    /// The models whisper was told to use, in order.
+    fn used_models(rig: &Rig) -> Vec<String> {
+        drain(&rig.whisper)
+            .into_iter()
+            .filter_map(|c| match c {
+                WhisperCmd::UseModel(m) => Some(m),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Review d04 #1, arch-plan 9.2: a recording that starts while a job still waits for whisper
+    /// keeps that job's model, whatever app is in front; once the queue is through, the next
+    /// press takes its own app's model again.
+    #[test]
+    fn a_busy_machine_keeps_its_model_for_the_next_recording() {
+        let mut rig = profile_rig(FileMode::Off, "");
+        rig.event(Event::ModelLoaded, 0);
+        rig.event(Event::ChordDown, 0);
+        rig.event(Event::ChordUp, 1000);
+        rig.event(Event::Tick, 1500);
+        assert_eq!(used_models(&rig), ["tiny"]);
+        rig.c.foreground = Box::new(|| "other.exe".into());
+        rig.event(Event::ChordDown, 3000);
+        rig.event(Event::ChordUp, 4000);
+        rig.event(Event::Tick, 4500);
+        assert_eq!(used_models(&rig), ["tiny"], "no switch mid-queue");
+        let jobs: Vec<JobId> = {
+            let mut jobs: Vec<JobId> = rig.c.profiles.keys().copied().collect();
+            jobs.sort_unstable();
+            jobs
+        };
+        assert_eq!(jobs.len(), 2);
+        let second = &rig.c.profiles[&jobs[1]];
+        assert_eq!(second.model, "tiny");
+        assert_eq!(
+            second.language, rig.c.active.model.language,
+            "the app's own language still applies"
+        );
+        for (i, job) in jobs.iter().enumerate() {
+            let at = 5000 + 100 * i as u64;
+            rig.c.handle(
+                Inbox::JobAudio {
+                    job: *job,
+                    samples: vec![0.5; 4],
+                    spool: None,
+                    voiced_ms: 0,
+                },
+                Millis(at),
+            );
+            rig.c.handle(
+                Inbox::Transcribed {
+                    job: *job,
+                    text: Some("hi".into()),
+                    words: Vec::new(),
+                    held: Vec::new(),
+                },
+                Millis(at + 50),
+            );
+        }
+        drain(&rig.whisper);
+        rig.event(Event::ChordDown, 9000);
+        assert_eq!(used_models(&rig), ["turbo"], "the queue is through");
+    }
+
+    /// Review d04 #5: the paste worker's to-file warning shows in the status until it clears.
+    #[test]
+    fn a_to_file_warning_shows_in_the_status_until_it_clears() {
+        let mut rig = Rig::new();
+        let line = "Dictations are not written to the file: entity not found";
+        rig.c.handle(fw(JobId(0), Some(line)), Millis(10));
+        assert!(rig.c.status().warnings.iter().any(|w| w == line));
+        rig.c.handle(fw(JobId(0), None), Millis(20));
+        assert!(!rig.c.status().warnings.iter().any(|w| w == line));
+    }
+
+    /// d04-fix 3: the warning of a failing folder goes when file mode is turned off or the folder
+    /// changes; another setting keeps it.
+    #[test]
+    fn a_to_file_warning_goes_when_its_folder_is_no_longer_written() {
+        let line = "Dictations are not written to the file: entity not found";
+        let output = |mode, folder: &str| {
+            let mut config = Config::default();
+            config.output.file_mode = mode;
+            config.output.file_folder = folder.into();
+            config
+        };
+        let mut rig = Rig::with(output(FileMode::Also, "C:/synthetic/a"));
+        let warned = |rig: &Rig| rig.c.status().warnings.iter().any(|w| w == line);
+        let mut at = 10;
+        let mut apply = |rig: &mut Rig, config: Config| {
+            rig.c.handle(fw(JobId(0), Some(line)), Millis(at));
+            let config = Box::new(config);
+            let warnings = Vec::new();
+            rig.c
+                .handle(Inbox::Config { config, warnings }, Millis(at + 5));
+            at += 10;
+        };
+        let mut other = output(FileMode::Also, "C:/synthetic/a");
+        other.paste.trailing_space = !other.paste.trailing_space;
+        apply(&mut rig, other);
+        assert!(warned(&rig), "the same folder is still written");
+        apply(&mut rig, output(FileMode::Also, "C:/synthetic/b"));
+        assert!(!warned(&rig), "another folder");
+        apply(&mut rig, output(FileMode::Off, "C:/synthetic/b"));
+        assert!(!warned(&rig), "file mode off");
+    }
+
+    /// d04-fix 2: a write queued for the old folder that fails after the folder changed (or file
+    /// mode went off) brings no warning back; a write of the folder in use does.
+    #[test]
+    fn a_late_failure_of_a_folder_no_longer_written_is_not_a_warning() {
+        let line = "Dictations are not written to the file: entity not found";
+        let warned = |rig: &Rig| rig.c.status().warnings.iter().any(|w| w == line);
+        let mut rig = profile_rig(FileMode::Also, "C:/synthetic/a");
+        let job = rig.transcribed("hi");
+        rig.land(job, 3000);
+        let mut config = rig.c.active.clone();
+        config.output.file_folder = "C:/synthetic/b".into();
+        let config = Box::new(config);
+        let warnings = Vec::new();
+        rig.c
+            .handle(Inbox::Config { config, warnings }, Millis(3100));
+        rig.c.handle(fw(job, Some(line)), Millis(3200));
+        assert!(!warned(&rig), "the old folder's queued write");
+        rig.c.handle(fw(JobId(99), Some(line)), Millis(3300));
+        assert!(warned(&rig), "a write of the folder in use");
+    }
+
+    /// d04-fix 2: a job that ends with no audio (a silent tap, a muted mic, a failed capture)
+    /// leaves no profile behind, so the next press in another app takes its own model.
+    #[test]
+    fn a_job_with_no_audio_leaves_no_profile_to_hold_the_next_model() {
+        for why in [
+            EmptyAudio::NothingHeard,
+            EmptyAudio::MicSilence,
+            EmptyAudio::Failed,
+        ] {
+            let mut rig = profile_rig(FileMode::Off, "");
+            rig.event(Event::ModelLoaded, 0);
+            let job = rig.record();
+            rig.event(Event::JobAudioEmpty { job, why }, 2100);
+            assert!(rig.c.profiles.is_empty(), "{why:?}");
+            drain(&rig.whisper);
+            rig.c.foreground = Box::new(|| "other.exe".into());
+            rig.event(Event::ChordDown, 9000);
+            assert_eq!(used_models(&rig), ["turbo"], "{why:?}");
+        }
+    }
+
+    /// Review d04 #7: a write-only dictation still transcribing at quit reaches its file too
+    /// (within the grace), after the clipboard.
+    #[test]
+    fn quit_writes_the_text_of_a_to_file_dictation_to_its_file() {
+        let mut rig = profile_rig(FileMode::Only, "C:/synthetic/notes");
+        rig.event(Event::ModelLoaded, 0);
+        let job = rig.record();
+        rig.c.handle(
+            Inbox::JobAudio {
+                job,
+                samples: vec![0.5; 4],
+                spool: None,
+                voiced_ms: 0,
+            },
+            Millis(2100),
+        );
+        rig.drain_all();
+        let msgs = vec![Inbox::Transcribed {
+            job,
+            text: Some("hello".into()),
+            words: Vec::new(),
+            held: Vec::new(),
+        }];
+        let q = quit(rig, msgs, 60_000);
+        let sent: Vec<_> = q
+            .paste
+            .into_iter()
+            .map(|c| match c {
+                PasteCmd::CopyOnly { text, .. } => format!("copy {text}"),
+                PasteCmd::File { text, to, until } => {
+                    assert!(to.only && to.folder.ends_with("notes"));
+                    assert!(until > std::time::Instant::now(), "the grace bounds it");
+                    format!("file {text}")
+                }
+                PasteCmd::Paste { .. } => panic!("pasted at quit"),
+            })
+            .collect();
+        assert_eq!(sent, ["copy hello", "file hello"]);
+    }
+
+    fn fw(job: JobId, line: Option<&str>) -> Inbox {
+        let line = line.map(str::to_owned);
+        Inbox::FileWarning { job, line }
+    }
+
+    /// d03-label: a write the full queue refuses answers before the writes ahead of it. By job,
+    /// the late failure of the old folder is dropped and the refusal of the folder in use shows;
+    /// in arrival order the refusal was taken for the stale write and dropped.
+    #[test]
+    fn a_file_answer_belongs_to_its_own_job_not_to_the_oldest_write() {
+        let (full, gone) = ("queue full", "entity not found");
+        let mut rig = profile_rig(FileMode::Also, "C:/synthetic/a");
+        let first = rig.transcribed("hi");
+        rig.land(first, 3000);
+        let mut config = rig.c.active.clone();
+        config.output.file_folder = "C:/synthetic/b".into();
+        let config = Box::new(config);
+        let warnings = Vec::new();
+        rig.c
+            .handle(Inbox::Config { config, warnings }, Millis(3100));
+        rig.event(Event::ChordDown, 4000);
+        rig.event(Event::ChordUp, 5000);
+        rig.event(Event::Tick, 6000);
+        let second = JobId(first.0 + 1);
+        assert!(drain(&rig.audio).contains(&AudioCmd::Stop(second)));
+        let audio = Inbox::JobAudio {
+            job: second,
+            samples: vec![0.5; 4],
+            spool: None,
+            voiced_ms: 0,
+        };
+        rig.c.handle(audio, Millis(6100));
+        rig.c.handle(transcribed(second, Some("hi")), Millis(6200));
+        rig.c.handle(fw(second, Some(full)), Millis(6300));
+        rig.c.handle(fw(first, Some(gone)), Millis(6400));
+        let warnings = rig.c.status().warnings;
+        assert!(warnings.iter().any(|w| w == full), "{warnings:?}");
+        assert!(!warnings.iter().any(|w| w == gone), "{warnings:?}");
+    }
+
+    /// The focus the fake OS reports: window `w`, control 2, no keys.
+    fn at(w: usize) -> Focus {
+        Focus {
+            window: w,
+            control: 2,
+            keys: 0,
+        }
+    }
+
+    /// A rig with `paste.press_enter` on whose OS focus is the window in the returned cell.
+    fn enter_rig() -> (Rig, Rc<Cell<usize>>) {
+        let mut config = Config::default();
+        config.paste.press_enter = true;
+        let mut rig = Rig::with(config);
+        let window = Rc::new(Cell::new(1));
+        let w = Rc::clone(&window);
+        rig.c.focus = Box::new(move || Some(at(w.get())));
+        (rig, window)
+    }
+
+    /// The `focus_at_start` of each paste sent since the last look.
+    fn starts(rig: &Rig) -> Vec<Option<Focus>> {
+        drain(&rig.paste)
+            .into_iter()
+            .filter_map(|c| match c {
+                PasteCmd::Paste { focus_at_start, .. } => Some(focus_at_start),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Review d08 #1 (the owner's case): dictate in chat A, switch to chat B while speaking or
+    /// while whisper runs. The paste carries A, the focus of the record start, so the worker's
+    /// check at Enter time sees the switch.
+    #[test]
+    fn the_paste_carries_the_focus_of_the_record_start() {
+        let (mut rig, window) = enter_rig();
+        rig.event(Event::ModelLoaded, 0);
+        rig.event(Event::ChordDown, 0);
+        window.set(2); // switched while speaking
+        rig.event(Event::ChordUp, 1000);
+        rig.event(Event::Tick, 2000);
+        let job = JobId(0);
+        let audio = Inbox::JobAudio {
+            job,
+            samples: vec![0.5; 4],
+            spool: None,
+            voiced_ms: 0,
+        };
+        rig.c.handle(audio, Millis(2100));
+        window.set(3); // and again while whisper runs
+        rig.c.handle(transcribed(job, Some("hi")), Millis(2500));
+        assert_eq!(starts(&rig), [Some(at(1))]);
+        // The setting off: the OS is not asked and the paste carries none.
+        let mut rig = Rig::new();
+        rig.c.focus = Box::new(|| panic!("asked with the setting off"));
+        rig.transcribed("hi");
+        assert_eq!(starts(&rig), [None]);
+    }
+
+    /// Review d08 #1: a hold-gap continuation is one dictation: its Enter checks against where
+    /// the first part started, not where the re-press was.
+    #[test]
+    fn a_continued_dictation_carries_the_focus_of_its_first_part() {
+        let (mut rig, window) = enter_rig();
+        rig.event(Event::ModelLoaded, 0);
+        rig.event(Event::ChordDown, 0);
+        rig.event(Event::ChordUp, 1000);
+        rig.event(Event::Tick, 1100);
+        let audio = |job| Inbox::JobAudio {
+            job,
+            samples: vec![0.1; 800],
+            spool: None,
+            voiced_ms: 0,
+        };
+        rig.c.handle(audio(JobId(0)), Millis(1150));
+        rig.c
+            .handle(transcribed(JobId(0), Some("one")), Millis(1200));
+        window.set(2);
+        rig.event(Event::ChordDown, 1300); // inside the gap, in another window
+        rig.event(Event::ChordUp, 2000);
+        rig.event(Event::Tick, 2100);
+        rig.c.handle(audio(JobId(1)), Millis(2150));
+        rig.c
+            .handle(transcribed(JobId(1), Some("one two")), Millis(2200));
+        rig.event(Event::Tick, 2600);
+        assert_eq!(starts(&rig), [Some(at(1))]);
+    }
+
+    /// Review d08 #5: a lock or a sleep while a dictation runs, or a recording started while
+    /// locked, gives its paste no start focus: the lock screen may hold the focus at both reads.
+    #[test]
+    fn a_lock_or_a_sleep_takes_the_start_focus_away() {
+        for (off, on) in [
+            (Event::Lock, Event::Unlock),
+            (Event::Suspend, Event::Resume),
+        ] {
+            let (mut rig, _) = enter_rig();
+            rig.event(Event::ModelLoaded, 0);
+            let job = rig.record();
+            let audio = Inbox::JobAudio {
+                job,
+                samples: vec![0.5; 4],
+                spool: None,
+                voiced_ms: 0,
+            };
+            rig.c.handle(audio, Millis(2100));
+            rig.event(off.clone(), 2200);
+            rig.event(on, 2300);
+            rig.c.handle(transcribed(job, Some("hi")), Millis(2500));
+            assert_eq!(starts(&rig), [None], "{off:?}");
+        }
+        // Started while locked: none either; after the unlock the next one has its own.
+        let (mut rig, _) = enter_rig();
+        rig.event(Event::Lock, 0);
+        rig.c.start_profile();
+        assert_eq!(rig.c.next_profile.as_ref().unwrap().focus_at_start, None);
+        rig.event(Event::Unlock, 10);
+        rig.c.start_profile();
+        let next = rig.c.next_profile.as_ref().unwrap().focus_at_start;
+        assert_eq!(next, Some(at(1)));
     }
 }

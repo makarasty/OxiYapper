@@ -33,6 +33,8 @@ notices! {
     AdminWindow,
     RestoreSkipped,
     PasteFailed,
+    FileFailed,
+    ModelFellBack,
     MicFallback,
     ConfigInvalid,
     ConfigAdjusted,

@@ -11,6 +11,9 @@
 //! goes in unprocessed) and `--ctx both` runs each record with `Full` and with `Fit` against the
 //! stored text. `--no-text` prints no transcript, only counts, timings and error rates.
 //!
+//! Word times: `--history --timings live|tokens|turbo|large-v3|tiny` scores the times of the records (whisper's token
+//! timestamps, or DTW with that preset) against the voice gate. Numbers only (arch-plan 8.2).
+//!
 //! `OxiYapper bench --record <seconds> <out.wav>` records the default microphone instead. The
 //! clip is raw: 16 kHz mono through the capture pipeline with trim and normalise off.
 
@@ -30,7 +33,7 @@ use oxi_core::text::Outcome;
 use oxi_core::types::{Language, Millis};
 use oxi_platform::capture::{Capture, CaptureEvent, CpalCapture, LevelMeter};
 use oxi_platform::wav::{read_wav_mono_f32, write_wav};
-use oxi_whisper::Engine;
+use oxi_whisper::{Engine, Timing, dtw_preset};
 
 use crate::pipeline::{self, TextAssets};
 
@@ -67,6 +70,17 @@ struct Args {
     min_s: u64,
     max_s: u64,
     limit: usize,
+    /// `--timings`: score word times of the History records instead of transcribing them.
+    timings: Option<BenchTiming>,
+}
+
+/// What `--timings` scores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchTiming {
+    /// Token times on the normal engine (flash attention as the app loads it).
+    Live,
+    /// A timing engine of its own ([`Engine::load_timing`]).
+    Method(Timing),
 }
 
 /// Which `audio_ctx` runs: `both` is the accuracy guard.
@@ -83,6 +97,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
     let (mut audio, mut cut_end_ms, mut vram) = (Audio::default(), 0, false);
     let (mut no_text, mut history) = (false, false);
     let (mut ctx, mut min_s, mut max_s, mut limit) = (Ctx::Full, 0, u64::MAX, 20);
+    let mut timings = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -93,7 +108,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
             "--no-text" => no_text = true,
             "--history" => history = true,
             "--model" | "--prompt-file" | "--gpu" | "--lang" | "--cut-end-ms" | "--ctx"
-            | "--min-s" | "--max-s" | "--limit" => {
+            | "--min-s" | "--max-s" | "--limit" | "--timings" => {
                 let value = it
                     .next()
                     .with_context(|| format!("{arg} needs a value\n{USAGE}"))?;
@@ -105,6 +120,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
                     "--min-s" => min_s = value.parse().context("--min-s")?,
                     "--max-s" => max_s = value.parse().context("--max-s")?,
                     "--limit" => limit = value.parse().context("--limit")?,
+                    "--timings" => timings = Some(parse_timing(value)?),
                     "--ctx" => {
                         ctx = match value.as_str() {
                             "full" => Ctx::Full,
@@ -137,6 +153,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
         min_s,
         max_s,
         limit,
+        timings,
     })
 }
 
@@ -395,6 +412,176 @@ fn run_history(args: &Args, engine: &mut Engine, assets: &TextAssets) -> Result<
     Ok(())
 }
 
+/// `live`, `tokens`, or a registry model id (`turbo`, `large-v3`, `tiny`) for its DTW preset.
+fn parse_timing(value: &str) -> Result<BenchTiming> {
+    match value {
+        "live" => return Ok(BenchTiming::Live),
+        "tokens" => return Ok(BenchTiming::Method(Timing::Tokens)),
+        _ => {}
+    }
+    dtw_preset(value)
+        .map(|preset| BenchTiming::Method(Timing::Dtw(preset)))
+        .with_context(|| {
+            format!("--timings is live, tokens, turbo, large-v3 or tiny, not {value:?}")
+        })
+}
+
+/// A word's start and end in ms.
+type Span = (u64, u64);
+
+/// Longest a word may last from its start by the capped variant: a base plus a rate per letter.
+const CAP_BASE_MS: u64 = 150;
+const CAP_PER_CHAR_MS: u64 = 70;
+
+/// What the timing check adds up over the records.
+#[derive(Default)]
+struct TimingStats {
+    words: usize,
+    /// `t0 <= t1 <= next t0`.
+    monotone: usize,
+    /// `t1` inside the clip.
+    inside: usize,
+    word_ms: u64,
+    voiced_ms: u64,
+    /// Distance from each edge of a gate pause (400 ms or more, between two voiced runs) to the
+    /// nearest word boundary.
+    edges: Vec<u64>,
+}
+
+/// Ms of `a` that lie inside `runs` (both sorted, `runs` not overlapping).
+fn overlap_ms(a: Span, runs: &[Span]) -> u64 {
+    runs.iter()
+        .map(|r| a.1.min(r.1).saturating_sub(a.0.max(r.0)))
+        .sum()
+}
+
+impl TimingStats {
+    /// Scores the words of one clip of `clip_ms` against the gate's voiced `runs` (in ms).
+    fn add(&mut self, words: &[Span], clip_ms: u64, runs: &[Span]) {
+        for (i, w) in words.iter().enumerate() {
+            self.words += 1;
+            let next = words.get(i + 1).map_or(u64::MAX, |n| n.0);
+            self.monotone += usize::from(w.0 <= w.1 && w.1 <= next);
+            self.inside += usize::from(w.1 <= clip_ms);
+            self.word_ms += w.1.saturating_sub(w.0);
+            self.voiced_ms += overlap_ms(*w, runs);
+        }
+        for pair in runs.windows(2) {
+            if pair[1].0 - pair[0].1 < 400 {
+                continue;
+            }
+            for edge in [pair[0].1, pair[1].0] {
+                let near = words.iter().flat_map(|w| [w.0, w.1]);
+                self.edges.extend(near.map(|b| b.abs_diff(edge)).min());
+            }
+        }
+    }
+
+    /// One line: shares in percent, then the pause-edge median and 90th percentile.
+    #[allow(clippy::cast_precision_loss, reason = "counts are tiny")]
+    fn line(&mut self) -> String {
+        let pct = |a: usize, b: usize| 100.0 * a as f64 / b.max(1) as f64;
+        self.edges.sort_unstable();
+        let edges: Vec<u128> = self.edges.iter().map(|&e| u128::from(e)).collect();
+        format!(
+            "words {}\tmonotone {:.1} %\tinside {:.1} %\tvoiced {:.1} %\tpause edges {}: p50 {} ms p90 {} ms",
+            self.words,
+            pct(self.monotone, self.words),
+            pct(self.inside, self.words),
+            100.0 * self.voiced_ms as f64 / self.word_ms.max(1) as f64,
+            edges.len(),
+            percentile(&edges, 50),
+            percentile(&edges, 90),
+        )
+    }
+}
+
+/// Word spans in ms of a transcript; words with no time are left out (counted in the second value).
+fn word_spans(t: &oxi_whisper::Transcript) -> (Vec<(Span, usize)>, usize) {
+    let mut out = Vec::new();
+    let mut missing = 0;
+    for w in t.segments.iter().flat_map(|s| &s.words) {
+        match (w.t0, w.t1) {
+            (Some(a), Some(b)) => out.push(((a.0, b.0), w.text.chars().count())),
+            _ => missing += 1,
+        }
+    }
+    (out, missing)
+}
+
+/// Each word ends at most [`CAP_BASE_MS`] plus [`CAP_PER_CHAR_MS`] a letter after its start.
+fn capped(words: &[(Span, usize)]) -> Vec<Span> {
+    words
+        .iter()
+        .map(|&((a, b), n)| (a, b.min(a + CAP_BASE_MS + CAP_PER_CHAR_MS * n as u64)))
+        .collect()
+}
+
+/// `--timings`: word times of the History records, by one method, scored against the gate. Read
+/// only; numbers only, no text is printed.
+fn run_timings(args: &Args, timing: BenchTiming) -> Result<()> {
+    let records = history_records(args)?;
+    if records.is_empty() {
+        bail!("no matching done records in {}", args.dir.display());
+    }
+    let started = Instant::now();
+    let mut engine = match timing {
+        BenchTiming::Live => {
+            let mut engine = Engine::load(&args.model, &args.gpu)?;
+            engine.set_token_times(true);
+            engine
+        }
+        BenchTiming::Method(method) => Engine::load_timing(&args.model, &args.gpu, method)?,
+    };
+    println!(
+        "{timing:?}: loaded in {} ms on {}",
+        started.elapsed().as_millis(),
+        engine.info().device.as_deref().unwrap_or("CPU")
+    );
+    let (mut raw, mut cap) = (TimingStats::default(), TimingStats::default());
+    let (mut times, mut missing, mut audio_ms) = (Vec::new(), 0, 0);
+    for (n, rec) in records.iter().enumerate() {
+        let Ok((mono, rate)) = read_wav_mono_f32(&rec.wav) else {
+            continue;
+        };
+        if rate != audio::SAMPLE_RATE {
+            continue;
+        }
+        let clip_ms = mono.len() as u64 / 16;
+        let runs: Vec<Span> = audio::voiced_runs(&mono, args.audio.vad_sensitivity)
+            .iter()
+            .map(|r| (r.start as u64 / 16, r.end as u64 / 16))
+            .collect();
+        let at = Instant::now();
+        let t = engine.transcribe(&mono, args.lang, "")?;
+        let ms = at.elapsed().as_millis();
+        let (words, miss) = word_spans(&t);
+        missing += miss;
+        raw.add(
+            &words.iter().map(|w| w.0).collect::<Vec<_>>(),
+            clip_ms,
+            &runs,
+        );
+        cap.add(&capped(&words), clip_ms, &runs);
+        times.push(ms);
+        audio_ms += clip_ms;
+        println!(
+            "#{n}\taudio {clip_ms} ms\trun {ms} ms\twords {}\twithout time {miss}",
+            words.len()
+        );
+    }
+    times.sort_unstable();
+    println!(
+        "records {}\taudio {audio_ms} ms\tp50 {} ms\tp95 {} ms\twords without time {missing}",
+        times.len(),
+        percentile(&times, 50),
+        percentile(&times, 95)
+    );
+    println!("raw\t{}", raw.line());
+    println!("capped\t{}", cap.line());
+    Ok(())
+}
+
 /// `--record <seconds> <out.wav>`: the whole argument list, nothing else. Seconds are capped
 /// at the config recording limit; the path is checked before the microphone opens.
 fn parse_record(args: &[String]) -> Result<(Duration, PathBuf)> {
@@ -455,6 +642,9 @@ pub fn run(args: &[String]) -> Result<()> {
         return record(args);
     }
     let args = parse_args(args)?;
+    if args.timings.is_some() && !args.history {
+        bail!("--timings needs --history");
+    }
     let files = if args.history {
         Vec::new()
     } else {
@@ -472,6 +662,9 @@ pub fn run(args: &[String]) -> Result<()> {
     };
 
     pipeline::verify_hash(&args.model)?;
+    if let Some(timing) = args.timings {
+        return run_timings(&args, timing);
+    }
     print_vram(&args, "before load");
     let started = Instant::now();
     let mut engine = Engine::load(&args.model, &args.gpu)?;
@@ -691,5 +884,42 @@ mod tests {
         assert_eq!(percentile(&[7], 95), 7);
         let v: Vec<u128> = (1..=10).collect();
         assert_eq!((percentile(&v, 50), percentile(&v, 95)), (5, 10));
+    }
+
+    #[test]
+    fn timing_stats_count_order_clip_voice_and_pause_edges() {
+        let mut s = TimingStats::default();
+        // Voice 0..900 and 1800..2300 with a 900 ms pause between; the words follow it exactly.
+        s.add(
+            &[(0, 500), (500, 900), (1800, 2300)],
+            2400,
+            &[(0, 900), (1800, 2300)],
+        );
+        assert_eq!((s.words, s.monotone, s.inside), (3, 3, 3));
+        assert_eq!(s.voiced_ms, s.word_ms);
+        assert_eq!(s.edges, [0, 0]);
+        // A word that runs into the next one, and one past the end of the clip.
+        let mut s = TimingStats::default();
+        s.add(&[(0, 600), (500, 3000)], 2400, &[]);
+        assert_eq!((s.monotone, s.inside, s.voiced_ms), (1, 1, 0));
+        assert_eq!(s.edges.len(), 0);
+    }
+
+    #[test]
+    fn the_capped_variant_cuts_only_long_words() {
+        let words = [((0, 5000), 3), ((6000, 6200), 3)];
+        assert_eq!(capped(&words), [(0, 360), (6000, 6200)]);
+    }
+
+    #[test]
+    fn timings_flag_takes_live_tokens_or_a_model() {
+        let a = parse_args(&strs(&["d", "--model", "m", "--timings", "live"])).unwrap();
+        assert_eq!(a.timings, Some(BenchTiming::Live));
+        let a = parse_args(&strs(&["d", "--model", "m", "--timings", "turbo"])).unwrap();
+        assert!(matches!(
+            a.timings,
+            Some(BenchTiming::Method(Timing::Dtw(_)))
+        ));
+        assert!(parse_args(&strs(&["d", "--model", "m", "--timings", "huge"])).is_err());
     }
 }

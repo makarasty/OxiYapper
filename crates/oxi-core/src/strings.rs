@@ -26,6 +26,10 @@ pub const fn notice(notice: Notice) -> &'static str {
         Notice::AdminWindow => "Admin window: press Ctrl+V",
         Notice::RestoreSkipped => "Pasted. The previous clipboard could not be restored",
         Notice::PasteFailed => "Could not paste. Use Copy last text in the tray menu",
+        Notice::FileFailed => "Could not write to the file. Use Copy last text in the tray menu",
+        Notice::ModelFellBack => {
+            "A chosen model is not downloaded or cannot load. Used the main model"
+        }
         Notice::MicFallback => "Selected microphone not found, using the system default",
         Notice::ConfigInvalid => {
             "config.toml has an error. Using the last good settings. Open Settings to see it"
@@ -131,6 +135,8 @@ pub const fn notice_short(notice: Notice) -> &'static str {
         Notice::AdminWindow => "Admin window",
         Notice::RestoreSkipped => "Not restored",
         Notice::PasteFailed => "Paste failed",
+        Notice::FileFailed => "File failed",
+        Notice::ModelFellBack => "Main model used",
         Notice::MicFallback => "Mic changed",
         Notice::ConfigInvalid => "Config error",
         Notice::ConfigAdjusted => "Config adjusted",
@@ -159,6 +165,10 @@ pub const fn overlay_label(state: OverlayState) -> &'static str {
         OverlayState::Transcribing => "Transcribing",
         OverlayState::Pasting => "Pasting",
         OverlayState::Text(n) => notice_short(n),
+        OverlayState::HeldBack { all: true } => "Held back",
+        OverlayState::HeldBack { all: false } => "Some held back",
+        OverlayState::SavedToFile { also: false } => "Saved to file",
+        OverlayState::SavedToFile { also: true } => "Also saved",
     }
 }
 
@@ -323,6 +333,18 @@ pub const MODEL_PATH_MISSING: &str = "File not found";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// d04-fix review 5: the fallback comes from an app rule or a by-language entry, so the text
+    /// names neither.
+    #[test]
+    fn the_model_fallback_text_fits_an_app_rule_and_a_language_entry() {
+        let text = notice(Notice::ModelFellBack);
+        assert!(
+            !text.contains("app") && !text.contains("language"),
+            "{text}"
+        );
+        assert!(text.contains("main model"));
+    }
 
     #[test]
     fn sizes_and_messages() {

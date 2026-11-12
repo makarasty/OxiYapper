@@ -201,6 +201,7 @@ fn item(id: &str, text: &str) -> HistoryItem {
         model: String::new(),
         language: "ru".to_owned(),
         text: Spoken(text.to_owned()),
+        held: Vec::new(),
     }
 }
 

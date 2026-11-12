@@ -1,8 +1,9 @@
-// Text page (SPEC Text), in four sub-tabs: dictionary.txt with its prompt token budget, replace.txt
+// Text page (SPEC Text), in sub-tabs: dictionary.txt with its prompt token budget, replace.txt
 // with the lines it ignores, how text is pasted (mode, trailing space, Win+V history, restore
 // delay), and the per-app rules.
-import { Theme, Shell, Icons, Group, Card, CardFrame, Caption, Row, Divider, ToggleRow, SliderRow, Combo, TextField, SearchField, TextArea, TilePicker, Button, ButtonKind, IconButton, InfoTip, Tip, ProgressBar, Note, Severity, SubTabs, SubTabPane, GalleryTile, CardGrid, EmptyState, ScrollBox } from "../theme/index.slint";
+import { Theme, Shell, Icons, Group, Card, CardFrame, Caption, Row, Divider, ToggleRow, SliderRow, Combo, Segmented, TextField, SearchField, TextArea, TilePicker, Button, ButtonKind, IconButton, InfoTip, Tip, ProgressBar, Note, Severity, SubTabs, SubTabPane, GalleryTile, CardGrid, EmptyState, ScrollBox } from "../theme/index.slint";
 import { WarningSlot, Warnings } from "../theme/components/feedback.slint";
+import { SystemState } from "system.slint";
 
 export enum TextFile { dictionary, replacements }
 
@@ -38,7 +39,7 @@ export struct PasteRuleRow {
 
 // Filled and read by `pages::text`.
 export global TextState {
-    // The open sub-tab: 0 Dictionary, 1 Replacements, 2 Paste, 3 Per-app rules.
+    // The open sub-tab: 0 Dictionary, 1 Replacements, 2 Paste, 3 Per-app rules, 4 Processing, 5 Words.
     in-out property <int> tab;
     in-out property <string> dictionary;
     in property <FileInfo> dictionary-info;
@@ -56,9 +57,46 @@ export global TextState {
     in-out property <bool> trailing-space;
     // The dictation stays in Win+V history (`paste.keep_in_clipboard_history`).
     in-out property <bool> keep-history;
+    // One Enter after the whole text landed (`paste.press_enter`).
+    in-out property <bool> press-enter;
     in-out property <float> restore-delay-ms;
     in property <float> default-restore-delay-ms;
+    // Processing (`[text]`): every switch is off until the person turns it on.
+    in-out property <bool> pause-punctuation;
+    in-out property <float> pause-sentence-ms;
+    // 0 is off.
+    in-out property <float> pause-paragraph-ms;
+    in-out property <bool> filler-filter;
+    // One word per line.
+    in-out property <string> fillers;
+    in-out property <bool> voice-commands;
+    // One `trigger => text` per line; a backslash and n in the text is a line break.
+    in-out property <string> snippets;
+    in-out property <bool> confidence-filter;
+    in-out property <float> confidence-min;
+    // History saving is on: a held part has a place to be kept, so the confidence filter can run.
+    // Follows the System page's switch, so a change made anywhere shows at once.
+    out property <bool> history-on: SystemState.history-on;
     in property <[PasteRuleRow]> rules;
+    // To-file mode (`[output]`): 0 off, 1 also, 2 only; the format 0 md, 1 txt; the folder's name
+    // (empty while none is chosen, the whole path is its tip).
+    in-out property <int> file-mode;
+    in-out property <int> file-format;
+    in property <string> file-folder-name;
+    in property <string> file-folder;
+    // Why the last dictation did not reach its file (the daemon's status warning); empty when it did.
+    in property <string> file-warning;
+    // The rule whose profile is open in the Per-app card, -1 for the list.
+    in-out property <int> profile-rule: -1;
+    in property <string> profile-name;
+    in property <string> profile-app;
+    in property <image> profile-icon;
+    // The choices of the profile's two long lists, "Default" first.
+    in property <[string]> language-names;
+    in property <[string]> model-names;
+    // The profile's values as indexes into those lists and the three-way ones (0 default, 1 on, 2
+    // off); the order is the fields of `profile-picked`.
+    in property <[int]> profile-values;
     // How many rules the search field leaves visible.
     in property <int> rule-matches;
     // The search field of the rules list: filters the rules, offers the installed apps and a typed exe.
@@ -90,8 +128,25 @@ export global TextState {
     callback paste-mode-picked(int);
     callback trailing-space-toggled(bool);
     callback keep-history-toggled(bool);
+    callback press-enter-toggled(bool);
     callback restore-delay-changed(float);
+    callback pause-punctuation-toggled(bool);
+    callback pause-sentence-changed(float);
+    callback pause-paragraph-changed(float);
+    callback filler-filter-toggled(bool);
+    callback fillers-edited(string);
+    callback voice-commands-toggled(bool);
+    callback snippets-edited(string);
+    callback confidence-filter-toggled(bool);
+    callback confidence-min-changed(float);
     callback rule-mode-picked(int, int);
+    // 0 language, 1 model, 2 to file, 3 dictionary, 4 replacements, 5 voice commands, 6 filler
+    // words, 7 pause punctuation; the index into that field's list.
+    callback profile-picked(int, int);
+    callback profile-opened(int);
+    callback file-mode-picked(int);
+    callback file-format-picked(int);
+    callback file-folder-choose();
     callback rule-removed(int);
     // A row of the field's list: add the rule for this exe (a duplicate is refused: its rule flashes).
     callback rule-picked(string);
@@ -335,7 +390,17 @@ export component TextPage inherits VerticalLayout {
     // rows (the empty states) and what the room leaves.
     property <length> bar-block: Theme.control-height + Theme.space-3;
     property <length> list-room: max(root.room - 2 * Theme.card-padding-v - root.bar-block, 3 * Theme.row-height);
+    // The profile editor of a rule: its header, then eight rows; it takes what the room leaves, so a short
+    // window scrolls inside it (rule 26).
+    property <length> profile-height: min(root.room, 2 * Theme.card-padding-v + Theme.control-height + 2 * Theme.space-3 + 8 * Theme.control-height + 7 * Theme.space-3 + Theme.space-2);
     property <length> list-height: min(root.list-room, max(TextState.rule-matches * Theme.row-height, 3 * Theme.row-height));
+    // The card is as tall with a profile open as with the list, the taller of the two, so opening one
+    // moves nothing (UI rule 1); the list keeps its rows at the top.
+    property <length> rules-card: max(2 * Theme.card-padding-v + root.bar-block + root.list-height, root.profile-height);
+    // Words: the two editors share what the room leaves after both cards' padding, the
+    // toggle and the two headers, so the tab never scrolls as a page; each keeps three rows.
+    property <length> words-min: 3 * Theme.control-height;
+    property <length> words-height: max(root.words-min, (root.room - Theme.card-gap - 4 * Theme.card-padding-v - 3 * Theme.row-height - 3 * Theme.space-2) / 2);
     // The row of the field's list under the arrows.
     property <int> active;
     // The window's width, from the shell: the page's own width is short of it by the rail and
@@ -383,8 +448,8 @@ export component TextPage inherits VerticalLayout {
         }
     }
     tabs := SubTabs {
-        items: [@tr("Dictionary"), @tr("Replacements"), @tr("Paste"), @tr("Per-app rules")];
-        counts: [-1, -1, -1, TextState.rules.length];
+        items: [@tr("Dictionary"), @tr("Replacements"), @tr("Paste"), @tr("Per-app rules"), @tr("Processing"), @tr("Words")];
+        counts: [-1, -1, -1, TextState.rules.length, -1, -1];
         selected: TextState.tab;
         picked(i) => {
             TextState.tab = i;
@@ -488,6 +553,203 @@ export component TextPage inherits VerticalLayout {
                                 TextState.restore-delay-changed(v);
                             }
                         }
+                        // In the same card: a card of its own does not fit the least window with a banner
+                        // (UI rule 25).
+                        Divider { }
+                        Row {
+                            title: @tr("Also write to a file");
+                            warning: TextState.file-warning;
+                            info: @tr("Each dictation is added to a file of the day, YYYY-MM-DD, in the folder. With Write only nothing is pasted. Without a folder nothing is written.");
+                            Combo {
+                                model: [@tr("Off"), @tr("Paste and write"), @tr("Write only")];
+                                current-index: TextState.file-mode;
+                                accessible-label: @tr("Also write to a file");
+                                selected => {
+                                    TextState.file-mode-picked(self.current-index);
+                                }
+                            }
+                        }
+                        Divider { }
+                        // The format beside the folder: one row less, for the same reason.
+                        Row {
+                            title: @tr("Folder");
+                            info: TextState.file-folder == "" ? @tr("Choose the folder the files go to. Markdown adds a list line, - 09:05 text; Text adds 09:05  text.") : TextState.file-folder;
+                            HorizontalLayout {
+                                alignment: end;
+                                spacing: Theme.control-gap;
+                                Segmented {
+                                    accessible-label: @tr("File format");
+                                    items: [".md", ".txt"];
+                                    spoken: [@tr("Markdown"), @tr("Text")];
+                                    tips: [@tr("Markdown: a list line, - 09:05 text"), @tr("Text: 09:05  text")];
+                                    selected: TextState.file-format;
+                                    picked(i) => {
+                                        TextState.file-format-picked(i);
+                                    }
+                                }
+                                Button {
+                                    text: TextState.file-folder-name == "" ? @tr("Choose folder") : TextState.file-folder-name;
+                                    icon: Icons.folder-open;
+                                    enabled: !Shell.locked;
+                                    tooltip: Shell.locked-tip;
+                                    clicked => {
+                                        TextState.file-folder-choose();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        SubTabPane {
+            shown: TextState.tab == 4;
+            VerticalLayout {
+                alignment: start;
+                Group {
+                    Card {
+                        ToggleRow {
+                            flat: true;
+                            title: @tr("Punctuation from pauses");
+                            info: @tr("A long pause ends the sentence: a full stop and a capital letter. \"привет  как дела\" with a pause becomes \"привет. Как дела\"; \"hello  how are you\" becomes \"hello. How are you\".");
+                            checked <=> TextState.pause-punctuation;
+                            toggled(on) => {
+                                TextState.pause-punctuation-toggled(on);
+                            }
+                        }
+                        Divider { }
+                        SliderRow {
+                            title: @tr("Sentence pause");
+                            info: @tr("A pause at least this long ends a sentence.");
+                            enabled: TextState.pause-punctuation;
+                            minimum: 300;
+                            maximum: 3000;
+                            step: 100;
+                            unit: "ms";
+                            default-value: 800;
+                            value <=> TextState.pause-sentence-ms;
+                            changed(v) => {
+                                TextState.pause-sentence-changed(v);
+                            }
+                        }
+                        Divider { }
+                        SliderRow {
+                            title: @tr("Paragraph pause");
+                            info: @tr("A pause at least this long also leaves a blank line. Typed text gets a space instead: a line break would send the message.");
+                            enabled: TextState.pause-punctuation;
+                            minimum: 0;
+                            maximum: 10000;
+                            step: 1000;
+                            unit: "ms";
+                            zero-text: @tr("Off");
+                            default-value: 0;
+                            value <=> TextState.pause-paragraph-ms;
+                            changed(v) => {
+                                TextState.pause-paragraph-changed(v);
+                            }
+                        }
+                        Divider { }
+                        ToggleRow {
+                            flat: true;
+                            title: @tr("Voice commands");
+                            info: @tr("Say \"новая строка\" or \"new line\" for a line break, \"новый абзац\" or \"new paragraph\" for a blank line, \"удали последнее\", \"delete that\" or \"scratch that\" to remove the sentence before it. Text already pasted is never touched. Typed text gets a space instead of a line break.");
+                            checked <=> TextState.voice-commands;
+                            toggled(on) => {
+                                TextState.voice-commands-toggled(on);
+                            }
+                        }
+                        Divider { }
+                        ToggleRow {
+                            flat: true;
+                            title: @tr("Press Enter after pasting");
+                            info: @tr("One Enter once the whole text is in. Not sent if, since you started speaking, the window or the field changed, you pressed a key, or the PC was locked or asleep.");
+                            // Owner 2026-11-12: after Ctrl+V the Enter needs the app's own read.
+                            warning: TextState.press-enter && TextState.paste-mode == 0 ? @tr("With Clipboard mode, Enter only when the app confirms it took the text from the clipboard. No confirmation, no Enter. Type mode always gets the Enter.") : "";
+                            checked <=> TextState.press-enter;
+                            toggled(on) => {
+                                TextState.press-enter-toggled(on);
+                            }
+                        }
+                        Divider { }
+                        ToggleRow {
+                            flat: true;
+                            title: @tr("Hold doubtful words back");
+                            info: @tr("A part Whisper was unsure of is not pasted; its text stays in the History record. Needs History saving.");
+                            enabled: TextState.history-on;
+                            off-tip: @tr("Turn on History saving: a held part is kept there");
+                            checked <=> TextState.confidence-filter;
+                            toggled(on) => {
+                                TextState.confidence-filter-toggled(on);
+                            }
+                        }
+                        Divider { }
+                        SliderRow {
+                            title: @tr("Doubt level");
+                            info: @tr("A part is held back when Whisper's confidence in it is under this share.");
+                            enabled: TextState.history-on && TextState.confidence-filter;
+                            minimum: 0.05;
+                            maximum: 0.95;
+                            step: 0.05;
+                            decimals: 2;
+                            default-value: 0.35;
+                            value <=> TextState.confidence-min;
+                            changed(v) => {
+                                TextState.confidence-min-changed(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        SubTabPane {
+            shown: TextState.tab == 5;
+            VerticalLayout {
+                alignment: start;
+                Group {
+                    Card {
+                        ToggleRow {
+                            flat: true;
+                            title: @tr("Remove filler words");
+                            info: @tr("Removes the words below, with their comma: \"Ну, э, привет\" becomes \"Ну, привет\"; \"Um, hello\" becomes \"Hello\".");
+                            checked <=> TextState.filler-filter;
+                            toggled(on) => {
+                                TextState.filler-filter-toggled(on);
+                            }
+                        }
+                        Row {
+                            title: @tr("Filler words");
+                            info: @tr("One word per line, any case. Whole words only.");
+                            text-only: true;
+                        }
+                        TextArea {
+                            width: 100%;
+                            preferred-height: root.words-height;
+                            min-height: root.words-min;
+                            text <=> TextState.fillers;
+                            placeholder-text: @tr("One word per line");
+                            accessible-label: @tr("Filler words");
+                            edited(text) => {
+                                TextState.fillers-edited(text);
+                            }
+                        }
+                    }
+                    Card {
+                        Row {
+                            title: @tr("Snippets");
+                            info: @tr("When you say only the trigger, the text takes its place: \"мой адрес => ул. Ленина, 1\" or \"my email => me@example.com\". A trigger inside a longer sentence does nothing. Write a backslash and n for a line break in the text.");
+                            text-only: true;
+                        }
+                        TextArea {
+                            width: 100%;
+                            preferred-height: root.words-height;
+                            min-height: root.words-min;
+                            text <=> TextState.snippets;
+                            placeholder-text: @tr("trigger => text");
+                            accessible-label: @tr("Snippets");
+                            edited(text) => {
+                                TextState.snippets-edited(text);
+                            }
+                        }
                     }
                 }
             }
@@ -497,10 +759,11 @@ export component TextPage inherits VerticalLayout {
             VerticalLayout {
                 alignment: start;
                 card := CardFrame {
-                    height: 2 * Theme.card-padding-v + root.bar-block + root.list-height;
+                    height: root.rules-card;
                     // Search, add and scan in one field: it filters the rules below, lists the installed
                     // apps that match, and takes a typed exe for an app with no shortcut.
                     HorizontalLayout {
+                        visible: TextState.profile-rule < 0;
                         x: Theme.card-padding-h;
                         y: Theme.card-padding-v;
                         width: parent.width - 2 * Theme.card-padding-h;
@@ -561,10 +824,11 @@ export component TextPage inherits VerticalLayout {
                     // The list overhangs the card's padding by the bar's gutter, so the buttons end where
                     // the search bar does and the thumb sits in the padding.
                     Rectangle {
+                        visible: TextState.profile-rule < 0;
                         x: Theme.card-padding-h;
                         y: Theme.card-padding-v + root.bar-block;
                         width: parent.width - 2 * Theme.card-padding-h;
-                        height: root.list-height;
+                        height: root.rules-card - 2 * Theme.card-padding-v - root.bar-block;
                         rules-box := ScrollBox {
                             // Without an x a sized child is centred: pinned, so the overhang is all on the right.
                             x: 0;
@@ -654,6 +918,18 @@ export component TextPage inherits VerticalLayout {
                                                 alignment: center;
                                                 Button {
                                                     kind: ButtonKind.icon;
+                                                    icon: Icons.edit-16;
+                                                    text: @tr("Profile of {}", rule.app);
+                                                    tooltip: @tr("Language, model and text options for this app");
+                                                    clicked => {
+                                                        TextState.profile-opened(i);
+                                                    }
+                                                }
+                                            }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                Button {
+                                                    kind: ButtonKind.icon;
                                                     destructive: true;
                                                     icon: Icons.delete-16;
                                                     text: @tr("Remove {}", rule.app);
@@ -687,7 +963,7 @@ export component TextPage inherits VerticalLayout {
                         }
                     }
                     // Under the field, over the list: the installed apps that match, then the typed exe.
-                    if root.suggest-open: CardFrame {
+                    if root.suggest-open && TextState.profile-rule < 0: CardFrame {
                         x: Theme.card-padding-h;
                         y: Theme.card-padding-v + Theme.control-height + Theme.space-1;
                         width: search.width;
@@ -747,6 +1023,157 @@ export component TextPage inherits VerticalLayout {
                                 mouse-cursor: MouseCursor.pointer;
                                 clicked => {
                                     root.pick-suggestion(i);
+                                }
+                            }
+                        }
+                    }
+                    // One rule's profile in the place of the list: the card keeps its size, so nothing
+                    // moves. Every field is "Default" (follow the other tabs) or this app's own value.
+                    if TextState.profile-rule >= 0: VerticalLayout {
+                        x: Theme.card-padding-h;
+                        y: Theme.card-padding-v;
+                        width: parent.width - 2 * Theme.card-padding-h;
+                        height: parent.height - 2 * Theme.card-padding-v;
+                        spacing: Theme.space-3;
+                        HorizontalLayout {
+                            height: Theme.control-height;
+                            spacing: Theme.icon-gap;
+                            VerticalLayout {
+                                alignment: center;
+                                Image {
+                                    source: TextState.profile-icon.width > 0 ? TextState.profile-icon : Icons.app-generic;
+                                    width: Theme.icon-size;
+                                    height: Theme.icon-size;
+                                    image-fit: contain;
+                                    colorize: TextState.profile-icon.width > 0 ? transparent : Theme.text-secondary;
+                                    accessible-role: none;
+                                }
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: TextState.profile-name != "" ? TextState.profile-name : TextState.profile-app;
+                                font-size: Theme.body-size;
+                                font-weight: Theme.weight-strong;
+                                color: Theme.text-primary;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                IconButton {
+                                    icon: Icons.close;
+                                    label: @tr("Close the profile");
+                                    tooltip: @tr("Back to the apps");
+                                    clicked => {
+                                        TextState.profile-rule = -1;
+                                    }
+                                }
+                            }
+                        }
+                        Divider { }
+                        profile-box := ScrollBox {
+                            vertical-stretch: 1;
+                            reserve-gutter: true;
+                            content-height: 8 * Theme.control-height + 7 * Theme.space-3;
+                            VerticalLayout {
+                                alignment: start;
+                                spacing: Theme.space-3;
+                                width: profile-box.content-width;
+                                Row {
+                                    title: @tr("Language");
+                                    info: @tr("This app's language. A language with its own model (Model, Settings, Model by language) runs that model; Auto runs the model in use.");
+                                    Combo {
+                                        model: TextState.language-names;
+                                        current-index: TextState.profile-values[0];
+                                        accessible-label: @tr("Language");
+                                        selected => {
+                                            TextState.profile-picked(0, self.current-index);
+                                        }
+                                    }
+                                }
+                                Row {
+                                    title: @tr("Model");
+                                    info: @tr("This app's model. Changing between two apps with different models loads a model each time (1 to 4 seconds, while you speak).");
+                                    Combo {
+                                        model: TextState.model-names;
+                                        current-index: TextState.profile-values[1];
+                                        accessible-label: @tr("Model");
+                                        selected => {
+                                            TextState.profile-picked(1, self.current-index);
+                                        }
+                                    }
+                                }
+                                Row {
+                                    title: @tr("Write to a file");
+                                    info: @tr("Needs the folder on the Paste tab.");
+                                    Combo {
+                                        model: [@tr("Default"), @tr("Off"), @tr("Paste and write"), @tr("Write only")];
+                                        current-index: TextState.profile-values[2];
+                                        accessible-label: @tr("Write to a file");
+                                        selected => {
+                                            TextState.profile-picked(2, self.current-index);
+                                        }
+                                    }
+                                }
+                                Row {
+                                    title: @tr("Dictionary");
+                                    info: @tr("Off sends Whisper no dictionary words for this app.");
+                                    Combo {
+                                        model: [@tr("Default"), @tr("On"), @tr("Off")];
+                                        current-index: TextState.profile-values[3];
+                                        accessible-label: @tr("Dictionary");
+                                        selected => {
+                                            TextState.profile-picked(3, self.current-index);
+                                        }
+                                    }
+                                }
+                                Row {
+                                    title: @tr("Replacements");
+                                    info: @tr("Off skips the replacements of the Replacements tab for this app.");
+                                    Combo {
+                                        model: [@tr("Default"), @tr("On"), @tr("Off")];
+                                        current-index: TextState.profile-values[4];
+                                        accessible-label: @tr("Replacements");
+                                        selected => {
+                                            TextState.profile-picked(4, self.current-index);
+                                        }
+                                    }
+                                }
+                                Row {
+                                    title: @tr("Voice commands");
+                                    info: @tr("On or off for this app, whatever the Processing tab says.");
+                                    Combo {
+                                        model: [@tr("Default"), @tr("On"), @tr("Off")];
+                                        current-index: TextState.profile-values[5];
+                                        accessible-label: @tr("Voice commands");
+                                        selected => {
+                                            TextState.profile-picked(5, self.current-index);
+                                        }
+                                    }
+                                }
+                                Row {
+                                    title: @tr("Remove filler words");
+                                    info: @tr("On or off for this app, whatever the Words tab says.");
+                                    Combo {
+                                        model: [@tr("Default"), @tr("On"), @tr("Off")];
+                                        current-index: TextState.profile-values[6];
+                                        accessible-label: @tr("Remove filler words");
+                                        selected => {
+                                            TextState.profile-picked(6, self.current-index);
+                                        }
+                                    }
+                                }
+                                Row {
+                                    title: @tr("Pause punctuation");
+                                    info: @tr("On or off for this app, whatever the Processing tab says.");
+                                    Combo {
+                                        model: [@tr("Default"), @tr("On"), @tr("Off")];
+                                        current-index: TextState.profile-values[7];
+                                        accessible-label: @tr("Pause punctuation");
+                                        selected => {
+                                            TextState.profile-picked(7, self.current-index);
+                                        }
+                                    }
                                 }
                             }
                         }

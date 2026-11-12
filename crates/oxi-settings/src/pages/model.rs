@@ -10,11 +10,12 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use std::time::SystemTime;
 
-use oxi_core::config::{Advanced, Auto, Decoding};
+use oxi_core::config::{Advanced, Auto, Decoding, LanguageKey};
 use oxi_core::device::{Device, DeviceChoice, pick};
 use oxi_core::ipc::{DeleteResult, DownloadResult, Push, Request};
 use oxi_core::languages::{self, LanguageInfo};
 use oxi_core::models::{self, MODELS, ModelEntry, ModelStatus, PartialDownload};
+use oxi_core::paste::file::WRITE_FAILED;
 use oxi_core::paths::PART_SUFFIX;
 use oxi_core::strings::{self, gb};
 use oxi_core::tuning::{self, Sampling};
@@ -24,7 +25,7 @@ use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, Vec
 
 use super::progress::{Bars, DOWNLOAD_EST};
 use crate::constants::FOLDER_POLL;
-use crate::generated::{GalleryTile, ModelRow, ModelState, Toast};
+use crate::generated::{GalleryTile, ModelRow, ModelState, TextState, Toast};
 use crate::ipc::{Event, Link, Subscription};
 use crate::{AppWindow, Ctx, Error, Page, report};
 
@@ -82,6 +83,7 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         loaded: Cell::new(false),
         choices: RefCell::new(Vec::new()),
         unloads: RefCell::new(Vec::new()),
+        by_language: RefCell::new(Vec::new()),
         // Not a pair the config can hold: the first `push_language` takes the config's.
         slots: Cell::new([Language::AUTO; 2]),
         found: RefCell::new(Vec::new()),
@@ -141,6 +143,10 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     let p = Rc::clone(&page);
     s.on_unload_picked(move |i| p.unload_picked(i));
     let p = Rc::clone(&page);
+    s.on_by_language_shown(move |i| p.by_language_shown(i));
+    let p = Rc::clone(&page);
+    s.on_by_language_picked(move |lang, model| p.by_language_picked(lang, model));
+    let p = Rc::clone(&page);
     s.on_adv_changed(move |param, mode, value| p.adv_changed(param, mode, value));
     let p = Rc::clone(&page);
     s.on_adv_prompt_edited(move |text| p.adv_prompt_edited(&text));
@@ -175,6 +181,8 @@ struct PageState {
     choices: RefCell<Vec<DeviceChoice>>,
     /// What each unload picker row writes, as in [`UNLOAD`].
     unloads: RefCell<Vec<Option<u32>>>,
+    /// The languages of the by-language row, in its order ([`by_language_order`]).
+    by_language: RefCell<Vec<Language>>,
     /// The two language segments as shown, see [`languages::slots`].
     slots: Cell<[Language; 2]>,
     /// The rows of the language popup: what the search matched.
@@ -255,7 +263,120 @@ impl PageState {
         self.check_custom(&path, false);
         self.push_gpus(s);
         self.push_language(s);
+        self.push_by_language(s, None);
         self.push_advanced(s);
+    }
+
+    /// The by-language row (arch-plan 9.3), showing `shown`, else the dictation language when
+    /// it is one, else the first language with a model.
+    fn push_by_language(&self, s: &ModelState<'_>, shown: Option<Language>) {
+        let file = self.ctx.config.borrow();
+        let model = &file.config.model;
+        let order = by_language_order(&model.by_language);
+        let shown = shown
+            .or_else(|| (model.language != Language::AUTO).then_some(model.language))
+            .unwrap_or(order[0]);
+        let at = order.iter().position(|l| *l == shown).unwrap_or(0);
+        let names: Vec<SharedString> = order
+            .iter()
+            .map(|l| l.info().map_or(l.as_str(), |i| i.english).into())
+            .collect();
+        let ids = self.by_language_models(order[at]);
+        let id = model.by_language.get(&LanguageKey(order[at]));
+        let model_at = id.and_then(|id| ids.iter().position(|m| m.as_deref() == Some(id)));
+        let missing = strings::model_badge(ModelStatus::Missing);
+        let labels: Vec<SharedString> = ids
+            .iter()
+            .map(|id| match id.as_deref() {
+                None => "Default".into(),
+                Some(CUSTOM) => "Own model file".into(),
+                Some(id) if self.downloaded(id) => {
+                    models::find(id).map_or(id, |e| e.display_name).into()
+                }
+                // The language's own model, gone from disk: shown so it can be changed.
+                Some(id) => format!(
+                    "{}: {missing}",
+                    models::find(id).map_or(id, |e| e.display_name)
+                )
+                .into(),
+            })
+            .collect();
+        drop(file);
+        s.set_by_language_names(ModelRc::from(Rc::new(VecModel::from(names))));
+        s.set_by_language_models(ModelRc::from(Rc::new(VecModel::from(labels))));
+        s.set_by_language(int(at));
+        s.set_by_language_model(model_at.map_or(0, int));
+        *self.by_language.borrow_mut() = order;
+    }
+
+    /// What each row of the by-language model list of `lang` writes: none (Default), the page's
+    /// downloaded models, the own file when one is set, and `lang`'s own model when it is none of
+    /// these (d04-fix 1: a model not on disk is not offered; the daemon falls back from it).
+    fn by_language_models(&self, lang: Language) -> Vec<Option<String>> {
+        let file = self.ctx.config.borrow();
+        let model = &file.config.model;
+        let own = !model.custom_path.trim().is_empty();
+        let mut ids: Vec<Option<String>> = std::iter::once(None)
+            .chain(
+                self.entries
+                    .iter()
+                    .filter(|e| self.downloaded(e.id))
+                    .map(|e| Some(e.id.to_owned())),
+            )
+            .chain(own.then(|| Some(CUSTOM.to_owned())))
+            .collect();
+        let current = model.by_language.get(&LanguageKey(lang)).cloned();
+        if current.is_some() && !ids.contains(&current) {
+            ids.push(current);
+        }
+        ids
+    }
+
+    /// Registry model `id` is on disk, as its row last read the files.
+    fn downloaded(&self, id: &str) -> bool {
+        self.entries
+            .iter()
+            .position(|e| e.id == id)
+            .and_then(|i| self.rows.row_data(i))
+            .is_some_and(|r| r.ready)
+    }
+
+    /// The Text page's file row: this page hears every `Status` already (one subscriber per
+    /// page), so it passes the to-file line on.
+    fn file_warning(&self, line: &str) {
+        if let Some(window) = self.window.upgrade() {
+            window.global::<TextState>().set_file_warning(line.into());
+        }
+    }
+
+    fn by_language_shown(&self, i: i32) {
+        let lang = usize::try_from(i)
+            .ok()
+            .and_then(|i| self.by_language.borrow().get(i).copied());
+        if let Some(lang) = lang {
+            self.state(|s| self.push_by_language(s, Some(lang)));
+        }
+    }
+
+    fn by_language_picked(&self, lang: i32, model: i32) {
+        let lang = usize::try_from(lang)
+            .ok()
+            .and_then(|i| self.by_language.borrow().get(i).copied());
+        let Some(lang) = lang else { return };
+        let id = usize::try_from(model)
+            .ok()
+            .and_then(|i| self.by_language_models(lang).get(i).cloned());
+        let Some(id) = id else { return };
+        let mut file = self.ctx.config.borrow_mut();
+        let map = &mut file.config.model.by_language;
+        match id {
+            Some(id) => map.insert(LanguageKey(lang), id),
+            None => map.remove(&LanguageKey(lang)),
+        };
+        drop(file);
+        report(&self.window, self.ctx.save());
+        // A language that got or lost its model moves in the list: keep it shown.
+        self.state(|s| self.push_by_language(s, Some(lang)));
     }
 
     /// The Advanced tab from the config: each parameter's choice, and the number beside it (what
@@ -742,6 +863,10 @@ impl PageState {
                 s.set_download_off(download_off(*link).into());
                 s.set_delete_off(delete_off(*link).into());
             });
+            // The daemon's warnings are its own: with it gone they are stale.
+            if *link != Link::Online {
+                self.file_warning("");
+            }
         }
         match event {
             // The daemon replays its active downloads right after this, so a flag left from an
@@ -775,11 +900,13 @@ impl PageState {
                     backend.clone_into(&mut self.backend.borrow_mut());
                     self.state(|s| self.push_advanced(s));
                 }
-                // The sound lines are the Audio page's (audio::sound_warning).
+                // The sound lines are the Audio page's (audio::sound_warning), the to-file line the
+                // Text page's file row.
+                self.file_warning(&super::text::file_warning(warnings));
                 let ours: Vec<&str> = warnings
                     .iter()
                     .map(String::as_str)
-                    .filter(|l| !l.starts_with("sounds."))
+                    .filter(|l| !l.starts_with("sounds.") && !l.starts_with(WRITE_FAILED))
                     .collect();
                 self.state(|s| s.set_warning(ours.join("\n").into()));
             }
@@ -846,6 +973,15 @@ impl PageState {
         drop(listed);
         *self.partials.borrow_mut() = partials;
         self.push_partials();
+        // The by-language list offers only downloaded models: a download or delete changes it.
+        self.state(|s| {
+            let shown = usize::try_from(s.get_by_language())
+                .ok()
+                .and_then(|i| self.by_language.borrow().get(i).copied());
+            if shown.is_some() {
+                self.push_by_language(s, shown);
+            }
+        });
     }
 
     /// The "Delete partial downloads" button: off with nothing to delete or while a download
@@ -1111,6 +1247,18 @@ fn kept(days: u64) -> String {
 
 /// Unload picker labels and what each writes: [`UNLOAD`], with the configured minutes added in
 /// order when they are not one of them (an older slider value), so they stay picked.
+/// The languages of the by-language row: those with a model first (by code), then the rest in
+/// the table's order.
+fn by_language_order(map: &std::collections::BTreeMap<LanguageKey, String>) -> Vec<Language> {
+    let all = languages::LANGUAGES
+        .iter()
+        .filter_map(|l| l.code.parse::<Language>().ok());
+    let rest: Vec<Language> = all
+        .filter(|l| !map.contains_key(&LanguageKey(*l)))
+        .collect();
+    map.keys().map(|k| k.0).chain(rest).collect()
+}
+
 fn unload_rows(current: Option<u32>) -> (Vec<SharedString>, Vec<Option<u32>>) {
     let mut values = UNLOAD.to_vec();
     if !values.contains(&current) {
@@ -1588,6 +1736,45 @@ mod tests {
     fn saved_model(layout: &Layout) -> oxi_core::config::Model {
         let text = fs::read_to_string(layout.config_file()).unwrap();
         ConfigFile::parse(&text).unwrap().config.model
+    }
+
+    /// Review d04 #9, arch-plan 9.3: the Model page edits `model.by_language`; a language with
+    /// its own model moves to the top of the list, Default takes it out.
+    #[test]
+    fn by_language_row_gives_a_language_its_model_and_default_takes_it_away() {
+        let (window, _ipc, _sent, layout) = window("bylang");
+        let s = window.global::<ModelState>();
+        let names = || -> Vec<SharedString> { s.get_by_language_names().iter().collect() };
+        let offered = || -> Vec<SharedString> { s.get_by_language_models().iter().collect() };
+        // d04-fix 1: nothing downloaded and no own file: Default alone is offered.
+        assert_eq!(offered(), ["Default"]);
+        let entry = models::find("turbo").unwrap();
+        on_disk(&layout, entry.file_name, entry.size);
+        s.invoke_shown();
+        assert_eq!(
+            offered(),
+            ["Default", entry.display_name],
+            "only what is on disk"
+        );
+        let turbo = 1;
+        assert_eq!(names().len(), languages::LANGUAGES.len());
+        let ru = names().iter().position(|n| n == "Russian").unwrap();
+        s.invoke_by_language_shown(int(ru));
+        assert_eq!(s.get_by_language_model(), 0, "no model of its own yet");
+        s.invoke_by_language_picked(int(ru), int(turbo));
+        let saved = saved_model(&layout).by_language;
+        assert_eq!(
+            saved.get(&LanguageKey(Language::RU)).map(String::as_str),
+            Some("turbo")
+        );
+        assert_eq!(names()[0], "Russian", "first, still shown with its model");
+        assert_eq!(
+            (s.get_by_language(), s.get_by_language_model()),
+            (0, int(turbo))
+        );
+        s.invoke_by_language_picked(0, 0);
+        assert!(saved_model(&layout).by_language.is_empty());
+        assert_eq!(names().len(), languages::LANGUAGES.len());
     }
 
     #[test]

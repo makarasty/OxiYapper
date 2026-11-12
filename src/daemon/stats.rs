@@ -16,6 +16,8 @@ use oxi_platform::stats_store;
 struct Entry {
     words: u64,
     speech: Millis,
+    /// The voiced part of `speech`; 0 when not known.
+    voiced: Millis,
 }
 
 /// Entries kept while the file cannot be loaded; the oldest go first.
@@ -54,7 +56,7 @@ impl Writer {
             return;
         };
         for e in self.pending.drain(..) {
-            stats.record(today, e.words, e.speech);
+            stats.record_voiced(today, e.words, e.speech, e.voiced);
         }
         // A file of a newer build is counted in memory only.
         if stats.writable()
@@ -101,10 +103,14 @@ impl Recorder {
             .ok()
     }
 
-    pub fn add(&self, words: u64, speech: Millis) {
+    pub fn add_voiced(&self, words: u64, speech: Millis, voiced: Millis) {
         if let Some(tx) = &self.tx {
             // A panicked stats thread loses the count; dictation goes on.
-            let _ = tx.send(Entry { words, speech });
+            let _ = tx.send(Entry {
+                words,
+                speech,
+                voiced,
+            });
         }
     }
 }
@@ -150,13 +156,13 @@ mod tests {
         let path = dir.join(stats::FILE);
         let today = || Date::from_ymd(2026, 11, 7).unwrap();
         let recorder = Recorder::spawn(path.clone(), today).unwrap();
-        recorder.add(3, Millis(1_200));
-        recorder.add(2, Millis(800));
+        recorder.add_voiced(3, Millis(1_200), Millis(900));
+        recorder.add_voiced(2, Millis(800), Millis(600));
         drop(recorder); // waits for the writes
         let sum = summary(Some(&path), today());
         assert_eq!(
             (sum.dictations, sum.words, sum.wpm, sum.streak),
-            (2, 5, 150, 1)
+            (2, 5, 200, 1)
         );
         assert_eq!(
             summary(None, today()),
@@ -175,6 +181,7 @@ mod tests {
             Entry {
                 words: 3,
                 speech: Millis(1_000),
+                voiced: Millis(0),
             },
             today,
         );
@@ -184,6 +191,7 @@ mod tests {
             Entry {
                 words: 2,
                 speech: Millis(1_000),
+                voiced: Millis(0),
             },
             today,
         );

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::History;
 use crate::stats::Date;
 use crate::tuning::SettingsSet;
+use crate::types::Millis;
 
 /// Extension of the saved audio.
 pub const WAV: &str = "wav";
@@ -121,6 +122,78 @@ pub struct Meta {
     /// what a restore put aside. Absent until a text was replaced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous: Option<Previous>,
+    /// The words of the audio with the confidence of each (and times once they were computed).
+    /// Empty for an entry from before this field; see [`Word`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<Word>,
+    /// How the word times were made; present when `words` carry times.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timings: Option<Timings>,
+    /// The `.wav` is the raw microphone audio at the device's own rate, not what whisper got
+    /// (a recording recovered after a crash). Stays set after a transcribe-again or an edit
+    /// rewrote `status`, so a microphone that records at 16 kHz itself still reads as raw.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub raw: bool,
+    /// The parts of the dictation the confidence filter held back, in order; empty when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<HeldPart>,
+    /// How the text reached the user; `None` when not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered: Option<Delivered>,
+}
+
+impl Meta {
+    /// The meta of entry `id` known by its list fields only: what a reader makes up for an entry
+    /// whose meta file is missing (saved by an older build, or a save that stopped early).
+    #[must_use]
+    pub fn basic(id: &str, duration_ms: u64, status: Status, model: &str, language: &str) -> Self {
+        Self {
+            version: Self::VERSION,
+            started: started(id).unwrap_or_default(),
+            duration_ms,
+            status,
+            model: model.to_owned(),
+            language: language.to_owned(),
+            settings: None,
+            previous: None,
+            words: Vec::new(),
+            timings: None,
+            raw: false,
+            held: Vec::new(),
+            delivered: None,
+        }
+    }
+}
+
+/// One part of a dictation held back by the confidence filter: its text is kept, not inserted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldPart {
+    pub text: String,
+    /// Start and end in ms from the start of the `.wav`.
+    pub t0: u32,
+    pub t1: u32,
+    pub why: crate::text::HeldWhy,
+}
+
+/// How the text of an entry reached the user (`delivered` in the meta file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Delivered {
+    Pasted,
+    Typed,
+    /// Left on the clipboard.
+    Clipboard,
+    /// To-file mode.
+    File,
+    /// The confidence filter held all of it back; nothing was inserted, the `.txt` still has it.
+    Filtered,
+    Failed,
+    /// To-file only, and the write failed: nothing reached the file or the field.
+    #[serde(rename = "file_failed")]
+    FileFailed,
+    /// Also any value a newer version writes, so its entry keeps the rest of its meta.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The text an entry had before it was replaced, with the run that made it.
@@ -141,6 +214,57 @@ pub struct Previous {
 )]
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// A word with a confidence under this is shown as doubtful (display only, no setting).
+pub const LOW_CONFIDENCE: f32 = 0.45;
+
+/// One word of the audio: its text, the model's confidence in it and, once computed, its time.
+/// `p` is clamped to 0..=1 by the producer, so words compare as equal values (no NaN).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Word {
+    pub w: String,
+    pub p: f32,
+    /// Start and end in ms from the start of the `.wav`; absent until the times were computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t0: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t1: Option<u32>,
+}
+
+impl Eq for Word {}
+
+impl Word {
+    /// The word is one the model doubted.
+    #[must_use]
+    pub fn is_doubtful(&self) -> bool {
+        self.p < LOW_CONFIDENCE
+    }
+}
+
+/// How the times of `words` were made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TimingBy {
+    /// Cross-attention alignment (needs a model with a preset).
+    Dtw,
+    /// Whisper's own token timestamps.
+    Tokens,
+    /// Also any value a newer version writes, so its entry keeps the rest of its meta.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The `timings` field: which method made the word times, with which preset and model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Timings {
+    pub by: TimingBy,
+    /// DTW preset name (`large-v3`); empty for `tokens`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub preset: String,
+    /// Registry id of the model that made them; empty when unknown.
+    #[serde(default)]
+    pub model: String,
 }
 
 impl Meta {
@@ -315,6 +439,324 @@ fn tokens(text: &str) -> Vec<&str> {
     out
 }
 
+/// Lower case, letters and digits only: what `align` compares.
+fn plain(word: &str) -> String {
+    word.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Times for the `shown` words of a text from the `timed` words of a pass over the audio, which
+/// can differ from it (replacements, edits). Words are paired by longest common subsequence of
+/// their lower-cased letters; a word with no partner (or a partner with no time) gets a slice of
+/// the gap between its neighbours' times, shared by letter count. `None` for every word when
+/// `timed` has no times at all.
+///
+/// shortcut: two lists whose table would pass `DIFF_CELLS` pair by position (index scaled to the
+/// other list) instead of by words; use a linear-space alignment if that ever shows.
+#[must_use]
+pub fn align(shown: &[&str], timed: &[Word]) -> Vec<Option<(Millis, Millis)>> {
+    let mut out = vec![None; shown.len()];
+    let stamps: Vec<Option<(u32, u32)>> = timed.iter().map(|w| w.t0.zip(w.t1)).collect();
+    let (Some(first), Some(last)) = (
+        stamps.iter().flatten().next().copied(),
+        stamps.iter().flatten().next_back().copied(),
+    ) else {
+        return out;
+    };
+    let (a, b): (Vec<String>, Vec<String>) = (
+        shown.iter().map(|w| plain(w)).collect(),
+        timed.iter().map(|w| plain(&w.w)).collect(),
+    );
+    let same = |i: usize, j: usize| !a[i].is_empty() && a[i] == b[j];
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    if (a.len() + 1).saturating_mul(b.len() + 1) > DIFF_CELLS {
+        pairs.extend((0..a.len()).map(|i| (i, (i * b.len() / a.len()).min(b.len() - 1))));
+    } else {
+        let stride = b.len() + 1;
+        let mut lcs = vec![0_u32; (a.len() + 1) * stride];
+        for i in (0..a.len()).rev() {
+            for j in (0..b.len()).rev() {
+                lcs[i * stride + j] = if same(i, j) {
+                    lcs[(i + 1) * stride + j + 1] + 1
+                } else {
+                    lcs[(i + 1) * stride + j].max(lcs[i * stride + j + 1])
+                };
+            }
+        }
+        let (mut i, mut j) = (0, 0);
+        while i < a.len() && j < b.len() {
+            if same(i, j) {
+                pairs.push((i, j));
+                (i, j) = (i + 1, j + 1);
+            } else if lcs[(i + 1) * stride + j] >= lcs[i * stride + j + 1] {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+    }
+    for (i, j) in pairs {
+        out[i] = stamps[j].map(|(t0, t1)| (Millis(t0.into()), Millis(t1.max(t0).into())));
+    }
+    // Words without a time share the gap before the next timed one; the ends of the list use the
+    // first and last time of the pass.
+    let mut at = 0;
+    let mut from = u64::from(first.0);
+    while at < out.len() {
+        if let Some((_, end)) = out[at] {
+            from = end.0;
+            at += 1;
+            continue;
+        }
+        let run = out[at..].iter().take_while(|t| t.is_none()).count();
+        let to = out
+            .get(at + run)
+            .copied()
+            .flatten()
+            .map_or(u64::from(last.1), |(start, _)| start.0)
+            .max(from);
+        let weights: Vec<u64> = a[at..at + run]
+            .iter()
+            .map(|w| w.chars().count().max(1) as u64)
+            .collect();
+        let total: u64 = weights.iter().sum();
+        let mut done = 0;
+        for (slot, weight) in out[at..at + run].iter_mut().zip(weights) {
+            let (s, e) = (done, done + weight);
+            done = e;
+            *slot = Some((
+                Millis(from + (to - from) * s / total),
+                Millis(from + (to - from) * e / total),
+            ));
+        }
+        at += run;
+    }
+    out
+}
+
+/// A stretch with no voice this long or longer is a pause the player can jump over.
+pub const SKIP_MIN_PAUSE: Millis = Millis(1000);
+/// What of a pause stays at each side that touches voice: a word edge is never cut and a breath
+/// stays.
+pub const SKIP_KEEP: Millis = Millis(150);
+
+/// Parts of the audio the player jumps over: every stretch with no voice of [`SKIP_MIN_PAUSE`] or
+/// longer (also at the start and the end), shortened by [`SKIP_KEEP`] at each side that touches
+/// voice. `voiced` are the voice runs in order. With no voice run at all it returns nothing: a
+/// record with no voice found plays as it is (it may be a quiet one, and the gate is not proof of
+/// silence).
+#[must_use]
+pub fn skips(voiced: &[std::ops::Range<Millis>], total: Millis) -> Vec<std::ops::Range<Millis>> {
+    if voiced.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    // The gaps: before the first run, between runs, after the last; each side that is voice keeps
+    // `SKIP_KEEP`.
+    let mut gap_start = (0, false);
+    let ends = voiced
+        .iter()
+        .map(|r| (r.start.0.min(total.0), r.end.0.min(total.0)))
+        .chain(std::iter::once((total.0, total.0)));
+    for (i, (start, end)) in ends.enumerate() {
+        let last = i == voiced.len();
+        let (from, after_voice) = gap_start;
+        if start.saturating_sub(from) >= SKIP_MIN_PAUSE.0 {
+            let a = if after_voice {
+                from + SKIP_KEEP.0
+            } else {
+                from
+            };
+            let b = if last { start } else { start - SKIP_KEEP.0 };
+            if a < b {
+                out.push(Millis(a)..Millis(b));
+            }
+        }
+        gap_start = (gap_start.0.max(end), true);
+    }
+    out
+}
+
+/// Lower case with `ё` read as `е`, the form search compares in.
+#[must_use]
+pub fn fold(text: &str) -> String {
+    text.to_lowercase().replace('ё', "е")
+}
+
+/// What a History search narrows to; every part must hold.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Filter {
+    /// The recordings of this local day.
+    pub day: Option<Date>,
+    /// Inclusive bounds on the length of the recording.
+    pub min_ms: Option<u64>,
+    pub max_ms: Option<u64>,
+}
+
+/// One recording as search sees it. `text_lower` is the text through [`fold`].
+#[derive(Debug, Clone, Copy)]
+pub struct Searched<'a> {
+    pub text_lower: &'a str,
+    pub day: Date,
+    pub duration_ms: u64,
+}
+
+/// Does `entry` pass `filter` and hold every word of `query` (any order, as part of a word)? A
+/// query with no words matches all. No ranking: a dictation list is a timeline.
+#[must_use]
+pub fn matches(query: &str, filter: &Filter, entry: &Searched<'_>) -> bool {
+    filter.day.is_none_or(|d| d == entry.day)
+        && filter.min_ms.is_none_or(|m| entry.duration_ms >= m)
+        && filter.max_ms.is_none_or(|m| entry.duration_ms <= m)
+        && fold(query)
+            .split_whitespace()
+            .all(|word| entry.text_lower.contains(word))
+}
+
+/// How far back from the end of a chunk [`chunks`] looks for a pause to cut in.
+pub const CHUNK_SEEK: Millis = Millis(30_000);
+
+/// The stretches of the audio to transcribe one by one: none longer than `max`, in order, covering
+/// `0..total` once. A cut goes into the longest pause (a gap between `voiced` runs) in the last
+/// [`CHUNK_SEEK`] of a chunk, at its middle; with no pause there it is a hard cut at `max`.
+#[must_use]
+pub fn chunks(
+    voiced: &[std::ops::Range<Millis>],
+    total: Millis,
+    max: Millis,
+) -> Vec<std::ops::Range<Millis>> {
+    let max = max.0.max(1);
+    let mut out = Vec::new();
+    let mut start = 0;
+    while total.0 - start > max {
+        let end = start + max;
+        let from = end.saturating_sub(CHUNK_SEEK.0).max(start + 1);
+        // The longest part of a gap inside `from..end`.
+        let mut best: Option<(u64, u64)> = None;
+        let mut gap_from = 0;
+        let runs = voiced
+            .iter()
+            .map(|r| (r.start.0, r.end.0))
+            .chain(std::iter::once((total.0, total.0)));
+        for (run_start, run_end) in runs {
+            let (a, b) = (gap_from.max(from), run_start.min(end));
+            if a < b && best.is_none_or(|(x, y)| b - a > y - x) {
+                best = Some((a, b));
+            }
+            gap_from = gap_from.max(run_end);
+        }
+        let cut = best.map_or(end, |(a, b)| a + (b - a) / 2);
+        out.push(Millis(start)..Millis(cut));
+        start = cut;
+    }
+    if start < total.0 || out.is_empty() {
+        out.push(Millis(start)..total);
+    }
+    out
+}
+
+/// A record written to a file (History export). Pure; the window writes the file.
+pub mod export {
+    use std::fmt::Write;
+
+    use super::{Meta, Word};
+
+    /// A cue ends at a pause this long between two words (ms)...
+    const PAUSE_MS: u32 = 400;
+    /// ...at this many characters...
+    const MAX_CHARS: usize = 84;
+    /// ...or this long (ms).
+    const MAX_MS: u32 = 5_000;
+
+    /// The text as it is.
+    #[must_use]
+    pub fn txt(text: &str) -> String {
+        text.to_owned()
+    }
+
+    /// The meta object of the record plus `"text"`.
+    ///
+    /// # Errors
+    /// Only a meta that cannot be written as JSON.
+    pub fn json(meta: &Meta, text: &str) -> Result<String, serde_json::Error> {
+        let mut value = serde_json::to_value(meta)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("text".into(), text.into());
+        }
+        serde_json::to_string_pretty(&value)
+    }
+
+    /// `SubRip` cues; empty when no word has times.
+    #[must_use]
+    pub fn srt(words: &[Word]) -> String {
+        cues(words, ',', true)
+    }
+
+    /// `WebVTT` cues; the bare header when no word has times.
+    #[must_use]
+    pub fn vtt(words: &[Word]) -> String {
+        format!("WEBVTT\n\n{}", cues(words, '.', false))
+    }
+
+    fn clock(ms: u32, mark: char) -> String {
+        format!(
+            "{:02}:{:02}:{:02}{mark}{:03}",
+            ms / 3_600_000,
+            ms / 60_000 % 60,
+            ms / 1000 % 60,
+            ms % 1000
+        )
+    }
+
+    /// One cue being built: start, end, text.
+    type Cue = (u32, u32, String);
+
+    fn cues(words: &[Word], mark: char, numbered: bool) -> String {
+        let mut out = String::new();
+        let mut n = 0;
+        let mut cue: Option<Cue> = None;
+        let mut flush = |cue: &mut Option<Cue>, out: &mut String| {
+            if let Some((a, b, text)) = cue.take() {
+                n += 1;
+                if numbered {
+                    let _ = writeln!(out, "{n}");
+                }
+                let _ = write!(out, "{} --> {}\n{text}\n\n", clock(a, mark), clock(b, mark));
+            }
+        };
+        for word in words {
+            let (Some(t0), Some(t1)) = (word.t0, word.t1) else {
+                continue;
+            };
+            let text = word.w.trim();
+            if text.is_empty() {
+                continue;
+            }
+            if let Some((a, b, held)) = &cue {
+                let wide = t0.saturating_sub(*b) >= PAUSE_MS
+                    || held.chars().count() + 1 + text.chars().count() > MAX_CHARS
+                    || t1.saturating_sub(*a) > MAX_MS
+                    || held.ends_with(['.', '!', '?', '\u{2026}']);
+                if wide {
+                    flush(&mut cue, &mut out);
+                }
+            }
+            match &mut cue {
+                Some((_, b, held)) => {
+                    *b = t1;
+                    held.push(' ');
+                    held.push_str(text);
+                }
+                None => cue = Some((t0, t1, text.to_owned())),
+            }
+        }
+        flush(&mut cue, &mut out);
+        out
+    }
+}
+
 /// Bytes of the canonical 16-bit mono PCM wav header the spool writes.
 pub const WAV_HEADER: usize = 44;
 
@@ -404,6 +846,28 @@ pub fn expired(entries: &[Entry], today: Date, cfg: &History) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// d04-fix review: a `delivered` value from a newer version reads as `unknown`, it does not
+    /// fail the whole meta.
+    #[test]
+    fn an_unknown_delivered_value_reads_as_unknown() {
+        let read = |v: &str| serde_json::from_str::<Delivered>(&format!("\"{v}\"")).ok();
+        assert_eq!(read("file_failed"), Some(Delivered::FileFailed));
+        assert_eq!(read("sent_by_mail"), Some(Delivered::Unknown));
+    }
+
+    /// A `why` or a `timings.by` from a newer version reads as `unknown`; the rest of the meta loads.
+    #[test]
+    fn unknown_held_why_and_timing_by_keep_the_rest_of_the_meta() {
+        let basic = Meta::basic("2026-11-08/000000-000", 900, Status::Done, "m", "en");
+        let mut v = serde_json::to_value(basic).unwrap();
+        v["held"] = serde_json::json!([{"text": "x", "t0": 0, "t1": 5, "why": "from_the_future"}]);
+        v["timings"] = serde_json::json!({"by": "from_the_future"});
+        let meta: Meta = serde_json::from_value(v).unwrap();
+        assert_eq!(meta.held[0].why, crate::text::HeldWhy::Unknown);
+        assert_eq!(meta.timings.unwrap().by, TimingBy::Unknown);
+        assert_eq!(meta.model, "m");
+    }
 
     fn day(y: i32, m: u32, d: u32) -> Date {
         Date::from_ymd(y, m, d).unwrap()
@@ -632,6 +1096,11 @@ mod tests {
                 model: "small".into(),
             }),
             previous: None,
+            words: Vec::new(),
+            timings: None,
+            raw: false,
+            held: Vec::new(),
+            delivered: None,
         }
     }
 
@@ -862,5 +1331,338 @@ mod tests {
             ..meta(Status::Done)
         };
         assert_eq!(Meta::from_json(&with.to_json().unwrap()).unwrap(), with);
+    }
+
+    fn timed(words: &[(&str, Option<(u32, u32)>)]) -> Vec<Word> {
+        words
+            .iter()
+            .map(|&(w, t)| Word {
+                w: w.into(),
+                p: 0.9,
+                t0: t.map(|t| t.0),
+                t1: t.map(|t| t.1),
+            })
+            .collect()
+    }
+
+    fn spans(v: &[Option<(Millis, Millis)>]) -> Vec<Option<(u64, u64)>> {
+        v.iter().map(|t| t.map(|(a, b)| (a.0, b.0))).collect()
+    }
+
+    #[test]
+    fn an_old_record_has_no_words_and_a_new_one_round_trips() {
+        // A record from before the field: no `words`, no `timings`.
+        let old = r#"{"version":1,"started":"2026-11-08T13:00:00.123","duration_ms":4500,
+            "status":"done","model":"small","language":"ru","settings":null}"#;
+        let m = Meta::from_json(old).unwrap();
+        assert!(m.words.is_empty() && m.timings.is_none());
+        // And it is written back without the fields.
+        let json = m.to_json().unwrap();
+        assert!(
+            !json.contains("words") && !json.contains("timings"),
+            "{json}"
+        );
+
+        let with = Meta {
+            words: timed(&[("привет", Some((120, 480))), ("мир", None)]),
+            timings: Some(Timings {
+                by: TimingBy::Dtw,
+                preset: "large-v3".into(),
+                model: "podlodka".into(),
+            }),
+            ..m
+        };
+        let json = with.to_json().unwrap();
+        assert!(json.contains("\"by\": \"dtw\""), "{json}");
+        // A word with no time writes no `t0`/`t1`.
+        assert_eq!(json.matches("\"t0\"").count(), 1, "{json}");
+        assert_eq!(Meta::from_json(&json).unwrap(), with);
+    }
+
+    #[test]
+    fn low_confidence_is_under_the_constant() {
+        let w = |p| Word {
+            w: "x".into(),
+            p,
+            t0: None,
+            t1: None,
+        };
+        assert!(w(0.44).is_doubtful() && !w(0.45).is_doubtful());
+    }
+
+    #[test]
+    fn align_identical_lists_take_the_times_as_they_are() {
+        let t = timed(&[("Привет,", Some((0, 400))), ("мир.", Some((500, 900)))]);
+        let got = align(&["привет", "МИР"], &t);
+        assert_eq!(spans(&got), [Some((0, 400)), Some((500, 900))]);
+    }
+
+    #[test]
+    fn align_a_replaced_word_gets_the_gap_between_its_neighbours() {
+        let t = timed(&[
+            ("one", Some((0, 100))),
+            ("two", Some((200, 300))),
+            ("three", Some((400, 500))),
+        ]);
+        let got = align(&["one", "2", "three"], &t);
+        assert_eq!(
+            spans(&got),
+            [Some((0, 100)), Some((100, 400)), Some((400, 500))]
+        );
+    }
+
+    #[test]
+    fn align_a_deleted_word_just_leaves_the_others_in_place() {
+        let t = timed(&[
+            ("a", Some((0, 100))),
+            ("b", Some((100, 200))),
+            ("c", Some((200, 300))),
+        ]);
+        let got = align(&["a", "c"], &t);
+        assert_eq!(spans(&got), [Some((0, 100)), Some((200, 300))]);
+    }
+
+    #[test]
+    fn align_an_inserted_sentence_is_shared_out_by_letters() {
+        let t = timed(&[("start", Some((0, 100))), ("end", Some((900, 1000)))]);
+        // "ab" has 2 letters and "cdef" 4: the gap 100..900 splits 1 : 2.
+        let got = align(&["start", "ab", "cdef", "end"], &t);
+        let got = spans(&got);
+        assert_eq!(got[0], Some((0, 100)));
+        assert_eq!(got[3], Some((900, 1000)));
+        assert_eq!(got[1], Some((100, 366)));
+        assert_eq!(got[2], Some((366, 900)));
+    }
+
+    #[test]
+    fn align_words_outside_the_timed_ones_use_the_ends_of_the_pass() {
+        let t = timed(&[("mid", Some((300, 400)))]);
+        let got = align(&["before", "mid", "after"], &t);
+        assert_eq!(
+            spans(&got),
+            [Some((300, 300)), Some((300, 400)), Some((400, 400))]
+        );
+        // No time anywhere: nothing to say.
+        let t = timed(&[("mid", None)]);
+        assert_eq!(align(&["mid"], &t), [None]);
+    }
+
+    fn ms(r: &[(u64, u64)]) -> Vec<std::ops::Range<Millis>> {
+        r.iter().map(|&(a, b)| Millis(a)..Millis(b)).collect()
+    }
+
+    #[test]
+    fn skips_jump_long_pauses_only_and_keep_a_margin_at_voice() {
+        // No pause.
+        assert_eq!(skips(&ms(&[(0, 5000)]), Millis(5000)), []);
+        // A 3 s pause between two runs: skipped from 150 ms after the first to 150 ms before the
+        // second.
+        assert_eq!(
+            skips(&ms(&[(0, 1000), (4000, 5000)]), Millis(5000)),
+            ms(&[(1150, 3850)])
+        );
+        // A 900 ms pause stays.
+        assert_eq!(skips(&ms(&[(0, 1000), (1900, 3000)]), Millis(3000)), []);
+        // 2 s of silence at the start and at the end.
+        assert_eq!(
+            skips(&ms(&[(2000, 3000)]), Millis(5000)),
+            ms(&[(0, 1850), (3150, 5000)])
+        );
+        // No voice at all: the record plays as it is.
+        assert_eq!(skips(&[], Millis(5000)), []);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn skips_are_ordered_apart_inside_and_never_on_voice(
+            cuts in proptest::collection::vec(0_u64..20_000, 0..12),
+            total in 0_u64..25_000,
+        ) {
+            let mut cuts = cuts;
+            cuts.sort_unstable();
+            let voiced: Vec<_> = cuts.as_chunks::<2>().0.iter().map(|[a, b]| Millis(*a)..Millis(*b)).collect();
+            let got = skips(&voiced, Millis(total));
+            for pair in got.windows(2) {
+                proptest::prop_assert!(pair[0].end < pair[1].start);
+            }
+            for s in &got {
+                proptest::prop_assert!(s.start < s.end && s.end.0 <= total);
+                for v in &voiced {
+                    proptest::prop_assert!(s.end <= v.start || s.start >= v.end || v.start == v.end);
+                }
+            }
+        }
+    }
+
+    fn found(query: &str, filter: &Filter, text: &str, day: Date, ms: u64) -> bool {
+        matches(
+            query,
+            filter,
+            &Searched {
+                text_lower: &fold(text),
+                day,
+                duration_ms: ms,
+            },
+        )
+    }
+
+    #[test]
+    fn search_words_are_parts_of_words_in_any_order_ignoring_case_and_yo() {
+        let (d, none) = (day(2026, 11, 8), Filter::default());
+        assert!(found("", &none, "Привет мир", d, 0), "no words match all");
+        assert!(found("  ", &none, "Привет мир", d, 0));
+        assert!(found("прив", &none, "Привет мир", d, 0));
+        assert!(found("мир привет", &none, "Привет мир", d, 0));
+        assert!(found("ПРИВЕТ", &none, "привет", d, 0));
+        assert!(found("еж", &none, "Ёж", d, 0));
+        assert!(found("ёж", &none, "еж", d, 0));
+        assert!(!found("привет пока", &none, "Привет мир", d, 0));
+    }
+
+    #[test]
+    fn search_filters_are_inclusive_and_anded_with_the_query() {
+        let d = day(2026, 11, 8);
+        let f = Filter {
+            day: Some(d),
+            min_ms: Some(1000),
+            max_ms: Some(2000),
+        };
+        assert!(found("a", &f, "a", d, 1000) && found("a", &f, "a", d, 2000));
+        assert!(!found("a", &f, "a", d, 999) && !found("a", &f, "a", d, 2001));
+        assert!(!found("a", &f, "a", day(2026, 11, 9), 1500), "other day");
+        assert!(
+            !found("b", &f, "a", d, 1500),
+            "filters pass, query does not"
+        );
+        assert!(found("", &f, "", d, 1500), "no query, filters pass");
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn a_longer_query_never_adds_a_match(q in "[a-zа-я ]{0,12}", extra in "[a-zа-я]{1,4}", text in "[a-zа-я ]{0,30}") {
+            let (d, none) = (day(2026, 11, 8), Filter::default());
+            let longer = format!("{q} {extra}");
+            proptest::prop_assert!(!found(&longer, &none, &text, d, 0) || found(&q, &none, &text, d, 0));
+        }
+    }
+
+    fn spoken(words: &[(&str, u32, u32)]) -> Vec<Word> {
+        words
+            .iter()
+            .map(|&(w, a, b)| Word {
+                w: w.into(),
+                p: 1.0,
+                t0: Some(a),
+                t1: Some(b),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn srt_and_vtt_break_at_pauses_and_sentence_ends_with_their_own_time_marks() {
+        let words = spoken(&[
+            ("Hello", 0, 400),
+            (" there.", 450, 900),
+            ("Next", 950, 1_500),
+            ("one", 2_000, 3_723_004),
+        ]);
+        assert_eq!(
+            export::srt(&words),
+            "1\n00:00:00,000 --> 00:00:00,900\nHello there.\n\n\
+             2\n00:00:00,950 --> 00:00:01,500\nNext\n\n\
+             3\n00:00:02,000 --> 01:02:03,004\none\n\n"
+        );
+        let vtt = export::vtt(&words);
+        assert!(
+            vtt.starts_with("WEBVTT\n\n00:00:00.000 --> 00:00:00.900\n"),
+            "{vtt}"
+        );
+        assert!(!vtt.contains("\n1\n"), "VTT cues are not numbered");
+    }
+
+    #[test]
+    fn cues_break_at_84_characters_and_at_5_seconds() {
+        let long = "x".repeat(40);
+        let words = spoken(&[(&long, 0, 100), (&long, 100, 200), (&long, 200, 300)]);
+        assert_eq!(
+            export::srt(&words).matches("-->").count(),
+            2,
+            "84 characters"
+        );
+        let slow = spoken(&[("a", 0, 100), ("b", 4_900, 5_200)]);
+        assert_eq!(export::srt(&slow).matches("-->").count(), 2, "5 seconds");
+    }
+
+    #[test]
+    fn export_without_times_is_empty_and_json_carries_the_text() {
+        let untimed = vec![Word {
+            w: "a".into(),
+            p: 1.0,
+            t0: None,
+            t1: None,
+        }];
+        assert_eq!(export::srt(&untimed), "");
+        assert_eq!(export::srt(&[]), "");
+        assert_eq!(export::vtt(&[]), "WEBVTT\n\n");
+        assert_eq!(export::txt("a b"), "a b");
+        let json = export::json(&meta(Status::Done), "hello").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["text"], "hello");
+        assert_eq!(value["status"], "done");
+    }
+
+    fn at(spans: &[(u64, u64)]) -> Vec<std::ops::Range<Millis>> {
+        spans.iter().map(|&(a, b)| Millis(a)..Millis(b)).collect()
+    }
+
+    #[test]
+    fn chunks_cut_in_the_longest_pause_near_the_border() {
+        let max = Millis(300_000);
+        // Short audio is one chunk, with or without voice.
+        assert_eq!(chunks(&[], Millis(10_000), max), at(&[(0, 10_000)]));
+        assert_eq!(chunks(&[], Millis(0), max), at(&[(0, 0)]));
+        // Pauses of 1 s at 280 s and 2 s at 290 s, both in the last 30 s: the longer one wins.
+        let voiced = at(&[(0, 280_000), (281_000, 290_000), (292_000, 400_000)]);
+        assert_eq!(
+            chunks(&voiced, Millis(400_000), max),
+            at(&[(0, 291_000), (291_000, 400_000)])
+        );
+        // No pause: a hard cut at the maximum.
+        assert_eq!(
+            chunks(&at(&[(0, 700_000)]), Millis(700_000), max),
+            at(&[(0, 300_000), (300_000, 600_000), (600_000, 700_000)])
+        );
+        // A pause before the last 30 s is not used.
+        assert_eq!(
+            chunks(
+                &at(&[(0, 100_000), (150_000, 400_000)]),
+                Millis(400_000),
+                max
+            ),
+            at(&[(0, 300_000), (300_000, 400_000)])
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn chunks_cover_the_audio_once_in_order_and_none_is_over_the_maximum(
+            cuts in proptest::collection::vec(0_u64..900_000, 0..16),
+            total in 0_u64..900_000,
+            max in 1_000_u64..400_000,
+        ) {
+            let mut cuts = cuts;
+            cuts.sort_unstable();
+            let voiced: Vec<_> = cuts.as_chunks::<2>().0.iter().map(|[a, b]| Millis(*a)..Millis(*b)).collect();
+            let got = chunks(&voiced, Millis(total), Millis(max));
+            proptest::prop_assert_eq!(got.first().map(|c| c.start.0), Some(0));
+            proptest::prop_assert_eq!(got.last().map(|c| c.end.0), Some(total));
+            for pair in got.windows(2) {
+                proptest::prop_assert_eq!(pair[0].end, pair[1].start);
+            }
+            for c in &got {
+                proptest::prop_assert!(c.end.0 - c.start.0 <= max);
+                proptest::prop_assert!(c.end.0 > c.start.0 || total == 0);
+            }
+        }
     }
 }

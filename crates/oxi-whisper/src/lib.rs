@@ -18,8 +18,8 @@ use oxi_core::tuning::{self, RunParams, Sampling};
 use oxi_core::types::{Language, Millis};
 use whisper_rs::whisper_rs_sys as sys;
 use whisper_rs::{
-    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperError,
-    WhisperState,
+    DtwMode, DtwModelPreset, DtwParameters, FullParams, SamplingStrategy, WhisperContext,
+    WhisperContextParameters, WhisperError, WhisperState,
 };
 
 pub use device::list_devices;
@@ -127,6 +127,117 @@ pub struct Segment {
     pub t0: Millis,
     pub t1: Millis,
     pub no_speech_prob: f32,
+    /// The words of the segment, `p` the lowest token probability of each; times only when the
+    /// engine was loaded for timings ([`Engine::load_timing`]).
+    pub words: Vec<Word>,
+}
+
+/// One word of a segment: its tokens joined.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Word {
+    pub text: String,
+    pub p: f32,
+    /// From the start of the audio whisper got; `None` outside a timing engine.
+    pub t0: Option<Millis>,
+    pub t1: Option<Millis>,
+}
+
+/// How word times are made. DTW needs a context without flash attention (so never the live one);
+/// `Tokens` are whisper's own token timestamps, which work with any context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Timing {
+    Dtw(DtwPreset),
+    Tokens,
+}
+
+/// The alignment-head table whisper.cpp has for a model family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DtwPreset {
+    Tiny,
+    LargeV3,
+    LargeV3Turbo,
+}
+
+impl DtwPreset {
+    /// The name stored in `timings.preset` of a history record.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Tiny => "tiny",
+            Self::LargeV3 => "large-v3",
+            Self::LargeV3Turbo => "large-v3-turbo",
+        }
+    }
+
+    fn raw(self) -> DtwModelPreset {
+        match self {
+            Self::Tiny => DtwModelPreset::Tiny,
+            Self::LargeV3 => DtwModelPreset::LargeV3,
+            Self::LargeV3Turbo => DtwModelPreset::LargeV3Turbo,
+        }
+    }
+}
+
+/// The DTW preset of a registry model id; `None` for a custom file (and for ids without a table).
+#[must_use]
+pub fn dtw_preset(model_id: &str) -> Option<DtwPreset> {
+    match model_id {
+        "turbo" => Some(DtwPreset::LargeV3Turbo),
+        // The Russian fine-tune is large-v3 with the same heads.
+        "large-v3" | "podlodka" => Some(DtwPreset::LargeV3),
+        "tiny" => Some(DtwPreset::Tiny),
+        _ => None,
+    }
+}
+
+/// One text token as the word assembly sees it. Times are 10 ms units from the audio start,
+/// `None` when the engine made none.
+struct Tok {
+    bytes: Vec<u8>,
+    p: f32,
+    start: Option<i64>,
+    end: Option<i64>,
+}
+
+/// A word being built: its bytes, lowest token probability, start and end.
+type Raw = (Vec<u8>, f32, Option<i64>, Option<i64>);
+
+/// Words from the text tokens of one segment (special and timestamp tokens already left out): a
+/// token whose text starts with a space, or the first token, starts a word. The text is decoded
+/// after the tokens are joined (a Russian letter can be split between two tokens). A word with no
+/// end of its own ends where the next word starts, the last one at `seg_end`.
+fn assemble(toks: &[Tok], seg_end: Option<i64>) -> Vec<Word> {
+    let mut raw: Vec<Raw> = Vec::new();
+    for t in toks {
+        match raw.last_mut() {
+            Some(w) if t.bytes.first() != Some(&b' ') => {
+                w.0.extend_from_slice(&t.bytes);
+                w.1 = w.1.min(t.p);
+                w.3 = t.end.or(w.3);
+            }
+            _ => raw.push((t.bytes.clone(), t.p, t.start, t.end)),
+        }
+    }
+    let starts: Vec<Option<i64>> = raw.iter().map(|w| w.2).collect();
+    raw.into_iter()
+        .enumerate()
+        .filter_map(|(i, (bytes, p, t0, t1))| {
+            let text = String::from_utf8_lossy(&bytes).trim().to_owned();
+            if text.is_empty() {
+                return None;
+            }
+            let next = starts.get(i + 1).copied().unwrap_or(seg_end);
+            let t1 = t1.or(next);
+            // A start after its own end is a bad alignment: cut it down to the end.
+            let t0 = t0.zip(t1).map_or(t0, |(a, b)| Some(a.min(b)));
+            Some(Word {
+                text,
+                p: p.clamp(0.0, 1.0),
+                t0: t0.map(centis),
+                t1: t1.map(centis),
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -145,6 +256,8 @@ pub struct Engine {
     /// Bench only (`bench --ctx fit`): cut `audio_ctx` to the clip. Never set from config: the
     /// accuracy guard failed (repeat loops, CER 0.44 against 0.02), so the setting `Fit` stays a no-op.
     bench_fit_ctx: bool,
+    /// Set by [`Engine::load_timing`]: word times are made.
+    timing: Option<Timing>,
 }
 
 fn logical_threads() -> usize {
@@ -155,10 +268,19 @@ fn open(
     path: &Path,
     gpu: Option<usize>,
     flash_attn: bool,
+    dtw: Option<DtwPreset>,
 ) -> Result<(WhisperContext, WhisperState), WhisperError> {
     let mut params = WhisperContextParameters::new();
     params.use_gpu(gpu.is_some());
     params.flash_attn(flash_attn);
+    if let Some(preset) = dtw {
+        params.dtw_parameters(DtwParameters {
+            mode: DtwMode::ModelPreset {
+                model_preset: preset.raw(),
+            },
+            ..DtwParameters::default()
+        });
+    }
     if let Some(i) = gpu {
         params.gpu_device(i32::try_from(i).unwrap_or(0));
     }
@@ -175,9 +297,9 @@ fn open_gpu(
     adv: &Advanced,
 ) -> Result<(WhisperContext, WhisperState), WhisperError> {
     let flash = tuning::flash_attn(adv, true).unwrap_or(true);
-    let opened = open(path, Some(i), flash);
+    let opened = open(path, Some(i), flash, None);
     if flash && opened.is_err() {
-        return open(path, Some(i), false);
+        return open(path, Some(i), false, None);
     }
     opened
 }
@@ -199,7 +321,7 @@ impl Engine {
         let gpu_err = match picked.index {
             None => {
                 let flash = tuning::flash_attn(adv, false).unwrap_or(false);
-                let (ctx, state) = open(path, None, flash).map_err(load_error)?;
+                let (ctx, state) = open(path, None, flash, None).map_err(load_error)?;
                 let info = LoadInfo {
                     device: None,
                     warning,
@@ -223,12 +345,47 @@ impl Engine {
             },
         };
         let flash = tuning::flash_attn(adv, false).unwrap_or(false);
-        let (ctx, state) = open(path, None, flash).map_err(load_error)?;
+        let (ctx, state) = open(path, None, flash, None).map_err(load_error)?;
         let info = LoadInfo {
             device: None,
             warning: Some(EngineWarning::CpuFallback { reason: gpu_err }),
         };
         Ok(Self::new(ctx, state, info, adv))
+    }
+
+    /// A second engine that makes word times (never the live one: DTW needs flash attention off,
+    /// which costs 14 to 41 % of the speed). The GPU is tried once, then the CPU.
+    ///
+    /// # Errors
+    /// The model cannot be loaded.
+    pub fn load_timing(path: &Path, choice: &DeviceChoice, timing: Timing) -> Result<Self, Error> {
+        watch_logs();
+        ALLOC_FAILED.store(false, Ordering::Relaxed);
+        let dtw = match timing {
+            Timing::Dtw(preset) => Some(preset),
+            Timing::Tokens => None,
+        };
+        let devices = list_devices();
+        let gpu = pick(&devices, choice)
+            .index
+            .filter(|&i| device::gpu_starts(i))
+            .and_then(|i| {
+                let (ctx, state) = open(path, Some(i), false, dtw).ok()?;
+                Some((ctx, state, Some(devices[i].name.clone())))
+            });
+        let (ctx, state, device) = if let Some(opened) = gpu {
+            opened
+        } else {
+            let (ctx, state) = open(path, None, false, dtw).map_err(load_error)?;
+            (ctx, state, None)
+        };
+        let info = LoadInfo {
+            device,
+            warning: None,
+        };
+        let mut engine = Self::new(ctx, state, info, &Advanced::default());
+        engine.timing = Some(timing);
+        Ok(engine)
     }
 
     fn new(ctx: WhisperContext, state: WhisperState, info: LoadInfo, adv: &Advanced) -> Self {
@@ -240,6 +397,7 @@ impl Engine {
             run: tuning::resolve(adv, on_gpu, logical_threads()),
             on_gpu,
             bench_fit_ctx: false,
+            timing: None,
         }
     }
 
@@ -253,6 +411,15 @@ impl Engine {
     /// `audio_ctx` never reaches the decoder.
     pub fn set_bench_fit_ctx(&mut self, on: bool) {
         self.bench_fit_ctx = on;
+    }
+
+    /// Word times from whisper's own token timestamps on this (live) engine, on or off. They need no
+    /// second context and work with flash attention; DTW does not, and needs [`Self::load_timing`] (an
+    /// engine loaded that way keeps DTW).
+    pub fn set_token_times(&mut self, on: bool) {
+        if !matches!(self.timing, Some(Timing::Dtw(_))) {
+            self.timing = on.then_some(Timing::Tokens);
+        }
     }
 
     pub fn info(&self) -> &LoadInfo {
@@ -311,6 +478,9 @@ impl Engine {
         params.set_print_progress(false);
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
+        if self.timing.is_some() {
+            params.set_token_timestamps(true);
+        }
 
         // SAFETY: both user pointers outlive `full` below. The progress one is used on this
         // thread only (`&mut`); the abort one is a shared `&Cancel`, which is `Sync`.
@@ -329,15 +499,39 @@ impl Engine {
             return Err(Error::Cancelled);
         }
         ran.map_err(Error::Run)?;
+        let eot = self.ctx.token_eot();
+        let timing = self.timing;
         let segments = self
             .state
             .as_iter()
             .map(|s| {
+                let mut toks = Vec::new();
+                for i in 0..s.n_tokens() {
+                    let Some(tok) = s.get_token(i) else { continue };
+                    // Special tokens (the language, timestamps) sit at or above end-of-text.
+                    if tok.token_id() >= eot {
+                        continue;
+                    }
+                    let d = tok.token_data();
+                    let some = |t: i64| (t >= 0).then_some(t);
+                    let (start, end) = match timing {
+                        None => (None, None),
+                        Some(Timing::Dtw(_)) => (some(d.t_dtw), None),
+                        Some(Timing::Tokens) => (some(d.t0), some(d.t1)),
+                    };
+                    toks.push(Tok {
+                        bytes: tok.to_bytes()?.to_vec(),
+                        p: tok.token_probability(),
+                        start,
+                        end,
+                    });
+                }
                 Ok(Segment {
                     text: s.to_str_lossy()?.into_owned(),
                     t0: centis(s.start_timestamp()),
                     t1: centis(s.end_timestamp()),
                     no_speech_prob: s.no_speech_probability(),
+                    words: assemble(&toks, timing.map(|_| s.end_timestamp())),
                 })
             })
             .collect::<Result<_, WhisperError>>()
@@ -525,6 +719,89 @@ mod tests {
         assert_eq!(audio_ctx_override(false, 16_000), None);
         assert_eq!(audio_ctx_override(true, 16_000), Some(256));
         assert_eq!(audio_ctx_override(true, 31 * 16_000), None);
+    }
+
+    fn tok(text: &str, p: f32, start: Option<i64>, end: Option<i64>) -> Tok {
+        Tok {
+            bytes: text.as_bytes().to_vec(),
+            p,
+            start,
+            end,
+        }
+    }
+
+    #[test]
+    fn words_start_at_a_space_and_keep_the_lowest_probability() {
+        let toks = [
+            tok("При", 0.9, None, None),
+            tok("вет", 0.4, None, None),
+            tok(",", 0.8, None, None),
+            tok(" мир", 0.95, None, None),
+            tok(" ", 0.99, None, None),
+        ];
+        let words = assemble(&toks, None);
+        let got: Vec<_> = words.iter().map(|w| (w.text.as_str(), w.p)).collect();
+        assert_eq!(got, [("Привет,", 0.4), ("мир", 0.95)]);
+        assert!(words.iter().all(|w| w.t0.is_none() && w.t1.is_none()));
+    }
+
+    #[test]
+    fn a_letter_split_between_two_tokens_is_joined_before_decoding() {
+        // "я" is 0xD1 0x8F: one token holds each byte.
+        let toks = [
+            Tok {
+                bytes: vec![b' ', 0xD1],
+                p: 0.7,
+                start: None,
+                end: None,
+            },
+            Tok {
+                bytes: vec![0x8F],
+                p: 0.6,
+                start: None,
+                end: None,
+            },
+        ];
+        let words = assemble(&toks, None);
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].text, "я");
+    }
+
+    #[test]
+    fn dtw_starts_give_each_word_the_next_start_as_its_end() {
+        let toks = [
+            tok("a", 1.0, Some(10), None),
+            tok(" b", 1.0, Some(40), None),
+            tok(" c", 1.0, Some(90), None),
+        ];
+        let w = assemble(&toks, Some(120));
+        let times: Vec<_> = w.iter().map(|w| (w.t0, w.t1)).collect();
+        assert_eq!(
+            times,
+            [
+                (Some(Millis(100)), Some(Millis(400))),
+                (Some(Millis(400)), Some(Millis(900))),
+                (Some(Millis(900)), Some(Millis(1200))),
+            ]
+        );
+    }
+
+    #[test]
+    fn token_ends_win_and_a_start_past_its_end_is_cut_down() {
+        let toks = [
+            tok("a", 1.0, Some(10), Some(30)),
+            tok(" b", 1.0, Some(50), Some(40)),
+        ];
+        let w = assemble(&toks, None);
+        assert_eq!((w[0].t0, w[0].t1), (Some(Millis(100)), Some(Millis(300))));
+        assert_eq!((w[1].t0, w[1].t1), (Some(Millis(400)), Some(Millis(400))));
+    }
+
+    #[test]
+    fn presets_follow_the_model_family() {
+        assert_eq!(dtw_preset("turbo"), Some(DtwPreset::LargeV3Turbo));
+        assert_eq!(dtw_preset("podlodka"), Some(DtwPreset::LargeV3));
+        assert_eq!(dtw_preset("custom"), None);
     }
 
     #[test]

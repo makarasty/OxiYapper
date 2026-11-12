@@ -285,6 +285,10 @@ pub struct Paste {
     pub trailing_space: bool,
     /// Dictated text stays in the OS clipboard history (Win+V). Cloud upload is never allowed.
     pub keep_in_clipboard_history: bool,
+    /// Press Enter once after the whole dictation was typed, if the focus did not change and the
+    /// person typed nothing since the record start (`paste::enter_decision`). Off: the app sends
+    /// no Enter by itself.
+    pub press_enter: bool,
     /// Pace of typed output; a rule can set its own.
     pub type_speed: TypeSpeed,
     pub rules: Vec<PasteRule>,
@@ -297,6 +301,7 @@ impl Default for Paste {
             restore_delay_ms: 300,
             trailing_space: true,
             keep_in_clipboard_history: true,
+            press_enter: false,
             type_speed: TypeSpeed::Fast,
             // Remote desktop drops a synthetic Ctrl+V, so type there.
             rules: vec![PasteRule {

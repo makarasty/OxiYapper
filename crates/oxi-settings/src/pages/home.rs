@@ -21,7 +21,7 @@ use oxi_platform::stats_store;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use crate::constants::FOLDER_POLL;
-use crate::generated::{HomeState, MonthLabel, Shell, Toast};
+use crate::generated::{HistoryState, HomeState, MonthLabel, Shell, Toast};
 use crate::ipc::{Event, Link};
 use crate::{AppWindow, Ctx, Error, Page, report};
 
@@ -131,23 +131,35 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         }
     });
 
-    let (w, c) = (window.as_weak(), ctx.clone());
+    let (w, c, shown) = (window.as_weak(), ctx.clone(), seen.clone());
     window.global::<HomeState>().on_pick(move |card| {
         if let Some(window) = w.upgrade() {
             let s = window.global::<HomeState>();
             s.set_selected(if s.get_selected() == card { -1 } else { card });
-            if !show_trend(&window, &c, &seen, true) {
-                seen.stamp.set(Stamp::default());
+            if !show_trend(&window, &c, &shown, true) {
+                shown.stamp.set(Stamp::default());
             }
         }
     });
 
-    // shortcut: History cannot filter by day yet; a click on a day opens it unfiltered.
-    let w = window.as_weak();
-    window.global::<HomeState>().on_open_day(move || {
-        if let Some(window) = w.upgrade() {
-            window.set_page(Page::History);
+    // A heatmap cell: History opens on that day.
+    let (w, s) = (window.as_weak(), seen);
+    window.global::<HomeState>().on_open_day(move |cell| {
+        let Some(window) = w.upgrade() else {
+            return;
+        };
+        let fit = window.global::<HomeState>().get_fit_weeks();
+        let day = s.summary.borrow().as_ref().and_then(|summary| {
+            let (start, heat) = summary.heat_tail(u16::try_from(fit).unwrap_or(0));
+            let cell = usize::try_from(cell).ok().filter(|&c| c < heat.len())?;
+            Some(start.add_days(i32::try_from(cell).ok()?))
+        });
+        if let Some(day) = day {
+            window
+                .global::<HistoryState>()
+                .invoke_open_day(day.to_string().into());
         }
+        window.set_page(Page::History);
     });
 
     let (w, c) = (window.as_weak(), ctx.clone());
@@ -274,7 +286,7 @@ fn show_trend(window: &AppWindow, ctx: &Ctx, seen: &Seen, grow: bool) -> bool {
         let trend = stats.trend(today, metric);
         let days = trend.values.len();
         let trend = padded(trend);
-        let tips: Vec<SharedString> = tips(&trend, metric, today)
+        let tips: Vec<SharedString> = tips(&trend, metric, today, stats)
             .into_iter()
             .map(Into::into)
             .collect();
@@ -304,8 +316,9 @@ fn padded(trend: Trend) -> Trend {
     }
 }
 
-/// Each bar's tooltip: "Nov 8: 1,234 words".
-fn tips(trend: &Trend, metric: Metric, today: Date) -> Vec<String> {
+/// Each bar's tooltip: "Nov 8: 1,234 words"; the speech rate's adds the day's share of pauses
+/// when it is known: "Nov 8: 150 words per minute, 23 % pauses".
+fn tips(trend: &Trend, metric: Metric, today: Date, stats: &Stats) -> Vec<String> {
     let (one, many) = match metric {
         Metric::Words => ("word", "words"),
         Metric::Wpm => ("word per minute", "words per minute"),
@@ -316,8 +329,15 @@ fn tips(trend: &Trend, metric: Metric, today: Date) -> Vec<String> {
         .zip(&trend.values)
         .map(|(i, &v)| {
             let unit = if v == 1 { one } else { many };
-            let day = day_label(trend.start.add_days(i), today);
-            format!("{day}: {} {unit}", grouped(v))
+            let date = trend.start.add_days(i);
+            let pauses = stats
+                .days
+                .binary_search_by_key(&date, |d| d.date)
+                .ok()
+                .and_then(|at| stats.days[at].n.pause_pct())
+                .filter(|_| metric == Metric::Wpm && v > 0);
+            let pauses = pauses.map_or_else(String::new, |p| format!(", {p} % pauses"));
+            format!("{}: {} {unit}{pauses}", day_label(date, today), grouped(v))
         })
         .collect()
 }
@@ -403,7 +423,7 @@ fn revealed(height: i32, i: usize, n: usize, t: Duration) -> i32 {
 }
 
 /// "Nov 8"; with the year when it is not this year's.
-fn day_label(date: Date, today: Date) -> String {
+pub(super) fn day_label(date: Date, today: Date) -> String {
     let (y, m, d) = date.ymd();
     let month = MONTHS[m as usize - 1];
     if y == today.ymd().0 {
@@ -555,11 +575,11 @@ mod tests {
             values: vec![1, 1_234_567],
         };
         assert_eq!(
-            tips(&trend, Metric::Words, today),
+            tips(&trend, Metric::Words, today, &Stats::default()),
             ["Dec 31, 2025: 1 word", "Jan 1: 1,234,567 words"]
         );
         assert_eq!(
-            tips(&trend, Metric::Streak, today)[0],
+            tips(&trend, Metric::Streak, today, &Stats::default())[0],
             "Dec 31, 2025: 1 day in a row"
         );
         for (n, want) in [
@@ -573,6 +593,27 @@ mod tests {
     }
 
     #[test]
+    fn the_speech_rate_tip_adds_that_days_pauses_when_known() {
+        let today = Date::from_ymd(2026, 11, 10).unwrap();
+        let mut stats = Stats::default();
+        stats.record_voiced(today, 100, Millis(60_000), Millis(40_000));
+        stats.record(today.add_days(-1), 100, Millis(60_000));
+        let trend = stats.trend(today, Metric::Wpm);
+        assert_eq!(
+            tips(&trend, Metric::Wpm, today, &stats),
+            [
+                "Nov 9: 100 words per minute",
+                "Nov 10: 150 words per minute, 33 % pauses"
+            ]
+        );
+        assert_eq!(
+            tips(&trend, Metric::Words, today, &stats)[1],
+            "Nov 10: 150 words",
+            "only the rate says it"
+        );
+    }
+
+    #[test]
     fn a_heatmap_day_tip_names_the_day_and_its_counts() {
         let today = Date::from_ymd(2026, 11, 10).unwrap();
         let day = Date::from_ymd(2026, 11, 8).unwrap();
@@ -581,6 +622,7 @@ mod tests {
                 dictations,
                 words,
                 speech_ms: 0,
+                voiced_ms: 0,
             })
         };
         assert_eq!(
@@ -750,21 +792,24 @@ mod tests {
             #[allow(clippy::cast_precision_loss, reason = "a window height")]
             let height = size.1 as f32;
             assert!(bottom <= height, "{size:?}: the page ends at {bottom}");
-            // Where the height, not the width, limits the cells (one row of cards at 1280 and 899
-            // wide, two rows at 899 x 640, the least window that holds both): the grid fills the room
+            // Where the height, not the width, limits the cells (one row of cards at 1280 wide; the
+            // two-row sizes under 900 are limited by their width, so `home-chrome-row` has no
+            // check here): the grid fills the room
             // to within the 8 px that whole-pixel cells leave, so a chrome token that is off by
             // more than that (`home-chrome`, `home-chrome-row`) fails here. The legend is one 16 px
-            // line, not a cell high, and the page's cell formula still reserves a cell: that
-            // difference (cell - 16) is spare room too (home.slint `cell-high`).
+            // line, and the page's cell formula (home.slint `cell-high`) reserves just that.
             // `home-chrome-labels` (two label lines) only comes with a card under 172 px, a width
             // that never limits by height inside the least window: it is not reachable here.
-            if [(1280, 540), (1280, 520), (899, 520), (899, 640)].contains(&size) {
+            if [(1280, 540), (1280, 520)].contains(&size) {
                 // The heatmap is 20 (months) + 7 x (cell + 3) + 12 + 16 (legend) high.
-                let cell = (h.height - 69.0) / 7.0;
-                let spare = height - bottom - (cell - 16.0);
+                let spare = height - bottom;
                 assert!((0.0..8.0).contains(&spare), "{size:?}: {spare} px spare");
             }
         }
+        // 899x520 is width-limited (cell == cell-wide): 200 px more height leaves the cells as
+        // they are, so a height formula that starves it still fails above.
+        let grid = |size| heatmap(&home_at("fits", size)).size().height;
+        assert!((grid((899, 520)) - grid((899, 720))).abs() < 0.5);
     }
 
     #[test]

@@ -1,11 +1,14 @@
 //! Clipboard snapshot and restore (ARCHITECTURE section 10, steps 4, 5 and 7; items 37-40).
+//! With the optional Enter on, a dictation goes on the clipboard by delayed rendering, so the
+//! target's own read is seen ([`WinClipboard::arm_proof`], owner 2026-11-12).
 
+use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::ptr::{copy_nonoverlapping, null, null_mut};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::thread::{self, sleep};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::{self, JoinHandle, sleep};
 use std::time::{Duration, Instant};
 
 use oxi_core::paste::{
@@ -18,12 +21,16 @@ use windows::ApplicationModel::DataTransfer::{
     StandardDataFormats,
 };
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
-use windows_sys::Win32::Foundation::{GetLastError, GlobalFree, HANDLE, HWND, SetLastError};
+use windows_sys::Win32::Foundation::{
+    ERROR_CLASS_ALREADY_EXISTS, GetLastError, GlobalFree, HANDLE, HWND, LPARAM, LRESULT,
+    SetLastError, WPARAM,
+};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, CountClipboardFormats, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
-    GetClipboardFormatNameW, GetClipboardOwner, GetClipboardSequenceNumber, OpenClipboard,
-    RegisterClipboardFormatW, SetClipboardData,
+    GetClipboardFormatNameW, GetClipboardOwner, GetClipboardSequenceNumber, GetOpenClipboardWindow,
+    OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::{
     GMEM_FIXED, GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
@@ -32,9 +39,13 @@ use windows_sys::Win32::System::Ole::{
     CF_ENHMETAFILE, CF_GDIOBJLAST, CF_HDROP, CF_METAFILEPICT, CF_OEMTEXT, CF_OWNERDISPLAY,
     CF_PALETTE, CF_PRIVATEFIRST, CF_TEXT, CF_UNICODETEXT,
 };
+use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, HWND_MESSAGE, IsHungAppWindow,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow, GetMessageW, HWND_MESSAGE,
+    IsHungAppWindow, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassExW, WM_APP,
+    WM_DESTROYCLIPBOARD, WM_QUIT, WM_RENDERALLFORMATS, WM_RENDERFORMAT, WNDCLASSEXW,
 };
+use windows_sys::core::PCWSTR;
 use windows_sys::w;
 
 use super::wide;
@@ -68,6 +79,18 @@ pub struct WinClipboard {
     snapshot_busy: Arc<AtomicBool>,
     /// Why the last snapshot was not whole.
     last_why: Option<IncompleteWhy>,
+    /// The next `set_text` goes by delayed rendering ([`WinClipboard::arm_proof`]).
+    armed: bool,
+    /// The last `set_pasted` went by delayed rendering: its proof is still being collected.
+    late: bool,
+    /// That text and its history flag, until `settle` puts it plainly (option A, review d08-fix).
+    plain: Option<(Vec<u8>, bool)>,
+    /// When the restore after that set began.
+    gone: Option<Instant>,
+    /// The delayed-render owner thread, started at the first armed set; `None` before, or when
+    /// it could not start (then the set goes the plain way and no proof comes).
+    owner: Option<Owner>,
+    owner_failed: bool,
 }
 
 /// Why a read gave no whole snapshot.
@@ -107,7 +130,54 @@ impl WinClipboard {
             history_limit: HISTORY_TIMEOUT,
             snapshot_busy: Arc::default(),
             last_why: None,
+            armed: false,
+            late: false,
+            plain: None,
+            gone: None,
+            owner: None,
+            owner_failed: false,
         })
+    }
+
+    /// The next `set_pasted` puts the text by delayed rendering, so the first program that reads
+    /// it is seen ([`WinClipboard::proof`]). Asked per paste, only with the optional Enter on.
+    pub fn arm_proof(&mut self) {
+        self.armed = true;
+    }
+
+    /// `[asked, gone]` of the last armed paste, for `oxi_core::paste::enter_decision`: when the
+    /// foreground app asked for the text (`None`: nobody did, someone else read first, or the
+    /// set went the plain way) and when the proof window closed. Disarms. A delayed text still on
+    /// the clipboard (settle and restore both failed) is rendered now, so it outlives this process.
+    pub fn proof(&mut self) -> [Option<Instant>; 2] {
+        self.armed = false;
+        self.plain = None;
+        let late = std::mem::take(&mut self.late);
+        if late && let Some(owner) = &self.owner {
+            owner.flush();
+        }
+        let asked = self
+            .owner
+            .as_ref()
+            .filter(|_| late)
+            .and_then(|o| *o.first.lock().unwrap_or_else(PoisonError::into_inner))
+            .filter(|a| a.by_target)
+            .map(|a| a.at);
+        [asked, self.gone.take()]
+    }
+
+    /// The owner thread, started on first use; `None` (logged once) when it cannot start.
+    fn owner(&mut self) -> Option<&Owner> {
+        if self.owner.is_none() && !self.owner_failed {
+            match Owner::spawn(self.exclude) {
+                Ok(owner) => self.owner = Some(owner),
+                Err(e) => {
+                    self.owner_failed = true;
+                    tracing::warn!("clipboard owner for the Enter proof not started: {e}");
+                }
+            }
+        }
+        self.owner.as_ref()
     }
 
     /// Reads on a helper thread: `GetClipboardData` on a delayed-render format waits for its
@@ -179,26 +249,85 @@ impl WinClipboard {
         formats: impl IntoIterator<Item = (u32, &'a [u8])>,
     ) -> Result<u32, ClipError> {
         let window = Window::new()?;
-        let open = Open::new(&window)?;
-        // SAFETY: the clipboard is open on this thread (`open`).
-        if unsafe { EmptyClipboard() } == 0 {
-            return Err(os_error("EmptyClipboard"));
-        }
-        for (format, value) in markers(self.exclude, history) {
-            put(format, &value.to_ne_bytes())?;
-        }
-        for (format, bytes) in formats {
-            if !self.exclude.contains(&format) {
-                put(format, bytes)?;
+        let formats = formats.into_iter().map(|(f, b)| (f, Some(b)));
+        write(&window, self.exclude, history, formats, || {})
+    }
+}
+
+/// [`WinClipboard::replace`] through `window`: a `None` format is put for delayed rendering, so
+/// `window` must answer `WM_RENDERFORMAT`. `emptied` runs right after `EmptyClipboard`, before
+/// any reader can ask for the new content.
+fn write<'a>(
+    window: &Window,
+    exclude: [u32; 3],
+    history: bool,
+    formats: impl IntoIterator<Item = (u32, Option<&'a [u8]>)>,
+    emptied: impl FnOnce(),
+) -> Result<u32, ClipError> {
+    write_open(
+        Open::new(window)?,
+        window,
+        exclude,
+        history,
+        formats,
+        emptied,
+    )
+}
+
+/// [`write`] on a clipboard `window` already holds open (`open`, closed here).
+fn write_open<'a>(
+    open: Open<'_>,
+    window: &Window,
+    exclude: [u32; 3],
+    history: bool,
+    formats: impl IntoIterator<Item = (u32, Option<&'a [u8]>)>,
+    emptied: impl FnOnce(),
+) -> Result<u32, ClipError> {
+    // SAFETY: the clipboard is open on this thread (`open`).
+    if unsafe { EmptyClipboard() } == 0 {
+        return Err(os_error("EmptyClipboard"));
+    }
+    emptied();
+    for (format, value) in markers(exclude, history) {
+        put(format, &value.to_ne_bytes())?;
+    }
+    for (format, bytes) in formats {
+        if !exclude.contains(&format) {
+            match bytes {
+                Some(bytes) => put(format, bytes)?,
+                None => put_late(format)?,
             }
         }
-        let inside = self.sequence();
-        drop(open);
-        let after = self.sequence();
-        // SAFETY: no arguments; compared as a value only.
-        let ours = unsafe { GetClipboardOwner() } == window.0;
-        Ok(if ours { after } else { inside })
     }
+    // SAFETY: no arguments, no preconditions.
+    let inside = unsafe { GetClipboardSequenceNumber() };
+    drop(open);
+    // SAFETY: as above.
+    let after = unsafe { GetClipboardSequenceNumber() };
+    // SAFETY: no arguments; compared as a value only.
+    let ours = unsafe { GetClipboardOwner() } == window.0;
+    Ok(if ours { after } else { inside })
+}
+
+impl WinClipboard {
+    /// `settle` could not open the clipboard (the target still holds it): see [`after_unopened`].
+    fn unopened(&self, owner: usize) -> Option<u32> {
+        // SAFETY: no arguments; compared as a value only.
+        let now = unsafe { GetClipboardOwner() }.addr();
+        let seq = after_unopened(now, owner, self.sequence());
+        if seq.is_some() {
+            tracing::warn!("clipboard held after the paste: the user's copy is restored");
+        }
+        seq
+    }
+}
+
+/// The answer of `settle` when the clipboard stayed locked: the delayed render may have moved the
+/// number, so the armed one is no proof. A window other than ours owns it: theirs stays (`None`).
+/// Ours or nobody's (unknown): the current number, so the restore puts the user's copy back
+/// instead of taking our own render for a copy of theirs.
+fn after_unopened(owner_now: usize, ours: usize, current: u32) -> Option<u32> {
+    (owner_now == ours || owner_now == 0).then_some(current)
 }
 
 impl Clipboard for WinClipboard {
@@ -232,13 +361,60 @@ impl Clipboard for WinClipboard {
         carries_exclusion(&snapshot.0, self.exclude) || history_skips(&snapshot.0, self.exclude)
     }
 
+    /// Always plain: clipboard-only, "Copy last text" (review d08-fix #1).
     fn set_text(&mut self, text: &str, in_history: bool) -> Result<u32, ClipError> {
-        let bytes: Vec<u8> = text
-            .encode_utf16()
-            .chain([0])
-            .flat_map(u16::to_ne_bytes)
-            .collect();
+        self.replace(
+            in_history,
+            [(u32::from(CF_UNICODETEXT), utf16z(text).as_slice())],
+        )
+    }
+
+    /// Armed: by delayed rendering through the owner thread, out of history and monitors whatever
+    /// `in_history` says (review d08-fix #2, #3); `settle` puts it plainly with that flag.
+    fn set_pasted(&mut self, text: &str, in_history: bool) -> Result<u32, ClipError> {
+        let bytes = utf16z(text);
+        self.late = false;
+        self.plain = None;
+        self.gone = None;
+        if std::mem::take(&mut self.armed)
+            && let Some(owner) = self.owner()
+        {
+            let seq = owner.set(bytes.clone());
+            if seq.is_ok() {
+                self.late = true;
+                self.plain = Some((bytes, in_history));
+            }
+            return seq;
+        }
         self.replace(in_history, [(u32::from(CF_UNICODETEXT), bytes.as_slice())])
+    }
+
+    /// Option A (review d08-fix #3): the proof window closes here, then the text goes on plainly
+    /// (into history when asked) only while our owner window still holds the clipboard, checked
+    /// inside the same open: someone else's write since stays (`None`).
+    fn settle(&mut self) -> Option<u32> {
+        let (bytes, history) = self.plain.take()?;
+        self.gone.get_or_insert_with(Instant::now);
+        let owner = self.owner.as_ref()?.hwnd;
+        let Ok(window) = Window::new() else {
+            return self.unopened(owner);
+        };
+        let Ok(open) = Open::new(&window) else {
+            return self.unopened(owner);
+        };
+        // SAFETY: no arguments; compared as a value only.
+        if unsafe { GetClipboardOwner() }.addr() != owner {
+            return None;
+        }
+        let text = [(u32::from(CF_UNICODETEXT), Some(&bytes[..]))];
+        match write_open(open, &window, self.exclude, history, text, || {}) {
+            Ok(seq) => Some(seq),
+            Err(e) => {
+                // Emptied by us and partly written: ours, so the restore puts the user's copy back.
+                tracing::warn!("dictation not put plainly after the paste: {e}");
+                Some(self.sequence())
+            }
+        }
     }
 
     fn sequence(&self) -> u32 {
@@ -247,6 +423,10 @@ impl Clipboard for WinClipboard {
     }
 
     fn restore(&mut self, snapshot: &Saved, in_history: bool) -> Result<u32, ClipError> {
+        // From here on a read may get the user's copy: a request after it is no proof.
+        if self.late && self.gone.is_none() {
+            self.gone = Some(Instant::now());
+        }
         self.replace(
             in_history,
             snapshot.0.iter().map(|(f, b)| (*f, b.as_slice())),
@@ -581,12 +761,18 @@ struct Window(HWND);
 
 impl Window {
     fn new() -> Result<Self, ClipError> {
-        // SAFETY: the predefined STATIC class needs no registration; HWND_MESSAGE makes the
-        // window invisible and message-only; `Drop` destroys it on this same thread.
+        // The predefined STATIC class needs no registration.
+        Self::of(w!("STATIC"))
+    }
+
+    /// A message-only window of `class` (registered with this module's instance, or a system one).
+    fn of(class: PCWSTR) -> Result<Self, ClipError> {
+        // SAFETY: HWND_MESSAGE makes the window invisible and message-only; `class` is a live
+        // NUL-terminated name; `Drop` destroys the window on this same thread.
         let hwnd = unsafe {
             CreateWindowExW(
                 0,
-                w!("STATIC"),
+                class,
                 null(),
                 0,
                 0,
@@ -595,7 +781,7 @@ impl Window {
                 0,
                 HWND_MESSAGE,
                 null_mut(),
-                null_mut(),
+                GetModuleHandleW(null()),
                 null(),
             )
         };
@@ -757,6 +943,336 @@ fn put(format: u32, bytes: &[u8]) -> Result<(), ClipError> {
     Ok(())
 }
 
+/// Puts `format` for delayed rendering: the owner of the open clipboard renders it on request.
+fn put_late(format: u32) -> Result<(), ClipError> {
+    // A null handle is the documented delayed-render call; it returns null then too, so the last
+    // error tells a failure.
+    // SAFETY: the clipboard is open on this thread (the caller holds `Open`) through a window
+    // that answers `WM_RENDERFORMAT` (`owner_proc`).
+    let code = unsafe {
+        SetLastError(0);
+        SetClipboardData(format, null_mut());
+        GetLastError()
+    };
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(ClipError::Os {
+            call: "SetClipboardData (delayed)",
+            code,
+        })
+    }
+}
+
+/// The first request for our delayed text: when, and whether the foreground app made it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Asked {
+    at: Instant,
+    by_target: bool,
+}
+
+/// Owner 2026-11-12: the clipboard owner of an armed dictation. A thread with a message-only
+/// window holds the text and renders it on `WM_RENDERFORMAT`, noting the first request. Only the
+/// first reader makes Windows ask: after the render the data sits on the clipboard.
+#[derive(Debug)]
+struct Owner {
+    thread_id: u32,
+    /// The owner window's handle as a number, for the "still ours" check at `settle`.
+    hwnd: usize,
+    commands: Sender<Command>,
+    first: Arc<Mutex<Option<Asked>>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// Work for the owner thread.
+enum Command {
+    /// One armed `set_pasted`.
+    Set {
+        bytes: Vec<u8>,
+        reply: Sender<Result<u32, ClipError>>,
+    },
+    /// Render a text still delayed on the clipboard, as `WM_RENDERALLFORMATS` does.
+    Flush,
+}
+
+/// The armed text's history flag: always out of Win+V and clipboard monitors (review d08-fix #2,
+/// #3), so a monitor or the history service never makes the first request in the target's place.
+const ARMED_IN_HISTORY: bool = false;
+
+/// What the owner window answers with; lives on the owner thread only.
+struct Held {
+    /// The dictation as `CF_UNICODETEXT` bytes until the clipboard is emptied: never logged.
+    text: Option<Vec<u8>>,
+    first: Arc<Mutex<Option<Asked>>>,
+}
+
+thread_local! {
+    static HELD: RefCell<Option<Held>> = const { RefCell::new(None) };
+}
+
+/// Posted to the owner thread when a [`Command`] waits in its channel.
+const WM_SET_LATE: u32 = WM_APP;
+const OWNER_CLASS: PCWSTR = w!("OxiYapperClipboardOwner");
+const NO_OWNER: ClipError = ClipError::Os {
+    call: "clipboard owner thread",
+    code: 0,
+};
+
+impl Owner {
+    fn spawn(exclude: [u32; 3]) -> Result<Self, ClipError> {
+        let first = Arc::new(Mutex::new(None));
+        let (commands, rx) = mpsc::channel();
+        let (ready_tx, ready) = mpsc::channel();
+        let shared = Arc::clone(&first);
+        let thread = thread::Builder::new()
+            .name("clipboard-owner".into())
+            .spawn(move || owner_thread(exclude, &rx, &ready_tx, shared))
+            .map_err(|e| ClipError::Os {
+                call: "spawn clipboard-owner thread",
+                code: e.raw_os_error().map_or(0, i32::cast_unsigned),
+            })?;
+        match ready.recv() {
+            Ok(Ok((thread_id, hwnd))) => Ok(Self {
+                thread_id,
+                hwnd,
+                commands,
+                first,
+                thread: Some(thread),
+            }),
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                Err(e)
+            }
+            Err(_) => {
+                let _ = thread.join();
+                Err(NO_OWNER)
+            }
+        }
+    }
+
+    /// Empties the clipboard and puts `bytes` as delayed `CF_UNICODETEXT` through the owner
+    /// window; the sequence number as [`WinClipboard::replace`] gives it.
+    fn set(&self, bytes: Vec<u8>) -> Result<u32, ClipError> {
+        let (reply, answer) = mpsc::channel();
+        self.post(Command::Set { bytes, reply })?;
+        // The owner thread does a bounded open (OPEN_RETRIES) and a few calls, then answers.
+        answer.recv().map_err(|_| NO_OWNER)?
+    }
+
+    /// Asks the owner thread to render a text still delayed; not waited for.
+    fn flush(&self) {
+        if let Err(e) = self.post(Command::Flush) {
+            tracing::warn!("delayed clipboard text not flushed: {e}");
+        }
+    }
+
+    fn post(&self, command: Command) -> Result<(), ClipError> {
+        self.commands.send(command).map_err(|_| NO_OWNER)?;
+        // SAFETY: a message without pointers to a thread id; a dead thread only fails.
+        if unsafe { PostThreadMessageW(self.thread_id, WM_SET_LATE, 0, 0) } == 0 {
+            return Err(os_error("PostThreadMessageW"));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Owner {
+    /// Ends the thread. Its window, destroyed while it still owns the clipboard, renders the text
+    /// first (`WM_RENDERALLFORMATS`), so a dictation left on the clipboard stays there.
+    fn drop(&mut self) {
+        // SAFETY: as in `Owner::set`.
+        unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0) };
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn owner_thread(
+    exclude: [u32; 3],
+    commands: &Receiver<Command>,
+    ready: &Sender<Result<(u32, usize), ClipError>>,
+    first: Arc<Mutex<Option<Asked>>>,
+) {
+    let mut msg = MSG::default();
+    // SAFETY: `msg` is a valid MSG; this call only creates the thread's message queue, so a
+    // posted command cannot be lost once `ready` is sent.
+    unsafe { PeekMessageW(&raw mut msg, null_mut(), 0, 0, PM_NOREMOVE) };
+    let class = WNDCLASSEXW {
+        cbSize: u32::try_from(size_of::<WNDCLASSEXW>()).unwrap_or(u32::MAX),
+        lpfnWndProc: Some(owner_proc),
+        // SAFETY: a null name asks for the exe's own module handle.
+        hInstance: unsafe { GetModuleHandleW(null()) },
+        lpszClassName: OWNER_CLASS,
+        ..Default::default()
+    };
+    // SAFETY: `class` is a valid WNDCLASSEXW with a 'static name and procedure; the last-error
+    // read has no arguments.
+    let refused = unsafe {
+        RegisterClassExW(&raw const class) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS
+    };
+    if refused {
+        let _ = ready.send(Err(os_error("RegisterClassExW")));
+        return;
+    }
+    let window = match Window::of(OWNER_CLASS) {
+        Ok(window) => window,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return;
+        }
+    };
+    HELD.set(Some(Held { text: None, first }));
+    // SAFETY: no arguments, no preconditions.
+    let _ = ready.send(Ok((unsafe { GetCurrentThreadId() }, window.0.addr())));
+    // Sent messages (the render requests) are handled inside GetMessageW.
+    // SAFETY: `msg` is a valid MSG; a null window takes every message of this thread.
+    while unsafe { GetMessageW(&raw mut msg, null_mut(), 0, 0) } > 0 {
+        if msg.message == WM_SET_LATE {
+            for command in commands.try_iter() {
+                match command {
+                    Command::Set { bytes, reply } => {
+                        let _ = reply.send(set_late(&window, exclude, bytes));
+                    }
+                    Command::Flush => flush(window.0),
+                }
+            }
+        }
+    }
+    // Destroyed before `HELD` goes: WM_RENDERALLFORMATS still finds the text.
+    drop(window);
+    HELD.set(None);
+}
+
+/// One armed set on the owner thread. The text is held from the moment the clipboard is empty,
+/// so a reader woken inside the close (a viewer answered there) already gets it.
+fn set_late(window: &Window, exclude: [u32; 3], bytes: Vec<u8>) -> Result<u32, ClipError> {
+    armed_set(bytes, |history, formats, emptied| {
+        write(window, exclude, history, formats, emptied)
+    })
+}
+
+/// [`set_late`]'s arguments to the write `put`, which a test replaces: always `ARMED_IN_HISTORY`.
+fn armed_set(
+    bytes: Vec<u8>,
+    put: impl FnOnce(bool, [(u32, Option<&[u8]>); 1], &mut dyn FnMut()) -> Result<u32, ClipError>,
+) -> Result<u32, ClipError> {
+    let mut bytes = Some(bytes);
+    put(
+        ARMED_IN_HISTORY,
+        [(u32::from(CF_UNICODETEXT), None)],
+        &mut || {
+            HELD.with_borrow_mut(|held| {
+                if let Some(held) = held {
+                    held.text = bytes.take();
+                    *held.first.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                }
+            });
+        },
+    )
+}
+
+/// The owner window's procedure: renders on request, lets the text go when the clipboard is
+/// emptied, renders it for good when destroyed while still the owner.
+unsafe extern "system" fn owner_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_RENDERFORMAT => {
+            if wparam == usize::from(CF_UNICODETEXT) {
+                render(asked_by_foreground());
+            }
+            0
+        }
+        WM_RENDERALLFORMATS => {
+            flush(hwnd);
+            0
+        }
+        WM_DESTROYCLIPBOARD => {
+            HELD.with_borrow_mut(|held| {
+                if let Some(held) = held {
+                    held.text = None;
+                }
+            });
+            0
+        }
+        // SAFETY: the window's own arguments, passed on unchanged.
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// Puts a held text for good while `hwnd` (the owner window, this thread's) still owns the
+/// clipboard; nothing held, nothing opened.
+fn flush(hwnd: HWND) {
+    if !HELD.with_borrow(|held| held.as_ref().is_some_and(|h| h.text.is_some())) {
+        return;
+    }
+    // SAFETY: `hwnd` is this thread's live window; closed below on the same thread.
+    if unsafe { OpenClipboard(hwnd) } != 0 {
+        // SAFETY: no arguments; compared as a value only.
+        if unsafe { GetClipboardOwner() } == hwnd {
+            render_text();
+        }
+        // SAFETY: opened just above on this thread.
+        unsafe { CloseClipboard() };
+    }
+}
+
+/// A dictation as `CF_UNICODETEXT` bytes: UTF-16, NUL-terminated.
+fn utf16z(text: &str) -> Vec<u8> {
+    text.encode_utf16()
+        .chain([0])
+        .flat_map(u16::to_ne_bytes)
+        .collect()
+}
+
+/// A reader asked for the text: the first request is noted, then the text is put.
+fn render(by_target: bool) {
+    let holding = HELD.with_borrow(|held| {
+        let held = held.as_ref().filter(|h| h.text.is_some())?;
+        let mut first = held.first.lock().unwrap_or_else(PoisonError::into_inner);
+        note_request(&mut first, Instant::now(), by_target);
+        Some(())
+    });
+    if holding.is_some() {
+        render_text();
+    }
+}
+
+/// Only the first request counts: after it the data is on the clipboard and nobody asks again.
+fn note_request(first: &mut Option<Asked>, at: Instant, by_target: bool) {
+    first.get_or_insert(Asked { at, by_target });
+}
+
+/// Puts the held text; the clipboard is open by the reader (or by us for `WM_RENDERALLFORMATS`).
+fn render_text() {
+    HELD.with_borrow(|held| {
+        if let Some(text) = held.as_ref().and_then(|h| h.text.as_deref())
+            && let Err(e) = put(u32::from(CF_UNICODETEXT), text)
+        {
+            tracing::warn!("delayed clipboard text not rendered: {e}");
+        }
+    });
+}
+
+/// Whether the program that has the clipboard open (the reader, inside `WM_RENDERFORMAT`) is the
+/// foreground app: its window, or a window of its process. A reader without a window, or this
+/// process itself, is not.
+fn asked_by_foreground() -> bool {
+    // SAFETY: no arguments; the handles are compared and given to a pid lookup only.
+    let (reader, fg) = unsafe { (GetOpenClipboardWindow(), GetForegroundWindow()) };
+    if reader.is_null() || fg.is_null() {
+        return false;
+    }
+    let pid = super::input::window_pid(reader);
+    // SAFETY: no arguments.
+    let own = unsafe { GetCurrentProcessId() };
+    pid != 0 && pid != own && (reader == fg || pid == super::input::window_pid(fg))
+}
+
 fn os_error(call: &'static str) -> ClipError {
     // SAFETY: reads this thread's last-error value, no arguments.
     let code = unsafe { GetLastError() };
@@ -856,6 +1372,83 @@ mod tests {
         });
         assert_eq!(panicked, Err(HISTORY_TIMED_OUT));
         assert_eq!(on_sta(&busy, Duration::from_secs(5), || Ok(4)), Ok(4));
+    }
+
+    /// Owner 2026-11-12: only the first request for the delayed text is the proof's; a later one
+    /// (impossible once rendered, but a failed render may be asked again) never replaces it.
+    #[test]
+    fn only_the_first_render_request_is_noted() {
+        let t0 = Instant::now();
+        let mut first = None;
+        note_request(&mut first, t0, false);
+        note_request(&mut first, t0 + Duration::from_millis(5), true);
+        assert_eq!(
+            first,
+            Some(Asked {
+                at: t0,
+                by_target: false
+            })
+        );
+    }
+
+    /// Review d08-fix #2, #3: the armed text is kept from clipboard monitors (Office Clipboard, a
+    /// browser extension, a manager in focus would otherwise read it as the target) and from
+    /// Win+V (its service would read first, so the target never asks), whatever the setting. What
+    /// the armed write really passes is checked, not the constant: the markers it then puts.
+    #[test]
+    fn the_armed_write_passes_the_flag_that_keeps_it_out_of_monitors_and_history() {
+        let [monitor, history, cloud] = IDS;
+        let mut seen = None;
+        let put = |in_history: bool, formats: [(u32, Option<&[u8]>); 1], _: &mut dyn FnMut()| {
+            seen = Some((in_history, formats[0].0, formats[0].1.is_none()));
+            Ok(7)
+        };
+        assert_eq!(armed_set(vec![1, 0], put), Ok(7));
+        let (in_history, format, delayed) = seen.unwrap();
+        assert_eq!((format, delayed), (u32::from(CF_UNICODETEXT), true));
+        let marks = markers(IDS, in_history);
+        assert!(marks.contains(&(monitor, 0)), "{marks:?}");
+        assert!(marks.contains(&(history, 0)), "{marks:?}");
+        assert!(marks.contains(&(cloud, 0)), "{marks:?}");
+    }
+
+    /// Review d08-fix2 #1: a clipboard still held after the paste is ours (a delayed render moved
+    /// the number) or unknown: the restore must see the current number. Another window's: theirs.
+    #[test]
+    fn a_held_clipboard_after_the_paste_is_restored_unless_another_window_owns_it() {
+        assert_eq!(after_unopened(0x10, 0x10, 9), Some(9), "ours");
+        assert_eq!(after_unopened(0, 0x10, 9), Some(9), "nobody's");
+        assert_eq!(after_unopened(0x20, 0x10, 9), None, "another window's");
+    }
+
+    /// The owner window lets the text go when the clipboard is emptied, and a request after that
+    /// is no proof and renders nothing. The procedure is called directly: no clipboard call.
+    #[test]
+    fn an_emptied_owner_notes_no_request_and_renders_nothing() {
+        let first = Arc::new(Mutex::new(None));
+        HELD.set(Some(Held {
+            text: Some(vec![104, 0, 0, 0]),
+            first: Arc::clone(&first),
+        }));
+        // SAFETY: the procedure never touches the null window for these two messages.
+        unsafe { owner_proc(null_mut(), WM_DESTROYCLIPBOARD, 0, 0) };
+        assert!(HELD.with_borrow(|h| h.as_ref().unwrap().text.is_none()));
+        // SAFETY: as above; with no text held nothing is put.
+        unsafe { owner_proc(null_mut(), WM_RENDERFORMAT, usize::from(CF_UNICODETEXT), 0) };
+        assert_eq!(*first.lock().unwrap(), None);
+        HELD.set(None);
+    }
+
+    /// The owner thread starts and ends on drop, with its window; nothing is written.
+    #[test]
+    fn the_owner_thread_starts_and_ends_without_touching_the_clipboard() {
+        let owner = Owner::spawn(IDS).unwrap();
+        assert_eq!(*owner.first.lock().unwrap(), None);
+        let started = Instant::now();
+        drop(owner);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // A second one registers the class again without failing.
+        drop(Owner::spawn(IDS).unwrap());
     }
 
     /// Only files are judged never to enter Win+V; a big copy may still register (its measure is

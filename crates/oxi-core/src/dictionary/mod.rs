@@ -17,6 +17,10 @@
 
 use std::sync::OnceLock;
 
+mod suggest;
+
+pub use suggest::{Suggestion, suggest};
+
 use crate::constants::VOCAB_FILE;
 
 /// Prompt tokens whisper.cpp keeps: half of the 448-token text context, less one

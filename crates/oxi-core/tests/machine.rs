@@ -5,8 +5,8 @@ use oxi_core::audio::DETECTOR_LATENCY;
 use oxi_core::config::Config;
 use oxi_core::device::DeviceChoice;
 use oxi_core::machine::{
-    Effect, Effects, EmptyAudio, Event, JobId, MachineConfig, Mode, ModelFailure, Notice,
-    OverlayState, Phase, PhaseCell, Sound, State, step,
+    BOUNCE, Effect, Effects, EmptyAudio, Event, JobId, MachineConfig, Mode, ModelFailure, Note,
+    Notice, OverlayState, Phase, PhaseCell, Sound, State, step,
 };
 use oxi_core::paste::{ClipboardOnlyWhy, PasteOutcome};
 use oxi_core::types::Millis;
@@ -66,10 +66,18 @@ impl Sim {
         self.0.phase()
     }
 
-    /// Press at `down`, release at `up`; returns the effects of the release.
+    /// Press at `down`, release at `up` and let its bounce window pass; returns the effects of
+    /// the release and of the window's end.
     fn press(&mut self, down: u64, up: u64) -> Effects {
         self.at(down, Event::ChordDown);
-        self.at(up, Event::ChordUp)
+        self.release(up)
+    }
+
+    /// Release at `up` and let its bounce window pass ([`BOUNCE`]): a held release stops then.
+    fn release(&mut self, up: u64) -> Effects {
+        let mut fx = self.at(up, Event::ChordUp);
+        fx.extend(self.at(up + BOUNCE.0, Event::Tick));
+        fx
     }
 }
 
@@ -112,7 +120,7 @@ fn done(job: JobId) -> Event {
 fn edge_01_key_during_transcription_starts_a_new_recording() {
     let mut s = Sim::loaded();
     assert_eq!(s.core(0, Event::ChordDown), START);
-    assert_eq!(s.core(400, Event::ChordUp), stop(J0));
+    assert_eq!(without_overlay(s.release(400)), stop(J0));
     assert_eq!(
         s.core(450, Event::JobAudioReady(J0)),
         [Effect::Transcribe(J0)]
@@ -146,7 +154,7 @@ fn edge_01_jobs_run_and_paste_in_order_and_a_third_waiting_job_is_refused() {
 
     // One job waits, the one in whisper does not count: a new recording starts.
     assert_eq!(s.core(1100, Event::ChordDown), START);
-    assert_eq!(s.core(1500, Event::ChordUp), stop(J2));
+    assert_eq!(without_overlay(s.release(1500)), stop(J2));
     assert_eq!(s.core(1550, Event::JobAudioReady(J2)), []);
 
     // Two jobs wait: the next key-down is refused with the error sound, nothing else.
@@ -213,6 +221,7 @@ fn edge_02_double_tap_locks_recording_on() {
         s.press(1000, 1000 + p1);
         s.at(t2, Event::ChordDown);
         let fx = s.at(t2 + p2, Event::ChordUp);
+        s.at(t2 + p2 + BOUNCE.0, Event::Tick); // a tap ends once no bounce came
         let case = format!("press {p1}, gap {gap}, press {p2}");
         if locked {
             assert_eq!(s.phase(), Phase::Recording, "{case}");
@@ -231,8 +240,13 @@ fn edge_02_double_tap_locks_recording_on() {
 fn edge_02_locked_audio_counts_from_the_second_press_and_next_press_stops_it() {
     let mut s = Sim::loaded();
     assert_eq!(s.core(1000, Event::ChordDown), START);
-    // The first tap's capture is thrown away; the second press opens a fresh one.
-    assert_eq!(s.core(1100, Event::ChordUp), [Effect::DiscardCapture]);
+    // The first tap's capture is thrown away once no bounce came; the second press opens a
+    // fresh one.
+    assert_eq!(s.core(1100, Event::ChordUp), []);
+    assert_eq!(
+        s.core(1100 + BOUNCE.0, Event::Tick),
+        [Effect::DiscardCapture]
+    );
     assert_eq!(s.core(1200, Event::ChordDown), START);
     assert_eq!(s.core(1300, Event::ChordUp), [Effect::Play(Sound::Start)]);
     // Locked recording does not poll the key and ignores other keys.
@@ -265,10 +279,11 @@ fn edge_03_press_under_300_ms_is_discarded() {
             assert_eq!(without_overlay(fx), stop(J0), "{case}");
             assert_eq!(s.phase(), Phase::Transcribing, "{case}");
         } else {
-            assert_eq!(without_overlay(fx), [Effect::DiscardCapture], "{case}");
+            // Thrown away once the bounce window passed without a press.
+            assert!(fx.contains(&Effect::DiscardCapture), "{case}: {fx:?}");
             assert_eq!(s.phase(), Phase::Idle, "{case}");
             assert_eq!(
-                overlay_of(&s.at(1000 + ms + 1, Event::Tick)),
+                overlay_of(&s.at(1000 + ms + BOUNCE.0 + 1, Event::Tick)),
                 None,
                 "{case}"
             );
@@ -477,7 +492,8 @@ fn edge_08_watchdog_polls_every_100_ms_and_a_released_chord_is_a_key_up() {
     assert_eq!(s.core(1210, Event::ChordPolled { held: true }), []);
     assert_eq!(s.phase(), Phase::Recording);
 
-    assert_eq!(s.core(1500, Event::ChordPolled { held: false }), stop(J0));
+    assert_eq!(s.core(1500, Event::ChordPolled { held: false }), []);
+    assert_eq!(s.core(1500 + BOUNCE.0, Event::Tick), stop(J0));
     assert_eq!(s.phase(), Phase::Transcribing);
     // The real key-up arriving late is harmless.
     assert_eq!(s.core(1600, Event::ChordUp), []);
@@ -506,8 +522,9 @@ fn edge_08_toggle_start_press_held_three_periods_polls_three_times() {
 fn edge_08_a_poll_that_sees_a_short_press_end_discards_it() {
     let mut s = Sim::loaded();
     s.at(1000, Event::ChordDown);
+    assert_eq!(s.core(1100, Event::ChordPolled { held: false }), []);
     assert_eq!(
-        s.core(1100, Event::ChordPolled { held: false }),
+        s.core(1100 + BOUNCE.0, Event::Tick),
         [Effect::DiscardCapture]
     );
 }
@@ -536,7 +553,7 @@ fn edge_09_10_key_events_produce_no_key_injection_or_swallow_effect() {
         ]
     );
     assert_eq!(
-        s.at(500, Event::ChordUp),
+        s.release(500),
         [
             Effect::StopCapture(J0),
             Effect::Play(Sound::Stop),
@@ -551,7 +568,7 @@ fn edge_10_phase_is_recording_only_while_recording_so_the_hook_swallows_esc_only
     let mut seen = vec![s.phase()];
     s.at(0, Event::ChordDown);
     seen.push(s.phase());
-    s.at(500, Event::ChordUp);
+    s.release(500);
     seen.push(s.phase());
     s.at(550, Event::JobAudioReady(J0));
     s.at(600, done(J0));
@@ -582,7 +599,7 @@ fn edge_11_new_config_waits_for_idle() {
     s.at(0, Event::ChordDown);
     assert_eq!(s.at(100, Event::ConfigChanged(toggle)), []);
     // Still push-to-talk: the release stops this recording.
-    assert_eq!(s.core(500, Event::ChordUp), stop(J0));
+    assert_eq!(without_overlay(s.release(500)), stop(J0));
     s.at(550, Event::JobAudioReady(J0));
     assert_eq!(s.core(600, done(J0)), [Effect::Paste(J0)]);
     // Back to Idle: the new config goes live.
@@ -782,7 +799,7 @@ fn model_loads_on_key_down_and_a_job_waits_for_it() {
             Effect::Play(Sound::Start)
         ]
     );
-    let fx = s.at(700, Event::ChordUp);
+    let fx = s.release(700);
     assert_eq!(overlay_of(&fx), Some(OverlayState::LoadingModel));
     // Audio is ready but the model is not: no whisper call yet.
     assert_eq!(s.core(750, Event::JobAudioReady(J0)), []);
@@ -1071,7 +1088,7 @@ fn model_unloads_after_the_idle_time_and_a_press_cancels_it() {
     assert_eq!(s.0.next_deadline(), Some(Millis(300_000)));
     s.at(100_000, Event::ChordDown);
     assert_eq!(s.0.next_deadline(), Some(Millis(100_100))); // poll only, unload disarmed
-    s.at(100_500, Event::ChordUp);
+    s.release(100_500);
     s.at(100_600, Event::JobAudioReady(J0));
     s.at(100_900, done(J0));
     s.at(101_000, pasted(J0));
@@ -1100,7 +1117,7 @@ fn immediate_unload_waits_for_the_job_to_end() {
     }));
     s.at(0, Event::ChordDown); // recording: the model loads for it
     s.at(10, Event::ModelLoaded);
-    assert_eq!(s.core(500, Event::ChordUp), stop(J0));
+    assert_eq!(without_overlay(s.release(500)), stop(J0));
     for (t, event) in [(600, Event::JobAudioReady(J0)), (900, done(J0))] {
         let fx = s.core(t, event);
         assert!(!fx.contains(&Effect::Unload), "unloaded mid-job at {t}");
@@ -1132,7 +1149,7 @@ fn tail_delays_the_stop_of_every_kept_recording() {
         (Mode::Push, 100, Event::ChordPolled { held: false }, 1100),
         (Mode::Toggle, 100, Event::ChordDown, 1100),
         (Mode::Push, 250, Event::ChordUp, 1250),
-        (Mode::Push, 0, Event::ChordUp, 1000),
+        (Mode::Push, 0, Event::ChordUp, 1000 + BOUNCE.0), // a held release waits out a bounce
         (Mode::Toggle, 0, Event::ChordDown, 1000),
     ];
     for (mode, tail, event, stop_at) in table {
@@ -1159,7 +1176,12 @@ fn tail_delays_the_stop_of_every_kept_recording() {
 fn tail_does_not_hold_back_a_discarded_tap() {
     let mut s = tailed(Mode::Push, 100);
     s.at(0, Event::ChordDown);
-    assert_eq!(s.core(100, Event::ChordUp), [Effect::DiscardCapture]);
+    s.at(100, Event::ChordUp);
+    // Only the bounce window, not the 100 ms tail.
+    assert_eq!(
+        s.core(100 + BOUNCE.0, Event::Tick),
+        [Effect::DiscardCapture]
+    );
     assert_eq!(s.phase(), Phase::Idle);
 }
 
@@ -1438,4 +1460,197 @@ fn phase_serialises_lowercase() {
     let v = toml::Value::try_from(Phase::Transcribing).unwrap();
     assert_eq!(v.as_str(), Some("transcribing"));
     assert_eq!(v.try_into::<Phase>().unwrap(), Phase::Transcribing);
+}
+
+// ---- held keys mean dictation (owner, 2026-11-12) -------------------------------------------
+
+/// Two jobs wait for their audio (a third press is refused): presses at 0-400 and 500-900.
+fn queue_full() -> Sim {
+    let mut s = Sim::loaded();
+    s.press(0, 400);
+    s.press(500, 900);
+    assert_eq!(s.at(1000, Event::ChordDown), [Effect::Play(Sound::Error)]);
+    assert_eq!(
+        s.0.take_notes(),
+        [Note::RefusedQueueFull],
+        "the c06 log line"
+    );
+    s
+}
+
+fn nothing_heard(job: JobId) -> Event {
+    Event::JobAudioEmpty {
+        job,
+        why: EmptyAudio::NothingHeard,
+    }
+}
+
+#[test]
+fn a_refused_press_still_held_records_the_moment_a_job_leaves() {
+    // Rapid presses fill the queue; the first one turns out to be "nothing heard". The chord is
+    // still held: capture starts in that same step, not after the notice or a new press.
+    let mut s = queue_full();
+    let fx = s.at(1100, nothing_heard(J0));
+    assert_eq!(without_overlay(fx.clone()), START);
+    assert_eq!(
+        overlay_of(&fx),
+        Some(REC),
+        "the recording is the news, not the notice"
+    );
+    assert_eq!(s.0.take_notes(), [], "refused once, logged once");
+    assert_eq!(without_overlay(s.release(2000)), stop(J2));
+}
+
+#[test]
+fn a_refused_press_released_or_turned_shortcut_starts_nothing_later() {
+    // Released while the error is fresh: the "nothing heard" shows, no recording starts.
+    let mut s = queue_full();
+    assert_eq!(s.core(1050, Event::ChordUp), []);
+    let fx = s.at(1100, nothing_heard(J0));
+    assert_eq!(without_overlay(fx.clone()), []);
+    assert_eq!(
+        overlay_of(&fx),
+        Some(OverlayState::Text(Notice::NothingHeard))
+    );
+
+    // Another key while held: the chord was a shortcut. A lock: nothing records into it.
+    for event in [Event::OtherKey, Event::Lock, Event::Esc] {
+        let mut s = queue_full();
+        s.at(1050, event.clone());
+        assert_eq!(s.core(1100, nothing_heard(J0)), [], "{event:?}");
+        assert_ne!(s.phase(), Phase::Recording, "{event:?}");
+    }
+}
+
+#[test]
+fn a_bounce_at_the_start_keeps_one_capture_and_is_no_double_tap() {
+    let mut s = Sim::loaded();
+    assert_eq!(s.core(0, Event::ChordDown), START);
+    assert_eq!(s.core(5, Event::ChordUp), []);
+    // Back within the bounce window: the same capture goes on, no second start sound.
+    assert_eq!(s.core(10, Event::ChordDown), []);
+    assert_eq!(without_overlay(s.release(2000)), stop(J0));
+
+    // A bounce then a short press: a tap, thrown away, never a lock.
+    let mut s = Sim::loaded();
+    s.at(0, Event::ChordDown);
+    s.at(5, Event::ChordUp);
+    s.at(10, Event::ChordDown);
+    assert_eq!(s.core(150, Event::ChordUp), []);
+    assert_eq!(
+        s.core(150 + BOUNCE.0, Event::Tick),
+        [Effect::DiscardCapture]
+    );
+    assert_eq!(s.phase(), Phase::Idle);
+}
+
+#[test]
+fn a_bounce_mid_recording_never_splits_it_even_without_a_hold_gap() {
+    let mut s = tailed(Mode::Push, 100); // hold gap off
+    s.at(0, Event::ChordDown);
+    assert_eq!(s.core(1000, Event::ChordUp), []);
+    assert_eq!(s.core(1000 + BOUNCE.0 - 1, Event::ChordDown), []);
+    assert_eq!(s.phase(), Phase::Recording);
+    assert_eq!(s.core(3000, Event::ChordUp), []);
+    assert_eq!(s.core(3100, Event::Tick), stop(J0));
+    assert_eq!(s.core(3200, Event::Tick), [], "one job");
+}
+
+#[test]
+fn os_key_repeat_while_held_changes_nothing() {
+    let mut s = Sim::loaded();
+    s.at(0, Event::ChordDown);
+    for t in [30, 60, 500] {
+        assert_eq!(s.core(t, Event::ChordDown), [], "repeat at {t}");
+    }
+    assert_eq!(without_overlay(s.release(1000)), stop(J0));
+
+    // During the tail of the release too: the hook repeating itself is no new press.
+    let mut s = tailed(Mode::Push, 100);
+    s.at(0, Event::ChordDown);
+    s.at(1000, Event::ChordUp);
+    s.at(1020, Event::ChordDown); // a bounce: goes on
+    assert_eq!(s.core(1060, Event::ChordDown), [], "repeat");
+    assert_eq!(s.phase(), Phase::Recording);
+}
+
+#[test]
+fn esc_or_a_lock_inside_the_bounce_window_is_no_cancel() {
+    for event in [Event::Esc, Event::Lock] {
+        let mut s = Sim::loaded();
+        s.at(0, Event::ChordDown);
+        s.at(100, Event::SpeechHeard);
+        s.at(150, Event::ChordUp); // a tap, waiting out its bounce window
+        let fx = s.core(160, event.clone());
+        assert_eq!(fx, [Effect::DiscardCapture], "{event:?}");
+        assert_eq!(s.0.take_notes(), [], "{event:?}: no cancel line");
+    }
+}
+
+#[test]
+fn a_bounce_in_the_lock_press_keeps_the_lock() {
+    // The second press of a double tap bounces at its start: the lock stays, nothing discarded.
+    let mut s = Sim::loaded();
+    s.press(0, 100);
+    s.at(140, Event::Tick); // the first tap is thrown away
+    s.at(250, Event::ChordDown);
+    assert_eq!(s.core(255, Event::ChordUp), [Effect::Play(Sound::Start)]);
+    assert_eq!(s.core(260, Event::ChordDown), [], "a bounce, no stop");
+    assert_eq!(s.core(1000, Event::ChordUp), []);
+    assert_eq!(s.phase(), Phase::Recording);
+    assert_eq!(s.core(3000, Event::ChordDown), stop(J0));
+
+    // The lock press bounces on its release.
+    let mut s = Sim::loaded();
+    s.press(0, 100);
+    s.at(140, Event::Tick);
+    s.at(250, Event::ChordDown);
+    assert_eq!(s.core(400, Event::ChordUp), [Effect::Play(Sound::Start)]);
+    assert_eq!(s.core(405, Event::ChordDown), [], "a bounce, no stop");
+    assert_eq!(s.core(410, Event::ChordUp), []);
+    assert_eq!(s.phase(), Phase::Recording);
+    assert_eq!(s.core(3000, Event::ChordDown), stop(J0));
+}
+
+#[test]
+fn a_bounce_in_a_toggle_press_neither_stops_nor_restarts() {
+    // The start press bounces: one recording, it goes on.
+    let mut s = Sim::toggle();
+    assert_eq!(s.core(0, Event::ChordDown), START);
+    s.at(5, Event::ChordUp);
+    assert_eq!(s.core(10, Event::ChordDown), []);
+    s.at(100, Event::ChordUp);
+    assert_eq!(s.phase(), Phase::Recording);
+
+    // The stop press bounces at its start or its release, with or without a tail: one job,
+    // and the microphone stays off.
+    for tail in [0, 100] {
+        for (up, down) in [(1003, 1006), (1200, 1210)] {
+            let mut s = tailed(Mode::Toggle, tail);
+            s.at(0, Event::ChordDown);
+            s.at(50, Event::ChordUp);
+            s.at(1000, Event::ChordDown);
+            s.at(up, Event::ChordUp);
+            assert_eq!(
+                s.core(down, Event::ChordDown),
+                [],
+                "tail {tail}, {up}/{down}"
+            );
+            s.at(down + 5, Event::ChordUp);
+            s.at(1500, Event::Tick);
+            assert_ne!(s.phase(), Phase::Recording, "tail {tail}, {up}/{down}");
+            assert_eq!(s.core(1600, Event::Tick), [], "tail {tail}, {up}/{down}");
+        }
+    }
+}
+
+#[test]
+fn a_bounce_after_a_release_without_tail_or_gap_is_one_job() {
+    let mut s = tailed(Mode::Push, 0);
+    s.at(0, Event::ChordDown);
+    assert_eq!(s.core(1000, Event::ChordUp), [], "waits out a bounce");
+    assert_eq!(s.core(1005, Event::ChordDown), []);
+    assert_eq!(s.core(3000, Event::ChordUp), []);
+    assert_eq!(s.core(3000 + BOUNCE.0, Event::Tick), stop(J0));
+    assert_eq!(s.core(3200, Event::Tick), [], "one job");
 }

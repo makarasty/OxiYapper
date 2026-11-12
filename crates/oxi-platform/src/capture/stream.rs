@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, I24, InputCallbackInfo, Sample, SampleFormat, SizedSample, Stream};
@@ -24,6 +24,11 @@ struct Shared {
     stop: AtomicBool,
     /// Set before `stop` on cancel: the drain exits without processing what it holds.
     cancel: AtomicBool,
+    /// Microseconds from the start of `open` to the device's first callback; 0 until then. Set
+    /// once by the callback, logged once by the drain as `capture started`.
+    first_us: AtomicU64,
+    /// Microseconds from the key-down to the start of `open`; set before the stream exists.
+    lead_us: u64,
 }
 
 /// Names of the input devices, for the settings list.
@@ -90,6 +95,17 @@ impl Capture for CpalCapture {
         meter: LevelMeter,
         on_event: impl FnMut(CaptureEvent) + Send + 'static,
     ) -> Result<Self, CaptureError> {
+        Self::open_pressed(opts, meter, Instant::now(), on_event)
+    }
+
+    fn open_pressed(
+        opts: &Audio,
+        meter: LevelMeter,
+        pressed: Instant,
+        on_event: impl FnMut(CaptureEvent) + Send + 'static,
+    ) -> Result<Self, CaptureError> {
+        let opened = Instant::now();
+        let lead_us = micros(opened.saturating_duration_since(pressed));
         let device = opts.device.as_str();
         let host = cpal::default_host();
         let named = if device.is_empty() {
@@ -116,7 +132,10 @@ impl Capture for CpalCapture {
         let pipeline = Pipeline::new(rate, opts)?;
         let channel = opts.channel;
         let (tx, rx) = RingBuffer::new(rate as usize * channels * RING_SECONDS);
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared {
+            lead_us,
+            ..Shared::default()
+        });
         // Two senders (cpal error thread, drain thread), both off the data callback.
         let on_event = Arc::new(Mutex::new(on_event));
         let drain_event = Arc::clone(&on_event);
@@ -140,17 +159,18 @@ impl Capture for CpalCapture {
         };
 
         let config = supported.config();
-        let cb_shared = Arc::clone(&shared);
+        // The callback's state, and when the open began: its first call logs the latency.
+        let cb = (Arc::clone(&shared), opened);
         let stream = match format {
-            SampleFormat::F32 => build::<f32>(&dev, config, tx, channels, cb_shared, on_error),
-            SampleFormat::F64 => build::<f64>(&dev, config, tx, channels, cb_shared, on_error),
-            SampleFormat::I8 => build::<i8>(&dev, config, tx, channels, cb_shared, on_error),
-            SampleFormat::I16 => build::<i16>(&dev, config, tx, channels, cb_shared, on_error),
-            SampleFormat::I24 => build::<I24>(&dev, config, tx, channels, cb_shared, on_error),
-            SampleFormat::I32 => build::<i32>(&dev, config, tx, channels, cb_shared, on_error),
-            SampleFormat::U8 => build::<u8>(&dev, config, tx, channels, cb_shared, on_error),
-            SampleFormat::U16 => build::<u16>(&dev, config, tx, channels, cb_shared, on_error),
-            SampleFormat::U32 => build::<u32>(&dev, config, tx, channels, cb_shared, on_error),
+            SampleFormat::F32 => build::<f32>(&dev, config, tx, channels, cb, on_error),
+            SampleFormat::F64 => build::<f64>(&dev, config, tx, channels, cb, on_error),
+            SampleFormat::I8 => build::<i8>(&dev, config, tx, channels, cb, on_error),
+            SampleFormat::I16 => build::<i16>(&dev, config, tx, channels, cb, on_error),
+            SampleFormat::I24 => build::<I24>(&dev, config, tx, channels, cb, on_error),
+            SampleFormat::I32 => build::<i32>(&dev, config, tx, channels, cb, on_error),
+            SampleFormat::U8 => build::<u8>(&dev, config, tx, channels, cb, on_error),
+            SampleFormat::U16 => build::<u16>(&dev, config, tx, channels, cb, on_error),
+            SampleFormat::U32 => build::<u32>(&dev, config, tx, channels, cb, on_error),
             other => return Err(CaptureError::UnsupportedFormat(other.to_string())),
         }?;
 
@@ -189,6 +209,10 @@ impl Capture for CpalCapture {
         })
     }
 
+    fn stop_stream(&mut self) {
+        drop(self.stream.take());
+    }
+
     fn input_rate(&self) -> u32 {
         self.rate
     }
@@ -215,7 +239,7 @@ fn build<T>(
     config: cpal::StreamConfig,
     mut tx: Producer<f32>,
     channels: usize,
-    shared: Arc<Shared>,
+    (shared, opened): (Arc<Shared>, Instant),
     on_error: impl FnMut(cpal::Error) + Send + 'static,
 ) -> Result<Stream, CaptureError>
 where
@@ -224,10 +248,21 @@ where
 {
     Ok(dev.build_input_stream(
         config,
-        move |data: &[T], _: &InputCallbackInfo| push_converted(&mut tx, data, channels, &shared),
+        move |data: &[T], _: &InputCallbackInfo| {
+            // From here the audio is kept; one clock read, no lock.
+            if shared.first_us.load(Ordering::Relaxed) == 0 {
+                let us = micros(opened.elapsed());
+                shared.first_us.store(us.max(1), Ordering::Relaxed);
+            }
+            push_converted(&mut tx, data, channels, &shared);
+        },
         on_error,
         None,
     )?)
+}
+
+fn micros(d: Duration) -> u64 {
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
 }
 
 /// The whole cpal callback: convert to f32 and push whole frames into the ring.
@@ -254,6 +289,10 @@ trait Sink {
     fn finish(self) -> Result<Recorded, AudioError>;
     /// The user is heard speaking ([`Pipeline::speech_started`]).
     fn speech_started(&self) -> bool {
+        false
+    }
+    /// The gate scored at least one frame as voice ([`Pipeline::voice_seen`]).
+    fn voice_seen(&self) -> bool {
         false
     }
     /// The recording was cancelled: nothing of it is kept.
@@ -287,6 +326,10 @@ impl Sink for Pipeline {
     fn speech_started(&self) -> bool {
         Pipeline::speech_started(self)
     }
+
+    fn voice_seen(&self) -> bool {
+        Pipeline::voice_seen(self)
+    }
 }
 
 /// Queues the raw mono windows for a [`WavSpool`] as they arrive (its own thread writes them, so
@@ -308,7 +351,12 @@ impl<S: Sink> Sink for Spooled<S> {
         self.inner.speech_started()
     }
 
+    fn voice_seen(&self) -> bool {
+        self.inner.voice_seen()
+    }
+
     fn finish(self) -> Result<Recorded, AudioError> {
+        let voice = self.inner.voice_seen();
         let mut result = self.inner.finish();
         if let Some(spool) = self.spool {
             match &mut result {
@@ -316,8 +364,11 @@ impl<S: Sink> Sink for Spooled<S> {
                 Ok(r) if !r.samples.is_empty() => r.spool = Some(spool.finish()),
                 // An all-zero mic has nothing to retranscribe.
                 Ok(_) | Err(AudioError::MicSilence) => spool.discard(),
-                // Nothing heard (a very quiet word) is still kept, so the owner can retranscribe
-                // it from History; so is any other failure. No transcript will come.
+                // Rule: nothing heard is kept only with a hint of speech (the gate scored at least
+                // one voiced frame), so a very quiet word can be retranscribed from History; a
+                // hold with no voiced frame at all is deleted.
+                Err(AudioError::NothingHeard) if !voice => spool.discard(),
+                // Any other failure is kept too. No transcript will come.
                 Err(_) => spool.fail(),
             }
         }
@@ -359,9 +410,21 @@ impl Drain<'_> {
     ) -> Result<Recorded, AudioError> {
         let mut failed = None;
         let mut heard = false;
+        let mut logged = false;
         loop {
             // Read before draining: everything pushed before `stop` is seen by the last pass.
             let stopping = self.shared.stop.load(Ordering::Acquire);
+            let first_us = self.shared.first_us.load(Ordering::Relaxed);
+            if !logged && first_us > 0 {
+                logged = true;
+                // From the key-down, and from the open alone (d11).
+                let from_key_us = first_us.saturating_add(self.shared.lead_us);
+                tracing::info!(
+                    latency_ms = from_key_us / 1000,
+                    from_open_ms = first_us / 1000,
+                    "capture started"
+                );
+            }
             if stopping && self.shared.cancel.load(Ordering::Relaxed) {
                 // Discarded, also after a failed push: the machine stops (never discards) a
                 // recording with speech, so this one has nothing worth keeping (triage #12).
@@ -673,7 +736,7 @@ mod tests {
         let (mut tx, rx) = RingBuffer::new(CAPACITY);
         let (event_tx, events) = std::sync::mpsc::channel();
         let wait_empty = |tx: &Producer<f32>| {
-            let start = std::time::Instant::now();
+            let start = Instant::now();
             while tx.slots() < CAPACITY && start.elapsed() < Duration::from_secs(5) {
                 thread::sleep(Duration::from_millis(1));
             }
@@ -803,7 +866,7 @@ mod tests {
     /// writer too: one that has not created its file yet would delete the next spool's (same path
     /// within one clock tick).
     fn wait_until_no_parts(dir: &std::path::Path, why: &str) {
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         while !parts(dir).is_empty() || !crate::wav::spool_idle() {
             assert!(start.elapsed() < Duration::from_secs(5), "{why}");
             thread::sleep(Duration::from_millis(5));
@@ -894,7 +957,7 @@ mod tests {
     }
 
     /// Ends with the given error, as the pipeline does at key-up.
-    struct EndsWith(fn() -> AudioError);
+    struct EndsWith(fn() -> AudioError, bool);
 
     impl Sink for EndsWith {
         fn push(&mut self, _: &[f32]) -> Result<Level, AudioError> {
@@ -904,14 +967,20 @@ mod tests {
             })
         }
 
+        fn voice_seen(&self) -> bool {
+            self.1
+        }
+
         fn finish(self) -> Result<Recorded, AudioError> {
             Err((self.0)())
         }
     }
 
-    /// A quiet word the gate did not hear stays in History (retranscribe); an all-zero mic does not.
+    /// A quiet word the gate did not count stays in History (retranscribe) when it scored a voiced
+    /// frame; an all-zero mic and a hold without one do not.
     #[test]
-    fn a_nothing_heard_clip_is_kept_and_mic_silence_is_not() {
+    fn a_nothing_heard_clip_is_kept_only_with_a_hint_of_speech() {
+        type Case = (fn() -> AudioError, bool, usize);
         let _guard = crate::wav::SPOOL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -919,20 +988,21 @@ mod tests {
         crate::wav::spool_give_up_all();
         let _ = crate::wav::spool_take_orphans();
         crate::wav::set_spool_dir(Some(dir.clone()));
-        let kept: [(fn() -> AudioError, usize); 2] = [
-            (|| AudioError::MicSilence, 0),
+        let kept: [Case; 3] = [
+            (|| AudioError::MicSilence, true, 0),
+            (|| AudioError::NothingHeard, false, 0),
             // Last: its file stays, so a spool begun in the same clock tick would collide.
-            (|| AudioError::NothingHeard, 1),
+            (|| AudioError::NothingHeard, true, 1),
         ];
-        for (err, orphans) in kept {
+        for (err, voice, orphans) in kept {
             let mut sink = Spooled {
-                inner: EndsWith(err),
+                inner: EndsWith(err, voice),
                 spool: WavSpool::begin(RATE),
             };
             sink.push(&[0.01; 320]).unwrap();
             assert!(sink.finish().is_err());
             assert_eq!(crate::wav::spool_take_orphans().len(), orphans);
-            let start = std::time::Instant::now();
+            let start = Instant::now();
             while !crate::wav::spool_idle() {
                 assert!(start.elapsed() < Duration::from_secs(5), "writer settles");
                 thread::sleep(Duration::from_millis(5));
@@ -953,5 +1023,114 @@ mod tests {
             pick_channel(&[0.25, 0.5], 1, AudioChannel::Right),
             [0.25, 0.5]
         );
+    }
+
+    /// A capture whose first sample has come, and the time from `t` to that sample.
+    fn open_started(opts: &Audio, t: Instant) -> (CpalCapture, Duration) {
+        let lead = t.elapsed();
+        let c = CpalCapture::open(opts, LevelMeter::default(), |_| {}).unwrap();
+        // A sleep would add the 15 ms Windows timer tick to every wait.
+        loop {
+            let us = c.shared.first_us.load(Ordering::Relaxed);
+            if us > 0 {
+                return (c, lead + Duration::from_micros(us));
+            }
+            assert!(t.elapsed() < Duration::from_secs(5), "no first sample");
+            thread::yield_now();
+        }
+    }
+
+    fn p50_p95(mut v: Vec<Duration>) -> (u128, u128) {
+        v.sort_unstable();
+        let at = |q: usize| v[(v.len() * q / 100).min(v.len() - 1)].as_millis();
+        (at(50), at(95))
+    }
+
+    /// Open to first sample on the real default microphone, idle and with a busy thread per
+    /// core at normal priority, then below it (whisper's threads, were they lowered): a fresh press, a re-press that finishes the old capture first (the audio worker
+    /// before d11) and one that finishes it on another thread (after), and a fresh press of
+    /// the device by name (the device list is walked). Prints p50/p95 in ms; run alone with
+    /// `--nocapture`. Audio is never written to disk.
+    #[test]
+    fn start_latency_live() {
+        const RECORD: Duration = Duration::from_secs(2);
+        if std::env::var_os("OXI_MIC_TEST").is_none_or(|v| v != "1") {
+            eprintln!("skipped: set OXI_MIC_TEST=1");
+            return;
+        }
+        // The spool is process-wide: without the lock a spool test's folder would get mic audio.
+        let _guard = crate::wav::SPOOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::wav::set_spool_dir(None);
+        let opts = Audio::default();
+        for (load, low) in [(false, false), (true, false), (true, true)] {
+            let stop = Arc::new(AtomicBool::new(false));
+            let cores = if load {
+                thread::available_parallelism().map_or(1, usize::from)
+            } else {
+                0
+            };
+            let burners: Vec<_> = (0..cores)
+                .map(|_| {
+                    let stop = Arc::clone(&stop);
+                    thread::spawn(move || {
+                        #[cfg(windows)]
+                        if low {
+                            use windows_sys::Win32::System::Threading::{
+                                GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+                            };
+                            // SAFETY: the pseudo handle of this thread and a valid level.
+                            unsafe {
+                                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL)
+                            };
+                        }
+                        let mut x = 0u64;
+                        while !stop.load(Ordering::Relaxed) {
+                            x = std::hint::black_box(x.wrapping_mul(31).wrapping_add(7));
+                        }
+                    })
+                })
+                .collect();
+            let (mut fresh, mut serial, mut parallel, mut named) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for _ in 0..10 {
+                let (a, took) = open_started(&opts, Instant::now());
+                fresh.push(took);
+                thread::sleep(RECORD);
+                let t = Instant::now();
+                let _ = a.finish();
+                let (b, took) = open_started(&opts, t);
+                serial.push(took);
+                thread::sleep(RECORD);
+                let t = Instant::now();
+                let mut b = b;
+                // As the audio worker does: the old stream stops here, its finish goes aside.
+                b.stop_stream();
+                let old = thread::spawn(move || b.finish().is_ok());
+                let (c, took) = open_started(&opts, t);
+                parallel.push(took);
+                let _ = old.join();
+                let by_name = Audio {
+                    device: c.device_name().into(),
+                    ..Audio::default()
+                };
+                drop(c);
+                named.push(open_started(&by_name, Instant::now()).1);
+            }
+            stop.store(true, Ordering::Relaxed);
+            for b in burners {
+                b.join().unwrap();
+            }
+            for (what, v) in [
+                ("fresh", fresh),
+                ("re-press finish-first", serial),
+                ("re-press finish-aside", parallel),
+                ("fresh by name", named),
+            ] {
+                let (p50, p95) = p50_p95(v);
+                eprintln!("load={load} low={low} cores={cores} {what}: p50={p50} ms p95={p95} ms");
+            }
+        }
     }
 }

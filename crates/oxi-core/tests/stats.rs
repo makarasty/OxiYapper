@@ -2,6 +2,7 @@
 
 // One module, so `cargo test -p oxi-core stats` selects every test here.
 mod stats {
+    use oxi_core::audio::{EdgeStats, Trim};
     use oxi_core::stats::{
         Date, Day, KEEP_DAYS, Metric, Stats, TREND_DAYS, Totals, VERSION, audio_length,
         format_count, word_count,
@@ -286,11 +287,86 @@ mod stats {
                 dictations: 1,
                 words: 1_000,
                 speech_ms: 0,
+                voiced_ms: 0,
             },
         });
         let sum = s.summary(today.add_days(1), 1);
         assert_eq!((sum.words, sum.wpm), (1_150, 150));
         assert_eq!(Stats::default().summary(today, 1).wpm, 0);
+    }
+
+    #[test]
+    fn the_rate_counts_voiced_time_and_the_pause_share_is_the_rest() {
+        let today = date(2026, 11, 7);
+        let mut s = Stats::default();
+        assert_eq!(s.pause_pct(), None, "nothing dictated");
+        // 100 words in a minute of audio, 40 s of it voice: 150 words per voiced minute.
+        s.record_voiced(today, 100, Millis(60_000), Millis(40_000));
+        assert_eq!(s.summary(today, 1).wpm, 150);
+        assert_eq!(s.pause_pct(), Some(33));
+        assert_eq!(s.trend(today, Metric::Wpm).values, [150]);
+        // Voice cannot outlast its audio.
+        s.record_voiced(today, 0, Millis(1_000), Millis(9_000));
+        assert_eq!(s.days[0].n.voiced_ms, 41_000);
+    }
+
+    #[test]
+    fn rows_without_a_voiced_time_fall_back_to_audio_and_stay_out_of_the_pause_share() {
+        let today = date(2026, 11, 7);
+        let mut s = Stats::default();
+        s.record(today.add_days(-1), 100, Millis(60_000)); // old row: 100 per audio minute
+        assert_eq!(s.pause_pct(), None);
+        assert_eq!(s.summary(today, 1).wpm, 100);
+        s.record_voiced(today, 100, Millis(120_000), Millis(30_000));
+        // 200 words over 1 + 0.5 voiced-or-audio minutes; only today's row has pauses (75 %).
+        assert_eq!(s.summary(today, 1).wpm, 133);
+        assert_eq!(s.pause_pct(), Some(75));
+    }
+
+    #[test]
+    fn a_file_from_before_the_voiced_time_reads_as_unknown_and_is_written_unchanged() {
+        let old = br#"{"version":1,"days":[{"date":"2026-11-07","dictations":2,"words":5,"speech_ms":2000}]}"#;
+        let s = Stats::parse(old).unwrap();
+        assert_eq!(s.days[0].n.voiced_ms, 0);
+        assert_eq!(s.pause_pct(), None);
+        let json = String::from_utf8(s.to_json().unwrap()).unwrap();
+        assert!(!json.contains("voiced_ms"), "{json}");
+        let mut s = s;
+        s.record_voiced(date(2026, 11, 7), 1, Millis(1_000), Millis(500));
+        let again = Stats::parse(&s.to_json().unwrap()).unwrap();
+        assert_eq!(again, s);
+        // The day's earlier 2 s of audio count as voice: 6 words over 2.5 s, not over 0.5 s.
+        assert_eq!(again.days[0].n.voiced_ms, 2_500);
+    }
+
+    #[test]
+    fn a_day_mixing_rows_with_and_without_a_voiced_time_counts_the_unknown_audio_as_voice() {
+        let today = date(2026, 11, 7);
+        let mut old_first = Stats::default();
+        old_first.record(today, 5, Millis(2_000));
+        old_first.record_voiced(today, 1, Millis(1_000), Millis(500));
+        let mut new_first = Stats::default();
+        new_first.record_voiced(today, 1, Millis(1_000), Millis(500));
+        new_first.record(today, 5, Millis(2_000));
+        for s in [old_first, new_first] {
+            // 6 words over 2.5 voiced s: 144 a minute (not 720), 16 % pauses (not 83 %).
+            assert_eq!(s.summary(today, 1).wpm, 144);
+            assert_eq!(s.pause_pct(), Some(16));
+            assert_eq!(s.trend(today, Metric::Wpm).values, [144]);
+        }
+    }
+
+    #[test]
+    fn the_voiced_time_is_unknown_without_the_gate_and_all_audio_when_it_skipped() {
+        let edge = EdgeStats {
+            audio_ms: 5_000,
+            voiced_ms: 200,
+            ..EdgeStats::default()
+        };
+        assert_eq!(Stats::voiced_time(Trim::Cut, &edge), Millis(200));
+        // 5 s of quiet speech the gate scored 200 ms of: not 96 % pauses.
+        assert_eq!(Stats::voiced_time(Trim::Skipped, &edge), Millis(5_000));
+        assert_eq!(Stats::voiced_time(Trim::Off, &edge), Millis(0));
     }
 
     #[test]

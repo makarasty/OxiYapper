@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use oxi_core::hotkey::Key;
 use oxi_core::ipc::{
-    HistoryItem, HistoryOp, Observed, PROTO, Push, Request, Spoken, TestFailure, TestOutcome,
-    attention,
+    FileFailure, FileResult, HeldText, HistoryItem, HistoryOp, Observed, PROTO, Push, Request,
+    Spoken, TestFailure, TestOutcome, Words, WordsFailure, WordsResult, attention,
 };
 use oxi_core::machine::ModelFailure;
 use oxi_core::models::{self, ModelStatus};
@@ -89,19 +89,50 @@ pub trait Host: Send + Sync + 'static {
     fn probe(&self, model: &str, device: &str) -> Probe;
     /// One `History` push: the recordings older than `older_than`, newest first.
     fn history_list(&self, older_than: Option<&str>) -> Push;
+    /// One `HistoryFound` push (carrying `seq`): the recordings that pass `filter` and hold every
+    /// word of `query`, older than `older_than`, newest first. `cache` is the connection's: what
+    /// an earlier query read is not read again.
+    fn history_search(
+        &self,
+        cache: &mut history::SearchCache,
+        seq: u32,
+        query: &str,
+        filter: &oxi_core::history::Filter,
+        older_than: Option<&str>,
+    ) -> Push;
+    /// What a file run transcribes with (the configured model and audio steps); `None` when
+    /// History saving is off, so the result would have nowhere to go.
+    fn file_set(&self) -> Option<SettingsSet>;
+    /// Saves a transcribed file (`samples`: its 16 kHz mono copy) as a History record.
+    fn history_save_file(
+        &self,
+        samples: &[f32],
+        text: &str,
+        language: Language,
+    ) -> io::Result<HistoryItem>;
     /// The audio of recording `id`, 16 kHz mono, for a new transcript.
     fn history_audio(&self, id: &str) -> io::Result<Vec<f32>>;
     /// Did the app already process the audio of recording `id` (gain, denoise, trim, normalise)?
     /// `false` for a recovered raw one (`interrupted`, `failed`) and for an unknown id.
     fn history_processed(&self, id: &str) -> bool;
-    /// Stores `text` as the transcript of recording `id`, made by `set` in `language`.
+    /// Stores `text` as the transcript of recording `id`, made by `set` in `language`; `words`
+    /// are the run's words (kept only when the record has no timed ones).
     fn history_set_text(
         &self,
         id: &str,
         text: &str,
         set: &SettingsSet,
         language: Language,
+        words: Vec<oxi_core::history::Word>,
     ) -> io::Result<()>;
+    /// The stored words of recording `id` and how their times were made (`None`: they have none).
+    fn history_words(
+        &self,
+        id: &str,
+    ) -> io::Result<(
+        Vec<oxi_core::history::Word>,
+        Option<oxi_core::history::Timings>,
+    )>;
     /// Replaces the transcript of recording `id` with the user's edit; the run stays.
     fn history_edit(&self, id: &str, text: &str) -> io::Result<()>;
     /// Swaps the transcript of recording `id` with its other version.
@@ -150,10 +181,15 @@ pub fn announce_status(report: &StatusReport) {
 /// Queue to the settings connection, shared by every thread that pushes. Cheap to clone.
 ///
 /// The [`Origin`] is where the audio of the job this handle replies to came from.
-/// shortcut: it rides here because `TestJob` (cmd.rs) is not this task's file; move it to a
-/// `TestJob` field when cmd.rs is free.
+/// shortcut: it rides here because the coordinator's tests build `TestJob`; move it to a `TestJob`
+/// field when the coordinator is free. The same goes for the record a word-times run is for
+/// ([`Pushes::with_words_for`]) and the switch that stops that run.
 #[derive(Clone, Default)]
-pub struct Pushes(Arc<Mutex<Slot>>, Origin);
+pub struct Pushes(
+    Arc<Mutex<Slot>>,
+    Origin,
+    Option<(Arc<str>, Arc<AtomicBool>)>,
+);
 
 /// Where the audio of a recognition test came from.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -180,7 +216,31 @@ impl Pushes {
     /// This queue for a job whose audio came from `origin`.
     #[must_use]
     pub fn with_origin(&self, origin: Origin) -> Self {
-        Self(Arc::clone(&self.0), origin)
+        Self(Arc::clone(&self.0), origin, self.2.clone())
+    }
+
+    /// This queue for the word-times run of recording `id`: the whisper worker makes the times
+    /// of its audio and stores them in that record.
+    #[must_use]
+    pub fn with_words_for(&self, id: &str) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        Self(Arc::clone(&self.0), self.1, Some((id.into(), stop)))
+    }
+
+    /// The recording a word-times run replying here is for.
+    pub fn words_for(&self) -> Option<&str> {
+        self.2.as_ref().map(|(id, _)| &**id)
+    }
+
+    /// The switch that stops the word-times run replying here: set, the run ends as soon as the
+    /// worker looks (before it starts, or at whisper's next cancel check) and answers `Busy`.
+    pub fn words_stop(&self) -> Option<&Arc<AtomicBool>> {
+        self.2.as_ref().map(|(_, stop)| stop)
+    }
+
+    /// Was the word-times run replying here stopped?
+    pub fn words_stopped(&self) -> bool {
+        self.words_stop().is_some_and(|s| s.load(Ordering::Acquire))
     }
 
     /// This queue for a job whose audio is a stored, already processed recording.
@@ -417,6 +477,35 @@ struct Session {
     test_running: Option<u32>,
     /// A `TestTranscribe` was sent, so the worker may hold a model for it.
     tested: bool,
+    /// The word-times run in hand and its stop switch: any other run, a cancel, or the window
+    /// closing stops it (arch-plan 8.3), so it never holds the slot against them.
+    words: Option<(u32, Arc<AtomicBool>)>,
+    /// The file run in hand and its stop switch.
+    file: Option<(u32, Arc<AtomicBool>)>,
+    /// What this window's searches have read.
+    search: history::SearchCache,
+}
+
+impl Session {
+    /// `HistoryWordsCancel`: stops run `run` when it is the one in hand; always `true` (the
+    /// connection goes on).
+    fn cancel_words(&mut self, run: u32) -> bool {
+        if self.words.as_ref().is_some_and(|(r, _)| *r == run) {
+            self.stop_words();
+        }
+        true
+    }
+
+    /// Stops the word-times run in hand, if any, and frees the slot it held; its `Busy` answer
+    /// comes later and frees nothing.
+    fn stop_words(&mut self) {
+        if let Some((run, stop)) = self.words.take() {
+            stop.store(true, Ordering::Release);
+            if self.test_running == Some(run) {
+                self.test_running = None;
+            }
+        }
+    }
 }
 
 /// Turns capture off the moment the settings window loses the foreground.
@@ -464,6 +553,11 @@ impl Ctx {
             self.serve(&mut conn, &mut session);
         }
         self.end_capture(&mut session);
+        session.stop_words();
+        // The run's pushes would reach the next window, whose run ids start over.
+        if let Some((_, stop)) = session.file.take() {
+            stop.store(true, Ordering::Release);
+        }
         if session.tested {
             let _ = self.inbox.send(Inbox::Ipc(IpcAsk::TestDone));
         }
@@ -516,6 +610,7 @@ impl Ctx {
     }
 
     /// Acts on `req`; `false` closes the connection.
+    #[allow(clippy::too_many_lines, reason = "one arm per request")]
     fn handle(&self, req: Request, conn: &mut Conn, session: &mut Session) -> bool {
         let first = session.settings.is_none();
         match req {
@@ -561,6 +656,7 @@ impl Ctx {
                 true
             }
             Request::TestTranscribe { id, set, language } => {
+                session.stop_words();
                 if session.test_running.is_some() {
                     return conn.send(&test_failed(id, TestFailure::Busy)).is_ok();
                 }
@@ -570,6 +666,39 @@ impl Ctx {
             Request::HistoryList { older_than } => conn
                 .send(&self.host.history_list(older_than.as_deref()))
                 .is_ok(),
+            Request::HistorySearch {
+                seq,
+                query: Spoken(query),
+                day,
+                min_ms,
+                max_ms,
+                older_than,
+            } => {
+                let filter = oxi_core::history::Filter {
+                    day: day.as_deref().and_then(oxi_core::history::day_dir),
+                    min_ms,
+                    max_ms,
+                };
+                let found = self.host.history_search(
+                    &mut session.search,
+                    seq,
+                    &query,
+                    &filter,
+                    older_than.as_deref(),
+                );
+                conn.send(&found).is_ok()
+            }
+            Request::TranscribeFile {
+                run,
+                path,
+                language,
+            } => self.transcribe_file(conn, session, run, path, language),
+            Request::TranscribeFileCancel { run } => {
+                if let Some((_, stop)) = session.file.as_ref().filter(|(r, _)| *r == run) {
+                    stop.store(true, Ordering::Release);
+                }
+                true
+            }
             Request::HistoryRetranscribe {
                 run,
                 id,
@@ -581,10 +710,15 @@ impl Ctx {
                 text: Spoken(text),
                 set,
                 language,
+                words: Words(words),
             } => {
-                let done = self.host.history_set_text(&id, &text, &set, language);
+                let done = self
+                    .host
+                    .history_set_text(&id, &text, &set, language, words);
                 history_result(conn, id, HistoryOp::SetText, done)
             }
+            Request::HistoryWords { run, id } => self.words(conn, session, run, &id),
+            Request::HistoryWordsCancel { run } => session.cancel_words(run),
             Request::HistoryEdit {
                 id,
                 text: Spoken(text),
@@ -648,6 +782,7 @@ impl Ctx {
         set: SettingsSet,
         language: Language,
     ) -> bool {
+        session.stop_words();
         if session.test_running.is_some() {
             return conn.send(&test_failed(run, TestFailure::Busy)).is_ok();
         }
@@ -660,6 +795,108 @@ impl Ctx {
             Origin::HistoryRaw
         };
         self.start_test(session, run, set, language, samples, origin)
+    }
+
+    /// The words of a recording for the player: the stored ones at once when they carry times,
+    /// else a word-times run in the slot of a test run (its answer is a push from the worker).
+    fn words(&self, conn: &mut Conn, session: &mut Session, run: u32, id: &str) -> bool {
+        let answer = |conn: &mut Conn, result| {
+            conn.send(&Push::HistoryWords {
+                run,
+                id: id.to_owned(),
+                result,
+            })
+            .is_ok()
+        };
+        let no_audio = WordsResult::Unavailable {
+            why: WordsFailure::NoAudio,
+        };
+        session.stop_words();
+        if session.test_running.is_some() {
+            return answer(conn, WordsResult::Busy);
+        }
+        match self.host.history_words(id) {
+            Ok((words, Some(_))) if words.iter().any(|w| w.t0.is_some()) => {
+                let result = WordsResult::Ready {
+                    words: Words(words),
+                    timed: true,
+                };
+                return answer(conn, result);
+            }
+            Ok(_) => {}
+            Err(_) => return answer(conn, no_audio),
+        }
+        let Ok(samples) = self.host.history_audio(id) else {
+            return answer(conn, no_audio);
+        };
+        let reply = self.pushes.with_origin(Origin::History).with_words_for(id);
+        session.test_running = Some(run);
+        session.tested = true;
+        session.words = reply.words_stop().map(|stop| (run, Arc::clone(stop)));
+        // The configured model and language run it: `set` and `language` are not read.
+        let job = TestJob {
+            id: run,
+            set: SettingsSet::defaults(),
+            language: Language::AUTO,
+            samples,
+            reply,
+        };
+        self.inbox.send(Inbox::Ipc(IpcAsk::Test(job))).is_ok()
+    }
+
+    /// A file run: a thread of its own decodes, cuts and runs the pieces one by one in the test
+    /// slot (this connection holds it until `FileResult`), then saves the record.
+    fn transcribe_file(
+        &self,
+        conn: &mut Conn,
+        session: &mut Session,
+        run: u32,
+        path: String,
+        language: Language,
+    ) -> bool {
+        session.stop_words();
+        if session.test_running.is_some() {
+            return conn.send(&file_failed(run, FileFailure::Busy)).is_ok();
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let (host, inbox, pushes) = (
+            Arc::clone(&self.host),
+            self.inbox.clone(),
+            self.pushes.clone(),
+        );
+        let thread_stop = Arc::clone(&stop);
+        let spawned = thread::Builder::new()
+            .name("file-run".into())
+            .spawn(move || {
+                let push = |p: Push| pushes.send(p);
+                let chunk =
+                    |set: &SettingsSet,
+                     language,
+                     samples: &[f32],
+                     on: &mut dyn FnMut(u8, Option<u32>) -> bool| {
+                        run_chunk(&inbox, run, set, language, samples, on, &thread_stop)
+                    };
+                let save =
+                    |samples: &[f32], text: &str| host.history_save_file(samples, text, language);
+                let env = FileEnv {
+                    set: host.file_set(),
+                    push: &push,
+                    chunk: &chunk,
+                    save: &save,
+                    cancel: &thread_stop,
+                    max: CHUNK_MAX,
+                    busy_wait: BUSY_WAIT,
+                };
+                let result = file_run(&env, run, std::path::Path::new(&path), language);
+                pushes.send(Push::FileResult { run, result });
+            });
+        if spawned.is_err() {
+            return conn.send(&file_failed(run, FileFailure::Failed)).is_ok();
+        }
+        session.test_running = Some(run);
+        session.tested = true;
+        session.file = Some((run, stop));
+        true
     }
 
     /// Hands a recognition test run to the coordinator; its result comes back as a push. For
@@ -764,8 +1001,21 @@ fn flush(conn: &mut Conn, session: &mut Session) -> bool {
     loop {
         match queue.try_recv() {
             Ok(push) => {
-                if matches!(push, Push::TestResult { id, .. } if session.test_running == Some(id)) {
+                if matches!(push, Push::TestResult { id, .. } | Push::HistoryWords { run: id, .. } if session.test_running == Some(id))
+                {
                     session.test_running = None;
+                }
+                if matches!(&push, Push::TestResult { id, .. } | Push::HistoryWords { run: id, .. } if session.words.as_ref().is_some_and(|(r, _)| r == id))
+                {
+                    session.words = None;
+                }
+                if let Push::FileResult { run, .. } = &push
+                    && session.file.as_ref().is_some_and(|(r, _)| r == run)
+                {
+                    session.file = None;
+                    if session.test_running == Some(*run) {
+                        session.test_running = None;
+                    }
                 }
                 if conn.send(&push).is_err() {
                     return false;
@@ -782,6 +1032,199 @@ fn test_failed(id: u32, why: TestFailure) -> Push {
     Push::TestResult {
         id,
         outcome: TestOutcome::Failed { why },
+    }
+}
+
+fn file_failed(run: u32, why: FileFailure) -> Push {
+    Push::FileResult {
+        run,
+        result: FileResult::Failed { why },
+    }
+}
+
+/// The longest piece of a file given to whisper at once (arch-plan 9.6).
+const CHUNK_MAX: oxi_core::types::Millis = oxi_core::types::Millis(300_000);
+/// How long a piece waits when a dictation holds the worker (the dictation goes first).
+const BUSY_WAIT: Duration = Duration::from_millis(500);
+
+/// How one piece of a file ended.
+enum Chunk {
+    Text(String),
+    /// A dictation is running: try the piece again.
+    Busy,
+    /// The run was cancelled or its window is gone.
+    Stopped,
+    Failed(FileFailure),
+}
+
+/// What [`file_run`] needs from outside, so a test runs it without a worker or a host.
+struct FileEnv<'a> {
+    /// `None`: History is off.
+    set: Option<SettingsSet>,
+    /// Queues a push for the window; `false` when nobody listens.
+    push: &'a dyn Fn(Push) -> bool,
+    /// Runs one piece; calls the closure with (percent, estimated ms) as it goes and stops when
+    /// it answers `false`.
+    #[allow(
+        clippy::type_complexity,
+        reason = "one callback, named by its parameters"
+    )]
+    chunk: &'a dyn Fn(
+        &SettingsSet,
+        Language,
+        &[f32],
+        &mut dyn FnMut(u8, Option<u32>) -> bool,
+    ) -> Chunk,
+    save: &'a dyn Fn(&[f32], &str) -> io::Result<HistoryItem>,
+    cancel: &'a AtomicBool,
+    max: oxi_core::types::Millis,
+    busy_wait: Duration,
+}
+
+/// Decodes the file at `path`, cuts it at pauses, transcribes the pieces one by one and saves the
+/// text as a record (announced with `HistoryAdded` before the `Done`). Progress is the share of
+/// the audio done: finished pieces plus the percent whisper reports inside the one running.
+fn file_run(env: &FileEnv<'_>, run: u32, path: &std::path::Path, language: Language) -> FileResult {
+    use oxi_core::audio::{SAMPLE_RATE, voiced_runs};
+    use oxi_core::config::VadSensitivity;
+    use oxi_core::types::Millis;
+    use oxi_platform::decode::{DecodeError, decode_file};
+
+    let failed = |why| FileResult::Failed { why };
+    let Some(set) = &env.set else {
+        return failed(FileFailure::HistoryOff);
+    };
+    // Decoded straight to 16 kHz: the file's own rate is never held whole.
+    let samples = match decode_file(path, SAMPLE_RATE) {
+        Ok(samples) => samples,
+        Err(DecodeError::Unsupported { what }) => return failed(FileFailure::Unsupported { what }),
+        Err(DecodeError::Corrupt) => return failed(FileFailure::Corrupt),
+        Err(DecodeError::TooLong) => return failed(FileFailure::TooLong),
+        Err(DecodeError::Io(e)) => {
+            tracing::warn!(kind = ?e.kind(), "file not opened");
+            return failed(FileFailure::Unreadable);
+        }
+    };
+    let per_ms = u64::from(SAMPLE_RATE) / 1000;
+    let total = samples.len() as u64 / per_ms;
+    let voiced: Vec<_> = voiced_runs(&samples, VadSensitivity::Normal)
+        .into_iter()
+        .map(|r| Millis(r.start as u64 / per_ms)..Millis(r.end as u64 / per_ms))
+        .collect();
+    let mut texts = Vec::new();
+    for (i, cut) in oxi_core::history::chunks(&voiced, Millis(total), env.max)
+        .iter()
+        .enumerate()
+    {
+        let piece_ms = (cut.end.0 - cut.start.0).max(1);
+        let at = |ms: u64| usize::try_from(ms * per_ms).unwrap_or(usize::MAX);
+        let piece = &samples[at(cut.start.0)..at(cut.end.0).min(samples.len())];
+        loop {
+            if env.cancel.load(Ordering::Acquire) {
+                return FileResult::Cancelled;
+            }
+            let mut progress = |percent: u8, est_ms: Option<u32>| {
+                let done = cut.start.0 + piece_ms * u64::from(percent.min(100)) / 100;
+                // The estimate is for the piece: the first one scales it to the whole file.
+                let est_ms = est_ms.filter(|_| i == 0).map(|e| {
+                    u32::try_from(u64::from(e) * total.max(1) / piece_ms).unwrap_or(u32::MAX)
+                });
+                (env.push)(Push::TestProgress {
+                    id: run,
+                    percent: u8::try_from(done * 100 / total.max(1))
+                        .unwrap_or(100)
+                        .min(100),
+                    est_ms,
+                })
+            };
+            match (env.chunk)(set, language, piece, &mut progress) {
+                Chunk::Text(text) => {
+                    texts.push(text);
+                    break;
+                }
+                Chunk::Busy => thread::sleep(env.busy_wait),
+                Chunk::Stopped => return FileResult::Cancelled,
+                Chunk::Failed(why) => return failed(why),
+            }
+        }
+    }
+    let text = texts
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.is_empty() {
+        return failed(FileFailure::NothingHeard);
+    }
+    match (env.save)(&samples, &text) {
+        Ok(item) => {
+            let id = item.id.clone();
+            (env.push)(Push::HistoryAdded { item });
+            FileResult::Done { id }
+        }
+        Err(e) => {
+            tracing::warn!(kind = ?e.kind(), "file result not saved");
+            failed(FileFailure::Failed)
+        }
+    }
+}
+
+/// One piece through the worker, in the test slot: its progress goes to `on`, its text comes
+/// back. The worker cannot be stopped inside a piece, so a cancel abandons the wait and the
+/// worker's answer goes nowhere.
+fn run_chunk(
+    inbox: &Sender<Inbox>,
+    run: u32,
+    set: &SettingsSet,
+    language: Language,
+    samples: &[f32],
+    on: &mut dyn FnMut(u8, Option<u32>) -> bool,
+    cancel: &AtomicBool,
+) -> Chunk {
+    let own = Pushes::default();
+    let (_, replies) = own.claim(0);
+    let job = TestJob {
+        id: run,
+        set: set.clone(),
+        language,
+        samples: samples.to_vec(),
+        reply: own,
+    };
+    if inbox.send(Inbox::Ipc(IpcAsk::Test(job))).is_err() {
+        return Chunk::Failed(FileFailure::Failed);
+    }
+    loop {
+        match replies.recv_timeout(POLL) {
+            Ok(Push::TestProgress {
+                percent, est_ms, ..
+            }) => {
+                if !on(percent, est_ms) {
+                    return Chunk::Stopped;
+                }
+            }
+            Ok(Push::TestResult { outcome, .. }) => {
+                return match outcome {
+                    TestOutcome::Heard { text, .. } => Chunk::Text(text),
+                    TestOutcome::Failed {
+                        why: TestFailure::Busy,
+                    } => Chunk::Busy,
+                    TestOutcome::Failed {
+                        why: TestFailure::ModelMissing | TestFailure::ModelBad,
+                    } => Chunk::Failed(FileFailure::NoModel),
+                    TestOutcome::Failed { .. } => Chunk::Failed(FileFailure::Failed),
+                };
+            }
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if cancel.load(Ordering::Acquire) {
+                    return Chunk::Stopped;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Chunk::Failed(FileFailure::Failed);
+            }
+        }
     }
 }
 
@@ -804,23 +1247,22 @@ fn hello_ack() -> Push {
     }
 }
 
-/// Is the wav of an entry the app's processed 16 kHz audio? The audio decides, then the status:
-/// a wav that is not at 16 kHz is raw device audio whatever the status says (a recovered
-/// recording stays raw after a retranscribe wrote `done`). At 16 kHz only `done` and `cancelled`
-/// count; a recovered one (`interrupted`, `failed`) is raw (docs/HISTORY-FORMAT.md), which covers
-/// a microphone that records at 16 kHz itself (a Bluetooth headset). Still ambiguous: such a raw
-/// 16 kHz clip after `set_text` or `edit_text` made it `done`; it reads as processed then.
+/// Is the wav of an entry the app's processed 16 kHz audio? A wav that is not at 16 kHz is raw
+/// device audio. A meta file with `raw` set says so for good (a recovered recording stays raw
+/// after a retranscribe or an edit wrote `done`, also when the microphone records at 16 kHz
+/// itself, a Bluetooth headset). An older record has no marker: at 16 kHz only `done` and
+/// `cancelled` count, a recovered one (`interrupted`, `failed`) is raw (docs/HISTORY-FORMAT.md);
+/// such a record rewritten to `done` by a build from before the marker reads as processed.
 /// No readable meta: as `history::list` reads it, `done` when there is a text, else `failed`.
 fn audio_is_processed(meta_json: Option<&str>, has_text: bool, wav_rate: Option<u32>) -> bool {
     if wav_rate != Some(oxi_core::audio::SAMPLE_RATE) {
         return false;
     }
-    let status = meta_json
-        .and_then(|j| oxi_core::history::Meta::from_json(j).ok())
-        .map(|m| m.status);
-    match status {
-        Some(s) => matches!(
-            s,
+    let meta = meta_json.and_then(|j| oxi_core::history::Meta::from_json(j).ok());
+    match meta {
+        Some(m) if m.raw => false,
+        Some(m) => matches!(
+            m.status,
             oxi_core::history::Status::Done | oxi_core::history::Status::Cancelled
         ),
         None => has_text,
@@ -895,6 +1337,18 @@ fn mic_missing(device: &str, mics: &[String]) -> bool {
         mics.is_empty()
     } else {
         !mics.iter().any(|m| m == device)
+    }
+}
+
+fn history_item(r: history::Recording) -> HistoryItem {
+    HistoryItem {
+        id: r.id,
+        status: r.meta.status,
+        duration_ms: r.meta.duration_ms,
+        model: r.meta.model,
+        language: r.meta.language,
+        text: Spoken(r.text),
+        held: r.meta.held.iter().map(HeldText::from).collect(),
     }
 }
 
@@ -1115,19 +1569,62 @@ impl Host for SystemHost {
         // Lazy: only the entries of this page are read (`history::list_from`).
         let (items, more) = match self.history_dir() {
             Ok(dir) => history_page(
-                history::list_from(&dir, older_than).map(|r| HistoryItem {
-                    id: r.id,
-                    status: r.meta.status,
-                    duration_ms: r.meta.duration_ms,
-                    model: r.meta.model,
-                    language: r.meta.language,
-                    text: Spoken(r.text),
-                }),
+                history::list_from(&dir, older_than).map(history_item),
                 older_than,
             ),
             Err(_) => (Vec::new(), false),
         };
         Push::History { items, more }
+    }
+
+    fn history_search(
+        &self,
+        cache: &mut history::SearchCache,
+        seq: u32,
+        query: &str,
+        filter: &oxi_core::history::Filter,
+        older_than: Option<&str>,
+    ) -> Push {
+        let (items, more) = match self.history_dir() {
+            Ok(dir) => history_page(
+                history::search(&dir, query, filter, older_than, cache).map(history_item),
+                older_than,
+            ),
+            Err(_) => (Vec::new(), false),
+        };
+        Push::HistoryFound { seq, items, more }
+    }
+
+    fn file_set(&self) -> Option<SettingsSet> {
+        let layout = self.layout.as_ref()?;
+        let cfg = std::fs::read_to_string(layout.config_file())
+            .ok()
+            .and_then(|text| oxi_core::config::ConfigFile::parse(&text).ok())
+            .map(|file| file.config)
+            .unwrap_or_default();
+        cfg.history.enabled.then_some(SettingsSet {
+            normalize: cfg.audio.normalize,
+            denoise: cfg.audio.denoise,
+            trim: cfg.audio.trim,
+            model: cfg.model.id,
+        })
+    }
+
+    fn history_save_file(
+        &self,
+        samples: &[f32],
+        text: &str,
+        language: Language,
+    ) -> io::Result<HistoryItem> {
+        let layout = self.layout.as_ref().ok_or(io::ErrorKind::NotFound)?;
+        let ctx = history::file_context(&layout.config_file(), language.as_str());
+        history::save_transcribed(
+            &self.history_dir()?,
+            samples,
+            text,
+            &ctx,
+            oxi_platform::fs::local_now(),
+        )
     }
 
     fn announces(&self) -> bool {
@@ -1149,13 +1646,24 @@ impl Host for SystemHost {
         text: &str,
         set: &SettingsSet,
         language: Language,
+        words: Vec<oxi_core::history::Word>,
     ) -> io::Result<()> {
         let ctx = HistoryContext {
             model: set.model.clone(),
             language: language.as_str().to_owned(),
             settings: Some(set.clone()),
         };
-        history::set_text(&self.history_dir()?, id, text, &ctx)
+        history::set_text_with_words(&self.history_dir()?, id, text, &ctx, words)
+    }
+
+    fn history_words(
+        &self,
+        id: &str,
+    ) -> io::Result<(
+        Vec<oxi_core::history::Word>,
+        Option<oxi_core::history::Timings>,
+    )> {
+        history::read_words(&self.history_dir()?, id)
     }
 
     fn history_edit(&self, id: &str, text: &str) -> io::Result<()> {
@@ -1266,6 +1774,10 @@ mod tests {
         on_delay: AtomicU64,
         /// The threads `probe` ran on.
         probed_on: Mutex<Vec<Option<String>>>,
+        /// The words each `history_set_text` got.
+        set_words: Mutex<Vec<Vec<oxi_core::history::Word>>>,
+        /// History is on, so a file run goes past its start.
+        file_on: AtomicBool,
     }
 
     impl Host for Fake {
@@ -1315,12 +1827,44 @@ mod tests {
                 model: "turbo".into(),
                 language: "auto".into(),
                 text: Spoken("words".into()),
+                held: Vec::new(),
             };
             let (items, more) = history_page(
                 [item("2026-11-10/120000-000"), item("2026-11-09/120000-000")],
                 older_than,
             );
             Push::History { items, more }
+        }
+        fn history_search(
+            &self,
+            _cache: &mut history::SearchCache,
+            seq: u32,
+            query: &str,
+            _filter: &oxi_core::history::Filter,
+            _older_than: Option<&str>,
+        ) -> Push {
+            let found = query == "words";
+            let items = if found {
+                let Push::History { items, .. } = self.history_list(None) else {
+                    unreachable!()
+                };
+                items
+            } else {
+                Vec::new()
+            };
+            Push::HistoryFound {
+                seq,
+                items,
+                more: false,
+            }
+        }
+        fn file_set(&self) -> Option<SettingsSet> {
+            self.file_on
+                .load(Ordering::SeqCst)
+                .then(SettingsSet::defaults)
+        }
+        fn history_save_file(&self, _: &[f32], _: &str, _: Language) -> io::Result<HistoryItem> {
+            Err(io::ErrorKind::Unsupported.into())
         }
         fn history_audio(&self, id: &str) -> io::Result<Vec<f32>> {
             if id == GOOD_ID || id == RAW_ID {
@@ -1338,8 +1882,33 @@ mod tests {
             _text: &str,
             _set: &SettingsSet,
             _language: Language,
+            words: Vec<oxi_core::history::Word>,
         ) -> io::Result<()> {
+            lock(&self.set_words).push(words);
             self.history_audio(id).map(drop)
+        }
+        fn history_words(
+            &self,
+            id: &str,
+        ) -> io::Result<(
+            Vec<oxi_core::history::Word>,
+            Option<oxi_core::history::Timings>,
+        )> {
+            self.history_audio(id).map(|_| {
+                let timed = id == GOOD_ID;
+                let word = oxi_core::history::Word {
+                    w: "w".into(),
+                    p: 0.9,
+                    t0: timed.then_some(5),
+                    t1: timed.then_some(15),
+                };
+                let how = oxi_core::history::Timings {
+                    by: oxi_core::history::TimingBy::Tokens,
+                    preset: String::new(),
+                    model: String::new(),
+                };
+                (vec![word], timed.then_some(how))
+            })
         }
         fn history_edit(&self, id: &str, _text: &str) -> io::Result<()> {
             self.history_audio(id).map(drop)
@@ -1461,6 +2030,8 @@ mod tests {
             capturing: AtomicBool::new(false),
             on_delay: AtomicU64::new(0),
             probed_on: Mutex::new(Vec::new()),
+            set_words: Mutex::new(Vec::new()),
+            file_on: AtomicBool::new(false),
         });
         let pushes = Pushes::default();
         spawn(
@@ -1611,6 +2182,7 @@ mod tests {
                 text: Spoken("new".into()),
                 set: SettingsSet::defaults(),
                 language: Language::RU,
+                words: Words::default(),
             })
             .unwrap();
             assert_eq!(
@@ -1700,6 +2272,142 @@ mod tests {
     }
 
     #[test]
+    fn stored_word_times_are_answered_at_once_and_the_rest_goes_to_the_worker() {
+        let rig = rig("words");
+        let mut conn = settings(&rig);
+        let ask = |run, id: &str| Request::HistoryWords { run, id: id.into() };
+        conn.send(&ask(1, "2026-11-10/000000-000")).unwrap();
+        assert_eq!(
+            conn.recv::<Push>().unwrap(),
+            Some(Push::HistoryWords {
+                run: 1,
+                id: "2026-11-10/000000-000".into(),
+                result: WordsResult::Unavailable {
+                    why: WordsFailure::NoAudio
+                }
+            })
+        );
+        // GOOD_ID has timed words in the fake: no worker run.
+        conn.send(&ask(2, GOOD_ID)).unwrap();
+        let Some(Push::HistoryWords {
+            run: 2,
+            result: WordsResult::Ready { words, timed: true },
+            ..
+        }) = conn.recv::<Push>().unwrap()
+        else {
+            panic!("no Ready");
+        };
+        assert_eq!(words.0[0].t0, Some(5));
+        assert!(rig.inbox.recv_timeout(Duration::from_millis(50)).is_err());
+        // RAW_ID has words without times: the worker gets a run for that record.
+        conn.send(&ask(3, RAW_ID)).unwrap();
+        let job = |rig: &Rig| match rig.inbox.recv_timeout(WAIT) {
+            Ok(Inbox::Ipc(IpcAsk::Test(job))) => job,
+            _ => panic!("no job"),
+        };
+        let three = job(&rig);
+        assert_eq!((three.id, three.reply.words_for()), (3, Some(RAW_ID)));
+        assert!(!three.reply.words_stopped());
+        // The next ask (the pick moved on) stops the run in hand instead of being Busy.
+        conn.send(&ask(4, RAW_ID)).unwrap();
+        let four = job(&rig);
+        assert_eq!(four.id, 4);
+        assert!(three.reply.words_stopped() && !four.reply.words_stopped());
+        // The stopped run's late answer and a cancel of it leave the new run alone.
+        three.reply.send(Push::HistoryWords {
+            run: 3,
+            id: RAW_ID.into(),
+            result: WordsResult::Busy,
+        });
+        assert!(matches!(
+            conn.recv::<Push>().unwrap(),
+            Some(Push::HistoryWords { run: 3, .. })
+        ));
+        conn.send(&Request::HistoryWordsCancel { run: 3 }).unwrap();
+        conn.send(&Request::Stats).unwrap();
+        assert!(matches!(conn.recv::<Push>().unwrap(), Some(Push::Stats(_))));
+        assert!(!four.reply.words_stopped());
+        // Transcribe again goes first: the words run stops, the run starts.
+        conn.send(&Request::HistoryRetranscribe {
+            run: 6,
+            id: GOOD_ID.into(),
+            set: SettingsSet::defaults(),
+            language: Language::RU,
+        })
+        .unwrap();
+        assert_eq!(job(&rig).id, 6);
+        assert!(four.reply.words_stopped());
+    }
+
+    #[test]
+    fn a_words_run_stops_on_its_cancel_and_when_the_window_closes() {
+        let rig = rig("words-stop");
+        let mut conn = settings(&rig);
+        let job = |rig: &Rig| match rig.inbox.recv_timeout(WAIT) {
+            Ok(Inbox::Ipc(IpcAsk::Test(job))) => job,
+            _ => panic!("no job"),
+        };
+        conn.send(&Request::HistoryWords {
+            run: 1,
+            id: RAW_ID.into(),
+        })
+        .unwrap();
+        let one = job(&rig);
+        conn.send(&Request::HistoryWordsCancel { run: 1 }).unwrap();
+        conn.send(&Request::Stats).unwrap();
+        assert!(matches!(conn.recv::<Push>().unwrap(), Some(Push::Stats(_))));
+        assert!(one.reply.words_stopped());
+        // The slot is free at once: a Test page run is not Busy.
+        conn.send(&Request::TestTranscribe {
+            id: 7,
+            set: SettingsSet::defaults(),
+            language: Language::RU,
+        })
+        .unwrap();
+        assert_eq!(job(&rig).id, 7);
+
+        let rig = self::rig("words-close");
+        let mut conn = settings(&rig);
+        conn.send(&Request::HistoryWords {
+            run: 2,
+            id: RAW_ID.into(),
+        })
+        .unwrap();
+        let two = job(&rig);
+        drop(conn);
+        let until = Instant::now() + WAIT;
+        while !two.reply.words_stopped() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(two.reply.words_stopped(), "the closed window's run goes on");
+    }
+
+    #[test]
+    fn the_words_of_a_new_run_reach_the_record_with_its_text() {
+        let rig = rig("set-words");
+        let mut conn = settings(&rig);
+        let word = oxi_core::history::Word {
+            w: "new".into(),
+            p: 0.3,
+            t0: None,
+            t1: None,
+        };
+        conn.send(&Request::HistorySetText {
+            id: GOOD_ID.into(),
+            text: Spoken("new".into()),
+            set: SettingsSet::defaults(),
+            language: Language::RU,
+            words: Words(vec![word.clone()]),
+        })
+        .unwrap();
+        assert!(matches!(
+            conn.recv::<Push>().unwrap(),
+            Some(Push::HistoryResult { ok: true, .. })
+        ));
+        assert_eq!(*lock(&rig.host.set_words), [vec![word]]);
+    }
+
+    #[test]
     fn a_recovered_raw_recording_still_gets_processed_on_retranscribe() {
         let rig = rig("retranscribe-raw");
         let mut conn = settings(&rig);
@@ -1753,6 +2461,11 @@ mod tests {
             language: String::new(),
             settings: None,
             previous: None,
+            words: Vec::new(),
+            timings: None,
+            raw: false,
+            held: Vec::new(),
+            delivered: None,
         };
         std::fs::write(dir.join(id).with_extension("json"), meta.to_json().unwrap()).unwrap();
         (dir, id)
@@ -1771,14 +2484,30 @@ mod tests {
     }
 
     #[test]
-    fn a_recovered_16k_recording_is_raw_until_its_status_is_rewritten() {
+    fn a_recovered_16k_recording_stays_raw_after_its_status_is_rewritten() {
         let (dir, id) = entry("raw16", 16_000, oxi_core::history::Status::Failed);
         assert!(!entry_processed(&dir, id), "a Bluetooth clip, as recovered");
-        // The limit: nothing on disk tells it from a processed one after the rewrite.
+        // The recovered record carries the marker; a retranscribe or an edit keep it.
+        mark_raw(&dir, id);
+        retranscribed(&dir, id);
+        assert!(!entry_processed(&dir, id), "after set_text");
+        history::edit_text(&dir, id, "edited").unwrap();
+        assert!(!entry_processed(&dir, id), "after edit_text");
+        // An older record with no marker: nothing on disk tells it from a processed one.
+        let (dir, id) = entry("raw16-old", 16_000, oxi_core::history::Status::Failed);
         retranscribed(&dir, id);
         assert!(entry_processed(&dir, id));
         let (dir, id) = entry("done16", 16_000, oxi_core::history::Status::Done);
         assert!(entry_processed(&dir, id));
+    }
+
+    /// What `recover_part` writes: the marker on top of the meta the entry has.
+    fn mark_raw(dir: &std::path::Path, id: &str) {
+        let json = dir.join(id).with_extension("json");
+        let meta =
+            oxi_core::history::Meta::from_json(&std::fs::read_to_string(&json).unwrap()).unwrap();
+        let meta = oxi_core::history::Meta { raw: true, ..meta };
+        std::fs::write(json, meta.to_json().unwrap()).unwrap();
     }
 
     #[test]
@@ -1794,6 +2523,11 @@ mod tests {
                 language: String::new(),
                 settings: None,
                 previous: None,
+                words: Vec::new(),
+                timings: None,
+                raw: false,
+                held: Vec::new(),
+                delivered: None,
             }
             .to_json()
             .unwrap()
@@ -1914,6 +2648,7 @@ mod tests {
             model: String::new(),
             language: String::new(),
             text: Spoken("t".into()),
+            held: Vec::new(),
         };
         let all: Vec<_> = (0..HISTORY_PAGE_ITEMS + 5).map(item).collect();
         let (first, more) = history_page(all.clone(), None);
@@ -2426,7 +3161,11 @@ mod tests {
         ));
         let recorder =
             super::super::stats::Recorder::spawn(dir.join(oxi_core::stats::FILE), today).unwrap();
-        recorder.add(4099, oxi_core::types::Millis(1_200));
+        recorder.add_voiced(
+            4099,
+            oxi_core::types::Millis(1_200),
+            oxi_core::types::Millis(0),
+        );
         drop(recorder); // waits for the write
         let summary = bus.next(2000, |p| match p {
             Push::Stats(s) if s.words == 4099 => Some(s),
@@ -2466,5 +3205,254 @@ mod tests {
             seen(WatchedFile::Dictionary).is_some(),
             "no FileChanged for the dictionary"
         );
+    }
+
+    #[test]
+    fn a_search_is_answered_with_its_own_seq_and_a_file_with_history_off_frees_the_slot() {
+        let rig = rig("search-file");
+        let mut conn = settings(&rig);
+        let ask = |seq, query: &str| Request::HistorySearch {
+            seq,
+            query: Spoken(query.into()),
+            day: None,
+            min_ms: None,
+            max_ms: None,
+            older_than: None,
+        };
+        conn.send(&ask(3, "words")).unwrap();
+        let Some(Push::HistoryFound { seq, items, more }) = conn.recv::<Push>().unwrap() else {
+            panic!("no HistoryFound");
+        };
+        assert_eq!((seq, items.len(), more), (3, 2, false));
+        conn.send(&ask(4, "absent")).unwrap();
+        let Some(Push::HistoryFound { seq, items, .. }) = conn.recv::<Push>().unwrap() else {
+            panic!("no HistoryFound");
+        };
+        assert_eq!((seq, items.len()), (4, 0));
+        // History is off for the fake host: each run ends at once, and the next is not Busy.
+        for run in [1, 2] {
+            conn.send(&Request::TranscribeFile {
+                run,
+                path: "none.mp3".into(),
+                language: Language::RU,
+            })
+            .unwrap();
+            assert_eq!(
+                conn.recv::<Push>().unwrap(),
+                Some(Push::FileResult {
+                    run,
+                    result: FileResult::Failed {
+                        why: FileFailure::HistoryOff
+                    }
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_run_stops_when_its_window_closes() {
+        let dir =
+            crate::log::scratch::scratch_dir(&format!("oxi-file-close-{}", std::process::id()));
+        let rig = rig("file-close");
+        rig.host.file_on.store(true, Ordering::SeqCst);
+        let mut conn = settings(&rig);
+        conn.send(&Request::TranscribeFile {
+            run: 1,
+            path: tone_gap_tone(&dir).to_string_lossy().into_owned(),
+            language: Language::RU,
+        })
+        .unwrap();
+        let Ok(Inbox::Ipc(IpcAsk::Test(job))) = rig.inbox.recv_timeout(WAIT) else {
+            panic!("no piece");
+        };
+        // The next window claims the slot before the old connection's thread has ended, as when
+        // the window is reopened at once: without the run's stop flag, its pushes land here (a
+        // released slot alone does not stop them).
+        let mut next = settings(&rig);
+        next.set_read_timeout(Some(Duration::from_millis(1)))
+            .unwrap();
+        drop(conn);
+        // The run gives up its wait for the piece, so nothing of it reaches the next window.
+        let progress = || Push::TestProgress {
+            id: 1,
+            percent: 10,
+            est_ms: None,
+        };
+        let until = Instant::now() + WAIT;
+        // The run looks at its stop flag only between pushes (a wait of POLL), so progress comes
+        // slower than that; the new window reads what reaches it, so a full queue cannot end the run.
+        while job.reply.send(progress()) && Instant::now() < until {
+            thread::sleep(POLL * 2);
+            let _ = next.recv::<Push>();
+        }
+        assert!(
+            !job.reply.send(progress()),
+            "the closed window's file run goes on"
+        );
+    }
+
+    /// A 16 kHz mono wav of tone, a gap, tone: 1 s, 0.4 s, 1.6 s.
+    fn tone_gap_tone(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("talk.wav");
+        let samples: Vec<f32> = (0..48_000_u32)
+            .map(|i| {
+                let quiet = (16_000..22_400).contains(&i);
+                if quiet {
+                    0.0
+                } else {
+                    (i as f32 * 0.17).sin() * 0.5
+                }
+            })
+            .collect();
+        oxi_platform::wav::write_wav(&path, &samples).unwrap();
+        path
+    }
+
+    struct FileRig {
+        pushed: Mutex<Vec<Push>>,
+        pieces: Mutex<Vec<usize>>,
+        saved: Mutex<Vec<String>>,
+        cancel: AtomicBool,
+        busy_once: AtomicBool,
+        cancel_after_first: bool,
+    }
+
+    impl FileRig {
+        fn new() -> Self {
+            Self {
+                pushed: Mutex::new(Vec::new()),
+                pieces: Mutex::new(Vec::new()),
+                saved: Mutex::new(Vec::new()),
+                cancel: AtomicBool::new(false),
+                busy_once: AtomicBool::new(false),
+                cancel_after_first: false,
+            }
+        }
+
+        fn run(&self, path: &std::path::Path) -> FileResult {
+            let push = |p| {
+                lock(&self.pushed).push(p);
+                true
+            };
+            let chunk = |_: &SettingsSet,
+                         _: Language,
+                         samples: &[f32],
+                         on: &mut dyn FnMut(u8, Option<u32>) -> bool| {
+                if self.busy_once.swap(false, Ordering::SeqCst) {
+                    return Chunk::Busy;
+                }
+                let n = {
+                    let mut pieces = lock(&self.pieces);
+                    pieces.push(samples.len());
+                    pieces.len()
+                };
+                for percent in [0, 50, 100] {
+                    on(percent, (percent == 0).then_some(1000));
+                }
+                if self.cancel_after_first {
+                    self.cancel.store(true, Ordering::SeqCst);
+                }
+                Chunk::Text(format!("part{n}"))
+            };
+            let save = |samples: &[f32], text: &str| {
+                lock(&self.saved).push(text.to_owned());
+                Ok(HistoryItem {
+                    id: "2026-11-10/101500-123".into(),
+                    status: oxi_core::history::Status::Done,
+                    duration_ms: samples.len() as u64 / 16,
+                    model: String::new(),
+                    language: String::new(),
+                    text: Spoken(text.into()),
+                    held: Vec::new(),
+                })
+            };
+            let env = FileEnv {
+                set: Some(SettingsSet::defaults()),
+                push: &push,
+                chunk: &chunk,
+                save: &save,
+                cancel: &self.cancel,
+                max: oxi_core::types::Millis(1500),
+                busy_wait: Duration::ZERO,
+            };
+            file_run(&env, 7, path, Language::RU)
+        }
+
+        fn percents(&self) -> Vec<u8> {
+            lock(&self.pushed)
+                .iter()
+                .filter_map(|p| match p {
+                    Push::TestProgress { percent, .. } => Some(*percent),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn a_file_is_cut_run_piece_by_piece_with_real_fractions_and_saved_once() {
+        let dir = crate::log::scratch::scratch_dir(&format!("oxi-file-run-{}", std::process::id()));
+        let rig = FileRig::new();
+        rig.busy_once.store(true, Ordering::SeqCst);
+        let done = rig.run(&tone_gap_tone(&dir));
+        assert_eq!(
+            done,
+            FileResult::Done {
+                id: "2026-11-10/101500-123".into()
+            }
+        );
+        let pieces = lock(&rig.pieces).clone();
+        assert!(pieces.len() >= 2, "{pieces:?}");
+        assert!(
+            pieces.iter().all(|&n| n <= 1500 * 16),
+            "none over the maximum"
+        );
+        assert_eq!(
+            pieces.iter().sum::<usize>(),
+            48_000,
+            "the pieces cover the audio once"
+        );
+        // One busy answer was retried, not skipped; the texts are joined in order, saved once.
+        let want: Vec<String> = (1..=pieces.len()).map(|n| format!("part{n}")).collect();
+        assert_eq!(*lock(&rig.saved), [want.join(" ")]);
+        // Fractions rise from 0 to 100 with a step for every piece and every report inside it.
+        let percents = rig.percents();
+        assert!(percents.windows(2).all(|w| w[0] <= w[1]), "{percents:?}");
+        assert_eq!((percents.first(), percents.last()), (Some(&0), Some(&100)));
+        assert!(
+            percents.iter().any(|p| (10..90).contains(p)),
+            "{percents:?}"
+        );
+        // The record is announced before the end.
+        let pushed = lock(&rig.pushed);
+        assert!(matches!(pushed.last(), Some(Push::HistoryAdded { .. })));
+        // The first estimate is scaled from the piece to the whole file.
+        let Some(Push::TestProgress {
+            est_ms: Some(est), ..
+        }) = pushed.first()
+        else {
+            panic!("no estimate");
+        };
+        assert!(*est > 1000, "{est}");
+    }
+
+    #[test]
+    fn a_cancel_between_pieces_saves_nothing_and_a_bad_file_names_its_reason() {
+        let dir = crate::log::scratch::scratch_dir(&format!("oxi-file-bad-{}", std::process::id()));
+        let mut rig = FileRig::new();
+        rig.cancel_after_first = true;
+        assert_eq!(rig.run(&tone_gap_tone(&dir)), FileResult::Cancelled);
+        assert_eq!(lock(&rig.pieces).len(), 1);
+        assert!(lock(&rig.saved).is_empty());
+        let rig = FileRig::new();
+        let why = |path: &std::path::Path| match rig.run(path) {
+            FileResult::Failed { why } => why,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(why(&dir.join("none.mp3")), FileFailure::Unreadable);
+        let junk = dir.join("junk.mp3");
+        std::fs::write(&junk, b"not audio at all, just words").unwrap();
+        assert_ne!(why(&junk), FileFailure::Unreadable);
+        assert!(lock(&rig.saved).is_empty() && lock(&rig.pieces).is_empty());
     }
 }

@@ -18,6 +18,9 @@ use super::cmd::UiCmd;
 /// How long `PreviewOverlay` shows the pill.
 const PREVIEW: Duration = Duration::from_secs(2);
 
+/// How long a cue pill ("held back", "saved to file") stays: the machine's `overlay_hide`.
+const CUE: Duration = Duration::from_millis(1500);
+
 pub struct Ui {
     rx: Receiver<UiCmd>,
     overlay: Overlay<'static>,
@@ -29,6 +32,10 @@ pub struct Ui {
     /// The transcription pill stays until its bar has run to the end (DS-26); the state the
     /// coordinator asked for meanwhile waits in `state`.
     hold_until: Option<Instant>,
+    /// A cue pill is not a machine notice: it ends here, not by a machine `Hidden`.
+    cue_until: Option<Instant>,
+    /// What the coordinator asked for while a cue was up: shown when the cue ends.
+    after_cue: Option<OverlayState>,
     progress: Progress,
     waker: Waker,
 }
@@ -44,6 +51,8 @@ impl Ui {
             state: OverlayState::Hidden,
             preview_until: None,
             hold_until: None,
+            cue_until: None,
+            after_cue: None,
             waker,
         }
     }
@@ -62,15 +71,39 @@ impl Ui {
             self.hold_until = None;
             if self.preview_until.is_none() {
                 self.show(self.state);
+                self.arm_cue();
             }
+        }
+        if preview_over(self.cue_until, now) {
+            self.cue_until = None;
+            if self.state.is_cue() {
+                self.state = self.after_cue.take().unwrap_or(OverlayState::Hidden);
+                if self.preview_until.is_none() && self.hold_until.is_none() {
+                    self.show(self.state);
+                }
+            }
+        }
+    }
+
+    /// Starts the end of a cue pill that is on screen now.
+    fn arm_cue(&mut self) {
+        self.cue_until = self.state.is_cue().then(|| Instant::now() + CUE);
+        if self.cue_until.is_some() {
+            self.wake_after(CUE);
         }
     }
 
     fn apply(&mut self, cmd: UiCmd, tray: &mut MainLoop) {
         match cmd {
             UiCmd::Overlay(state) => {
+                if waits_for_cue(self.state, state) {
+                    self.after_cue = Some(state);
+                    return;
+                }
                 // A real state replaces a preview at once.
                 self.preview_until = None;
+                self.cue_until = None;
+                self.after_cue = None;
                 let held = self.hold_until.is_some_and(|t| Instant::now() < t);
                 let left = hold(self.state, state, held, self.progress.finishing_left());
                 self.state = state;
@@ -80,6 +113,7 @@ impl Ui {
                 } else {
                     self.hold_until = None;
                     self.show(state);
+                    self.arm_cue();
                 }
             }
             UiCmd::Tray(phase) => {
@@ -177,6 +211,13 @@ fn hold(
     None
 }
 
+/// Whether `next` waits until the cue `was` (on screen, or behind a held pill) has had its time:
+/// the end of a dictation is seen even when the next one already runs (d03-label review #2). A
+/// recording or another cue never waits.
+fn waits_for_cue(was: OverlayState, next: OverlayState) -> bool {
+    was.is_cue() && !next.is_cue() && !matches!(next, OverlayState::Recording { .. })
+}
+
 /// What the preview pill shows: the current state, or the recording look when hidden.
 fn preview_state(current: OverlayState) -> OverlayState {
     match current {
@@ -271,6 +312,21 @@ mod tests {
             Rgba(0x5B, 0x5B, 0xD6, 0xFF),
             "the tray follows"
         );
+    }
+
+    #[test]
+    fn the_next_step_waits_for_a_cue_and_a_recording_never_does() {
+        let some = OverlayState::HeldBack { all: false };
+        let saved = OverlayState::SavedToFile { also: true };
+        let rec = OverlayState::Recording {
+            locked: false,
+            ending_soon: false,
+        };
+        assert!(waits_for_cue(some, OverlayState::Transcribing));
+        assert!(waits_for_cue(saved, OverlayState::Hidden));
+        assert!(!waits_for_cue(some, rec), "a press is shown at once");
+        assert!(!waits_for_cue(some, saved), "a newer cue replaces it");
+        assert!(!waits_for_cue(OverlayState::Pasting, OverlayState::Hidden));
     }
 
     #[test]

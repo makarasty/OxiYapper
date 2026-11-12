@@ -17,14 +17,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use oxi_core::config::Model;
+use oxi_core::config::{Model, Text};
 use oxi_core::dictionary::build_prompt;
 use oxi_core::machine::ModelFailure;
 use oxi_core::models::{
     ModelEntry, ModelStatus, find, find_by_file_name, sha256_file, status, write_stamp,
 };
 use oxi_core::paths::Layout;
-use oxi_core::text::{HallucinationFilter, Outcome, ReplaceRules, decode_text_file, process};
+use oxi_core::text::{
+    HallucinationFilter, Lists, Outcome, Processed, ReplaceRules, Seg, TextOptions, WordIn,
+    decode_text_file, run,
+};
 use oxi_whisper::Transcript;
 
 /// Where the configured model lives and, for a registry model, what it must hash to.
@@ -191,14 +194,58 @@ impl TextAssets {
     }
 }
 
-/// Whisper segments to the text to paste: newlines, hallucinations, replace rules, trailing space.
+/// Whisper segments to the text to paste with every optional `[text]` stage off: newlines,
+/// hallucinations, replace rules, trailing space.
 pub fn finish(transcript: &Transcript, assets: &TextAssets, trailing_space: bool) -> Outcome {
-    let segments: Vec<&str> = transcript
+    let opts = TextOptions {
+        trailing_space,
+        ..TextOptions::default()
+    };
+    finish_with(transcript, assets, &Text::default(), &opts).outcome
+}
+
+/// The whole text pipeline over a transcript: `text` supplies the filler list and the snippets,
+/// `opts` the switches (arch-plan 9.1).
+pub fn finish_with(
+    transcript: &Transcript,
+    assets: &TextAssets,
+    text: &Text,
+    opts: &TextOptions,
+) -> Processed {
+    let words: Vec<Vec<WordIn<'_>>> = transcript
         .segments
         .iter()
-        .map(|s| s.text.as_str())
+        .map(|s| {
+            s.words
+                .iter()
+                .map(|w| WordIn {
+                    text: &w.text,
+                    p: w.p,
+                    t0: w.t0,
+                    t1: w.t1,
+                })
+                .collect()
+        })
         .collect();
-    process(&segments, &assets.filter, &assets.rules, trailing_space)
+    let segments: Vec<Seg<'_>> = transcript
+        .segments
+        .iter()
+        .zip(&words)
+        .map(|(s, words)| Seg {
+            text: &s.text,
+            t0: s.t0,
+            t1: s.t1,
+            no_speech_prob: s.no_speech_prob,
+            words,
+        })
+        .collect();
+    let lists = Lists {
+        hallucinations: &assets.filter,
+        replace: &assets.rules,
+        fillers: &text.fillers,
+        snippets: &text.snippets,
+    };
+    run(&segments, opts, &lists)
 }
 
 #[cfg(test)]
@@ -235,6 +282,7 @@ mod tests {
                     t0: Millis(0),
                     t1: Millis(1),
                     no_speech_prob: 0.0,
+                    words: Vec::new(),
                 })
                 .collect(),
         }
@@ -341,6 +389,40 @@ mod tests {
         assert!(read_text(&bad).is_err());
         assert_eq!(read_asset(&bad), "");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn finish_with_reads_the_words_and_times_of_the_transcript() {
+        let word = |text: &str, t0, t1| oxi_whisper::Word {
+            text: text.into(),
+            p: 0.9,
+            t0: Some(Millis(t0)),
+            t1: Some(Millis(t1)),
+        };
+        let t = Transcript {
+            segments: vec![Segment {
+                text: " one two ".into(),
+                t0: Millis(0),
+                t1: Millis(3000),
+                no_speech_prob: 0.0,
+                words: vec![word("one", 0, 300), word("two", 2000, 2300)],
+            }],
+        };
+        let assets = TextAssets::default();
+        let mut cfg = Text::default();
+        let mut opts = TextOptions::from_config(&cfg, false);
+        // Every setting at its default: the plain pipeline.
+        assert_eq!(
+            finish_with(&t, &assets, &cfg, &opts).outcome,
+            Outcome::Text("one two".into())
+        );
+        assert_eq!(finish(&t, &assets, false), Outcome::Text("one two".into()));
+        cfg.pause_punctuation = true;
+        opts = TextOptions::from_config(&cfg, false);
+        assert_eq!(
+            finish_with(&t, &assets, &cfg, &opts).outcome,
+            Outcome::Text("one. Two".into())
+        );
     }
 
     #[test]

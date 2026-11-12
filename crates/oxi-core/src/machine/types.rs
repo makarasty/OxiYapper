@@ -185,6 +185,9 @@ pub enum Event {
     },
     /// The configured microphone is missing; capture opened the system default (item 15).
     MicFellBack,
+    /// The model an app rule or the language picks (its id) could not be used; the configured
+    /// model transcribed the job instead.
+    ModelFellBack(String),
     ModelLoaded,
     ModelFailed(ModelFailure),
     /// New settings; applied when the machine is Idle (item 11).
@@ -275,6 +278,10 @@ pub enum Notice {
     RestoreSkipped,
     /// The paste worker could not deliver the text; "Copy last text" still has it (item 42).
     PasteFailed,
+    /// To-file only: the file write failed; "Copy last text" still has the text.
+    FileFailed,
+    /// The model an app rule or the language picks is not usable; the main model was used.
+    ModelFellBack,
     /// The configured microphone is missing; the system default records (item 15).
     MicFallback,
     /// The config file has an error; the last good config stays in use. Line and message go
@@ -307,6 +314,24 @@ pub enum OverlayState {
     Transcribing,
     Pasting,
     Text(Notice),
+    /// The confidence filter held text back (d03 review #5). `all`: nothing was pasted, the
+    /// text is in the History; else the rest was pasted. The coordinator asks for it, the
+    /// machine does not know of it.
+    HeldBack {
+        all: bool,
+    },
+    /// To-file mode saved the text. `also`: it was pasted as well; else the file is all.
+    SavedToFile {
+        also: bool,
+    },
+}
+
+impl OverlayState {
+    /// A cue shown by the coordinator after a dictation, which ends by itself after a moment.
+    #[must_use]
+    pub const fn is_cue(self) -> bool {
+        matches!(self, Self::HeldBack { .. } | Self::SavedToFile { .. })
+    }
 }
 
 /// Why a recording was cancelled (the log line `recording cancelled why=...`).

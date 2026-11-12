@@ -10,6 +10,7 @@ mod stream;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use oxi_core::audio::{AudioError, EdgeStats, Level, Trim};
 use oxi_core::config::Audio;
@@ -116,6 +117,22 @@ pub trait Capture: Sized {
         meter: LevelMeter,
         on_event: impl FnMut(CaptureEvent) + Send + 'static,
     ) -> Result<Self, CaptureError>;
+
+    /// [`Capture::open`] for a key pressed at `pressed`: the `capture started` log counts from
+    /// the key-down, and from the open as a second figure.
+    fn open_pressed(
+        opts: &Audio,
+        meter: LevelMeter,
+        pressed: Instant,
+        on_event: impl FnMut(CaptureEvent) + Send + 'static,
+    ) -> Result<Self, CaptureError> {
+        let _ = pressed;
+        Self::open(opts, meter, on_event)
+    }
+
+    /// Stop the device now: nothing it hears from here on is kept, and it is free for the next
+    /// open. What it heard before still comes out of [`Capture::finish`]; idempotent.
+    fn stop_stream(&mut self);
 
     /// Native sample rate of the device.
     fn input_rate(&self) -> u32;

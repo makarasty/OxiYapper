@@ -81,6 +81,11 @@ impl Gate {
         self.frames += 1;
     }
 
+    /// True once any frame scored as voice, however short the run.
+    pub(super) fn any_voice(&self) -> bool {
+        self.voiced.is_some()
+    }
+
     /// The voiced runs in frames, in order. A run still going at the end of the stream is whole:
     /// the voice reaches the last frame scored, so no hold is in it to take off.
     pub(super) fn runs(&self) -> Vec<Range<usize>> {

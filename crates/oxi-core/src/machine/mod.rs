@@ -7,7 +7,7 @@
 mod state;
 mod types;
 
-pub use state::State;
+pub use state::{BOUNCE, State};
 pub use types::{
     CancelWhy, Effect, Effects, EmptyAudio, EngineWarning, Event, JobId, MachineConfig, Mode,
     ModelFailure, ModelIdentity, Note, Notice, OverlayState, Phase, PhaseCell, Sound,

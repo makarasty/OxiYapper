@@ -80,7 +80,7 @@ All measured against the 8 owner reference phrases before becoming defaults.
 
 ## Decided in round 3
 
-- Paste: restore the previous clipboard (see Text); add a trailing space; a "type character by character" mode for fields where Ctrl+V does not work (games, terminals, remote desktop). No auto-Enter.
+- Paste: restore the previous clipboard (see Text); add a trailing space; a "type character by character" mode for fields where Ctrl+V does not work (games, terminals, remote desktop). No auto-Enter, except the opt-in setting `paste.press_enter` (default off), which presses Enter once after a whole, verified delivery into the unchanged, unedited field; fail closed (owner 2026-11-12).
 - Cancel by Esc is a setting, off by default (see Recording). No "paste last again" hotkey, no second-language hotkey.
 - History (recording storage, see History): retention by size cap and by age, both configurable (default 2 GB and the last 30 days; whichever limit is hit first removes the oldest entries). The age limit is strict by date; only entries dated after today (clock set back) are spared. Both limits apply to the folder in use also while saving is off; a former folder is never touched (owner 2026-11-10). A history view in settings (owner 2026-11-10): play, copy, Transcribe again, add to replacements, delete, Copy path. The Test page can run on several recordings from the history, each with its own editable reference text.
 - Distribution: free only. Windows per-user installer (no admin) plus portable zip; macOS .dmg; Linux AppImage and .deb. Package managers and code signing later.

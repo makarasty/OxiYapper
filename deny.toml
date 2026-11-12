@@ -45,6 +45,15 @@ exceptions = [
     { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "i-slint-renderer-skia" },
     { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "i-slint-renderer-software" },
     { allow = ["MPL-2.0"], crate = "option-ext" }, # directories -> dirs-sys; file-level copyleft, unmodified
+# Symphonia (History: transcribe a file) is MPL-2.0 too; these crates only, no other exception.
+    { allow = ["MPL-2.0"], crate = "symphonia" }, # file-level copyleft, unmodified
+    { allow = ["MPL-2.0"], crate = "symphonia-bundle-flac" }, # file-level copyleft, unmodified
+    { allow = ["MPL-2.0"], crate = "symphonia-bundle-mp3" }, # file-level copyleft, unmodified
+    { allow = ["MPL-2.0"], crate = "symphonia-codec-aac" }, # file-level copyleft, unmodified
+    { allow = ["MPL-2.0"], crate = "symphonia-core" }, # file-level copyleft, unmodified
+    { allow = ["MPL-2.0"], crate = "symphonia-format-isomp4" }, # file-level copyleft, unmodified
+    { allow = ["MPL-2.0"], crate = "symphonia-metadata" }, # file-level copyleft, unmodified
+    { allow = ["MPL-2.0"], crate = "symphonia-utils-xiph" }, # file-level copyleft, unmodified
 ]
 
 [bans]

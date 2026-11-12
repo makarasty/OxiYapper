@@ -25,7 +25,9 @@ use crate::types::Language;
 /// Protocol version. `Hello`, `HelloAck` and `Shutdown` never change shape. 2: `Stats`. 3: `PreviewSound`.
 /// 4: `TestAudio`, `TestTranscribe`. 5: `Attention`, the history requests, `DeleteModel`,
 /// `TestProgress`. 6: the daemon pushes `HistoryAdded`, `HistoryRemoved`, `FileChanged` and `Woke`
-/// and sends `Stats`, `Status` and `Attention` unasked.
+/// and sends `Stats`, `Status` and `Attention` unasked. `HistoryWords`, `HistoryWordsCancel`,
+/// `HistoryRunWords` and the words of `HistorySetText` came with 6 (the daemon and the window are
+/// one build).
 pub const PROTO: u32 = 6;
 
 /// Longest accepted line, newline excluded.
@@ -85,6 +87,30 @@ pub enum Request {
     HistoryList {
         older_than: Option<String>,
     },
+    /// The recordings that hold every word of `query` and pass the filters, newest first, answered
+    /// with [`Push::HistoryFound`] carrying `seq` (a newer search makes the older answers stale).
+    /// `day` is `YYYY-MM-DD`; `min_ms` and `max_ms` bound the length, inclusive. `older_than` pages
+    /// as in [`Request::HistoryList`].
+    HistorySearch {
+        seq: u32,
+        query: Spoken,
+        day: Option<String>,
+        min_ms: Option<u64>,
+        max_ms: Option<u64>,
+        older_than: Option<String>,
+    },
+    /// Transcribe the audio file at `path` in `language`: the daemon decodes and cuts it, runs the
+    /// pieces one by one in the test slot, and saves the text as a History record. Progress is
+    /// [`Push::TestProgress`] carrying `run`, the end is [`Push::FileResult`].
+    TranscribeFile {
+        run: u32,
+        path: String,
+        language: Language,
+    },
+    /// Stop the file run `run`; it ends with [`FileResult::Cancelled`] and saves nothing.
+    TranscribeFileCancel {
+        run: u32,
+    },
     /// Transcribe recording `id` again with `set` in `language`. Answered like a
     /// [`Request::TestTranscribe`], with [`Push::TestResult`] carrying `run`, and it takes the
     /// same one-run-at-a-time slot. The result is stored only by [`Request::HistorySetText`].
@@ -101,6 +127,23 @@ pub enum Request {
         text: Spoken,
         set: SettingsSet,
         language: Language,
+        /// The words of the run that made `text` ([`Push::HistoryRunWords`]); empty when it sent none.
+        #[serde(default)]
+        words: Words,
+    },
+    /// The words of recording `id` with their times, for the player. Answered with
+    /// [`Push::HistoryWords`] carrying `run`; times the record has are answered at once, else the
+    /// whisper worker makes them in the slot of a test run (one at a time, a dictation first) and
+    /// [`Push::TestProgress`] carries `run` meanwhile.
+    HistoryWords {
+        run: u32,
+        id: String,
+    },
+    /// The word-times run `run` is no longer wanted (the pick moved on): the worker stops it and
+    /// it answers [`Push::HistoryWords`] `Busy`, and the slot is free at once. Nothing when that
+    /// run is not the one out.
+    HistoryWordsCancel {
+        run: u32,
     },
     /// Replace the transcript of recording `id` with `text` the user edited; the run that made
     /// it (model, language, settings) stays. The old text is kept as the other version. Answered
@@ -138,6 +181,83 @@ impl std::fmt::Debug for Spoken {
     }
 }
 
+/// The words of a recording on the wire: text, confidence and, once computed, times. `Debug` hides
+/// the text like [`Spoken`].
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Words(pub Vec<crate::history::Word>);
+
+impl std::fmt::Debug for Words {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Words({})", self.0.len())
+    }
+}
+
+/// How a [`Request::HistoryWords`] ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "r")]
+pub enum WordsResult {
+    /// The words of the record; `timed`: they carry times.
+    Ready {
+        words: Words,
+        timed: bool,
+    },
+    /// A dictation or another run holds the model: ask again later.
+    Busy,
+    Unavailable {
+        why: WordsFailure,
+    },
+}
+
+/// Why a record has no word times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WordsFailure {
+    /// The record's audio is gone or cannot be read.
+    NoAudio,
+    /// The model is not downloaded or would not load.
+    ModelMissing,
+    /// The run gave no times (nothing heard, or whisper failed).
+    Failed,
+}
+
+/// How a file run ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "r")]
+pub enum FileResult {
+    /// Saved as History record `id`.
+    Done {
+        id: String,
+    },
+    Failed {
+        why: FileFailure,
+    },
+    Cancelled,
+}
+
+/// Why a file run has no record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "r")]
+pub enum FileFailure {
+    /// The format or codec is not read here; `what` names it.
+    Unsupported { what: String },
+    /// Damaged, or no audio in it.
+    Corrupt,
+    /// More than the longest audio taken.
+    TooLong,
+    /// Whisper heard no speech in it.
+    NothingHeard,
+    /// The file cannot be opened.
+    Unreadable,
+    /// History saving is off, so there is nowhere to put the result.
+    HistoryOff,
+    /// Another run holds the slot.
+    Busy,
+    /// The model is missing or would not load.
+    NoModel,
+    /// Whisper failed, or the record could not be saved.
+    Failed,
+}
+
 /// One saved recording as the History page lists it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryItem {
@@ -151,6 +271,26 @@ pub struct HistoryItem {
     pub language: String,
     /// Empty for a cancelled, interrupted or failed recording.
     pub text: Spoken,
+    /// The parts of the dictation held back (not inserted), in order; the History page offers
+    /// Copy and "Add to the text" for each. Empty when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<HeldText>,
+}
+
+/// A part of a dictation that was held back, on the wire. `Debug` hides the text like [`Spoken`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldText {
+    pub text: Spoken,
+    pub why: crate::text::HeldWhy,
+}
+
+impl From<&crate::history::HeldPart> for HeldText {
+    fn from(part: &crate::history::HeldPart) -> Self {
+        Self {
+            text: Spoken(part.text.clone()),
+            why: part.why,
+        }
+    }
 }
 
 /// A file the daemon watches for the settings window ([`Push::FileChanged`]).
@@ -451,6 +591,30 @@ pub enum Push {
     History {
         items: Vec<HistoryItem>,
         more: bool,
+    },
+    /// Answer to [`Request::HistorySearch`] with the same `seq`: one page, newest first.
+    HistoryFound {
+        seq: u32,
+        items: Vec<HistoryItem>,
+        more: bool,
+    },
+    /// The end of the file run `run` ([`Request::TranscribeFile`]); the record itself comes as
+    /// [`Push::HistoryAdded`] just before a `Done`.
+    FileResult {
+        run: u32,
+        result: FileResult,
+    },
+    /// Answer to [`Request::HistoryWords`] with the same `run`.
+    HistoryWords {
+        run: u32,
+        id: String,
+        result: WordsResult,
+    },
+    /// The words of the history run `id` (a Transcribe again), sent just before its
+    /// [`Push::TestResult`]: the window hands them back with [`Request::HistorySetText`].
+    HistoryRunWords {
+        id: u32,
+        words: Words,
     },
     /// Answer to [`Request::HistorySetText`], [`Request::HistoryEdit`], [`Request::HistoryRestore`]
     /// and [`Request::HistoryDelete`].
@@ -781,6 +945,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines, reason = "one table of every wire message")]
     fn the_new_messages_survive_the_wire_and_hide_the_text() {
         let set = SettingsSet::defaults();
         let requests = vec![
@@ -799,7 +964,32 @@ mod tests {
                 text: Spoken("secret words".into()),
                 set,
                 language: Language::RU,
+                words: Words(vec![crate::history::Word {
+                    w: "secret".into(),
+                    p: 0.5,
+                    t0: Some(10),
+                    t1: Some(20),
+                }]),
             },
+            Request::HistoryWords {
+                run: 3,
+                id: "2026-11-10/101500-123".into(),
+            },
+            Request::HistoryWordsCancel { run: 3 },
+            Request::HistorySearch {
+                seq: 2,
+                query: Spoken("secret words".into()),
+                day: Some("2026-11-10".into()),
+                min_ms: Some(500),
+                max_ms: None,
+                older_than: Some("2026-11-10/101500-123".into()),
+            },
+            Request::TranscribeFile {
+                run: 5,
+                path: "C:/talks/a.mp3".into(),
+                language: Language::RU,
+            },
+            Request::TranscribeFileCancel { run: 5 },
             Request::HistoryEdit {
                 id: "2026-11-10/101500-123".into(),
                 text: Spoken("secret words".into()),
@@ -835,13 +1025,70 @@ mod tests {
                     model: "turbo".into(),
                     language: "auto".into(),
                     text: Spoken("secret words".into()),
+                    held: vec![HeldText {
+                        text: Spoken("secret held".into()),
+                        why: crate::text::HeldWhy::Hallucination,
+                    }],
                 }],
                 more: true,
+            },
+            Push::HistoryFound {
+                seq: 2,
+                items: Vec::new(),
+                more: false,
+            },
+            Push::FileResult {
+                run: 5,
+                result: FileResult::Failed {
+                    why: FileFailure::Unsupported {
+                        what: "Opus".into(),
+                    },
+                },
+            },
+            Push::FileResult {
+                run: 5,
+                result: FileResult::Done {
+                    id: "2026-11-10/101500-123".into(),
+                },
             },
             Push::HistoryResult {
                 id: "2026-11-10/101500-123".into(),
                 op: HistoryOp::Delete,
                 ok: true,
+            },
+            Push::HistoryWords {
+                run: 3,
+                id: "2026-11-10/101500-123".into(),
+                result: WordsResult::Ready {
+                    words: Words(vec![crate::history::Word {
+                        w: "secret".into(),
+                        p: 0.5,
+                        t0: Some(10),
+                        t1: None,
+                    }]),
+                    timed: true,
+                },
+            },
+            Push::HistoryWords {
+                run: 4,
+                id: "2026-11-10/101500-123".into(),
+                result: WordsResult::Unavailable {
+                    why: WordsFailure::NoAudio,
+                },
+            },
+            Push::HistoryWords {
+                run: 5,
+                id: "2026-11-10/101500-123".into(),
+                result: WordsResult::Busy,
+            },
+            Push::HistoryRunWords {
+                id: 4,
+                words: Words(vec![crate::history::Word {
+                    w: "secret".into(),
+                    p: 0.9,
+                    t0: None,
+                    t1: None,
+                }]),
             },
             Push::ModelDeleted {
                 id: "turbo".into(),
@@ -858,5 +1105,30 @@ mod tests {
             assert_eq!(d.decode::<Push>().unwrap().unwrap(), push);
             assert!(!format!("{push:?}").contains("secret"));
         }
+    }
+}
+
+#[cfg(test)]
+mod words_tests {
+    use super::*;
+
+    #[test]
+    fn a_set_text_from_an_older_window_has_no_words() {
+        // The line of a window that sent no `words` field.
+        let with = encode(&Request::HistorySetText {
+            id: "2026-11-10/101500-123".into(),
+            text: Spoken("x".into()),
+            set: SettingsSet::defaults(),
+            language: Language::RU,
+            words: Words::default(),
+        });
+        let without = with.replace(r#","words":[]"#, "");
+        assert_ne!(with, without);
+        let mut d = Decoder::new();
+        d.push(without.as_bytes());
+        assert!(matches!(
+            d.decode::<Request>().unwrap().unwrap(),
+            Request::HistorySetText { words, .. } if words.0.is_empty()
+        ));
     }
 }

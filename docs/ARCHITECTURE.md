@@ -170,6 +170,7 @@ mode = "clipboard"             # clipboard | type
 restore_delay_ms = 300
 trailing_space = true
 keep_in_clipboard_history = true   # dictation stays in Win+V history; false excludes it (cloud is always excluded)
+press_enter = false            # true: one Enter after the whole text was typed (never after Ctrl+V), only if the foreground window and focused control are those of the record start and no own key was pressed since
 rules = [{ app = "mstsc.exe", mode = "type" }]   # per-app overrides: mode, chord, delay
 [overlay]
 enabled = true

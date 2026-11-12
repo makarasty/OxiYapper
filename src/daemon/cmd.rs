@@ -26,13 +26,15 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
 use oxi_core::config::{
-    Accent, Audio, Config, ConfigError, History, Hotkey, Overlay, OverlayPosition, Paste, Sounds,
+    Accent, Audio, Config, ConfigError, FileFormat, History, Hotkey, Overlay, OverlayPosition,
+    Paste, Sounds,
 };
 use oxi_core::device::DeviceChoice;
 use oxi_core::ipc::SoundWarning;
 use oxi_core::machine::{
     EngineWarning, Event, JobId, ModelFailure, Notice, OverlayState, Phase, Sound,
 };
+use oxi_core::paste::{Focus, Profile};
 use oxi_core::tray::TrayBadge;
 use oxi_core::tuning::SettingsSet;
 use oxi_core::types::Language;
@@ -46,19 +48,30 @@ pub enum Inbox {
     Event(Event),
     /// Audio worker: the trimmed 16 kHz mono samples of a stopped job, never empty, and its raw
     /// recording streamed to the history folder (`None` while saving is off). The spool goes
-    /// with the job to its `HistoryCmd::Save`, or to `history::no_transcript`.
+    /// with the job to its `HistoryCmd::Save`, or to `history::no_transcript`. `voiced_ms` is
+    /// the part of the recording the speech gate scored as voice, for the speech rate and the
+    /// pause share in the usage stats.
     JobAudio {
         job: JobId,
         samples: Vec<f32>,
         spool: Option<PathBuf>,
+        voiced_ms: u64,
     },
     /// Audio worker: an event of the capture opened by `AudioCmd::Start { session }`. The
     /// coordinator drops it once a later capture started, so a stale `DeviceLost` cannot stop
     /// the next recording.
     Capture { session: u64, event: Event },
     /// Whisper worker: `Some` is the final text (empty when nothing is left to paste), `None`
-    /// a failed transcription.
-    Transcribed { job: JobId, text: Option<String> },
+    /// a failed transcription. `words` are whisper's words with their confidence, for the
+    /// history entry (empty when `text` is `None`). `held` are the parts of the dictation the
+    /// confidence filter held back: their text is not in `text`, the entry keeps it. When all
+    /// of it was held, `text` is empty and `held` has everything.
+    Transcribed {
+        job: JobId,
+        text: Option<String>,
+        words: Vec<oxi_core::history::Word>,
+        held: Vec<oxi_core::history::HeldPart>,
+    },
     /// Whisper worker: why the model runs elsewhere than configured; `None` once it runs as
     /// configured again or no model is loaded.
     EngineWarning(Option<EngineWarning>),
@@ -75,6 +88,10 @@ pub enum Inbox {
     /// History worker: why dictations are not saved (a write or clean-up error); `None` once a
     /// save or clean-up worked again. Never carries the text.
     HistoryWarning(Option<String>),
+    /// Paste worker: how the to-file write of `job` went: why dictations do not reach the
+    /// folder (the error kind, never the text), `None` when it worked (arch-plan 9.4). Each write
+    /// answers once, a refused one at once, so the job says which write it is (d03-label).
+    FileWarning { job: JobId, line: Option<String> },
     /// Watcher: a good `config.toml`, with the values the load corrected (`ConfigFile::warnings`).
     /// Held until the machine is Idle, then sent to the workers.
     Config {
@@ -145,8 +162,12 @@ pub struct StatusReport {
 /// Commands for the audio worker.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AudioCmd {
-    /// Open the capture with the current `Audio` options; its events carry `session`.
-    Start { session: u64 },
+    /// Open the capture with the current `Audio` options; its events carry `session`. `pressed`
+    /// is the key-down that started it, for the `capture started` latency (d11).
+    Start {
+        session: u64,
+        pressed: Option<std::time::Instant>,
+    },
     /// Stop, flush the tail, answer `Inbox::JobAudio` or `Event::JobAudioEmpty` for this job.
     Stop(JobId),
     /// Stop and throw the audio away; no answer.
@@ -164,8 +185,15 @@ pub enum WhisperCmd {
     /// Delete the files of registry model `id` (unloading it first when it is the loaded one)
     /// and push `ModelDeleted` on `reply`.
     DeleteModel { id: String, reply: Pushes },
-    /// Transcribe and answer `Inbox::Transcribed`.
-    Transcribe { job: JobId, samples: Vec<f32> },
+    /// Model for the next `Preload` (key-down, from the profile of the app in front).
+    UseModel(String),
+    /// Transcribe with the dictation's profile (language, model, text switches) and answer
+    /// `Inbox::Transcribed`.
+    Transcribe {
+        job: JobId,
+        samples: Vec<f32>,
+        profile: Box<Profile>,
+    },
     /// Recognition test: run one set, answer `Push::TestResult`, write nothing to disk. A run
     /// that a dictation overtook in the queue answers `Busy` when its turn comes.
     Test(TestJob),
@@ -190,6 +218,14 @@ pub enum SoundCmd {
     Preview { choice: String, volume_percent: u8 },
 }
 
+/// Where to-file mode writes one dictation (arch-plan 9.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToFile {
+    pub folder: PathBuf,
+    pub format: FileFormat,
+    pub only: bool,
+}
+
 /// Commands for the paste worker.
 pub enum PasteCmd {
     /// Deliver the text and answer `Event::PasteDone { job, outcome }`.
@@ -197,9 +233,22 @@ pub enum PasteCmd {
         job: JobId,
         text: String,
         cfg: Paste,
+        /// To-file mode: also append the text to the daily file; with `only` nothing is pasted.
+        file: Option<ToFile>,
+        /// `paste.press_enter`: the focus at the record start of the dictation (its first part
+        /// in a hold-gap continuation); `None` when the setting was off, the focus unknown or the
+        /// session locked or slept since. `None` sends no Enter.
+        focus_at_start: Option<Focus>,
     },
     /// "Copy last text": set the clipboard only, never send a chord, no answer.
     CopyOnly { text: String, in_history: bool },
+    /// Quit: append the text of a dictation that is not pasted to its daily file, giving up
+    /// at `until` (the quit grace); no answer.
+    File {
+        text: String,
+        to: ToFile,
+        until: std::time::Instant,
+    },
 }
 
 /// Commands for the history worker. It answers `Inbox::HistoryWarning` when the outcome changes.
@@ -212,10 +261,16 @@ pub enum HistoryCmd {
     /// streamed recording (`Inbox::JobAudio`): the entry takes its name, or it is deleted when
     /// saving is off. `carried` are the streamed recordings of the earlier parts a press inside
     /// the hold gap carried on into this dictation: deleted once its audio is written, kept as
-    /// failed when the write fails.
+    /// failed when the write fails. `words` go into the entry's json (whisper's words and their
+    /// confidence, no times).
     Save {
         samples: Vec<f32>,
         text: String,
+        words: Vec<oxi_core::history::Word>,
+        /// Held-back parts of the dictation, kept in the entry's json.
+        held: Vec<oxi_core::history::HeldPart>,
+        /// `Some(Filtered)` when `text` is only the held parts and nothing was inserted.
+        delivered: Option<oxi_core::history::Delivered>,
         cfg: History,
         spool: Option<PathBuf>,
         carried: Vec<PathBuf>,
@@ -268,6 +323,10 @@ pub trait ChordHook {
     fn reinstall(&self);
     /// The active hotkey, at start and on every `ApplyConfig`.
     fn set_hotkey(&self, hotkey: &Hotkey);
+    /// When the chord went down for the last `ChordDown`, once (the hook's key time).
+    fn take_pressed(&self) -> Option<std::time::Instant> {
+        oxi_platform::os::hook::take_chord_down()
+    }
 }
 
 /// The coordinator's ends of the worker channels.

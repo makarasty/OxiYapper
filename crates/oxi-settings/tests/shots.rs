@@ -1417,3 +1417,53 @@ fn stat_values_share_a_baseline_where_a_label_wraps() {
         "value tops {tops:?}"
     );
 }
+
+/// d12: History after Copy of one long line. The detail card must end inside the window, so the
+/// right border and the whole toolbar are still there (the Copy used to widen the card to the
+/// line's length).
+#[test]
+fn history_after_copy_stays_inside_the_window() {
+    use oxi_core::history::Status;
+    use oxi_core::ipc::{HistoryItem, Spoken};
+    let text = "a long dictation without any pause in it ".repeat(40);
+    for size in [(720.0, 520.0), (1280.0, 860.0)] {
+        for (theme, choice) in THEMES {
+            SIZE.set(size);
+            let _ = slint::platform::set_platform(Box::new(Shots));
+            let layout = common::layout(
+                "history-copy",
+                Some("version = 2\n[history]\nenabled = true\n"),
+            );
+            let (ipc, _sent) = Ipc::fake();
+            let window = oxi_settings::open_with(layout, ipc.clone()).unwrap();
+            window.set_page(Page::History);
+            window.set_theme(choice);
+            window.show().unwrap();
+            push(
+                &ipc,
+                Push::History {
+                    items: vec![HistoryItem {
+                        id: "2026-11-10/120000-000".into(),
+                        status: Status::Done,
+                        duration_ms: 4_500,
+                        model: String::new(),
+                        language: String::new(),
+                        text: Spoken(text.clone()),
+                        held: Vec::new(),
+                    }],
+                    more: false,
+                },
+            );
+            slint::platform::update_timers_and_animations();
+            common::with_role(&window, "Copy text", AccessibleRole::Button)
+                .invoke_accessible_default_action();
+            let shot = render(&window, size, 1.0);
+            for label in ["Copy text", "Delete", "Transcript"] {
+                let e = common::one(&window, label);
+                let right = e.absolute_position().x + e.size().width;
+                assert!(right <= size.0, "{label} ends at {right}, window {size:?}");
+            }
+            save(&shot, &format!("history-copy-{}-{theme}", size.0));
+        }
+    }
+}

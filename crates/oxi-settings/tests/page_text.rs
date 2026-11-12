@@ -581,6 +581,42 @@ fn locked_config_keeps_paste_controls_off() {
     assert_eq!(fs::read_to_string(l.config_file()).unwrap(), original);
 }
 
+/// Owner 2026-11-12: off by default; on with Clipboard mode the row's "!" says the Enter needs
+/// the app's own read (UI rule 2), and it goes away in Type mode.
+#[test]
+fn press_enter_is_off_until_switched_on_and_warns_in_clipboard_mode() {
+    const WARN: &str = "With Clipboard mode, Enter only when the app confirms it took the text";
+    let l = layout("press-enter", None);
+    let window = open_tall(&l);
+    sub_tab(&window, "Processing");
+    assert!(!config(&l).config.paste.press_enter);
+    assert_eq!(
+        labels(&window, WARN),
+        Vec::<String>::new(),
+        "off: no warning"
+    );
+    with_role(&window, "Press Enter after pasting", AccessibleRole::Switch)
+        .invoke_accessible_default_action();
+    assert!(config(&l).config.paste.press_enter);
+    let shown = labels(&window, WARN);
+    assert_eq!(shown.len(), 1, "on, Clipboard mode: one warning");
+    // Review d08-fix #4: option A keeps the text from Win+V and monitors until the app took it,
+    // so the "!" no longer blames them; it says what fails closed.
+    assert!(
+        shown[0].contains("No confirmation, no Enter.") && !shown[0].contains("Win+V"),
+        "{shown:?}"
+    );
+    sub_tab(&window, "Paste");
+    with_role(&window, "Type", AccessibleRole::RadioButton).invoke_accessible_default_action();
+    assert_eq!(config(&l).config.paste.mode, PasteMode::Type);
+    sub_tab(&window, "Processing");
+    assert_eq!(
+        labels(&window, WARN),
+        Vec::<String>::new(),
+        "Type mode: no warning"
+    );
+}
+
 #[test]
 fn sub_tabs_show_one_part_of_the_page() {
     let l = layout("tabs", None);
@@ -739,6 +775,8 @@ fn every_tab_fits_the_minimum_size_with_long_lists() {
             ("Replacements", "Save replace.txt"),
             ("Paste", "Restore your copy after"),
             ("Per-app rules", "Scan for apps"),
+            ("Processing", "Doubt level"),
+            ("Words", "Snippets"),
         ] {
             sub_tab(&window, tab);
             i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
@@ -746,11 +784,59 @@ fn every_tab_fits_the_minimum_size_with_long_lists() {
                 whole_in_view(&window, last),
                 "{last} is cut on {tab} (banner {banner:?}, daemon {daemon:?})"
             );
+            if tab == "Words" {
+                // The label also names the row above the editor: the editor itself must be whole.
+                let e = editor(&window, "Snippets");
+                let bottom = e.absolute_position().y + e.size().height;
+                assert!(
+                    bottom <= 520.0,
+                    "the snippets editor is cut: bottom {bottom}"
+                );
+            }
             assert!(
                 !page_scrolls(&window),
                 "{tab} scrolls at 720 x 520 (banner {banner:?}, daemon {daemon:?})"
             );
         }
+    }
+}
+
+/// Review d04 #8, UI rule 1: opening a rule's profile keeps the card's size, at the least window
+/// and a large one, and the large one shows every field of the profile.
+#[test]
+fn opening_a_profile_keeps_the_card_size() {
+    let l = layout("profile-size", Some(&many_rules(2)));
+    let window = open_min(&l);
+    sub_tab(&window, "Per-app rules");
+    for (w, h) in [(720.0, 520.0), (1280.0, 860.0)] {
+        window.window().set_size(slint::LogicalSize::new(w, h));
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+        let card = || {
+            let card = i_slint_backend_testing::ElementHandle::find_by_element_id(
+                &window,
+                "TextPage::card",
+            )
+            .next()
+            .expect("the rules card");
+            (card.absolute_position(), card.size())
+        };
+        let list = card();
+        one(&window, "Profile of synthapp0.exe").invoke_accessible_default_action();
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+        assert!(has(&window, "Close the profile"), "the profile is open");
+        assert_eq!(card(), list, "the card moved or changed size at {w}x{h}");
+        if h > 520.0 {
+            let bottom = i_slint_backend_testing::ElementHandle::find_by_accessible_label(
+                &window,
+                "Pause punctuation",
+            )
+            .map(|e| e.absolute_position().y + e.size().height)
+            .fold(0.0_f32, f32::max);
+            assert!(bottom <= list.0.y + list.1.height, "the last field is cut");
+        }
+        one(&window, "Close the profile").invoke_accessible_default_action();
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+        assert_eq!(card(), list, "closing moved the card at {w}x{h}");
     }
 }
 

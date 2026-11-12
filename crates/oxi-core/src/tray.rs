@@ -47,6 +47,7 @@ mod tests {
             | Notice::CaptureFailed
             | Notice::TranscriptionFailed
             | Notice::PasteFailed
+            | Notice::FileFailed
             | Notice::ConfigInvalid => true,
             Notice::Cancelled
             | Notice::CancelledKept
@@ -55,6 +56,7 @@ mod tests {
             | Notice::AdminWindow
             | Notice::RestoreSkipped
             | Notice::MicFallback
+            | Notice::ModelFellBack
             | Notice::MicSilence
             | Notice::ConfigAdjusted
             | Notice::HistoryOn

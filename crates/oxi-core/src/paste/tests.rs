@@ -15,6 +15,7 @@ const TIMED_OUT: ClipError = ClipError::Os {
 };
 
 /// A clipboard with a Win+V list. Restoring writes the user's data again, as the OS does.
+#[allow(clippy::struct_excessive_bools)] // reason: a test fake; each flag is one independent fault switch
 struct HistClip {
     current: String,
     /// Win+V, newest first: (id, data). Never longer than [`HISTORY_CAP`].
@@ -51,6 +52,13 @@ struct HistClip {
     limit: u64,
     /// The user copies this (into history) as history call number `.0` starts.
     copy_on_call: Option<(u32, &'static str)>,
+    /// The history flag a delayed set must be settled with.
+    held: Option<bool>,
+    /// `Some`: `set_pasted` works like the Windows proof write (out of history, rendered late so
+    /// the target's read moves the number, put plainly at `settle`), counting its sets.
+    late_sets: Option<u32>,
+    /// `settle` finds the clipboard still held by the target: no write, the current number back.
+    settle_held: bool,
 }
 
 impl HistClip {
@@ -81,6 +89,9 @@ impl HistClip {
             evicted: 0,
             limit: HISTORY_TIMEOUT.0,
             copy_on_call: None,
+            held: None,
+            late_sets: None,
+            settle_held: false,
         };
         for k in 1..n {
             clip.write(&format!("old {k}"), true);
@@ -170,6 +181,25 @@ impl Clipboard for HistClip {
     }
     fn set_text(&mut self, text: &str, in_history: bool) -> Result<u32, ClipError> {
         Ok(self.write(text, in_history))
+    }
+    fn set_pasted(&mut self, text: &str, in_history: bool) -> Result<u32, ClipError> {
+        let Some(sets) = &mut self.late_sets else {
+            return self.set_text(text, in_history);
+        };
+        *sets += 1;
+        self.held = Some(in_history);
+        let seq = self.write(text, false);
+        // The target's read renders it, which moves the number.
+        self.seq += 1;
+        Ok(seq)
+    }
+    fn settle(&mut self) -> Option<u32> {
+        let in_history = self.held.take()?;
+        if self.settle_held {
+            return Some(self.seq);
+        }
+        let text = self.current.clone();
+        Some(self.write(&text, in_history))
     }
     fn sequence(&self) -> u32 {
         self.seq
@@ -1142,6 +1172,42 @@ fn paste_typing_goes_in_chunks_at_the_pace_and_reports_rising_progress() {
     }
 }
 
+/// Review d03 #8: a line break is never typed as Enter, whichever path types (mode, app rule,
+/// a clipboard that cannot be saved).
+#[test]
+fn paste_typing_never_sends_a_line_break() {
+    let rule = Paste {
+        rules: vec![PasteRule {
+            app: "Notepad.EXE".into(),
+            mode: Some(PasteMode::Type),
+            ..PasteRule::default()
+        }],
+        ..Paste::default()
+    };
+    let text = "ls\nnext\r\nend\n";
+    let typed = |cfg: &Paste, clip: &mut dyn FnMut(&mut Keys) -> PasteOutcome| {
+        let mut keys = Keys::default();
+        assert_eq!(clip(&mut keys), PasteOutcome::Typed, "{cfg:?}");
+        keys.typed.unwrap_or_default()
+    };
+    let mode = type_mode(TypeSpeed::Fast);
+    for cfg in [&mode, &rule] {
+        let got = typed(cfg, &mut |k| {
+            with_steps(text, cfg, &mut HistClip::new("c"), k).0
+        });
+        assert_eq!(got, "ls next end ", "{cfg:?}");
+    }
+    let got = typed(&Paste::default(), &mut |k| {
+        with_steps(text, &Paste::default(), &mut Unsaved(None), k).0
+    });
+    assert_eq!(got, "ls next end ");
+    // Review d03-fix #2: a paragraph break ("новый абзац") is one space, not two.
+    let got = typed(&Paste::default(), &mut |k| {
+        with_steps("A.\n\nB.", &Paste::default(), &mut Unsaved(None), k).0
+    });
+    assert_eq!(got, "A. B.");
+}
+
 #[test]
 fn paste_typing_blocked_on_the_third_call_fails_and_sends_nothing_after() {
     let mut keys = Keys {
@@ -1244,4 +1310,54 @@ fn paste_win_v_order_is_dictation_then_copy_and_typed_adds_nothing() {
     let (out, _) = with_steps("dictation 1", &cfg, &mut clip, &mut Keys::default());
     assert_eq!(out, PasteOutcome::Typed);
     assert_eq!(clip.texts(), ["my copy", "old 2", "old 1"]);
+}
+
+/// Owner 2026-11-12, option A (review d08-fix #1, #3): the text put for the Enter's proof (out of
+/// Win+V, rendered late, which moves the number) goes on plainly after the restore delay, so Win+V
+/// still shows the dictation and the user's copy still comes back. A clipboard-only paste never
+/// puts it that way: no Ctrl+V follows, nobody may ever ask for it.
+#[test]
+fn a_text_put_for_the_enter_proof_still_reaches_win_v_and_the_copy_comes_back() {
+    let mut clip = HistClip {
+        late_sets: Some(0),
+        ..HistClip::new("my copy")
+    };
+    let (cfg, mut ours) = (Paste::default(), OurEntries::default());
+    for n in 1..=3 {
+        assert_eq!(dictate(&mut clip, &cfg, &mut ours, n), PasteOutcome::Pasted);
+        assert_eq!(clip.current, "my copy", "after dictation {n}");
+        assert_eq!(clip.texts(), [&format!("dictation {n}"), "my copy"]);
+    }
+    assert_eq!(clip.late_sets, Some(3));
+    for mut keys in [
+        Keys {
+            held: true,
+            ..Keys::default()
+        },
+        Keys {
+            elevated: true,
+            ..Keys::default()
+        },
+    ] {
+        let out = paste_with("left", &cfg, &mut clip, &mut keys, &mut ours, &mut |_| {});
+        assert!(matches!(out, PasteOutcome::ClipboardOnly(_)), "{out:?}");
+        assert_eq!(clip.current, "left");
+    }
+    assert_eq!(clip.late_sets, Some(3), "clipboard-only went the plain way");
+}
+
+/// Review d08-fix2 #1: the target still holds the clipboard when `settle` tries, and its delayed
+/// render has moved the number. The number `settle` answers is the current one, so the restore
+/// takes the render for ours and puts the user's copy back (never `Theirs`, never lost).
+#[test]
+fn a_clipboard_still_held_at_settle_still_gets_the_users_copy_back() {
+    let mut clip = HistClip {
+        late_sets: Some(0),
+        settle_held: true,
+        ..HistClip::new("my copy")
+    };
+    let (cfg, mut ours) = (Paste::default(), OurEntries::default());
+    assert_eq!(dictate(&mut clip, &cfg, &mut ours, 1), PasteOutcome::Pasted);
+    assert_eq!(clip.current, "my copy");
+    assert_eq!(clip.restores, 1);
 }

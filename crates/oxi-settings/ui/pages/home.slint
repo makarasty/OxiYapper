@@ -44,8 +44,8 @@ export global HomeState {
     callback fit();
     callback pick(int);
     callback open-history();
-    // A day with dictations was clicked: History opens (it cannot filter by day yet).
-    callback open-day();
+    // Heatmap cell `i` (an index into `levels`) was clicked: History opens on that day.
+    callback open-day(int);
 }
 
 struct Stat {
@@ -81,10 +81,10 @@ export component HomePage inherits VerticalLayout {
     property <length> chrome: Theme.home-chrome + (root.label-lines == 2 ? Theme.home-chrome-labels : 0px) + (root.one-row ? 0px : Theme.home-chrome-row);
     property <length> grid-room: root.free-height - root.chrome - Theme.heat-top - 7 * heat.gap;
     // The cell: fills the card's width up to `heat-cell-max`, and no more than the height allows.
-    // With the legend (a gap and one more cell high) when the height leaves cells of
+    // With the legend (a gap and one 16 px line) when the height leaves cells of
     // `heat-cell-legend` or more; else the legend is the first thing a low window drops.
     property <length> cell-wide: Theme.heat-cell(root.heat-room, root.fit-weeks, heat.gap);
-    property <length> cell-high: floor((root.grid-room - Theme.space-3) / 8 / 1px) * 1px;
+    property <length> cell-high: floor((root.grid-room - Theme.space-3 - Theme.heat-cell-legend) / 7 / 1px) * 1px;
     property <bool> legend: root.cell-high >= Theme.heat-cell-legend;
     property <length> cell: max(Theme.heat-cell-floor, min(root.cell-wide, root.legend ? root.cell-high : floor(root.grid-room / 7 / 1px) * 1px));
     init => {
@@ -171,7 +171,7 @@ export component HomePage inherits VerticalLayout {
                                 cell: root.cell;
                                 legend-shown: root.legend;
                                 day-clicked(day) => {
-                                    HomeState.open-day();
+                                    HomeState.open-day(day);
                                 }
                                 summary: @tr("{n} active day in the last {} weeks" | "{n} active days in the last {} weeks" % HomeState.active-days, root.weeks);
                             }

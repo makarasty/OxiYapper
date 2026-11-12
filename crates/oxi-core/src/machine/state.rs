@@ -20,6 +20,11 @@ const MAX_WAITING_JOBS: usize = 2;
 /// (Ctrl+Win+D). Later the recording goes on whatever the level, so a quiet mic loses nothing.
 const SHORTCUT_WINDOW: Millis = Millis(400);
 
+/// A release of the held chord that a press undoes this soon is a key bounce or a wobbling
+/// chord, not a stop: the capture runs on (owner, 2026-11-12: held keys mean dictation). Far
+/// under the gap of a deliberate double tap.
+pub const BOUNCE: Millis = Millis(40);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     /// Push mode, chord held.
@@ -46,8 +51,12 @@ struct Recording {
     /// A shortcut key came: cancelled at this time unless speech is heard first.
     cancel_at: Option<Millis>,
     /// The user released the held chord at this time (only with `hold_gap`): the job this
-    /// recording becomes may be continued by a new press until then plus the gap.
+    /// recording becomes may be continued by a new press until then plus the gap. Set without
+    /// a gap too: a press within [`BOUNCE`] goes on all the same.
     released_at: Option<Millis>,
+    /// Released as a tap at this time: thrown away when `tail_until` ([`BOUNCE`] later) comes,
+    /// unless a bounce puts the chord back first.
+    tap_at: Option<Millis>,
     /// Jobs of earlier presses this recording carries on (oldest first): their audio goes in
     /// front of this one's ([`Effect::Merge`]).
     continues: Vec<JobId>,
@@ -110,6 +119,13 @@ pub struct State {
     last_tap: Option<Millis>,
     /// Between the hook's `ChordDown` and its `ChordUp`, in both modes.
     chord_held: bool,
+    /// A press refused for a full queue whose chord is still held: it records as soon as a job
+    /// leaves the queue, without a new press.
+    refused_held: bool,
+    /// The held chord started, locked or stopped a recording that no key-up ends (toggle, lock).
+    toggle_press: bool,
+    /// Key-up of such a press: a down within [`BOUNCE`] of it is that press bouncing, not a new one.
+    bounce_from: Option<Millis>,
     notice: Option<(Notice, Millis)>,
     idle_unload_at: Option<Millis>,
     /// Sleep asked for an unload; done as soon as nothing is in flight.
@@ -120,6 +136,8 @@ pub struct State {
     shown: OverlayState,
     /// One-time notice already given in this daemon run.
     mic_fallback_noted: bool,
+    /// The models whose fallback was told since the last config apply: each missing model once.
+    model_fallback_noted: Vec<String>,
     /// Log facts since the last `take_notes`.
     notes: Vec<Note>,
 }
@@ -141,12 +159,16 @@ impl State {
             model: ModelStatus::Unloaded,
             last_tap: None,
             chord_held: false,
+            refused_held: false,
+            toggle_press: false,
+            bounce_from: None,
             notice: None,
             idle_unload_at: None,
             unload_when_idle: false,
             model_for: None,
             shown: OverlayState::Hidden,
             mic_fallback_noted: false,
+            model_fallback_noted: Vec::new(),
             notes: Vec::new(),
         }
     }
@@ -232,6 +254,14 @@ impl State {
 
     pub(super) fn handle(&mut self, event: Event, now: Millis) -> Effects {
         let mut fx = Effects::new();
+        self.end_tap(now, &mut fx);
+        // A key outside the chord, Esc, a lock: the refused press was no dictation.
+        if matches!(
+            event,
+            Event::OtherKey | Event::Esc | Event::Lock | Event::Suspend
+        ) {
+            self.refused_held = false;
+        }
         match event {
             Event::ChordDown => {
                 let repeat = std::mem::replace(&mut self.chord_held, true);
@@ -240,6 +270,7 @@ impl State {
             // A poll that finds the chord released is a key-up the hook never delivered.
             Event::ChordUp | Event::ChordPolled { held: false } => {
                 self.chord_held = false;
+                self.refused_held = false;
                 self.chord_up(now, &mut fx);
             }
             Event::ChordPolled { held: true } => {}
@@ -283,6 +314,14 @@ impl State {
                     fx.push(Effect::Notify(Notice::MicFallback));
                 }
             }
+            // Once per model until the settings change: every dictation with it falls back the
+            // same way, but another rule's missing model is news.
+            Event::ModelFellBack(model) => {
+                if !self.model_fallback_noted.contains(&model) {
+                    self.model_fallback_noted.push(model);
+                    fx.push(Effect::Notify(Notice::ModelFellBack));
+                }
+            }
             Event::ModelLoaded if self.stale_load() => {
                 self.unload(&mut fx); // the old settings' model; `dispatch` loads for a job
                 self.preload_for_recording(&mut fx);
@@ -313,8 +352,20 @@ impl State {
             Event::Tick => self.tick(now, &mut fx),
         }
         self.dispatch(now, &mut fx);
+        // Held keys mean dictation: a refused press records the moment there is room.
+        if self.refused_held && self.rec.is_none() && !self.queue_full(now) {
+            self.start_recording(now, &mut fx);
+        }
         self.settle(now, &mut fx);
         fx
+    }
+
+    /// A tap whose bounce window ran out is over, whatever comes now (its tick may be late).
+    fn end_tap(&mut self, now: Millis, fx: &mut Effects) {
+        let tap = self.rec.as_ref().and_then(|r| r.tap_at);
+        if tap.is_some_and(|t| now >= t + BOUNCE) {
+            self.discard_recording(fx);
+        }
     }
 
     /// A key outside the chord went down; it reached the system already. Whether it cancels the
@@ -443,6 +494,7 @@ impl State {
     fn paste_notice(&mut self, outcome: PasteOutcome, now: Millis, fx: &mut Effects) {
         let notice = match outcome {
             PasteOutcome::Failed => return self.fail(Notice::PasteFailed, now, fx),
+            PasteOutcome::FileFailed => return self.fail(Notice::FileFailed, now, fx),
             PasteOutcome::Pasted | PasteOutcome::Typed => None,
             PasteOutcome::ClipboardOnly(ClipboardOnlyWhy::ModifiersHeld) => {
                 Some(Notice::PressPaste)
@@ -547,6 +599,10 @@ impl State {
     /// is cancelled with it, by a lock or sleep too: nothing pastes into a locking session.
     fn cancel_recording(&mut self, now: Millis, why: CancelWhy, explicit: bool, fx: &mut Effects) {
         let Some(r) = self.rec.take() else { return };
+        if r.tap_at.is_some() {
+            // A tap waiting out its bounce window is over already: no cancel.
+            return fx.push(Effect::DiscardCapture);
+        }
         self.notes.push(Note::Cancelled {
             why,
             speech: r.speech,
@@ -569,6 +625,15 @@ impl State {
 
     /// `repeat`: the chord was already held, so this is the hook repeating itself.
     fn chord_down(&mut self, now: Millis, repeat: bool, fx: &mut Effects) {
+        if !repeat && self.bounce_from.is_some_and(|u| now < u + BOUNCE) {
+            // A toggle or lock press bouncing: one press, it neither stops nor starts again.
+            self.toggle_press = true;
+            let poll = now + self.cfg.watchdog_period;
+            if let Some(r) = self.rec.as_mut().filter(|r| r.tail_until.is_none()) {
+                r.next_poll = Some(poll);
+            }
+            return;
+        }
         let Some(r) = self.rec.as_ref() else {
             return self.start_recording(now, fx);
         };
@@ -577,35 +642,45 @@ impl State {
                 // A new press must not wait for the old tail: no lost words (ARCHITECTURE 3).
                 // A shortcut cancel still pending is not lost to it: shortcut audio must not
                 // reach whisper.
-                if r.cancel_at.is_some() {
+                if r.tap_at.is_some() {
+                    // Back within the bounce window: the tap was a bounce, the press goes on,
+                    // and it is no half of a double tap.
+                    self.last_tap = None;
+                    return self.go_on(now);
+                } else if r.cancel_at.is_some() {
                     self.cancel_recording(now, CancelWhy::Shortcut, false, fx);
-                } else if r.released_at.is_some_and(|t| now < t + self.cfg.hold_gap) {
-                    // A quick re-press inside the hold gap: the same recording goes on.
-                    let poll = now + self.cfg.watchdog_period;
-                    if let Some(r) = self.rec.as_mut() {
-                        r.tail_until = None;
-                        r.released_at = None;
-                        r.next_poll = Some(poll);
-                    }
-                    return;
+                } else if r
+                    .released_at
+                    .is_some_and(|t| now < t + BOUNCE.max(self.cfg.hold_gap))
+                {
+                    // A bounce, or a quick re-press inside the hold gap: the same recording
+                    // goes on.
+                    return self.go_on(now);
                 } else {
                     self.stop_recording(now, false, fx);
                 }
                 self.start_recording(now, fx);
             }
         } else if r.kind != Kind::Held {
+            self.toggle_press = true;
             self.release(now, fx);
         } // Held: down without an up, the hook repeated itself
     }
 
-    fn start_recording(&mut self, now: Millis, fx: &mut Effects) {
-        if let ModelStatus::Failed(why) = self.model {
-            self.fail(model_notice(why), now, fx);
-            return;
+    /// The released recording goes on as if the chord had never been let go.
+    fn go_on(&mut self, now: Millis) {
+        let poll = now + self.cfg.watchdog_period;
+        if let Some(r) = self.rec.as_mut() {
+            r.tail_until = None;
+            r.released_at = None;
+            r.tap_at = None;
+            r.next_poll = Some(poll);
         }
-        // A press inside the hold gap of the newest job carries it on; that adds no waiting job.
-        let carried = self
-            .jobs
+    }
+
+    /// A press inside the hold gap of the newest job carries it on; that adds no waiting job.
+    fn carried(&self, now: Millis) -> Option<JobId> {
+        self.jobs
             .back()
             .filter(|j| {
                 !j.cancelled
@@ -613,7 +688,11 @@ impl State {
                     && j.stage != Stage::Pasting
                     && j.hold_until.is_some_and(|t| t > now)
             })
-            .map(|j| j.id);
+            .map(|j| j.id)
+    }
+
+    /// Too many jobs wait for a press at `now` to record.
+    fn queue_full(&self, now: Millis) -> bool {
         let waiting = self.jobs.iter().filter(|j| {
             !j.cancelled
                 && !j.superseded
@@ -622,11 +701,22 @@ impl State {
                     Stage::AwaitingAudio | Stage::Queued | Stage::Transcribed
                 )
         });
-        if carried.is_none() && waiting.count() >= MAX_WAITING_JOBS {
-            self.notes.push(Note::RefusedQueueFull);
-            fx.push(Effect::Play(Sound::Error));
+        self.carried(now).is_none() && waiting.count() >= MAX_WAITING_JOBS
+    }
+
+    fn start_recording(&mut self, now: Millis, fx: &mut Effects) {
+        self.refused_held = false;
+        if let ModelStatus::Failed(why) = self.model {
+            self.fail(model_notice(why), now, fx);
             return;
         }
+        if self.queue_full(now) {
+            self.notes.push(Note::RefusedQueueFull);
+            fx.push(Effect::Play(Sound::Error));
+            self.refused_held = self.chord_held;
+            return;
+        }
+        let carried = self.carried(now);
         let push = self.cfg.mode == Mode::Push;
         let lock_candidate = push
             && carried.is_none()
@@ -654,6 +744,7 @@ impl State {
             speech: carried.is_some(),
             cancel_at: None,
             released_at: None,
+            tap_at: None,
             continues: carried.into_iter().collect(),
         });
         fx.push(Effect::StartCapture);
@@ -663,6 +754,7 @@ impl State {
         if carried.is_none() {
             fx.push(Effect::Play(Sound::Start));
         }
+        self.toggle_press = !push;
     }
 
     fn preload(&mut self, fx: &mut Effects) {
@@ -685,6 +777,9 @@ impl State {
     }
 
     fn chord_up(&mut self, now: Millis, fx: &mut Effects) {
+        if std::mem::take(&mut self.toggle_press) {
+            self.bounce_from = Some(now);
+        }
         let Some(r) = self.rec.as_mut() else { return };
         r.next_poll = None; // chord released: nothing left to watch
         if r.kind != Kind::Held || r.tail_until.is_some() {
@@ -693,6 +788,7 @@ impl State {
         let held = now - r.started;
         if r.lock_candidate && held < self.cfg.double_tap_max_press {
             r.kind = Kind::Locked;
+            self.bounce_from = Some(now);
             // A lock is never silent: the start sound again, now the second one in a row.
             // shortcut: no sound role of its own; a `Sound::Locked` needs the daemon player and config schema.
             fx.push(Effect::Play(Sound::Start));
@@ -701,7 +797,13 @@ impl State {
             if !r.lock_candidate && held < self.cfg.double_tap_max_press && r.cancel_at.is_none() {
                 self.last_tap = Some(now);
             }
-            self.discard_recording(fx);
+            if r.cancel_at.is_some() {
+                self.discard_recording(fx); // a shortcut: no bounce to wait for
+            } else {
+                // Thrown away at the end of the bounce window, unless the chord comes back.
+                r.tap_at = Some(now);
+                r.tail_until = Some(now + BOUNCE);
+            }
         } else {
             self.release(now, fx);
         }
@@ -709,10 +811,12 @@ impl State {
 
     /// The user stopped the recording: discard a tap, else stop after `release_tail`.
     fn release(&mut self, now: Millis, fx: &mut Effects) {
-        let tail = self.cfg.release_tail;
+        let mut tail = self.cfg.release_tail;
         let tap_max = self.cfg.tap_max;
         if let Some(r) = self.rec.as_mut().filter(|r| r.kind == Kind::Held) {
-            r.released_at = (self.cfg.hold_gap > Millis(0)).then_some(now);
+            r.released_at = Some(now);
+            // A held release waits out a bounce even with no tail: a bounce must not split it.
+            tail = tail.max(BOUNCE);
         }
         match self.rec.as_mut() {
             // A pending shortcut cancel decides first: the tail lasts at least until then. What
@@ -736,8 +840,10 @@ impl State {
             return;
         }
         let id = self.push_job(false, false);
-        if let (Some(t), Some(j)) = (r.released_at, self.jobs.back_mut()) {
-            j.hold_until = Some(t + self.cfg.hold_gap);
+        let gap = self.cfg.hold_gap;
+        let released = r.released_at.filter(|_| gap > Millis(0));
+        if let (Some(t), Some(j)) = (released, self.jobs.back_mut()) {
+            j.hold_until = Some(t + gap);
         }
         fx.push(Effect::StopCapture(id));
         self.hand_over(r.continues, id, fx);
@@ -839,6 +945,7 @@ impl State {
             if let Some(cfg) = self.pending_cfg.take() {
                 self.cfg = cfg;
                 self.idle_unload_at = None;
+                self.model_fallback_noted.clear(); // the rule may be fixed, or another one broken
                 fx.push(Effect::ApplyConfig);
                 // A load in flight is judged when it answers, against the config of that time.
                 match self.model {

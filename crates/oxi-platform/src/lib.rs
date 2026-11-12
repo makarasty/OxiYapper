@@ -2,6 +2,7 @@
 
 pub mod autostart;
 pub mod capture;
+pub mod decode;
 pub mod dirs;
 pub mod draw;
 pub mod fs;

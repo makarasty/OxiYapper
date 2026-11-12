@@ -133,7 +133,7 @@ fn open_tab(window: &AppWindow, page: Page, name: &str) -> Result<(), String> {
         Page::Test => &["record", "results"],
         Page::Audio => &["microphone", "recording", "start", "stop"],
         Page::Model => &["models", "settings", "advanced"],
-        Page::Text => &["dictionary", "replacements", "paste", "rules"],
+        Page::Text => &["dictionary", "replacements", "paste", "rules", "processing"],
         Page::System => &["general", "recordings"],
         _ => &[],
     };
@@ -302,13 +302,20 @@ fn sample_history() -> Vec<HistoryItem> {
         model: String::new(),
         language: String::new(),
         text: Spoken(text.into()),
+        held: Vec::new(),
     };
+    // The newest has a part held back, so the "Not inserted" row can be shot.
+    let mut first = item(
+        "2026-11-10/120000-000",
+        Status::Done,
+        "Sample dictation one",
+    );
+    first.held = vec![oxi_core::ipc::HeldText {
+        text: Spoken("sample held words".into()),
+        why: oxi_core::text::HeldWhy::Hallucination,
+    }];
     vec![
-        item(
-            "2026-11-10/120000-000",
-            Status::Done,
-            "Sample dictation one",
-        ),
+        first,
         item(
             "2026-11-10/115000-000",
             Status::Done,

@@ -1166,6 +1166,7 @@ mod tests {
         ) -> Result<Self, CaptureError> {
             Ok(opened(false).capture)
         }
+        fn stop_stream(&mut self) {}
         fn input_rate(&self) -> u32 {
             SAMPLE_RATE
         }

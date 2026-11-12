@@ -142,6 +142,14 @@ impl Pipeline {
         self.speech != Heard::Nothing
     }
 
+    /// True when the gate scored at least one frame as voice, however short: a hint of speech.
+    /// Ask before [`Pipeline::finish_with_stats`] (which consumes the pipeline); the unflushed
+    /// tail is under one gate frame.
+    #[must_use]
+    pub fn voice_seen(&self) -> bool {
+        self.gate.as_ref().is_some_and(Gate::any_voice)
+    }
+
     /// Key-up: the 16 kHz clip for whisper.
     ///
     /// # Errors
@@ -370,6 +378,29 @@ mod signals {
             "{}",
             f.samples.len()
         );
+    }
+
+    #[test]
+    fn audio_voice_seen_tells_a_hint_from_nothing() {
+        let hint = |parts: &[Vec<f32>]| record(parts, &opts()).0;
+        // Noise floor: no frame scores as voice.
+        let p = hint(&[silence(2000)]);
+        assert!(!p.voice_seen());
+        assert!(matches!(
+            p.finish_with_stats(),
+            Err(AudioError::NothingHeard)
+        ));
+        // Borderline: 30 ms of quiet tone, short of a 5-frame run, does not count but scored voice.
+        let p = hint(&[silence(500), tone(30, -45.0), silence(500)]);
+        assert!(p.voice_seen());
+        assert!(matches!(
+            p.finish_with_stats(),
+            Err(AudioError::NothingHeard)
+        ));
+        // The quiet one-word case: heard, so kept whole.
+        let p = hint(&[silence(1000), tone(200, -45.0), silence(1000)]);
+        assert!(p.voice_seen());
+        assert!(p.finish_with_stats().is_ok());
     }
 
     #[test]

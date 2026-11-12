@@ -85,6 +85,11 @@ pub fn look_with(state: OverlayState, accent: Rgba) -> Look {
             let (accent, icon) = notice_look(notice);
             (accent, icon, false)
         }
+        // Nothing pasted: a warning mark; the rest says so in words and an info mark.
+        OverlayState::HeldBack { all: true } => (palette::WARN, Icon::Warning, false),
+        OverlayState::HeldBack { all: false } | OverlayState::SavedToFile { .. } => {
+            (palette::INFO, Icon::Info, false)
+        }
     };
     Look {
         accent,
@@ -105,6 +110,7 @@ fn notice_look(notice: Notice) -> (Rgba, Icon) {
         Notice::PressPaste | Notice::AdminWindow => (palette::WARN, Icon::Paste),
         Notice::RestoreSkipped
         | Notice::MicFallback
+        | Notice::ModelFellBack
         | Notice::MicSilence
         | Notice::ConfigAdjusted => (palette::WARN, Icon::Warning),
         Notice::NoModel
@@ -114,6 +120,7 @@ fn notice_look(notice: Notice) -> (Rgba, Icon) {
         | Notice::CaptureFailed
         | Notice::TranscriptionFailed
         | Notice::PasteFailed
+        | Notice::FileFailed
         | Notice::ConfigInvalid => (palette::ERROR, Icon::Warning),
     }
 }
@@ -147,5 +154,43 @@ mod tests {
             look_with(OverlayState::Text(Notice::MicFallback), a).accent,
             palette::WARN
         );
+    }
+
+    /// d03-label: each cue says it in words and in a mark (DS-21.1), fits the pill, and
+    /// "held back" is not "nothing heard".
+    #[test]
+    fn overlay_cues_have_words_a_mark_and_fit_the_pill() {
+        let cues = [
+            (
+                OverlayState::HeldBack { all: true },
+                "Held back",
+                palette::WARN,
+            ),
+            (
+                OverlayState::HeldBack { all: false },
+                "Some held back",
+                palette::INFO,
+            ),
+            (
+                OverlayState::SavedToFile { also: false },
+                "Saved to file",
+                palette::INFO,
+            ),
+            (
+                OverlayState::SavedToFile { also: true },
+                "Also saved",
+                palette::INFO,
+            ),
+        ];
+        let nothing = look(OverlayState::Text(Notice::NothingHeard)).label;
+        for (state, label, accent) in cues {
+            let l = look(state);
+            assert_eq!((l.label, l.accent), (label, accent), "{state:?}");
+            assert_ne!(l.icon, Icon::None, "{state:?}");
+            assert_ne!(l.label, nothing, "{state:?}");
+            assert!(l.label.chars().count() <= strings::OVERLAY_LABEL_MAX);
+            assert!(state.is_cue());
+        }
+        assert!(!OverlayState::Hidden.is_cue());
     }
 }

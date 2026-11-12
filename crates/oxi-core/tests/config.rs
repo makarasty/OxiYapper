@@ -588,6 +588,22 @@ fn keep_in_clipboard_history_defaults_on_for_files_without_the_key() {
 }
 
 #[test]
+fn press_enter_defaults_off_without_the_key_and_on_survives_a_save() {
+    let file = ConfigFile::parse(FULL).unwrap();
+    assert!(!file.config.paste.press_enter);
+    assert!(!file.to_toml_string().unwrap().contains("press_enter"));
+    let mut file = ConfigFile::parse(
+        "version = 2
+",
+    )
+    .unwrap();
+    file.config.paste.press_enter = true;
+    let out = file.to_toml_string().unwrap();
+    assert!(out.contains("press_enter = true"), "{out}");
+    assert!(ConfigFile::parse(&out).unwrap().config.paste.press_enter);
+}
+
+#[test]
 fn keep_in_clipboard_history_off_survives_a_save() {
     let mut file = ConfigFile::parse(
         "version = 2

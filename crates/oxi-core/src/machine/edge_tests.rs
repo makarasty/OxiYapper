@@ -1,8 +1,8 @@
 //! Another key, Esc and cancels while recording (R2.1): every edge case, with speech or without.
 
 use super::{
-    CancelWhy, Effect, Effects, EmptyAudio, Event, JobId, MachineConfig, Mode, ModelFailure, Note,
-    Notice, OverlayState, Phase, Sound, State, step,
+    BOUNCE, CancelWhy, Effect, Effects, EmptyAudio, Event, JobId, MachineConfig, Mode,
+    ModelFailure, Note, Notice, OverlayState, Phase, Sound, State, step,
 };
 use crate::audio::DETECTOR_LATENCY;
 use crate::config::OtherKey;
@@ -57,6 +57,13 @@ impl Sim {
         self.0.phase()
     }
 
+    /// Release at `ms` and let its bounce window pass ([`BOUNCE`]): a held release stops then.
+    fn release(&mut self, ms: u64) -> Effects {
+        let mut fx = self.core(ms, Event::ChordUp);
+        fx.extend(self.core(ms + BOUNCE.0, Event::Tick));
+        fx
+    }
+
     /// Ticks at every deadline up to `ms`, as the coordinator does; effects without the overlay
     /// and the watchdog polls.
     fn until(&mut self, ms: u64) -> Effects {
@@ -104,7 +111,7 @@ fn auto_after_speech_keeps_recording_and_the_release_still_stops_it() {
     s.at(100, Event::SpeechHeard);
     assert_eq!(s.core(200, Event::OtherKey), []);
     assert_eq!(s.phase(), Phase::Recording);
-    assert_eq!(s.core(1000, Event::ChordUp), stop(J0));
+    assert_eq!(s.release(1000), stop(J0));
     s.at(1050, Event::JobAudioReady(J0));
     assert_eq!(s.phase(), Phase::Transcribing);
 }
@@ -125,7 +132,7 @@ fn a_300_ms_utterance_with_an_accidental_extra_key_is_kept() {
             s.at(heard, Event::SpeechHeard);
             let up = (spoken + 300).max(heard);
             assert_eq!(s.until(up), [], "{case}");
-            assert_eq!(s.core(up, Event::ChordUp), stop(J0), "{case}");
+            assert_eq!(s.release(up), stop(J0), "{case}");
         }
     }
 }
@@ -139,7 +146,7 @@ fn a_quiet_mic_never_loses_a_dictation_to_a_key_after_the_window() {
         assert_eq!(s.core(t, Event::OtherKey), [], "{t}");
     }
     assert_eq!(s.until(12_000), []);
-    assert_eq!(s.core(12_000, Event::ChordUp), stop(J0));
+    assert_eq!(s.release(12_000), stop(J0));
 }
 
 #[test]
@@ -189,7 +196,7 @@ fn a_shortcut_released_quickly_is_no_tap_for_a_double_tap_lock() {
     s.at(200, Event::ChordDown);
     s.at(260, Event::SpeechHeard);
     assert_eq!(s.until(900), []);
-    assert_eq!(s.core(900, Event::ChordUp), stop(J0));
+    assert_eq!(s.release(900), stop(J0));
 }
 
 #[test]
@@ -221,7 +228,8 @@ fn speech_heard_without_a_recording_is_ignored() {
 fn speech_of_a_discarded_tap_does_not_carry_into_the_next_recording() {
     let mut s = Sim::recording(cfg(Mode::Push, OtherKey::Auto, false));
     s.at(50, Event::SpeechHeard);
-    assert_eq!(s.core(100, Event::ChordUp), [Effect::DiscardCapture]); // a tap
+    assert_eq!(s.core(100, Event::ChordUp), []); // a tap: thrown away after the bounce window
+    assert_eq!(s.until(100 + BOUNCE.0), [Effect::DiscardCapture]);
     s.at(1000, Event::ChordDown);
     s.at(1020, Event::OtherKey);
     assert_eq!(s.until(1020 + DL), [Effect::DiscardCapture]);
@@ -236,7 +244,7 @@ fn never_does_not_cancel_before_or_after_speech() {
     s.at(100, Event::SpeechHeard);
     assert_eq!(s.core(150, Event::OtherKey), []);
     assert_eq!(s.phase(), Phase::Recording);
-    assert_eq!(s.core(1000, Event::ChordUp), stop(J0));
+    assert_eq!(s.release(1000), stop(J0));
 }
 
 #[test]
@@ -312,7 +320,7 @@ fn other_key_while_idle_or_transcribing_is_not_ours() {
     s.at(0, Event::ModelLoaded);
     assert_eq!(s.at(10, Event::OtherKey), []);
     s.at(100, Event::ChordDown);
-    s.at(600, Event::ChordUp);
+    s.release(600);
     s.at(650, Event::JobAudioReady(J0));
     assert_eq!(s.at(700, Event::OtherKey), []);
     assert_eq!(s.phase(), Phase::Transcribing);
@@ -403,7 +411,7 @@ fn key_repeat_of_the_chord_is_not_a_second_recording() {
     assert_eq!(s.core(30, Event::ChordDown), []);
     assert_eq!(s.core(60, Event::ChordDown), []);
     s.at(100, Event::SpeechHeard);
-    assert_eq!(s.core(1000, Event::ChordUp), stop(J0));
+    assert_eq!(s.release(1000), stop(J0));
 }
 
 #[test]
@@ -523,7 +531,7 @@ fn chord_pressed_again_with_a_shortcut_cancel_pending_sends_no_audio_to_whisper(
 fn pasting(s: &mut Sim) {
     s.at(0, Event::ModelLoaded);
     s.at(0, Event::ChordDown);
-    s.at(500, Event::ChordUp);
+    s.release(500);
     s.at(550, Event::JobAudioReady(J0));
     s.at(
         600,
@@ -541,7 +549,7 @@ fn a_failed_clipboard_restore_is_told_every_time() {
         let base = job * 10_000;
         s.at(base, Event::ModelLoaded);
         s.at(base, Event::ChordDown);
-        s.at(base + 500, Event::ChordUp);
+        s.release(base + 500);
         s.at(base + 550, Event::JobAudioReady(JobId(job)));
         s.at(
             base + 600,
@@ -579,6 +587,7 @@ fn the_done_sound_plays_when_text_was_pasted_and_only_then() {
             false,
         ),
         (PasteOutcome::Failed, false),
+        (PasteOutcome::FileFailed, false),
     ];
     for (outcome, done) in table {
         let mut s = Sim(State::new(cfg(Mode::Push, OtherKey::Auto, false)));
@@ -591,6 +600,55 @@ fn the_done_sound_plays_when_text_was_pasted_and_only_then() {
     assert!(
         !s.core(1000, Event::ChordUp)
             .contains(&Effect::Play(Sound::Done))
+    );
+}
+
+/// d04-fix 5: a to-file-only write that failed says the file failed, not the paste.
+#[test]
+fn a_failed_file_write_is_told_as_a_file_failure() {
+    let mut s = Sim(State::new(cfg(Mode::Push, OtherKey::Auto, false)));
+    pasting(&mut s);
+    let outcome = PasteOutcome::FileFailed;
+    let fx = s.core(900, Event::PasteDone { job: J0, outcome });
+    assert_eq!(
+        fx,
+        [
+            Effect::Play(Sound::Error),
+            Effect::Notify(Notice::FileFailed)
+        ]
+    );
+    assert_eq!(s.phase(), Phase::Idle);
+}
+
+/// d04-fix 1: an app's model that could not be used is told once, again after a settings
+/// change, and never fails the machine: the next press records.
+#[test]
+fn a_model_fallback_is_told_once_per_config_and_blocks_nothing() {
+    let c = cfg(Mode::Push, OtherKey::Auto, false);
+    let mut s = Sim(State::new(c.clone()));
+    s.at(0, Event::ModelLoaded);
+    let told_of = |s: &mut Sim, at, model: &str| {
+        s.core(at, Event::ModelFellBack(model.into()))
+            .contains(&Effect::Notify(Notice::ModelFellBack))
+    };
+    let told = |s: &mut Sim, at| told_of(s, at, "tiny");
+    assert!(told(&mut s, 100));
+    assert!(!told(&mut s, 200), "once");
+    // d04-fix review 4: another rule's missing model is told too, once.
+    assert!(told_of(&mut s, 210, "base"), "another model");
+    assert!(!told_of(&mut s, 220, "base"), "once per model");
+    s.at(300, Event::ChordDown);
+    assert_eq!(
+        s.phase(),
+        Phase::Recording,
+        "the model still counts as loaded"
+    );
+    s.at(400, Event::ChordUp); // a tap: nothing to transcribe
+    s.until(5000);
+    s.at(5000, Event::ConfigChanged(c));
+    assert!(
+        told(&mut s, 5100),
+        "a settings change may have broken another rule"
     );
 }
 
@@ -1141,11 +1199,11 @@ fn a_key_down_with_the_queue_full_is_refused_with_a_note() {
     let mut s = Sim(State::new(cfg(Mode::Push, OtherKey::Auto, false)));
     s.at(0, Event::ModelLoaded);
     s.at(0, Event::ChordDown);
-    s.at(400, Event::ChordUp);
+    s.release(400);
     s.at(450, Event::JobAudioReady(J0)); // job 0 goes to whisper
     for (down, up, job) in [(500, 1000, 1), (1100, 1500, 2)] {
         s.at(down, Event::ChordDown);
-        s.at(up, Event::ChordUp);
+        s.release(up);
         s.at(up + 50, Event::JobAudioReady(JobId(job)));
     }
     assert_eq!(s.0.take_notes(), []);
