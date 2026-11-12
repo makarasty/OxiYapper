@@ -252,6 +252,10 @@ where
 trait Sink {
     fn push(&mut self, mono: &[f32]) -> Result<Level, AudioError>;
     fn finish(self) -> Result<Recorded, AudioError>;
+    /// The user is heard speaking ([`Pipeline::speech_started`]).
+    fn speech_started(&self) -> bool {
+        false
+    }
     /// The recording was cancelled: nothing of it is kept.
     fn cancel(self)
     where
@@ -272,10 +276,16 @@ impl Sink for Pipeline {
     }
 
     fn finish(self) -> Result<Recorded, AudioError> {
-        Pipeline::finish(self).map(|samples| Recorded {
-            samples,
+        Pipeline::finish_with_stats(self).map(|f| Recorded {
+            samples: f.samples,
             spool: None,
+            trim: f.trim,
+            stats: f.stats,
         })
+    }
+
+    fn speech_started(&self) -> bool {
+        Pipeline::speech_started(self)
     }
 }
 
@@ -294,15 +304,20 @@ impl<S: Sink> Sink for Spooled<S> {
         self.inner.push(mono)
     }
 
+    fn speech_started(&self) -> bool {
+        self.inner.speech_started()
+    }
+
     fn finish(self) -> Result<Recorded, AudioError> {
         let mut result = self.inner.finish();
         if let Some(spool) = self.spool {
             match &mut result {
                 // The job carries the path to its history save.
                 Ok(r) if !r.samples.is_empty() => r.spool = Some(spool.finish()),
-                // A quiet tap is not a recording.
-                Ok(_) | Err(AudioError::NothingHeard | AudioError::MicSilence) => spool.discard(),
-                // Any other failure still keeps what was said; no transcript will come.
+                // An all-zero mic has nothing to retranscribe.
+                Ok(_) | Err(AudioError::MicSilence) => spool.discard(),
+                // Nothing heard (a very quiet word) is still kept, so the owner can retranscribe
+                // it from History; so is any other failure. No transcript will come.
                 Err(_) => spool.fail(),
             }
         }
@@ -335,6 +350,7 @@ struct Drain<'a> {
 impl Drain<'_> {
     /// Moves the ring into `sink` until stopped, then drains once more so nothing captured is
     /// lost. After a failed push the ring is still emptied (no overrun) but not processed.
+    /// Sends [`CaptureEvent::SpeechHeard`] once, after the pass in which the sink first hears it.
     fn run(
         &self,
         mut rx: Consumer<f32>,
@@ -342,6 +358,7 @@ impl Drain<'_> {
         mut notify: impl FnMut(CaptureEvent),
     ) -> Result<Recorded, AudioError> {
         let mut failed = None;
+        let mut heard = false;
         loop {
             // Read before draining: everything pushed before `stop` is seen by the last pass.
             let stopping = self.shared.stop.load(Ordering::Acquire);
@@ -367,6 +384,9 @@ impl Drain<'_> {
                 failed = Some(e);
                 self.meter.clear();
                 notify(CaptureEvent::Failed);
+            } else if !heard && !stopping && sink.speech_started() {
+                heard = true;
+                notify(CaptureEvent::SpeechHeard);
             }
             if stopping {
                 break;
@@ -581,6 +601,45 @@ mod tests {
         assert_eq!(stopped_drain(true).unwrap(), Recorded::default());
     }
 
+    /// The drain says once that speech started, while the recording runs, not at the stop.
+    #[test]
+    fn speech_is_reported_once_while_recording() {
+        let opts = Audio {
+            denoise: false,
+            ..Audio::default()
+        };
+        let pipeline = Pipeline::new(RATE, &opts).unwrap();
+        let shared = Arc::new(Shared::default());
+        let (mut tx, rx) = RingBuffer::new(RATE as usize);
+        let (event_tx, events) = std::sync::mpsc::channel();
+        let worker = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                let drain = Drain {
+                    channels: 1,
+                    channel: AudioChannel::Mix,
+                    window: samples_for(CHUNK, RATE),
+                    shared: &shared,
+                    meter: &LevelMeter::default(),
+                };
+                drain.run(rx, pipeline, |e| event_tx.send(e).unwrap())
+            })
+        };
+        // 300 ms of a loud 300 Hz tone.
+        for i in 0..300 * 16 {
+            let t = i as f32 / RATE as f32;
+            tx.push(0.5 * (std::f32::consts::TAU * 300.0 * t).sin())
+                .unwrap();
+        }
+        let event = events.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(event, CaptureEvent::SpeechHeard);
+        shared.stop.store(true, Ordering::Release);
+        worker.thread().unpark();
+        let recorded = worker.join().unwrap().unwrap();
+        assert_ne!(recorded.samples.len(), 0);
+        assert!(events.try_recv().is_err(), "one event only");
+    }
+
     /// Fails from the second push on; counts pushes.
     struct FailingSink(Arc<AtomicU64>);
 
@@ -599,7 +658,7 @@ mod tests {
         fn finish(self) -> Result<Recorded, AudioError> {
             Ok(Recorded {
                 samples: vec![1.0],
-                spool: None,
+                ..Recorded::default()
             })
         }
     }
@@ -830,6 +889,55 @@ mod tests {
         );
         let (samples, rate) = crate::wav::read_wav_mono_f32(&part).unwrap();
         assert_eq!((samples.len(), rate), (32_000, RATE));
+        crate::wav::set_spool_dir(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ends with the given error, as the pipeline does at key-up.
+    struct EndsWith(fn() -> AudioError);
+
+    impl Sink for EndsWith {
+        fn push(&mut self, _: &[f32]) -> Result<Level, AudioError> {
+            Ok(Level {
+                peak: 0.0,
+                rms: 0.0,
+            })
+        }
+
+        fn finish(self) -> Result<Recorded, AudioError> {
+            Err((self.0)())
+        }
+    }
+
+    /// A quiet word the gate did not hear stays in History (retranscribe); an all-zero mic does not.
+    #[test]
+    fn a_nothing_heard_clip_is_kept_and_mic_silence_is_not() {
+        let _guard = crate::wav::SPOOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = scratch_dir(&format!("oxi-stream-quiet-{}", std::process::id()));
+        crate::wav::spool_give_up_all();
+        let _ = crate::wav::spool_take_orphans();
+        crate::wav::set_spool_dir(Some(dir.clone()));
+        let kept: [(fn() -> AudioError, usize); 2] = [
+            (|| AudioError::MicSilence, 0),
+            // Last: its file stays, so a spool begun in the same clock tick would collide.
+            (|| AudioError::NothingHeard, 1),
+        ];
+        for (err, orphans) in kept {
+            let mut sink = Spooled {
+                inner: EndsWith(err),
+                spool: WavSpool::begin(RATE),
+            };
+            sink.push(&[0.01; 320]).unwrap();
+            assert!(sink.finish().is_err());
+            assert_eq!(crate::wav::spool_take_orphans().len(), orphans);
+            let start = std::time::Instant::now();
+            while !crate::wav::spool_idle() {
+                assert!(start.elapsed() < Duration::from_secs(5), "writer settles");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
         crate::wav::set_spool_dir(None);
         let _ = std::fs::remove_dir_all(&dir);
     }

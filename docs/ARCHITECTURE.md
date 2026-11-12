@@ -116,7 +116,7 @@ Framing: one JSON object per line (`serde_json`), max 1 MiB per line, tagged enu
 |---|---|
 | `Hello { proto, version }` | `HelloAck { proto, version }` |
 | `OpenSettings` (also sent by a second daemon launch) | `Raise` to the open settings window, or spawn one |
-| `Status` | `Status { phase, model, device, backend, warnings }` |
+| `Status` | `Status { phase, model, device, backend, loaded, warnings }`; `loaded`: a model is in memory (it loads with the first dictation and unloads when idle) |
 | `ListDevices` | `Devices { mics, gpus }` |
 | `DownloadModel { id }`, `CancelDownload { id }` | `DownloadProgress { id, done, total }`, `DownloadDone { id, result }` |
 | `CaptureHotkey { on }` | `Key { code, down }` while on |
@@ -124,7 +124,7 @@ Framing: one JSON object per line (`serde_json`), max 1 MiB per line, tagged enu
 | `Stats` | `Stats { dictations, words, wpm, streak, longest_streak, heat_start, heat }`, read from `stats.json` |
 | `PreviewSound { choice, volume_percent }` | the daemon plays `choice` once; a sound that cannot be used shows as a `sounds.preview: ...` line in `Status.warnings` |
 | `TestAudio { reset, pcm }` | no reply; the connection holds the raw 16 kHz mono recording in memory until it closes, never on disk |
-| `TestTranscribe { id, set, language }` | `TestResult { id, outcome }`: `Heard { text, ms }` or `Failed { why }` for one settings set on the held recording; one run in flight per connection, the rest and any run a dictation overtakes answer `Busy`. A model only a test loaded is dropped after 60 s with no test request |
+| `TestTranscribe { id, set, language }` | `TestResult { id, outcome }`: `Heard { text, ms }` or `Failed { why }` for one settings set on the held recording, preceded by `TestProgress { id, percent, est_ms }` (0 to 100 while whisper runs; the first carries `est_ms`, the estimated length of the run, so the bar moves before whisper reports; optional, serde default); one run in flight per connection, the rest and any run a dictation overtakes answer `Busy`. A model only a test loaded is dropped after 60 s with no test request |
 | `Shutdown` | daemon exits |
 | | `ConfigError { file, line, message }` pushed on a bad reload |
 
@@ -289,7 +289,7 @@ Order, and where each step can fail:
 3. **Mono**: average the channels. Manual gain applied here, so the meter shows it.
 4. **Denoise** (optional, off): RNNoise needs 48 kHz mono in 480-sample frames, so it runs before the 16 kHz resample, after a resample to 48 kHz if the device rate differs.
 5. **Resample** to 16 kHz with rubato, streaming in 20 ms chunks during recording. Fails only on a bad config (unsupported rate) at stream start.
-6. **Trim** silence at both ends with an energy gate (earshot), keeping 200 ms of padding. Fewer than 250 ms of voiced audio left: "nothing heard", no whisper call.
+6. **Trim** silence at both ends with an energy gate (earshot), keeping 200 ms of padding. Fewer than 250 ms of voiced audio left (and the level detector never fired): "nothing heard", no whisper call; the raw recording is kept as `failed`, and "Transcribe again" sends it whole.
 7. **Normalise**: RMS toward a target with a +20 dB gain cap and a peak limit. Pure silence (all zeros) is not normalised; it raises "microphone gives silence".
 
 Steps 3-7 are pure functions in `oxi-core::audio`, tested on synthetic signals. Defaults (normalise on, trim on, denoise off, tail 100 ms) are confirmed against the 8 reference phrases in M5 before they ship.

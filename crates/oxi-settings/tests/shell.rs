@@ -597,9 +597,9 @@ fn spawn_reason_clears_on_a_blocked_link_and_on_restart_but_not_on_connecting() 
     assert_eq!(window.get_spawn_error(), "");
 }
 
-/// One poll of the file from outside.
-fn poll() {
-    i_slint_backend_testing::mock_elapsed_time(oxi_settings::FILE_POLL);
+/// One look at the files from outside (no timer drives it now; the watcher push does).
+fn poll(window: &AppWindow) {
+    window.invoke_files_check();
 }
 
 #[test]
@@ -610,7 +610,7 @@ fn a_file_fixed_outside_clears_the_banner_and_refreshes_the_pages() {
     assert!(window.global::<Shell>().get_locked());
 
     fs::write(l.config_file(), "version = 2\n[ui]\ntheme = \"dark\"\n").unwrap();
-    poll();
+    poll(&window);
     assert_eq!(window.get_banner_text(), "");
     assert!(!window.global::<Shell>().get_locked());
     assert_eq!(window.get_theme(), ThemeChoice::Dark);
@@ -619,7 +619,7 @@ fn a_file_fixed_outside_clears_the_banner_and_refreshes_the_pages() {
     // Broken again: the banner comes back, the hand edit stays on disk.
     let broken = "version = 2\n[ui]\ntheme = \n";
     fs::write(l.config_file(), broken).unwrap();
-    poll();
+    poll(&window);
     assert!(window.get_banner_text().contains("line 3"));
     assert!(window.global::<Shell>().get_locked());
     assert_eq!(fs::read_to_string(l.config_file()).unwrap(), broken);
@@ -642,7 +642,7 @@ fn a_file_fixed_outside_drops_the_daemons_config_error() {
     );
 
     fs::write(l.config_file(), "version = 2\n").unwrap();
-    poll();
+    poll(&window);
     assert_eq!(banners(&window), Vec::<String>::new());
 }
 
@@ -1332,6 +1332,7 @@ fn idle_never_and_the_engine_warning_move_no_row() {
         model: "turbo".into(),
         device: oxi_core::device::DeviceChoice::Auto,
         backend: "cpu".into(),
+        loaded: true,
         warnings: vec![warning.into()],
     }));
     assert!(has(&window, warning));

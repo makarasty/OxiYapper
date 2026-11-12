@@ -142,6 +142,9 @@ pub struct Engine {
     /// Per-run parameters, resolved for this load's device; see [`Engine::set_advanced`].
     run: RunParams,
     on_gpu: bool,
+    /// Bench only (`bench --ctx fit`): cut `audio_ctx` to the clip. Never set from config: the
+    /// accuracy guard failed (repeat loops, CER 0.44 against 0.02), so the setting `Fit` stays a no-op.
+    bench_fit_ctx: bool,
 }
 
 fn logical_threads() -> usize {
@@ -236,6 +239,7 @@ impl Engine {
             info,
             run: tuning::resolve(adv, on_gpu, logical_threads()),
             on_gpu,
+            bench_fit_ctx: false,
         }
     }
 
@@ -243,6 +247,12 @@ impl Engine {
     /// parameter: a change of it needs a new load).
     pub fn set_advanced(&mut self, adv: &Advanced) {
         self.run = tuning::resolve(adv, self.on_gpu, logical_threads());
+    }
+
+    /// Bench only: run the next jobs with [`fit_audio_ctx`] (see the field). The config's
+    /// `audio_ctx` never reaches the decoder.
+    pub fn set_bench_fit_ctx(&mut self, on: bool) {
+        self.bench_fit_ctx = on;
     }
 
     pub fn info(&self) -> &LoadInfo {
@@ -294,6 +304,9 @@ impl Engine {
         params.set_logprob_thold(run.logprob_threshold);
         params.set_entropy_thold(run.entropy_threshold);
         params.set_suppress_nst(run.suppress_non_speech);
+        if let Some(ctx) = audio_ctx_override(self.bench_fit_ctx, audio.len()) {
+            params.set_audio_ctx(ctx);
+        }
         params.set_print_special(false);
         params.set_print_progress(false);
         params.set_print_realtime(false);
@@ -357,6 +370,24 @@ unsafe extern "C" fn on_abort(user: *mut c_void) -> bool {
     // SAFETY: `user` is the `&&Cancel` of the running `transcribe_with`.
     let cancel = unsafe { &*user.cast::<&Cancel>() };
     cancel()
+}
+
+/// The `audio_ctx` to force: only for the bench's Fit, never from config.
+fn audio_ctx_override(bench_fit: bool, samples: usize) -> Option<c_int> {
+    bench_fit.then(|| fit_audio_ctx(samples)).flatten()
+}
+
+/// Encoder frames for a clip of `samples` (16 kHz) under the bench's Fit: 50 frames a second
+/// plus 96 of headroom, up to a multiple of 64, at least 256. `None` = the full 1500-frame window
+/// (from 1280 up there is nothing left to save, and a clip over 30 s needs the whole window).
+pub fn fit_audio_ctx(samples: usize) -> Option<c_int> {
+    let frames = samples.div_ceil(320) + 96;
+    let ctx = frames.next_multiple_of(64).max(256);
+    if ctx >= 1280 {
+        None
+    } else {
+        c_int::try_from(ctx).ok()
+    }
 }
 
 /// whisper.cpp timestamps are in 10 ms units.
@@ -471,6 +502,29 @@ mod tests {
         assert!(matches!(r, Err(Error::Cancelled)));
         // The engine still works after a cancel.
         engine.transcribe(&audio, Language::EN, "").unwrap();
+    }
+
+    #[test]
+    fn fit_audio_ctx_table() {
+        let secs = |s: usize| s * 16_000;
+        for (samples, want) in [
+            (0, Some(256)),
+            (secs(1), Some(256)),
+            (secs(5), Some(384)),
+            (secs(10), Some(640)),
+            (secs(20), Some(1152)),
+            (secs(24), None),
+            (secs(31), None),
+        ] {
+            assert_eq!(fit_audio_ctx(samples), want, "{samples} samples");
+        }
+    }
+
+    #[test]
+    fn only_the_bench_forces_audio_ctx() {
+        assert_eq!(audio_ctx_override(false, 16_000), None);
+        assert_eq!(audio_ctx_override(true, 16_000), Some(256));
+        assert_eq!(audio_ctx_override(true, 31 * 16_000), None);
     }
 
     #[test]

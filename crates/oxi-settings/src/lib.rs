@@ -16,7 +16,7 @@ use oxi_core::ipc::{Push, SettingsPage, SettingsTab, Target};
 use oxi_core::overlay::Rect;
 use oxi_core::paths::Layout;
 use oxi_core::strings::CONFIG_READ_ONLY_NEXT;
-use slint::{ComponentHandle, Timer, TimerMode, Weak};
+use slint::{ComponentHandle, Weak};
 #[cfg(windows)]
 use slint::{LogicalSize, PhysicalPosition};
 
@@ -29,7 +29,6 @@ use ipc::{Action, Event, Level, Link, Options};
 mod generated {
     slint::include_modules!();
 }
-pub use constants::FILE_POLL;
 pub use generated::{
     AppWindow, AudioState, ChipLevel, HomeState, ModelState, Page, PathText, Shell, SystemState,
     TestRow, TestState, TextState, Theme as Tokens, ThemeChoice, Toast,
@@ -255,6 +254,35 @@ pub fn set_accent(window: &AppWindow, dark: AccentColors, light: AccentColors) {
     tokens.set_accent_dark(dark.to_set());
     tokens.set_accent_light(light.to_set());
     own_accent(window);
+    set_window_icon(window, light.accent);
+}
+
+/// The title-bar icon with its record dot in `accent` (`0xRRGGBB`), at the size the window's
+/// display scale picks from the PNGs (`Icons.window-logo`). The tile is paper, so the light
+/// theme's accent is the one that holds on it.
+fn set_window_icon(window: &AppWindow, accent: u32) {
+    let size = icon_size(window.get_icon_scale());
+    let [_, r, g, b] = accent.to_be_bytes();
+    let Some(pm) = oxi_platform::draw::logo_with(size, oxi_core::overlay::Rgba(r, g, b, 0xFF))
+    else {
+        return;
+    };
+    let buffer =
+        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(pm.data(), size, size);
+    window.set_window_icon(slint::Image::from_rgba8_premultiplied(buffer));
+}
+
+/// The title-bar icon's side in pixels at display scale `scale`.
+fn icon_size(scale: f32) -> u32 {
+    if scale > 1.5 {
+        32
+    } else if scale > 1.25 {
+        24
+    } else if scale > 1.0 {
+        20
+    } else {
+        16
+    }
 }
 
 /// Back to the brand Red.
@@ -335,8 +363,11 @@ fn open_inner(
     link: impl FnOnce(&AppWindow) -> Result<Option<Ipc>, Error>,
 ) -> Result<AppWindow, Error> {
     let window = AppWindow::new()?;
+    // Before any page: the accent builds the title-bar icon at this scale.
+    pages::set_scale(&window);
     own_accent(&window);
     draw_whole_frames(&window);
+    watch_os_events(&window);
     follow_os_motion(&window);
     elide_paths(&window);
     let (mut ctx, problem) = Ctx::load(layout)?;
@@ -387,35 +418,27 @@ fn open_inner(
 
     let banner = followed.is_some().then(|| {
         let (weak, ipc) = (window.as_weak(), ctx.ipc.clone());
+        let c = ctx.clone();
         let events = ctx.ipc.subscribe(move |event| {
             if let Some(window) = weak.upgrade() {
                 on_daemon_event(&window, &ipc, event);
+                // The daemon saw a file change, or the machine woke: look again. No timer.
+                if matches!(event, Event::Push(Push::FileChanged { .. } | Push::Woke)) {
+                    look_again(&window, &c, true);
+                }
             }
         });
         // The worker may have reported before the subscription: show the state as it is now.
         on_daemon_event(&window, &ctx.ipc, &Event::Link(ctx.ipc.link()));
         events
     });
-    let poll = Timer::default();
-    poll.start(TimerMode::Repeated, FILE_POLL, {
-        let (weak, c) = (window.as_weak(), ctx.clone());
-        move || {
-            if let Some(window) = weak.upgrade() {
-                own_accent(&window);
-                // Puts back a frame the OS lost with no paint message (see `draw_whole_frames`).
-                window.window().request_redraw();
-                follow_os_motion(&window);
-                reload(&window, &c, linked);
-                pages::poll(&window, &c);
-            }
-        }
-    });
+    on_files_check(&window, &ctx, linked);
     let ipc = ctx.ipc.clone();
     window.on_start_daemon({
         let weak = window.as_weak();
         move || {
             // Held by this callback, which lives as long as the window.
-            let _ = (&banner, &poll);
+            let _ = &banner;
             if let Some(window) = weak.upgrade() {
                 window.set_spawn_error("".into());
             }
@@ -444,6 +467,67 @@ fn open_inner(
     pages::test::bind(&window, &ctx);
     bind(&window, &ctx);
     Ok(window)
+}
+
+/// The window got the focus (or a test says so): look again, and tell the pages that follow a file
+/// of their own (Home's stats).
+fn on_files_check(window: &AppWindow, ctx: &Ctx, linked: bool) {
+    let (weak, c) = (window.as_weak(), ctx.clone());
+    window.on_files_check(move || {
+        if let Some(window) = weak.upgrade() {
+            // Linked, the banner's subscriber looks again on `Woke`: once is enough.
+            if !linked {
+                look_again(&window, &c, linked);
+            }
+            c.ipc.deliver(&Event::Push(Push::Woke));
+        }
+    });
+}
+
+/// What the one-second timer did, now only when something says it may have changed (the
+/// daemon's `FileChanged` or `Woke`, the window getting the focus, a new OS theme): the accent
+/// and motion the backend may have overwritten, the config and text files, and the pixels the OS
+/// may have dropped (`draw_whole_frames`).
+fn look_again(window: &AppWindow, ctx: &Ctx, linked: bool) {
+    #[cfg(test)]
+    tests::LOOKS.with(|n| n.set(n.get() + 1));
+    own_accent(window);
+    follow_os_motion(window);
+    reload(window, ctx, linked);
+    pages::poll(window, ctx);
+    window.window().request_redraw();
+}
+
+/// Puts back a frame the OS lost with no paint message, and looks at the files, on the events
+/// that can follow a lost frame or a change made while the window was not looked at. Nothing
+/// runs while the window sits still. A no-op under the testing backend.
+// shortcut: winit's window behind the pinned `slint =1.18.1` (`unstable-winit-030`), as
+// `caption_theme`; re-check on every Slint bump. A frame lost while the window is neither focused
+// nor under the cursor stays wrong until the user comes back to it.
+fn watch_os_events(window: &AppWindow) {
+    use slint::winit_030::winit::event::WindowEvent as Win;
+    use slint::winit_030::{EventResult, WinitWindowAccessor as _};
+    let weak = window.as_weak();
+    window.window().on_winit_window_event(move |w, event| {
+        match event {
+            Win::Focused(true) | Win::ThemeChanged(_) => {
+                // After this event: the callback must not re-enter the window mid-event.
+                let weak = weak.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(window) = weak.upgrade() {
+                        window.invoke_files_check();
+                    }
+                });
+                w.request_redraw();
+            }
+            Win::Occluded(false)
+            | Win::Resized(_)
+            | Win::ScaleFactorChanged { .. }
+            | Win::CursorEntered { .. } => w.request_redraw(),
+            _ => {}
+        }
+        EventResult::Propagate
+    });
 }
 
 /// The config banner for `problem`; `None` clears it.
@@ -694,6 +778,67 @@ mod tests {
             spawn_note(&e),
             "Could not start OxiYapper: entity not found."
         );
+    }
+
+    thread_local! {
+        /// How many times `look_again` ran on this thread (the test).
+        pub(super) static LOOKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Review c04 #9: a focus change reads the files once, not twice.
+    #[test]
+    fn a_files_check_looks_again_once() {
+        let (window, _ipc, _sent, _) = crate::testing::linked("lib", "looks", super::Page::Home);
+        LOOKS.with(|n| n.set(0));
+        window.invoke_files_check();
+        assert_eq!(LOOKS.with(std::cell::Cell::get), 1);
+    }
+
+    /// Review c04 #8: the title-bar icon is built at the window's display scale (it was built at
+    /// scale 1, so 16 px on a 150 % display). A forced 2.0 makes it show on any box.
+    #[test]
+    fn the_window_icon_is_built_at_the_window_scale() {
+        crate::pages::force_scale(Some(2.0));
+        let (window, _ipc, _sent, _) = crate::testing::linked("lib", "icon", super::Page::Home);
+        crate::pages::force_scale(None);
+        assert!((window.get_icon_scale() - 2.0).abs() < f32::EPSILON);
+        assert_eq!(window.get_window_icon().size().width, 32);
+        assert_eq!(super::icon_size(1.5), 24);
+        assert_eq!(super::icon_size(1.0), 16);
+    }
+
+    /// The title-bar icon takes the accent at run time: the record dot of the light accent.
+    #[test]
+    fn the_window_icon_follows_the_accent() {
+        let (window, _ipc, _sent, _) =
+            crate::testing::linked("lib", "icon-accent", super::Page::Home);
+        let dot = |window: &AppWindow| {
+            let image = window.get_window_icon();
+            let buffer = image.to_rgba8().expect("pixels");
+            let n = buffer.width() as usize;
+            let pixels = buffer.as_slice();
+            // The most saturated pixel is the dot.
+            let c = pixels
+                .iter()
+                .max_by_key(|p| {
+                    p.r.abs_diff(p.g)
+                        .max(p.g.abs_diff(p.b))
+                        .max(p.r.abs_diff(p.b))
+                })
+                .copied()
+                .unwrap();
+            assert!(n >= 16);
+            (c.r, c.g, c.b)
+        };
+        let red = dot(&window);
+        let iris = super::AccentColors {
+            accent: 0x005B_5BD6,
+            ..super::AccentColors::RED_LIGHT
+        };
+        super::set_accent(&window, iris, iris);
+        let blue = dot(&window);
+        assert_ne!(red, blue);
+        assert!(blue.2 > blue.0, "blue-ish after Iris: {blue:?}");
     }
 
     #[test]

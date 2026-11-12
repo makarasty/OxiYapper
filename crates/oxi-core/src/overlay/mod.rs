@@ -4,6 +4,7 @@ mod accent;
 mod look;
 mod meter;
 mod place;
+mod progress;
 
 pub use accent::{
     AccentTheme, PRESETS, Preset, close_to_error, contrast, derive, hex, lift, mix, parse_seed,
@@ -19,4 +20,9 @@ pub use place::{
     PILL_EM_MIN, PILL_GAP, PILL_H_DIP, PILL_ICON, PILL_METER_MIN, PILL_PAD, PILL_TRACK,
     PILL_TRACK_BOTTOM, PILL_W_DIP, Quns, RecClock, Rect, SWEEP, SWEEP_LEN, label_variants, label_x,
     pill_label, place, progress_span, visible,
+};
+pub use progress::{
+    CHASE_MS, DEFAULT_EST, EST_CEIL, EST_TAU, FINISH_MS, HOLD_MS, KICK, KICK_MS, MIN_EST,
+    PROJECT_AHEAD, REAL_MIN, SPEED_LIMIT, Smooth, State as ProgressState, TARGET_CAP, learn,
+    transcribe_base_ms, transcribe_est, typing_est,
 };

@@ -2,14 +2,13 @@
 //! and 11). It opens a [`Capture`] on `Start`, hands the finished 16 kHz audio to the coordinator
 //! on `Stop`, and turns capture events into machine events. Audio is never logged.
 
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, Sender};
 use std::thread::{Builder, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use oxi_core::audio::{AudioError, Level, SpeechDetector};
+use oxi_core::audio::AudioError;
 use oxi_core::config::Audio;
 use oxi_core::machine::{EmptyAudio, Event, JobId};
-use oxi_core::types::Millis;
 use oxi_platform::capture::{
     Capture, CaptureError, CaptureEvent, CpalCapture, LevelMeter, Recorded,
 };
@@ -27,85 +26,42 @@ pub fn spawn(
         .spawn(move || run::<CpalCapture>(&rx, &inbox, &meter))
 }
 
-/// How often the meter is read for speech while a recording runs; the meter window is 20 ms.
-const SPEECH_POLL: Duration = Duration::from_millis(10);
-
-/// Watches the meter of one recording and says once when speech starts ([`Event::SpeechHeard`]).
-struct SpeechWatch {
-    session: u64,
-    detector: SpeechDetector,
-}
-
-impl SpeechWatch {
-    fn new(session: u64) -> Self {
-        Self {
-            session,
-            detector: SpeechDetector::new(),
-        }
-    }
-
-    /// The message for the coordinator when `level` at `now` is the moment speech is heard.
-    fn poll(&mut self, level: Level, now: Millis) -> Option<Inbox> {
-        self.detector.feed(level, now).then_some(Inbox::Capture {
-            session: self.session,
-            event: Event::SpeechHeard,
-        })
-    }
-}
-
 /// The command loop. The capture is created and dropped on this thread only (cpal streams are
 /// not always `Send`), so `C` needs no `Send` bound.
 fn run<C: Capture>(rx: &Receiver<AudioCmd>, inbox: &Sender<Inbox>, meter: &LevelMeter) {
     let mut opts = Audio::default();
     let mut capture: Option<C> = None;
-    // Set while a recording runs and speech has not been heard yet.
-    let mut watch: Option<SpeechWatch> = None;
-    let epoch = Instant::now();
     // A send fails only when the coordinator is gone; nothing is left to tell then.
     let send = |msg: Inbox| {
         let _ = inbox.send(msg);
     };
 
-    loop {
-        let cmd = if watch.is_some() {
-            match rx.recv_timeout(SPEECH_POLL) {
-                Ok(cmd) => cmd,
-                Err(RecvTimeoutError::Timeout) => {
-                    let now =
-                        Millis(u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX));
-                    if let Some(msg) = watch.as_mut().and_then(|w| w.poll(meter.read(), now)) {
-                        send(msg);
-                        watch = None;
-                    }
-                    continue;
-                }
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
-        } else {
-            let Ok(cmd) = rx.recv() else { return };
-            cmd
-        };
+    // Speech comes from the capture as an event: no timer here, the loop only waits for commands.
+    while let Ok(cmd) = rx.recv() {
         match cmd {
             AudioCmd::Config(audio) => opts = audio,
             AudioCmd::Start { session } => {
                 capture = None; // a second Start must not hold two streams
-                watch = None;
                 let events = inbox.clone();
+                let opening = Instant::now();
                 let opened = C::open(&opts, meter.clone(), move |e| {
                     let event = match e {
                         CaptureEvent::DeviceLost => Event::DeviceLost,
                         CaptureEvent::Failed => Event::CaptureFailed,
+                        CaptureEvent::SpeechHeard => Event::SpeechHeard,
                     };
                     let _ = events.send(Inbox::Capture { session, event });
                 });
+                // Speech before the stream runs is never recorded: this says how long that was.
+                let open_ms = opening.elapsed().as_millis();
                 match opened {
                     Ok(c) => {
+                        tracing::info!(session, open_ms, "microphone opened");
                         if c.fell_back_to_default() {
                             let event = Event::MicFellBack;
                             send(Inbox::Capture { session, event });
                         }
                         capture = Some(c);
-                        watch = Some(SpeechWatch::new(session));
                     }
                     Err(e) => {
                         tracing::warn!("microphone not opened: {e}");
@@ -114,14 +70,10 @@ fn run<C: Capture>(rx: &Receiver<AudioCmd>, inbox: &Sender<Inbox>, meter: &Level
                     }
                 }
             }
-            AudioCmd::Discard => {
-                capture = None;
-                watch = None;
-            }
+            AudioCmd::Discard => capture = None,
             AudioCmd::Stop(job) => {
-                watch = None;
                 send(match finish(capture.take(), job) {
-                    Ok(Recorded { samples, spool }) => Inbox::JobAudio {
+                    Ok(Recorded { samples, spool, .. }) => Inbox::JobAudio {
                         job,
                         samples,
                         spool,
@@ -134,7 +86,8 @@ fn run<C: Capture>(rx: &Receiver<AudioCmd>, inbox: &Sender<Inbox>, meter: &Level
 }
 
 /// The audio of a stopped capture, or why there is none. Either way the job gets its answer, so
-/// it is not stranded in `AwaitingAudio`, and whisper never gets empty audio.
+/// it is not stranded in `AwaitingAudio`, and whisper never gets empty audio. Every outcome is
+/// logged with where the voice sat (never the audio), so a lost recording leaves a reason.
 fn finish<C: Capture>(capture: Option<C>, job: JobId) -> Result<Recorded, EmptyAudio> {
     let Some(capture) = capture else {
         tracing::warn!(?job, "stop without an open capture");
@@ -144,7 +97,7 @@ fn finish<C: Capture>(capture: Option<C>, job: JobId) -> Result<Recorded, EmptyA
     if dropped > 0 {
         tracing::warn!(?job, dropped, "capture ring overflowed");
     }
-    match capture.finish_recording() {
+    let result = match capture.finish_recording() {
         Ok(rec) if !rec.samples.is_empty() => Ok(rec),
         // A quiet tap is ordinary: no warning.
         Ok(_) | Err(CaptureError::Audio(AudioError::NothingHeard)) => Err(EmptyAudio::NothingHeard),
@@ -153,7 +106,24 @@ fn finish<C: Capture>(capture: Option<C>, job: JobId) -> Result<Recorded, EmptyA
             tracing::warn!(?job, "capture failed to finish: {e}");
             Err(EmptyAudio::Failed)
         }
+    };
+    match &result {
+        Ok(Recorded { trim, stats, .. }) => tracing::info!(
+            ?job,
+            outcome = "ok",
+            ?trim,
+            audio_ms = stats.audio_ms,
+            voiced_ms = stats.voiced_ms,
+            first_voiced_ms = ?stats.first_voiced_ms,
+            last_voiced_to_end_ms = ?stats.last_voiced_to_end_ms,
+            dropped_samples = dropped,
+            "capture finished"
+        ),
+        Err(why) => {
+            tracing::info!(?job, outcome = ?why, dropped_samples = dropped, "capture finished");
+        }
     }
+    result
 }
 
 #[cfg(test)]
@@ -164,7 +134,8 @@ mod tests {
 
     /// No microphone: `opts.device` picks the behaviour. "fail" cannot open, "fallback" reports
     /// the default device, "lose" loses the device right after opening, "bad-finish" fails in
-    /// `finish`, "quiet" hears no speech, "mute" gives all zeros, "spooled" streamed to history.
+    /// `finish`, "quiet" hears no speech, "mute" gives all zeros, "spooled" streamed to history,
+    /// "speech" hears the user speak right after opening.
     struct Fake {
         device: String,
     }
@@ -185,6 +156,9 @@ mod tests {
             if opts.device == "lose" {
                 on_event(CaptureEvent::DeviceLost);
             }
+            if opts.device == "speech" {
+                on_event(CaptureEvent::SpeechHeard);
+            }
             Ok(Self {
                 device: opts.device.clone(),
             })
@@ -200,7 +174,11 @@ mod tests {
         }
         fn finish_recording(self) -> Result<Recorded, CaptureError> {
             let spool = (self.device == "spooled").then(|| SPOOL.into());
-            self.finish().map(|samples| Recorded { samples, spool })
+            self.finish().map(|samples| Recorded {
+                samples,
+                spool,
+                ..Recorded::default()
+            })
         }
         fn finish(self) -> Result<Vec<f32>, CaptureError> {
             match self.device.as_str() {
@@ -359,25 +337,13 @@ mod tests {
     }
 
     #[test]
-    fn speech_is_reported_once_with_the_session_of_its_recording() {
-        let loud = Level {
-            peak: 0.5,
-            rms: 0.5,
-        };
-        let mut w = SpeechWatch::new(4);
-        assert!(w.poll(loud, Millis(0)).is_none());
-        let Some(Inbox::Capture { session, event }) = w.poll(loud, Millis(100)) else {
-            panic!("speech not reported");
-        };
-        assert_eq!((session, event), (4, Event::SpeechHeard));
-        // A quiet recording says nothing.
-        let mut quiet = SpeechWatch::new(5);
-        let silence = Level {
-            peak: 0.0,
-            rms: 0.0,
-        };
-        assert!(quiet.poll(silence, Millis(0)).is_none());
-        assert!(quiet.poll(silence, Millis(1000)).is_none());
+    fn audio_speech_heard_by_the_capture_reaches_the_machine_with_its_session() {
+        let msgs = drive(vec![cfg("speech"), start(4), AudioCmd::Stop(J)]);
+        assert_eq!(captures(&msgs), [(4, Event::SpeechHeard)]);
+        assert_eq!(job_audio(&msgs).len(), 1);
+        // A recording the capture heard nothing in says nothing.
+        let quiet = drive(vec![start(5), AudioCmd::Stop(J)]);
+        assert_eq!(captures(&quiet), []);
     }
 
     #[test]

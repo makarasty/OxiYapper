@@ -6,16 +6,25 @@ use crate::types::Millis;
 const SPEECH_RMS_DBFS: f32 = -40.0;
 /// The level must hold this long without a gap: a click is a few milliseconds.
 const SPEECH_HOLD: Millis = Millis(80);
+/// Worst input time from the first spoken sound to the gate path reporting speech (a quiet voice
+/// under the level; `audio_quiet_short_phrase_is_heard_and_kept` pins it with a -45 dBFS tone).
+pub(super) const GATE_REPORT_MAX: Millis = Millis(150);
+/// The level path: the hold plus the one 20 ms window that carries it.
+pub(super) const LEVEL_REPORT_MAX: Millis = Millis(SPEECH_HOLD.0 + 20);
+/// What is added after the pipeline reports: the 10 ms capture drain poll, ~20 ms of device buffer
+/// and the hop to the coordinator with margin.
+pub(super) const REPORT_OVERHEAD: Millis = Millis(50);
 /// Worst time from the first spoken sound to [`crate::machine::Event::SpeechHeard`] reaching the
-/// machine: the hold, a 20 ms meter window, a 10 ms meter poll, ~20 ms of device buffer and the
-/// hop to the coordinator, plus margin. A cancel waits this long for speech already started.
-pub const DETECTOR_LATENCY: Millis = Millis(SPEECH_HOLD.0 + 70);
+/// machine, over the slower of the two paths (the gate: a cancel must wait for it too, or a stray
+/// key just after a quiet start cancels a recording that has speech). A cancel waits this long.
+pub const DETECTOR_LATENCY: Millis = Millis(GATE_REPORT_MAX.0 + REPORT_OVERHEAD.0);
+// The budget covers both report paths.
+const _: () = assert!(LEVEL_REPORT_MAX.0 + REPORT_OVERHEAD.0 <= DETECTOR_LATENCY.0);
 
-/// Says when the user started speaking, from the meter level over the capture so far. The machine
-/// uses it to tell a shortcut pressed before any speech from a stray key during dictation (R2.1).
-///
-/// shortcut: a level gate, not the VAD (the speech gate lives in the capture thread and does not
-/// report); upgrade by sending a `CaptureEvent` from `Gate::feed` when `oxi-platform` is open.
+/// Says when the user started speaking, from the level of each window over the capture so far.
+/// [`super::Pipeline::speech_started`] joins it with the speech gate (a quiet voice under the
+/// level); the machine uses that to tell a shortcut pressed before any speech from a stray key
+/// during dictation (R2.1).
 #[derive(Debug, Clone, Default)]
 pub struct SpeechDetector {
     /// When the level went over the threshold, if it is over now.

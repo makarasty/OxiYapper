@@ -2,8 +2,8 @@ use oxi_core::config::OverlayPosition;
 use oxi_core::device::{Device, DeviceChoice};
 use oxi_core::hotkey::Key;
 use oxi_core::ipc::{
-    DecodeError, Decoder, DownloadResult, MAX_LINE, PROTO, Push, Request, TestFailure, TestOutcome,
-    encode, pipe_name, socket_file,
+    DecodeError, Decoder, DownloadResult, HistoryItem, MAX_LINE, PROTO, Push, Request, Spoken,
+    TestFailure, TestOutcome, WatchedFile, encode, pipe_name, socket_file,
 };
 use oxi_core::machine::Phase;
 use oxi_core::stats::{Date, Summary};
@@ -55,6 +55,7 @@ fn pushes() -> Vec<Push> {
             model: "turbo".into(),
             device: DeviceChoice::Named("Vulkan0".into()),
             backend: "Vulkan0".into(),
+            loaded: true,
             warnings: vec!["gpu not found".into()],
         },
         Push::Devices {
@@ -102,6 +103,11 @@ fn pushes() -> Vec<Push> {
             heat_start: Date::from_ymd(2026, 11, 2).unwrap(),
             heat: vec![0, 1, 4, 2, 3, 0],
         }),
+        Push::TestProgress {
+            id: 7,
+            percent: 0,
+            est_ms: Some(1200),
+        },
         Push::TestResult {
             id: 7,
             outcome: TestOutcome::Heard {
@@ -115,6 +121,26 @@ fn pushes() -> Vec<Push> {
                 why: TestFailure::ModelMissing,
             },
         },
+        Push::HistoryAdded {
+            item: HistoryItem {
+                id: "2026-11-11/101500-123".into(),
+                status: oxi_core::history::Status::Done,
+                duration_ms: 2500,
+                model: "turbo".into(),
+                language: "auto".into(),
+                text: Spoken("test".into()),
+            },
+        },
+        Push::HistoryRemoved {
+            ids: vec![
+                "2026-11-01/090000-000".into(),
+                "2026-11-01/090100-000".into(),
+            ],
+        },
+        Push::FileChanged {
+            file: WatchedFile::Replace,
+        },
+        Push::Woke,
     ]
 }
 
@@ -162,6 +188,20 @@ fn unknown_optional_field_is_accepted() {
     assert_eq!(
         d.decode::<Request>().unwrap().unwrap(),
         Request::CaptureHotkey { on: false }
+    );
+}
+
+#[test]
+fn a_progress_push_without_an_estimate_still_decodes() {
+    let mut d = Decoder::new();
+    d.push(b"{\"t\":\"TestProgress\",\"id\":3,\"percent\":40}\n");
+    assert_eq!(
+        d.decode::<Push>().unwrap().unwrap(),
+        Push::TestProgress {
+            id: 3,
+            percent: 40,
+            est_ms: None
+        }
     );
 }
 

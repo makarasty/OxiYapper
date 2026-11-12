@@ -59,14 +59,9 @@ impl Input for Keyboard {
         keys::send_keys(&chord_events(keys)).map_err(|_| InputBlocked)
     }
 
-    fn type_units(&mut self, units: &[u16], gap: Millis) -> Result<(), InputBlocked> {
-        for (i, character) in characters(units).enumerate() {
-            if i > 0 {
-                self.sleep(gap);
-            }
-            keys::send_units(character).map_err(|_| InputBlocked)?;
-        }
-        Ok(())
+    /// One `SendInput` call for the whole batch; the pace is core's (`TypePace`).
+    fn send_units(&mut self, units: &[u16]) -> Result<(), InputBlocked> {
+        keys::send_units(units).map_err(|_| InputBlocked)
     }
 
     fn sleep(&mut self, time: Millis) {
@@ -79,16 +74,6 @@ fn chord_events(keys: &[Key]) -> Vec<(Key, bool)> {
     let downs = keys.iter().map(|&k| (k, true));
     let ups = keys.iter().rev().map(|&k| (k, false));
     downs.chain(ups).collect()
-}
-
-/// `units` split per character: a valid surrogate pair stays together, any other unit alone.
-fn characters(units: &[u16]) -> impl Iterator<Item = &[u16]> {
-    let mut rest = units;
-    char::decode_utf16(units.iter().copied()).map(move |c| {
-        let (character, tail) = rest.split_at(c.map_or(1, char::len_utf16));
-        rest = tail;
-        character
-    })
 }
 
 fn foreground() -> Foreground {
@@ -119,7 +104,7 @@ fn hosted_app(frame: u32, children: &[u32]) -> Option<u32> {
 }
 
 /// Exe name (empty when unreadable) and integrity level of process `pid`.
-fn process_facts(pid: u32) -> (String, Option<u32>) {
+pub(super) fn process_facts(pid: u32) -> (String, Option<u32>) {
     // SAFETY: opening with query rights only; pid 0 or a dead pid gives a null handle.
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if process.is_null() {
@@ -132,7 +117,7 @@ fn process_facts(pid: u32) -> (String, Option<u32>) {
     (app, integrity(process.0))
 }
 
-fn window_pid(window: HWND) -> u32 {
+pub(super) fn window_pid(window: HWND) -> u32 {
     let mut pid = 0;
     // SAFETY: `pid` is a live local; a null or stale window leaves it 0.
     unsafe { GetWindowThreadProcessId(window, &raw mut pid) };
@@ -243,18 +228,6 @@ mod tests {
                 (Key::LCtrl, false),
             ]
         );
-    }
-
-    #[test]
-    fn characters_keep_surrogate_pairs_whole() {
-        let units: Vec<u16> = "a\u{1F600}b".encode_utf16().collect();
-        let got: Vec<&[u16]> = characters(&units).collect();
-        assert_eq!(got, [&[0x61][..], &[0xD83D, 0xDE00], &[0x62]]);
-        // Lone or reversed surrogates go one unit at a time, nothing dropped.
-        let broken = [0xD83D, 0x61, 0xDE00, 0xD83D];
-        let got: Vec<&[u16]> = characters(&broken).collect();
-        assert_eq!(got, [&[0xD83D][..], &[0x61], &[0xDE00], &[0xD83D]]);
-        assert_eq!(characters(&[]).count(), 0);
     }
 
     #[test]

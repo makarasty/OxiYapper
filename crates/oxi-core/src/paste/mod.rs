@@ -1,9 +1,12 @@
 //! Paste: the outcome vocabulary, the clipboard and input traits each OS implements, and the
 //! paste algorithm itself (ARCHITECTURE 10, decision D6).
 
-use crate::config::{Paste, PasteMode};
+use crate::config::{Paste, PasteMode, PasteRule, TypeSpeed};
 use crate::hotkey::{Chord, Key};
 use crate::types::Millis;
+
+mod typing;
+pub use typing::chunk_end;
 
 #[cfg(test)]
 mod tests;
@@ -13,7 +16,8 @@ mod tests;
 pub enum PasteOutcome {
     /// Clipboard set, paste chord sent, clipboard restored.
     Pasted,
-    /// Typed key by key (type mode, or the clipboard could not be saved whole).
+    /// Typed key by key (type mode, or the clipboard could not be saved whole). Why is reported
+    /// as [`PasteStep::Typed`].
     Typed,
     /// Left on the clipboard for the user to paste.
     ClipboardOnly(ClipboardOnlyWhy),
@@ -67,8 +71,38 @@ const UNSEEN_MISSES: u8 = 3;
 pub const RESTORE_TRIES: u32 = 5;
 /// Item 52: the wait before the second try, doubled before each later one (50 to 400 ms).
 pub const RESTORE_RETRY_GAP: Millis = Millis(50);
-/// Type mode: gap between characters (games drop faster input).
+/// Type mode: gap between characters at the safe pace (games drop faster input).
 pub const TYPE_GAP: Millis = Millis(5);
+
+/// How typed text is paced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypePace {
+    /// UTF-16 units handed to one [`Input::send_units`] call at most.
+    pub units_per_call: usize,
+    /// Wait before every call but the first.
+    pub gap: Millis,
+}
+
+impl TypePace {
+    /// 300 characters in about 40 ms (19 calls).
+    pub const FAST: Self = Self {
+        units_per_call: 16,
+        gap: Millis(2),
+    };
+    /// One character per call, [`TYPE_GAP`] apart: the pace before chunking, for apps that drop
+    /// fast synthetic input.
+    pub const SAFE: Self = Self {
+        units_per_call: 1,
+        gap: TYPE_GAP,
+    };
+
+    fn of(speed: TypeSpeed) -> Self {
+        match speed {
+            TypeSpeed::Fast => Self::FAST,
+            TypeSpeed::Safe => Self::SAFE,
+        }
+    }
+}
 
 /// What [`Clipboard::snapshot`] could save of the current clipboard.
 #[derive(Debug, PartialEq, Eq)]
@@ -76,10 +110,60 @@ pub enum Snap<S> {
     /// Every format was saved.
     Complete(S),
     /// Some format was too big, delayed-render or unreadable: a restore would lose data, so
-    /// the clipboard is left alone and the text typed.
+    /// the clipboard is left alone and the text typed. Why: [`Clipboard::incomplete_why`].
     Incomplete,
     /// Another app held the clipboard open through every retry.
     Locked,
+}
+
+/// Why a snapshot is not whole. Format ids, OS codes and sizes only, never clipboard content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncompleteWhy {
+    /// `GetClipboardData` gave no data for this format.
+    NoData { format: u32, code: u32 },
+    /// The format's memory block could not be sized or locked.
+    NoLock { format: u32, code: u32 },
+    /// Listing the formats failed.
+    EnumFailed { code: u32 },
+    /// One format is bigger than the room left under [`SNAPSHOT_CAP`].
+    TooBig { format: u32, bytes: u64, room: u64 },
+    /// Windows marks the clipboard owner's window hung.
+    HungOwner,
+    /// Only handle formats (a lone metafile, say): a restore would put back nothing.
+    OnlyHandles,
+    /// The helper thread or its window could not be made.
+    NoHelper,
+    /// The owner did not render this delayed format in [`DELAYED_RENDER_TIMEOUT`].
+    RenderTimeout { format: u32 },
+    /// Our earlier helper still holds the clipboard open (it gave up on a slow owner).
+    HelperBusy,
+}
+
+/// Why the text was typed instead of pasted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypedWhy {
+    /// `paste.mode = "type"`.
+    Mode,
+    /// A rule for the foreground app says `mode = "type"`.
+    Rule,
+    /// The clipboard could not be saved whole; `None` when the clipboard does not say why.
+    Incomplete(Option<IncompleteWhy>),
+    /// Another app held the clipboard open.
+    Locked,
+    /// The user copied during the history work and that copy could not be saved whole.
+    ChangedDuringHistory,
+}
+
+/// What the paste worker can say about one paste while it runs (no text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteStep {
+    /// The text will be typed; sent before the first unit goes out.
+    Typed(TypedWhy),
+    /// `done` of `total` UTF-16 units typed so far.
+    Typing { done: usize, total: usize },
+    /// The text is in the field: right after the paste chord, or after the last typed unit.
+    /// The clipboard restore and history work may still run.
+    Landed,
 }
 
 /// A clipboard call failed. Carries the call and OS code, never clipboard text.
@@ -101,6 +185,11 @@ pub trait Clipboard {
     /// Saved clipboard contents, handed back to [`Clipboard::restore`].
     type Snapshot;
     fn snapshot(&mut self) -> Snap<Self::Snapshot>;
+    /// Why the last [`snapshot`](Self::snapshot) answered [`Snap::Incomplete`]; `None` when
+    /// this clipboard does not say (the default).
+    fn incomplete_why(&self) -> Option<IncompleteWhy> {
+        None
+    }
     /// Whether the saved data stays out of the OS clipboard history: its owner kept it out (a
     /// password manager's copy, say) or the history never takes it (files).
     /// The paste then never waits for it to show there.
@@ -180,9 +269,28 @@ pub trait Input {
     fn foreground(&self) -> Foreground;
     /// Presses `keys` in order and releases them in reverse.
     fn send_chord(&mut self, keys: &[Key]) -> Result<(), InputBlocked>;
+    /// One input batch: key-down and key-up for each UTF-16 unit, in order. No sleep inside.
+    /// The default is one [`type_units`](Self::type_units) call at [`TYPE_GAP`].
+    // shortcut: `send_units` and `type_units` default to each other so inputs written against
+    // the old per-character call still build; an input must override at least one. Upgrade:
+    // make `send_units` required and drop `type_units` once no input implements only it.
+    fn send_units(&mut self, units: &[u16]) -> Result<(), InputBlocked> {
+        self.type_units(units, TYPE_GAP)
+    }
     /// Types each UTF-16 unit as a Unicode key event pair, characters `gap` apart; the two
     /// units of a surrogate pair go together with no gap.
-    fn type_units(&mut self, units: &[u16], gap: Millis) -> Result<(), InputBlocked>;
+    fn type_units(&mut self, units: &[u16], gap: Millis) -> Result<(), InputBlocked> {
+        let mut from = 0;
+        while from < units.len() {
+            if from > 0 {
+                self.sleep(gap);
+            }
+            let end = chunk_end(units, from, 1);
+            self.send_units(&units[from..end])?;
+            from = end;
+        }
+        Ok(())
+    }
     fn sleep(&mut self, time: Millis);
 }
 
@@ -198,9 +306,7 @@ pub struct Plan {
 /// Step 1: the first rule whose app matches (case-insensitive) overrides each field it sets.
 /// A rule chord that does not parse falls back to Ctrl+V.
 pub fn plan(paste: &Paste, fg: &Foreground) -> Plan {
-    let lower = |s: &str| s.chars().flat_map(char::to_lowercase).collect::<String>();
-    let app = lower(&fg.app);
-    let rule = paste.rules.iter().find(|r| lower(&r.app) == app);
+    let rule = rule_for(&paste.rules, &fg.app);
     Plan {
         mode: rule.and_then(|r| r.mode).unwrap_or(paste.mode),
         chord: rule
@@ -211,6 +317,33 @@ pub fn plan(paste: &Paste, fg: &Foreground) -> Plan {
             rule.and_then(|r| r.restore_delay_ms)
                 .unwrap_or(paste.restore_delay_ms),
         )),
+    }
+}
+
+/// The first rule in `rules` whose app matches `app` (case-insensitive).
+fn rule_for<'a>(rules: &'a [PasteRule], app: &str) -> Option<&'a PasteRule> {
+    let lower = |s: &str| s.chars().flat_map(char::to_lowercase).collect::<String>();
+    let app = lower(app);
+    rules.iter().find(|r| lower(&r.app) == app)
+}
+
+/// The pace typed text goes at in `fg`: the matching rule's `type_speed`; else safe when a rule
+/// for the app forces typing (the user's, or the built-in one when the user's list holds no rule
+/// for it), so every app typed into by rule keeps the old pace; else `paste.type_speed`.
+pub fn type_pace(paste: &Paste, fg: &Foreground) -> TypePace {
+    let rule = rule_for(&paste.rules, &fg.app);
+    if let Some(speed) = rule.and_then(|r| r.type_speed) {
+        return TypePace::of(speed);
+    }
+    let forced = match rule {
+        Some(r) => r.mode == Some(PasteMode::Type),
+        None => rule_for(&Paste::default().rules, &fg.app)
+            .is_some_and(|r| r.mode == Some(PasteMode::Type)),
+    };
+    if forced {
+        TypePace::SAFE
+    } else {
+        TypePace::of(paste.type_speed)
     }
 }
 
@@ -226,7 +359,14 @@ pub fn paste<C: Clipboard>(
     clip: &mut C,
     input: &mut impl Input,
 ) -> PasteOutcome {
-    paste_with(text, paste, clip, input, &mut OurEntries::default())
+    paste_with(
+        text,
+        paste,
+        clip,
+        input,
+        &mut OurEntries::default(),
+        &mut |_| {},
+    )
 }
 
 /// A write of ours the history did not show in time (item 52): a later paste finds it by its place
@@ -299,6 +439,14 @@ impl OurEntries {
             }
         }
         ours
+    }
+}
+
+impl OurEntries {
+    /// Ids of our entries still in Win+V, oldest first (ids only, no text).
+    #[must_use]
+    pub fn ids(&self) -> &[String] {
+        &self.ids
     }
 }
 
@@ -685,13 +833,15 @@ fn restore_retrying<C: Clipboard>(
 /// until the history shows it and lists it in `ours` (kept by the caller), and the user's copy
 /// goes back outside the history. Ctrl+V gives the user's copy, Win+V shows this dictation on
 /// top, and no entry of the user's is pushed out. A copy that cannot be kept is never
-/// overwritten: the text is typed instead.
+/// overwritten: the text is typed instead. `report` hears why the text is typed, its typing
+/// progress and the moment it has landed (never for `Failed` or `ClipboardOnly`).
 pub fn paste_with<C: Clipboard>(
     text: &str,
     paste: &Paste,
     clip: &mut C,
     input: &mut impl Input,
     ours: &mut OurEntries,
+    report: &mut dyn FnMut(PasteStep),
 ) -> PasteOutcome {
     let keep = paste.keep_in_clipboard_history;
     let mut waited = Millis(0);
@@ -709,13 +859,21 @@ pub fn paste_with<C: Clipboard>(
         return clipboard_only(text, keep, clip, input, ours, ClipboardOnlyWhy::Elevated);
     }
     let plan = plan(paste, &fg);
+    let pace = type_pace(paste, &fg);
     if plan.mode == PasteMode::Type {
-        return type_text(text, input);
+        let by_rule = rule_for(&paste.rules, &fg.app).is_some_and(|r| r.mode.is_some());
+        let why = if by_rule {
+            TypedWhy::Rule
+        } else {
+            TypedWhy::Mode
+        };
+        return type_text(text, why, pace, input, report);
     }
     // Read before the snapshot: a copy in between only makes the snapshot newer.
     let before = clip.sequence();
-    let Some(mut saved) = snapshot(clip) else {
-        return type_text(text, input);
+    let mut saved = match snapshot(clip) {
+        Ok(saved) => saved,
+        Err(why) => return type_text(text, why, pace, input, report),
     };
     let deadline = clip.now() + HISTORY_BUDGET + plan.restore_delay;
     let excluded = clip.is_excluded(&saved);
@@ -723,8 +881,8 @@ pub fn paste_with<C: Clipboard>(
     if clip.sequence() != before {
         // The user copied while the history work ran: that copy is what goes back (make_room
         // already kept the dictation out of Win+V).
-        let Some(newer) = snapshot(clip) else {
-            return type_text(text, input);
+        let Ok(newer) = snapshot(clip) else {
+            return type_text(text, TypedWhy::ChangedDuringHistory, pace, input, report);
         };
         saved = newer;
     }
@@ -735,6 +893,7 @@ pub fn paste_with<C: Clipboard>(
     };
     let sent = input.send_chord(&plan.chord);
     if sent.is_ok() {
+        report(PasteStep::Landed);
         input.sleep(plan.restore_delay);
     }
     // Before the restore: the history reads the clipboard late, and a restore before it saw
@@ -757,13 +916,14 @@ pub fn paste_with<C: Clipboard>(
     }
 }
 
-/// Step 4: the whole clipboard, or `None` when it is too big, has a hung or slow owner, or is
+/// Step 4: the whole clipboard, or why not when it is too big, has a hung or slow owner, or is
 /// held open: a restore would lose the user's copy, so it is not overwritten at all (item 52,
 /// owner 2026-11-10).
-fn snapshot<C: Clipboard>(clip: &mut C) -> Option<C::Snapshot> {
+fn snapshot<C: Clipboard>(clip: &mut C) -> Result<C::Snapshot, TypedWhy> {
     match clip.snapshot() {
-        Snap::Complete(saved) => Some(saved),
-        Snap::Incomplete | Snap::Locked => None,
+        Snap::Complete(saved) => Ok(saved),
+        Snap::Incomplete => Err(TypedWhy::Incomplete(clip.incomplete_why())),
+        Snap::Locked => Err(TypedWhy::Locked),
     }
 }
 
@@ -777,7 +937,7 @@ fn clipboard_only(
 ) -> PasteOutcome {
     let before = clip.sequence();
     // Judged as in `paste_with`: a copy the history never takes costs no wait. Unreadable: wait.
-    let excluded = snapshot(clip).is_some_and(|saved| clip.is_excluded(&saved));
+    let excluded = snapshot(clip).is_ok_and(|saved| clip.is_excluded(&saved));
     let deadline = clip.now() + HISTORY_BUDGET;
     let room = make_room(keep, ours, before, excluded, deadline, clip, input);
     let Ok(seq) = clip.set_text(text, room.in_history(keep)) else {
@@ -790,10 +950,29 @@ fn clipboard_only(
     PasteOutcome::ClipboardOnly(why)
 }
 
-fn type_text(text: &str, input: &mut impl Input) -> PasteOutcome {
+/// Types `text` in chunks of [`chunk_end`], `pace.gap` apart, reporting progress after each.
+fn type_text(
+    text: &str,
+    why: TypedWhy,
+    pace: TypePace,
+    input: &mut impl Input,
+    report: &mut dyn FnMut(PasteStep),
+) -> PasteOutcome {
+    report(PasteStep::Typed(why));
     let units: Vec<u16> = text.encode_utf16().collect();
-    match input.type_units(&units, TYPE_GAP) {
-        Ok(()) => PasteOutcome::Typed,
-        Err(InputBlocked) => PasteOutcome::Failed,
+    let total = units.len();
+    let mut from = 0;
+    while from < total {
+        if from > 0 {
+            input.sleep(pace.gap);
+        }
+        let end = chunk_end(&units, from, pace.units_per_call);
+        if input.send_units(&units[from..end]).is_err() {
+            return PasteOutcome::Failed;
+        }
+        from = end;
+        report(PasteStep::Typing { done: from, total });
     }
+    report(PasteStep::Landed);
+    PasteOutcome::Typed
 }

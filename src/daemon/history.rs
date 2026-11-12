@@ -16,6 +16,7 @@ use std::thread::{self, JoinHandle};
 use oxi_core::audio::{SAMPLE_RATE, resample};
 use oxi_core::config::{ConfigFile, History};
 use oxi_core::history::{self, EXTENSIONS, Entry, JSON, Meta, Status, TXT, WAV};
+use oxi_core::ipc::{HistoryItem, Push, Spoken};
 use oxi_core::machine::Notice;
 use oxi_core::stats::Date;
 use oxi_core::tuning::SettingsSet;
@@ -76,6 +77,8 @@ pub fn spawn(
         local_now,
         move || Context::from_config_file(&config_file),
         notify,
+        // Lazy: nothing is read unless a settings window is connected.
+        super::ipc::announce,
     )
 }
 
@@ -86,6 +89,7 @@ fn spawn_with(
     clock: fn() -> (Date, u32),
     context: impl Fn() -> Context + Send + 'static,
     notify: impl Fn(Notice) + Send + 'static,
+    changed: impl Fn(Push) + Send + 'static,
 ) -> io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("history".into())
@@ -106,6 +110,15 @@ fn spawn_with(
                     if !pass.recovered.is_empty() {
                         notify(Notice::Recovered);
                     }
+                }
+                // After the files are on disk: an open History shows the change at once.
+                for item in std::mem::take(&mut pass.added) {
+                    changed(Push::HistoryAdded { item });
+                }
+                if !pass.removed.is_empty() {
+                    changed(Push::HistoryRemoved {
+                        ids: std::mem::take(&mut pass.removed),
+                    });
                 }
                 if warning != shown {
                     shown.clone_from(&warning);
@@ -156,7 +169,8 @@ fn handle_in(
             text,
             cfg,
             spool,
-        } => (cfg, Some((samples, text, spool))),
+            carried,
+        } => (cfg, Some((samples, text, spool, carried))),
     };
     let dir = history::folder(&cfg, default_dir);
     let claimed = if cfg.enabled { claim(&dir) } else { Ok(()) };
@@ -166,20 +180,28 @@ fn handle_in(
         Some(format!("History not saved ({:?})", e.kind()))
     };
     match dictation {
-        Some((samples, text, spool)) if cfg.enabled => {
+        Some((samples, text, spool, carried)) if cfg.enabled => {
             let saved = claimed
                 .and_then(|()| save(&dir, &samples, &text, spool.as_deref(), now, &context()));
-            if let Err(e) = saved {
-                return refused(&e);
+            match saved {
+                Ok(item) => {
+                    pass.added.push(item);
+                    // The merged audio is on disk now: the earlier parts' own recordings can go.
+                    remove_spools(&carried);
+                }
+                Err(e) => {
+                    // They may be all there is of those parts: kept as failed at the next pass.
+                    for part in &carried {
+                        spool_give_up(part);
+                    }
+                    return refused(&e);
+                }
             }
         }
         _ => {
-            // Saving was turned off during the dictation: its streamed recording goes too.
-            if let Some(part) = dictation
-                .and_then(|(_, _, spool)| spool)
-                .filter(|p| spool_take(p))
-            {
-                let _ = fs::remove_file(part);
+            // Saving was turned off during the dictation: its streamed recordings go too.
+            if let Some((_, _, spool, carried)) = dictation {
+                remove_spools(spool.iter().chain(&carried));
             }
             if let Err(e) = &claimed {
                 return refused(e);
@@ -195,6 +217,13 @@ fn handle_in(
         .map(|kind| format!("Old history not removed ({kind:?})"))
 }
 
+/// Deletes the finished recordings at `parts` that are still waiting, once their files are closed.
+fn remove_spools<'a>(parts: impl IntoIterator<Item = &'a PathBuf>) {
+    for part in parts.into_iter().filter(|p| spool_take(p)) {
+        let _ = fs::remove_file(part);
+    }
+}
+
 /// One clean-up pass: a step that fails is logged and the pass goes on with the next entry.
 #[derive(Default)]
 struct Pass {
@@ -204,6 +233,10 @@ struct Pass {
     recovered: HashSet<String>,
     /// The pass looked for recordings to recover.
     searched: bool,
+    /// The recordings this pass saved or recovered.
+    added: Vec<HistoryItem>,
+    /// The entries this pass removed, for the window.
+    removed: Vec<String>,
 }
 
 impl Pass {
@@ -290,7 +323,7 @@ fn save(
     spool: Option<&Path>,
     (date, ms): (Date, u32),
     ctx: &Context,
-) -> io::Result<()> {
+) -> io::Result<HistoryItem> {
     let spooled = spool.filter(|p| spool_take(p)).and_then(|part| {
         let base = PathBuf::from(part.to_str()?.strip_suffix(".wav.part")?);
         id_of(dir, &base)?;
@@ -316,6 +349,14 @@ fn save(
     let id = id_of(dir, &base).unwrap_or_default();
     write_atomic(&base.with_extension(TXT), text.as_bytes())
         .and_then(|()| write_meta(&base, &meta(&id, duration_ms, status, ctx)))
+        .map(|()| HistoryItem {
+            id: id.clone(),
+            status,
+            duration_ms,
+            model: ctx.model.clone(),
+            language: ctx.language.clone(),
+            text: Spoken(text.to_owned()),
+        })
         .inspect_err(|_| {
             let written = if spooled.is_some() {
                 &EXTENSIONS[1..]
@@ -381,8 +422,9 @@ fn recover(dir: &Path, pass: &mut Pass, context: &impl Fn() -> Context) {
                     Status::Interrupted
                 };
                 let done = recover_part(dir, &path, status, &context());
-                if let Some(Some(id)) = pass.check("recover a recording", done) {
-                    pass.recovered.insert(id);
+                if let Some(Some(item)) = pass.check("recover a recording", done) {
+                    pass.recovered.insert(item.id.clone());
+                    pass.added.push(item);
                 }
             }
         }
@@ -390,7 +432,7 @@ fn recover(dir: &Path, pass: &mut Pass, context: &impl Fn() -> Context) {
 }
 
 /// Makes the `.wav.part` at `part` a whole entry: the header is set from the bytes on disk, the
-/// file renamed to `.wav`, an empty `.txt` and a meta file written; returns its id. A part with
+/// file renamed to `.wav`, an empty `.txt` and a meta file written; returns the entry. A part with
 /// no audio, or not one of ours, is removed; one whose `.wav` already exists was adopted by a
 /// save and is removed.
 fn recover_part(
@@ -398,7 +440,7 @@ fn recover_part(
     part: &Path,
     status: Status,
     ctx: &Context,
-) -> io::Result<Option<String>> {
+) -> io::Result<Option<HistoryItem>> {
     let Some(base) = part
         .to_str()
         .and_then(|p| p.strip_suffix(".wav.part"))
@@ -426,7 +468,14 @@ fn recover_part(
     let id = id_of(dir, &base).unwrap_or_default();
     write_atomic(&base.with_extension(TXT), b"")?;
     write_meta(&base, &meta(&id, duration_ms, status, ctx))?;
-    Ok(Some(id))
+    Ok(Some(HistoryItem {
+        id,
+        status,
+        duration_ms,
+        model: ctx.model.clone(),
+        language: ctx.language.clone(),
+        text: Spoken(String::new()),
+    }))
 }
 
 /// Every entry of `dir`: the `.wav`, `.txt` and `.json` files named `HHMMSS-mmm` in day folders.
@@ -478,7 +527,11 @@ fn remove_entry(dir: &Path, stem: &str, pass: &mut Pass) {
 fn prune(dir: &Path, cfg: &History, today: Date, pass: &mut Pass) {
     for stem in history::expired(&scan(dir, pass), today, cfg) {
         if !pass.recovered.contains(&stem) {
+            let failed = pass.failed;
             remove_entry(dir, &stem, pass);
+            if pass.failed == failed {
+                pass.removed.push(stem);
+            }
         }
     }
 }
@@ -487,52 +540,76 @@ fn prune(dir: &Path, cfg: &History, today: Date, pass: &mut Pass) {
 // (`crates/oxi-core/src/ipc.rs`); until they are wired the daemon never calls them.
 
 /// One saved recording as the History page shows it.
-#[allow(dead_code, reason = "wired to IPC by t12")]
 pub struct Recording {
     /// `YYYY-MM-DD/HHMMSS-mmm`, the id every call below takes.
     pub id: String,
     pub meta: Meta,
     /// The transcript; empty for a cancelled, interrupted or failed one.
     pub text: String,
-    pub wav: PathBuf,
 }
 
-/// The recordings in `dir`, newest first. A folder this app did not make lists nothing. An entry
-/// without a readable meta file gets one made from its name and audio: done when it has a text
-/// (saved by an older build), failed when it has none (a save that stopped after the audio).
-#[allow(dead_code, reason = "wired to IPC by t12")]
-pub fn list(dir: &Path) -> Vec<Recording> {
-    if !owned(dir) {
-        return Vec::new();
+/// The recordings in `dir` older than `older_than`, newest first, read one at a time: the
+/// folder is listed (names and sizes, no file opened) and an entry's `.txt` and `.json` are read
+/// only when the caller asks for it, so a page of 200 reads 400 files however long the history is.
+/// A folder this app did not make lists nothing. An entry without a readable meta file gets one
+/// made from its name and audio: done when it has a text (saved by an older build), failed when
+/// it has none (a save that stopped after the audio).
+pub fn list_from<'a>(
+    dir: &'a Path,
+    older_than: Option<&'a str>,
+) -> impl Iterator<Item = Recording> + 'a {
+    list_with(dir, older_than, read_recording)
+}
+
+/// [`list_from`] with the reader of one entry given.
+fn list_with<'a>(
+    dir: &'a Path,
+    older_than: Option<&'a str>,
+    mut read: impl FnMut(&Path, String) -> Option<Recording> + 'a,
+) -> impl Iterator<Item = Recording> + 'a {
+    let entries = if owned(dir) {
+        scan(dir, &mut Pass::default())
+    } else {
+        Vec::new()
+    };
+    entries
+        .into_iter()
+        .rev()
+        // Ids are `YYYY-MM-DD/HHMMSS-mmm`: text order is time order.
+        .filter(move |e| older_than.is_none_or(|id| e.stem.as_str() < id))
+        .filter_map(move |e| read(dir, e.stem))
+}
+
+fn read_recording(dir: &Path, id: String) -> Option<Recording> {
+    let base = dir.join(&id);
+    let wav = base.with_extension(WAV);
+    if !regular(&wav) {
+        return None;
     }
-    let mut out = Vec::new();
-    for entry in scan(dir, &mut Pass::default()).into_iter().rev() {
-        let base = dir.join(&entry.stem);
-        let wav = base.with_extension(WAV);
-        if !regular(&wav) {
-            continue;
-        }
-        let text = fs::read_to_string(base.with_extension(TXT)).unwrap_or_default();
-        let info = fs::read_to_string(base.with_extension(JSON))
-            .ok()
-            .and_then(|json| Meta::from_json(&json).ok())
-            .unwrap_or_else(|| {
-                let ms = wav_ms(&wav);
-                let status = if text.is_empty() {
-                    Status::Failed
-                } else {
-                    Status::Done
-                };
-                meta(&entry.stem, ms, status, &Context::default())
-            });
-        out.push(Recording {
-            id: entry.stem,
-            meta: info,
-            text,
-            wav,
+    let text = fs::read_to_string(base.with_extension(TXT)).unwrap_or_default();
+    let info = fs::read_to_string(base.with_extension(JSON))
+        .ok()
+        .and_then(|json| Meta::from_json(&json).ok())
+        .unwrap_or_else(|| {
+            let ms = wav_ms(&wav);
+            let status = if text.is_empty() {
+                Status::Failed
+            } else {
+                Status::Done
+            };
+            meta(&id, ms, status, &Context::default())
         });
-    }
-    out
+    Some(Recording {
+        id,
+        meta: info,
+        text,
+    })
+}
+
+/// Every recording in `dir`, newest first.
+#[cfg(test)]
+pub fn list(dir: &Path) -> Vec<Recording> {
+    list_from(dir, None).collect()
 }
 
 /// The audio of recording `id` as 16 kHz mono samples, ready for whisper (a recovered one is at
@@ -651,7 +728,7 @@ fn entry_base(dir: &Path, id: &str) -> io::Result<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::RefCell;
     use std::sync::mpsc::channel;
     use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -662,7 +739,8 @@ mod tests {
     use super::*;
     use crate::log::scratch::scratch_dir;
 
-    /// The spool folder is process-wide state: the tests run one at a time.
+    /// The spool folder is process-wide state: the tests that use it (also the coordinator's)
+    /// run one at a time, through [`temp`].
     static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
     thread_local! {
@@ -676,7 +754,7 @@ mod tests {
         (Date::from_ymd(2026, 11, 8).unwrap(), 13 * 3_600_000 + 123)
     }
 
-    fn temp(name: &str) -> PathBuf {
+    pub(crate) fn temp(name: &str) -> PathBuf {
         HELD.with(|held| {
             held.borrow_mut().get_or_insert_with(|| {
                 ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner)
@@ -704,6 +782,7 @@ mod tests {
             text: TEXT.into(),
             cfg,
             spool,
+            carried: Vec::new(),
         }
     }
 
@@ -711,7 +790,7 @@ mod tests {
     fn run(dir: &Path, cmds: Vec<HistoryCmd>) -> Vec<Option<String>> {
         let (tx, rx) = channel();
         let (inbox, replies) = channel();
-        let worker = spawn_with(rx, inbox, dir.to_owned(), clock, ctx, |_| {}).unwrap();
+        let worker = spawn_with(rx, inbox, dir.to_owned(), clock, ctx, |_| {}, |_| {}).unwrap();
         for cmd in cmds {
             tx.send(cmd).unwrap();
         }
@@ -1062,6 +1141,7 @@ mod tests {
             text: String::new(),
             cfg: cfg(true),
             spool: None,
+            carried: Vec::new(),
         };
         assert_eq!(handle(cmd, &dir, clock(), &ctx), None);
         let base = dir.join("2026-11-08/130000-123");
@@ -1155,7 +1235,7 @@ mod tests {
         let (inbox, _replies) = channel();
         let (seen_tx, seen) = channel();
         let notify = move |n| seen_tx.send(n).unwrap();
-        let worker = spawn_with(rx, inbox, dir.clone(), clock, ctx, notify).unwrap();
+        let worker = spawn_with(rx, inbox, dir.clone(), clock, ctx, notify, |_| {}).unwrap();
         tx.send(HistoryCmd::Config(cfg(true))).unwrap();
         let wait = Duration::from_secs(10);
         assert_eq!(seen.recv_timeout(wait), Ok(Notice::Recovered));
@@ -1183,7 +1263,7 @@ mod tests {
         let (inbox, replies) = channel();
         let (seen_tx, seen) = channel();
         let notify = move |n| seen_tx.send(n).unwrap();
-        let worker = spawn_with(rx, inbox, dir.clone(), clock, ctx, notify).unwrap();
+        let worker = spawn_with(rx, inbox, dir.clone(), clock, ctx, notify, |_| {}).unwrap();
         tx.send(HistoryCmd::Config(cfg(true))).unwrap();
         let wait = Duration::from_secs(10);
         assert!(matches!(
@@ -1280,6 +1360,62 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Two finished recordings: the first is carried on into the second by a press inside the
+    /// hold gap.
+    fn carried_pair(dir: &Path) -> (PathBuf, PathBuf) {
+        handle(HistoryCmd::Config(cfg(true)), dir, clock(), &ctx);
+        let mut first = WavSpool::begin(48_000).unwrap();
+        first.push(&vec![0.1; 4800]);
+        let first = first.finish();
+        thread::sleep(Duration::from_millis(3)); // the next one gets its own name
+        let mut second = WavSpool::begin(48_000).unwrap();
+        second.push(&vec![0.2; 4800]);
+        (first, second.finish())
+    }
+
+    /// The save of the merged dictation of `carried` and `spool`.
+    fn merged_save(spool: Option<PathBuf>, carried: &Path) -> HistoryCmd {
+        HistoryCmd::Save {
+            samples: vec![0.25; 1600],
+            text: TEXT.into(),
+            cfg: cfg(true),
+            spool,
+            carried: vec![carried.to_owned()],
+        }
+    }
+
+    /// The first part's own recording goes once the merged audio is written.
+    #[test]
+    fn a_merged_save_deletes_the_carried_part_after_its_audio_is_written() {
+        let dir = owned_temp("carried");
+        let (first, second) = carried_pair(&dir);
+        let save = merged_save(Some(second), &first);
+        assert_eq!(handle(save, &dir, clock(), &ctx), None);
+        assert!(!first.exists(), "the carried part goes after the write");
+        let [wav] = day_wavs(&dir).try_into().expect("one merged entry");
+        assert_eq!(meta_of(&wav).status, Status::Done);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The merged save fails: the first part's recording may be all there is of it and is kept
+    /// as failed.
+    #[test]
+    fn a_failed_merged_save_keeps_the_carried_part_as_failed() {
+        let dir = owned_temp("carried-fail");
+        let (first, second) = carried_pair(&dir);
+        // A file where the merged entry's day folder goes: its write fails.
+        let blocked = dir.join("2026-11-08");
+        fs::write(&blocked, "not a folder").unwrap();
+        assert!(handle(merged_save(None, &first), &dir, clock(), &ctx).is_some());
+        assert!(first.is_file(), "the carried part stays");
+        fs::remove_file(&blocked).unwrap();
+        assert!(spool_take(&second)); // out of the way: only the carried part is looked at
+        handle(HistoryCmd::Config(cfg(true)), &dir, clock(), &ctx);
+        let base = first.to_str().unwrap().strip_suffix(".wav.part").unwrap();
+        assert_eq!(meta_of(&PathBuf::from(base)).status, Status::Failed);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Recording 2 starts and stops while recording 1 is still being transcribed: each save gets
     /// its own recording, and the second, whose text never comes, is kept as failed.
     #[test]
@@ -1337,7 +1473,7 @@ mod tests {
         let dir = owned_temp("quit");
         let (tx, rx) = channel();
         let (inbox, _replies) = channel();
-        let worker = spawn_with(rx, inbox, dir.clone(), clock, ctx, |_| {}).unwrap();
+        let worker = spawn_with(rx, inbox, dir.clone(), clock, ctx, |_| {}, |_| {}).unwrap();
         tx.send(HistoryCmd::Config(cfg(true))).unwrap();
         // The worker sets the spool folder; a recording can start once it did.
         wait_until(|| {
@@ -1519,5 +1655,137 @@ mod tests {
         assert!(!dir.join("2026-09-01").exists());
         assert!(recent.is_file());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Runs `cmds` through a real worker and returns what it announced to the window.
+    fn announced(dir: &Path, cmds: Vec<HistoryCmd>) -> Vec<Push> {
+        let (tx, rx) = channel();
+        let (inbox, _replies) = channel();
+        let (seen_tx, seen) = channel();
+        let changed = move |p| seen_tx.send(p).unwrap();
+        let worker = spawn_with(rx, inbox, dir.to_owned(), clock, ctx, |_| {}, changed).unwrap();
+        for cmd in cmds {
+            tx.send(cmd).unwrap();
+        }
+        drop(tx);
+        worker.join().unwrap();
+        seen.try_iter().collect()
+    }
+
+    #[test]
+    fn a_saved_recording_is_announced_once_and_never_with_a_text_in_the_log_form() {
+        let dir = owned_temp("announce-add");
+        let sent = announced(&dir, vec![save_cmd(cfg(true))]);
+        let [Push::HistoryAdded { item }] = &sent[..] else {
+            panic!("{sent:?}");
+        };
+        assert_eq!(item.id, "2026-11-08/130000-123");
+        assert_eq!(item.status, Status::Done);
+        assert_eq!(item.text, Spoken(TEXT.into()));
+        assert!(
+            dir.join(format!("{}.json", item.id)).is_file(),
+            "after the files"
+        );
+        assert!(!format!("{item:?}").contains(TEXT), "Debug hides the text");
+    }
+
+    #[test]
+    fn a_retention_pass_that_removes_entries_announces_them_in_one_message() {
+        let dir = owned_temp("announce-remove");
+        let old = [
+            "2026-10-01/090000-000",
+            "2026-10-01/090100-000",
+            "2026-10-02/090000-000",
+        ];
+        for id in old {
+            file(dir.join(id).with_extension(WAV));
+            fs::write(dir.join(id).with_extension(TXT), "x").unwrap();
+        }
+        let keep = History {
+            max_days: 7,
+            ..cfg(true)
+        };
+        let sent = announced(&dir, vec![HistoryCmd::Config(keep)]);
+        let [Push::HistoryRemoved { ids }] = &sent[..] else {
+            panic!("{sent:?}");
+        };
+        assert_eq!(ids.len(), 3, "{ids:?}");
+        assert!(old.iter().all(|id| ids.iter().any(|i| i == id)));
+    }
+
+    /// Review c04 #2: a recording a Config pass files (a failed capture's streamed part) is
+    /// announced like a saved one.
+    #[test]
+    fn a_recovered_recording_is_announced_to_the_window() {
+        let dir = owned_temp("announce-recovered");
+        killed_part(&dir.join("2026-11-08/090000-000.wav.part"), 16_000, 0, 3200);
+        let sent = announced(&dir, vec![HistoryCmd::Config(cfg(true))]);
+        let [Push::HistoryAdded { item }] = &sent[..] else {
+            panic!("{sent:?}");
+        };
+        assert_eq!(item.id, "2026-11-08/090000-000");
+        assert_eq!(item.status, Status::Interrupted);
+        assert_eq!(item.text, Spoken(String::new()));
+    }
+
+    /// `count` tiny entries, a few bytes each, over several days.
+    fn many(dir: &Path, count: usize) -> Vec<String> {
+        let mut ids: Vec<String> = (0..count)
+            .map(|i| {
+                format!(
+                    "2026-{:02}-{:02}/{:02}0000-000",
+                    1 + i / 500,
+                    1 + (i % 500) / 20,
+                    i % 20
+                )
+            })
+            .collect();
+        ids.sort();
+        for id in &ids {
+            let base = dir.join(id);
+            fs::create_dir_all(base.parent().unwrap()).unwrap();
+            fs::write(base.with_extension(WAV), [0; 8]).unwrap();
+            fs::write(base.with_extension(TXT), "t").unwrap();
+        }
+        ids
+    }
+
+    #[test]
+    fn a_page_reads_its_own_entries_only_and_paging_walks_all_once() {
+        let dir = owned_temp("index");
+        let ids = many(&dir, 2000);
+        // The first page of 200 reads 200 entries (400 files), not 2000.
+        let mut reads = 0;
+        let first: Vec<_> = list_with(&dir, None, |d, id| {
+            reads += 1;
+            read_recording(d, id)
+        })
+        .take(200)
+        .map(|r| r.id)
+        .collect();
+        assert_eq!(reads, 200);
+        // Walk every page; one entry is deleted between two pages and is skipped.
+        let mut seen = first.clone();
+        let mut gone = None;
+        while seen.len() < 2000 - usize::from(gone.is_some()) {
+            let last = seen.last().unwrap().clone();
+            if gone.is_none() {
+                let victim = ids[ids.len() - seen.len() - 5].clone();
+                fs::remove_file(dir.join(&victim).with_extension(WAV)).unwrap();
+                gone = Some(victim);
+            }
+            let page: Vec<_> = list_from(&dir, Some(&last))
+                .take(200)
+                .map(|r| r.id)
+                .collect();
+            assert_ne!(page.len(), 0);
+            seen.extend(page);
+        }
+        let mut sorted = seen.clone();
+        sorted.sort_by(|a, b| b.cmp(a));
+        sorted.dedup();
+        assert_eq!(sorted, seen, "newest first, no duplicate");
+        assert!(!seen.contains(&gone.unwrap()), "a deleted entry is skipped");
+        assert_eq!(seen.len(), 1999, "no gap");
     }
 }

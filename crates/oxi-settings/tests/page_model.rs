@@ -879,15 +879,16 @@ fn reset_all_to_auto_empties_the_typed_prompt() {
     assert_eq!(field.accessible_value().as_deref(), Some(""));
 }
 
-/// Every engine parameter has its Auto row, the audio window included, each with its own glyph
-/// (DS-24.1: one meaning, one icon).
+/// Every engine parameter has its Auto row, each with its own glyph (DS-24.1: one meaning, one
+/// icon). The audio window is not one: the engine never reads it, so no row offers it.
 #[test]
 fn advanced_has_a_row_per_parameter_and_none_shares_a_glyph() {
     let window = open(&layout("adv-rows", None), Page::Model);
     sub_tab(&window, "Advanced");
-    for title in ["Audio window", "Temperature", "Repetition threshold"] {
+    for title in ["Temperature", "Repetition threshold"] {
         assert!(has(&window, title), "{title}");
     }
+    assert!(!has(&window, "Audio window"), "a choice the engine ignores");
     let slint = include_str!("../ui/pages/model.slint");
     let advanced = &slint[slint.find("ModelState.tab == 2").expect("the Advanced tab")..];
     let icons: Vec<&str> = advanced
@@ -895,7 +896,7 @@ fn advanced_has_a_row_per_parameter_and_none_shares_a_glyph() {
         .skip(1)
         .filter_map(|t| t.split(';').next())
         .collect();
-    assert!(icons.len() >= 12, "{icons:?}");
+    assert!(icons.len() >= 11, "{icons:?}");
     let mut seen = std::collections::HashSet::new();
     for icon in icons {
         assert!(seen.insert(icon), "{icon} is on two Advanced controls");

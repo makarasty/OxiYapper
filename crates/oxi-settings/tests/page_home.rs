@@ -14,7 +14,7 @@ use oxi_core::stats::{Date, FILE, Stats, Summary};
 use oxi_core::types::Millis;
 use oxi_platform::stats_store;
 use oxi_settings::ipc::{Cmd, Event, Link};
-use oxi_settings::{AppWindow, FILE_POLL, Ipc, Page};
+use oxi_settings::{AppWindow, Ipc, Page};
 use slint::platform::{Key, WindowEvent};
 use slint::{ComponentHandle, SharedString};
 
@@ -47,8 +47,8 @@ fn stats_push(ipc: &Ipc, summary: Summary) {
     ipc.deliver(&Event::Push(Push::Stats(summary)));
 }
 
-fn poll() {
-    i_slint_backend_testing::mock_elapsed_time(FILE_POLL);
+fn poll(window: &AppWindow) {
+    window.invoke_files_check();
 }
 
 /// Runs the `changed` handlers; the testing backend has no event loop.
@@ -167,7 +167,7 @@ fn a_changed_file_refreshes_the_open_page() {
     let window = open(&l, Page::Home);
     assert!(has(&window, "Words spoken: 0, All time"));
     write_stats(&l, 42);
-    poll();
+    poll(&window);
     assert!(has(&window, "Words spoken: 42, All time"));
 }
 
@@ -176,20 +176,22 @@ fn online_a_changed_file_asks_the_daemon_only_on_home() {
     let l = layout("changes-online", None);
     let (ipc, rx) = Ipc::fake();
     let window = open_linked(&l, Page::Hotkey, ipc);
-    poll();
+    // The first pass sets what the `changed` handlers compare against; no timer does it now.
+    settle();
+    poll(&window);
     asked(&rx);
     write_stats(&l, 42);
-    poll();
+    poll(&window);
     assert_eq!(asked(&rx), 0, "another page does not look");
     window.set_page(Page::Home);
     settle();
     assert_eq!(asked(&rx), 1, "page show");
-    poll();
+    poll(&window);
     assert_eq!(asked(&rx), 0, "nothing changed since");
     // Coarse file times could hide a rewrite within the same tick.
     std::thread::sleep(Duration::from_millis(20));
     write_stats(&l, 43);
-    poll();
+    poll(&window);
     assert_eq!(asked(&rx), 1, "the file changed");
 }
 
@@ -226,7 +228,7 @@ fn the_first_dictation_moves_nothing_below_the_heatmap() {
     };
     let before = folder();
     write_stats(&l, 42);
-    poll();
+    poll(&window);
     settle();
     assert!(
         has(&window, "Dictations: 1, All time"),
@@ -286,7 +288,7 @@ fn the_hints_live_in_info_tips() {
         [format!("Hold Ctrl + F13 and speak. {FIRST}")]
     );
     write_stats(&l, 42);
-    poll();
+    poll(&window);
     assert_eq!(
         tips(&window),
         [format!("Hold Ctrl + F13 and speak. {CLICK}")]
@@ -391,7 +393,7 @@ fn hovering_a_bar_shows_its_day_and_number() {
     );
     // A refresh under a still pointer: the bubble says the new number.
     write_stats(&l, 9);
-    poll();
+    poll(&window);
     settle();
     let fresh = bubble(&window).expect("still open").0;
     assert!(
@@ -476,14 +478,14 @@ fn an_unreadable_stats_file_keeps_the_numbers_and_is_retried() {
     assert!(has(&window, "Words spoken: 42, All time"));
 
     let locked = lock(&l);
-    poll();
+    poll(&window);
     assert!(
         has(&window, "Words spoken: 42, All time"),
         "kept, not zeroed"
     );
 
     unlock(&l, locked, || write_stats(&l, 43));
-    poll();
+    poll(&window);
     assert!(has(&window, "Words spoken: 43, All time"));
 }
 
@@ -597,7 +599,7 @@ fn the_open_chart_follows_the_file() {
     assert_eq!(chart(&window), None);
     assert!(has(&window, "No dictations yet"));
     write_days(&l, 1);
-    poll();
+    poll(&window);
     assert_eq!(chart(&window).unwrap(), "1 day, highest 5");
 }
 
@@ -633,11 +635,11 @@ fn a_locked_file_keeps_the_open_chart_and_the_poll_retries() {
     assert_eq!(chart(&window).unwrap(), "2 days, highest 5");
 
     let locked = lock(&l);
-    poll();
+    poll(&window);
     assert_eq!(chart(&window).unwrap(), "2 days, highest 5", "kept");
 
     unlock(&l, locked, || write_days(&l, 3));
-    poll();
+    poll(&window);
     assert_eq!(chart(&window).unwrap(), "3 days, highest 5", "retried");
 }
 
@@ -657,7 +659,7 @@ fn a_card_opened_on_a_locked_file_draws_its_own_bars_and_retries() {
     );
 
     unlock(&l, locked, || write_days(&l, 4));
-    poll();
+    poll(&window);
     assert_eq!(chart(&window).unwrap(), "4 days, highest 4", "retried");
 }
 

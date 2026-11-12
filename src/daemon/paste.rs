@@ -4,13 +4,24 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::{Builder, JoinHandle};
+use std::time::{Duration, Instant};
 
 use oxi_core::machine::Event;
-use oxi_core::paste::{Clipboard, Input, OurEntries, PasteOutcome, copy_only, paste_with};
+use oxi_core::paste::{
+    Clipboard, Input, OurEntries, PasteOutcome, PasteStep, copy_only, paste_with,
+};
 use oxi_platform::os::clipboard::WinClipboard;
 use oxi_platform::os::input::Keyboard;
 
 use super::cmd::{Inbox, PasteCmd};
+
+/// Typing progress goes to the coordinator at most this often, plus the last report.
+const PROGRESS_EVERY: Duration = Duration::from_millis(100);
+
+/// `done` of `total` typed units as a percent, at most 99: 100 is the `Landed` report.
+fn typed_percent(done: usize, total: usize) -> u8 {
+    u8::try_from((done * 100 / total.max(1)).min(99)).unwrap_or(99)
+}
 
 /// Start the paste worker on the real clipboard and keyboard. It returns when `rx` closes.
 /// `store` keeps the ids of our Win+V entries across restarts (`OurEntries::to_text`, no text).
@@ -64,13 +75,39 @@ fn run<C: Clipboard>(
         match cmd {
             PasteCmd::Paste { job, text, cfg } => {
                 let before = ours.clone();
+                let started = Instant::now();
+                let mut why = None;
+                let mut sent_at: Option<Instant> = None;
+                let mut report = |step| match step {
+                    PasteStep::Typed(typed) => why = Some(typed),
+                    PasteStep::Typing { done, total } => {
+                        if done == total || sent_at.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
+                            sent_at = Some(Instant::now());
+                            let _ = inbox.send(Inbox::Progress {
+                                job,
+                                percent: typed_percent(done, total),
+                            });
+                        }
+                    }
+                    PasteStep::Landed => {
+                        let _ = inbox.send(Inbox::Progress { job, percent: 100 });
+                    }
+                };
                 let outcome = clip.as_mut().map_or(PasteOutcome::Failed, |clip| {
-                    paste_with(&text, &cfg, clip, &mut input, &mut ours)
+                    paste_with(&text, &cfg, clip, &mut input, &mut ours, &mut report)
                 });
                 if ours != before {
                     save(&ours);
                 }
-                tracing::info!(?job, ?outcome, "paste done");
+                // The length and the reason only, never the text.
+                tracing::info!(
+                    ?job,
+                    ?outcome,
+                    ?why,
+                    units = text.encode_utf16().count(),
+                    took_ms = started.elapsed().as_millis(),
+                    "paste done"
+                );
                 // A send fails only when the coordinator is gone; nothing is left to tell then.
                 let _ = inbox.send(Inbox::Event(Event::PasteDone { job, outcome }));
             }
@@ -148,7 +185,7 @@ mod tests {
             self.0.borrow_mut().push(Call::Chord);
             Ok(())
         }
-        fn type_units(&mut self, _units: &[u16], _gap: Millis) -> Result<(), InputBlocked> {
+        fn send_units(&mut self, _units: &[u16]) -> Result<(), InputBlocked> {
             self.0.borrow_mut().push(Call::Type);
             Ok(())
         }
@@ -157,6 +194,17 @@ mod tests {
 
     /// Runs the worker over `cmds` (already queued) and returns the call log and the answers.
     fn drive(cmds: Vec<PasteCmd>, clip: bool) -> (Vec<Call>, Vec<(JobId, PasteOutcome)>) {
+        let (calls, msgs) = drive_all(cmds, clip);
+        let done = msgs.into_iter().filter_map(Result::err).collect();
+        (calls, done)
+    }
+
+    /// Every inbox message in order: `Ok` a progress percent, `Err` a paste answer.
+    #[allow(clippy::type_complexity, reason = "a test helper's tuple of logs")]
+    fn drive_all(
+        cmds: Vec<PasteCmd>,
+        clip: bool,
+    ) -> (Vec<Call>, Vec<Result<(JobId, u8), (JobId, PasteOutcome)>>) {
         let log = Log::default();
         let (tx, rx) = channel();
         let (inbox, answers) = channel();
@@ -180,19 +228,58 @@ mod tests {
             }
         }
         drop(inbox);
-        let done = answers
+        let msgs = answers
             .iter()
             .map(|msg| match msg {
-                Inbox::Event(Event::PasteDone { job, outcome }) => (job, outcome),
+                Inbox::Event(Event::PasteDone { job, outcome }) => Err((job, outcome)),
+                Inbox::Progress { job, percent } => Ok((job, percent)),
                 _ => panic!("unexpected inbox message"),
             })
             .collect::<Vec<_>>();
         assert_eq!(
-            clip && !done.is_empty(),
+            // A typed paste never touches the history, so it has nothing to save.
+            clip && msgs
+                .iter()
+                .any(|m| matches!(m, Err((_, PasteOutcome::Pasted)))),
             !saved.is_empty(),
             "a paste saves its ids"
         );
-        (log.take(), done)
+        (log.take(), msgs)
+    }
+
+    #[test]
+    fn a_typed_paste_reports_capped_progress_then_100_before_its_answer() {
+        let cfg = Paste {
+            mode: oxi_core::config::PasteMode::Type,
+            ..Paste::default()
+        };
+        let paste = PasteCmd::Paste {
+            job: JobId(3),
+            text: "a".repeat(40),
+            cfg,
+        };
+        let (calls, msgs) = drive_all(vec![paste], true);
+        // 40 units at the fast pace: 3 calls. The first and the last progress always go out;
+        // the middle one only on a box slow enough to pass the 100 ms throttle.
+        assert_eq!(calls, [Call::Type, Call::Type, Call::Type]);
+        let (last, progress) = msgs.split_last().unwrap();
+        assert_eq!(*last, Err((JobId(3), PasteOutcome::Typed)));
+        let percents: Vec<u8> = progress.iter().map(|m| m.unwrap().1).collect();
+        assert!(progress.iter().all(|m| m.unwrap().0 == JobId(3)));
+        assert_eq!(percents.first(), Some(&40));
+        assert_eq!(percents[percents.len() - 2..], [99, 100]);
+        assert!(percents.is_sorted_by(|a, b| a < b), "{percents:?}");
+        assert_eq!(typed_percent(0, 0), 0);
+        assert_eq!(typed_percent(7, 10), 70);
+    }
+
+    #[test]
+    fn a_clipboard_paste_reports_100_once_when_it_landed() {
+        let (_, msgs) = drive_all(vec![job(1, "one")], true);
+        assert_eq!(
+            msgs,
+            [Ok((JobId(1), 100)), Err((JobId(1), PasteOutcome::Pasted))]
+        );
     }
 
     fn job(id: u64, text: &str) -> PasteCmd {

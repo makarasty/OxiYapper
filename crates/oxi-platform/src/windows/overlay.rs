@@ -6,15 +6,15 @@
 
 use std::io;
 use std::ptr::{null, null_mut};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ab_glyph::FontRef;
 use oxi_core::config::Config;
 use oxi_core::machine::OverlayState;
 use oxi_core::overlay::{
-    METER_HZ, Meter, PILL_W_DIP, Quns, Rect, pill_accent, place, seed, visible,
+    FINISH_MS, HOLD_MS, METER_HZ, Meter, PILL_W_DIP, ProgressState, Quns, Rect, Smooth,
+    pill_accent, place, seed, visible,
 };
 use oxi_core::types::Millis;
 use thiserror::Error;
@@ -66,31 +66,176 @@ pub enum OverlayError {
     Win32(&'static str, #[source] io::Error),
 }
 
-/// Whisper's percent of the running transcription, set from any thread (the coordinator); the
-/// pill's timer reads it each frame, as it reads the [`LevelMeter`].
+/// The progress of the jobs the pill shows (DESIGN-SYSTEM section 26), set from any thread (the
+/// coordinator); the pill's timer reads it each frame, as it reads the [`LevelMeter`]. A bar
+/// belongs to one pill state: the transcription's to `Transcribing`, the typing's to `Pasting`,
+/// so a held Transcribing pill runs its own bar to the end while typing starts the next one
+/// (DS-26.5), and a clipboard paste, which has no bar, shows none. No [`Smooth`] for the state
+/// shown: the indeterminate sweep. It keeps its own clock, so the coordinator and the pill agree
+/// on the time without sharing one.
 #[derive(Debug, Clone)]
-pub struct Progress(Arc<AtomicU8>);
+pub struct Progress(Arc<Mutex<Cell>>);
 
-/// The stored value of an unknown percent.
-const UNKNOWN: u8 = u8::MAX;
+#[derive(Debug)]
+struct Cell {
+    epoch: Instant,
+    /// `Transcribing`'s bar, then `Pasting`'s.
+    bars: [Bar; 2],
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct Bar {
+    smooth: Option<Smooth>,
+    /// Cleared while it finished: it runs out for the pill held to show it, then goes.
+    ended: bool,
+}
+
+impl Bar {
+    /// What to draw at `now`; a cleared bar that has run out goes.
+    fn shown(&mut self, now: Millis) -> Option<u8> {
+        let s = self.smooth.as_mut()?;
+        if self.ended && s.state(now) == ProgressState::Finished {
+            *self = Self::default();
+            return None;
+        }
+        s.shown(now);
+        Some(s.percent())
+    }
+
+    /// How long its finish still runs and stays full at `now`.
+    fn finishing_left(&self, now: Millis) -> Option<Duration> {
+        let at = self.smooth.as_ref()?.finishing_since()?;
+        Some(Duration::from_millis(
+            (at.0 + FINISH_MS + HOLD_MS).saturating_sub(now.0),
+        ))
+        .filter(|left| !left.is_zero())
+    }
+}
 
 impl Default for Progress {
     fn default() -> Self {
-        Self(Arc::new(AtomicU8::new(UNKNOWN)))
+        Self(Arc::new(Mutex::new(Cell {
+            epoch: Instant::now(),
+            bars: [Bar::default(); 2],
+        })))
+    }
+}
+
+/// The bar of pill state `state`; only `Transcribing` and `Pasting` have one.
+fn slot(state: OverlayState) -> Option<usize> {
+    match state {
+        OverlayState::Transcribing => Some(0),
+        OverlayState::Pasting => Some(1),
+        _ => None,
     }
 }
 
 impl Progress {
-    /// `None` while whisper reported nothing for this transcription.
-    pub fn set(&self, percent: Option<u8>) {
+    fn cell(&self) -> std::sync::MutexGuard<'_, Cell> {
+        // A panic while the lock is held leaves a value that is still a valid `Cell`.
         self.0
-            .store(percent.map_or(UNKNOWN, |p| p.min(100)), Ordering::Relaxed);
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Runs `f` on the bar of `state`, if it has one.
+    fn with(&self, state: OverlayState, f: impl FnOnce(&mut Smooth)) {
+        let mut cell = self.cell();
+        if let Some(i) = slot(state)
+            && let Some(s) = &mut cell.bars[i].smooth
+        {
+            f(s);
+        }
+    }
+
+    /// Milliseconds on this cell's clock.
     #[must_use]
-    pub fn get(&self) -> Option<u8> {
-        let p = self.0.load(Ordering::Relaxed);
-        (p != UNKNOWN).then_some(p)
+    pub fn now(&self) -> Millis {
+        Millis(u64::try_from(self.cell().epoch.elapsed().as_millis()).unwrap_or(u64::MAX))
+    }
+
+    /// A new job: a new bar from 0 for pill state `state` (DS-26.5). `est`: the expected length
+    /// of the whole job. A new transcription also ends the typing bar of the job before.
+    pub fn start(&self, state: OverlayState, est: Option<Millis>) {
+        self.start_at(state, est, self.now());
+    }
+
+    pub fn start_at(&self, state: OverlayState, est: Option<Millis>, now: Millis) {
+        let Some(i) = slot(state) else { return };
+        let mut cell = self.cell();
+        if i == 0 {
+            cell.bars[1] = Bar::default();
+        }
+        cell.bars[i] = Bar {
+            smooth: Some(Smooth::start(est, now)),
+            ended: false,
+        };
+    }
+
+    /// A real fraction, 0 to 1, for the bar of `state`; no effect without one.
+    pub fn real(&self, state: OverlayState, fraction: f32) {
+        self.real_at(state, fraction, self.now());
+    }
+
+    pub fn real_at(&self, state: OverlayState, fraction: f32, now: Millis) {
+        self.with(state, |s| s.real(fraction, now));
+    }
+
+    /// The job of `state` is done: its bar runs to the end quickly.
+    pub fn finish(&self, state: OverlayState) {
+        self.finish_at(state, self.now());
+    }
+
+    pub fn finish_at(&self, state: OverlayState, now: Millis) {
+        self.with(state, |s| s.finish(now));
+    }
+
+    /// No bars: indeterminate, or no job. A bar still finishing is left to run out, so the pill
+    /// held for it is not cut mid-way.
+    pub fn clear(&self) {
+        self.clear_at(self.now());
+    }
+
+    pub fn clear_at(&self, now: Millis) {
+        for bar in &mut self.cell().bars {
+            if bar.finishing_left(now).is_some() {
+                bar.ended = true;
+            } else {
+                *bar = Bar::default();
+            }
+        }
+    }
+
+    /// Is there a job (a bar not cleared)?
+    #[must_use]
+    pub fn active(&self) -> bool {
+        self.cell()
+            .bars
+            .iter()
+            .any(|b| b.smooth.is_some() && !b.ended)
+    }
+
+    /// How long a finished bar still runs to its end and stays full; `None` when none is
+    /// finishing. The pill that shows it stays until then.
+    #[must_use]
+    pub fn finishing_left(&self) -> Option<Duration> {
+        let now = self.now();
+        self.cell()
+            .bars
+            .iter()
+            .filter_map(|b| b.finishing_left(now))
+            .max()
+    }
+
+    /// The percent to draw now in pill state `state`; `None` while it is indeterminate.
+    #[must_use]
+    pub fn get(&self, state: OverlayState) -> Option<u8> {
+        self.get_at(state, self.now())
+    }
+
+    pub fn get_at(&self, state: OverlayState, now: Millis) -> Option<u8> {
+        let i = slot(state)?;
+        self.cell().bars[i].shown(now)
     }
 }
 
@@ -270,11 +415,11 @@ impl Inner<'_> {
         let animated = recording
             || matches!(
                 state,
-                OverlayState::LoadingModel | OverlayState::Transcribing
+                OverlayState::LoadingModel | OverlayState::Transcribing | OverlayState::Pasting
             );
         self.state = state;
         self.rect = place(cfg.overlay.position, work, dpi as f32 / 96.0);
-        self.canvas.set_progress(self.progress.get());
+        self.canvas.set_progress(self.progress.get(self.state));
         self.render()?;
         // SAFETY: `hwnd` is our live window.
         unsafe {
@@ -309,7 +454,7 @@ impl Inner<'_> {
         if matches!(self.state, OverlayState::Recording { .. }) {
             self.meter.push(self.level.read(), self.now());
         }
-        self.canvas.set_progress(self.progress.get());
+        self.canvas.set_progress(self.progress.get(self.state));
         // A failed frame keeps the last one on screen; the next tick draws again.
         let _ = self.render();
     }
@@ -489,16 +634,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn progress_is_unknown_until_set_and_shared_by_its_clones() {
+    fn progress_is_unknown_until_started_and_shared_by_its_clones() {
+        let t = OverlayState::Transcribing;
         let cell = Progress::default();
         let reader = cell.clone();
-        assert_eq!(reader.get(), None);
-        cell.set(Some(42));
-        assert_eq!(reader.get(), Some(42));
-        cell.set(Some(250));
-        assert_eq!(reader.get(), Some(100), "a percent stays within 100");
-        cell.set(None);
-        assert_eq!(reader.get(), None);
+        assert_eq!(reader.get_at(t, Millis(0)), None, "no job is indeterminate");
+        cell.start_at(t, Some(Millis(4000)), Millis(0));
+        assert!(reader.active());
+        let mut last = 0;
+        for at in (100..=3000).step_by(100) {
+            let p = reader.get_at(t, Millis(at)).unwrap();
+            assert!(p >= last && p < 100, "{at}: {p}");
+            last = p;
+        }
+        assert!(
+            last > 30,
+            "the estimate moves the bar with no report: {last}"
+        );
+        cell.real_at(t, 1.0, Millis(3000));
+        cell.finish_at(t, Millis(3000));
+        assert_eq!(reader.get_at(t, Millis(3000 + FINISH_MS)), Some(100));
+        cell.clear_at(Millis(4000));
+        assert_eq!(reader.get_at(t, Millis(4000)), None);
+    }
+
+    /// Review c04 #3, #4, #5: each pill state reads its own bar, and a clear leaves a finishing
+    /// bar to run out.
+    #[test]
+    fn transcription_and_typing_bars_never_show_in_each_other_pill() {
+        let (t, p) = (OverlayState::Transcribing, OverlayState::Pasting);
+        let cell = Progress::default();
+        cell.start_at(t, Some(Millis(1000)), Millis(0));
+        cell.finish_at(t, Millis(1000));
+        // #4: a clipboard paste has no bar: the Pasting pill shows no percent, not 100.
+        assert_eq!(cell.get_at(p, Millis(1000 + FINISH_MS + HOLD_MS)), None);
+        // #3: typing starts its bar while the Transcribing pill is held: that pill still runs
+        // to 100, the typing bar starts from 0.
+        cell.start_at(p, Some(Millis(2000)), Millis(1050));
+        assert_eq!(cell.get_at(t, Millis(1000 + FINISH_MS)), Some(100));
+        assert!(cell.get_at(p, Millis(1060)).unwrap() < 10);
+        // #5: cleared mid-finish, the transcription bar runs out; a running bar goes at once.
+        let cell = Progress::default();
+        cell.start_at(t, Some(Millis(1000)), Millis(0));
+        cell.finish_at(t, Millis(500));
+        cell.clear_at(Millis(520));
+        assert!(!cell.active());
+        assert!(cell.get_at(t, Millis(520 + FINISH_MS)).is_some());
+        assert_eq!(cell.get_at(t, Millis(500 + FINISH_MS + HOLD_MS)), None);
+        cell.start_at(p, None, Millis(0));
+        cell.clear_at(Millis(10));
+        assert_eq!(cell.get_at(p, Millis(10)), None);
     }
 
     /// Live: shows a window. Runs only with `OXI_OVERLAY_TEST=1`.

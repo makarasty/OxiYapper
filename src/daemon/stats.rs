@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
 
+use oxi_core::ipc::Push;
 use oxi_core::stats::{self, Date, HEAT_WEEKS, Stats, Summary};
 use oxi_core::types::Millis;
 use oxi_platform::stats_store;
@@ -60,7 +61,10 @@ impl Writer {
             && let Err(e) = stats_store::save(&self.path, stats)
         {
             tracing::warn!(kind = ?e.kind(), "stats not saved");
+            return;
         }
+        // An open Home page shows the new count at once (read only when a window is there).
+        super::ipc::announce_with(|| Push::Stats(summary(Some(&self.path), today)));
     }
 }
 

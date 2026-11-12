@@ -24,6 +24,8 @@ struct HistClip {
     history_on: bool,
     /// The snapshot cannot save the clipboard whole (too big, hung or slow owner).
     incomplete: bool,
+    /// What `incomplete_why` answers.
+    why: Option<IncompleteWhy>,
     /// Every restore fails with an OS error.
     restore_fails: bool,
     /// The next this many restores find the clipboard held open.
@@ -65,6 +67,7 @@ impl HistClip {
             seq: 0,
             history_on: true,
             incomplete: false,
+            why: None,
             restore_fails: false,
             restore_locked: 0,
             foreign_on_lock: None,
@@ -159,6 +162,9 @@ impl Clipboard for HistClip {
             Snap::Complete(self.current.clone())
         }
     }
+    fn incomplete_why(&self) -> Option<IncompleteWhy> {
+        self.why
+    }
     fn is_excluded(&self, saved: &String) -> bool {
         saved.starts_with(UNREGISTERED)
     }
@@ -232,6 +238,10 @@ struct Keys {
     held: bool,
     elevated: bool,
     typed: Option<String>,
+    /// Every `send_units` batch, in order.
+    sent: Vec<Vec<u16>>,
+    /// This `send_units` call (1-based) is blocked.
+    block_call: Option<usize>,
     slept: u64,
 }
 
@@ -248,8 +258,13 @@ impl Input for Keys {
     fn send_chord(&mut self, _: &[Key]) -> Result<(), InputBlocked> {
         Ok(())
     }
-    fn type_units(&mut self, units: &[u16], _: Millis) -> Result<(), InputBlocked> {
-        self.typed = Some(String::from_utf16_lossy(units));
+    fn send_units(&mut self, units: &[u16]) -> Result<(), InputBlocked> {
+        if self.block_call == Some(self.sent.len() + 1) {
+            return Err(InputBlocked);
+        }
+        self.sent.push(units.to_vec());
+        let all: Vec<u16> = self.sent.concat();
+        self.typed = Some(String::from_utf16_lossy(&all));
         Ok(())
     }
     fn sleep(&mut self, time: Millis) {
@@ -266,6 +281,7 @@ fn dictate(clip: &mut HistClip, cfg: &Paste, ours: &mut OurEntries, n: u32) -> P
         clip,
         &mut Keys::default(),
         ours,
+        &mut |_| {},
     );
     assert_eq!(clip.evicted, evicted, "dictation {n} pushed an entry out");
     out
@@ -331,7 +347,14 @@ fn the_same_text_dictated_twice_leaves_one_entry() {
     let mut clip = HistClip::new("my copy");
     let (cfg, mut ours) = (Paste::default(), OurEntries::default());
     for _ in 0..3 {
-        paste_with("same", &cfg, &mut clip, &mut Keys::default(), &mut ours);
+        paste_with(
+            "same",
+            &cfg,
+            &mut clip,
+            &mut Keys::default(),
+            &mut ours,
+            &mut |_| {},
+        );
     }
     assert_eq!(clip.texts(), ["same", "my copy"]);
 }
@@ -355,7 +378,14 @@ fn an_older_or_pinned_user_entry_with_the_dictated_text_is_never_deleted() {
     clip.write("my copy", true);
     let (cfg, mut ours) = (Paste::default(), OurEntries::default());
     for _ in 0..3 {
-        paste_with("hello", &cfg, &mut clip, &mut Keys::default(), &mut ours);
+        paste_with(
+            "hello",
+            &cfg,
+            &mut clip,
+            &mut Keys::default(),
+            &mut ours,
+            &mut |_| {},
+        );
     }
     assert_eq!(clip.texts(), ["hello", "my copy", "hello"]);
     // The user's own "hello" (id1) is the older one and still there.
@@ -420,6 +450,7 @@ fn a_copy_that_cannot_be_saved_whole_is_left_alone_and_the_text_typed() {
         &mut clip,
         &mut keys,
         &mut ours,
+        &mut |_| {},
     );
     assert_eq!(out, PasteOutcome::Typed);
     assert_eq!(keys.typed.as_deref(), Some("hi there"));
@@ -446,7 +477,14 @@ fn a_restore_held_through_every_try_is_reported_and_bounded() {
     clip.restore_locked = u32::MAX;
     let (cfg, mut ours) = (Paste::default(), OurEntries::default());
     let mut keys = Keys::default();
-    let out = paste_with("dictation 1", &cfg, &mut clip, &mut keys, &mut ours);
+    let out = paste_with(
+        "dictation 1",
+        &cfg,
+        &mut clip,
+        &mut keys,
+        &mut ours,
+        &mut |_| {},
+    );
     assert_eq!(out, PasteOutcome::PastedNoRestore);
     assert_eq!(clip.restores, RESTORE_TRIES);
     // Restore delay plus 50 + 100 + 200 + 400 ms of gaps.
@@ -508,7 +546,14 @@ fn a_dictation_costs_four_history_calls_and_no_wait() {
         for n in 1..=3 {
             let mut keys = Keys::default();
             let looks = clip.looks;
-            paste_with(&format!("d{n}"), &cfg, &mut clip, &mut keys, &mut ours);
+            paste_with(
+                &format!("d{n}"),
+                &cfg,
+                &mut clip,
+                &mut keys,
+                &mut ours,
+                &mut |_| {},
+            );
             // The first has nothing of ours to delete.
             assert_eq!(clip.looks - looks, if n == 1 { 3 } else { 4 }, "{user}");
             assert_eq!(keys.slept, 300, "{user}");
@@ -643,7 +688,14 @@ fn clipboard_only_paths_never_lose_or_leak_the_dictation() {
                     ..Keys::default()
                 };
                 let text = format!("dictation {n}");
-                let out = paste_with(&text, &Paste::default(), &mut clip, &mut keys, &mut ours);
+                let out = paste_with(
+                    &text,
+                    &Paste::default(),
+                    &mut clip,
+                    &mut keys,
+                    &mut ours,
+                    &mut |_| {},
+                );
                 assert!(matches!(out, PasteOutcome::ClipboardOnly(_)));
                 settle(&mut clip);
                 assert_eq!(clip.current, text);
@@ -830,7 +882,14 @@ fn a_copy_during_clipboard_only_history_work_pushes_nothing_out() {
             ..Keys::default()
         };
         let evicted = clip.evicted;
-        let out = paste_with("dictation 2", &cfg, &mut clip, &mut keys, &mut ours);
+        let out = paste_with(
+            "dictation 2",
+            &cfg,
+            &mut clip,
+            &mut keys,
+            &mut ours,
+            &mut |_| {},
+        );
         assert!(matches!(out, PasteOutcome::ClipboardOnly(_)));
         settle(&mut clip);
         let case = format!("held {held}, elevated {elevated}: {:?}", clip.texts());
@@ -855,6 +914,7 @@ fn a_copy_the_history_never_takes_costs_no_wait() {
             &mut clip,
             &mut keys,
             &mut ours,
+            &mut |_| {},
         );
         assert_eq!(out, PasteOutcome::Pasted);
         assert_eq!(keys.slept, 300, "dictation {n}");
@@ -905,7 +965,7 @@ fn a_copy_the_history_never_takes_costs_no_wait_on_the_clipboard_only_path() {
             ..Keys::default()
         };
         let text = format!("dictation {n}");
-        let out = paste_with(&text, &cfg, &mut clip, &mut keys, &mut ours);
+        let out = paste_with(&text, &cfg, &mut clip, &mut keys, &mut ours, &mut |_| {});
         assert_eq!(out, PasteOutcome::ClipboardOnly(ClipboardOnlyWhy::Elevated));
         assert_eq!(keys.slept, 0, "dictation {n}");
         assert_eq!(clip.texts(), [text.as_str(), "my copy"], "dictation {n}");
@@ -935,4 +995,253 @@ fn our_late_write_on_top_under_a_late_copy_is_still_deleted() {
             "lag {lag}"
         );
     }
+}
+
+/// A clipboard whose snapshot never succeeds: `Some` answers `Incomplete` with that why,
+/// `None` answers `Locked`.
+struct Unsaved(Option<IncompleteWhy>);
+
+impl Clipboard for Unsaved {
+    type Snapshot = ();
+    fn snapshot(&mut self) -> Snap<()> {
+        if self.0.is_some() {
+            Snap::Incomplete
+        } else {
+            Snap::Locked
+        }
+    }
+    fn incomplete_why(&self) -> Option<IncompleteWhy> {
+        self.0
+    }
+    fn is_excluded(&self, (): &()) -> bool {
+        false
+    }
+    fn set_text(&mut self, _: &str, _: bool) -> Result<u32, ClipError> {
+        panic!("a clipboard that could not be saved is never written")
+    }
+    fn sequence(&self) -> u32 {
+        1
+    }
+    fn restore(&mut self, (): &(), _: bool) -> Result<u32, ClipError> {
+        panic!("nothing was saved to put back")
+    }
+}
+
+/// One paste with every step it reported.
+fn with_steps<C: Clipboard>(
+    text: &str,
+    cfg: &Paste,
+    clip: &mut C,
+    keys: &mut Keys,
+) -> (PasteOutcome, Vec<PasteStep>) {
+    let mut steps = Vec::new();
+    let mut ours = OurEntries::default();
+    let out = paste_with(text, cfg, clip, keys, &mut ours, &mut |s| steps.push(s));
+    (out, steps)
+}
+
+fn type_mode(speed: TypeSpeed) -> Paste {
+    Paste {
+        mode: PasteMode::Type,
+        type_speed: speed,
+        ..Paste::default()
+    }
+}
+
+#[test]
+fn paste_reports_why_each_unsaved_clipboard_is_typed() {
+    let whys = [
+        IncompleteWhy::NoData {
+            format: 0xC0F1,
+            code: 1418,
+        },
+        IncompleteWhy::NoLock {
+            format: 0xC0F2,
+            code: 6,
+        },
+        IncompleteWhy::EnumFailed { code: 5 },
+        IncompleteWhy::TooBig {
+            format: 8,
+            bytes: 40 << 20,
+            room: 32 << 20,
+        },
+        IncompleteWhy::HungOwner,
+        IncompleteWhy::OnlyHandles,
+        IncompleteWhy::NoHelper,
+        IncompleteWhy::RenderTimeout { format: 0xC0F3 },
+        IncompleteWhy::HelperBusy,
+    ];
+    let cases = whys
+        .into_iter()
+        .map(|w| (Some(w), TypedWhy::Incomplete(Some(w))))
+        .chain([(None, TypedWhy::Locked)]);
+    for (snap, want) in cases {
+        let mut keys = Keys::default();
+        let (out, steps) = with_steps("hi", &Paste::default(), &mut Unsaved(snap), &mut keys);
+        assert_eq!(out, PasteOutcome::Typed, "{want:?}");
+        assert_eq!(steps.first(), Some(&PasteStep::Typed(want)));
+        assert_eq!(keys.typed.as_deref(), Some("hi"));
+    }
+    // A clipboard that does not say why still types.
+    let mut clip = HistClip::new("my copy");
+    clip.incomplete = true;
+    let (_, steps) = with_steps("hi", &Paste::default(), &mut clip, &mut Keys::default());
+    assert_eq!(steps[0], PasteStep::Typed(TypedWhy::Incomplete(None)));
+}
+
+#[test]
+fn paste_reports_type_mode_and_type_rule_apart() {
+    let rule = Paste {
+        rules: vec![PasteRule {
+            app: "Notepad.EXE".into(),
+            mode: Some(PasteMode::Type),
+            ..PasteRule::default()
+        }],
+        ..Paste::default()
+    };
+    for (cfg, want) in [
+        (type_mode(TypeSpeed::Fast), TypedWhy::Mode),
+        (rule, TypedWhy::Rule),
+    ] {
+        let mut clip = HistClip::new("my copy");
+        let (out, steps) = with_steps("hi", &cfg, &mut clip, &mut Keys::default());
+        assert_eq!(
+            (out, steps[0]),
+            (PasteOutcome::Typed, PasteStep::Typed(want))
+        );
+        assert_eq!(clip.seq, 1, "type mode never writes the clipboard");
+    }
+}
+
+#[test]
+fn paste_typing_goes_in_chunks_at_the_pace_and_reports_rising_progress() {
+    let text = "a".repeat(300);
+    // (pace, calls, ms of gaps): 19 calls of up to 16 units 2 ms apart; one unit 5 ms apart.
+    for (speed, calls, slept) in [(TypeSpeed::Fast, 19, 36), (TypeSpeed::Safe, 300, 1495)] {
+        let mut keys = Keys::default();
+        let cfg = type_mode(speed);
+        let (out, steps) = with_steps(&text, &cfg, &mut HistClip::new("c"), &mut keys);
+        assert_eq!(out, PasteOutcome::Typed);
+        assert_eq!(keys.sent.len(), calls, "{speed:?}");
+        assert_eq!(keys.slept, slept, "{speed:?}");
+        assert_eq!(keys.typed.as_deref(), Some(text.as_str()));
+        let done: Vec<usize> = steps
+            .iter()
+            .filter_map(|s| match s {
+                PasteStep::Typing { done, total } => {
+                    assert_eq!(*total, 300);
+                    Some(*done)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(done.len(), calls);
+        assert!(done.is_sorted_by(|a, b| a < b), "{speed:?}");
+        assert_eq!(done.last(), Some(&300));
+        assert_eq!(steps.last(), Some(&PasteStep::Landed));
+    }
+}
+
+#[test]
+fn paste_typing_blocked_on_the_third_call_fails_and_sends_nothing_after() {
+    let mut keys = Keys {
+        block_call: Some(3),
+        ..Keys::default()
+    };
+    let cfg = type_mode(TypeSpeed::Fast);
+    let (out, steps) = with_steps(&"a".repeat(100), &cfg, &mut HistClip::new("c"), &mut keys);
+    assert_eq!(out, PasteOutcome::Failed);
+    assert_eq!(keys.sent.len(), 2);
+    assert!(!steps.contains(&PasteStep::Landed));
+}
+
+#[test]
+fn paste_pace_follows_the_rule_then_forced_typing_then_the_global_speed() {
+    let fg = |app: &str| Foreground {
+        app: app.into(),
+        elevated: false,
+    };
+    let rule = |app: &str, mode, type_speed| PasteRule {
+        app: app.into(),
+        mode,
+        type_speed,
+        ..PasteRule::default()
+    };
+    // The owner's shape: one type rule, the built-in mstsc.exe rule dropped from the list.
+    let owner = Paste {
+        rules: vec![rule("AJAZZ Driver.exe", Some(PasteMode::Type), None)],
+        ..Paste::default()
+    };
+    let fast_mstsc = Paste {
+        rules: vec![rule(
+            "mstsc.exe",
+            Some(PasteMode::Type),
+            Some(TypeSpeed::Fast),
+        )],
+        ..Paste::default()
+    };
+    let chord_only = Paste {
+        rules: vec![PasteRule {
+            app: "code.exe".into(),
+            chord: Some(vec!["LCtrl".into(), "LShift".into(), "V".into()]),
+            ..PasteRule::default()
+        }],
+        ..Paste::default()
+    };
+    let safe = Paste {
+        type_speed: TypeSpeed::Safe,
+        ..Paste::default()
+    };
+    let cases = [
+        (&owner, "ajazz driver.exe", TypePace::SAFE),
+        (&owner, "mstsc.exe", TypePace::SAFE),
+        (&owner, "Claude.exe", TypePace::FAST),
+        (&fast_mstsc, "mstsc.exe", TypePace::FAST),
+        (&chord_only, "code.exe", TypePace::FAST),
+        (&safe, "Claude.exe", TypePace::SAFE),
+        (&safe, "code.exe", TypePace::SAFE),
+    ];
+    for (cfg, app, want) in cases {
+        assert_eq!(type_pace(cfg, &fg(app)), want, "{app}");
+    }
+}
+
+#[test]
+fn paste_reports_landed_once_when_the_text_arrived_and_never_on_failure() {
+    let landed = |steps: &[PasteStep]| steps.iter().filter(|s| **s == PasteStep::Landed).count();
+    let cfg = Paste::default();
+    let (out, steps) = with_steps("d", &cfg, &mut HistClip::new("c"), &mut Keys::default());
+    assert_eq!((out, landed(&steps)), (PasteOutcome::Pasted, 1));
+    let mut clip = HistClip::new("c");
+    clip.restore_fails = true;
+    let (out, steps) = with_steps("d", &cfg, &mut clip, &mut Keys::default());
+    assert_eq!((out, landed(&steps)), (PasteOutcome::PastedNoRestore, 1));
+    let typed = type_mode(TypeSpeed::Fast);
+    let (out, steps) = with_steps("d", &typed, &mut HistClip::new("c"), &mut Keys::default());
+    assert_eq!((out, landed(&steps)), (PasteOutcome::Typed, 1));
+    let mut keys = Keys {
+        block_call: Some(1),
+        ..Keys::default()
+    };
+    let (out, steps) = with_steps("d", &typed, &mut HistClip::new("c"), &mut keys);
+    assert_eq!((out, landed(&steps)), (PasteOutcome::Failed, 0));
+}
+
+/// Arch-plan 3.6: a paste puts the dictation on top of Win+V and the user's copy second, Ctrl+V
+/// gives the copy; a typed paste leaves Win+V as it was.
+#[test]
+fn paste_win_v_order_is_dictation_then_copy_and_typed_adds_nothing() {
+    let cfg = Paste::default();
+    let mut clip = HistClip::with_entries(3, "my copy");
+    let before = clip.texts().len();
+    let (out, _) = with_steps("dictation 1", &cfg, &mut clip, &mut Keys::default());
+    assert_eq!(out, PasteOutcome::Pasted);
+    assert_eq!(clip.texts()[..2], ["dictation 1", "my copy"]);
+    assert_eq!(clip.texts().len(), before + 1);
+    assert_eq!(clip.current, "my copy");
+    let mut clip = HistClip::with_entries(3, "my copy");
+    clip.incomplete = true;
+    let (out, _) = with_steps("dictation 1", &cfg, &mut clip, &mut Keys::default());
+    assert_eq!(out, PasteOutcome::Typed);
+    assert_eq!(clip.texts(), ["my copy", "old 2", "old 1"]);
 }

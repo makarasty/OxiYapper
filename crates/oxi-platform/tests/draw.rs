@@ -12,7 +12,9 @@ use oxi_core::overlay::{
 };
 use oxi_core::tray::TrayBadge;
 use oxi_core::types::Millis;
-use oxi_platform::draw::{PillCanvas, bgra, bgra_into, logo, logo_svg, pill, tray_icon};
+use oxi_platform::draw::{
+    PillCanvas, bgra, bgra_into, logo, logo_svg, pill, tray_icon, tray_icon_with,
+};
 use tiny_skia::{Pixmap, PixmapPaint, Transform};
 
 #[path = "../../oxi-core/tests/common/notices.rs"]
@@ -367,6 +369,32 @@ fn bgra_swaps_red_and_blue() {
     let i = (7 * 16 + 2) * 4;
     let c = tray_colour(Rgba(0xD9, 0x3A, 0x3F, 0xFF), false);
     assert_eq!(&out[i..i + 4], &[c.2, c.1, c.0, c.3]);
+}
+
+/// The recording state is the whole mark in the accent (DS-21.4), lifted for the taskbar like every
+/// tray colour; the other phases do not change with it, and Red is what `tray_icon` draws.
+#[test]
+fn the_recording_icon_follows_the_accent() {
+    let iris = Rgba(0x5B, 0x5B, 0xD6, 0xFF);
+    let red = Rgba(0xD9, 0x3A, 0x3F, 0xFF);
+    for light in [false, true] {
+        let inside = |pm: &Pixmap| {
+            let c = pm.pixel(2, 7).unwrap();
+            (c.red(), c.green(), c.blue(), c.alpha())
+        };
+        let want = tray_colour(iris, light);
+        let pm = tray_icon_with(Phase::Recording, 16, light, TrayBadge::None, iris).unwrap();
+        assert_eq!(inside(&pm), (want.0, want.1, want.2, 255), "light={light}");
+        let default = tray_icon(Phase::Recording, 16, light, TrayBadge::None).unwrap();
+        let red_icon = tray_icon_with(Phase::Recording, 16, light, TrayBadge::None, red).unwrap();
+        assert_eq!(default.data(), red_icon.data(), "Red is the default");
+        assert_ne!(default.data(), pm.data());
+        for phase in [Phase::Idle, Phase::Transcribing, Phase::Pasting] {
+            let a = tray_icon_with(phase, 16, light, TrayBadge::None, iris).unwrap();
+            let b = tray_icon(phase, 16, light, TrayBadge::None).unwrap();
+            assert_eq!(a.data(), b.data(), "{phase:?}");
+        }
+    }
 }
 
 /// Brand concept C: an ink "o" ring and a red record dot on a paper tile, corners clear.
@@ -837,6 +865,40 @@ fn transcribing_shows_its_percent_and_a_track() {
     let (a, b) = (frame(None, 300), frame(None, 700));
     assert_ne!(a.data(), b.data());
     assert!(track_fill(&a, busy) > 0);
+}
+
+/// Pasting: typing reports a percent and gets a filled track; a clipboard paste (no percent) is one
+/// step, shows no track and no sweep (DS-26.4).
+#[test]
+fn pasting_has_a_track_only_while_typing() {
+    let bytes = font_bytes();
+    let font = bytes
+        .as_deref()
+        .map(|b| FontRef::try_from_slice(b).unwrap());
+    let (meter, _) = speech(0.5);
+    let r = rect(1.0);
+    let frame = |progress: Option<u8>, now: u64| {
+        let mut c = PillCanvas::new(font.clone());
+        c.set_progress(progress);
+        c.draw(OverlayState::Pasting, &meter, Millis(now), r)
+            .unwrap()
+            .clone()
+    };
+    let busy = accent();
+    let (clip, quarter, half, full) = (
+        frame(None, 300),
+        frame(Some(25), 300),
+        frame(Some(50), 300),
+        frame(Some(100), 300),
+    );
+    assert!(track_fill(&quarter, busy) > track_fill(&clip, busy));
+    assert!(track_fill(&half, busy) > track_fill(&quarter, busy));
+    assert!(track_fill(&full, busy) > track_fill(&half, busy));
+    assert_eq!(
+        clip.data(),
+        frame(None, 700).data(),
+        "no sweep without a bar"
+    );
 }
 
 /// A locked recording first says how to stop, then shows how long it has run.

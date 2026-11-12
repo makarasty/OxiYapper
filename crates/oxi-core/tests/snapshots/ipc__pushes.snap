@@ -2,9 +2,9 @@
 source: crates/oxi-core/tests/ipc.rs
 expression: lines(pushes().iter().map(encode).collect())
 ---
-{"t":"HelloAck","proto":5,"version":"0.1.0"}
+{"t":"HelloAck","proto":6,"version":"0.1.0"}
 {"t":"Raise"}
-{"t":"Status","phase":"recording","model":"turbo","device":"Vulkan0","backend":"Vulkan0","warnings":["gpu not found"]}
+{"t":"Status","phase":"recording","model":"turbo","device":"Vulkan0","backend":"Vulkan0","loaded":true,"warnings":["gpu not found"]}
 {"t":"Devices","mics":["Mic"],"gpus":[{"name":"Vulkan0","description":"Test GPU","uma":false}]}
 {"t":"DownloadProgress","id":"turbo","done":10,"total":100}
 {"t":"DownloadDone","id":"turbo","result":{"r":"Ok"}}
@@ -13,5 +13,10 @@ expression: lines(pushes().iter().map(encode).collect())
 {"t":"Key","code":"F13","down":true}
 {"t":"ConfigError","file":"config.toml","line":3,"message":"bad"}
 {"t":"Stats","dictations":11300,"words":299900,"wpm":146,"streak":6,"longest_streak":40,"heat_start":"2026-11-02","heat":[0,1,4,2,3,0]}
+{"t":"TestProgress","id":7,"percent":0,"est_ms":1200}
 {"t":"TestResult","id":7,"outcome":{"r":"Heard","text":"test","ms":840}}
 {"t":"TestResult","id":8,"outcome":{"r":"Failed","why":"ModelMissing"}}
+{"t":"HistoryAdded","item":{"id":"2026-11-11/101500-123","status":"done","duration_ms":2500,"model":"turbo","language":"auto","text":"test"}}
+{"t":"HistoryRemoved","ids":["2026-11-01/090000-000","2026-11-01/090100-000"]}
+{"t":"FileChanged","file":"Replace"}
+{"t":"Woke"}

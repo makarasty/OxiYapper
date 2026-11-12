@@ -26,7 +26,7 @@ use oxi_core::tuning::{
     self, MAX_TEST_SAMPLES, PCM_CHUNK_SAMPLES, Profile, SettingsSet, WordErrors, encode_pcm,
     word_errors,
 };
-use oxi_core::types::Language;
+use oxi_core::types::{Language, Millis};
 use oxi_platform::capture::{Capture, CaptureError, CaptureEvent, CpalCapture, LevelMeter, play};
 use slint::{
     CloseRequestResponse, ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode,
@@ -37,6 +37,7 @@ use crate::generated::{TestHeard, TestRow, TestState, TestTake, Toast};
 use crate::ipc::{Event, Link, Subscription};
 use crate::{AppWindow, Ctx, Page, report};
 
+use super::progress::Bars;
 use super::tuning as tuning_view;
 use tuning_view::{BARS, clock, history_label, peaks, total};
 
@@ -146,6 +147,16 @@ pub fn bind_with(window: &AppWindow, ctx: &Ctx, mic: Mic, player: Player) {
         offered: RefCell::new(Vec::new()),
         offered_model: Rc::new(VecModel::default()),
         run: RefCell::new(None),
+        bar: Bars::new({
+            let window = window.as_weak();
+            move |(), shown| {
+                if let Some(window) = window.upgrade() {
+                    let s = window.global::<TestState>();
+                    s.set_progress(shown);
+                    s.set_progress_text(format!("{:.0} %", (shown * 100.0).floor()).into());
+                }
+            }
+        }),
         left_out: Cell::new(None),
         rows: Rc::new(VecModel::default()),
         heard: Rc::new(VecModel::default()),
@@ -290,6 +301,8 @@ struct PageState {
     offered: RefCell<Vec<String>>,
     offered_model: Rc<VecModel<SharedString>>,
     run: RefCell<Option<Run>>,
+    /// The bar of the whole run: the one progress driver, not a percent of its own.
+    bar: Rc<Bars<()>>,
     /// The request a closed window left with the daemon, until its answer comes.
     left_out: Cell<Option<u32>>,
     rows: Rc<VecModel<TestRow>>,
@@ -764,6 +777,7 @@ impl PageState {
         self.stop_playing();
         if let Some(run) = self.run.borrow_mut().take() {
             self.left_out.set(Some(run.id));
+            self.bar.clear(&());
             self.mark_not_run(&run);
         }
         let mut i = 0;
@@ -811,8 +825,7 @@ impl PageState {
         s.set_selected(0);
         s.set_best_text(SharedString::new());
         s.set_apply_off(OFF_NO_BEST.into());
-        s.set_progress(0.0);
-        s.set_progress_text("0 %".into());
+        self.bar.clear(&());
         s.set_view(1);
         let run = Run {
             id: 0,
@@ -830,6 +843,7 @@ impl PageState {
         let sets = self.results.borrow().sets.clone();
         if n == 0 || run.job >= sets.len() * n {
             self.finish_run();
+            self.bar.finish(&());
             return;
         }
         let (set, take) = (run.job / n, run.job % n);
@@ -862,7 +876,8 @@ impl PageState {
         };
         self.ctx.ipc.send(request);
         self.set_cell(set, take, Answer::Running);
-        self.progress(&run, 0);
+        // Only moves a bar that runs: the first push of the daemon starts it, with its estimate.
+        self.progress(&run, 0, None);
         *self.run.borrow_mut() = Some(run);
         self.state(|s| self.refresh(s));
     }
@@ -965,23 +980,32 @@ impl PageState {
         self.show_heard(set);
     }
 
-    /// The live percent of the whole run: the jobs done and `percent` of the one out.
-    fn progress(&self, run: &Run, percent: u8) {
-        let jobs = self.results.borrow().sets.len() * run.takes.len();
+    /// The whole run's bar: the jobs done and `percent` of the one out are what is really known.
+    /// A push with `est_ms` (the first of a job) starts the bar, sized for every job; until then
+    /// the bar is the indeterminate sweep, and `bar.real` moves nothing.
+    fn progress(&self, run: &Run, percent: u8, est_ms: Option<u32>) {
+        let jobs = (self.results.borrow().sets.len() * run.takes.len()).max(1);
+        if let Some(est) = est_ms
+            && !self.bar.live(&())
+        {
+            self.bar
+                .start((), Some(Millis(u64::from(est) * jobs as u64)));
+        }
         #[expect(clippy::cast_precision_loss, reason = "job counts are tiny")]
-        let done = (run.job as f32 + f32::from(percent.min(100)) / 100.0) / jobs.max(1) as f32;
-        self.state(|s| {
-            s.set_progress(done);
-            s.set_progress_text(format!("{:.0} %", done * 100.0).into());
-        });
+        let done = (run.job as f32 + f32::from(percent.min(100)) / 100.0) / jobs as f32;
+        self.bar.real(&(), done);
     }
 
     fn event(&self, event: &Event) {
         match event {
             Event::Push(Push::TestResult { id, outcome }) => self.answered(*id, outcome),
-            Event::Push(Push::TestProgress { id, percent }) => {
+            Event::Push(Push::TestProgress {
+                id,
+                percent,
+                est_ms,
+            }) => {
                 if let Some(run) = self.run.borrow().as_ref().filter(|r| r.id == *id) {
-                    self.progress(run, *percent);
+                    self.progress(run, *percent, *est_ms);
                 }
             }
             Event::Push(Push::History { items, .. }) => self.listed(items),
@@ -1064,13 +1088,15 @@ impl PageState {
         }
     }
 
-    /// Ends the run early: what was not answered is marked, the answers so far stay.
+    /// Ends the run early: what was not answered is marked, the answers so far stay, and the
+    /// bar stops where it is (DS-26: a failed run never runs to 100).
     fn abort_run(&self, why: &str) {
         let Some(run) = self.run.borrow_mut().take() else {
             return;
         };
         self.mark_not_run(&run);
         self.toast(why);
+        self.bar.fail(&());
         self.finish_run();
     }
 
@@ -1114,7 +1140,6 @@ impl PageState {
                 s.set_best_text(NOTHING_HEARD.into());
                 s.set_apply_off(NOTHING_HEARD.into());
             }
-            s.set_progress(1.0);
             self.refresh(s);
         });
         *self.best.borrow_mut() = best.map(|(_, set, _)| set);

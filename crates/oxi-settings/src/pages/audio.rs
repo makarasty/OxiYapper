@@ -2238,6 +2238,7 @@ device = \"USB Mic\"
             model: String::new(),
             device: oxi_core::device::DeviceChoice::default(),
             backend: String::new(),
+            loaded: false,
             warnings: vec!["sounds.start: empty, using rise".into()],
         }));
         assert_ne!(state.get_sound_warning(), "");

@@ -6,8 +6,8 @@ use crate::audio::DETECTOR_LATENCY;
 use crate::config::OtherKey;
 
 use super::types::{
-    Effect, Effects, EmptyAudio, Event, JobId, MachineConfig, Mode, ModelFailure, ModelIdentity,
-    Notice, OverlayState, Phase, Sound,
+    CancelWhy, Effect, Effects, EmptyAudio, Event, JobId, MachineConfig, Mode, ModelFailure,
+    ModelIdentity, Note, Notice, OverlayState, Phase, Sound,
 };
 use crate::paste::{ClipboardOnlyWhy, PasteOutcome};
 use crate::types::Millis;
@@ -45,6 +45,12 @@ struct Recording {
     speech: bool,
     /// A shortcut key came: cancelled at this time unless speech is heard first.
     cancel_at: Option<Millis>,
+    /// The user released the held chord at this time (only with `hold_gap`): the job this
+    /// recording becomes may be continued by a new press until then plus the gap.
+    released_at: Option<Millis>,
+    /// Jobs of earlier presses this recording carries on (oldest first): their audio goes in
+    /// front of this one's ([`Effect::Merge`]).
+    continues: Vec<JobId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +70,16 @@ struct Job {
     cancelled: bool,
     /// Ended by a mic or model failure (`cancelled` too): its audio is kept as failed.
     failed: bool,
+    /// A new press inside the hold gap carries this job on in a longer one: it neither goes to
+    /// whisper nor pastes. The [`Effect::Merge`] of that recording takes its audio and ends it;
+    /// a recording that fails gives it back instead ([`State::resume`]).
+    superseded: bool,
+    /// The audio side's or whisper's answer that came while superseded: it changes nothing
+    /// then, and is acted on only if the job is given back.
+    answer: Option<Event>,
+    /// Set for a stop that came from a release of the held chord: the paste waits until then, so
+    /// a quick re-press can still continue it.
+    hold_until: Option<Millis>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +120,8 @@ pub struct State {
     shown: OverlayState,
     /// One-time notice already given in this daemon run.
     mic_fallback_noted: bool,
+    /// Log facts since the last `take_notes`.
+    notes: Vec<Note>,
 }
 
 impl Default for State {
@@ -129,19 +147,23 @@ impl State {
             model_for: None,
             shown: OverlayState::Hidden,
             mic_fallback_noted: false,
+            notes: Vec::new(),
         }
+    }
+
+    /// The log facts of the steps since the last call, oldest first.
+    pub fn take_notes(&mut self) -> Vec<Note> {
+        std::mem::take(&mut self.notes)
     }
 
     pub fn phase(&self) -> Phase {
         if self.rec.is_some() {
             Phase::Recording
-        } else if self.jobs.iter().all(|j| j.cancelled) {
+        } else if self.jobs.iter().all(|j| j.cancelled || j.superseded) {
             Phase::Idle
-        } else if self
-            .jobs
-            .iter()
-            .any(|j| !j.cancelled && !matches!(j.stage, Stage::Transcribed | Stage::Pasting))
-        {
+        } else if self.jobs.iter().any(|j| {
+            !j.cancelled && !j.superseded && !matches!(j.stage, Stage::Transcribed | Stage::Pasting)
+        }) {
             Phase::Transcribing
         } else {
             Phase::Pasting
@@ -155,7 +177,8 @@ impl State {
     }
 
     /// The earliest armed timer: max recording, its warning, the watchdog poll, the release
-    /// tail, the overlay hide, the idle unload.
+    /// tail, the end of the hold gap of the job waiting to paste, the overlay hide, the idle
+    /// unload.
     pub fn next_deadline(&self) -> Option<Millis> {
         let rec = self
             .rec
@@ -170,9 +193,33 @@ impl State {
                 ]
             })
             .flatten();
-        rec.chain(self.notice.map(|(_, t)| t))
+        let hold = self
+            .jobs
+            .front()
+            .filter(|j| j.stage == Stage::Transcribed && !j.superseded)
+            .and_then(|j| j.hold_until);
+        rec.chain(hold)
+            .chain(self.notice.map(|(_, t)| t))
             .chain(self.idle_unload_at)
             .min()
+    }
+
+    /// The earliest time `job` may paste (the end of its hold gap), while the job exists. For
+    /// the property tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn hold_until(&self, job: JobId) -> Option<Millis> {
+        self.jobs
+            .iter()
+            .find(|j| j.id == job)
+            .and_then(|j| j.hold_until)
+    }
+
+    /// `None` when no job `job` is left (a longer dictation took it in, so whisper's answer
+    /// for it is not used); `Some(true)` while a newer press carries it on.
+    #[must_use]
+    pub fn superseded(&self, job: JobId) -> Option<bool> {
+        self.jobs.iter().find(|j| j.id == job).map(|j| j.superseded)
     }
 
     fn max_at(&self, r: &Recording) -> Millis {
@@ -198,7 +245,7 @@ impl State {
             Event::ChordPolled { held: true } => {}
             Event::Esc => {
                 if self.cfg.esc_cancels {
-                    self.cancel_recording(now, true, &mut fx);
+                    self.cancel_recording(now, CancelWhy::Esc, true, &mut fx);
                 }
             }
             Event::OtherKey => self.other_key(now, &mut fx),
@@ -209,37 +256,22 @@ impl State {
                 }
             }
             Event::DeviceLost => {
-                if self.rec.is_some() {
+                if let Some(r) = self.rec.as_mut() {
+                    r.released_at = None; // not a release: nothing to continue
                     self.stop_recording(now, true, &mut fx);
                     fx.push(Effect::Notify(Notice::DeviceLost));
                 }
             }
             Event::CaptureFailed => {
                 if self.rec.is_some() {
-                    self.end_failed_recording(&mut fx);
+                    self.end_failed_recording(now, &mut fx);
                     self.fail(Notice::CaptureFailed, now, &mut fx);
                 }
             }
             Event::JobAudioReady(id) => self.audio_ready(id, now, &mut fx),
-            Event::JobAudioEmpty { job, why } => self.audio_empty(job, why, now, &mut fx),
-            Event::TranscriptionDone { job, empty } => {
-                if let Some(j) = self.job_in(job, Stage::Transcribing) {
-                    j.stage = Stage::Transcribed;
-                    if empty {
-                        self.jobs.retain(|j| j.id != job);
-                        self.show(Notice::NothingHeard, now);
-                    }
-                }
-            }
-            Event::TranscriptionFailed(job) => {
-                if self.job_in(job, Stage::Transcribing).is_some() {
-                    self.jobs.retain(|j| j.id != job);
-                    // A model that failed to load for this job was announced already: one notice.
-                    if !matches!(self.model, ModelStatus::Failed(_)) {
-                        self.fail(Notice::TranscriptionFailed, now, &mut fx);
-                    }
-                }
-            }
+            Event::JobAudioEmpty { .. }
+            | Event::TranscriptionDone { .. }
+            | Event::TranscriptionFailed(_) => self.answer(event, now, &mut fx),
             Event::PasteDone { job, outcome } => {
                 if self.job_in(job, Stage::Pasting).is_some() {
                     self.jobs.retain(|j| j.id != job);
@@ -268,19 +300,19 @@ impl State {
             Event::ModelFailed(why) => {
                 self.model = ModelStatus::Failed(why);
                 self.model_for = None;
-                self.end_failed_recording(&mut fx);
+                self.end_failed_recording(now, &mut fx);
                 self.fail(model_notice(why), now, &mut fx);
             }
             Event::ConfigChanged(cfg) => self.pending_cfg = Some(cfg),
             Event::Suspend => {
-                self.cancel_recording(now, false, &mut fx);
+                self.cancel_recording(now, CancelWhy::Suspend, false, &mut fx);
                 self.unload_when_idle = true;
             }
-            Event::Lock => self.cancel_recording(now, false, &mut fx),
+            Event::Lock => self.cancel_recording(now, CancelWhy::Lock, false, &mut fx),
             Event::Resume | Event::Unlock => fx.push(Effect::ReinstallHook),
             Event::Tick => self.tick(now, &mut fx),
         }
-        self.dispatch(&mut fx);
+        self.dispatch(now, &mut fx);
         self.settle(now, &mut fx);
         fx
     }
@@ -299,7 +331,7 @@ impl State {
             OtherKey::Always => {
                 // Silent unless there is audio to keep.
                 let speech = r.speech;
-                self.cancel_recording(now, speech, fx);
+                self.cancel_recording(now, CancelWhy::OtherKey, speech, fx);
             }
             // Early and before speech: a shortcut, cancelled once the detector had time to
             // report speech that already started. Otherwise the recording goes on.
@@ -311,6 +343,44 @@ impl State {
         }
     }
 
+    /// No audio or no text for a job. One a newer press carries on keeps the answer: its audio
+    /// may still be in the merge, and no notice comes while the user records.
+    fn answer(&mut self, event: Event, now: Millis, fx: &mut Effects) {
+        let (Event::JobAudioEmpty { job, .. }
+        | Event::TranscriptionDone { job, .. }
+        | Event::TranscriptionFailed(job)) = event
+        else {
+            return;
+        };
+        if let Some(j) = self.jobs.iter_mut().find(|j| j.id == job && j.superseded) {
+            j.answer = Some(event);
+            return;
+        }
+        match event {
+            Event::JobAudioEmpty { why, .. } => self.audio_empty(job, why, now, fx),
+            Event::TranscriptionDone { empty, .. } => {
+                if let Some(j) = self.job_in(job, Stage::Transcribing) {
+                    j.stage = Stage::Transcribed;
+                    if empty {
+                        self.jobs.retain(|j| j.id != job);
+                        self.show(Notice::NothingHeard, now);
+                    }
+                }
+            }
+            _ => {
+                if self.job_in(job, Stage::Transcribing).is_some() {
+                    self.jobs.retain(|j| j.id != job);
+                    // A model that failed to load for this job was announced already: one notice.
+                    if !matches!(self.model, ModelStatus::Failed(_)) {
+                        self.fail(Notice::TranscriptionFailed, now, fx);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A superseded job takes its audio too: it may be given back ([`Self::resume`]) and then
+    /// goes to whisper like any job.
     fn job_in(&mut self, id: JobId, stage: Stage) -> Option<&mut Job> {
         self.jobs
             .iter_mut()
@@ -411,14 +481,46 @@ impl State {
     }
 
     /// A mic or model failure ends the recording. With speech and history on its audio is
-    /// kept, as a job whisper never sees (triage #12); otherwise it is thrown away.
-    fn end_failed_recording(&mut self, fx: &mut Effects) {
+    /// kept, as a job whisper never sees (triage #12); otherwise it is thrown away. A job it
+    /// carried on is no part of the failure: it pastes and is kept as before the re-press.
+    fn end_failed_recording(&mut self, now: Millis, fx: &mut Effects) {
         let Some(r) = self.rec.take() else { return };
+        self.resume(&r.continues, now, fx);
         if r.speech && self.cfg.keep_history {
             let id = self.push_job(true, true);
             fx.push(Effect::StopCapture(id));
         } else {
             fx.push(Effect::DiscardCapture);
+        }
+    }
+
+    /// The jobs `from` that a recording carried on end here: their audio goes in front of the
+    /// audio of `into`.
+    fn hand_over(&mut self, from: Vec<JobId>, into: JobId, fx: &mut Effects) {
+        if from.is_empty() {
+            return;
+        }
+        self.jobs.retain(|j| !from.contains(&j.id));
+        fx.push(Effect::Merge { from, into });
+    }
+
+    /// A recording that carried jobs on fails without becoming their dictation: they are live
+    /// again, so their text pastes and their audio is kept (no lost words). An answer that came
+    /// meanwhile is acted on now.
+    fn resume(&mut self, carried: &[JobId], now: Millis, fx: &mut Effects) {
+        let mut answers = Vec::new();
+        for j in self.jobs.iter_mut().filter(|j| carried.contains(&j.id)) {
+            j.superseded = false;
+            answers.extend(j.answer.take());
+        }
+        for answer in answers {
+            // The coordinator kept the audio of a job with no text for the merge: now it goes.
+            if let Event::TranscriptionDone { job, empty: true } | Event::TranscriptionFailed(job) =
+                answer
+            {
+                fx.push(Effect::DropJob(job));
+            }
+            self.answer(answer, now, fx);
         }
     }
 
@@ -431,6 +533,9 @@ impl State {
             stage: Stage::AwaitingAudio,
             cancelled,
             failed,
+            superseded: false,
+            answer: None,
+            hold_until: None,
         });
         id
     }
@@ -438,13 +543,20 @@ impl State {
     /// Cancel the recording in progress. After speech the audio is kept as a cancelled job
     /// (R2.1) and the notice comes with it; before speech it is thrown away. `explicit`: the
     /// user asked for it (Esc, or a key that always cancels): sound, and the overlay text when
-    /// there is no audio to keep. Otherwise it is silent.
-    fn cancel_recording(&mut self, now: Millis, explicit: bool, fx: &mut Effects) {
+    /// there is no audio to keep. Otherwise it is silent. A dictation the recording carried on
+    /// is cancelled with it, by a lock or sleep too: nothing pastes into a locking session.
+    fn cancel_recording(&mut self, now: Millis, why: CancelWhy, explicit: bool, fx: &mut Effects) {
         let Some(r) = self.rec.take() else { return };
+        self.notes.push(Note::Cancelled {
+            why,
+            speech: r.speech,
+        });
         if r.speech {
             let id = self.push_job(true, false);
             fx.push(Effect::StopCapture(id));
+            self.hand_over(r.continues, id, fx);
         } else {
+            debug_assert!(r.continues.is_empty(), "a continuation always has speech");
             fx.push(Effect::DiscardCapture);
             if explicit {
                 self.show(Notice::Cancelled, now);
@@ -466,7 +578,16 @@ impl State {
                 // A shortcut cancel still pending is not lost to it: shortcut audio must not
                 // reach whisper.
                 if r.cancel_at.is_some() {
-                    self.cancel_recording(now, false, fx);
+                    self.cancel_recording(now, CancelWhy::Shortcut, false, fx);
+                } else if r.released_at.is_some_and(|t| now < t + self.cfg.hold_gap) {
+                    // A quick re-press inside the hold gap: the same recording goes on.
+                    let poll = now + self.cfg.watchdog_period;
+                    if let Some(r) = self.rec.as_mut() {
+                        r.tail_until = None;
+                        r.released_at = None;
+                        r.next_poll = Some(poll);
+                    }
+                    return;
                 } else {
                     self.stop_recording(now, false, fx);
                 }
@@ -482,19 +603,33 @@ impl State {
             self.fail(model_notice(why), now, fx);
             return;
         }
+        // A press inside the hold gap of the newest job carries it on; that adds no waiting job.
+        let carried = self
+            .jobs
+            .back()
+            .filter(|j| {
+                !j.cancelled
+                    && !j.superseded
+                    && j.stage != Stage::Pasting
+                    && j.hold_until.is_some_and(|t| t > now)
+            })
+            .map(|j| j.id);
         let waiting = self.jobs.iter().filter(|j| {
             !j.cancelled
+                && !j.superseded
                 && matches!(
                     j.stage,
                     Stage::AwaitingAudio | Stage::Queued | Stage::Transcribed
                 )
         });
-        if waiting.count() >= MAX_WAITING_JOBS {
+        if carried.is_none() && waiting.count() >= MAX_WAITING_JOBS {
+            self.notes.push(Note::RefusedQueueFull);
             fx.push(Effect::Play(Sound::Error));
             return;
         }
         let push = self.cfg.mode == Mode::Push;
         let lock_candidate = push
+            && carried.is_none()
             && self
                 .last_tap
                 .is_some_and(|t| now - t < self.cfg.double_tap_gap);
@@ -502,6 +637,10 @@ impl State {
         self.notice = None;
         self.idle_unload_at = None;
         self.unload_when_idle = false;
+        if let (Some(id), Some(j)) = (carried, self.jobs.back_mut()) {
+            j.superseded = true;
+            fx.push(Effect::Supersede(id));
+        }
         self.rec = Some(Recording {
             started: now,
             kind: if push { Kind::Held } else { Kind::Toggled },
@@ -511,14 +650,19 @@ impl State {
             // modes, so a stale `chord_held` never lets typing cancel a toggle recording.
             next_poll: Some(now + self.cfg.watchdog_period),
             tail_until: None,
-            speech: false,
+            // What was said before is in this dictation: a cancel keeps it.
+            speech: carried.is_some(),
             cancel_at: None,
+            released_at: None,
+            continues: carried.into_iter().collect(),
         });
         fx.push(Effect::StartCapture);
         if self.model == ModelStatus::Unloaded {
             self.preload(fx);
         }
-        fx.push(Effect::Play(Sound::Start));
+        if carried.is_none() {
+            fx.push(Effect::Play(Sound::Start));
+        }
     }
 
     fn preload(&mut self, fx: &mut Effects) {
@@ -552,7 +696,7 @@ impl State {
             // A lock is never silent: the start sound again, now the second one in a row.
             // shortcut: no sound role of its own; a `Sound::Locked` needs the daemon player and config schema.
             fx.push(Effect::Play(Sound::Start));
-        } else if held < self.cfg.tap_max {
+        } else if held < self.cfg.tap_max && r.continues.is_empty() {
             // A tap makes "Thank you." hallucinations: throw it away. A shortcut is no tap.
             if !r.lock_candidate && held < self.cfg.double_tap_max_press && r.cancel_at.is_none() {
                 self.last_tap = Some(now);
@@ -567,10 +711,15 @@ impl State {
     fn release(&mut self, now: Millis, fx: &mut Effects) {
         let tail = self.cfg.release_tail;
         let tap_max = self.cfg.tap_max;
+        if let Some(r) = self.rec.as_mut().filter(|r| r.kind == Kind::Held) {
+            r.released_at = (self.cfg.hold_gap > Millis(0)).then_some(now);
+        }
         match self.rec.as_mut() {
-            // A pending shortcut cancel decides first: the tail lasts at least until then.
+            // A pending shortcut cancel decides first: the tail lasts at least until then. What
+            // carries an earlier press on is never a tap.
             Some(r)
-                if (tail > Millis(0) || r.cancel_at.is_some()) && now - r.started >= tap_max =>
+                if (tail > Millis(0) || r.cancel_at.is_some())
+                    && (now - r.started >= tap_max || !r.continues.is_empty()) =>
             {
                 r.tail_until = Some(r.cancel_at.map_or(now + tail, |c| c.max(now + tail)));
             }
@@ -581,12 +730,17 @@ impl State {
     /// End the recording and make it a job. `discard_short`: audio under `tap_max` is dropped.
     fn stop_recording(&mut self, now: Millis, discard_short: bool, fx: &mut Effects) {
         let Some(r) = self.rec.take() else { return };
-        if discard_short && now - r.started < self.cfg.tap_max {
+        // The parts of a carried-on dictation must come out, however short the last one is.
+        if discard_short && r.continues.is_empty() && now - r.started < self.cfg.tap_max {
             fx.push(Effect::DiscardCapture);
             return;
         }
         let id = self.push_job(false, false);
+        if let (Some(t), Some(j)) = (r.released_at, self.jobs.back_mut()) {
+            j.hold_until = Some(t + self.cfg.hold_gap);
+        }
         fx.push(Effect::StopCapture(id));
+        self.hand_over(r.continues, id, fx);
         fx.push(Effect::Play(Sound::Stop));
     }
 
@@ -594,11 +748,17 @@ impl State {
         // Still set: no speech came in time, so the key was a shortcut.
         let due = |t: Option<Millis>| t.is_some_and(|t| now >= t);
         if self.rec.as_ref().is_some_and(|r| due(r.cancel_at)) {
-            self.cancel_recording(now, false, fx);
+            self.cancel_recording(now, CancelWhy::Shortcut, false, fx);
         }
         if let Some(r) = self.rec.as_ref() {
             if now >= self.max_at(r) || due(r.tail_until) {
-                // Never discard a long recording; the cap stops it without a tail.
+                // Never discard a long recording; the cap stops it without a tail, and it is
+                // no release: nothing to continue.
+                if now >= self.max_at(r)
+                    && let Some(r) = self.rec.as_mut()
+                {
+                    r.released_at = None;
+                }
                 self.stop_recording(now, false, fx);
             } else {
                 let warn = !r.warned && now >= self.warn_at(r);
@@ -634,12 +794,15 @@ impl State {
 
     /// Hand out work: one job to whisper (oldest first, model permitting), the oldest
     /// transcribed job to paste. Jobs never overtake each other.
-    fn dispatch(&mut self, fx: &mut Effects) {
-        while !self.jobs.iter().any(|j| j.stage == Stage::Transcribing) {
-            let next = self
-                .jobs
-                .iter()
-                .position(|j| matches!(j.stage, Stage::AwaitingAudio | Stage::Queued));
+    fn dispatch(&mut self, now: Millis, fx: &mut Effects) {
+        while !self
+            .jobs
+            .iter()
+            .any(|j| j.stage == Stage::Transcribing && !j.superseded)
+        {
+            let next = self.jobs.iter().position(|j| {
+                !j.superseded && matches!(j.stage, Stage::AwaitingAudio | Stage::Queued)
+            });
             let Some(i) = next.filter(|&i| self.jobs[i].stage == Stage::Queued) else {
                 break;
             };
@@ -662,11 +825,9 @@ impl State {
                 }
             }
         }
-        if let Some(front) = self
-            .jobs
-            .front_mut()
-            .filter(|j| j.stage == Stage::Transcribed)
-        {
+        if let Some(front) = self.jobs.front_mut().filter(|j| {
+            j.stage == Stage::Transcribed && !j.superseded && j.hold_until.is_none_or(|t| now >= t)
+        }) {
             front.stage = Stage::Pasting;
             fx.push(Effect::Paste(front.id));
         }

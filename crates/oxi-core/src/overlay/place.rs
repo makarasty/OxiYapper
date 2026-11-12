@@ -84,7 +84,7 @@ impl RecClock {
 }
 
 /// The pill's text into `out` (cleared first): the state's label, with the percent after it
-/// while transcribing and whisper reports one ("Transcribing 42%"), and a locked recording's
+/// while transcribing or typing and a percent is known ("Transcribing 42%"), and a locked recording's
 /// length as `m:ss` once the lock is [`LOCK_HINT`] old (the lock icon still says locked).
 pub fn pill_label(
     out: &mut String,
@@ -97,7 +97,7 @@ pub fn pill_label(
     let label = strings::overlay_label(state);
     let since = |t: Option<Millis>| t.map(|t| now - t);
     match (state, percent) {
-        (OverlayState::Transcribing, Some(p)) => {
+        (OverlayState::Transcribing | OverlayState::Pasting, Some(p)) => {
             let _ = write!(out, "{label} {}%", p.min(100));
         }
         (

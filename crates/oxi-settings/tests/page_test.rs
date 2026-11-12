@@ -160,6 +160,15 @@ impl Fixture {
             .deliver(&Event::Push(Push::TestResult { id, outcome }));
     }
 
+    /// Whisper's progress of the job `id`.
+    fn progress(&self, id: u32, percent: u8, est_ms: Option<u32>) {
+        self.ipc.deliver(&Event::Push(Push::TestProgress {
+            id,
+            percent,
+            est_ms,
+        }));
+    }
+
     fn errors(&self) -> Vec<String> {
         self.state()
             .get_rows()
@@ -641,10 +650,25 @@ fn the_flow_runs_every_set_over_every_recording_and_apply_writes_the_best() {
     s.invoke_record();
     assert!(!s.get_recording(), "no recording during a run");
 
-    // Live percent: 8 jobs, the first half done.
-    f.ipc
-        .deliver(&Event::Push(Push::TestProgress { id, percent: 50 }));
-    assert_eq!(s.get_progress_text(), "6 %");
+    // Live percent: 8 jobs, the first half done. The first push starts the bar with its
+    // estimate; the shown value is the driver's (it chases what is known), so it is a few percent.
+    assert!(s.get_progress() <= 0.0, "nothing known: the sweep");
+    f.progress(id, 0, Some(1000));
+    f.progress(id, 50, None);
+    assert!(
+        s.get_progress() < 0.0625,
+        "1/16 raw: the driver moves only on its frame"
+    );
+    std::thread::sleep(Duration::from_millis(250));
+    mock_elapsed_time(Duration::from_millis(100));
+    // The first frame also runs the page's init, which lists the history again: not a job.
+    let _ = f.take_sent();
+    let shown = s.get_progress();
+    assert!((0.02..=0.2).contains(&shown), "{shown}");
+    assert_eq!(
+        s.get_progress_text().as_str(),
+        format!("{:.0} %", (shown * 100.0).floor())
+    );
 
     // Set 1: a word wrong on the new recording, the history one right.
     let wrong = format!("{first} нет", first = first_phrase());
@@ -805,7 +829,7 @@ fn an_outside_config_edit_keeps_the_recordings_and_the_run() {
     let s = f.state();
     s.invoke_record();
     fs::write(f.layout.config_file(), "version = 2\n# one\n").unwrap();
-    mock_elapsed_time(oxi_settings::FILE_POLL);
+    f.window.invoke_files_check();
     assert!(s.get_recording(), "an open recording goes on");
     s.invoke_record();
     assert_eq!(f.takes()[0].duration, "0:01");
@@ -816,7 +840,7 @@ fn an_outside_config_edit_keeps_the_recordings_and_the_run() {
         panic!("first set");
     };
     fs::write(f.layout.config_file(), "version = 2\n# one and two\n").unwrap();
-    mock_elapsed_time(oxi_settings::FILE_POLL);
+    f.window.invoke_files_check();
     assert_eq!(s.get_view(), 1, "the results stay open");
     assert_eq!(f.errors()[0], "Running…");
     assert_eq!(f.takes().len(), 1);
@@ -902,6 +926,7 @@ fn an_answer_to_another_run_is_ignored() {
     f.ipc.deliver(&Event::Push(Push::TestProgress {
         id: 999,
         percent: 90,
+        est_ms: Some(1000),
     }));
     assert_eq!(f.errors()[0], "Running…");
     assert_eq!(f.state().get_progress_text(), "0 %");
@@ -931,9 +956,19 @@ fn losing_the_daemon_ends_the_run() {
     let f = Fixture::new("lost", None);
     f.record_and_stop();
     f.state().invoke_run();
+    let (id, _, _) = f.one_job();
+    f.progress(id, 50, Some(1000));
+    std::thread::sleep(Duration::from_millis(100));
+    mock_elapsed_time(Duration::from_millis(40));
     f.ipc.deliver(&Event::Link(Link::Offline));
     assert!(f.errors().iter().all(|e| e == "Not run"));
     assert_eq!(f.toast(), "OxiYapper stopped answering, so the test ended.");
+    // DS-26: the bar of a failed run stops where it is, it never glides to 100 %.
+    std::thread::sleep(Duration::from_millis(250));
+    mock_elapsed_time(Duration::from_millis(100));
+    let after = f.state().get_progress();
+    assert!(after < 0.5, "{after}");
+    assert_ne!(f.state().get_progress_text(), "100 %");
 }
 
 /// The named path of "new recordings are gone when the window closes": `PageState::forget`.
@@ -1198,6 +1233,7 @@ fn real_shots_of_the_states() {
                 ipc.deliver(&Event::Push(Push::TestProgress {
                     id: id + 1,
                     percent: 40,
+                    est_ms: None,
                 }));
             }
         }

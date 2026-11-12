@@ -15,7 +15,7 @@ use oxi_core::history::{self, DiffKind, Meta, Status, word_diff};
 use oxi_core::ipc::{HistoryItem, HistoryOp, Push, Request, Spoken, TestFailure, TestOutcome};
 use oxi_core::text::decode_text_file;
 use oxi_core::tuning::SettingsSet;
-use oxi_core::types::Language;
+use oxi_core::types::{Language, Millis};
 use oxi_platform::capture::{CaptureError, play};
 use slint::{ComponentHandle, ModelRc, StyledText, Timer, TimerMode, VecModel, Weak};
 
@@ -23,6 +23,7 @@ use crate::generated::{HistoryRow, HistoryState, Theme, Toast};
 use crate::ipc::{Event, Link, Subscription};
 use crate::{AppWindow, Ctx, Error, Page, report};
 
+use super::progress::Bars;
 use super::tuning::{BARS, clock, peaks, when};
 
 /// Plays mono samples at a rate; dropping what it gives stops the sound. Tests swap in a silent one.
@@ -80,12 +81,21 @@ pub fn bind_with(window: &AppWindow, ctx: &Ctx, player: Player) {
         items: RefCell::new(Vec::new()),
         rows: Rc::new(VecModel::default()),
         fresh: Cell::new(false),
+        added_since: RefCell::new(Vec::new()),
         loading: Cell::new(false),
         shown_id: RefCell::new(None),
         audible: Cell::new(false),
         playing: RefCell::new(None),
         play_timer: Timer::default(),
         run: RefCell::new(None),
+        bar: Bars::new({
+            let window = window.as_weak();
+            move |(), shown| {
+                if let Some(window) = window.upgrade() {
+                    window.global::<HistoryState>().set_progress(shown);
+                }
+            }
+        }),
         next_run: Cell::new(FIRST_RUN),
         other: RefCell::new(None),
         restored: Cell::new(false),
@@ -150,6 +160,9 @@ struct PageState {
     /// The next list answer replaces the list instead of joining it (entries the limits removed
     /// go).
     fresh: Cell<bool>,
+    /// Entries the daemon announced while a fresh list was out: the answer may have been read
+    /// before they were saved, so they survive its clearing.
+    added_since: RefCell<Vec<HistoryItem>>,
     loading: Cell<bool>,
     /// The entry whose waveform is drawn.
     shown_id: RefCell<Option<String>>,
@@ -158,6 +171,8 @@ struct PageState {
     playing: RefCell<Option<Box<dyn Any>>>,
     play_timer: Timer,
     run: RefCell<Option<Run>>,
+    /// The bar of the run: the one progress driver, not a percent of its own.
+    bar: Rc<Bars<()>>,
     next_run: Cell<u32>,
     /// The other version of the picked entry's text: the one before the last new text, or the one
     /// a Restore put aside (`Meta::previous`, read from its json when it is picked).
@@ -236,6 +251,7 @@ impl PageState {
             let mut held = self.items.borrow_mut();
             if self.fresh.replace(false) {
                 held.clear();
+                held.append(&mut self.added_since.borrow_mut());
             }
             for item in items {
                 match held.iter_mut().find(|h| h.id == item.id) {
@@ -252,6 +268,39 @@ impl PageState {
             _ => {}
         }
         self.show_rows(keep.as_deref(), 0);
+    }
+
+    /// The daemon saved a recording: it joins the list (the newest goes on top), and the pick,
+    /// the scroll position and what the page is doing stay.
+    fn added(&self, item: &HistoryItem) {
+        let keep = self.selected_id();
+        if self.fresh.get() {
+            self.added_since.borrow_mut().push(item.clone());
+        }
+        {
+            let mut held = self.items.borrow_mut();
+            match held.iter_mut().find(|h| h.id == item.id) {
+                Some(h) => *h = item.clone(),
+                None => held.push(item.clone()),
+            }
+            held.sort_by(|a, b| b.id.cmp(&a.id));
+        }
+        self.show_rows(keep.as_deref(), 0);
+    }
+
+    /// The limits removed recordings: their rows go. A removed pick moves to the row that took
+    /// its place.
+    fn removed(&self, ids: &[String]) {
+        let at = self
+            .selected_id()
+            .and_then(|id| self.items.borrow().iter().position(|i| i.id == id))
+            .unwrap_or(0);
+        let keep = self.selected_id().filter(|id| !ids.contains(id));
+        self.items.borrow_mut().retain(|i| !ids.contains(&i.id));
+        self.added_since
+            .borrow_mut()
+            .retain(|i| !ids.contains(&i.id));
+        self.show_rows(keep.as_deref(), at);
     }
 
     /// Fills the list, keeping `keep` picked, else the row at `at` (clamped).
@@ -380,10 +429,8 @@ impl PageState {
             language,
             text: None,
         });
-        self.state(|s| {
-            s.set_progress(0.0);
-            self.refresh(s);
-        });
+        self.bar.clear(&());
+        self.state(|s| self.refresh(s));
     }
 
     /// The daemon answered a run: store a heard text, or say why there is none.
@@ -401,7 +448,7 @@ impl PageState {
                     set: run.set.clone(),
                     language: run.language,
                 });
-                self.state(|s| s.set_progress(1.0));
+                self.bar.finish(&());
                 return;
             }
             TestOutcome::Heard { .. } => NOTHING_HEARD,
@@ -409,6 +456,7 @@ impl PageState {
         };
         *slot = None;
         drop(slot);
+        self.bar.fail(&());
         self.toast(why);
         self.state(|s| self.refresh(s));
     }
@@ -686,9 +734,20 @@ impl PageState {
     fn event(&self, event: &Event) {
         match event {
             Event::Push(Push::History { items, more }) => self.listed(items, *more),
-            Event::Push(Push::TestProgress { id, percent }) => {
+            Event::Push(Push::HistoryAdded { item }) => self.added(item),
+            Event::Push(Push::HistoryRemoved { ids }) => self.removed(ids),
+            Event::Push(Push::TestProgress {
+                id,
+                percent,
+                est_ms,
+            }) => {
                 if self.run.borrow().as_ref().is_some_and(|r| r.id == *id) {
-                    self.state(|s| s.set_progress(f32::from((*percent).min(100)) / 100.0));
+                    // The first push carries the estimate: the bar starts there, and until it
+                    // does the bar is the indeterminate sweep (the model may still be loading).
+                    if !self.bar.live(&()) {
+                        self.bar.start((), est_ms.map(|ms| Millis(u64::from(ms))));
+                    }
+                    self.bar.real(&(), f32::from((*percent).min(100)) / 100.0);
                 }
             }
             Event::Push(Push::TestResult { id, outcome }) => self.answered(*id, outcome),
@@ -700,6 +759,7 @@ impl PageState {
                 } else {
                     self.loading.set(false);
                     if self.run.borrow_mut().take().is_some() {
+                        self.bar.fail(&());
                         self.toast(LINK_LOST);
                     }
                 }
@@ -901,6 +961,48 @@ mod tests {
     }
 
     #[test]
+    fn a_new_dictation_joins_an_open_list_and_a_removed_one_leaves_it() {
+        let (window, ipc, _sent, _ctx) = page("live");
+        let s = window.global::<HistoryState>();
+        s.invoke_shown();
+        listed(
+            &ipc,
+            vec![
+                item("2026-11-08/120000-000", Status::Done, "old"),
+                item("2026-11-08/110000-000", Status::Done, "older"),
+            ],
+            false,
+        );
+        s.invoke_select(1);
+        // The daemon saved a recording: one more row, on top; the pick stays on its entry.
+        let new = item("2026-11-08/134501-123", Status::Done, "fresh");
+        ipc.deliver(&Event::Push(Push::HistoryAdded { item: new.clone() }));
+        let ids =
+            |w: &AppWindow| -> Vec<String> { rows(w).iter().map(|r| r.id.to_string()).collect() };
+        assert_eq!(
+            ids(&window),
+            [
+                "2026-11-08/134501-123",
+                "2026-11-08/120000-000",
+                "2026-11-08/110000-000"
+            ]
+        );
+        assert_eq!(s.get_selected(), 2, "the pick stays on its entry");
+        // The same entry again is not a second row.
+        ipc.deliver(&Event::Push(Push::HistoryAdded { item: new }));
+        assert_eq!(ids(&window).len(), 3);
+        // The limits removed the picked one: its row goes, the list stays.
+        ipc.deliver(&Event::Push(Push::HistoryRemoved {
+            ids: vec!["2026-11-08/110000-000".into()],
+        }));
+        assert_eq!(
+            ids(&window),
+            ["2026-11-08/134501-123", "2026-11-08/120000-000"]
+        );
+        assert!(s.get_selected() < 2);
+    }
+
+    #[test]
     fn lists_every_page_newest_first_and_marks_unfinished_ones() {
         let (window, ipc, sent, _ctx) = page("list");
         let s = window.global::<HistoryState>();
@@ -952,6 +1054,32 @@ mod tests {
         listed(
             &ipc,
             vec![item("2026-11-08/134501-123", Status::Done, "hello")],
+            false,
+        );
+        assert_eq!(rows_len(&window), 1);
+    }
+
+    /// Review c04 #1: a recording saved after the daemon read the folder for a fresh list, but
+    /// announced before that list arrived, stays in the list.
+    #[test]
+    fn a_recording_announced_before_a_fresh_list_arrives_stays() {
+        let (window, ipc, _sent, _ctx) = page("race");
+        let s = window.global::<HistoryState>();
+        s.invoke_shown();
+        let new = item("2026-11-08/134501-123", Status::Done, "fresh");
+        ipc.deliver(&Event::Push(Push::HistoryAdded { item: new }));
+        listed(
+            &ipc,
+            vec![item("2026-11-08/120000-000", Status::Done, "old")],
+            false,
+        );
+        let ids: Vec<String> = rows(&window).iter().map(|r| r.id.to_string()).collect();
+        assert_eq!(ids, ["2026-11-08/134501-123", "2026-11-08/120000-000"]);
+        // The next opening starts clean: only what its own list holds.
+        s.invoke_shown();
+        listed(
+            &ipc,
+            vec![item("2026-11-08/120000-000", Status::Done, "old")],
             false,
         );
         assert_eq!(rows_len(&window), 1);
@@ -1054,11 +1182,28 @@ enabled = false
         s.invoke_redo();
         assert_eq!(sent_now(&sent), [], "one run at a time");
 
+        // Nothing known yet: the empty (sweeping) bar. The first push starts it, with its estimate.
+        assert!(s.get_progress() <= 0.0);
+        ipc.deliver(&Event::Push(Push::TestProgress {
+            id: run,
+            percent: 0,
+            est_ms: Some(5000),
+        }));
         ipc.deliver(&Event::Push(Push::TestProgress {
             id: run,
             percent: 40,
+            est_ms: None,
         }));
-        assert!((s.get_progress() - 0.4).abs() < 1e-6);
+        // The bar shows only what the driver answers, which has not moved before its next frame.
+        assert!(s.get_progress() < 0.4, "the page drew the raw percent");
+        // A frame later it has moved, ahead of nothing it cannot back up: whisper said 40 %.
+        std::thread::sleep(Duration::from_millis(250));
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(100));
+        assert!(
+            (0.02..=0.5).contains(&s.get_progress()),
+            "{}",
+            s.get_progress()
+        );
         // Another page's run is not ours.
         ipc.deliver(&Event::Push(Push::TestResult {
             id: 1,
@@ -1093,6 +1238,14 @@ enabled = false
         assert_eq!(s.get_selected(), 1, "the pick stays");
         assert_eq!(s.get_running_id(), "");
         assert_eq!(s.get_redo_off(), "");
+        // The end runs the bar to full and leaves it there: no 100 -> 0 jump.
+        std::thread::sleep(Duration::from_millis(200));
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(100));
+        assert!(
+            (s.get_progress() - 1.0).abs() < 1e-6,
+            "{}",
+            s.get_progress()
+        );
     }
 
     #[test]

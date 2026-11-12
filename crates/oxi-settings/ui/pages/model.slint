@@ -98,14 +98,14 @@ export global ModelState {
     callback gpu-picked(int);
     callback unload-picked(int);
     // Advanced: per parameter (0 threads, 1 flash attention, 2 decoding, 3 temperature, 4 retry,
-    // 5 silence, 6 confidence, 7 repetition, 8 non-speech, 9 audio window) its choice (0 is Auto)
+    // 5 silence, 6 confidence, 7 repetition, 8 non-speech) its choice (0 is Auto)
     // and its number.
     in property <[int]> adv-mode;
     in property <[float]> adv-value;
     in property <string> adv-prompt;
     // The device `Auto` is judged for: a GPU is loaded (or would be picked), not the processor.
     in property <bool> adv-gpu;
-    // (parameter, choice, number); parameter 10 is the number beside Decoding.
+    // (parameter, choice, number); parameter 9 is the number beside Decoding.
     callback adv-changed(int, int, float);
     callback adv-prompt-edited(string);
     callback adv-reset();
@@ -718,7 +718,7 @@ export component ModelPage inherits VerticalLayout {
                                 label: @tr("Decoding");
                                 choices: [@tr("Auto"), @tr("Greedy"), @tr("Beam")];
                                 number: true;
-                                number-index: 10;
+                                number-index: 9;
                                 minimum: 1;
                                 maximum: 8;
                             }
@@ -749,18 +749,6 @@ export component ModelPage inherits VerticalLayout {
                                 index: 4;
                                 label: @tr("Retry doubtful segments");
                                 choices: [@tr("Auto"), @tr("On"), @tr("Off")];
-                            }
-                        }
-                        Divider { }
-                        Row {
-                            icon: Icons.audio-window;
-                            title: @tr("Audio window");
-                            info: @tr("Auto: Full, the whole 30 s window Whisper was trained on. Fit cuts the window to the clip.");
-                            fill-controls: true;
-                            AdvControl {
-                                index: 9;
-                                label: @tr("Audio window");
-                                choices: [@tr("Auto"), @tr("Full"), @tr("Fit")];
                             }
                         }
                     }

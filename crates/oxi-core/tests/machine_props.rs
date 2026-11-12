@@ -1,6 +1,6 @@
 //! Invariants of the state machine over arbitrary event streams (ARCHITECTURE section 13).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use oxi_core::machine::{
     Effect, EmptyAudio, Event, JobId, MachineConfig, Mode, ModelFailure, Phase, Sound, State, step,
@@ -161,6 +161,8 @@ struct Workers {
     transcribed: Vec<JobId>,
     whisper_busy: BTreeSet<JobId>,
     paste_busy: BTreeSet<JobId>,
+    /// Jobs a longer dictation took in (`Merge`): they never paste.
+    merged: BTreeSet<JobId>,
     /// An `Unload` was sent and no `Preload` or `ModelLoaded` came after it.
     unloaded: bool,
 }
@@ -195,6 +197,21 @@ impl Workers {
                 Effect::StopCapture(id) => {
                     assert!(self.issued.insert(id), "job {id:?} issued twice");
                 }
+                Effect::Supersede(id) => {
+                    assert!(
+                        !self.pasted.contains(&id),
+                        "{id:?} carried on after its paste"
+                    );
+                }
+                Effect::Merge { ref from, into } => {
+                    assert!(from.iter().all(|f| *f < into), "merged into an older job");
+                    for f in from {
+                        assert!(!self.pasted.contains(f), "{f:?} merged after its paste");
+                        // The coordinator drops a merged job's whisper result.
+                        self.whisper_busy.remove(f);
+                        self.merged.insert(*f);
+                    }
+                }
                 Effect::Transcribe(id) => {
                     assert!(self.issued.contains(&id), "{id:?} was never recorded");
                     assert!(!self.transcribed.contains(&id), "{id:?} transcribed twice");
@@ -214,6 +231,7 @@ impl Workers {
                         "{id:?} pasted untranscribed"
                     );
                     assert!(!self.pasted.contains(&id), "{id:?} pasted twice");
+                    assert!(!self.merged.contains(&id), "{id:?} pasted after a merge");
                     self.pasted.push(id);
                     self.paste_busy.insert(id);
                     assert!(self.paste_busy.len() <= 1, "two pastes at once");
@@ -224,6 +242,29 @@ impl Workers {
         assert!(self.pasted.is_sorted(), "pasted out of order");
         assert!(self.transcribed.is_sorted(), "transcribed out of order");
     }
+}
+
+/// Steps `event` and answers every effect the way the workers would, at once: audio for a
+/// stop, a text for whisper, a done paste, a load.
+fn answered(state: &mut State, event: Event, now: Millis) -> Vec<Effect> {
+    let mut all = Vec::new();
+    let mut queue = VecDeque::from([event]);
+    while let Some(event) = queue.pop_front() {
+        for effect in step(state, event, now) {
+            queue.extend(match effect {
+                Effect::StopCapture(job) => Some(Event::JobAudioReady(job)),
+                Effect::Transcribe(job) => Some(Event::TranscriptionDone { job, empty: false }),
+                Effect::Paste(job) => Some(Event::PasteDone {
+                    job,
+                    outcome: PasteOutcome::Pasted,
+                }),
+                Effect::Preload => Some(Event::ModelLoaded),
+                _ => None,
+            });
+            all.push(effect);
+        }
+    }
+    all
 }
 
 proptest! {
@@ -241,44 +282,54 @@ proptest! {
             now += dt;
             let fx = step(&mut state, event.clone(), Millis(now));
             workers.observe(&event, &fx);
+            for effect in &fx {
+                if let Effect::Paste(job) = *effect {
+                    let hold = state.hold_until(job);
+                    prop_assert!(hold.is_none_or(|t| now >= t.0), "{job:?} pasted before {hold:?}");
+                }
+            }
         }
     }
 
-    /// Once the events stop, the workers answer and the deadlines run out, the machine is
-    /// Idle with nothing armed.
+    /// Once the events stop, the workers answer and the deadlines run out (a job waiting out
+    /// its hold gap pastes at its end), the machine is Idle with no job left behind.
     #[test]
     fn drains_back_to_idle(cfg in config(), steps in script(event())) {
         let mut state = State::new(cfg);
         let mut now = 0;
         let mut issued = 0;
-        for (event, dt) in steps {
-            now += dt;
-            for e in step(&mut state, event, Millis(now)) {
-                if let Effect::StopCapture(JobId(n)) = e {
-                    issued = issued.max(n + 1);
+        let note = |fx: &[Effect], issued: &mut u64| {
+            for e in fx {
+                if let Effect::StopCapture(JobId(n)) = *e {
+                    *issued = (*issued).max(n + 1);
                 }
             }
+        };
+        for (event, dt) in steps {
+            now += dt;
+            note(&step(&mut state, event, Millis(now)), &mut issued);
         }
 
-        step(&mut state, Event::Esc, Millis(now));
+        note(&answered(&mut state, Event::Esc, Millis(now)), &mut issued);
         for _ in 0..3 {
-            step(&mut state, Event::ModelLoaded, Millis(now));
+            answered(&mut state, Event::ModelLoaded, Millis(now));
             for n in 0..issued {
                 let job = JobId(n);
-                step(&mut state, Event::JobAudioReady(job), Millis(now));
-                step(&mut state, Event::TranscriptionDone { job, empty: false }, Millis(now));
+                answered(&mut state, Event::JobAudioReady(job), Millis(now));
+                answered(&mut state, Event::TranscriptionDone { job, empty: false }, Millis(now));
                 let outcome = PasteOutcome::Pasted;
-                step(&mut state, Event::PasteDone { job, outcome }, Millis(now));
+                answered(&mut state, Event::PasteDone { job, outcome }, Millis(now));
             }
         }
         let mut ticks = 0;
         while let Some(deadline) = state.next_deadline() {
             now = now.max(deadline.0);
-            step(&mut state, Event::Tick, Millis(now));
+            answered(&mut state, Event::Tick, Millis(now));
             ticks += 1;
             prop_assert!(ticks < 10_000, "deadlines never drain");
         }
         prop_assert_eq!(state.phase(), Phase::Idle);
+        prop_assert!(!state.busy(), "a job was left behind");
     }
 
     /// A model that fails to load for the job in whisper (the worker answers `ModelFailed`,

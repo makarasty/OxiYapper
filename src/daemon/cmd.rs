@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
 use oxi_core::config::{
-    Audio, Config, ConfigError, History, Hotkey, Overlay, OverlayPosition, Paste, Sounds,
+    Accent, Audio, Config, ConfigError, History, Hotkey, Overlay, OverlayPosition, Paste, Sounds,
 };
 use oxi_core::device::DeviceChoice;
 use oxi_core::ipc::SoundWarning;
@@ -210,12 +210,15 @@ pub enum HistoryCmd {
     /// Save one dictation as `<stem>.wav` and `<stem>.txt` in the configured folder, then apply
     /// the retention limits. Nothing is written when `cfg.enabled` is false. `spool` is the job's
     /// streamed recording (`Inbox::JobAudio`): the entry takes its name, or it is deleted when
-    /// saving is off.
+    /// saving is off. `carried` are the streamed recordings of the earlier parts a press inside
+    /// the hold gap carried on into this dictation: deleted once its audio is written, kept as
+    /// failed when the write fails.
     Save {
         samples: Vec<f32>,
         text: String,
         cfg: History,
         spool: Option<PathBuf>,
+        carried: Vec<PathBuf>,
     },
 }
 
@@ -243,10 +246,12 @@ pub enum UiCmd {
     Notify(Notice),
     /// Show the pill at this position for 2 s (settings preview).
     PreviewOverlay(OverlayPosition),
-    /// The active config parts the overlay reads: its options and the meter sensitivity.
+    /// The active config parts the overlay and the tray read: the overlay options, the meter
+    /// sensitivity and the accent.
     Config {
         overlay: Overlay,
         meter_sensitivity_db: f32,
+        accent: Accent,
     },
     /// Status warnings for the tray tooltip; sent when they change.
     Warnings(Vec<String>),

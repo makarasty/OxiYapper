@@ -20,7 +20,7 @@ use oxi_core::stats::{
 use oxi_platform::stats_store;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
-use crate::constants::{FILE_POLL, FOLDER_POLL};
+use crate::constants::FOLDER_POLL;
 use crate::generated::{HomeState, MonthLabel, Shell, Toast};
 use crate::ipc::{Event, Link};
 use crate::{AppWindow, Ctx, Error, Page, report};
@@ -104,28 +104,21 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
                 show(&window, &s, summary, keep_heat);
             }
             Event::Link(_) if window.get_page() == Page::Home => refresh(&window, &c, &s, false),
+            // The window got the focus or the machine woke: the stats file may have changed.
+            Event::Push(Push::Woke)
+                if window.get_page() == Page::Home && stamp(&c) != s.stamp.get() =>
+            {
+                refresh(&window, &c, &s, false);
+            }
             _ => {}
         }
     });
 
-    // A finished dictation sends nothing here; the stats file changing is the sign of one.
-    let poll = Timer::default();
-    poll.start(TimerMode::Repeated, FILE_POLL, {
-        let (w, c, s) = (window.as_weak(), ctx.clone(), seen.clone());
-        move || {
-            if let Some(window) = w.upgrade()
-                && window.get_page() == Page::Home
-                && stamp(&c) != s.stamp.get()
-            {
-                refresh(&window, &c, &s, false);
-            }
-        }
-    });
-
+    // A finished dictation arrives as `Push::Stats` (the daemon sends it after each write): no timer.
     let (w, c, s) = (window.as_weak(), ctx.clone(), seen.clone());
     window.global::<HomeState>().on_shown(move || {
         // Held by this callback: a rebind (Reset) replaces it and so stops them.
-        let _ = (&events, &poll);
+        let _ = &events;
         if let Some(window) = w.upgrade() {
             refresh(&window, &c, &s, true);
         }

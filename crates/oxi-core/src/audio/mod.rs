@@ -8,8 +8,9 @@ mod resample;
 mod speech;
 mod trim;
 
-pub use pipeline::{Pipeline, process};
+pub use pipeline::{EdgeStats, Finished, Pipeline, Trim, process};
 pub use speech::{DETECTOR_LATENCY, SpeechDetector};
+pub use trim::voiced_runs;
 
 use crate::types::Millis;
 
@@ -42,7 +43,7 @@ pub const fn samples_for(ms: Millis, rate: u32) -> usize {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AudioError {
-    /// Less than [`MIN_VOICED`] of speech: no whisper call.
+    /// Less than [`MIN_VOICED`] of voice and the level never heard speech: no whisper call.
     #[error("nothing heard")]
     NothingHeard,
     /// All samples are zero: hardware mute or a privacy switch.

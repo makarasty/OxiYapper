@@ -17,6 +17,7 @@ use oxi_core::machine::{
     EngineWarning, Event, JobId, MachineConfig, ModelFailure, ModelIdentity, Phase, PhaseCell,
 };
 use oxi_core::models;
+use oxi_core::overlay::{learn, transcribe_est};
 use oxi_core::paths::Layout;
 use oxi_core::strings;
 use oxi_core::text::Outcome;
@@ -127,7 +128,7 @@ pub fn spawn(
 }
 
 /// `Status.backend` while no model is loaded (the coordinator's value before the first load).
-const NO_BACKEND: &str = "none";
+pub(super) const NO_BACKEND: &str = "none";
 /// How long a model only a test asked for stays with no further test request.
 const TEST_MODEL_IDLE: Duration = Duration::from_secs(60);
 
@@ -156,6 +157,9 @@ struct Worker<R, L> {
     reported: Option<EngineWarning>,
     /// Where the progress of the running job or test goes.
     tap: Tap,
+    /// How much slower (or faster) than the first-guess fit this machine ran the last tests,
+    /// for the estimate a test run starts its bar with.
+    test_speed: f32,
 }
 
 impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<R>> Worker<R, L> {
@@ -176,6 +180,7 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<
             cpu_reason: None,
             reported: None,
             tap: Tap::None,
+            test_speed: 1.0,
         }
     }
 
@@ -225,7 +230,7 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<
                         id,
                         reply: reply.clone(),
                     };
-                    let outcome = self.test(&samples, &set, language);
+                    let outcome = self.test(&samples, &reply, &set, language);
                     self.tap = Tap::None;
                     outcome
                 } else {
@@ -340,32 +345,57 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<
 
     /// One recognition test run on `samples`. The audio stays in memory all the way: it is
     /// handed to whisper as a slice (`Recognizer::transcribe`), no temp file exists.
-    fn test(&mut self, samples: &[f32], set: &SettingsSet, language: Language) -> TestOutcome {
+    fn test(
+        &mut self,
+        samples: &[f32],
+        origin: &Pushes,
+        set: &SettingsSet,
+        language: Language,
+    ) -> TestOutcome {
         if samples.is_empty() {
             return TestOutcome::Failed {
                 why: TestFailure::NoAudio,
             };
         }
-        let opts = Audio {
-            normalize: set.normalize,
-            denoise: set.denoise,
-            trim: set.trim,
-            ..self.cfg.audio.clone()
-        };
-        let clip = match audio::process(samples, audio::SAMPLE_RATE, &opts) {
-            Ok(clip) => clip,
-            Err(AudioError::NothingHeard | AudioError::MicSilence) => {
-                return TestOutcome::Heard {
-                    text: String::new(),
-                    ms: 0,
+        // A stored recording went through gain, denoise, trim and normalise when the app saved it:
+        // doing it again would double the gain.
+        let processed;
+        let clip: &[f32] = if origin.is_stored_audio() {
+            samples
+        } else {
+            let opts = Audio {
+                normalize: set.normalize,
+                denoise: set.denoise,
+                trim: set.trim,
+                ..self.cfg.audio.clone()
+            };
+            let mut done = audio::process(samples, audio::SAMPLE_RATE, &opts);
+            if origin.is_from_history() && matches!(done, Err(AudioError::NothingHeard)) {
+                // The gate may miss a quiet word, and History keeps such a recording to be heard
+                // again: send it whole instead of answering "nothing heard" a second time. A
+                // Test-page clip of silence stays silence: whisper would invent a phrase.
+                let whole = Audio {
+                    trim: false,
+                    ..opts
                 };
+                done = audio::process(samples, audio::SAMPLE_RATE, &whole);
             }
-            Err(e) => {
-                tracing::warn!("recognition test audio failed: {e}");
-                return TestOutcome::Failed {
-                    why: TestFailure::Failed,
-                };
-            }
+            processed = match done {
+                Ok(clip) => clip,
+                Err(AudioError::NothingHeard | AudioError::MicSilence) => {
+                    return TestOutcome::Heard {
+                        text: String::new(),
+                        ms: 0,
+                    };
+                }
+                Err(e) => {
+                    tracing::warn!("recognition test audio failed: {e}");
+                    return TestOutcome::Failed {
+                        why: TestFailure::Failed,
+                    };
+                }
+            };
+            &processed
         };
         // The existing load and retry paths run on the set's model, then the config comes back.
         // A GPU failure of another model says nothing about the configured one: no CPU pin.
@@ -379,7 +409,7 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<
             self.test_loaded = true;
         }
         self.quiet = set.model != active.id;
-        let outcome = self.run_test(&clip);
+        let outcome = self.run_test(clip);
         self.quiet = false;
         if set.model != active.id {
             self.cpu_reason = pin;
@@ -552,13 +582,27 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<
         let tap = self.tap.clone();
         let inbox = self.inbox.clone();
         let phase = self.phase.clone();
+        let audio_ms = samples.len() as u64 * 1000 / u64::from(audio::SAMPLE_RATE);
+        if let Tap::Test { id, reply } = &tap {
+            // The window's bar starts from this, before whisper says anything.
+            let est = transcribe_est(audio_ms, self.test_speed).0;
+            reply.send(Push::TestProgress {
+                id: *id,
+                percent: 0,
+                est_ms: Some(u32::try_from(est).unwrap_or(u32::MAX)),
+            });
+        }
         let mut progress = |percent: u8| match &tap {
             Tap::None => {}
             Tap::Job(job) => {
                 let _ = inbox.send(Inbox::Progress { job: *job, percent });
             }
             Tap::Test { id, reply } => {
-                reply.send(Push::TestProgress { id: *id, percent });
+                reply.send(Push::TestProgress {
+                    id: *id,
+                    percent,
+                    est_ms: None,
+                });
             }
         };
         // Every job cancelled leaves the phase Idle; a test only runs while it is Idle already.
@@ -570,7 +614,13 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<
         };
         engine.set_advanced(&self.cfg.model.advanced);
         let prompt = tuning::prompt(&self.cfg.model.advanced, &self.assets.prompt);
-        engine.transcribe(samples, self.cfg.model.language, &prompt, hooks)
+        let started = Instant::now();
+        let transcript = engine.transcribe(samples, self.cfg.model.language, &prompt, hooks);
+        if matches!(tap, Tap::Test { .. }) && transcript.is_ok() {
+            let took = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            self.test_speed = learn(self.test_speed, audio_ms, took);
+        }
+        transcript
     }
 }
 
@@ -589,6 +639,7 @@ mod tests {
     use oxi_whisper::Segment;
 
     use super::*;
+    use crate::daemon::ipc::Origin;
     use crate::log::scratch::scratch_dir;
 
     /// What a fake load was asked for, and what its engine does.
@@ -613,6 +664,8 @@ mod tests {
         silent_cpu: bool,
         /// No GPU at all (CPU-only build): a GPU request runs on CPU with no warning.
         no_gpu: bool,
+        /// The samples every fake engine was handed, in order.
+        heard: Rc<RefCell<Vec<Vec<f32>>>>,
     }
 
     type Loader = Box<dyn FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<Fake>>;
@@ -622,6 +675,7 @@ mod tests {
         gpu: bool,
         info: LoadInfo,
         fail_run: bool,
+        heard: Rc<RefCell<Vec<Vec<f32>>>>,
     }
 
     impl Recognizer for Fake {
@@ -630,11 +684,12 @@ mod tests {
         }
         fn transcribe(
             &mut self,
-            _: &[f32],
+            samples: &[f32],
             _: Language,
             _: &str,
             hooks: Hooks<'_>,
         ) -> anyhow::Result<Transcript> {
+            self.heard.borrow_mut().push(samples.to_vec());
             (hooks.progress)(40);
             if hooks.cancel.is_some_and(|cancel| cancel()) {
                 return Err(oxi_whisper::Error::Cancelled.into());
@@ -664,6 +719,7 @@ mod tests {
                 gpu_run_fails: false,
                 silent_cpu: false,
                 no_gpu: false,
+                heard: Rc::default(),
             }
         }
 
@@ -682,6 +738,7 @@ mod tests {
                 Ok(Fake {
                     gpu: !cpu,
                     fail_run: s.gpu_run_fails,
+                    heard: s.heard.clone(),
                     info: LoadInfo {
                         device: (!cpu).then(|| "Vulkan0".into()),
                         warning: if asked_gpu && s.silent_cpu {
@@ -849,8 +906,27 @@ mod tests {
         let (_, window) = pushes.claim(0);
         w.handle(test_job(&pushes, "custom"));
         let got: Vec<_> = window.try_iter().collect();
-        assert_eq!(got[0], Push::TestProgress { id: 9, percent: 40 });
-        assert!(matches!(got[1], Push::TestResult { id: 9, .. }));
+        assert!(
+            matches!(
+                got[0],
+                Push::TestProgress {
+                    id: 9,
+                    percent: 0,
+                    est_ms: Some(_)
+                }
+            ),
+            "the run starts with its estimate: {:?}",
+            got[0]
+        );
+        assert_eq!(
+            got[1],
+            Push::TestProgress {
+                id: 9,
+                percent: 40,
+                est_ms: None
+            }
+        );
+        assert!(matches!(got[2], Push::TestResult { id: 9, .. }));
     }
 
     #[test]
@@ -871,6 +947,7 @@ mod tests {
                 warning: None,
             },
             fail_run: false,
+            heard: Rc::default(),
         });
         w.loaded_for = Some(w.identity());
         assert_eq!(w.delete_model("tiny"), DeleteResult::Done { freed: 6 });
@@ -1288,6 +1365,91 @@ mod tests {
         );
         assert!(next(&inbox).is_none(), "no ModelFailed for a test");
         assert_eq!(w.cfg.model.id, "custom", "config restored");
+    }
+
+    #[test]
+    fn a_stored_recording_is_not_processed_again_but_a_microphone_clip_is() {
+        let (r, s) = (rig("teststored"), Script::new());
+        let (mut w, _inbox) = worker(&s, &r);
+        let pushes = Pushes::default();
+        let (_, rx) = pushes.claim(1);
+        let mut cfg = r.cfg(DeviceChoice::Cpu);
+        cfg.audio.gain_db = 12.0;
+        w.handle(WhisperCmd::Config(cfg));
+        let WhisperCmd::Test(raw) = test_job(&pushes, "custom") else {
+            unreachable!()
+        };
+        let samples = raw.samples.clone();
+        w.handle(WhisperCmd::Test(raw));
+        let _ = outcome(&rx);
+        w.handle(test_job(&pushes.for_stored_audio(), "custom"));
+        let _ = outcome(&rx);
+        let heard = s.heard.borrow();
+        assert_ne!(
+            heard[0], samples,
+            "a microphone clip gets gain and normalise"
+        );
+        assert_eq!(heard[1], samples, "a stored one went in as saved");
+    }
+
+    /// A 200 ms clip at -45 dBFS: too quiet for the gate to count five voiced frames.
+    fn quiet_job(w: &TestWorker, reply: &Pushes) -> WhisperCmd {
+        let WhisperCmd::Test(mut job) = test_job(reply, "custom") else {
+            unreachable!()
+        };
+        job.samples = (0..3_200u16)
+            .map(|i| 0.0056 * (f32::from(i) * 0.12).sin())
+            .collect();
+        job.set.trim = true;
+        job.set.normalize = false;
+        let opts = Audio {
+            trim: true,
+            normalize: false,
+            ..w.cfg.audio.clone()
+        };
+        assert!(
+            matches!(
+                audio::process(&job.samples, audio::SAMPLE_RATE, &opts),
+                Err(AudioError::NothingHeard)
+            ),
+            "the premise: the gate hears nothing"
+        );
+        WhisperCmd::Test(job)
+    }
+
+    #[test]
+    fn a_quiet_clip_the_gate_misses_is_sent_whole_on_a_retest() {
+        let (r, s) = (rig("testwholeclip"), Script::new());
+        let (mut w, _inbox) = worker(&s, &r);
+        let pushes = Pushes::default();
+        let (_, rx) = pushes.claim(1);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        let job = quiet_job(&w, &pushes.with_origin(Origin::HistoryRaw));
+        w.handle(job);
+        let _ = outcome(&rx);
+        assert_eq!(s.heard.borrow().len(), 1, "it reached whisper");
+    }
+
+    #[test]
+    fn a_silent_test_page_clip_is_not_sent_to_whisper() {
+        let (r, s) = (rig("testsilentmic"), Script::new());
+        let (mut w, _inbox) = worker(&s, &r);
+        let pushes = Pushes::default();
+        let (_, rx) = pushes.claim(1);
+        w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Cpu)));
+        let job = quiet_job(&w, &pushes);
+        w.handle(job);
+        assert_eq!(
+            outcome(&rx),
+            TestOutcome::Heard {
+                text: String::new(),
+                ms: 0
+            }
+        );
+        assert!(
+            s.heard.borrow().is_empty(),
+            "nothing heard: no whisper call"
+        );
     }
 
     #[test]

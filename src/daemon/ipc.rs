@@ -36,6 +36,7 @@ use oxi_platform::ipc::{Conn, Error, Server, default_name, forward_open_settings
 use super::cmd::{Inbox, IoCmd, IpcAsk, StatusReport, TestJob};
 use super::history::{self, Context as HistoryContext};
 use super::lock;
+use super::whisper::NO_BACKEND;
 
 /// Concurrent connections; more are closed unanswered.
 const MAX_CONNS: usize = 8;
@@ -90,6 +91,9 @@ pub trait Host: Send + Sync + 'static {
     fn history_list(&self, older_than: Option<&str>) -> Push;
     /// The audio of recording `id`, 16 kHz mono, for a new transcript.
     fn history_audio(&self, id: &str) -> io::Result<Vec<f32>>;
+    /// Did the app already process the audio of recording `id` (gain, denoise, trim, normalise)?
+    /// `false` for a recovered raw one (`interrupted`, `failed`) and for an unknown id.
+    fn history_processed(&self, id: &str) -> bool;
     /// Stores `text` as the transcript of recording `id`, made by `set` in `language`.
     fn history_set_text(
         &self,
@@ -103,19 +107,99 @@ pub trait Host: Send + Sync + 'static {
     /// Swaps the transcript of recording `id` with its other version.
     fn history_restore(&self, id: &str) -> io::Result<()>;
     fn history_delete(&self, id: &str) -> io::Result<()>;
+    /// Does this host take the daemon's announcements ([`announce`])? Only the real one does, so
+    /// a thread under test never reaches another test's window.
+    fn announces(&self) -> bool {
+        false
+    }
+}
+
+/// Who hears what the daemon announces without being asked (a saved recording, a stats write,
+/// a file the watcher saw, a status change): the settings connection of the real daemon.
+static BUS: Mutex<Option<Pushes>> = Mutex::new(None);
+
+/// Is a settings window connected? Cheap: a worker asks before it builds a push.
+pub fn connected() -> bool {
+    lock(&BUS).as_ref().is_some_and(Pushes::connected)
+}
+
+/// Queues `push` for the settings window, if one is connected and a bus was set.
+pub fn announce(push: Push) {
+    announce_with(|| push);
+}
+
+/// [`announce`] with the push built only when a window is there to read it.
+pub fn announce_with(make: impl FnOnce() -> Push) {
+    let bus = lock(&BUS).clone();
+    if let Some(pushes) = bus
+        && pushes.connected()
+    {
+        pushes.send(make());
+    }
+}
+
+/// `Status` and `Attention` for the window, after the daemon's own state changed. Only leaves
+/// the report: the connection's thread probes the disk and the microphones and sends both, so
+/// the caller (the coordinator) never waits on a device enumeration.
+pub fn announce_status(report: &StatusReport) {
+    if let Some(pushes) = lock(&BUS).as_ref() {
+        pushes.post_status(report.clone());
+    }
 }
 
 /// Queue to the settings connection, shared by every thread that pushes. Cheap to clone.
+///
+/// The [`Origin`] is where the audio of the job this handle replies to came from.
+/// shortcut: it rides here because `TestJob` (cmd.rs) is not this task's file; move it to a
+/// `TestJob` field when cmd.rs is free.
 #[derive(Clone, Default)]
-pub struct Pushes(Arc<Mutex<Slot>>);
+pub struct Pushes(Arc<Mutex<Slot>>, Origin);
+
+/// Where the audio of a recognition test came from.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum Origin {
+    /// The Test page's microphone clip: raw, and silence stays silence.
+    #[default]
+    Mic,
+    /// A History recording the app already processed (gain, denoise, trim, normalise) when it
+    /// saved it.
+    History,
+    /// A recovered History recording: raw microphone audio.
+    HistoryRaw,
+}
 
 #[derive(Default)]
 struct Slot {
     next_id: u64,
     current: Option<(u64, u32, SyncSender<Push>)>,
+    /// A status for the settings connection's thread to send with its `Attention`.
+    status: Option<StatusReport>,
 }
 
 impl Pushes {
+    /// This queue for a job whose audio came from `origin`.
+    #[must_use]
+    pub fn with_origin(&self, origin: Origin) -> Self {
+        Self(Arc::clone(&self.0), origin)
+    }
+
+    /// This queue for a job whose audio is a stored, already processed recording.
+    #[cfg(test)]
+    #[must_use]
+    pub fn for_stored_audio(&self) -> Self {
+        self.with_origin(Origin::History)
+    }
+
+    /// Is the audio of the job replying here already processed (see [`Self::for_stored_audio`])?
+    pub fn is_stored_audio(&self) -> bool {
+        self.1 == Origin::History
+    }
+
+    /// Does the audio of the job replying here come from History, processed or not?
+    pub fn is_from_history(&self) -> bool {
+        self.1 != Origin::Mic
+    }
+
     /// Queues `push` for the settings connection. `false` when there is none, or when its
     /// queue is full (it is then disconnected, so a stuck window cannot grow memory).
     pub fn send(&self, push: Push) -> bool {
@@ -144,7 +228,32 @@ impl Pushes {
         slot.next_id += 1;
         let id = slot.next_id;
         slot.current = Some((id, client, tx));
+        slot.status = None;
         (id, rx)
+    }
+
+    /// Leaves `report` for the settings connection's thread, which sends it with its
+    /// `Attention`; a newer one replaces one not sent yet. Nothing without a connection.
+    pub fn post_status(&self, report: StatusReport) {
+        let mut slot = lock(&self.0);
+        if slot.current.is_some() {
+            slot.status = Some(report);
+        }
+    }
+
+    /// The status posted for connection `id`, while it is the settings connection.
+    fn take_status(&self, id: u64) -> Option<StatusReport> {
+        let mut slot = lock(&self.0);
+        if slot.current.as_ref().is_some_and(|(cur, _, _)| *cur == id) {
+            slot.status.take()
+        } else {
+            None
+        }
+    }
+
+    /// Is a settings connection up?
+    pub fn connected(&self) -> bool {
+        lock(&self.0).current.is_some()
     }
 
     /// Process id of the settings client, if one is connected.
@@ -224,6 +333,9 @@ pub fn spawn(
     pushes: Pushes,
     keys: Receiver<(Key, bool)>,
 ) -> io::Result<JoinHandle<()>> {
+    if host.announces() {
+        *lock(&BUS) = Some(pushes.clone());
+    }
     let key_pushes = pushes.clone();
     thread::Builder::new()
         .name("ipc-keys".into())
@@ -376,6 +488,12 @@ impl Ctx {
             if !answer_status(conn, session, &*self.host) {
                 return;
             }
+            if let Some((id, _)) = session.settings
+                && let Some(report) = self.pushes.take_status(id)
+                && !send_status(conn, report, &*self.host)
+            {
+                return;
+            }
             match conn.recv::<Request>() {
                 // A client that connects and closes (the probe of `Server::bind`) reads as `None`.
                 Ok(None) => return,
@@ -447,7 +565,7 @@ impl Ctx {
                     return conn.send(&test_failed(id, TestFailure::Busy)).is_ok();
                 }
                 let samples = session.test_audio.clone().unwrap_or_default();
-                self.start_test(session, id, set, language, samples)
+                self.start_test(session, id, set, language, samples, Origin::Mic)
             }
             Request::HistoryList { older_than } => conn
                 .send(&self.host.history_list(older_than.as_deref()))
@@ -536,10 +654,17 @@ impl Ctx {
         let Ok(samples) = self.host.history_audio(id) else {
             return conn.send(&test_failed(run, TestFailure::NoAudio)).is_ok();
         };
-        self.start_test(session, run, set, language, samples)
+        let origin = if self.host.history_processed(id) {
+            Origin::History
+        } else {
+            Origin::HistoryRaw
+        };
+        self.start_test(session, run, set, language, samples, origin)
     }
 
-    /// Hands a recognition test run to the coordinator; its result comes back as a push.
+    /// Hands a recognition test run to the coordinator; its result comes back as a push. For
+    /// `Origin::History` the worker does not process the samples again (a recovered raw one and
+    /// a microphone clip still go through the processing).
     fn start_test(
         &self,
         session: &mut Session,
@@ -547,6 +672,7 @@ impl Ctx {
         set: SettingsSet,
         language: Language,
         samples: Vec<f32>,
+        origin: Origin,
     ) -> bool {
         session.test_running = Some(id);
         session.tested = true;
@@ -555,7 +681,7 @@ impl Ctx {
             set,
             language,
             samples,
-            reply: self.pushes.clone(),
+            reply: self.pushes.with_origin(origin),
         };
         self.inbox.send(Inbox::Ipc(IpcAsk::Test(job))).is_ok()
     }
@@ -608,9 +734,7 @@ fn answer_status(conn: &mut Conn, session: &mut Session, host: &dyn Host) -> boo
         match rx.try_recv() {
             Ok(report) => {
                 session.asks.pop_front();
-                let probe = host.probe(&report.model, &report.device);
-                let attention = attention_push(&report, probe);
-                if conn.send(&status_push(report)).is_err() || conn.send(&attention).is_err() {
+                if !send_status(conn, report, host) {
                     return false;
                 }
             }
@@ -622,6 +746,14 @@ fn answer_status(conn: &mut Conn, session: &mut Session, host: &dyn Host) -> boo
         }
     }
     true
+}
+
+/// Sends `report` and the `Attention` the disk and the system make of it; `false` when the
+/// connection is over.
+fn send_status(conn: &mut Conn, report: StatusReport, host: &dyn Host) -> bool {
+    let probe = host.probe(&report.model, &report.device);
+    let attention = attention_push(&report, probe);
+    conn.send(&status_push(report)).is_ok() && conn.send(&attention).is_ok()
 }
 
 /// Writes what other threads queued; `false` when the connection is over.
@@ -672,12 +804,63 @@ fn hello_ack() -> Push {
     }
 }
 
+/// Is the wav of an entry the app's processed 16 kHz audio? The audio decides, then the status:
+/// a wav that is not at 16 kHz is raw device audio whatever the status says (a recovered
+/// recording stays raw after a retranscribe wrote `done`). At 16 kHz only `done` and `cancelled`
+/// count; a recovered one (`interrupted`, `failed`) is raw (docs/HISTORY-FORMAT.md), which covers
+/// a microphone that records at 16 kHz itself (a Bluetooth headset). Still ambiguous: such a raw
+/// 16 kHz clip after `set_text` or `edit_text` made it `done`; it reads as processed then.
+/// No readable meta: as `history::list` reads it, `done` when there is a text, else `failed`.
+fn audio_is_processed(meta_json: Option<&str>, has_text: bool, wav_rate: Option<u32>) -> bool {
+    if wav_rate != Some(oxi_core::audio::SAMPLE_RATE) {
+        return false;
+    }
+    let status = meta_json
+        .and_then(|j| oxi_core::history::Meta::from_json(j).ok())
+        .map(|m| m.status);
+    match status {
+        Some(s) => matches!(
+            s,
+            oxi_core::history::Status::Done | oxi_core::history::Status::Cancelled
+        ),
+        None => has_text,
+    }
+}
+
+/// Is the wav of entry `id` in `dir` the app's processed audio (see [`audio_is_processed`])?
+fn entry_processed(dir: &std::path::Path, id: &str) -> bool {
+    if !oxi_core::history::is_id(id) {
+        return false;
+    }
+    let base = dir.join(id);
+    let json = std::fs::read_to_string(base.with_extension("json")).ok();
+    let has_text = std::fs::read_to_string(base.with_extension("txt")).is_ok_and(|t| !t.is_empty());
+    audio_is_processed(
+        json.as_deref(),
+        has_text,
+        wav_rate(&base.with_extension("wav")),
+    )
+}
+
+/// The sample rate a wav's header names (a killed recording's header is repaired first).
+fn wav_rate(wav: &std::path::Path) -> Option<u32> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(wav).ok()?;
+    let mut head = [0; oxi_core::history::WAV_HEADER];
+    let got = file.read(&mut head).ok()?;
+    oxi_core::history::repaired_header(&head[..got], file.metadata().ok()?.len())
+        .map(|h| h.sample_rate)
+}
+
 fn status_push(report: StatusReport) -> Push {
+    // The worker names no device while nothing is in memory.
+    let loaded = report.backend != NO_BACKEND;
     Push::Status {
         phase: report.phase,
         model: report.model,
         device: report.gpu,
         backend: report.backend,
+        loaded,
         warnings: report.warnings,
     }
 }
@@ -929,25 +1112,35 @@ impl Host for SystemHost {
     }
 
     fn history_list(&self, older_than: Option<&str>) -> Push {
-        let all = self
-            .history_dir()
-            .map(|dir| history::list(&dir))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| HistoryItem {
-                id: r.id,
-                status: r.meta.status,
-                duration_ms: r.meta.duration_ms,
-                model: r.meta.model,
-                language: r.meta.language,
-                text: Spoken(r.text),
-            });
-        let (items, more) = history_page(all, older_than);
+        // Lazy: only the entries of this page are read (`history::list_from`).
+        let (items, more) = match self.history_dir() {
+            Ok(dir) => history_page(
+                history::list_from(&dir, older_than).map(|r| HistoryItem {
+                    id: r.id,
+                    status: r.meta.status,
+                    duration_ms: r.meta.duration_ms,
+                    model: r.meta.model,
+                    language: r.meta.language,
+                    text: Spoken(r.text),
+                }),
+                older_than,
+            ),
+            Err(_) => (Vec::new(), false),
+        };
         Push::History { items, more }
+    }
+
+    fn announces(&self) -> bool {
+        true
     }
 
     fn history_audio(&self, id: &str) -> io::Result<Vec<f32>> {
         history::audio_16k(&self.history_dir()?, id)
+    }
+
+    fn history_processed(&self, id: &str) -> bool {
+        self.history_dir()
+            .is_ok_and(|dir| entry_processed(&dir, id))
     }
 
     fn history_set_text(
@@ -992,6 +1185,58 @@ impl Host for SystemHost {
 }
 
 #[cfg(test)]
+pub(super) mod test_bus {
+    use std::sync::MutexGuard;
+
+    use super::{BUS, Duration, Instant, Mutex, Push, Pushes, Receiver, lock};
+
+    /// The process bus is one global: a test that sets it holds this lock and leaves it empty.
+    pub static BUS_TEST: Mutex<()> = Mutex::new(());
+
+    /// A settings window "connected" on the process bus, for the producers that announce
+    /// through it (the stats thread, the file watcher, the coordinator).
+    pub struct OnBus {
+        rx: Receiver<Push>,
+        _only_one: MutexGuard<'static, ()>,
+    }
+
+    impl OnBus {
+        pub fn connected() -> Self {
+            let only_one = lock(&BUS_TEST);
+            let pushes = Pushes::default();
+            let (_, rx) = pushes.claim(0);
+            *lock(&BUS) = Some(pushes);
+            Self {
+                rx,
+                _only_one: only_one,
+            }
+        }
+
+        /// The next push within `ms` that `want` picks.
+        pub fn next<T>(&self, ms: u64, want: impl Fn(Push) -> Option<T>) -> Option<T> {
+            let end = Instant::now() + Duration::from_millis(ms);
+            while let Some(left) = end.checked_duration_since(Instant::now()) {
+                match self.rx.recv_timeout(left) {
+                    Ok(push) => {
+                        if let Some(found) = want(push) {
+                            return Some(found);
+                        }
+                    }
+                    Err(_) => return None,
+                }
+            }
+            None
+        }
+    }
+
+    impl Drop for OnBus {
+        fn drop(&mut self) {
+            *lock(&BUS) = None;
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicU64;
 
@@ -1000,6 +1245,7 @@ mod tests {
     use oxi_core::ipc::{Attention, DeleteResult, MAX_LINE, SoundWarning, SoundWarningKind};
     use oxi_core::machine::{Phase, Sound};
 
+    use super::test_bus::OnBus;
     use super::*;
 
     const WAIT: Duration = Duration::from_secs(3);
@@ -1018,6 +1264,8 @@ mod tests {
         capturing: AtomicBool,
         /// Milliseconds `set_capture(true, ..)` takes, as when its thread is preempted.
         on_delay: AtomicU64,
+        /// The threads `probe` ran on.
+        probed_on: Mutex<Vec<Option<String>>>,
     }
 
     impl Host for Fake {
@@ -1053,6 +1301,7 @@ mod tests {
             Ok(())
         }
         fn probe(&self, _model: &str, _device: &str) -> Probe {
+            lock(&self.probed_on).push(thread::current().name().map(String::from));
             Probe {
                 model: Some(ModelStatus::Bad),
                 mic_missing: true,
@@ -1074,11 +1323,14 @@ mod tests {
             Push::History { items, more }
         }
         fn history_audio(&self, id: &str) -> io::Result<Vec<f32>> {
-            if id == GOOD_ID {
+            if id == GOOD_ID || id == RAW_ID {
                 Ok(vec![0.25; 3])
             } else {
                 Err(io::ErrorKind::NotFound.into())
             }
+        }
+        fn history_processed(&self, id: &str) -> bool {
+            id != RAW_ID
         }
         fn history_set_text(
             &self,
@@ -1101,6 +1353,8 @@ mod tests {
     }
 
     const GOOD_ID: &str = "2026-11-10/101500-123";
+    /// A recovered recording: raw microphone audio.
+    const RAW_ID: &str = "2026-11-10/101600-456";
 
     /// A one-process child (`ping` starts no grandchild), so nothing is left behind.
     fn sleeper() -> std::process::Child {
@@ -1206,6 +1460,7 @@ mod tests {
             calls: calls_tx,
             capturing: AtomicBool::new(false),
             on_delay: AtomicU64::new(0),
+            probed_on: Mutex::new(Vec::new()),
         });
         let pushes = Pushes::default();
         spawn(
@@ -1249,6 +1504,45 @@ mod tests {
         conn
     }
 
+    /// Review c04 #7: a status the coordinator posts is probed and sent by the connection's
+    /// thread; the poster only leaves it (no device enumeration on the coordinator).
+    #[test]
+    fn a_posted_status_is_probed_and_sent_by_the_connection_thread() {
+        let rig = rig("posted");
+        let mut conn = settings(&rig);
+        let report = StatusReport {
+            phase: Phase::Idle,
+            model: "tiny".into(),
+            device: "mic".into(),
+            gpu: DeviceChoice::Auto,
+            backend: "cpu".into(),
+            model_failure: None,
+            warnings: Vec::new(),
+            sounds: Vec::new(),
+        };
+        rig.pushes.post_status(report.clone());
+        rig.pushes.post_status(report); // a newer one replaces the unsent one
+        assert!(
+            lock(&rig.host.probed_on).is_empty(),
+            "the poster never probes"
+        );
+        assert!(matches!(
+            conn.recv::<Push>().unwrap(),
+            Some(Push::Status {
+                phase: Phase::Idle,
+                ..
+            })
+        ));
+        assert!(matches!(
+            conn.recv::<Push>().unwrap(),
+            Some(Push::Attention { .. })
+        ));
+        let me = thread::current().name().map(String::from);
+        let probed = lock(&rig.host.probed_on).clone();
+        assert_eq!(probed.len(), 1, "sent once: {probed:?}");
+        assert_ne!(probed[0], me);
+    }
+
     #[test]
     fn status_and_devices_are_answered() {
         let rig = rig("status");
@@ -1275,6 +1569,7 @@ mod tests {
                 model: "tiny".into(),
                 device: DeviceChoice::Named("Vulkan0".into()),
                 backend: "cpu".into(),
+                loaded: true,
                 warnings: vec!["w".into()],
             })
         );
@@ -1387,6 +1682,10 @@ mod tests {
             panic!("no test job");
         };
         assert_eq!((job.id, job.samples), (2, vec![0.25; 3]));
+        assert!(
+            job.reply.is_stored_audio(),
+            "a History recording is already processed"
+        );
         // Its answer is pending: the next one waits.
         conn.send(&ask(3, GOOD_ID)).unwrap();
         assert_eq!(
@@ -1398,6 +1697,117 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn a_recovered_raw_recording_still_gets_processed_on_retranscribe() {
+        let rig = rig("retranscribe-raw");
+        let mut conn = settings(&rig);
+        conn.send(&Request::HistoryRetranscribe {
+            run: 1,
+            id: RAW_ID.into(),
+            set: SettingsSet::defaults(),
+            language: Language::RU,
+        })
+        .unwrap();
+        let Ok(Inbox::Ipc(IpcAsk::Test(job))) = rig.inbox.recv_timeout(WAIT) else {
+            panic!("no test job");
+        };
+        assert!(!job.reply.is_stored_audio(), "raw audio must be processed");
+    }
+
+    /// A wav header of `rate` Hz mono 16 bit and two samples of silence.
+    fn tiny_wav(rate: u32) -> Vec<u8> {
+        let mut b = b"RIFF".to_vec();
+        b.extend(40_u32.to_le_bytes());
+        b.extend(b"WAVEfmt ");
+        b.extend(16_u32.to_le_bytes());
+        b.extend([1, 0, 1, 0]);
+        b.extend(rate.to_le_bytes());
+        b.extend((rate * 2).to_le_bytes());
+        b.extend([2, 0, 16, 0]);
+        b.extend(b"data");
+        b.extend(4_u32.to_le_bytes());
+        b.extend([0; 4]);
+        b
+    }
+
+    /// An entry in a fresh owned folder: a wav at `rate` and a meta with `status`.
+    fn entry(
+        tag: &str,
+        rate: u32,
+        status: oxi_core::history::Status,
+    ) -> (std::path::PathBuf, &'static str) {
+        let dir =
+            crate::log::scratch::scratch_dir(&format!("oxi-ipc-{tag}-{}", std::process::id()));
+        std::fs::write(dir.join(oxi_core::history::MARKER), b"x").unwrap();
+        let id = "2026-11-10/101600-456";
+        std::fs::create_dir_all(dir.join("2026-11-10")).unwrap();
+        std::fs::write(dir.join(id).with_extension("wav"), tiny_wav(rate)).unwrap();
+        let meta = oxi_core::history::Meta {
+            version: oxi_core::history::Meta::VERSION,
+            started: String::new(),
+            duration_ms: 0,
+            status,
+            model: String::new(),
+            language: String::new(),
+            settings: None,
+            previous: None,
+        };
+        std::fs::write(dir.join(id).with_extension("json"), meta.to_json().unwrap()).unwrap();
+        (dir, id)
+    }
+
+    fn retranscribed(dir: &std::path::Path, id: &str) {
+        history::set_text(dir, id, "text", &HistoryContext::default()).unwrap();
+    }
+
+    #[test]
+    fn a_raw_device_rate_recording_stays_raw_after_a_retranscribe_wrote_done() {
+        let (dir, id) = entry("raw48", 48_000, oxi_core::history::Status::Interrupted);
+        assert!(!entry_processed(&dir, id));
+        retranscribed(&dir, id); // status is now done
+        assert!(!entry_processed(&dir, id), "second retranscribe: still raw");
+    }
+
+    #[test]
+    fn a_recovered_16k_recording_is_raw_until_its_status_is_rewritten() {
+        let (dir, id) = entry("raw16", 16_000, oxi_core::history::Status::Failed);
+        assert!(!entry_processed(&dir, id), "a Bluetooth clip, as recovered");
+        // The limit: nothing on disk tells it from a processed one after the rewrite.
+        retranscribed(&dir, id);
+        assert!(entry_processed(&dir, id));
+        let (dir, id) = entry("done16", 16_000, oxi_core::history::Status::Done);
+        assert!(entry_processed(&dir, id));
+    }
+
+    #[test]
+    fn only_done_and_cancelled_audio_counts_as_processed() {
+        use oxi_core::history::Status::{Cancelled, Done, Failed, Interrupted};
+        let meta = |status: oxi_core::history::Status| {
+            oxi_core::history::Meta {
+                version: oxi_core::history::Meta::VERSION,
+                started: String::new(),
+                duration_ms: 0,
+                status,
+                model: String::new(),
+                language: String::new(),
+                settings: None,
+                previous: None,
+            }
+            .to_json()
+            .unwrap()
+        };
+        let rate = Some(16_000);
+        assert!(audio_is_processed(Some(&meta(Done)), false, rate));
+        assert!(audio_is_processed(Some(&meta(Cancelled)), false, rate));
+        assert!(!audio_is_processed(Some(&meta(Interrupted)), false, rate));
+        assert!(!audio_is_processed(Some(&meta(Failed)), true, rate));
+        assert!(audio_is_processed(None, true, rate));
+        assert!(!audio_is_processed(None, false, rate));
+        assert!(!audio_is_processed(Some("not json"), false, rate));
+        assert!(!audio_is_processed(Some(&meta(Done)), true, Some(48_000)));
+        assert!(!audio_is_processed(Some(&meta(Done)), true, None));
     }
 
     #[test]
@@ -1462,6 +1872,17 @@ mod tests {
                 items: vec![Attention::OutOfMemory { cpu: true }]
             }
         );
+        // Status.loaded follows the worker's "no device" word.
+        assert!(matches!(
+            status_push(report.clone()),
+            Push::Status { loaded: false, .. }
+        ));
+        report.backend = "Vulkan0".into();
+        assert!(matches!(
+            status_push(report.clone()),
+            Push::Status { loaded: true, .. }
+        ));
+        report.backend = "none".into();
         // The sound worker's kind decides, not its line's wording.
         report.model_failure = None;
         report.sounds = vec![SoundWarning {
@@ -1571,7 +1992,8 @@ mod tests {
         .unwrap();
         assert!(matches!(
             rig.inbox.recv_timeout(WAIT),
-            Ok(Inbox::Ipc(IpcAsk::Test(job))) if job.id == 3 && job.samples == [0.1, 0.2, 0.3]
+            Ok(Inbox::Ipc(IpcAsk::Test(job)))
+                if job.id == 3 && job.samples == [0.1, 0.2, 0.3] && !job.reply.is_stored_audio()
         ));
         drop(conn);
         assert!(matches!(
@@ -1806,6 +2228,7 @@ mod tests {
             model: "tiny".into(),
             device: DeviceChoice::Auto,
             backend: "cpu".into(),
+            loaded: true,
             warnings: vec!["w".repeat(64 * 1024)],
         };
         let start = Instant::now();
@@ -1977,5 +2400,71 @@ mod tests {
             let msg = refusal(error).to_string();
             assert!(msg.contains(text), "{msg:?} lacks {text:?}");
         }
+    }
+    /// The window nobody connected is never read for: the push is not even built.
+    #[test]
+    fn nothing_is_built_for_a_window_that_is_not_there() {
+        let _only_one = lock(&test_bus::BUS_TEST);
+        announce_with(|| panic!("built with no bus"));
+        let pushes = Pushes::default();
+        *lock(&BUS) = Some(pushes);
+        announce_with(|| panic!("built with no connection"));
+        *lock(&BUS) = None;
+    }
+
+    #[test]
+    fn a_stats_write_is_pushed_to_the_window() {
+        use oxi_core::stats::Date;
+        let dir =
+            crate::log::scratch::scratch_dir(&format!("oxi-ipc-stats-{}", std::process::id()));
+        let bus = OnBus::connected();
+        let today = || Date::from_ymd(2026, 11, 7).unwrap();
+        // Another test's stats thread may write while the bus is set (the stats tests run in
+        // parallel): its push is there first, and only this test's word count picks ours.
+        announce(Push::Stats(
+            oxi_core::stats::Stats::default().summary(today(), 1),
+        ));
+        let recorder =
+            super::super::stats::Recorder::spawn(dir.join(oxi_core::stats::FILE), today).unwrap();
+        recorder.add(4099, oxi_core::types::Millis(1_200));
+        drop(recorder); // waits for the write
+        let summary = bus.next(2000, |p| match p {
+            Push::Stats(s) if s.words == 4099 => Some(s),
+            _ => None,
+        });
+        let summary = summary.expect("no Stats push after a write");
+        assert_eq!((summary.dictations, summary.words), (1, 4099));
+    }
+
+    #[test]
+    fn an_edit_of_a_watched_file_is_pushed_to_the_window() {
+        use oxi_core::ipc::WatchedFile;
+        use oxi_core::paths::Layout;
+        let dir =
+            crate::log::scratch::scratch_dir(&format!("oxi-ipc-watch-{}", std::process::id()));
+        let layout = Layout {
+            config_dir: dir.clone(),
+            data_dir: dir.clone(),
+            logs_dir: dir,
+        };
+        let bus = OnBus::connected();
+        let (tx, _rx) = mpsc::channel();
+        let _watcher = super::super::watch::spawn(&layout, tx, |_| {}).unwrap();
+        oxi_platform::fs::write_atomic(&layout.config_file(), b"version = 2\n").unwrap();
+        let seen = |want: WatchedFile| {
+            bus.next(5000, |p| match p {
+                Push::FileChanged { file } if file == want => Some(()),
+                _ => None,
+            })
+        };
+        assert!(
+            seen(WatchedFile::Config).is_some(),
+            "no FileChanged for the config"
+        );
+        oxi_platform::fs::write_atomic(&layout.dictionary_file(), b"word\n").unwrap();
+        assert!(
+            seen(WatchedFile::Dictionary).is_some(),
+            "no FileChanged for the dictionary"
+        );
     }
 }

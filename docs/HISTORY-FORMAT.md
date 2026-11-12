@@ -84,9 +84,10 @@ The audio is written to disk as it is recorded, so a crash or a power cut keeps 
    too slow to keep up stops the file growing; the dictation itself goes on.
 2. At key-up the file is closed and waits for the text. The save renames it to `.wav` under the
    same name (the recording's start time), replaces it with the processed 16 kHz audio, then
-   writes the `.txt` and the `.json`. A recording that is cancelled early or in which nothing was
-   heard is deleted. One whose transcription fails, comes out empty, or is still waiting when the
-   app quits becomes an entry with status `failed` at once.
+   writes the `.txt` and the `.json`. A recording that is cancelled early, or whose microphone
+   gave only zeros, is deleted. One in which the gate heard nothing (a very quiet word) is kept as
+   `failed`, so it can be transcribed again. So is one whose transcription fails, comes out empty,
+   or is still waiting when the app quits: it becomes an entry with status `failed` at once.
 3. At the next start, a `.wav.part` that no running recording owns is made whole: its header is
    set from the bytes on disk, it is renamed to `.wav`, and an empty `.txt` and a `.json` with
    status `interrupted` are written. A recording cut off while it waited for its text also reads

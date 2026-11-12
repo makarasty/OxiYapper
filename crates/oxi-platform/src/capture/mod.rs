@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use oxi_core::audio::{AudioError, Level};
+use oxi_core::audio::{AudioError, EdgeStats, Level, Trim};
 use oxi_core::config::Audio;
 use thiserror::Error;
 
@@ -58,6 +58,9 @@ pub enum CaptureEvent {
     /// Processing failed mid-recording (sent once). The meter reads zero, the ring keeps being
     /// emptied without processing, and `finish` returns the error.
     Failed,
+    /// The user started speaking ([`oxi_core::audio::Pipeline::speech_started`]); sent once, by
+    /// the drain thread, as soon as it knows.
+    SpeechHeard,
 }
 
 #[derive(Debug, Error)]
@@ -98,6 +101,9 @@ pub struct Recorded {
     /// for its transcript; `None` while saving is off. Hand it to `wav::spool_take` or
     /// `wav::spool_give_up`.
     pub spool: Option<PathBuf>,
+    /// What the speech gate did, and where the voice sits; for the log.
+    pub trim: Trim,
+    pub stats: EdgeStats,
 }
 
 /// One microphone recording: open on key-down, [`Capture::finish`] on key-up.
@@ -130,7 +136,7 @@ pub trait Capture: Sized {
     fn finish_recording(self) -> Result<Recorded, CaptureError> {
         self.finish().map(|samples| Recorded {
             samples,
-            spool: None,
+            ..Recorded::default()
         })
     }
 }

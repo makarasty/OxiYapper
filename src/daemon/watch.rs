@@ -17,6 +17,7 @@ use notify_debouncer_full::{
     DebounceEventResult, DebouncedEvent, Debouncer, RecommendedCache, file_id, new_debouncer,
 };
 use oxi_core::config::{ConfigError, ConfigFile};
+use oxi_core::ipc::{Push, WatchedFile};
 use oxi_core::machine::Notice;
 use oxi_core::paths::{CONFIG_FILE, DICTIONARY_FILE, Layout, REPLACE_FILE};
 
@@ -167,9 +168,16 @@ fn run(
         }
         if changed.config {
             reload_config(config_file, inbox, notify);
+            super::ipc::announce(Push::FileChanged {
+                file: WatchedFile::Config,
+            });
         }
         if changed.assets {
             let _ = inbox.send(Inbox::AssetsChanged);
+            // One flag for both files: the window checks each of them.
+            for file in [WatchedFile::Dictionary, WatchedFile::Replace] {
+                super::ipc::announce(Push::FileChanged { file });
+            }
         }
     }
 }

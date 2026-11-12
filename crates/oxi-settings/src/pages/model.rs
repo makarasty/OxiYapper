@@ -10,7 +10,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use std::time::SystemTime;
 
-use oxi_core::config::{Advanced, AudioCtx, Auto, Decoding};
+use oxi_core::config::{Advanced, Auto, Decoding};
 use oxi_core::device::{Device, DeviceChoice, pick};
 use oxi_core::ipc::{DeleteResult, DownloadResult, Push, Request};
 use oxi_core::languages::{self, LanguageInfo};
@@ -22,6 +22,7 @@ use oxi_core::types::Language;
 use oxi_platform::fs::list_partials;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
+use super::progress::{Bars, DOWNLOAD_EST};
 use crate::constants::FOLDER_POLL;
 use crate::generated::{GalleryTile, ModelRow, ModelState, Toast};
 use crate::ipc::{Event, Link, Subscription};
@@ -78,11 +79,20 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         partials: RefCell::new(Vec::new()),
         listed: RefCell::new(None),
         backend: RefCell::new(String::new()),
+        loaded: Cell::new(false),
         choices: RefCell::new(Vec::new()),
         unloads: RefCell::new(Vec::new()),
         // Not a pair the config can hold: the first `push_language` takes the config's.
         slots: Cell::new([Language::AUTO; 2]),
         found: RefCell::new(Vec::new()),
+        bars: Bars::new({
+            let me = me.clone();
+            move |&i, shown| {
+                if let Some(page) = me.upgrade() {
+                    page.update(i, |r| r.progress = shown);
+                }
+            }
+        }),
         checks: Checks {
             latest: Cell::new(0),
             running: Cell::new(0),
@@ -159,6 +169,8 @@ struct PageState {
     listed: RefCell<Option<Vec<Device>>>,
     /// The daemon's `Status.backend` (`cpu`, `Vulkan0`, `none`); empty until it answers.
     backend: RefCell<String>,
+    /// The daemon's `Status.loaded`: a model is in memory (what `backend` names is running).
+    loaded: Cell<bool>,
     /// What each GPU picker row writes.
     choices: RefCell<Vec<DeviceChoice>>,
     /// What each unload picker row writes, as in [`UNLOAD`].
@@ -167,6 +179,9 @@ struct PageState {
     slots: Cell<[Language; 2]>,
     /// The rows of the language popup: what the search matched.
     found: RefCell<Vec<&'static LanguageInfo>>,
+    /// The download bars by row: they show what the one progress driver answers, not the bytes
+    /// as they come.
+    bars: Rc<Bars<usize>>,
     checks: Checks,
 }
 
@@ -250,6 +265,7 @@ impl PageState {
         let model = &file.config.model;
         let on_gpu = auto_on_gpu(
             &self.backend.borrow(),
+            self.loaded.get(),
             self.listed.borrow().as_deref(),
             &model.gpu,
         );
@@ -269,7 +285,6 @@ impl PageState {
             r.no_speech_threshold,
             r.logprob_threshold,
             r.entropy_threshold,
-            0.0,
             0.0,
         ];
         s.set_adv_mode(ModelRc::from(Rc::new(VecModel::from(adv_modes(
@@ -473,6 +488,7 @@ impl PageState {
 
     fn stop_downloading(&self) {
         for i in 0..self.rows.row_count() {
+            self.bars.clear(&i);
             self.update(i, |r| r.downloading = false);
         }
         self.refresh_rows();
@@ -748,10 +764,14 @@ impl PageState {
                 self.refresh_rows();
             }
             Event::Push(Push::Status {
-                warnings, backend, ..
+                warnings,
+                backend,
+                loaded,
+                ..
             }) => {
                 // What Auto picks follows the device that is loaded (DS-11.4 h).
-                if *self.backend.borrow() != *backend {
+                let was_loaded = self.loaded.replace(*loaded);
+                if *self.backend.borrow() != *backend || was_loaded != *loaded {
                     backend.clone_into(&mut self.backend.borrow_mut());
                     self.state(|s| self.push_advanced(s));
                 }
@@ -765,9 +785,13 @@ impl PageState {
             }
             Event::Push(Push::DownloadProgress { id, done, total }) => {
                 if let Some(i) = self.index_of(id) {
+                    // Real from the first byte (DS-26.4); the estimate stays flat meanwhile.
+                    if !self.bars.live(&i) {
+                        self.bars.start(i, Some(DOWNLOAD_EST));
+                    }
+                    self.bars.real(&i, fraction(*done, *total));
                     self.update(i, |r| {
                         r.downloading = true;
-                        r.progress = fraction(*done, *total);
                         r.progress_text = strings::download_progress(*done, *total).into();
                         r.badge = strings::MODEL_BADGE_DOWNLOADING.into();
                     });
@@ -776,6 +800,7 @@ impl PageState {
             }
             Event::Push(Push::DownloadDone { id, result }) => {
                 if let Some(i) = self.index_of(id) {
+                    self.bars.clear(&i);
                     self.update(i, |r| {
                         r.downloading = false;
                         r.error = match result {
@@ -848,16 +873,21 @@ impl PageState {
 }
 
 /// Whether an `auto` setting is judged for a GPU: the loaded device when the daemon says one
-/// (`backend`), else what the picker would pick among the listed GPUs (all but the CPU choice
+/// (`backend`, while `loaded`), else what the picker would pick among the listed GPUs (all but the CPU choice
 /// while they are not listed yet). The CPU choice is the processor whatever is loaded.
-fn auto_on_gpu(backend: &str, listed: Option<&[Device]>, choice: &DeviceChoice) -> bool {
+fn auto_on_gpu(
+    backend: &str,
+    loaded: bool,
+    listed: Option<&[Device]>,
+    choice: &DeviceChoice,
+) -> bool {
     if *choice == DeviceChoice::Cpu {
         return false;
     }
-    match (backend, listed) {
-        ("" | "none", Some(gpus)) => pick(gpus, choice).index.is_some(),
-        ("" | "none", None) => true,
-        (loaded, _) => loaded != "cpu",
+    match (loaded, listed) {
+        (false, Some(gpus)) => pick(gpus, choice).index.is_some(),
+        (false, None) => true,
+        (true, _) => backend != "cpu",
     }
 }
 
@@ -926,12 +956,11 @@ const P_NO_SPEECH: i32 = 5;
 const P_LOGPROB: i32 = 6;
 const P_ENTROPY: i32 = 7;
 const P_SUPPRESS: i32 = 8;
-const P_AUDIO_CTX: i32 = 9;
 /// The number beside Decoding; it has a value but no choice of its own.
-const P_CANDIDATES: i32 = 10;
+const P_CANDIDATES: i32 = 9;
 
 /// The choice each parameter shows: 0 is Auto; a yes/no one then reads 1 On, 2 Off; decoding 1
-/// Greedy, 2 Beam; the numbers 1 Custom; the audio window 1 Full, 2 Fit.
+/// Greedy, 2 Beam; the numbers 1 Custom.
 fn adv_modes(a: &Advanced) -> Vec<i32> {
     let flag = |v: Auto<bool>| match v {
         Auto::Auto => 0,
@@ -953,11 +982,6 @@ fn adv_modes(a: &Advanced) -> Vec<i32> {
         custom(matches!(a.logprob_threshold, Auto::Set(_))),
         custom(matches!(a.entropy_threshold, Auto::Set(_))),
         flag(a.suppress_non_speech),
-        match a.audio_ctx {
-            Auto::Auto => 0,
-            Auto::Set(AudioCtx::Full) => 1,
-            Auto::Set(AudioCtx::Fit) => 2,
-        },
     ]
 }
 
@@ -1017,13 +1041,6 @@ fn adv_apply(a: &mut Advanced, param: i32, mode: i32, value: f32) {
         P_LOGPROB => a.logprob_threshold = number(&Advanced::LOGPROB),
         P_ENTROPY => a.entropy_threshold = number(&Advanced::ENTROPY),
         P_SUPPRESS => a.suppress_non_speech = flag(mode),
-        P_AUDIO_CTX => {
-            a.audio_ctx = match mode {
-                1 => Auto::Set(AudioCtx::Full),
-                2 => Auto::Set(AudioCtx::Fit),
-                _ => Auto::Auto,
-            };
-        }
         _ => {}
     }
 }
@@ -1309,6 +1326,13 @@ mod tests {
             .and_then(|e| e.accessible_value().map(String::from))
     }
 
+    /// The large-v3 bar after a few frames of the driver's timer.
+    fn settled_bar(window: &AppWindow) -> f32 {
+        thread::sleep(Duration::from_millis(300));
+        mock_elapsed_time(Duration::from_millis(100));
+        bar(window).expect("a bar").parse().expect("a number")
+    }
+
     #[test]
     fn download_sends_its_id_and_progress_moves_the_bar() {
         let (window, ipc, sent, _) = window("progress");
@@ -1322,14 +1346,21 @@ mod tests {
         assert_eq!(requests(&sent), [want]);
         assert_eq!(bar(&window).as_deref(), Some("0"));
 
+        // The bar shows the progress driver's value: it chases the bytes (a quarter, at most
+        // a tenth ahead of it) and never goes back.
         push(&ipc, progress("large-v3", 1_000_000_000, 4_000_000_000));
-        assert_eq!(bar(&window).as_deref(), Some("0.25"));
+        let raw = |w: &AppWindow| -> f32 { bar(w).expect("a bar").parse().expect("a number") };
+        assert!(raw(&window) < 0.25, "the page drew the raw fraction");
+        let first = settled_bar(&window);
+        assert!((0.03..=0.36).contains(&first), "{first}");
         assert!(has(&window, "1.0 of 4.0 GB"), "progress beside the bar");
         push(&ipc, progress("large-v3", 3_000_000_000, 4_000_000_000));
-        assert_eq!(bar(&window).as_deref(), Some("0.75"));
+        assert!(raw(&window) < 0.75, "the page drew the raw fraction");
+        let second = settled_bar(&window);
+        assert!(second > first && second <= 0.86, "{first} -> {second}");
         // Another model's progress leaves this bar alone.
         push(&ipc, progress("turbo", 1, 4));
-        assert_eq!(bar(&window).as_deref(), Some("0.75"));
+        assert!(bar(&window).is_some());
     }
 
     #[test]
@@ -1684,6 +1715,7 @@ mod tests {
             model: "turbo".into(),
             device: DeviceChoice::Auto,
             backend: "cpu".into(),
+            loaded: true,
             warnings: vec![note.clone(), "sounds.start: empty, using rise".into()],
         };
         push(&ipc, status);
@@ -2149,7 +2181,7 @@ mod tests {
     #[test]
     fn advanced_choices_write_the_config_and_read_back() {
         let mut a = Advanced::default();
-        assert_eq!(adv_modes(&a), [0; 10]);
+        assert_eq!(adv_modes(&a), [0; 9]);
         adv_apply(&mut a, P_THREADS, 1, 99.0);
         assert_eq!(a.threads, Auto::Set(32), "put in range");
         adv_apply(&mut a, P_FLASH, 2, 0.0);
@@ -2162,20 +2194,11 @@ mod tests {
         adv_apply(&mut a, P_TEMPERATURE, 1, 0.3);
         adv_apply(&mut a, P_LOGPROB, 1, -9.0);
         assert_eq!(a.logprob_threshold, Auto::Set(-5.0));
-        adv_apply(&mut a, P_AUDIO_CTX, 2, 0.0);
-        assert_eq!(a.audio_ctx, Auto::Set(AudioCtx::Fit));
-        assert_eq!(adv_modes(&a), [1, 2, 2, 1, 0, 0, 1, 0, 0, 2]);
-        for p in [
-            P_THREADS,
-            P_FLASH,
-            P_DECODING,
-            P_TEMPERATURE,
-            P_LOGPROB,
-            P_AUDIO_CTX,
-        ] {
+        assert_eq!(adv_modes(&a), [1, 2, 2, 1, 0, 0, 1, 0, 0]);
+        for p in [P_THREADS, P_FLASH, P_DECODING, P_TEMPERATURE, P_LOGPROB] {
             adv_apply(&mut a, p, 0, 1.0);
         }
-        assert_eq!(adv_modes(&a), [0; 10]);
+        assert_eq!(adv_modes(&a), [0; 9]);
     }
 
     /// What `auto` is judged for: the loaded device first, the CPU choice always the processor.
@@ -2189,20 +2212,32 @@ mod tests {
         let named = DeviceChoice::Named("Vulkan0".into());
         let table = [
             // Loaded: what runs counts, listed or not.
-            ("Vulkan0", None, DeviceChoice::Auto, true),
-            ("cpu", Some(&[gpu.clone()][..]), DeviceChoice::Auto, false),
-            ("cpu", None, named.clone(), false),
+            ("Vulkan0", true, None, DeviceChoice::Auto, true),
+            (
+                "cpu",
+                true,
+                Some(&[gpu.clone()][..]),
+                DeviceChoice::Auto,
+                false,
+            ),
+            ("cpu", true, None, named.clone(), false),
             // Whatever is loaded, the CPU choice is the processor.
-            ("Vulkan0", None, DeviceChoice::Cpu, false),
+            ("Vulkan0", true, None, DeviceChoice::Cpu, false),
             // Nothing loaded: what the picker would pick among the listed GPUs.
-            ("none", Some(&[][..]), DeviceChoice::Auto, false),
-            ("", Some(&[gpu.clone()][..]), DeviceChoice::Auto, true),
+            ("none", false, Some(&[][..]), DeviceChoice::Auto, false),
+            (
+                "",
+                false,
+                Some(&[gpu.clone()][..]),
+                DeviceChoice::Auto,
+                true,
+            ),
             // Not listed yet: a guess, GPU unless the CPU is chosen.
-            ("", None, DeviceChoice::Auto, true),
+            ("", false, None, DeviceChoice::Auto, true),
         ];
-        for (backend, listed, choice, want) in table {
+        for (backend, loaded, listed, choice, want) in table {
             assert_eq!(
-                auto_on_gpu(backend, listed, &choice),
+                auto_on_gpu(backend, loaded, listed, &choice),
                 want,
                 "{backend} {choice:?}"
             );

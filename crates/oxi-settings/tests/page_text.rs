@@ -370,7 +370,7 @@ fn ctrl_s_saves_the_focused_file_and_only_when_dirty() {
     );
 
     // The poll brings the clean editor up to date; Ctrl+S then saves what is typed next.
-    i_slint_backend_testing::mock_elapsed_time(oxi_settings::FILE_POLL);
+    window.invoke_files_check();
     assert_eq!(dictionary.accessible_value().as_deref(), Some("synthother"));
     // A Ukrainian layout sends "і" for the S key, a Russian one "ы".
     for letter in ["s", "і", "ы"] {
@@ -393,13 +393,13 @@ fn a_clean_editor_follows_the_file_and_a_dirty_one_keeps_its_text() {
     assert_eq!(value(), "synthone");
 
     fs::write(l.dictionary_file(), "synthtwo").unwrap();
-    i_slint_backend_testing::mock_elapsed_time(oxi_settings::FILE_POLL);
+    window.invoke_files_check();
     assert_eq!(value(), "synthtwo");
     assert!(!has(&window, "Unsaved changes"));
 
     editor(&window, "Dictionary").set_accessible_value("synthmine");
     fs::write(l.dictionary_file(), "synththree").unwrap();
-    i_slint_backend_testing::mock_elapsed_time(oxi_settings::FILE_POLL);
+    window.invoke_files_check();
     assert_eq!(value(), "synthmine");
     assert!(has(
         &window,

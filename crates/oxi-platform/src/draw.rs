@@ -8,13 +8,14 @@
 //! tiny-skia's hairline path, which steps visibly on a curve at 100 %.
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
+use oxi_core::config::Rgb;
 use oxi_core::machine::{OverlayState, Phase};
 use oxi_core::overlay::palette::{EDGE, SURFACE, TEXT};
 use oxi_core::overlay::{
     CARD_RADIUS, Icon, Meter, PILL_BAR_GAP as BAR_GAP, PILL_BAR_MAX as BAR_MAX,
     PILL_BAR_W as BAR_W, PILL_EM as EM, PILL_EM_MIN as EM_MIN, PILL_GAP as GAP, PILL_H_DIP,
     PILL_ICON as ICON, PILL_METER_MIN as METER_MIN, PILL_PAD as PAD, PILL_TRACK, PILL_TRACK_BOTTOM,
-    RecClock, Rect, Rgba, TOO_LOUD, label_variants, label_x, look_with, palette, pill_accent,
+    RecClock, Rect, Rgba, TOO_LOUD, label_variants, label_x, look_with, mix, palette, pill_accent,
     pill_label, pill_rim, progress_span, tray_colour,
 };
 use oxi_core::tray::TrayBadge;
@@ -145,6 +146,7 @@ impl<'f> PillCanvas<'f> {
                 self.font.as_ref(),
                 &self.text,
                 self.accent,
+                has_track(state, self.progress),
             );
             label.clone_from(&self.text);
             self.cache = Some(Cache {
@@ -168,15 +170,25 @@ impl<'f> PillCanvas<'f> {
     }
 }
 
+/// Whether the pill shows a progress track: while loading or transcribing, and while typing (a
+/// typing bar reports a percent; a clipboard paste is one step and has none, DS-26.4).
+fn has_track(state: OverlayState, percent: Option<u8>) -> bool {
+    match state {
+        OverlayState::LoadingModel | OverlayState::Transcribing => true,
+        OverlayState::Pasting => percent.is_some(),
+        _ => false,
+    }
+}
+
 /// Everything of the pill for `state` but its bars and progress fill, into the clear `pm`, with
-/// `label` as its text; the bars when the state has a meter, the progress track while loading
-/// or transcribing.
+/// `label` as its text; the bars when the state has a meter, the progress track when `with_track`.
 fn surface(
     pm: &mut Pixmap,
     state: OverlayState,
     font: Option<&FontRef<'_>>,
     label: &str,
     accent: Rgba,
+    with_track: bool,
 ) -> (Option<Bars>, Option<Track>) {
     let look = look_with(state, accent);
     if state == OverlayState::Hidden {
@@ -213,11 +225,7 @@ fn surface(
 
     let (pad, icon, gap) = ((PAD * h).round(), (ICON * h).round(), (GAP * h).round());
     let right = w - pad;
-    let track = matches!(
-        state,
-        OverlayState::LoadingModel | OverlayState::Transcribing
-    )
-    .then(|| Track::new(pm, look.accent, pad, right, h));
+    let track = with_track.then(|| Track::new(pm, look.accent, pad, right, h));
     let mut text = font
         .filter(|_| !label.is_empty())
         .map(|f| Label::new(f, label, EM * h));
@@ -324,6 +332,19 @@ impl Track {
 /// ring. `None` for size 0.
 #[must_use]
 pub fn tray_icon(phase: Phase, size: u32, light_taskbar: bool, badge: TrayBadge) -> Option<Pixmap> {
+    tray_icon_with(phase, size, light_taskbar, badge, DEFAULT_DOT)
+}
+
+/// [`tray_icon`] with the recording state drawn in `accent` (the seed of the `ui.accent` setting,
+/// DS-21.4): lifted to 3:1 on the taskbar like every tray colour.
+#[must_use]
+pub fn tray_icon_with(
+    phase: Phase,
+    size: u32,
+    light_taskbar: bool,
+    badge: TrayBadge,
+    accent: Rgba,
+) -> Option<Pixmap> {
     let mut pm = Pixmap::new(size, size)?;
     let n = size as f32;
     let k = n / 16.0;
@@ -340,12 +361,12 @@ pub fn tray_icon(phase: Phase, size: u32, light_taskbar: bool, badge: TrayBadge)
             fill(&mut pm, m.dot().as_ref(), ink, id);
         }
         Phase::Recording => {
-            let red = tray_colour(DEFAULT_DOT, light_taskbar);
+            let red = tray_colour(accent, light_taskbar);
             fill(&mut pm, m.disc(0.0).as_ref(), red, id);
             fill(&mut pm, m.hole().as_ref(), palette::WHITE, id);
             // A 1 px rim on every taskbar: red alone is under 3:1 against accent taskbars
             // (#8764B8, #005FB8), and a dark or white edge holds on any colour.
-            let rim = tray_rim(light_taskbar);
+            let rim = accent_rim(accent, red, light_taskbar);
             stroke(&mut pm, m.disc(0.5).as_ref(), rim, 1.0, id);
             fill(&mut pm, m.dot().as_ref(), red, id);
             // The dot gets the same rim, outside its edge: inside it would leave a 1 px red
@@ -403,6 +424,16 @@ fn tray_rim(light_taskbar: bool) -> Rgba {
     } else {
         palette::WHITE
     }
+}
+
+/// The rim of the recording shape: the colour drawn, darkened, on a light taskbar (the default
+/// accent keeps the fixed dark red); white on any other.
+fn accent_rim(accent: Rgba, drawn: Rgba, light_taskbar: bool) -> Rgba {
+    if !light_taskbar || accent == DEFAULT_DOT {
+        return tray_rim(light_taskbar);
+    }
+    let dark = mix(Rgb(drawn.0, drawn.1, drawn.2), Rgb(0, 0, 0), 0.45);
+    Rgba(dark.0, dark.1, dark.2, 0xFF)
 }
 
 /// The app icon at `size` px: the mark (ink ring, red record dot) on a paper rounded-square
@@ -1063,7 +1094,14 @@ mod tests {
                 .into_iter()
                 .map(|label| {
                     let mut pm = Pixmap::new(r.w.cast_unsigned(), r.h.cast_unsigned()).unwrap();
-                    let (bars, _) = surface(&mut pm, state, Some(&font), label, Rgba(1, 2, 3, 255));
+                    let (bars, _) = surface(
+                        &mut pm,
+                        state,
+                        Some(&font),
+                        label,
+                        Rgba(1, 2, 3, 255),
+                        false,
+                    );
                     bars.unwrap().x0.to_bits()
                 })
                 .collect();

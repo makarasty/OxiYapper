@@ -130,9 +130,14 @@ export component AppWindow inherits Window {
     callback open-file();
     callback reset-config();
     callback status-clicked();
+    // The window looks at its files again: it got the focus, the OS theme changed, or a test says so.
+    callback files-check();
+    // The title-bar icon. The accent colours the record dot, so Rust builds it again when the accent
+    // changes; the PNGs (the default red) show until then.
+    in property <image> window-icon: Icons.window-logo(root.icon-scale);
 
     title: @tr("{} settings", root.app-name);
-    icon: Icons.window-logo(root.icon-scale);
+    icon: root.window-icon;
     default-font-family: Theme.font-family;
     // Text that sets no size (the std ComboBox and its list) reads body size, as every control does.
     default-font-size: Theme.body-size;

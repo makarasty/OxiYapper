@@ -24,8 +24,9 @@ use crate::types::Language;
 
 /// Protocol version. `Hello`, `HelloAck` and `Shutdown` never change shape. 2: `Stats`. 3: `PreviewSound`.
 /// 4: `TestAudio`, `TestTranscribe`. 5: `Attention`, the history requests, `DeleteModel`,
-/// `TestProgress`.
-pub const PROTO: u32 = 5;
+/// `TestProgress`. 6: the daemon pushes `HistoryAdded`, `HistoryRemoved`, `FileChanged` and `Woke`
+/// and sends `Stats`, `Status` and `Attention` unasked.
+pub const PROTO: u32 = 6;
 
 /// Longest accepted line, newline excluded.
 pub const MAX_LINE: usize = 1024 * 1024;
@@ -150,6 +151,14 @@ pub struct HistoryItem {
     pub language: String,
     /// Empty for a cancelled, interrupted or failed recording.
     pub text: Spoken,
+}
+
+/// A file the daemon watches for the settings window ([`Push::FileChanged`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WatchedFile {
+    Config,
+    Dictionary,
+    Replace,
 }
 
 /// What a history request changed.
@@ -389,6 +398,8 @@ pub enum Push {
         device: DeviceChoice,
         /// Backend in use, e.g. `Vulkan0` or `cpu`.
         backend: String,
+        /// A model is in memory (it loads with the first dictation and unloads when idle).
+        loaded: bool,
         warnings: Vec<String>,
     },
     Devices {
@@ -424,10 +435,13 @@ pub enum Push {
         outcome: TestOutcome,
     },
     /// Whisper's progress of the run `id` (a test or a history run), 0 to 100; sent while it
-    /// runs, before its `TestResult`.
+    /// runs, before its `TestResult`. The first one (percent 0) carries `est_ms`, how long the
+    /// run should take, so the window's bar moves before whisper reports anything.
     TestProgress {
         id: u32,
         percent: u8,
+        #[serde(default)]
+        est_ms: Option<u32>,
     },
     /// Everything that needs the user, sent after each `Status` answer; empty when all is well.
     Attention {
@@ -450,6 +464,20 @@ pub enum Push {
         id: String,
         result: DeleteResult,
     },
+    /// A recording was saved, whatever its status. Sent unasked, after its files are on disk.
+    HistoryAdded {
+        item: HistoryItem,
+    },
+    /// Recordings the retention limits removed. Sent unasked, one message per pass.
+    HistoryRemoved {
+        ids: Vec<String>,
+    },
+    /// The watcher saw `file` change on disk (after its debounce).
+    FileChanged {
+        file: WatchedFile,
+    },
+    /// The machine woke from sleep or the session was unlocked: what the window drew may be stale.
+    Woke,
 }
 
 /// Windows named pipe for one user: `\\.\pipe\OxiYapper-<SID>`.
@@ -791,7 +819,11 @@ mod tests {
             assert!(!format!("{request:?}").contains("secret"));
         }
         let pushes = vec![
-            Push::TestProgress { id: 4, percent: 50 },
+            Push::TestProgress {
+                id: 4,
+                percent: 50,
+                est_ms: None,
+            },
             Push::Attention {
                 items: vec![Attention::NoModel, Attention::OutOfMemory { cpu: true }],
             },

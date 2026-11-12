@@ -44,6 +44,7 @@ fn status(ipc: &Ipc, warnings: &[&str]) {
         model: String::new(),
         device: DeviceChoice::default(),
         backend: String::new(),
+        loaded: false,
         warnings: warnings.iter().map(|w| (*w).to_owned()).collect(),
     }));
 }

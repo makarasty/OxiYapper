@@ -45,7 +45,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use super::wide;
 use tiny_skia::{LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
-use crate::draw::{bgra, tray_icon};
+use crate::draw::{bgra, tray_icon, tray_icon_with};
+use oxi_core::overlay::{PRESETS, Rgba};
 
 /// The [`Waker::wake`] message.
 const WM_WAKE: u32 = WM_APP;
@@ -164,6 +165,8 @@ pub struct MainLoop {
     hwnd: HWND,
     phase: Phase,
     badge: TrayBadge,
+    /// The seed of the accent the recording icon is drawn in.
+    accent: Rgba,
     /// The taskbar is light: the icon draws dark glyphs.
     light: bool,
     icon: HICON,
@@ -228,6 +231,12 @@ impl MainLoop {
             hwnd,
             phase: Phase::Idle,
             badge: TrayBadge::None,
+            accent: Rgba(
+                PRESETS[0].seed.0,
+                PRESETS[0].seed.1,
+                PRESETS[0].seed.2,
+                0xFF,
+            ),
             light: light_taskbar(),
             icon: ptr::null_mut(),
             copy_last: false,
@@ -257,6 +266,20 @@ impl MainLoop {
     pub fn set_phase(&mut self, phase: Phase) -> io::Result<()> {
         self.phase = phase;
         self.refresh()
+    }
+
+    /// Draws the recording icon in `accent` (DS-21.4). Only that state wears it, so the icon is
+    /// redrawn at once only while recording; any other phase takes it at its next change.
+    pub fn set_accent(&mut self, accent: Rgba) -> io::Result<()> {
+        if accent == self.accent {
+            return Ok(());
+        }
+        self.accent = accent;
+        if self.phase == Phase::Recording {
+            self.refresh()
+        } else {
+            Ok(())
+        }
     }
 
     /// Shows `badge` on the icon.
@@ -401,7 +424,7 @@ impl MainLoop {
         let side = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForWindow(self.hwnd)) };
         let pixmap = u32::try_from(side)
             .ok()
-            .and_then(|s| tray_icon(self.phase, s, self.light, self.badge))
+            .and_then(|s| tray_icon_with(self.phase, s, self.light, self.badge, self.accent))
             .ok_or_else(|| io::Error::other("tray icon size"))?;
         // Icons take straight (not premultiplied) alpha, BGRA, top row first.
         let colour: Vec<u8> = pixmap

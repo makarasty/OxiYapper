@@ -1,6 +1,7 @@
 //! Table tests for ARCHITECTURE section 11 items 1-12 (and the few neighbours they touch),
 //! with time driven by hand.
 
+use oxi_core::audio::DETECTOR_LATENCY;
 use oxi_core::config::Config;
 use oxi_core::device::DeviceChoice;
 use oxi_core::machine::{
@@ -20,10 +21,12 @@ const LOCKED: OverlayState = OverlayState::Recording {
 };
 
 /// SPEC defaults without the release tail, so a stop shows in the event that causes it.
-/// The tail has its own tests below.
+/// The tail has its own tests below; the hold gap (which holds the paste) has its own in
+/// `machine::edge_tests`.
 fn untailed() -> MachineConfig {
     MachineConfig {
         release_tail: Millis(0),
+        hold_gap: Millis(0),
         esc_cancels: true, // the Esc tests; `hotkey::edge_tests` cover it off
         ..MachineConfig::default()
     }
@@ -408,7 +411,8 @@ fn edge_07_other_key_cancels_silently_in_both_modes() {
         s.at(0, Event::ChordDown);
         // Auto rule: the key only arms the decision; the discard comes at key time + DETECTOR_LATENCY.
         assert_eq!(s.at(50, Event::OtherKey), [], "{mode:?}");
-        let fx = s.at(200, Event::Tick);
+        let cancel = 50 + DETECTOR_LATENCY.0;
+        let fx = s.at(cancel, Event::Tick);
         // No sound, no notification, no overlay text: just gone.
         assert_eq!(
             fx,
@@ -421,7 +425,11 @@ fn edge_07_other_key_cancels_silently_in_both_modes() {
         assert_eq!(s.core(900, Event::ChordUp), [], "{mode:?}");
         assert_eq!(s.phase(), Phase::Idle, "{mode:?}");
         // Only the idle unload is armed.
-        assert_eq!(s.0.next_deadline(), Some(Millis(200 + 300_000)), "{mode:?}");
+        assert_eq!(
+            s.0.next_deadline(),
+            Some(Millis(cancel + 300_000)),
+            "{mode:?}"
+        );
     }
 }
 
@@ -1110,6 +1118,7 @@ fn tailed(mode: Mode, tail: u64) -> Sim {
     Sim::with(MachineConfig {
         mode,
         release_tail: Millis(tail),
+        hold_gap: Millis(0),
         esc_cancels: true,
         ..MachineConfig::default()
     })

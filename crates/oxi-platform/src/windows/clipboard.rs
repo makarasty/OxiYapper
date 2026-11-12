@@ -4,13 +4,13 @@ use std::marker::PhantomData;
 use std::ptr::{copy_nonoverlapping, null, null_mut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 use oxi_core::paste::{
-    ClipError, Clipboard, DELAYED_RENDER_TIMEOUT, HISTORY_TIMEOUT, HistoryItem, OPEN_RETRIES,
-    OPEN_RETRY_GAP, SNAPSHOT_CAP, Snap,
+    ClipError, Clipboard, DELAYED_RENDER_TIMEOUT, HISTORY_TIMEOUT, HistoryItem, IncompleteWhy,
+    OPEN_RETRIES, OPEN_RETRY_GAP, SNAPSHOT_CAP, Snap,
 };
 use oxi_core::types::Millis;
 use windows::ApplicationModel::DataTransfer::{
@@ -20,8 +20,9 @@ use windows::ApplicationModel::DataTransfer::{
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows_sys::Win32::Foundation::{GetLastError, GlobalFree, HANDLE, HWND, SetLastError};
 use windows_sys::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardOwner,
-    GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    CloseClipboard, CountClipboardFormats, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
+    GetClipboardFormatNameW, GetClipboardOwner, GetClipboardSequenceNumber, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{
     GMEM_FIXED, GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
@@ -62,6 +63,18 @@ pub struct WinClipboard {
     born: Instant,
     /// Each history call's limit: [`HISTORY_TIMEOUT`], or less once the budget runs low.
     history_limit: Millis,
+    /// A snapshot helper is running (or stuck on an owner after it was given up): the next
+    /// snapshot answers `HelperBusy` at once instead of waiting out the open retries.
+    snapshot_busy: Arc<AtomicBool>,
+    /// Why the last snapshot was not whole.
+    last_why: Option<IncompleteWhy>,
+}
+
+/// Why a read gave no whole snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Miss {
+    Incomplete(IncompleteWhy),
+    Locked,
 }
 
 /// Every copied format with its bytes, in clipboard order.
@@ -92,7 +105,62 @@ impl WinClipboard {
             history_busy: Arc::default(),
             born: Instant::now(),
             history_limit: HISTORY_TIMEOUT,
+            snapshot_busy: Arc::default(),
+            last_why: None,
         })
+    }
+
+    /// Reads on a helper thread: `GetClipboardData` on a delayed-render format waits for its
+    /// owner without a time limit, so the wait here gives up after `DELAYED_RENDER_TIMEOUT`.
+    /// A helper that gave up keeps the clipboard open until the owner answers or exits (the
+    /// thread cannot be cut short); an owner Windows already marks hung is never asked.
+    fn read_whole(&self) -> Result<Saved, Miss> {
+        // SAFETY: no arguments; a null owner is passed on as null.
+        if unsafe { IsHungAppWindow(GetClipboardOwner()) } != 0 {
+            return Err(Miss::Incomplete(IncompleteWhy::HungOwner));
+        }
+        if self.snapshot_busy.swap(true, Ordering::Acquire) {
+            return Err(Miss::Incomplete(IncompleteWhy::HelperBusy));
+        }
+        let free = Free(Arc::clone(&self.snapshot_busy));
+        let (tx, rx) = mpsc::channel();
+        let exclude = self.exclude;
+        // A failed spawn drops the closure, and `free` with it.
+        let spawned = thread::Builder::new()
+            .name("clipboard-snapshot".into())
+            .spawn(move || {
+                let free = free;
+                let read = read_all(&tx, exclude);
+                // Freed before the answer (the clipboard is closed by now), so the caller's next
+                // snapshot never finds it still set.
+                drop(free);
+                let _ = tx.send(Step::Done(read));
+            });
+        if spawned.is_err() {
+            return Err(Miss::Incomplete(IncompleteWhy::NoHelper));
+        }
+        // The open retries are bounded by OPEN_RETRIES; only the reads after it are timed.
+        let mut reading = None;
+        loop {
+            let step = match reading {
+                Some(format) => match rx.recv_timeout(duration(DELAYED_RENDER_TIMEOUT)) {
+                    Ok(step) => step,
+                    Err(RecvTimeoutError::Timeout) => {
+                        return Err(Miss::Incomplete(IncompleteWhy::RenderTimeout { format }));
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err(Miss::Incomplete(IncompleteWhy::NoHelper));
+                    }
+                },
+                None => rx
+                    .recv()
+                    .map_err(|_| Miss::Incomplete(IncompleteWhy::NoHelper))?,
+            };
+            match step {
+                Step::Reading(format) => reading = Some(format),
+                Step::Done(read) => return read,
+            }
+        }
     }
 
     /// Empties the clipboard, writes the marker formats first (a later failure never leaves
@@ -136,40 +204,28 @@ impl WinClipboard {
 impl Clipboard for WinClipboard {
     type Snapshot = Saved;
 
-    /// Reads on a helper thread: `GetClipboardData` on a delayed-render format waits for its
-    /// owner without a time limit, so the wait here gives up after `DELAYED_RENDER_TIMEOUT`.
-    /// A helper that gave up keeps the clipboard open until the owner answers or exits (the
-    /// thread cannot be cut short); an owner Windows already marks hung is never asked.
+    /// [`WinClipboard::read_whole`]; a miss is logged with its reason (names and sizes only).
     fn snapshot(&mut self) -> Snap<Saved> {
-        // SAFETY: no arguments; a null owner is passed on as null.
-        if unsafe { IsHungAppWindow(GetClipboardOwner()) } != 0 {
-            return Snap::Incomplete;
-        }
-        let (tx, rx) = mpsc::channel();
-        let exclude = self.exclude;
-        let spawned = thread::Builder::new()
-            .name("clipboard-snapshot".into())
-            .spawn(move || {
-                let snap = read_all(&tx, exclude);
-                let _ = tx.send(Step::Done(snap));
-            });
-        if spawned.is_err() {
-            return Snap::Incomplete;
-        }
-        // The open retries are bounded by OPEN_RETRIES; only the reads after it are timed.
-        let mut opened = false;
-        loop {
-            let step = if opened {
-                rx.recv_timeout(duration(DELAYED_RENDER_TIMEOUT)).ok()
-            } else {
-                rx.recv().ok()
-            };
-            match step {
-                Some(Step::Reading) => opened = true,
-                Some(Step::Done(snap)) => return snap,
-                None => return Snap::Incomplete,
+        let started = Instant::now();
+        let read = self.read_whole();
+        self.last_why = None;
+        match read {
+            Ok(saved) => Snap::Complete(saved),
+            Err(miss) => {
+                log_miss(miss, started.elapsed());
+                match miss {
+                    Miss::Locked => Snap::Locked,
+                    Miss::Incomplete(why) => {
+                        self.last_why = Some(why);
+                        Snap::Incomplete
+                    }
+                }
             }
         }
+    }
+
+    fn incomplete_why(&self) -> Option<IncompleteWhy> {
+        self.last_why
     }
 
     fn is_excluded(&self, snapshot: &Saved) -> bool {
@@ -414,42 +470,50 @@ fn history_skips(saved: &[(u32, Vec<u8>)], markers: [u32; 3]) -> bool {
     files_only || saved.iter().all(|(f, _)| markers.contains(f))
 }
 
-/// What the snapshot thread reports: about to block on the clipboard, or finished (closed).
+/// What the snapshot thread reports: about to read this format (a call that can block on its
+/// owner), or finished (closed).
 enum Step {
-    Reading,
-    Done(Snap<Saved>),
+    Reading(u32),
+    Done(Result<Saved, Miss>),
 }
 
 /// Copies every copyable format, sending `Reading` before each call that can block on an owner.
 /// The clipboard is closed when this returns.
-fn read_all(tx: &Sender<Step>, exclude: [u32; 3]) -> Snap<Saved> {
+fn read_all(tx: &Sender<Step>, exclude: [u32; 3]) -> Result<Saved, Miss> {
+    let incomplete = |why| Err(Miss::Incomplete(why));
     let Ok(window) = Window::new() else {
-        return Snap::Incomplete;
+        return incomplete(IncompleteWhy::NoHelper);
     };
     let Ok(_open) = Open::new(&window) else {
-        return Snap::Locked;
+        return Err(Miss::Locked);
     };
     let mut saved: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut skipped_handle = false;
     let mut room = SNAPSHOT_CAP;
     let mut format = 0;
     loop {
-        if tx.send(Step::Reading).is_err() {
-            return Snap::Incomplete; // the caller gave up already
-        }
+        // Cleared first: the end of the list is told from a failure by the last error, and an
+        // earlier call (a retried open, say) may have left one behind.
         // SAFETY: the clipboard is open on this thread (`_open`).
-        format = unsafe { EnumClipboardFormats(format) };
+        format = unsafe {
+            SetLastError(0);
+            EnumClipboardFormats(format)
+        };
         if format == 0 {
-            // Zero is the end with ERROR_SUCCESS, or a failure with its code. A clipboard
-            // of handle formats only (a lone metafile, markers aside) would restore as nothing.
             // SAFETY: reads this thread's last-error value, no arguments.
-            let failed = unsafe { GetLastError() } != 0;
-            let only_markers = saved.iter().all(|(f, _)| exclude.contains(f));
-            return if failed || (only_markers && skipped_handle) {
-                Snap::Incomplete
-            } else {
-                Snap::Complete(Saved(saved))
-            };
+            let code = unsafe { GetLastError() };
+            if code != 0 {
+                return incomplete(IncompleteWhy::EnumFailed { code });
+            }
+            // A clipboard of handle formats only (a lone metafile, markers aside) would
+            // restore as nothing.
+            if skipped_handle && saved.iter().all(|(f, _)| exclude.contains(f)) {
+                return incomplete(IncompleteWhy::OnlyHandles);
+            }
+            return Ok(Saved(saved));
+        }
+        if tx.send(Step::Reading(format)).is_err() {
+            return incomplete(IncompleteWhy::NoHelper); // the caller gave up already
         }
         let kept: Vec<u32> = saved.iter().map(|(f, _)| *f).collect();
         match kind(format, &kept) {
@@ -457,18 +521,59 @@ fn read_all(tx: &Sender<Step>, exclude: [u32; 3]) -> Snap<Saved> {
             Kind::Synthesised => {}
             Kind::Copy => {
                 // SAFETY: the clipboard is open on this thread; a delayed render runs in the owner.
-                let handle = unsafe { GetClipboardData(format) };
-                let Some(bytes) = (!handle.is_null())
-                    .then(|| read_global(handle, room))
-                    .flatten()
-                else {
-                    return Snap::Incomplete;
+                let handle = unsafe {
+                    SetLastError(0);
+                    GetClipboardData(format)
                 };
+                if handle.is_null() {
+                    // SAFETY: reads this thread's last-error value, no arguments.
+                    let code = unsafe { GetLastError() };
+                    return incomplete(IncompleteWhy::NoData { format, code });
+                }
+                let bytes = read_global(handle, format, room).map_err(Miss::Incomplete)?;
                 room -= bytes.len();
                 saved.push((format, bytes));
             }
         }
     }
+}
+
+/// The registered name of `format` (`HTML Format`, say); empty for a standard format.
+fn format_name(format: u32) -> String {
+    let mut buf = [0u16; 128];
+    // SAFETY: `buf` holds 128 units; the call writes at most that many, NUL included.
+    let len = unsafe { GetClipboardFormatNameW(format, buf.as_mut_ptr(), 128) };
+    String::from_utf16_lossy(&buf[..usize::try_from(len).unwrap_or(0).min(buf.len())])
+}
+
+/// The exe file name of the clipboard owner's process; empty with no owner.
+fn owner_exe() -> String {
+    // SAFETY: no arguments; a null owner gives pid 0 and an empty name.
+    let owner = unsafe { GetClipboardOwner() };
+    super::input::process_facts(super::input::window_pid(owner)).0
+}
+
+/// One line per snapshot that is not whole: why, and which program and format, never content.
+fn log_miss(miss: Miss, took: Duration) {
+    let format = match miss {
+        Miss::Incomplete(
+            IncompleteWhy::NoData { format, .. }
+            | IncompleteWhy::NoLock { format, .. }
+            | IncompleteWhy::TooBig { format, .. }
+            | IncompleteWhy::RenderTimeout { format },
+        ) => Some(format),
+        _ => None,
+    };
+    // SAFETY: no arguments.
+    let clip_formats = unsafe { CountClipboardFormats() };
+    tracing::info!(
+        ?miss,
+        format_name = format.map(format_name).unwrap_or_default(),
+        clip_owner_exe = owner_exe(),
+        clip_formats,
+        snap_ms = took.as_millis(),
+        "clipboard not saved whole"
+    );
 }
 
 /// A message-only window, destroyed on drop. It owns the clipboard while one call has it open.
@@ -573,8 +678,9 @@ fn kind(format: u32, kept: &[u32]) -> Kind {
     }
 }
 
-/// Copies an HGLOBAL's bytes, or `None` when it is bigger than `room` or cannot be read.
-fn read_global(handle: HANDLE, room: usize) -> Option<Vec<u8>> {
+/// Copies an HGLOBAL's bytes of `format`, or why not: bigger than `room`, or unreadable.
+fn read_global(handle: HANDLE, format: u32, room: usize) -> Result<Vec<u8>, IncompleteWhy> {
+    let as_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
     // GlobalSize gives 0 both for an empty block and on failure; the last error tells them apart.
     // SAFETY: `handle` came from `GetClipboardData` for an HGLOBAL format, clipboard still open.
     let size = unsafe {
@@ -583,21 +689,32 @@ fn read_global(handle: HANDLE, room: usize) -> Option<Vec<u8>> {
     };
     if size == 0 {
         // SAFETY: reads this thread's last-error value, no arguments.
-        return (unsafe { GetLastError() } == 0).then(Vec::new);
+        let code = unsafe { GetLastError() };
+        return if code == 0 {
+            Ok(Vec::new())
+        } else {
+            Err(IncompleteWhy::NoLock { format, code })
+        };
     }
     if size > room {
-        return None;
+        return Err(IncompleteWhy::TooBig {
+            format,
+            bytes: as_u64(size),
+            room: as_u64(room),
+        });
     }
     // SAFETY: as above; unlocked below.
     let ptr = unsafe { GlobalLock(handle) };
     if ptr.is_null() {
-        return None;
+        // SAFETY: reads this thread's last-error value, no arguments.
+        let code = unsafe { GetLastError() };
+        return Err(IncompleteWhy::NoLock { format, code });
     }
     // SAFETY: a locked block of `size` bytes stays valid until `GlobalUnlock`.
     let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), size) }.to_vec();
     // SAFETY: balances the `GlobalLock` above.
     unsafe { GlobalUnlock(handle) };
-    Some(bytes)
+    Ok(bytes)
 }
 
 /// Puts one format on the open clipboard; the system owns the block once it is set.
@@ -798,6 +915,133 @@ mod tests {
         );
     }
 
+    /// Arch-plan 3.3: while an earlier helper is still busy, a snapshot answers at once and
+    /// spawns nothing. Neither opens nor reads the clipboard.
+    #[test]
+    fn a_busy_snapshot_helper_answers_helper_busy_at_once() {
+        let clip = WinClipboard::new().unwrap();
+        clip.snapshot_busy.store(true, Ordering::Release);
+        let started = Instant::now();
+        let read = clip.read_whole();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        // A hung owner is answered before the flag is looked at; either way nothing was read.
+        assert!(
+            matches!(
+                read,
+                Err(Miss::Incomplete(
+                    IncompleteWhy::HelperBusy | IncompleteWhy::HungOwner
+                ))
+            ),
+            "{read:?}"
+        );
+        assert!(
+            clip.snapshot_busy.load(Ordering::Acquire),
+            "not ours to clear"
+        );
+    }
+
+    /// The one read-only probe the owner allowed (arch-plan 3.3 item 5): reads the clipboard as
+    /// the app does and prints only the outcome, the reason, the owner's exe and every format's
+    /// id, registered name and size. No content, no write, no history call.
+    /// `cargo test -p oxi-platform --lib probe_snapshot_reason -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads this machine's clipboard (read only)"]
+    fn probe_snapshot_reason() {
+        let mut clip = WinClipboard::new().unwrap();
+        let started = Instant::now();
+        let snap = clip.snapshot();
+        let took = started.elapsed().as_millis();
+        let (kind, saved) = match &snap {
+            Snap::Complete(saved) => ("Complete", format!(" saved {saved:?}")),
+            Snap::Incomplete => ("Incomplete", String::new()),
+            Snap::Locked => ("Locked", String::new()),
+        };
+        println!(
+            "snapshot {kind} in {took} ms, why {:?}{saved}",
+            clip.incomplete_why()
+        );
+        drop(snap);
+        println!("owner exe '{}'", owner_exe());
+        // A format whose owner did not answer would block this listing too: names only then.
+        let sizes = !matches!(
+            clip.incomplete_why(),
+            Some(
+                IncompleteWhy::RenderTimeout { .. }
+                    | IncompleteWhy::HungOwner
+                    | IncompleteWhy::HelperBusy
+            )
+        );
+        let Ok(window) = Window::new() else {
+            println!("no window for the listing");
+            return;
+        };
+        let Ok(_open) = Open::new(&window) else {
+            println!("listing: clipboard locked");
+            return;
+        };
+        let mut format = 0;
+        loop {
+            // SAFETY: the clipboard is open on this thread (`_open`).
+            format = unsafe {
+                SetLastError(0);
+                EnumClipboardFormats(format)
+            };
+            if format == 0 {
+                // SAFETY: reads this thread's last-error value, no arguments.
+                println!("end of list, last error {}", unsafe { GetLastError() });
+                break;
+            }
+            let size = if sizes && kind_of(format) != Kind::Handle {
+                // SAFETY: open on this thread; the handle is only sized, never locked or read.
+                unsafe {
+                    SetLastError(0);
+                    let handle = GetClipboardData(format);
+                    if handle.is_null() {
+                        format!("no data (error {})", GetLastError())
+                    } else {
+                        SetLastError(0);
+                        format!("{} bytes (error {})", GlobalSize(handle), GetLastError())
+                    }
+                }
+            } else {
+                "handle or skipped".into()
+            };
+            println!("format {format:#06x} '{}' {size}", format_name(format));
+        }
+    }
+
+    fn kind_of(format: u32) -> Kind {
+        kind(format, &[])
+    }
+
+    /// The one read-only Win+V check the owner allowed (arch-plan 3.6): entry ids only, no text,
+    /// no write. Prints the count of entries and the place of the daemon's newest entry id, read
+    /// from the file named in `OXI_WINV_ENTRIES` (`clipboard-entries.txt`).
+    /// `cargo test -p oxi-platform --lib probe_winv_place -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads this machine's Win+V entry ids (read only)"]
+    fn probe_winv_place() {
+        use oxi_core::paste::OurEntries;
+
+        let file = std::env::var_os("OXI_WINV_ENTRIES").expect("set OXI_WINV_ENTRIES");
+        let ours = OurEntries::from_text(&std::fs::read_to_string(file).unwrap_or_default());
+        match WinClipboard::new().unwrap().history_ids() {
+            Ok(Some(list)) => {
+                let place = ours
+                    .ids()
+                    .last()
+                    .and_then(|id| list.iter().position(|x| x == id));
+                println!(
+                    "entries {}, our newest id at {}",
+                    list.len(),
+                    place.map_or_else(|| "absent".to_owned(), |p| p.to_string())
+                );
+            }
+            Ok(None) => println!("history off"),
+            Err(e) => println!("history call failed: {e}"),
+        }
+    }
+
     /// Runs the real sequence (6 dictations over a user copy) and prints the Win+V order.
     /// `cargo test -p oxi-platform --lib live_win_v -- --ignored --nocapture`. It overwrites
     /// the clipboard for a few seconds, puts it back, and deletes the entries it made. It adds
@@ -880,6 +1124,7 @@ mod tests {
                 &mut clip,
                 &mut Keys,
                 &mut ours,
+                &mut |_| {},
             );
             println!(
                 "dictation {n}: {out:?} in {} ms",

@@ -50,6 +50,9 @@ pub struct MachineConfig {
     pub release_tail: Millis,
     /// What a load depends on: a change unloads the loaded model, the next use loads the new one.
     pub model: ModelIdentity,
+    /// A press this soon after releasing the held chord carries the dictation on instead of
+    /// starting a new one; zero is off. Push mode only.
+    pub hold_gap: Millis,
     /// `[history] enabled`: a recording with speech is kept when it is cancelled or fails.
     pub keep_history: bool,
 }
@@ -89,6 +92,7 @@ impl From<&Config> for MachineConfig {
                 },
                 gpu: cfg.model.gpu.clone(),
             },
+            hold_gap: Millis(cfg.hotkey.hold_gap_ms.into()),
             keep_history: cfg.history.enabled,
         }
     }
@@ -305,6 +309,47 @@ pub enum OverlayState {
     Text(Notice),
 }
 
+/// Why a recording was cancelled (the log line `recording cancelled why=...`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelWhy {
+    /// A key outside the chord with no speech after it: the chord was part of a shortcut.
+    Shortcut,
+    Esc,
+    /// Another key, with `other_key = always`.
+    OtherKey,
+    Lock,
+    Suspend,
+}
+
+impl std::fmt::Display for CancelWhy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl CancelWhy {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shortcut => "shortcut",
+            Self::Esc => "esc",
+            Self::OtherKey => "other_key",
+            Self::Lock => "lock",
+            Self::Suspend => "suspend",
+        }
+    }
+}
+
+/// A fact for the log that no effect carries: read with `State::take_notes`. Never holds
+/// dictated text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Note {
+    /// A recording was cancelled; `speech`: its audio was kept.
+    Cancelled { why: CancelWhy, speech: bool },
+    /// A key-down was refused: too many jobs wait.
+    RefusedQueueFull,
+}
+
 /// A command for a worker or the UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
@@ -321,6 +366,16 @@ pub enum Effect {
     KeepCancelled(JobId),
     /// Free the audio of a job that will never be transcribed.
     DropJob(JobId),
+    /// A new press carries this job on: its text is never used, its audio waits for the
+    /// [`Effect::Merge`] that names it.
+    Supersede(JobId),
+    /// The recording that carried the jobs `from` on (oldest first) became job `into`: the audio
+    /// of `from` goes in front of the audio of `into`, which is transcribed as one dictation.
+    /// Comes right after [`Effect::StopCapture`] of `into`.
+    Merge {
+        from: Vec<JobId>,
+        into: JobId,
+    },
     Preload,
     Unload,
     /// Send the job to whisper.

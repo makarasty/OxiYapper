@@ -7,9 +7,10 @@ use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use oxi_core::config::{self, Config};
+use oxi_core::config::{self, Config, Rgb};
 use oxi_core::machine::OverlayState;
-use oxi_platform::os::overlay::Overlay;
+use oxi_core::overlay::{Rgba, seed};
+use oxi_platform::os::overlay::{Overlay, Progress};
 use oxi_platform::os::tray::{MainLoop, Waker};
 
 use super::cmd::UiCmd;
@@ -25,6 +26,10 @@ pub struct Ui {
     /// The last state the coordinator asked for; a preview ends by showing it again.
     state: OverlayState,
     preview_until: Option<Instant>,
+    /// The transcription pill stays until its bar has run to the end (DS-26); the state the
+    /// coordinator asked for meanwhile waits in `state`.
+    hold_until: Option<Instant>,
+    progress: Progress,
     waker: Waker,
 }
 
@@ -33,10 +38,12 @@ impl Ui {
     pub fn new(rx: Receiver<UiCmd>, overlay: Overlay<'static>, cfg: Config, waker: Waker) -> Self {
         Self {
             rx,
+            progress: overlay.progress(),
             overlay,
             cfg,
             state: OverlayState::Hidden,
             preview_until: None,
+            hold_until: None,
             waker,
         }
     }
@@ -46,9 +53,16 @@ impl Ui {
         while let Ok(cmd) = self.rx.try_recv() {
             self.apply(cmd, tray);
         }
-        if preview_over(self.preview_until, Instant::now()) {
+        let now = Instant::now();
+        if preview_over(self.preview_until, now) {
             self.preview_until = None;
             self.show(self.state);
+        }
+        if preview_over(self.hold_until, now) {
+            self.hold_until = None;
+            if self.preview_until.is_none() {
+                self.show(self.state);
+            }
         }
     }
 
@@ -57,10 +71,22 @@ impl Ui {
             UiCmd::Overlay(state) => {
                 // A real state replaces a preview at once.
                 self.preview_until = None;
+                let held = self.hold_until.is_some_and(|t| Instant::now() < t);
+                let left = hold(self.state, state, held, self.progress.finishing_left());
                 self.state = state;
-                self.show(state);
+                if let Some(left) = left {
+                    self.hold_until = Some(Instant::now() + left);
+                    self.wake_after(left);
+                } else {
+                    self.hold_until = None;
+                    self.show(state);
+                }
             }
             UiCmd::Tray(phase) => {
+                // The recording icon wears the accent (DS-21.4); unchanged is a no-op.
+                if let Err(e) = tray.set_accent(tray_accent(&self.cfg)) {
+                    tracing::warn!("tray accent not updated: {e}");
+                }
                 if let Err(e) = tray.set_phase(phase) {
                     tracing::warn!("tray icon not updated: {e}");
                 }
@@ -84,24 +110,22 @@ impl Ui {
                     tracing::warn!("overlay preview failed: {e}");
                 }
                 self.preview_until = Some(Instant::now() + PREVIEW);
-                let waker = self.waker.clone();
-                let timer =
-                    thread::Builder::new()
-                        .name("overlay-preview".into())
-                        .spawn(move || {
-                            thread::sleep(PREVIEW);
-                            let _ = waker.wake();
-                        });
-                if let Err(e) = timer {
-                    tracing::warn!(kind = ?e.kind(), "preview timer not started");
-                }
+                self.wake_after(PREVIEW);
             }
             UiCmd::Config {
                 overlay,
                 meter_sensitivity_db,
+                accent,
             } => {
-                take_config(&mut self.cfg, overlay, meter_sensitivity_db);
-                if self.preview_until.is_none() {
+                // A new accent shows on the tray at once, not at the next phase change.
+                take_config(
+                    &mut self.cfg,
+                    overlay,
+                    meter_sensitivity_db,
+                    accent,
+                    |accent| tray.set_accent(accent),
+                );
+                if self.preview_until.is_none() && self.hold_until.is_none() {
                     self.show(self.state);
                 }
             }
@@ -114,11 +138,43 @@ impl Ui {
         }
     }
 
+    /// Wakes the UI loop once `after` has passed (a preview or a held pill ends).
+    fn wake_after(&self, after: Duration) {
+        let waker = self.waker.clone();
+        let timer = thread::Builder::new()
+            .name("overlay-timer".into())
+            .spawn(move || {
+                thread::sleep(after);
+                let _ = waker.wake();
+            });
+        if let Err(e) = timer {
+            tracing::warn!(kind = ?e.kind(), "overlay timer not started");
+        }
+    }
+
     fn show(&mut self, state: OverlayState) {
         if let Err(e) = self.overlay.show(state, &self.cfg) {
             tracing::warn!("overlay not shown: {e}");
         }
     }
+}
+
+/// How long the pill of a transcription that just ended stays as it is, so its bar is seen to
+/// run to the end: `finishing` is what the bar has left. A recording never waits. `held`: a
+/// hold is already on, and whatever follows it waits too (the last state wins).
+fn hold(
+    was: OverlayState,
+    next: OverlayState,
+    held: bool,
+    finishing: Option<Duration>,
+) -> Option<Duration> {
+    if matches!(next, OverlayState::Recording { .. }) {
+        return None;
+    }
+    if held || was == OverlayState::Transcribing {
+        return finishing.filter(|_| next != OverlayState::Transcribing);
+    }
+    None
 }
 
 /// What the preview pill shows: the current state, or the recording look when hidden.
@@ -132,11 +188,28 @@ fn preview_state(current: OverlayState) -> OverlayState {
     }
 }
 
-/// Puts the parts of a new active config the overlay reads into `cfg`. The meter sensitivity is
-/// read when a recording starts, so the next one meters with it.
-fn take_config(cfg: &mut Config, overlay: config::Overlay, meter_sensitivity_db: f32) {
+/// The seed of the accent setting, as the tray draws it.
+fn tray_accent(cfg: &Config) -> Rgba {
+    let Rgb(r, g, b) = seed(cfg.ui.accent);
+    Rgba(r, g, b, 0xFF)
+}
+
+/// Puts the parts of a new active config the overlay and the tray read into `cfg`. The meter
+/// sensitivity is read when a recording starts, so the next one meters with it; the accent at
+/// the next pill drawn. `repaint_tray` gets the new accent at once.
+fn take_config(
+    cfg: &mut Config,
+    overlay: config::Overlay,
+    meter_sensitivity_db: f32,
+    accent: config::Accent,
+    repaint_tray: impl FnOnce(Rgba) -> std::io::Result<()>,
+) {
     cfg.overlay = overlay;
     cfg.audio.meter_sensitivity_db = meter_sensitivity_db;
+    cfg.ui.accent = accent;
+    if let Err(e) = repaint_tray(tray_accent(cfg)) {
+        tracing::warn!("tray accent not updated: {e}");
+    }
 }
 
 fn preview_over(until: Option<Instant>, now: Instant) -> bool {
@@ -161,15 +234,66 @@ mod tests {
     }
 
     #[test]
-    fn a_new_config_replaces_the_overlay_and_the_meter_sensitivity() {
+    fn the_tray_draws_the_seed_of_the_accent_setting() {
+        let mut cfg = Config::default();
+        assert_eq!(
+            tray_accent(&cfg),
+            Rgba(0xD9, 0x3A, 0x3F, 0xFF),
+            "Red by default"
+        );
+        cfg.ui.accent = config::Accent::Hex(Rgb(0x5B, 0x5B, 0xD6));
+        assert_eq!(tray_accent(&cfg), Rgba(0x5B, 0x5B, 0xD6, 0xFF));
+    }
+
+    #[test]
+    fn a_new_config_replaces_the_overlay_the_meter_sensitivity_and_the_accent() {
         let mut cfg = Config::default();
         let overlay = config::Overlay {
             enabled: !cfg.overlay.enabled,
             ..cfg.overlay.clone()
         };
-        take_config(&mut cfg, overlay.clone(), -9.0);
+        let iris = config::Accent::Hex(Rgb(0x5B, 0x5B, 0xD6));
+        let mut painted = None;
+        take_config(&mut cfg, overlay.clone(), -9.0, iris, |accent| {
+            painted = Some(accent);
+            Ok(())
+        });
+        assert_eq!(
+            painted,
+            Some(Rgba(0x5B, 0x5B, 0xD6, 0xFF)),
+            "the tray is repainted at once"
+        );
         assert_eq!(cfg.overlay, overlay);
         assert!((cfg.audio.meter_sensitivity_db + 9.0).abs() < f32::EPSILON);
+        assert_eq!(cfg.ui.accent, iris);
+        assert_eq!(
+            tray_accent(&cfg),
+            Rgba(0x5B, 0x5B, 0xD6, 0xFF),
+            "the tray follows"
+        );
+    }
+
+    #[test]
+    fn a_finished_transcription_pill_waits_for_its_bar_and_a_new_recording_never_waits() {
+        let left = Some(Duration::from_millis(300));
+        let rec = OverlayState::Recording {
+            locked: false,
+            ending_soon: false,
+        };
+        let (t, p, h) = (
+            OverlayState::Transcribing,
+            OverlayState::Pasting,
+            OverlayState::Hidden,
+        );
+        assert_eq!(hold(t, p, false, left), left);
+        assert_eq!(hold(p, h, true, left), left, "the next state waits too");
+        assert_eq!(hold(t, rec, false, left), None);
+        assert_eq!(hold(t, p, false, None), None, "no bar to finish");
+        assert_eq!(
+            hold(p, h, false, left),
+            None,
+            "only a transcription pill waits"
+        );
     }
 
     #[test]
