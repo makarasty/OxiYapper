@@ -36,16 +36,16 @@ rubato = "5"
 hound = "3.5"
 lewton = "0.10.2"
 # lewton's own Ogg reader, used to check the Vorbis headers before lewton reads them.
-ogg = "0.8"
+ogg = "0.9"
 earshot = "1.2"
 nnnoiseless = "0.5"
 unicode-normalization = "0.1.26"
 windows-sys = "0.61"
 # WinRT clipboard history (Win+V) beside windows-sys; features are set where it is used.
 windows = { version = "0.62", default-features = false }
-tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd", "png-format"] }
+tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd", "png-format"] }
 ab_glyph = "0.2"
-rfd = { version = "0.17", default-features = false }
+rfd = { version = "0.18", default-features = false }
 # One exact Slint release for all three; bump them together.
 slint = { version = "=1.18.1", default-features = false }
 slint-build = "=1.18.1"
