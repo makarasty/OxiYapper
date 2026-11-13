@@ -1,6 +1,7 @@
 // A popup with a search field over a list. The owner filters: `search` fires on every edit and it
 // answers with new `items`. Up/Down walk the matches, Enter takes the lit one, Esc closes. The size
-// is fixed and smaller than the smallest window, and Slint keeps a popup inside its window.
+// is fixed and smaller than the smallest window, and Slint keeps a popup inside its window. It is modal:
+// the component that holds it dims the window (see scrim.slint).
 import { Theme } from "../tokens.slint";
 import { Icons } from "../icons.slint";
 import { CardFrame, Caption, ScrollBox } from "base.slint";

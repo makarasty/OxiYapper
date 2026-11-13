@@ -1126,6 +1126,44 @@ fn page_title_centres_on_the_first_rail_item() {
     }
 }
 
+/// Owner item 43: a page with one section wears the open tab's accent underline under its name,
+/// flush with the header row's bottom; item 31: a tab's underline covers its count badge.
+#[test]
+fn headers_wear_the_underline_and_cover_the_badge() {
+    let (window, _ipc, _rx) = linked("header-underline");
+    let bottom = |e: &ElementHandle| e.absolute_position().y + e.size().height;
+    for page in [Page::Home, Page::Hotkey, Page::Overlay, Page::About] {
+        window.set_page(page);
+        let row = ElementHandle::find_by_element_type_name(&window, "HeaderRow")
+            .next()
+            .expect("a title page has a HeaderRow");
+        let line = ElementHandle::find_by_element_id(&window, "HeaderRow::underline")
+            .next()
+            .unwrap_or_else(|| panic!("{page:?}: no title underline"));
+        assert_eq!(
+            bottom(&line),
+            bottom(&row),
+            "{page:?}: flush with the bottom"
+        );
+        assert_eq!(line.absolute_position().x, row.absolute_position().x);
+        assert!(line.size().width > 0.0, "{page:?}: underline has a width");
+    }
+    window.set_page(Page::Test);
+    let badge = ElementHandle::find_by_element_id(&window, "SubTabs::badge")
+        .next()
+        .expect("Recordings shows its count at 0");
+    let line = ElementHandle::find_by_element_id(&window, "SubTabs::underline")
+        .next()
+        .expect("the open tab's underline");
+    let right = |e: &ElementHandle| e.absolute_position().x + e.size().width;
+    assert!(
+        right(&line) >= right(&badge) - 0.5,
+        "underline ends at {}, badge at {}",
+        right(&line),
+        right(&badge)
+    );
+}
+
 #[test]
 fn daemon_chip_shows_the_state_and_starts_the_daemon() {
     let (window, ipc, rx) = linked("chip");

@@ -56,6 +56,8 @@ export component Button {
     out property <length> icon-x: root.group-x;
     out property <length> icon-y: Theme.whole((root.height - Theme.icon-size-small) / 2);
     out property <length> label-x: root.group-x + root.icon-w + root.gap;
+    // Where the label's capitals are centred, from the top of the button (tests): the icon's centre line.
+    out property <length> label-mid: words.y + words.height / 2 + Theme.cap-lift;
 
     forward-focus: fs;
     height: Theme.control-height;
@@ -103,6 +105,9 @@ export component Button {
     words := Text {
         visible: root.has-label;
         x: root.label-x;
+        // Raised so the capitals, not the line box, are centred with the icon (DS-16.1).
+        y: -Theme.cap-lift;
+        height: root.height;
         width: root.label-w;
         text: root.text;
         font-size: Theme.body-size;
@@ -149,6 +154,7 @@ export component Button {
     Tip {
         text: root.is-icon && root.enabled ? root.text : root.enabled ? "" : root.tooltip;
         hovered: touch.has-hover;
+        pressed: touch.pressed;
     }
 }
 

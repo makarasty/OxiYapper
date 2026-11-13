@@ -21,6 +21,46 @@ export global Look {
     }
 }
 
+// Text whose capitals' centre (not its line box's) is the middle of the box: the text raised
+// `cap-lift`. Every text beside an icon or a dot is this (DS-16.1). Wrapped or cut text can be
+// narrower than itself and takes the spare room; plain text takes its own width. It keeps the Text's accessible label
+// unless `decorative` (its parent already says it, so it reads as empty).
+export component CapText inherits Rectangle {
+    in property <string> text;
+    in property <length> font-size: Theme.body-size;
+    in property <int> font-weight: 400;
+    in property <color> ink: Theme.text-primary;
+    in property <TextWrap> wrap: TextWrap.no-wrap;
+    in property <TextOverflow> overflow: TextOverflow.clip;
+    in property <bool> decorative;
+    // What a screen reader says when it is not `text`.
+    in property <string> spoken;
+    // The text's own width, whatever room it has (a cut text is wider than its room).
+    out property <length> text-width: label.preferred-width;
+    property <bool> shrinks: root.wrap != TextWrap.no-wrap || root.overflow == TextOverflow.elide;
+    horizontal-stretch: root.shrinks ? 1 : 0;
+    min-width: root.shrinks ? 0 : label.min-width;
+    preferred-width: label.preferred-width;
+    min-height: label.min-height;
+    preferred-height: label.preferred-height;
+    label := Text {
+        x: 0;
+        // The box is the Rectangle's and the text is raised in it: the capitals are the box's centre.
+        y: -Theme.cap-lift;
+        width: parent.width;
+        height: parent.height;
+        text: root.text;
+        font-size: root.font-size;
+        font-weight: root.font-weight;
+        color: root.ink;
+        wrap: root.wrap;
+        overflow: root.overflow;
+        vertical-alignment: center;
+        // Slint wants the role constant: a decorative text stays a text with no words to read.
+        accessible-label: root.decorative ? "" : root.spoken != "" ? root.spoken : root.text;
+    }
+}
+
 // Window-level message: card-shaped, severity fill with a 30 % stroke of the same hue, icon 20,
 // wrapping text, actions (children, buttons) on the right. Under 560 px the text takes its own
 // line above the buttons.
@@ -52,16 +92,14 @@ export component Banner inherits Rectangle {
         colorize: Look.ink(root.severity);
         accessible-role: none;
     }
-    message := Text {
+    message := CapText {
         x: root.text-x;
         y: root.pad-v + (root.narrow && root.has-actions ? 0 : (root.body-h - self.height) / 2);
         width: root.text-w;
         height: self.preferred-height;
         text: root.text;
-        font-size: Theme.body-size;
-        color: Theme.text-primary;
         wrap: word-wrap;
-        accessible-role: none;
+        decorative: true;
     }
     actions := HorizontalLayout {
         x: root.width - root.pad-h - self.preferred-width;
@@ -91,14 +129,12 @@ export component Note inherits HorizontalLayout {
             accessible-role: none;
         }
     }
-    Text {
+    CapText {
         text: root.text;
         font-size: Theme.caption-size;
-        color: Look.ink(root.severity);
+        ink: Look.ink(root.severity);
         wrap: word-wrap;
-        vertical-alignment: center;
-        horizontal-stretch: 1;
-        accessible-role: none;
+        decorative: true;
     }
     @children
 }
@@ -199,6 +235,7 @@ export component WarningSlot inherits Rectangle {
     Tip {
         text: root.text;
         hovered: touch.has-hover;
+        pressed: touch.pressed;
     }
 }
 

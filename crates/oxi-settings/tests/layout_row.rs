@@ -4,13 +4,18 @@
 //! The probe is built by `slint!`, without the debug info `ElementHandle` needs, so it reports
 //! its geometry through properties, and the "i" through the hover tooltip it opens.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 
-use slint::platform::WindowEvent;
-use slint::{ComponentHandle, LogicalPosition};
+use slint::platform::software_renderer::{
+    MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
+};
+use slint::platform::{Platform, WindowAdapter, WindowEvent};
+use slint::{ComponentHandle, LogicalPosition, Model, ModelRc, PhysicalSize, PlatformError};
 
 slint::slint! {
-    import { Theme, Shell, Card, Group, Row, SliderRow, ToggleRow, Divider, Combo, Switch, Button } from "../ui/theme/index.slint";
+    import { Theme, Shell, Icons, Card, Group, Row, SliderRow, ToggleRow, Divider, Combo, Switch, Button, StatusChip, IconLabel } from "../ui/theme/index.slint";
     import { HoverTip } from "../ui/theme/components/base.slint";
 
     export component RowProbe inherits Window {
@@ -113,6 +118,50 @@ slint::slint! {
                     Row {
                         title: "Inside";
                     }
+                }
+            }
+        }
+    }
+    // The pairs of an icon and its text, drawn: each one's icon region and text region, as window
+    // pixels (`x0 x1 y0 y1`), so the test measures the ink it finds there.
+    export component PairProbe inherits Window {
+        default-font-family: Theme.font-family;
+        default-font-size: Theme.body-size;
+        out property <[length]> row-icon: [keys.absolute-position.x, keys.absolute-position.x + Theme.icon-size, keys.absolute-position.y, keys.absolute-position.y + keys.height];
+        out property <[length]> row-text: [keys.title-x, keys.title-x + 120px, keys.absolute-position.y, keys.absolute-position.y + keys.height];
+        out property <[length]> head-icon: [head.absolute-position.x, head.absolute-position.x + Theme.icon-size, head.absolute-position.y, head.absolute-position.y + head.height];
+        out property <[length]> head-text: [head.absolute-position.x + Theme.icon-size + Theme.pair-gap, head.absolute-position.x + head.width, head.absolute-position.y, head.absolute-position.y + head.height];
+        out property <[length]> chip-dot: [chip.absolute-position.x + chip.width - Theme.space-2 - Theme.status-dot-size, chip.absolute-position.x + chip.width - Theme.space-2, chip.absolute-position.y, chip.absolute-position.y + chip.height];
+        out property <[length]> chip-text: [chip.absolute-position.x + Theme.space-2, chip.absolute-position.x + chip.width - Theme.space-2 - Theme.status-dot-size - Theme.pair-gap, chip.absolute-position.y, chip.absolute-position.y + chip.height];
+        out property <[length]> button-icon: [pair-button.absolute-position.x + pair-button.icon-x, pair-button.absolute-position.x + pair-button.icon-x + Theme.icon-size-small, pair-button.absolute-position.y, pair-button.absolute-position.y + pair-button.height];
+        out property <[length]> button-text: [pair-button.absolute-position.x + pair-button.label-x, pair-button.absolute-position.x + pair-button.width - Theme.space-3, pair-button.absolute-position.y, pair-button.absolute-position.y + pair-button.height];
+        VerticalLayout {
+            alignment: start;
+            // Capital H and E only: flat tops and bottoms, so the ink's middle is the capitals' middle.
+            // A circle icon: the same ink above and below its middle.
+            Card {
+                keys := Row {
+                    icon: Icons.error;
+                    title: "HEH";
+                }
+            }
+            head := IconLabel {
+                height: Theme.control-height;
+                icon: Icons.error;
+                text: "HEH";
+                font-weight: Theme.weight-strong;
+            }
+            HorizontalLayout {
+                alignment: start;
+                chip := StatusChip {
+                    text: "HEH";
+                }
+            }
+            HorizontalLayout {
+                alignment: start;
+                pair-button := Button {
+                    text: "HEH";
+                    icon: Icons.error;
                 }
             }
         }
@@ -316,6 +365,99 @@ fn a_group_info_is_an_i_a_pair_gap_after_the_title() {
         assert!(
             (gap - 18.0).abs() < 0.5,
             "at {width} px the i is {gap} px after the Group title, not the 8 px pair gap (18 to its middle)"
+        );
+    }
+}
+
+thread_local! {
+    static SURFACE: RefCell<Option<Rc<MinimalSoftwareWindow>>> = const { RefCell::new(None) };
+}
+
+struct Drawn;
+
+impl Platform for Drawn {
+    fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
+        let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+        SURFACE.with_borrow_mut(|surface| *surface = Some(window.clone()));
+        Ok(window)
+    }
+}
+
+/// The probe drawn at 1:1 into an RGB buffer.
+fn drawn(width: u32, height: u32) -> (PairProbe, Vec<[u8; 3]>) {
+    let _ = slint::platform::set_platform(Box::new(Drawn));
+    let probe = PairProbe::new().unwrap();
+    let surface = SURFACE.with_borrow(Clone::clone).unwrap();
+    surface.set_size(PhysicalSize::new(width, height));
+    probe.show().unwrap();
+    slint::platform::update_timers_and_animations();
+    surface.request_redraw();
+    let mut buffer = vec![PremultipliedRgbaColor::default(); (width * height) as usize];
+    assert!(surface.draw_if_needed(|renderer| {
+        renderer.render(&mut buffer, width as usize);
+    }));
+    (
+        probe,
+        buffer.iter().map(|p| [p.red, p.green, p.blue]).collect(),
+    )
+}
+
+/// The vertical centre of the ink in `area` (`x0 x1 y0 y1`, window px), weighted by how much each
+/// pixel differs from the area's top-left one, which is background; a half-covered edge row weighs
+/// half, so a 1 px shift of the text is a 1 px shift here. The area's edge rows are not read: a
+/// control's border is not ink.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)] // whole positive pixels
+fn ink_mid(pixels: &[[u8; 3]], width: u32, area: &ModelRc<f32>) -> f32 {
+    let at = |i| area.row_data(i).unwrap().round() as usize;
+    let (x0, x1, y0, y1) = (at(0), at(1), at(2) + 3, at(3) - 3);
+    let px = |x: usize, y: usize| pixels[y * width as usize + x];
+    let bg = px(x0, y0);
+    let (mut weight, mut moment) = (0.0, 0.0);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let ink: u32 = px(x, y)
+                .iter()
+                .zip(bg)
+                .map(|(a, b)| u32::from(a.abs_diff(b)))
+                .sum();
+            weight += ink as f32;
+            moment += ink as f32 * (y as f32 + 0.5);
+        }
+    }
+    assert!(weight > 0.0, "no ink in {x0}..{x1} x {y0}..{y1}");
+    moment / weight
+}
+
+// The 0.4 px bound is tuned for Segoe UI Variable Text, which only Windows has: elsewhere the font
+// falls back to another face with other capital proportions, so only a loose bound (still above
+// one icon height off) holds and the exact one is Windows-only.
+#[cfg(windows)]
+const CENTRE_TOLERANCE: f32 = 0.4;
+#[cfg(not(windows))]
+const CENTRE_TOLERANCE: f32 = 2.0;
+
+#[test]
+fn an_icon_and_its_text_share_one_centre_line() {
+    let (width, height) = (400, 300);
+    let (p, pixels) = drawn(width, height);
+    let pairs = [
+        ("Row title", p.get_row_text(), p.get_row_icon()),
+        ("IconLabel", p.get_head_text(), p.get_head_icon()),
+        ("StatusChip", p.get_chip_text(), p.get_chip_dot()),
+        ("Button", p.get_button_text(), p.get_button_icon()),
+    ];
+    for (name, text, icon) in pairs {
+        let (text, icon) = (
+            ink_mid(&pixels, width, &text),
+            ink_mid(&pixels, width, &icon),
+        );
+        assert!(
+            (text - icon).abs() <= CENTRE_TOLERANCE,
+            "the {name} capitals are centred at row {text}, its icon at row {icon} (on Windows cap-lift 1 px measures 0.1-0.3 apart, 0 measures 0.7)"
         );
     }
 }

@@ -64,6 +64,7 @@ export component Keycap {
     Tip {
         text: root.spoken != root.label ? root.spoken : "";
         hovered: touch.has-hover;
+        pressed: touch.pressed;
     }
 }
 
@@ -177,6 +178,7 @@ export component KeycapRow {
         Tip {
             text: root.label;
             hovered: touch.has-hover || root.hovered;
+            pressed: touch.pressed;
         }
     }
     empty := Text {

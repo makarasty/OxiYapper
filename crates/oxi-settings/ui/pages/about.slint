@@ -2,7 +2,7 @@
 // tile opens the std "Made with Slint" badge (SPEC Settings UI, R2.3). The browser opens every link;
 // the app makes no request.
 import { AboutSlint } from "std-widgets.slint";
-import { Theme, Icons, Caption, Group, Card, CardFrame, ClickCard, Button } from "../theme/index.slint";
+import { Theme, Shell, Icons, Caption, CapText, Group, Card, CardFrame, ClickCard, Button } from "../theme/index.slint";
 
 // `brand`: one of the `Theme.brand-*` inks (DS-19.3).
 // An empty `url`: the tile opens the Slint badge instead of a link.
@@ -55,21 +55,19 @@ component TechCard inherits ClickCard {
             alignment: center;
             spacing: Theme.title-gap;
             horizontal-stretch: 1;
-            Text {
+            CapText {
                 text: root.name;
                 height: Theme.body-line;
-                vertical-alignment: center;
-                font-size: Theme.body-size;
-                color: Theme.text-primary;
                 overflow: elide;
-                accessible-role: none;
+                decorative: true;
             }
-            if !root.short: Caption {
+            if !root.short: CapText {
                 text: root.note;
                 height: Theme.caption-line;
-                vertical-alignment: center;
+                font-size: Theme.caption-size;
+                ink: Theme.text-secondary;
                 overflow: elide;
-                accessible-role: none;
+                decorative: true;
             }
         }
         // `open-external` only on a tile that opens another app (DS-24.1); the Slint tile opens the
@@ -143,24 +141,28 @@ component AuthorCard inherits Card {
             spacing: Theme.title-gap;
             horizontal-stretch: 1;
             preferred-width: 0;
-            Text {
+            CapText {
                 text: "makarasty";
-                font-size: Theme.body-size;
                 font-weight: Theme.weight-strong;
-                color: Theme.text-primary;
             }
             HorizontalLayout {
                 alignment: start;
                 spacing: Theme.space-1;
-                Caption {
+                CapText {
                     text: "Made in Ukraine";
+                    font-size: Theme.caption-size;
+                    ink: Theme.text-secondary;
                 }
-                if !root.compact: Caption {
+                if !root.compact: CapText {
                     text: "·";
-                    accessible-role: none;
+                    font-size: Theme.caption-size;
+                    ink: Theme.text-secondary;
+                    decorative: true;
                 }
-                if !root.compact: Caption {
+                if !root.compact: CapText {
                     text: @tr("Issues and ideas welcome");
+                    font-size: Theme.caption-size;
+                    ink: Theme.text-secondary;
                     overflow: elide;
                 }
             }
@@ -187,6 +189,11 @@ export component AboutPage inherits VerticalLayout {
     in property <length> free-height;
     function open(url: string) {
         Platform.open-url(url);
+    }
+    // The popup reports its own `is-open` only to the component that holds it.
+    property <bool> badge-open: slint-badge.is-open;
+    changed badge-open => {
+        Shell.modal(root.badge-open);
     }
     property <[Tech]> techs: [
         { name: "Rust", note: @tr("The whole app"), mark: Icons.rust-mark, brand: Theme.brand-rust, url: "https://github.com/rust-lang/rust" },

@@ -1039,3 +1039,28 @@ fn the_filler_editor_follows_the_filter() {
         Some(true)
     );
 }
+
+/// Owner item 38: a modal popup dims the window behind it, the dim fades with the popup's motion
+/// and is gone when the popup closes (Esc here; a click outside shares the `is-open` path).
+#[test]
+fn apps_popup_dims_the_window_while_open() {
+    let window = open_tall(&layout("scrim", None));
+    sub_tab(&window, "Per-app rules");
+    let shell = window.global::<oxi_settings::Shell>();
+    assert_eq!(shell.get_modals(), 0, "dim before any popup");
+    one(&window, "Scan for apps").invoke_accessible_default_action();
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(250));
+    assert_eq!(shell.get_modals(), 1, "the popup is open but no dim");
+    window.window().dispatch_event(WindowEvent::KeyPressed {
+        text: Key::Escape.into(),
+    });
+    window.window().dispatch_event(WindowEvent::KeyReleased {
+        text: Key::Escape.into(),
+    });
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(250));
+    assert_eq!(
+        shell.get_modals(),
+        0,
+        "the dim stays after the popup closed"
+    );
+}

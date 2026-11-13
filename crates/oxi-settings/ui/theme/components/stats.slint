@@ -1,7 +1,7 @@
 // Home dashboard pieces: stat cards and the speaking-activity heatmap.
 import { Theme } from "../tokens.slint";
 import { Caption, Tip } from "base.slint";
-import { ClickCard } from "layout.slint";
+import { ClickCard, CapText } from "layout.slint";
 
 // One number on a card: icon + label, the big value ("299.9K"), a caption ("All time"). A click
 // opens its trend; while open the card is filled.
@@ -45,14 +45,11 @@ export component StatCard inherits ClickCard {
                     accessible-role: none;
                 }
             }
-            Text {
+            CapText {
                 text: root.label;
-                font-size: Theme.body-size;
-                color: Theme.text-secondary;
-                vertical-alignment: center;
-                horizontal-stretch: 1;
+                ink: Theme.text-secondary;
                 wrap: word-wrap;
-                accessible-role: none;
+                decorative: true;
             }
         }
         Text {
@@ -246,6 +243,7 @@ export component ActivityHeatmap {
             height: root.cell;
             text: root.hot >= 0 && root.hot < root.day-tips.length ? root.day-tips[root.hot] : "";
             hovered: root.hot >= 0;
+            pressed: touch.pressed;
         }
     }
     legend := HorizontalLayout {

@@ -304,6 +304,7 @@ export component PositionTiles {
                 Tip {
                     text: Shell.locked ? Shell.locked-tip : parent.accessible-label;
                     hovered: touch.has-hover;
+                    pressed: touch.pressed;
                 }
             }
         }

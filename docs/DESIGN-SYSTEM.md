@@ -205,8 +205,8 @@ Geometry (y from the header's top, x from the content's left edge = the cards' l
 | title, or first tab label | text left x = 0; text centre y = 20; `body-size`, `weight-strong` |
 | other tabs | label to label gap `tab-gap` (new, 24); `text-secondary` at rest, `text-primary` on hover and when selected; no fill |
 | tab width | each tab reserves its label's `weight-strong` width, so selecting a tab moves no neighbour |
-| tab count ("Per-app rules 1") | `caption-size`, `text-secondary`, `tab-count-gap` 6 right of the label |
-| selected underline | 2 px (`tab-underline`, was 3) `accent`, exactly the label's width, flush with the header's bottom |
+| tab count ("Per-app rules 1") | a pill badge (`badge-height` 20, `radius-round`, `bg-inset`, `caption-size`, `text-secondary`, `space-2` side padding, at least two digits wide), `tab-count-gap` 6 right of the label; shown at 0 too, muted (opacity 0.6), so 0 -> 1 -> 12 moves nothing |
+| selected underline | 2 px (`tab-underline`, was 3) `accent`, the label's width plus its count badge, flush with the header's bottom; a page title gets the same underline, its text's width (owner item 43) |
 | bottom line | 1 px `divider` from x = 0 to the content's right edge |
 | `StatusChip` | box right edge = content right edge; box centre y = 20 |
 | tab hit area | the label plus 12 px left and right, the full 40 px height (invisible) |
@@ -216,7 +216,7 @@ Geometry (y from the header's top, x from the content's left edge = the cards' l
 - DS-14.3 The header row's centre y equals the first rail item's centre y, within 1 px (UI rule 8). Check: shot of each page.
 - DS-14.4 StatusChip: text, then a dot (8 px, `radius-round`) `pair-gap` right of it. Dot colour: `success-text` running, `warning-text` attention, `error-text` down; the chip's text names the state, so the dot's colour is never the only cue (DS-21.1). Hover and pointer only when the status has an action.
 - DS-14.5 Same geometry on title pages and tab pages. Check: in shots of Home (title) and Model (tabs): first label left x, label centre y, chip centre y, bottom line y and first content y each match to 0 px. Today: label x 236 against 248, label and chip centre y 29 against 26.
-- DS-14.6 A title is inert (no hover, no underline). Tabs follow section 5's sub-tab row.
+- DS-14.6 A title is inert (no hover, no click) but wears the accent underline of an open tab, so a one-section page looks like a tabbed page with one tab open (owner item 43, replaces "no underline"). Tabs follow section 5's sub-tab row.
 - DS-14.7 Toasts show in the header row, between the tabs and the StatusChip (DS-25.9).
 
 ## 15. Card grid
@@ -230,7 +230,8 @@ Component: `CardGrid` (gallery.slint), shared by the apps popup, the model galle
 
 ## 16. Icon and label pairs
 
-- DS-16.1 In every icon+label pair the icon centre y equals the label's line-box centre y within 0.5 px, and the gap is `pair-gap`.
+- DS-16.1 In every icon+label (or dot+label) pair the icon's centre y equals the centre of the label's capital letters within 0.5 px, and the gap is `pair-gap`. Optical rule: the cap-height centre, not the line box. A line box centres ascent plus descent, which puts the capitals of Segoe UI Variable at 14 px about 1 px under the centre (measured on shots: Keys row, Speaking activity, Running chip, Change button all 1 to 1.5 px low). So every text beside an icon or dot is raised by `cap-lift` (1 px, tokens.slint).
+- DS-16.2 One place each: `CapText` (a text raised by `cap-lift`) and `IconLabel` (`[icon][CapText]`, the Group header) in layout.slint; `Row` title, `Button` label, `NavItem` label and the `StatusChip` text apply the same lift (`CapText` or `y: -cap-lift`). A new pair uses them and does not centre a Text by hand. Check: `tests/layout_row.rs` `an_icon_and_its_text_share_one_centre_line` (Row, IconLabel, StatusChip, Button); on a shot, measure the glyph rows of the icon and of a capital letter: the centres differ by at most 0.5 px.
 
 ## 17. "More" affordance
 
@@ -445,6 +446,7 @@ UI rules 1 to 6 hold. These add the cases found on screen:
 - DS-25.8 Content that loads later (app icons, history rows, model sizes) takes its final box at once: a placeholder of the same size, never a row that grows.
 - DS-25.9 Toast: one line, 32 px high, on its own layer in the header row, 4 px inside the header's 40 px, between the tabs and the StatusChip. Its right edge is `control-gap` (8) left of the chip's box; it is as wide as its text plus 2 x `space-3`, at most 360; its left edge stays at least 8 px right of the last tab (or the title), and a text longer than that span is elided. It covers no tab, no chip, no field and no button on any page, pushes nothing, takes no click, and leaves by itself after 3 s with a `motion-open` fade both ways. Toast texts are short enough to show whole on Text (the page with the most tabs) at 720 x 520 in every shipped language. Check: shot of each page with a toast at 720 x 520 and 1280 x 860: its rect lies inside the header row and overlaps neither a tab nor the chip; with an actionable chip ("No model"), the chip still takes the click while the toast shows. Today: the toast "Transcribed again." at the bottom covers History's fields. A result that has a place on the page (a diff bar, a row's status slot) is shown there instead of a toast.
 - DS-25.10 An item that is added, removed or reordered by an event while the user points at a list does not move the row under the pointer: new History rows come in at the top only while the list is at scroll 0; otherwise the list keeps its offset.
+- DS-25.11 A modal popup (the apps popup, the Export and playback menus, the Slint badge, the language search) dims the window behind it: one `Scrim` (scrim.slint) over the page and the rail, token `scrim` (black at 45 % in dark, ink at 25 % in light). It fades with `motion-open` (160 ms, none under reduced motion), no scale. It takes no pointer: a click outside closes the popup as before. Slint has no backdrop blur, so the dim stands in for it. A popup counts itself in with `Shell.modal(is-open)` from the component that holds it (a popup's `is-open` is readable only there); a Combo list is a menu and does not dim. Check: open the apps popup: the page behind is darker by the token; close it: the page is back; with `Shell.reduced-motion` the change is at once.
 
 ## 26. Progress [M12, M31]
 

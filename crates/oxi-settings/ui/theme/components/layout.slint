@@ -4,8 +4,37 @@ import { Theme, Shell } from "../tokens.slint";
 import { FocusRing, KeyFocus, CardFrame, Caption, Tip, InfoTip, ScrollBox } from "base.slint";
 import { Switch } from "switch.slint";
 import { Slider, NumberField } from "slider.slint";
-import { WarningSlot } from "feedback.slint";
+import { WarningSlot, CapText } from "feedback.slint";
 import { Button, ButtonKind } from "button.slint";
+
+// Defined in feedback.slint (which this file imports; the other way round would be a cycle).
+export { CapText }
+
+// `[icon] [text]` in a row: the icon centred in the row's height, the text's capitals on that same
+// line, `pair-gap` between. An empty `icon` leaves the text alone.
+export component IconLabel inherits HorizontalLayout {
+    in property <image> icon;
+    in property <string> text;
+    in property <int> font-weight: 400;
+    in property <color> ink: Theme.text-primary;
+    VerticalLayout {
+        alignment: center;
+        // The gap belongs to the icon's cell, so no icon leaves no gap.
+        padding-right: root.icon.width > 0 ? Theme.pair-gap : 0px;
+        picture := Image {
+            source: root.icon;
+            width: root.icon.width > 0 ? Theme.icon-size : 0px;
+            height: root.icon.width > 0 ? Theme.icon-size : 0px;
+            colorize: root.ink;
+            accessible-role: none;
+        }
+    }
+    words := CapText {
+        text: root.text;
+        font-weight: root.font-weight;
+        ink: root.ink;
+    }
+}
 
 // An optional header 8 px above its cards; the cards (children) 4 px apart. No box of its own.
 export component Group inherits VerticalLayout {
@@ -26,24 +55,12 @@ export component Group inherits VerticalLayout {
         padding-bottom: Theme.header-gap - Theme.card-gap;
         spacing: Theme.pair-gap;
         alignment: stretch;
-        // Centred in the row, which a trailing action button makes taller than the icon.
-        if root.icon.width > 0: VerticalLayout {
-            alignment: center;
-            Image {
-                source: root.icon;
-                width: Theme.icon-size;
-                height: Theme.icon-size;
-                colorize: Theme.text-primary;
-                accessible-role: none;
-            }
-        }
-        Text {
+        // The icon centred in the row (a trailing action button makes it taller than the icon), the
+        // title's capitals on the same line.
+        IconLabel {
+            icon: root.icon;
             text: root.title;
-            font-size: Theme.body-size;
             font-weight: Theme.weight-strong;
-            color: Theme.text-primary;
-            // Centred in the icon's 20 px cell, so the icon and the text share one centre.
-            vertical-alignment: center;
         }
         if root.info != "": VerticalLayout {
             alignment: center;
@@ -188,23 +205,22 @@ export component Row inherits HorizontalLayout {
         Rectangle {
             min-height: title.min-height;
             preferred-height: title.preferred-height;
-            title := Text {
+            title := CapText {
                 // Without an x Slint centres a narrowed child: the title would start half the "i" room in.
                 x: 0;
                 // The "i" keeps its room so a long title wraps before it, not under it.
                 width: parent.width - (root.info == "" ? 0 : Theme.pair-gap + Theme.icon-size);
                 height: 100%;
                 text: root.title;
-                font-size: Theme.body-size;
-                color: root.enabled ? Theme.text-primary : Theme.text-disabled;
+                ink: root.enabled ? Theme.text-primary : Theme.text-disabled;
                 wrap: root.elide ? TextWrap.no-wrap : TextWrap.word-wrap;
                 overflow: root.elide ? TextOverflow.elide : TextOverflow.clip;
-                vertical-alignment: center;
             }
             if root.elide: TouchArea {
                 Tip {
-                    text: title.preferred-width > title.width ? root.title : "";
+                    text: title.text-width > title.width ? root.title : "";
                     hovered: parent.has-hover;
+                    pressed: parent.pressed;
                 }
             }
             // One line of the title's font: the "i" centres on the first line when the title wraps.
@@ -217,7 +233,7 @@ export component Row inherits HorizontalLayout {
             // Slint does not give where a wrapped line ends, so a wrapped title's "i" sits at the end
             // of the first line's room (kept free above): never under the text, never on line two.
             if root.info != "": InfoTip {
-                x: min(title.preferred-width, title.width) + Theme.pair-gap;
+                x: min(title.text-width, title.width) + Theme.pair-gap;
                 // The box is the text block's height (the layout gives it its preferred), so line one starts at 0.
                 y: (line.preferred-height - self.height) / 2;
                 text: root.info;
@@ -257,6 +273,7 @@ export component Row inherits HorizontalLayout {
             Tip {
                 text: Shell.locked ? Shell.locked-tip : root.off-tip;
                 hovered: parent.has-hover;
+                pressed: parent.pressed;
             }
         }
         // A parent TouchArea sees the hover and still hands the pointer to the controls.
@@ -274,6 +291,7 @@ export component Row inherits HorizontalLayout {
             Tip {
                 text: measure.preferred-width > hover.width - Theme.control-height - Theme.space-3 ? root.full-text : "";
                 hovered: hover.has-hover;
+                pressed: hover.pressed;
             }
         }
         measure := Text {
@@ -430,7 +448,7 @@ export component ScrollView {
 
 // The page's header row (DS-14, R2.4): `SubTabs` (or the page name) left, the status chip slot
 // right, a 1 px divider across the whole content width at the bottom. Children go left; set
-// `title` instead on a page without tabs.
+// `title` instead on a page without tabs (shown as the one open tab, with its underline).
 export component HeaderRow {
     in property <string> title;
     height: Theme.header-row-height;
@@ -444,15 +462,28 @@ export component HeaderRow {
     }
     HorizontalLayout {
         spacing: Theme.control-gap;
-        if root.title != "": Text {
+        if root.title != "": CapText {
             text: root.title;
-            font-size: Theme.body-size;
             font-weight: Theme.weight-strong;
-            color: Theme.text-primary;
-            vertical-alignment: center;
-            accessible-role: none;
         }
         @children
+    }
+    // A page with one section: its name is the one open tab, so it wears the tab's underline
+    // (owner item 43); exactly the title's width, flush with the bottom, like `SubTabs`.
+    if root.title != "": underline := Rectangle {
+        x: 0;
+        y: root.height - Theme.tab-underline;
+        width: title-width.preferred-width;
+        height: Theme.tab-underline;
+        border-radius: Theme.radius-small;
+        background: Theme.accent;
+    }
+    title-width := Text {
+        visible: false;
+        text: root.title;
+        font-size: Theme.body-size;
+        font-weight: Theme.weight-strong;
+        accessible-role: none;
     }
 }
 
@@ -489,16 +520,13 @@ export component StatusChip {
         padding-left: Theme.space-2;
         padding-right: Theme.space-2;
         spacing: Theme.pair-gap;
-        Text {
+        words := CapText {
             text: root.text;
-            font-size: Theme.body-size;
-            color: Theme.text-secondary;
-            vertical-alignment: center;
-            accessible-role: none;
+            ink: Theme.text-secondary;
         }
         VerticalLayout {
             alignment: center;
-            Rectangle {
+            dot-box := Rectangle {
                 width: Theme.status-dot-size;
                 height: Theme.status-dot-size;
                 border-radius: Theme.radius-round;
@@ -518,6 +546,7 @@ export component StatusChip {
     Tip {
         text: root.tooltip;
         hovered: touch.has-hover;
+        pressed: touch.pressed;
     }
     fs := FocusScope {
         enabled: root.actionable;

@@ -122,6 +122,7 @@ export component Segmented {
                 Tip {
                     text: root.tips[i];
                     hovered: touch.has-hover;
+                    pressed: touch.pressed;
                 }
             }
         }
@@ -237,6 +238,7 @@ component Adornment inherits Rectangle {
     Tip {
         text: root.tip;
         hovered: touch.has-hover;
+        pressed: touch.pressed;
     }
 }
 
@@ -265,6 +267,22 @@ export component TextField {
     in property <bool> force-focus;
     out property <bool> has-focus: input.has-focus;
     out property <bool> has-hover: hover-area.has-hover;
+    // The press the TextInput (the focus it takes) and the glyph's TouchArea swallow still counts: a
+    // child that grabs the press stops `hover-area` from seeing it. shortcut: a press on a field that
+    // already has the focus (and no glyph under it) is not seen, so its tip still waits.
+    out property <bool> pressed: hover-area.pressed || focus-press || glyph-pressed;
+    property <bool> glyph-pressed;
+    // Focus gained under the pointer, not through the clear "x" (it has its own Tip, which dies with it).
+    property <bool> focus-press;
+    changed has-hover => {
+        if (!self.has-hover) {
+            self.focus-press = false;
+        }
+    }
+    // The focus press is long over once the value turns invalid: the glyph's press is a new edge.
+    changed invalid => {
+        self.focus-press = false;
+    }
     callback edited(string);
     callback accepted(string);
 
@@ -283,6 +301,7 @@ export component TextField {
         if (self.has-focus) {
             self.key-focus = !hover-area.has-hover;
         }
+        self.focus-press = self.has-focus && hover-area.has-hover && !self.clear-hover;
     }
     property <bool> show-clear: root.clearable && root.text != "" && root.live && !root.read-only;
     // The clear "x" has its own Tip; the field's Tip closes while it is hovered. Left open, it would
@@ -321,6 +340,7 @@ export component TextField {
         Tip {
             text: root.invalid ? root.invalid-tip : "";
             hovered: hover-area.has-hover && !(root.show-clear && root.clear-hover);
+            pressed: root.pressed;
         }
         FieldFrame {
             live: root.live;
@@ -396,6 +416,9 @@ export component TextField {
                 // The field's own Tip below covers the glyph; this only keeps the arrow cursor.
                 TouchArea {
                     mouse-cursor: MouseCursor.default;
+                    changed pressed => {
+                        root.glyph-pressed = self.pressed;
+                    }
                 }
             }
             if root.show-clear: Adornment {
@@ -646,6 +669,7 @@ export component PathField {
             Tip {
                 text: root.path;
                 hovered: field.has-hover;
+                pressed: field.pressed;
             }
         }
         if root.browse-text != "": Button {

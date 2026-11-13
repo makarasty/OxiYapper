@@ -3,7 +3,7 @@
 // it: its state on disk and what can be done now (download, resume, cancel, use, delete), or the
 // path of "use my own .bin". Settings: the GPU, the unload, the models folder and its partial
 // downloads. Advanced: what the engine does on its own.
-import { Theme, Shell, Icons, Group, Card, Row, Divider, Caption, Combo, Segmented, TextField, NumberField, Button, ButtonKind, IconButton, InfoTip, PathField, ProgressBar, WarningSlot, SubTabs, SubTabPane, CardGrid, GalleryTile } from "../theme/index.slint";
+import { Theme, Shell, Icons, CapText, Group, Card, Row, Divider, Caption, Combo, Segmented, TextField, NumberField, Button, ButtonKind, IconButton, InfoTip, PathField, ProgressBar, WarningSlot, SubTabs, SubTabPane, CardGrid, GalleryTile } from "../theme/index.slint";
 import { SearchPopup } from "../theme/components/search_popup.slint";
 
 export struct ModelRow {
@@ -249,24 +249,22 @@ component ModelCard inherits VerticalLayout {
                     // The status and its caption line are kept in every state, so the card keeps its
                     // height (DS-25); a status alone sits in the middle of them.
                     VerticalLayout {
+                        horizontal-stretch: 1;
                         min-height: Theme.body-line + Theme.title-gap + Theme.caption-line;
                         alignment: center;
                         spacing: Theme.title-gap;
-                        horizontal-stretch: 1;
                         // The tile above already says which model and its facts: the card says
                         // where it stands (its name is for a screen reader).
-                        Text {
+                        CapText {
                             text: root.data.badge;
-                            font-size: Theme.body-size;
-                            color: Theme.text-primary;
+                            spoken: @tr("{}: {}", root.data.name, root.data.badge);
                             overflow: elide;
-                            accessible-label: @tr("{}: {}", root.data.name, root.data.badge);
                         }
                         // What the tile does not say (paused: how much is there; damaged: what to do).
-                        if root.data.detail != "": Text {
+                        if root.data.detail != "": CapText {
                             text: root.data.detail;
                             font-size: Theme.caption-size;
-                            color: Theme.text-secondary;
+                            ink: Theme.text-secondary;
                             overflow: elide;
                         }
                     }
@@ -395,12 +393,8 @@ component ModelCard inherits VerticalLayout {
                 }
                 HorizontalLayout {
                     spacing: Theme.control-gap;
-                    Text {
-                        horizontal-stretch: 1;
-                        vertical-alignment: center;
+                    CapText {
                         text: root.data.paused && !root.data.ready ? @tr("Delete the partial download of {}? Frees {}.", root.data.name, root.data.frees) : @tr("Delete {}? Frees {}.", root.data.name, root.data.frees);
-                        font-size: Theme.body-size;
-                        color: Theme.text-primary;
                         wrap: word-wrap;
                     }
                     VerticalLayout {
@@ -470,11 +464,8 @@ component CustomCard inherits VerticalLayout {
                         horizontal-stretch: 1;
                         alignment: start;
                         spacing: Theme.pair-gap;
-                        Text {
+                        CapText {
                             text: @tr("Use my own .bin");
-                            font-size: Theme.body-size;
-                            color: Theme.text-primary;
-                            vertical-alignment: center;
                         }
                         VerticalLayout {
                             alignment: center;
@@ -525,6 +516,11 @@ export component ModelPage inherits VerticalLayout {
     alignment: start;
     // DS-1.3: the first card sits `header-bottom` under the tab line.
     spacing: Theme.header-bottom;
+    // The popup reports its own `is-open` only to the component that holds it; open, it dims the window.
+    property <bool> languages-open: all-languages.is-open;
+    changed languages-open => {
+        Shell.modal(root.languages-open);
+    }
     init => {
         ModelState.shown();
     }

@@ -32,6 +32,12 @@ export global Shell {
     // Windows "Animation effects" is off (SPI_GETCLIENTAREAANIMATION): every `Theme.motion-*`
     // duration reads 0 and lists, popups and knobs appear in place. The window keeps it current.
     in-out property <bool> reduced-motion;
+    // How many modal popups are open; the window's scrim shows while it is above 0. Each popup
+    // reports its own `is-open` through `modal` (no popup has a `closed` callback).
+    in-out property <int> modals;
+    public function modal(open: bool) {
+        self.modals = max(0, self.modals + (open ? 1 : -1));
+    }
 }
 
 export global Theme {
@@ -276,10 +282,17 @@ export global Theme {
     out property <length> subtitle-size: 20px;
     out property <length> title-size: 28px;
     out property <int> weight-strong: 600;
+    // A line box centres its text on the middle of ascent + descent, which puts the capitals about
+    // 1 px under it at 14 px (measured on the shots). Text beside an icon or a dot is raised by this,
+    // so the capitals' centre and the icon's centre are one line (DS-16.1).
+    out property <length> cap-lift: 1px;
 
     // 1.4 Neutrals and roles: concept C "white minimal" (owner's pick, 2026-11-10, DESIGN-SYSTEM
     // section 19): ink on paper, neutral steps only. Colour lives here alone, so a later colour
     // theme replaces these values and touches no page or component (DS-19.3).
+    // The dim behind a modal popup (DS-38): Slint has no backdrop blur, so a black veil; lighter on
+    // the light theme, where the same alpha would read as dirt.
+    out property <color> scrim: dark ? #00000073 : #1C1B1940;
     out property <color> bg-page: dark ? #161616 : #F7F5F0;
     out property <color> bg-card: dark ? #1F1F1F : #FCFBF8;
     out property <color> bg-control: dark ? #262626 : #FFFEFB;

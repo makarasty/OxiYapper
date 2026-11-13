@@ -11,8 +11,8 @@ import { FocusRing, KeyFocus } from "base.slint";
 export component SubTabs {
     in property <[string]> items;
     in property <int> selected;
-    // A number after the label, parallel to `items`; negative or missing: none. 0 shows, so the
-    // first item added or the last removed does not widen or narrow the tab.
+    // A badge after the label, parallel to `items`; negative or missing: none. 0 shows (muted), so
+    // the first item added or the last removed does not widen or narrow the tab.
     in property <[int]> counts;
     // Gallery: the tab drawn hovered and pressed (-1: none).
     in property <int> force-hover: -1;
@@ -102,25 +102,37 @@ export component SubTabs {
                         accessible-role: none;
                     }
                 }
-                if i < root.counts.length && root.counts[i] >= 0: Text {
-                    text: root.counts[i];
-                    // Digits are proportional: as wide as as many 0s, so 1 to 0 moves nothing.
-                    min-width: zero.preferred-width * self.text.character-count;
-                    font-size: Theme.caption-size;
-                    color: Theme.text-secondary;
-                    vertical-alignment: center;
-                    accessible-role: none;
+                // The count as a pill badge (owner item 31): at least two digits wide and shown
+                // at 0 too, so 0 -> 1 -> 12 moves nothing and the underline always covers it.
+                if i < root.counts.length && root.counts[i] >= 0: Rectangle {
+                    width: max(2, count.text.character-count) * zero.preferred-width + 2 * Theme.space-2;
+                    // Muted at 0: nothing to count yet, the width stays.
+                    opacity: root.counts[i] == 0 ? 0.6 : 1;
+                    badge := Rectangle {
+                        y: (parent.height - self.height) / 2;
+                        height: Theme.badge-height;
+                        border-radius: Theme.radius-round;
+                        background: Theme.bg-inset;
+                        count := Text {
+                            text: root.counts[i];
+                            font-size: Theme.caption-size;
+                            color: item-box.on || item-box.hover ? Theme.text-primary : Theme.text-secondary;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            accessible-role: none;
+                        }
+                    }
                 }
             }
             // The underline fades with the selection, no slide or scale (DS-5.5); it covers the
             // 1 px tab line.
-            Rectangle {
+            underline := Rectangle {
                 opacity: parent.on ? 1 : 0;
                 animate opacity { duration: Theme.motion-quick; easing: ease-out; }
-                // Exactly the label's width, not its count's (DS-14), flush with the bottom.
+                // The label and its badge (DS-14), flush with the bottom.
                 x: item-box.lead;
                 y: parent.height - Theme.tab-underline;
-                width: strong.preferred-width;
+                width: content.preferred-width - item-box.lead - Theme.space-3;
                 height: Theme.tab-underline;
                 border-radius: Theme.radius-small;
                 background: Theme.accent;

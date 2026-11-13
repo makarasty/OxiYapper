@@ -92,7 +92,7 @@ export component TipBubble inherits Tooltip {
     }
 }
 
-// A tooltip that opens after 600 ms of hover and closes when the pointer leaves (Slint 1.18 has
+// A tooltip that opens after 600 ms of hover (at once on a left press) and closes when the pointer leaves (Slint 1.18 has
 // no tooltip widget). Place it inside the hovered element; it fills it and takes no input. The
 // bubble (in `KeyTipHost`, as a popup would take the focus) is built on each show, so it fades in.
 // What an open hover `Tip` says and where, for `KeyTipHost`. Not a PopupWindow: that takes the focus
@@ -108,15 +108,29 @@ export global HoverTip {
 export component Tip {
     in property <string> text;
     in property <bool> hovered;
+    // The host's left button is down: a press on the hovered host opens the tip at once; a press
+    // on an open tip does nothing. Bound from the host's own `TouchArea` (a Tip takes no input).
+    in property <bool> pressed;
     property <bool> open;
+    function show() {
+        if (root.open || root.text == "") {
+            return;
+        }
+        root.open = true;
+        HoverTip.text = root.text;
+        HoverTip.x = root.absolute-position.x;
+        HoverTip.y = root.absolute-position.y + root.height + Theme.space-1;
+    }
     Timer {
         interval: 600ms;
         running: root.hovered && root.text != "" && !root.open;
         triggered => {
-            root.open = true;
-            HoverTip.text = root.text;
-            HoverTip.x = root.absolute-position.x;
-            HoverTip.y = root.absolute-position.y + root.height + Theme.space-1;
+            root.show();
+        }
+    }
+    changed pressed => {
+        if (self.pressed && self.hovered) {
+            root.show();
         }
     }
     Timer {
@@ -211,9 +225,10 @@ export component InfoTip {
         shown: root.force-focus || root.key-focused;
         radius: Theme.radius-round;
     }
-    Tip {
+    tip := Tip {
         text: root.text;
         hovered: touch.has-hover;
+        pressed: touch.pressed;
     }
 }
 

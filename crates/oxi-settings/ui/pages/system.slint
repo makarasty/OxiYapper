@@ -131,6 +131,7 @@ component AccentPicker inherits Rectangle {
                 Tip {
                     text: name;
                     hovered: touch.has-hover;
+                    pressed: touch.pressed;
                 }
             }
             accessible-role: radio-button;

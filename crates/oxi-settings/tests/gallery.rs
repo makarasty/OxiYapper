@@ -17,7 +17,59 @@ mod common;
 mod controls {
     slint::slint! {
         import { Palette } from "std-widgets.slint";
-        import { Theme, Icons, Button, Group, ActivityHeatmap, PathField, PositionTiles, TilePicker } from "../ui/theme/index.slint";
+        import { Theme, Icons, Button, Group, ActivityHeatmap, PathField, PositionTiles, TilePicker, Tip, InfoTip, IconButton, TextField } from "../ui/theme/index.slint";
+        import { HoverTip } from "../ui/theme/components/base.slint";
+
+        export { HoverTip }
+
+        // An "i" at (10, 10) and a host with its own `TouchArea` and a `Tip` at (60, 10), 20 px each.
+        export component TipClickProbe inherits Window {
+            out property <int> clicks;
+            width: 140px;
+            height: 60px;
+            info := InfoTip {
+                x: 10px;
+                y: 10px;
+                text: "Info";
+            }
+            host := TouchArea {
+                x: 60px;
+                y: 10px;
+                width: 20px;
+                height: 20px;
+                Tip {
+                    text: "Host";
+                    hovered: parent.has-hover;
+                    pressed: parent.pressed;
+                }
+            }
+            // A shared control with a tooltip: its own `clicked` must still fire.
+            IconButton {
+                x: 90px;
+                y: 10px;
+                label: "Icon";
+                clicked => {
+                    root.clicks += 1;
+                }
+            }
+        }
+
+        // A valid field that the test turns invalid.
+        export component ToggledFieldProbe inherits Window {
+            width: 400px;
+            height: 60px;
+            in property <bool> bad;
+            out property <bool> focused: f.has-focus;
+            // Pinned at 0,0: an element with a width and no x is centred, which moves the glyph.
+            f := TextField {
+                x: 0;
+                y: 0;
+                width: 240px;
+                text: "a";
+                invalid: root.bad;
+                invalid-tip: "Bad";
+            }
+        }
 
         export component PathProbe inherits Window {
             in property <string> display;
@@ -122,7 +174,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use common::purple;
-use controls::{GroupProbe, HeatSizeProbe};
+use controls::{GroupProbe, HeatSizeProbe, TipClickProbe, ToggledFieldProbe};
 use gallery::{
     ClickRingProbe, ComboProbe, Contrast, DotProbe, GalleryShot, GalleryTile, HeatProbe, HoverTip,
     IconDangerProbe, InvalidFieldProbe, MeterProbe, PathFieldProbe, PathText, PickProbe,
@@ -313,6 +365,64 @@ fn tooltip_bubble_fades_in() {
     }
 }
 
+/// A left press on the "i" or on a `Tip` host shows the bubble at once, a press on an open bubble
+/// changes nothing, hover alone waits 600 ms, and leaving closes it.
+#[test]
+fn tooltip_opens_at_once_on_a_left_press() {
+    let _ = slint::platform::set_platform(Box::new(Shots));
+    let probe = TipClickProbe::new().unwrap();
+    probe.show().unwrap();
+    advance(0);
+    let tip = probe.global::<controls::HoverTip>();
+    let window = probe.window();
+    let at = |x: f32, y: f32| {
+        window.dispatch_event(WindowEvent::PointerMoved {
+            position: LogicalPosition::new(x, y),
+        });
+        advance(0);
+    };
+    for (x, what, want) in [
+        (20.0, "the i", "Info"),
+        (70.0, "a Tip host", "Host"),
+        (106.0, "an IconButton", "Icon"),
+    ] {
+        at(x, 20.0);
+        assert_eq!(
+            tip.get_text(),
+            "",
+            "{what}: hover alone does not open it yet"
+        );
+        let position = LogicalPosition::new(x, 20.0);
+        let button = PointerEventButton::Left;
+        window.dispatch_event(WindowEvent::PointerPressed { position, button });
+        advance(0);
+        assert_eq!(tip.get_text(), want, "{what}: press opens it at once");
+        window.dispatch_event(WindowEvent::PointerReleased { position, button });
+        advance(0);
+        click_at(&probe, x, 20.0);
+        assert_eq!(
+            tip.get_text(),
+            want,
+            "{what}: a click on the open tip changes nothing"
+        );
+        advance(700);
+        assert_eq!(tip.get_text(), want, "{what}: still open");
+        at(110.0, 50.0);
+        assert_eq!(tip.get_text(), "", "{what}: leaving closes it");
+        at(x, 20.0);
+        advance(700);
+        assert_eq!(
+            tip.get_text(),
+            want,
+            "{what}: hover opens it after the delay"
+        );
+        at(110.0, 50.0);
+        assert_eq!(tip.get_text(), "", "{what}: closed again");
+    }
+    // Two press+release pairs landed on the button: the tip never swallowed its clicks.
+    assert_eq!(probe.get_clicks(), 2, "the button still gets its clicks");
+}
+
 /// DS-8.7: the reason shows on the field body and on the glyph, with the glyph in the field or not.
 #[test]
 fn invalid_field_exposes_its_tip() {
@@ -364,6 +474,86 @@ fn invalid_field_exposes_its_tip() {
         hover(30.0, 96.0),
         "Not a colour",
         "body after clear and retype"
+    );
+}
+
+/// A left press the field's own text or the error glyph takes (they grab it, so the field's hover
+/// area never sees it) still opens the reason at once, not after 600 ms.
+#[test]
+fn invalid_field_opens_its_reason_on_a_press_at_once() {
+    let _ = slint::platform::set_platform(Box::new(Shots));
+    let probe = InvalidFieldProbe::new().unwrap();
+    probe.show().unwrap();
+    advance(0);
+    let window = probe.window();
+    let tip = probe.global::<HoverTip>();
+    for (x, what) in [(30.0, "the text"), (224.0, "the glyph")] {
+        let position = LogicalPosition::new(x, 16.0);
+        window.dispatch_event(WindowEvent::PointerMoved { position });
+        advance(0);
+        assert_eq!(tip.get_text(), "", "{what}: hover alone waits");
+        let button = PointerEventButton::Left;
+        window.dispatch_event(WindowEvent::PointerPressed { position, button });
+        advance(0);
+        assert_eq!(tip.get_text(), "Not a colour", "{what}: press opens it");
+        window.dispatch_event(WindowEvent::PointerReleased { position, button });
+        window.dispatch_event(WindowEvent::PointerMoved {
+            position: LogicalPosition::new(300.0, 90.0),
+        });
+        advance(20);
+        assert_eq!(tip.get_text(), "", "{what}: leaving closes it");
+    }
+}
+
+/// Click into a valid field (the focus press stays "down" while the pointer is over it), type a bad
+/// value (the app sets `invalid`) so the glyph appears, press the glyph within 600 ms: a new press, so the reason shows at once.
+#[test]
+fn invalid_field_glyph_press_after_focus() {
+    let _ = slint::platform::set_platform(Box::new(Shots));
+    let probe = ToggledFieldProbe::new().unwrap();
+    probe.show().unwrap();
+    let window = probe.window();
+    window.dispatch_event(WindowEvent::WindowActiveChanged(true));
+    advance(0);
+    let tip = probe.global::<controls::HoverTip>();
+    let at = |x: f32| {
+        window.dispatch_event(WindowEvent::PointerMoved {
+            position: LogicalPosition::new(x, 16.0),
+        });
+        advance(0);
+    };
+    at(100.0);
+    // Click into the text: the TextInput takes the press and the focus.
+    let position = LogicalPosition::new(100.0, 16.0);
+    let button = PointerEventButton::Left;
+    window.dispatch_event(WindowEvent::PointerPressed { position, button });
+    window.dispatch_event(WindowEvent::PointerReleased { position, button });
+    advance(700);
+    assert!(probe.get_focused(), "the click focused the field");
+    probe.set_bad(true);
+    // The app draws a frame after the edit; that builds the glyph that just appeared.
+    let surface = LAST.with_borrow(Clone::clone).unwrap();
+    surface.set_size(PhysicalSize::new(400, 60));
+    surface.request_redraw();
+    let mut buffer = vec![PremultipliedRgbaColor::default(); 400 * 60];
+    surface.draw_if_needed(|renderer| {
+        renderer.render(&mut buffer, 400);
+    });
+    advance(0);
+    advance(0);
+    assert_eq!(tip.get_text(), "", "invalid now, not open yet");
+    // The glyph is the right 24 px of the field, 4 px in.
+    at(224.0);
+    let position = LogicalPosition::new(224.0, 16.0);
+    let button = PointerEventButton::Left;
+    window.dispatch_event(WindowEvent::PointerPressed { position, button });
+    // The glyph's press reaches the Tip through two `changed` hops: two rounds.
+    advance(0);
+    advance(0);
+    assert_eq!(
+        tip.get_text(),
+        "Bad",
+        "a press on the glyph opens the reason at once"
     );
 }
 

@@ -654,6 +654,12 @@ component Detail inherits CardFrame {
     property <bool> busy: root.running || HistoryState.timing;
     // Set by the page from its own width: the detail's width depends on what it holds.
     in property <bool> narrow;
+    // The popup reports its own `is-open` only to the component that holds it; the two never
+    // show together.
+    property <bool> menu-open: exporting.is-open || options.is-open;
+    changed menu-open => {
+        Shell.modal(root.menu-open);
+    }
     // The card takes what the list leaves; what it holds (a row of buttons) caps no width of it.
     min-width: 0;
     max-width: 100000px;
