@@ -1,8 +1,11 @@
-//! Test page: pick several recordings (new ones, or saved ones from history), each with the text
-//! of what was said; run every settings set of a scenario over all of them, one request at a time
-//! (`TestTranscribe` or `HistoryRetranscribe`, the next only after each `TestResult`); show the
-//! word error percent of each set over all recordings, each recording's transcript, and apply the
-//! best set.
+//! Test page: a three-step wizard (goal, models, Run; owner 2026-11-13, hold 29-32). The
+//! recordings are a few recent ones from History of varied length, or the ones picked by hand on
+//! the Recordings view (new ones, or saved ones from history), each with the text of what was
+//! said. Every set of the goal goes over all of them, one request at a time (`TestTranscribe` or
+//! `HistoryRetranscribe`, the next only after each `TestResult`); the quiet-microphone goal hears
+//! each recording again made quieter in software (sent as `TestAudio`). The results show the word
+//! error percent of each set over all recordings, each recording's transcript, Apply best, and the
+//! offers to download the recommended model the run skipped or delete the models that lost.
 //!
 //! New recordings live in [`PageState::takes`] and, during a run, on the daemon's connection, in
 //! memory only; closing the window drops them ([`PageState::forget`]) and ends the connection.
@@ -13,31 +16,35 @@ use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak as RcWeak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::thread;
 use std::time::Duration;
 
 use oxi_core::audio::{AudioError, SAMPLE_RATE};
 use oxi_core::config::Audio;
-use oxi_core::history::{self, HistoryId};
+use oxi_core::device::Device;
+use oxi_core::history::{self, HistoryId, Status};
 use oxi_core::ipc::{HistoryItem, HistoryOp, Push, Request, TestFailure, TestOutcome};
 use oxi_core::machine::Notice;
-use oxi_core::models;
-use oxi_core::strings::{self, NO_MIC};
+use oxi_core::models::{self, Adapter, MODELS, Machine, ModelEntry, ModelStatus};
+use oxi_core::strings::{self, NO_MIC, gb};
 use oxi_core::tuning::{
-    self, MAX_TEST_SAMPLES, PCM_CHUNK_SAMPLES, Profile, SettingsSet, WordErrors, encode_pcm,
-    word_errors,
+    self, Goal, MAX_TEST_SAMPLES, ModelChoice, ModelPreset, PCM_CHUNK_SAMPLES, PICK_COUNT,
+    SettingsSet, WordErrors, encode_pcm, word_errors,
 };
 use oxi_core::types::{Language, Millis};
 use oxi_platform::capture::{Capture, CaptureError, CaptureEvent, CpalCapture, LevelMeter, play};
+use oxi_platform::sysinfo;
 use slint::{
     CloseRequestResponse, ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode,
     VecModel, Weak,
 };
 
-use crate::generated::{TestHeard, TestRow, TestState, TestTake};
+use crate::generated::{ModelState, TestHeard, TestModel, TestRow, TestState, TestTake};
 use crate::ipc::{Event, Link, Subscription};
 use crate::{AppWindow, Ctx, Page, report};
 
-use super::progress::Bars;
+use super::progress::{Bars, left_label};
 use super::toast;
 use super::tuning as tuning_view;
 use tuning_view::{BARS, clock, history_label, peaks, total};
@@ -67,7 +74,9 @@ const PICKED_ALL: &str = "Every history recording is picked";
 const NOT_FOUND: &str = "The recording file is gone";
 const OFF_RUNNING: &str = "The test is running";
 const OFF_RECORDING: &str = "Stop the recording first";
-const OFF_NO_TAKES: &str = "Add a recording first";
+const OFF_NO_RECORDINGS: &str =
+    "No recordings yet: dictate a few times with History on, or add one on Recordings";
+const OFF_NO_MODEL: &str = "Tick a downloaded model";
 const OFF_NO_TEXT: &str = "Write what was said in every recording";
 const OFF_NEEDS_DAEMON: &str = "Start OxiYapper to run the test";
 const OFF_NO_BEST: &str = "Run the test first";
@@ -81,16 +90,19 @@ const NO_AUDIO: &str = "OxiYapper did not get the recording. Run the test again.
 const LINK_LOST: &str = "OxiYapper stopped answering, so the test ended.";
 const NOTHING_HEARD: &str = "No set heard every recording, so there is nothing to apply.";
 const APPLIED: &str = "Best set applied.";
+const CANCELLED: &str = "Test cancelled.";
+const NOT_DOWNLOADED: &str = "Not downloaded";
+const DROP_SENT: &str = "Deleting the other models.";
+const PLAN_TIP: &str = "Picked by hand on Recordings, or else a few recent recordings from History of different lengths, each scored against its saved text. Nothing is pasted anywhere and nothing leaves this PC.";
 const HISTORY_ON: &str = "History is on. New dictations are kept.";
 
-fn profile_name(profile: Profile) -> &'static str {
-    match profile {
-        Profile::General => "General",
-        Profile::FastSpeech => "Fast speech",
-        Profile::BadMicrophone => "Bad microphone",
-        Profile::LongDictation => "Long dictation",
-        Profile::SeveralPasses => "Several passes",
-    }
+/// The goal of tile `i`; the first for anything else.
+fn goal_at(i: i32) -> Goal {
+    usize::try_from(i)
+        .ok()
+        .and_then(|i| Goal::ALL.get(i))
+        .copied()
+        .unwrap_or(Goal::Model)
 }
 
 /// The raw audio the daemon wants: before gain, normalise, noise suppression and trim.
@@ -114,13 +126,33 @@ fn play_cpal(clip: &[f32], rate: u32) -> Result<Box<dyn Any>, CaptureError> {
 
 /// Once per window: a config reload only calls `shown`, so the recordings and the run outlive it.
 pub fn bind(window: &AppWindow, ctx: &Ctx) {
-    bind_with(window, ctx, open_mic, play_cpal);
+    bind_with(window, ctx, open_mic, play_cpal, None);
 }
 
 /// [`bind`] on another microphone and speaker. Binding again starts the page over, and the
-/// recordings go.
-pub fn bind_with(window: &AppWindow, ctx: &Ctx, mic: Mic, player: Player) {
+/// recordings go. `hardware` is the machine read already (RAM, adapters, free disk): a test hook
+/// that skips the worker read; `None` reads the real machine on the first open.
+pub fn bind_with(
+    window: &AppWindow,
+    ctx: &Ctx,
+    mic: Mic,
+    player: Player,
+    hardware: Option<Hardware>,
+) {
     let s = window.global::<TestState>();
+    let (tx, rx) = channel();
+    // The percent and the time left are drawn into one label.
+    let label = Rc::new(Cell::new((0.0_f32, None)));
+    let draw = {
+        let window = window.as_weak();
+        move |label: (f32, Option<u64>)| {
+            if let Some(window) = window.upgrade() {
+                let s = window.global::<TestState>();
+                s.set_progress(label.0);
+                s.set_progress_text(progress_label(label.0, label.1).into());
+            }
+        }
+    };
     let page = Rc::new_cyclic(|me: &RcWeak<PageState>| PageState {
         _events: ctx.ipc.subscribe({
             let me = me.clone();
@@ -148,16 +180,31 @@ pub fn bind_with(window: &AppWindow, ctx: &Ctx, mic: Mic, player: Player) {
         offered: RefCell::new(Vec::new()),
         offered_model: Rc::new(VecModel::default()),
         run: RefCell::new(None),
-        bar: Bars::new({
-            let window = window.as_weak();
-            move |(), shown| {
-                if let Some(window) = window.upgrade() {
-                    let s = window.global::<TestState>();
-                    s.set_progress(shown);
-                    s.set_progress_text(format!("{:.0} %", (shown * 100.0).floor()).into());
+        bar: Bars::with_left(
+            {
+                let (label, draw) = (Rc::clone(&label), draw.clone());
+                move |(), shown| {
+                    label.set((shown, label.get().1));
+                    draw(label.get());
                 }
-            }
-        }),
+            },
+            move |(), left| {
+                label.set((label.get().0, left));
+                draw(label.get());
+            },
+        ),
+        entries: MODELS.iter().filter(|m| m.id != "tiny").collect(),
+        choices: RefCell::new(Vec::new()),
+        ticked: RefCell::new(Vec::new()),
+        preset: Cell::new(Some(ModelPreset::Downloaded)),
+        models_model: Rc::new(VecModel::default()),
+        hardware: RefCell::new(hardware),
+        gpus: RefCell::new(None),
+        measuring: Cell::new(false),
+        measure_tx: tx,
+        measure_rx: rx,
+        get_id: Cell::new(None),
+        drop_ids: RefCell::new(Vec::new()),
         left_out: Cell::new(None),
         rows: Rc::new(VecModel::default()),
         heard: Rc::new(VecModel::default()),
@@ -165,12 +212,9 @@ pub fn bind_with(window: &AppWindow, ctx: &Ctx, mic: Mic, player: Player) {
         best: RefCell::new(None),
         next_id: Cell::new(1),
     });
-    let profiles: Vec<SharedString> = Profile::ALL
-        .iter()
-        .map(|p| profile_name(*p).into())
-        .collect();
-    s.set_profiles(ModelRc::from(Rc::new(VecModel::from(profiles))));
-    s.set_profile(0);
+    s.set_goal(0);
+    s.set_models(ModelRc::from(page.models_model.clone()));
+    s.set_plan_tip(PLAN_TIP.into());
     s.set_view(0);
     s.set_takes(ModelRc::from(page.cards.clone()));
     s.set_history(ModelRc::from(page.offered_model.clone()));
@@ -182,30 +226,10 @@ pub fn bind_with(window: &AppWindow, ctx: &Ctx, mic: Mic, player: Player) {
     s.set_selected(0);
     s.set_best_text(SharedString::new());
     s.set_apply_off(OFF_NO_BEST.into());
+    page.clear_offers(&s);
+    page.choose_models();
     page.refresh(&s);
-
-    let p = Rc::clone(&page);
-    s.on_shown(move || p.shown());
-    let p = Rc::clone(&page);
-    s.on_profile_picked(move || p.state(|s| p.refresh(s)));
-    let p = Rc::clone(&page);
-    s.on_record(move || p.record());
-    let p = Rc::clone(&page);
-    s.on_add_history(move || p.add_history());
-    let p = Rc::clone(&page);
-    s.on_turn_on_history(move || p.turn_on_history());
-    let p = Rc::clone(&page);
-    s.on_play(move |i| p.play(i));
-    let p = Rc::clone(&page);
-    s.on_remove(move |i| p.remove(i));
-    let p = Rc::clone(&page);
-    s.on_reference_edited(move |i, text| p.reference_edited(i, &text));
-    let p = Rc::clone(&page);
-    s.on_run(move || p.start_run());
-    let p = Rc::clone(&page);
-    s.on_select(move |i| p.select(i));
-    let p = Rc::clone(&page);
-    s.on_apply(move || p.apply());
+    connect(&s, &page);
     let weak = Rc::downgrade(&page);
     window.window().on_close_requested(move || {
         if let Some(page) = weak.upgrade() {
@@ -213,6 +237,44 @@ pub fn bind_with(window: &AppWindow, ctx: &Ctx, mic: Mic, player: Player) {
         }
         CloseRequestResponse::HideWindow
     });
+}
+
+/// The page's callbacks.
+fn connect(s: &TestState<'_>, page: &Rc<PageState>) {
+    let p = Rc::clone(page);
+    s.on_shown(move || p.shown());
+    let p = Rc::clone(page);
+    s.on_goal_picked(move |i| p.goal_picked(i));
+    let p = Rc::clone(page);
+    s.on_preset_picked(move |i| p.preset_picked(i));
+    let p = Rc::clone(page);
+    s.on_model_ticked(move |i| p.model_ticked(i));
+    let p = Rc::clone(page);
+    s.on_measured(move || p.measured());
+    let p = Rc::clone(page);
+    s.on_cancel(move || p.cancel());
+    let p = Rc::clone(page);
+    s.on_get(move || p.get());
+    let p = Rc::clone(page);
+    s.on_drop(move || p.drop_losers());
+    let p = Rc::clone(page);
+    s.on_record(move || p.record());
+    let p = Rc::clone(page);
+    s.on_add_history(move || p.add_history());
+    let p = Rc::clone(page);
+    s.on_turn_on_history(move || p.turn_on_history());
+    let p = Rc::clone(page);
+    s.on_play(move |i| p.play(i));
+    let p = Rc::clone(page);
+    s.on_remove(move |i| p.remove(i));
+    let p = Rc::clone(page);
+    s.on_reference_edited(move |i, text| p.reference_edited(i, &text));
+    let p = Rc::clone(page);
+    s.on_run(move || p.start_run());
+    let p = Rc::clone(page);
+    s.on_select(move |i| p.select(i));
+    let p = Rc::clone(page);
+    s.on_apply(move || p.apply());
 }
 
 /// Where a picked recording comes from.
@@ -260,14 +322,25 @@ struct Results {
     cells: Vec<Vec<Answer>>,
 }
 
+/// One recording of a run: where it comes from, its samples (sent for a new one), what was said.
+type RunTake = (Source, Rc<Vec<f32>>, String);
+/// A recording a run starts from: its source, samples and their rate, what was said, its label.
+type BaseTake = (Source, Rc<Vec<f32>>, u32, String, String);
+/// The system memory, the graphics adapters and the free space of the models drive.
+type Hardware = (Option<u64>, Vec<Adapter>, Option<u64>);
+
 /// A run in progress: one request is out with the daemon, the rest wait for its answer. Jobs go
 /// set by set, every recording under each set, so each set's total comes in as soon as it can.
+/// The jobs of a set the run skips (a model not on disk) are marked from the start and never sent.
 struct Run {
     /// The request out.
     id: u32,
     /// The job out: set `job / takes.len()`, recording `job % takes.len()`.
     job: usize,
-    takes: Vec<(Source, Rc<Vec<f32>>, String)>,
+    /// Jobs answered, and the jobs the run sends in all.
+    done: usize,
+    jobs: usize,
+    takes: Vec<RunTake>,
     /// The new recording whose audio the daemon holds.
     ///
     /// shortcut: with several new recordings each set sends each one again; keep them per id on the
@@ -311,6 +384,23 @@ struct PageState {
     results: RefCell<Results>,
     best: RefCell<Option<SettingsSet>>,
     next_id: Cell<u32>,
+    /// The registry models the wizard lists, in gallery order, and what is known of each.
+    entries: Vec<&'static ModelEntry>,
+    choices: RefCell<Vec<ModelChoice>>,
+    ticked: RefCell<Vec<bool>>,
+    /// The quick pick the ticks follow; `None` once ticked by hand.
+    preset: Cell<Option<ModelPreset>>,
+    models_model: Rc<VecModel<TestModel>>,
+    /// The system memory, graphics adapters and free space of the models drive, measured once on
+    /// a worker; the daemon's GPUs. Both feed the recommendation.
+    hardware: RefCell<Option<Hardware>>,
+    gpus: RefCell<Option<Vec<Device>>>,
+    measuring: Cell<bool>,
+    measure_tx: Sender<Hardware>,
+    measure_rx: Receiver<Hardware>,
+    /// The offers of the last run: the recommended model it skipped, the models that lost.
+    get_id: Cell<Option<&'static str>>,
+    drop_ids: RefCell<Vec<&'static str>>,
 }
 
 impl PageState {
@@ -330,7 +420,21 @@ impl PageState {
     /// changed.
     fn shown(&self) {
         self.list_history();
+        self.choose_models();
+        // A reload with another page open measures and asks nothing.
+        if self.open() {
+            self.measure();
+            if self.gpus.borrow().is_none() && self.ctx.ipc.link() == Link::Online {
+                self.ctx.ipc.send(Request::ListDevices);
+            }
+        }
         self.state(|s| self.refresh(s));
+    }
+
+    fn open(&self) -> bool {
+        self.window
+            .upgrade()
+            .is_some_and(|w| w.get_page() == Page::Test)
     }
 
     fn history_on(&self) -> bool {
@@ -343,11 +447,7 @@ impl PageState {
     /// shortcut: only the first page the daemon gives; ask with `older_than` when people pick
     /// recordings older than that.
     fn list_history(&self) {
-        let open = self
-            .window
-            .upgrade()
-            .is_some_and(|w| w.get_page() == Page::Test);
-        if open && self.history_on() && self.ctx.ipc.link() == Link::Online {
+        if self.open() && self.history_on() && self.ctx.ipc.link() == Link::Online {
             self.ctx.ipc.send(Request::HistoryList { older_than: None });
         }
     }
@@ -389,22 +489,32 @@ impl PageState {
             }
             .into(),
         );
+        let goal = goal_at(s.get_goal());
+        let recordings = if takes.is_empty() {
+            self.auto_picks().len()
+        } else {
+            takes.len()
+        };
+        let (sets, _) = self.sets(goal);
         let off = if running {
             OFF_RUNNING
         } else if recording {
             OFF_RECORDING
-        } else if takes.is_empty() {
-            OFF_NO_TAKES
+        } else if recordings == 0 {
+            OFF_NO_RECORDINGS
         } else if takes
             .iter()
             .any(|t| word_errors(&t.reference, "").words == 0)
         {
             // Scored over no words, heard text is 100 % and silence 0 %: Apply would prefer silence.
             OFF_NO_TEXT
+        } else if sets.is_empty() {
+            OFF_NO_MODEL
         } else {
             self.ctx.ipc.link().off_reason(OFF_NEEDS_DAEMON)
         };
         s.set_run_off(off.into());
+        s.set_plan(plan_text(recordings, !takes.is_empty(), goal, sets.len()).into());
         s.set_playing(
             self.playing
                 .borrow()
@@ -412,14 +522,6 @@ impl PageState {
                 .and_then(|(i, _)| i32::try_from(*i).ok())
                 .unwrap_or(-1),
         );
-    }
-
-    fn profile(s: &TestState<'_>) -> Profile {
-        usize::try_from(s.get_profile())
-            .ok()
-            .and_then(|i| Profile::ALL.get(i))
-            .copied()
-            .unwrap_or(Profile::General)
     }
 
     /// The card of take `i`, ready to show.
@@ -803,34 +905,36 @@ impl PageState {
             return;
         }
         self.stop_playing();
-        let sets = Self::profile(&s).sets();
-        let takes: Vec<(Source, Rc<Vec<f32>>, String)> = self
-            .takes
-            .borrow()
-            .iter()
-            .map(|t| (t.source.clone(), Rc::clone(&t.audio), t.reference.clone()))
-            .collect();
+        let goal = goal_at(s.get_goal());
+        let (runnable, skipped) = self.sets(goal);
+        let (takes, labels): (Vec<RunTake>, Vec<String>) = self.run_takes(goal).into_iter().unzip();
+        let n = takes.len();
+        let mut cells = vec![vec![Answer::Waiting; n]; runnable.len()];
+        cells.extend(vec![vec![Answer::Failed(NOT_DOWNLOADED); n]; skipped.len()]);
+        let sets: Vec<SettingsSet> = runnable.iter().chain(&skipped).cloned().collect();
         *self.results.borrow_mut() = Results {
-            cells: vec![vec![Answer::Waiting; takes.len()]; sets.len()],
-            labels: self
-                .takes
-                .borrow()
-                .iter()
-                .map(|t| t.label.clone())
-                .collect(),
+            cells,
+            labels,
             sets: sets.clone(),
         };
         self.rows
             .set_vec(sets.iter().map(row).collect::<Vec<TestRow>>());
+        for i in runnable.len()..sets.len() {
+            self.show_row(i);
+        }
         *self.best.borrow_mut() = None;
         s.set_selected(0);
         s.set_best_text(SharedString::new());
         s.set_apply_off(OFF_NO_BEST.into());
+        s.set_pace(SharedString::new());
+        self.clear_offers(&s);
         self.bar.clear(&());
-        s.set_view(1);
+        s.set_view(2);
         let run = Run {
             id: 0,
             job: 0,
+            done: 0,
+            jobs: runnable.len() * n,
             takes,
             held: None,
             language: self.ctx.config.borrow().config.model.language,
@@ -838,10 +942,115 @@ impl PageState {
         self.send_job(run);
     }
 
-    /// Sends the job `run.job`; with none left the run is over.
+    /// The recordings of a run with their labels: the ones picked by hand, or else a few recent
+    /// ones from History; each once per gain of `goal`. A quieter copy is made here and sent as a
+    /// new recording; a history file that cannot be read, or is not at the engine's rate, gets
+    /// none.
+    fn run_takes(&self, goal: Goal) -> Vec<(RunTake, String)> {
+        let base: Vec<BaseTake> = {
+            let takes = self.takes.borrow();
+            if takes.is_empty() {
+                self.auto_picks()
+                    .into_iter()
+                    .map(|item| {
+                        let label = tuning_view::when(&item.id);
+                        let text = item.text.0.trim().to_owned();
+                        let source = Source::History(item.id);
+                        (source, Rc::new(Vec::new()), SAMPLE_RATE, text, label)
+                    })
+                    .collect()
+            } else {
+                takes
+                    .iter()
+                    .map(|t| {
+                        let (audio, text) = (Rc::clone(&t.audio), t.reference.clone());
+                        (t.source.clone(), audio, t.rate, text, t.label.clone())
+                    })
+                    .collect()
+            }
+        };
+        let mut out = Vec::new();
+        for (source, mut audio, mut rate, reference, label) in base {
+            for &db in goal.gains() {
+                if db == 0.0 {
+                    let take = (source.clone(), Rc::clone(&audio), reference.clone());
+                    out.push((take, label.clone()));
+                    continue;
+                }
+                if let (Source::History(id), true) = (&source, audio.is_empty()) {
+                    let (samples, r) = self.read_history(id).unwrap_or((Vec::new(), rate));
+                    (audio, rate) = (Rc::new(samples), r);
+                }
+                // Over five minutes (picked by hand) it has no quieter copy; its 0 dB take runs.
+                let quieter = (!audio.is_empty() && rate == SAMPLE_RATE)
+                    .then(|| tuning::with_gain(&audio, db))
+                    .flatten();
+                let Some(quieter) = quieter else {
+                    continue;
+                };
+                let take = (Source::New, Rc::new(quieter), reference.clone());
+                out.push((take, format!("{label} · {db:.0} dB")));
+            }
+        }
+        out
+    }
+
+    /// The history recordings a run takes when none is picked by hand: done, with words to score
+    /// against, of varied length (`tuning::pick_recordings`).
+    fn auto_picks(&self) -> Vec<HistoryItem> {
+        if !self.history_on() {
+            return Vec::new();
+        }
+        let history = self.history.borrow();
+        let lengths: Vec<Option<u64>> = history
+            .iter()
+            .map(|item| {
+                (item.status == Status::Done && word_errors(&item.text.0, "").words > 0)
+                    .then_some(item.duration_ms)
+            })
+            .collect();
+        tuning::pick_recordings(&lengths, PICK_COUNT)
+            .into_iter()
+            .map(|i| history[i].clone())
+            .collect()
+    }
+
+    /// The sets of `goal` over the ticked models: the ones on disk run, the others are listed as
+    /// skipped (one line each).
+    fn sets(&self, goal: Goal) -> (Vec<SettingsSet>, Vec<SettingsSet>) {
+        let base = {
+            let audio = &self.ctx.config.borrow().config.audio;
+            SettingsSet {
+                normalize: audio.normalize,
+                denoise: audio.denoise,
+                trim: audio.trim,
+                model: String::new(),
+            }
+        };
+        let choices = self.choices.borrow();
+        let ticks = self.ticked.borrow();
+        let ticked = || choices.iter().zip(ticks.iter()).filter(|(_, on)| **on);
+        let ready: Vec<&str> = ticked()
+            .filter(|(c, _)| c.downloaded)
+            .map(|(c, _)| c.id.as_str())
+            .collect();
+        let missing: Vec<&str> = ticked()
+            .filter(|(c, _)| !c.downloaded)
+            .map(|(c, _)| c.id.as_str())
+            .collect();
+        (
+            tuning::wizard_sets(goal, &base, &ready),
+            tuning::wizard_sets(Goal::Model, &base, &missing),
+        )
+    }
+
+    /// Sends the next job that waits; with none left the run is over.
     fn send_job(&self, mut run: Run) {
         let n = run.takes.len();
         let sets = self.results.borrow().sets.clone();
+        while run.job < sets.len() * n && !self.waiting(run.job / n, run.job % n) {
+            run.job += 1;
+        }
         if n == 0 || run.job >= sets.len() * n {
             self.finish_run();
             self.bar.finish(&());
@@ -881,6 +1090,17 @@ impl PageState {
         self.progress(&run, 0, None);
         *self.run.borrow_mut() = Some(run);
         self.state(|s| self.refresh(s));
+    }
+
+    fn waiting(&self, set: usize, take: usize) -> bool {
+        matches!(
+            self.results
+                .borrow()
+                .cells
+                .get(set)
+                .and_then(|row| row.get(take)),
+            Some(Answer::Waiting)
+        )
     }
 
     fn set_cell(&self, set: usize, take: usize, cell: Answer) {
@@ -985,7 +1205,7 @@ impl PageState {
     /// A push with `est_ms` (the first of a job) starts the bar, sized for every job; until then
     /// the bar is the indeterminate sweep, and `bar.real` moves nothing.
     fn progress(&self, run: &Run, percent: u8, est_ms: Option<u32>) {
-        let jobs = (self.results.borrow().sets.len() * run.takes.len()).max(1);
+        let jobs = run.jobs.max(1);
         if let Some(est) = est_ms
             && !self.bar.live(&())
         {
@@ -993,7 +1213,7 @@ impl PageState {
                 .start((), Some(Millis(u64::from(est) * jobs as u64)));
         }
         #[expect(clippy::cast_precision_loss, reason = "job counts are tiny")]
-        let done = (run.job as f32 + f32::from(percent.min(100)) / 100.0) / jobs as f32;
+        let done = (run.done as f32 + f32::from(percent.min(100)) / 100.0) / jobs as f32;
         self.bar.real(&(), done);
     }
 
@@ -1010,6 +1230,30 @@ impl PageState {
                 }
             }
             Event::Push(Push::History { items, .. }) => self.listed(items),
+            Event::Push(Push::Devices { gpus, .. }) => {
+                *self.gpus.borrow_mut() = Some(gpus.clone());
+                self.choose_models();
+                self.state(|s| self.refresh(s));
+            }
+            // A model came or went: the list says so.
+            Event::Push(Push::ModelDeleted { .. } | Push::DownloadDone { .. }) => {
+                self.choose_models();
+                // An offer follows the disk: no Download of a model now there, no Delete of one gone.
+                let on_disk = |id: &str| {
+                    self.choices
+                        .borrow()
+                        .iter()
+                        .any(|c| c.id == id && c.downloaded)
+                };
+                if self.get_id.get().is_some_and(on_disk) {
+                    self.get_id.set(None);
+                }
+                self.drop_ids.borrow_mut().retain(|id| on_disk(id));
+                self.state(|s| {
+                    self.show_offers(s);
+                    self.refresh(s);
+                });
+            }
             Event::Push(Push::HistoryResult {
                 id,
                 op: HistoryOp::Delete,
@@ -1077,6 +1321,8 @@ impl PageState {
         };
         self.set_cell(set, take, cell);
         run.job += 1;
+        run.done += 1;
+        self.show_pace();
         self.send_job(run);
     }
 
@@ -1085,7 +1331,14 @@ impl PageState {
         let n = run.takes.len();
         let jobs = self.results.borrow().sets.len() * n;
         for job in run.job..jobs {
-            self.set_cell(job / n, job % n, Answer::NotRun);
+            let (set, take) = (job / n, job % n);
+            let open = matches!(
+                self.results.borrow().cells[set][take],
+                Answer::Waiting | Answer::Running
+            );
+            if open {
+                self.set_cell(set, take, Answer::NotRun);
+            }
         }
     }
 
@@ -1127,13 +1380,21 @@ impl PageState {
             .map(|(_, set, errors)| (set.clone(), *errors))
             .collect();
         let best = tuning::best(&pairs).map(|i| scored[i].clone());
+        self.offers(
+            best.as_ref().map(|(_, set, _)| set.model.as_str()),
+            &pairs.iter().map(|(set, _)| set.clone()).collect::<Vec<_>>(),
+        );
         self.state(|s| {
-            if let Some((row, _, errors)) = &best {
+            if let Some((row, set, errors)) = &best {
                 if let Some(mut line) = self.rows.row_data(*row) {
                     line.best = true;
                     self.rows.set_row_data(*row, line);
                 }
-                s.set_best_text(format!("Lowest error rate: {}", percent(*errors)).into());
+                let mut text = format!("{} · {} errors", model_name(&set.model), percent(*errors));
+                if let Some(ms) = self.mean_ms(Some(*row)) {
+                    text = format!("{text} · {}", per_recording(ms));
+                }
+                s.set_best_text(text.into());
                 s.set_apply_off(SharedString::new());
                 s.set_selected(i32::try_from(*row).unwrap_or(0));
                 self.show_heard(*row);
@@ -1144,6 +1405,327 @@ impl PageState {
             self.refresh(s);
         });
         *self.best.borrow_mut() = best.map(|(_, set, _)| set);
+    }
+
+    /// The offers of a finished run: Download of the recommended model it skipped (not on disk),
+    /// Delete of the downloaded models that heard everything but lost to `winner` (never the model
+    /// in use). No winner, no Delete.
+    fn offers(&self, winner: Option<&str>, scored: &[SettingsSet]) {
+        let recommended: Option<String> = self
+            .choices
+            .borrow()
+            .iter()
+            .find(|c| c.recommended && !c.downloaded)
+            .map(|c| c.id.clone());
+        let skipped = {
+            let results = self.results.borrow();
+            results.sets.iter().zip(&results.cells).any(|(set, cells)| {
+                Some(&set.model) == recommended.as_ref()
+                    && cells
+                        .iter()
+                        .all(|c| matches!(c, Answer::Failed(NOT_DOWNLOADED)))
+            })
+        };
+        let entry = |id: &str| self.entries.iter().find(|e| e.id == id).copied();
+        self.get_id.set(
+            recommended
+                .filter(|_| skipped)
+                .and_then(|id| entry(&id))
+                .map(|e| e.id),
+        );
+        let in_use = self.ctx.config.borrow().config.model.id.clone();
+        let downloaded: Vec<String> = self
+            .choices
+            .borrow()
+            .iter()
+            .filter(|c| c.downloaded)
+            .map(|c| c.id.clone())
+            .collect();
+        *self.drop_ids.borrow_mut() = winner
+            .map(|winner| tuning::losers(scored, winner, &in_use))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| downloaded.iter().any(|d| d == id))
+            .filter_map(|id| entry(id).map(|e| e.id))
+            .collect();
+        self.state(|s| self.show_offers(s));
+    }
+
+    fn clear_offers(&self, s: &TestState<'_>) {
+        self.get_id.set(None);
+        self.drop_ids.borrow_mut().clear();
+        self.show_offers(s);
+    }
+
+    fn show_offers(&self, s: &TestState<'_>) {
+        let name = |id: &str| model_name(id).to_owned();
+        s.set_get_text(
+            self.get_id
+                .get()
+                .map(|id| format!("Download {}", name(id)))
+                .unwrap_or_default()
+                .into(),
+        );
+        let drop = self.drop_ids.borrow();
+        let frees = gb(drop
+            .iter()
+            .filter_map(|id| models::find(id))
+            .map(|e| e.size)
+            .sum());
+        let (text, ask) = match drop.as_slice() {
+            [] => (String::new(), String::new()),
+            [one] => (
+                format!("Delete {} ({frees})", name(one)),
+                format!("Delete {}? Frees {frees}.", name(one)),
+            ),
+            many => {
+                let names: Vec<String> = many.iter().map(|id| name(id)).collect();
+                (
+                    format!("Delete {} others ({frees})", many.len()),
+                    format!("Delete {}? Frees {frees}.", names.join(", ")),
+                )
+            }
+        };
+        if drop.is_empty() {
+            // The question row asks about nothing now: the next offer starts at its button.
+            s.set_dropping(false);
+        }
+        s.set_drop_text(text.into());
+        s.set_drop_ask(ask.into());
+        s.set_drop_off(self.ctx.ipc.link().off_reason(OFF_NEEDS_DAEMON).into());
+    }
+
+    /// Download: the model page's own Download does it (never on its own).
+    fn get(&self) {
+        if let Some(window) = self.window.upgrade() {
+            window.set_page(Page::Model);
+            window.global::<ModelState>().set_tab(0);
+        }
+    }
+
+    /// Delete the models that lost, after the row asked; the model page reports each one.
+    fn drop_losers(&self) {
+        if self.ctx.ipc.link() != Link::Online {
+            return;
+        }
+        let ids: Vec<&'static str> = self.drop_ids.borrow_mut().drain(..).collect();
+        if ids.is_empty() {
+            self.state(|s| self.show_offers(s));
+            return;
+        }
+        let in_use = self.ctx.config.borrow().config.model.id.clone();
+        for id in ids.into_iter().filter(|id| *id != in_use) {
+            self.ctx
+                .ipc
+                .send(Request::DeleteModel { id: id.to_owned() });
+        }
+        self.toast(DROP_SENT);
+        self.state(|s| self.show_offers(s));
+    }
+
+    /// Cancel: the job out is left to finish on the daemon and its answer dropped; the sets that
+    /// heard every recording so far still compete.
+    fn cancel(&self) {
+        let Some(run) = self.run.borrow_mut().take() else {
+            return;
+        };
+        self.left_out.set(Some(run.id));
+        self.mark_not_run(&run);
+        self.bar.clear(&());
+        self.toast(CANCELLED);
+        self.finish_run();
+    }
+
+    /// The mean time of one recording, over the set `set` or over every set; `None` before the
+    /// first answer.
+    fn mean_ms(&self, set: Option<usize>) -> Option<u64> {
+        let results = self.results.borrow();
+        let times: Vec<u64> = results
+            .cells
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| set.is_none_or(|s| s == *i))
+            .flat_map(|(_, cells)| cells)
+            .filter_map(|c| match c {
+                Answer::Heard { ms, .. } => Some(*ms),
+                _ => None,
+            })
+            .collect();
+        let n = u64::try_from(times.len()).ok().filter(|n| *n > 0)?;
+        Some(times.iter().sum::<u64>() / n)
+    }
+
+    fn show_pace(&self) {
+        let pace = self.mean_ms(None).map(per_recording).unwrap_or_default();
+        self.state(|s| s.set_pace(pace.into()));
+    }
+
+    fn goal_picked(&self, i: i32) {
+        if self.run.borrow().is_some() {
+            return;
+        }
+        self.state(|s| {
+            s.set_goal(i);
+            self.refresh(s);
+        });
+    }
+
+    fn preset_picked(&self, i: i32) {
+        let Some(preset) = usize::try_from(i)
+            .ok()
+            .and_then(|i| ModelPreset::ALL.get(i))
+            .copied()
+        else {
+            return;
+        };
+        if self.run.borrow().is_some() {
+            return;
+        }
+        self.preset.set(Some(preset));
+        *self.ticked.borrow_mut() = tuning::preset_ticks(preset, &self.choices.borrow());
+        self.show_models();
+        self.state(|s| self.refresh(s));
+    }
+
+    fn model_ticked(&self, i: i32) {
+        let Ok(i) = usize::try_from(i) else {
+            return;
+        };
+        if self.run.borrow().is_some() {
+            return;
+        }
+        {
+            let mut ticks = self.ticked.borrow_mut();
+            let Some(on) = ticks.get_mut(i) else {
+                return;
+            };
+            *on = !*on;
+            self.preset
+                .set(tuning::preset_of(&ticks, &self.choices.borrow()));
+            if let Some(mut line) = self.models_model.row_data(i) {
+                line.on = ticks[i];
+                self.models_model.set_row_data(i, line);
+            }
+        }
+        self.state(|s| {
+            s.set_preset(preset_index(self.preset.get()));
+            self.refresh(s);
+        });
+    }
+
+    /// What is on disk and recommended now; the ticks follow the quick pick unless ticked by hand.
+    /// Reads the files' metadata only.
+    fn choose_models(&self) {
+        let (dir, in_use, language, device) = {
+            let file = self.ctx.config.borrow();
+            let model = &file.config.model;
+            (
+                self.ctx.layout.models_dir(),
+                model.id.clone(),
+                model.language,
+                model.gpu.clone(),
+            )
+        };
+        let downloaded: Vec<bool> = self
+            .entries
+            .iter()
+            .map(|e| {
+                matches!(
+                    models::status(e, &dir),
+                    ModelStatus::Ready | ModelStatus::NeedsHash
+                )
+            })
+            .collect();
+        let recommended = self
+            .hardware
+            .borrow()
+            .as_ref()
+            .and_then(|(ram, adapters, free)| {
+                let machine = Machine {
+                    ram: *ram,
+                    vram: models::graphics_memory(self.gpus.borrow().as_deref(), &device, adapters),
+                    free_disk: *free,
+                };
+                models::recommend(&machine, language, |id| {
+                    self.entries
+                        .iter()
+                        .zip(&downloaded)
+                        .find(|(e, _)| e.id == id)
+                        .map_or(0, |(e, on)| if *on { e.size } else { 0 })
+                })
+                .map(|r| r.id)
+            });
+        let choices: Vec<ModelChoice> = self
+            .entries
+            .iter()
+            .zip(&downloaded)
+            .map(|(e, on)| ModelChoice {
+                id: e.id.to_owned(),
+                downloaded: *on,
+                recommended: recommended == Some(e.id),
+                in_use: e.id == in_use,
+            })
+            .collect();
+        {
+            let mut ticks = self.ticked.borrow_mut();
+            match self.preset.get() {
+                Some(preset) => *ticks = tuning::preset_ticks(preset, &choices),
+                None => ticks.resize(choices.len(), false),
+            }
+        }
+        *self.choices.borrow_mut() = choices;
+        self.show_models();
+    }
+
+    fn show_models(&self) {
+        let lines: Vec<TestModel> = self
+            .entries
+            .iter()
+            .zip(self.choices.borrow().iter())
+            .zip(self.ticked.borrow().iter())
+            .map(|((e, c), on)| TestModel {
+                name: e.display_name.into(),
+                size: gb(e.size).into(),
+                on: *on,
+                downloaded: c.downloaded,
+                recommended: c.recommended,
+            })
+            .collect();
+        self.models_model.set_vec(lines);
+        self.state(|s| s.set_preset(preset_index(self.preset.get())));
+    }
+
+    /// Measures the system memory, the graphics adapters and the free space of the models drive
+    /// once, on a worker (a network folder can stall); the answer feeds the recommendation.
+    fn measure(&self) {
+        if self.hardware.borrow().is_some() || self.measuring.replace(true) {
+            return;
+        }
+        let (tx, dir, window) = (
+            self.measure_tx.clone(),
+            self.ctx.layout.models_dir(),
+            self.window.clone(),
+        );
+        thread::spawn(move || {
+            let measured = (
+                sysinfo::ram(),
+                sysinfo::adapters(),
+                sysinfo::free_space(&dir),
+            );
+            // A failed send or wake: the page or the window is gone, or no event loop runs.
+            if tx.send(measured).is_ok() {
+                let _ = window.upgrade_in_event_loop(|w| w.global::<TestState>().invoke_measured());
+            }
+        });
+    }
+
+    fn measured(&self) {
+        while let Ok(answer) = self.measure_rx.try_recv() {
+            *self.hardware.borrow_mut() = Some(answer);
+            self.measuring.set(false);
+        }
+        self.choose_models();
+        self.state(|s| self.refresh(s));
     }
 
     /// Apply best: writes the set to the config, as the Audio and Model pages would.
@@ -1166,13 +1748,64 @@ impl PageState {
     }
 }
 
+/// The display name of model `id`; the id itself when the registry does not know it.
+fn model_name(id: &str) -> &str {
+    models::find(id).map_or(id, |entry| entry.display_name)
+}
+
+/// The quick pick's segment, -1 for a pick by hand.
+fn preset_index(preset: Option<ModelPreset>) -> i32 {
+    preset
+        .and_then(|p| ModelPreset::ALL.iter().position(|q| *q == p))
+        .and_then(|i| i32::try_from(i).ok())
+        .unwrap_or(-1)
+}
+
+/// "42 %", then "42 % · 1 min left" once the time left is known.
+fn progress_label(shown: f32, left: Option<u64>) -> String {
+    let percent = format!("{:.0} %", (shown * 100.0).floor());
+    match left_label(left) {
+        left if left.is_empty() => percent,
+        left => format!("{percent} · {left}"),
+    }
+}
+
+/// "2.1 s per recording".
+#[expect(clippy::cast_precision_loss, reason = "a job is far below 2^52 ms")]
+fn per_recording(ms: u64) -> String {
+    format!("{:.1} s per recording", ms as f64 / 1000.0)
+}
+
+/// What Run takes: "3 recordings from History · 12 runs"; empty with nothing to run.
+fn plan_text(recordings: usize, by_hand: bool, goal: Goal, sets: usize) -> String {
+    if recordings == 0 || sets == 0 {
+        return String::new();
+    }
+    let what = match (by_hand, recordings) {
+        (true, 1) => "1 picked recording".to_owned(),
+        (true, n) => format!("{n} picked recordings"),
+        (false, 1) => "1 recording from History".to_owned(),
+        (false, n) => format!("{n} recordings from History"),
+    };
+    let levels = goal.gains().len();
+    let runs = recordings * levels * sets;
+    let runs = if runs == 1 {
+        "1 run".to_owned()
+    } else {
+        format!("{runs} runs")
+    };
+    if levels > 1 {
+        format!("{what} · {levels} loudness levels · {runs}")
+    } else {
+        format!("{what} · {runs}")
+    }
+}
+
 /// A results line for `set`, not run yet.
 fn row(set: &SettingsSet) -> TestRow {
     let on = |value: bool| SharedString::from(if value { "On" } else { "Off" });
     TestRow {
-        model: models::find(&set.model)
-            .map_or(set.model.as_str(), |entry| entry.display_name)
-            .into(),
+        model: model_name(&set.model).into(),
         normalize: on(set.normalize),
         denoise: on(set.denoise),
         trim: on(set.trim),

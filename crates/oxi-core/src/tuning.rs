@@ -113,6 +113,162 @@ impl Profile {
     }
 }
 
+/// What the Test wizard looks for, its first step (owner 2026-11-13, hold 29-32).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Goal {
+    /// Each ticked model with the audio settings in use.
+    Model,
+    /// Each ticked model with the settings in use and with each audio switch flipped.
+    Settings,
+    /// The recordings made quieter in steps ([`QUIET_STEPS_DB`]): which set still hears them.
+    QuietMic,
+}
+
+impl Goal {
+    pub const ALL: [Self; 3] = [Self::Model, Self::Settings, Self::QuietMic];
+
+    /// The software gain each recording is heard at, in dB: as recorded, then quieter.
+    pub fn gains(self) -> &'static [f32] {
+        match self {
+            Self::QuietMic => &QUIET_STEPS_DB,
+            Self::Model | Self::Settings => &[0.0],
+        }
+    }
+}
+
+/// The quiet-microphone check: the same recording as it is and 6, 12 and 18 dB quieter, so no new
+/// recording is needed.
+pub const QUIET_STEPS_DB: [f32; 4] = [0.0, -6.0, -12.0, -18.0];
+
+/// The quick picks of the wizard's model list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelPreset {
+    Downloaded,
+    /// The model recommended for this PC and the one in use, to compare against.
+    Recommended,
+    All,
+}
+
+impl ModelPreset {
+    pub const ALL: [Self; 3] = [Self::Downloaded, Self::Recommended, Self::All];
+}
+
+/// One model of the wizard's list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelChoice {
+    pub id: String,
+    pub downloaded: bool,
+    pub recommended: bool,
+    pub in_use: bool,
+}
+
+/// The ticks `preset` gives `list`.
+pub fn preset_ticks(preset: ModelPreset, list: &[ModelChoice]) -> Vec<bool> {
+    list.iter()
+        .map(|m| match preset {
+            ModelPreset::Downloaded => m.downloaded,
+            ModelPreset::Recommended => m.recommended || m.in_use,
+            ModelPreset::All => true,
+        })
+        .collect()
+}
+
+/// The preset whose ticks equal `ticks`, the first one when two give the same; `None` for a
+/// hand-made pick.
+pub fn preset_of(ticks: &[bool], list: &[ModelChoice]) -> Option<ModelPreset> {
+    ModelPreset::ALL
+        .into_iter()
+        .find(|p| preset_ticks(*p, list) == ticks)
+}
+
+/// The sets a run of `goal` tries over `models`, from `base` (the audio switches in use; its
+/// model is ignored). A model goes once per set, the base set first.
+pub fn wizard_sets(goal: Goal, base: &SettingsSet, models: &[&str]) -> Vec<SettingsSet> {
+    let with = |model: &str, normalize, denoise, trim| SettingsSet {
+        normalize,
+        denoise,
+        trim,
+        model: model.to_owned(),
+    };
+    let (n, d, t) = (base.normalize, base.denoise, base.trim);
+    let mut sets = Vec::new();
+    for model in models {
+        let variants = match goal {
+            Goal::Model => vec![(n, d, t)],
+            Goal::Settings => vec![(n, d, t), (n, !d, t), (!n, d, t), (n, d, !t)],
+            // A quiet microphone is what normalising and noise suppression are for.
+            Goal::QuietMic => vec![(n, d, t), (true, true, t)],
+        };
+        for (n, d, t) in variants {
+            let set = with(model, n, d, t);
+            if !sets.contains(&set) {
+                sets.push(set);
+            }
+        }
+    }
+    sets
+}
+
+/// Recordings shorter than this say too little to score.
+pub const PICK_MIN_MS: u64 = 1_000;
+/// Only this many of the newest recordings are looked at.
+pub const PICK_RECENT: usize = 20;
+/// Recordings a wizard run takes from History.
+pub const PICK_COUNT: usize = 3;
+
+/// The recordings a wizard run takes: among the newest [`PICK_RECENT`] usable ones (`Some`
+/// length, at least [`PICK_MIN_MS`] and at most the test limit), up to `n` of varied length (the
+/// shortest, the longest and evenly between). `lengths` is newest first; so is the answer.
+pub fn pick_recordings(lengths: &[Option<u64>], n: usize) -> Vec<usize> {
+    let max_ms = MAX_TEST_SAMPLES as u64 * 1000 / u64::from(SAMPLE_RATE);
+    let mut usable: Vec<(u64, usize)> = lengths
+        .iter()
+        .enumerate()
+        .filter_map(|(i, len)| {
+            len.filter(|l| (PICK_MIN_MS..=max_ms).contains(l))
+                .map(|l| (l, i))
+        })
+        .take(PICK_RECENT)
+        .collect();
+    if usable.len() <= n {
+        return usable.into_iter().map(|(_, i)| i).collect();
+    }
+    usable.sort_unstable();
+    let last = usable.len() - 1;
+    let mut picked: Vec<usize> = match n {
+        0 => Vec::new(),
+        1 => vec![usable[last / 2].1],
+        // Evenly spread, rounded to the nearest.
+        _ => (0..n)
+            .map(|k| usable[(k * last + (n - 1) / 2) / (n - 1)].1)
+            .collect(),
+    };
+    picked.sort_unstable();
+    picked.dedup();
+    picked
+}
+
+/// `samples` made `db` louder (negative: quieter); `None` for a recording longer than the daemon
+/// takes ([`MAX_TEST_SAMPLES`]): trimmed, it would no longer match its reference text.
+pub fn with_gain(samples: &[f32], db: f32) -> Option<Vec<f32>> {
+    let k = 10f32.powf(db / 20.0);
+    (samples.len() <= MAX_TEST_SAMPLES).then(|| samples.iter().map(|s| s * k).collect())
+}
+
+/// The models a finished run offers to delete: the ones that heard every recording (`scored`) but
+/// lost to `winner`, without the model in use; each once, in table order.
+pub fn losers<'a>(scored: &'a [SettingsSet], winner: &str, in_use: &str) -> Vec<&'a str> {
+    let mut out: Vec<&str> = Vec::new();
+    // The winner's model is kept whatever its other sets scored.
+    for set in scored {
+        let id = set.model.as_str();
+        if id != winner && id != in_use && !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
 /// Ready phrases for `language`; empty when there is no set for it (the person writes their
 /// own). Invented sentences, nobody's real text.
 pub fn phrases(language: Language) -> &'static [&'static str] {
@@ -433,6 +589,120 @@ pub fn preset_value(mode: usize, presets: &[f32], typed: f32) -> Auto<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn choice(id: &str, downloaded: bool, recommended: bool, in_use: bool) -> ModelChoice {
+        ModelChoice {
+            id: id.into(),
+            downloaded,
+            recommended,
+            in_use,
+        }
+    }
+
+    #[test]
+    fn presets_tick_the_downloaded_the_recommended_and_all() {
+        let list = [
+            choice("turbo", true, false, true),
+            choice("small", true, false, false),
+            choice("podlodka", false, true, false),
+        ];
+        let ticks = |p| preset_ticks(p, &list);
+        assert_eq!(ticks(ModelPreset::Downloaded), [true, true, false]);
+        assert_eq!(
+            ticks(ModelPreset::Recommended),
+            [true, false, true],
+            "the recommended one and the one in use"
+        );
+        assert_eq!(ticks(ModelPreset::All), [true, true, true]);
+        assert_eq!(
+            preset_of(&[true, false, true], &list),
+            Some(ModelPreset::Recommended)
+        );
+        assert_eq!(preset_of(&[false, true, false], &list), None, "by hand");
+        // Two presets with the same ticks show the first.
+        let one = [choice("turbo", true, true, true)];
+        assert_eq!(preset_of(&[true], &one), Some(ModelPreset::Downloaded));
+    }
+
+    #[test]
+    fn each_goal_builds_its_sets_from_the_settings_in_use() {
+        let base = SettingsSet::defaults();
+        let model = wizard_sets(Goal::Model, &base, &["turbo", "small"]);
+        assert_eq!(model.len(), 2);
+        assert!(model.iter().all(|s| s.changes() <= 1));
+        assert_eq!(model[1].model, "small");
+
+        let settings = wizard_sets(Goal::Settings, &base, &["turbo"]);
+        assert_eq!(settings.len(), 4);
+        assert_eq!(settings[0], base, "the settings in use first");
+        assert!(
+            settings[1..].iter().all(|s| s.changes() == 1),
+            "each flips one switch"
+        );
+
+        let quiet = wizard_sets(Goal::QuietMic, &base, &["turbo"]);
+        assert_eq!(quiet.len(), 2);
+        assert!(quiet[1].normalize && quiet[1].denoise);
+        // Already on: one set, not the same set twice.
+        let loud = SettingsSet {
+            denoise: true,
+            ..base.clone()
+        };
+        assert_eq!(wizard_sets(Goal::QuietMic, &loud, &["turbo"]).len(), 1);
+        assert!(
+            wizard_sets(Goal::Settings, &base, &[]).is_empty(),
+            "no model"
+        );
+        assert_eq!(Goal::QuietMic.gains(), QUIET_STEPS_DB);
+        assert_eq!(Goal::Model.gains(), [0.0]);
+    }
+
+    #[test]
+    fn the_wizard_picks_recent_recordings_of_varied_length() {
+        let s = |secs: u64| Some(secs * 1000);
+        // Newest first: the shortest, the longest and one between, kept newest first.
+        let lengths = [s(5), s(30), None, s(2), Some(400), s(12), s(60)];
+        assert_eq!(pick_recordings(&lengths, 3), [3, 5, 6]);
+        // Too short, too long and unreadable ones never count.
+        assert_eq!(pick_recordings(&[Some(500), s(301), None, s(4)], 3), [3]);
+        assert_eq!(pick_recordings(&lengths, 1), [5], "the middle length");
+        assert!(pick_recordings(&lengths, 0).is_empty(), "none asked");
+        // Only the newest are looked at.
+        let many: Vec<Option<u64>> = (0..40).map(|i| s(2 + i)).collect();
+        assert!(pick_recordings(&many, 3).iter().all(|&i| i < PICK_RECENT));
+    }
+
+    #[test]
+    fn gain_steps_scale_the_samples() {
+        let quieter = with_gain(&[0.5, -1.0], -6.0).unwrap();
+        assert!((quieter[0] - 0.5 * 0.501_187).abs() < 1e-4);
+        assert!((quieter[1] + 0.501_187).abs() < 1e-4);
+        assert_eq!(with_gain(&[0.25], 0.0).unwrap(), [0.25]);
+        // A history recording over five minutes gets no quieter copy: the daemon would refuse it.
+        assert!(with_gain(&vec![0.0; MAX_TEST_SAMPLES], -6.0).is_some());
+        assert!(with_gain(&vec![0.0; MAX_TEST_SAMPLES + 1], -6.0).is_none());
+    }
+
+    #[test]
+    fn losers_are_the_other_models_but_never_the_one_in_use() {
+        let set = |model: &str, denoise| SettingsSet {
+            denoise,
+            model: model.into(),
+            ..SettingsSet::defaults()
+        };
+        let scored = [
+            set("turbo", false),
+            set("small", false),
+            set("small", true),
+            set("large-v3", false),
+            set("base", false),
+        ];
+        assert_eq!(losers(&scored, "small", "turbo"), ["large-v3", "base"]);
+        assert!(
+            losers(&scored[..1], "turbo", "turbo").is_empty(),
+            "one model"
+        );
+    }
 
     #[test]
     fn auto_threads_table() {

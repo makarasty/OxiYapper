@@ -9,15 +9,22 @@ use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
+use std::thread;
 use std::time::Duration;
 
-use common::{assert_nothing_moved, config, has, layout, open_linked, spots, with_role};
+use common::{
+    assert_nothing_moved, config, fake_model, has, layout, open_linked, spots, with_role,
+};
 use i_slint_backend_testing::{AccessibleRole, ElementHandle, mock_elapsed_time};
 use oxi_core::config::Audio;
+use oxi_core::device::Device;
 use oxi_core::history::{HistoryId, Status};
-use oxi_core::ipc::{HistoryItem, HistoryOp, Push, Request, Spoken, TestFailure, TestOutcome};
+use oxi_core::ipc::{
+    DownloadResult, HistoryItem, HistoryOp, Push, Request, Spoken, TestFailure, TestOutcome,
+};
+use oxi_core::models::{self, MODELS};
 use oxi_core::paths::Layout;
-use oxi_core::tuning::{self, PCM_CHUNK_SAMPLES, Profile, SettingsSet, word_errors};
+use oxi_core::tuning::{self, Goal, PCM_CHUNK_SAMPLES, SettingsSet, word_errors};
 use oxi_core::types::Language;
 use oxi_platform::capture::CaptureError;
 use oxi_settings::ipc::{Cmd, Event, Link};
@@ -65,6 +72,9 @@ struct Take {
     play_off: String,
 }
 
+/// System memory, graphics adapters and free space of the models drive, as the page measures them.
+type Hardware = (Option<u64>, Vec<models::Adapter>, Option<u64>);
+
 struct Fixture {
     window: AppWindow,
     ipc: Ipc,
@@ -78,16 +88,36 @@ impl Fixture {
         Self::with_mic(name, config, fake_mic)
     }
 
+    /// A machine of fixed memory, adapters and free disk, so no hardware is read.
+    fn with_hardware(name: &str, hardware: Hardware) -> Self {
+        Self::build(name, None, fake_mic, Some(hardware))
+    }
+
+    /// The model in use is on disk; the goal is the best settings (four sets) and the
+    /// Recordings view is open, where most tests pick their recordings.
     fn with_mic(name: &str, config: Option<&str>, mic: oxi_settings::Mic) -> Self {
+        Self::build(name, config, mic, None)
+    }
+
+    fn build(
+        name: &str,
+        config: Option<&str>,
+        mic: oxi_settings::Mic,
+        hardware: Option<Hardware>,
+    ) -> Self {
         SAMPLES.set(MIC_SAMPLES);
         let layout = layout(name, config);
+        fake(&layout, "turbo");
         let (ipc, sent) = Ipc::fake();
         let window = open_linked(&layout, Page::Test, ipc.clone());
         let (mut ctx, _) = Ctx::load(layout.clone()).unwrap();
         ctx.ipc = ipc.clone();
-        bind_test_page(&window, &ctx, mic, fake_play);
+        bind_test_page(&window, &ctx, mic, fake_play, hardware);
         // The rebind above replaced what the first bind drew.
-        window.global::<TestState>().invoke_shown();
+        let s = window.global::<TestState>();
+        s.invoke_shown();
+        s.invoke_goal_picked(1);
+        s.set_view(1);
         let f = Self {
             window,
             ipc,
@@ -193,6 +223,18 @@ impl Fixture {
     }
 }
 
+/// Registry model `id` on disk: a sparse file of its size.
+fn fake(layout: &Layout, id: &str) {
+    let entry = models::find(id).unwrap();
+    fs::create_dir_all(layout.models_dir()).unwrap();
+    fake_model(&layout.models_dir().join(entry.file_name), entry.size);
+}
+
+/// The sets of the fixture's goal, the best settings, on the model in use.
+fn sets() -> Vec<SettingsSet> {
+    tuning::wizard_sets(Goal::Settings, &SettingsSet::defaults(), &["turbo"])
+}
+
 fn item(id: &str, text: &str) -> HistoryItem {
     HistoryItem {
         id: HistoryId::parse(id).unwrap(),
@@ -234,14 +276,19 @@ fn starts_empty_with_run_off() {
     let s = f.state();
     assert!(f.takes().is_empty());
     assert!(has(&f.window, "No recordings picked"));
-    // The row names what Run does, and its "i" says what the page is for (nothing is pasted).
-    assert!(has(&f.window, "Compare settings"));
-    assert!(has(
-        &f.window,
-        "Tries each settings set on the recordings below and shows which hears you best. Nothing is pasted anywhere."
-    ));
-    assert_eq!(s.get_profiles().row_count(), Profile::ALL.len());
-    assert_eq!(s.get_run_off(), "Add a recording first");
+    // The wizard: the goal as cards, the models, Run; Run's "i" says nothing leaves the PC.
+    s.set_view(0);
+    for text in ["1. Goal", "Best model", "Best settings", "Quiet microphone"] {
+        assert!(has(&f.window, text), "{text}");
+    }
+    assert!(has(&f.window, "2. Models"));
+    assert!(has(&f.window, "3. Run"));
+    assert!(s.get_plan_tip().contains("nothing leaves this PC"));
+    assert_eq!(
+        s.get_run_off(),
+        "No recordings yet: dictate a few times with History on, or add one on Recordings"
+    );
+    assert_eq!(s.get_plan(), "", "nothing to run, nothing to count");
     assert!(s.get_history_on());
     assert_eq!(s.get_add_off(), "No recordings in history");
     s.invoke_run();
@@ -252,7 +299,7 @@ fn starts_empty_with_run_off() {
             .all(|r| matches!(r, Request::HistoryList { .. })),
         "no recording, nothing to send: {sent:?}"
     );
-    s.set_view(1);
+    s.set_view(2);
     assert!(has(&f.window, "Nothing run yet"));
 }
 
@@ -591,7 +638,7 @@ fn a_click_on_a_history_line_adds_it() {
 }
 
 /// Under ~1180 px the control column is at its 240 px floor: the history picker must still sit
-/// inside the card, whose inner right edge is where the Scenario picker (filling the column) ends.
+/// inside the card, whose inner right edge is where the Record button ends.
 #[test]
 fn history_picker_fits_at_720x520() {
     let f = Fixture::new("history-narrow", None);
@@ -602,7 +649,7 @@ fn history_picker_fits_at_720x520() {
         item(HISTORY_ID, "newest"),
     ]);
     let right = |e: &ElementHandle| e.absolute_position().x + e.size().width;
-    let card_right = right(&with_role(&f.window, "Scenario", AccessibleRole::Combobox));
+    let card_right = right(&with_role(&f.window, "Record", AccessibleRole::Button));
     let picker = with_role(&f.window, "From history", AccessibleRole::Combobox);
     assert!(
         right(&picker) <= card_right + 0.5,
@@ -627,6 +674,7 @@ fn history_off_offers_to_turn_it_on() {
     assert_eq!(f.take_sent(), [Request::HistoryList { older_than: None }]);
 }
 
+#[expect(clippy::too_many_lines, reason = "one script of the whole flow")]
 #[test]
 fn the_flow_runs_every_set_over_every_recording_and_apply_writes_the_best() {
     let f = Fixture::new("flow", None);
@@ -634,8 +682,9 @@ fn the_flow_runs_every_set_over_every_recording_and_apply_writes_the_best() {
     f.record_and_stop();
     f.list_history(vec![item(HISTORY_ID, "раз два три")]);
     f.add_first();
+    assert_eq!(s.get_plan(), "2 picked recordings · 8 runs");
     s.invoke_run();
-    assert_eq!(s.get_view(), 1, "the table opens");
+    assert_eq!(s.get_view(), 2, "the table opens");
     assert!(s.get_running());
 
     let mut requests = f.take_sent();
@@ -649,7 +698,7 @@ fn the_flow_runs_every_set_over_every_recording_and_apply_writes_the_best() {
         panic!("then the first set on it");
     };
     assert_eq!(language, Language::RU);
-    assert_eq!(set, Profile::General.sets()[0]);
+    assert_eq!(set, sets()[0]);
     assert_eq!(f.errors()[0], "Running…");
     assert_eq!(f.errors()[1], "Waiting");
     assert_eq!(s.get_run_off(), "The test is running");
@@ -666,16 +715,18 @@ fn the_flow_runs_every_set_over_every_recording_and_apply_writes_the_best() {
         s.get_progress() < 0.0625,
         "1/16 raw: the driver moves only on its frame"
     );
-    std::thread::sleep(Duration::from_millis(250));
+    thread::sleep(Duration::from_millis(250));
     mock_elapsed_time(Duration::from_millis(100));
     // The first frame also runs the page's init, which lists the history again: not a job.
     let _ = f.take_sent();
     let shown = s.get_progress();
     assert!((0.02..=0.2).contains(&shown), "{shown}");
-    assert_eq!(
-        s.get_progress_text().as_str(),
-        format!("{:.0} %", (shown * 100.0).floor())
+    assert!(
+        s.get_progress_text()
+            .starts_with(&format!("{:.0} %", (shown * 100.0).floor())),
+        "the percent first, then the time left once it is known"
     );
+    assert_eq!(s.get_pace(), "", "no recording heard yet");
 
     // Set 1: a word wrong on the new recording, the history one right.
     let wrong = format!("{first} нет", first = first_phrase());
@@ -683,7 +734,8 @@ fn the_flow_runs_every_set_over_every_recording_and_apply_writes_the_best() {
     assert_eq!(f.errors()[0], "Running…", "the history recording is next");
     let (id, set, from) = f.one_job();
     assert_eq!(from.as_deref(), Some(HISTORY_ID));
-    assert_eq!(set, Profile::General.sets()[0]);
+    assert_eq!(set, sets()[0]);
+    assert_eq!(s.get_pace(), "1.5 s per recording");
     f.answer(id, heard("раз два три"));
     let want = word_errors(first_phrase(), &wrong).plus(word_errors("раз два три", "раз два три"));
     assert_eq!(f.errors()[0], format!("{:.1} %", want.percent()));
@@ -701,7 +753,7 @@ fn the_flow_runs_every_set_over_every_recording_and_apply_writes_the_best() {
     let Request::TestTranscribe { id, set, .. } = requests.remove(0) else {
         panic!("set 2");
     };
-    assert_eq!(set, Profile::General.sets()[1]);
+    assert_eq!(set, sets()[1]);
     f.answer(id, heard(first_phrase()));
     let (id, _, _) = f.one_job();
     f.answer(id, heard("раз, два, три!"));
@@ -721,7 +773,11 @@ fn the_flow_runs_every_set_over_every_recording_and_apply_writes_the_best() {
     let rows: Vec<_> = s.get_rows().iter().collect();
     assert!(rows[1].best && !rows[0].best && !rows[2].best);
     assert_eq!(s.get_selected(), 1, "the best set's recordings show");
-    assert_eq!(s.get_best_text(), "Lowest error rate: 0.0 %");
+    assert_eq!(
+        s.get_best_text(),
+        "Whisper large-v3 turbo · 0.0 % errors · 1.5 s per recording"
+    );
+    assert_eq!(s.get_drop_text(), "", "one model: nothing lost");
     assert_eq!(s.get_apply_off(), "");
     assert_eq!(s.get_run_off(), "");
     s.invoke_select(2);
@@ -730,7 +786,7 @@ fn the_flow_runs_every_set_over_every_recording_and_apply_writes_the_best() {
     assert_eq!(heard_rows[1].text, "раз два три");
 
     s.invoke_apply();
-    let want = &Profile::General.sets()[1];
+    let want = &sets()[1];
     let saved = config(&f.layout).config;
     assert!(saved.audio.denoise, "the best set is the denoise one");
     assert_eq!(saved.audio.normalize, want.normalize);
@@ -776,7 +832,7 @@ fn a_gone_history_file_fails_its_line_and_the_run_goes_on() {
     f.answer(id, failed(TestFailure::NoAudio));
     assert_eq!(f.errors()[0], "The recording file is gone");
     let (id, set, _) = f.one_job();
-    assert_eq!(set, Profile::General.sets()[1]);
+    assert_eq!(set, sets()[1]);
     f.answer(id, heard("text"));
     assert_eq!(f.errors()[1], "0.0 %");
 }
@@ -815,18 +871,316 @@ fn a_long_recording_goes_in_chunks_with_one_reset() {
 }
 
 #[test]
-fn the_scenario_picks_the_sets() {
-    let f = Fixture::new("scenario", None);
-    let i = Profile::ALL
-        .iter()
-        .position(|p| *p == Profile::BadMicrophone)
-        .unwrap();
-    f.state().set_profile(i32::try_from(i).unwrap());
-    f.state().invoke_profile_picked();
+fn the_goal_picks_the_sets() {
+    let f = Fixture::new("goal", None);
+    let s = f.state();
     f.record_and_stop();
-    let sets = Profile::BadMicrophone.sets().len();
-    f.state().invoke_run();
-    assert_eq!(f.state().get_rows().row_count(), sets);
+    s.invoke_goal_picked(0);
+    assert_eq!(s.get_plan(), "1 picked recording · 1 run");
+    s.invoke_goal_picked(1);
+    assert_eq!(s.get_plan(), "1 picked recording · 4 runs");
+    s.invoke_run();
+    assert_eq!(s.get_rows().row_count(), sets().len());
+    s.invoke_goal_picked(0);
+    assert_eq!(s.get_goal(), 1, "no new goal during a run");
+}
+
+/// Three clicks from a first visit: a goal card, a quick pick, Run. The recordings come from
+/// History by themselves: recent ones of different lengths, scored against their saved text.
+#[test]
+fn the_wizard_runs_on_recent_history_in_three_clicks() {
+    let f = Fixture::new("wizard", None);
+    let s = f.state();
+    s.set_view(0);
+    let at = |id: &str, ms: u64, text: &str| HistoryItem {
+        duration_ms: ms,
+        ..item(id, text)
+    };
+    f.list_history(vec![
+        at("2026-11-08/130005-123", 4_000, "четыре секунды"),
+        at("2026-11-08/120000-000", 30_000, "тридцать секунд"),
+        at("2026-11-08/110000-000", 12_000, "двенадцать секунд"),
+        at("2026-11-08/100000-000", 2_000, "две"),
+        at("2026-11-08/090000-000", 500, "too short"),
+    ]);
+    s.invoke_goal_picked(0);
+    s.invoke_preset_picked(0);
+    assert_eq!(s.get_plan(), "3 recordings from History · 3 runs");
+    assert_eq!(s.get_run_off(), "");
+    s.invoke_run();
+    assert_eq!(s.get_view(), 2);
+    let mut picked = Vec::new();
+    for _ in 0..3 {
+        let (id, set, from) = f.one_job();
+        assert_eq!(set, SettingsSet::defaults(), "the model in use, as set up");
+        picked.push(from.unwrap().to_string());
+        f.answer(id, heard("x"));
+    }
+    assert_eq!(
+        picked,
+        [
+            "2026-11-08/120000-000",
+            "2026-11-08/110000-000",
+            "2026-11-08/100000-000"
+        ],
+        "the longest, one between, the shortest; newest first"
+    );
+    assert!(!s.get_running());
+}
+
+/// The quiet-microphone check needs no new recording: each one is heard again 6, 12 and 18 dB
+/// quieter, sent as audio of its own.
+#[test]
+fn a_quiet_microphone_hears_each_recording_quieter() {
+    let f = Fixture::new("quiet", None);
+    let s = f.state();
+    f.record_and_stop();
+    s.invoke_goal_picked(2);
+    assert_eq!(
+        s.get_plan(),
+        "1 picked recording · 4 loudness levels · 8 runs"
+    );
+    s.invoke_run();
+    assert_eq!(
+        s.get_rows().row_count(),
+        2,
+        "as set, and normalise with denoise"
+    );
+    let mut levels = Vec::new();
+    loop {
+        let sent = f.take_sent();
+        let Some(id) = sent.iter().find_map(|r| match r {
+            Request::TestTranscribe { id, .. } => Some(*id),
+            _ => None,
+        }) else {
+            break;
+        };
+        if let Some(Request::TestAudio { pcm, .. }) = sent.first() {
+            levels.push(tuning::decode_pcm(pcm).unwrap()[0]);
+        }
+        f.answer(id, heard(first_phrase()));
+    }
+    let want: Vec<f32> = [0.0_f32, -6.0, -12.0, -18.0]
+        .iter()
+        .map(|db| 0.1 * 10f32.powf(db / 20.0))
+        .collect();
+    assert_eq!(
+        levels.len(),
+        8,
+        "every recording goes again for the second set"
+    );
+    for (got, want) in levels.iter().zip(want.iter().cycle()) {
+        assert!((got - want).abs() < 1e-5, "{got} vs {want}");
+    }
+    let labels: Vec<String> = s.get_heard().iter().map(|h| h.source.to_string()).collect();
+    assert_eq!(labels[3], "New recording 1 · -18 dB");
+}
+
+/// The quick picks tick the list, a tick by hand leaves them; a model not on disk is skipped
+/// with its reason and never sent.
+#[test]
+fn presets_tick_the_list_and_a_missing_model_is_skipped() {
+    let f = Fixture::new("presets", None);
+    let s = f.state();
+    let lines = || -> Vec<(String, bool, bool)> {
+        s.get_models()
+            .iter()
+            .map(|m| (m.name.to_string(), m.on, m.downloaded))
+            .collect()
+    };
+    let listed = MODELS.iter().filter(|m| m.id != "tiny").count();
+    assert_eq!(lines().len(), listed, "every model but the test one");
+    assert_eq!(s.get_preset(), 0, "Downloaded");
+    assert_eq!(
+        lines().iter().filter(|l| l.1).count(),
+        1,
+        "only the model on disk"
+    );
+    assert!(lines()[0].1 && lines()[0].2);
+    s.invoke_preset_picked(1);
+    assert_eq!(
+        lines().iter().filter(|l| l.1).count(),
+        1,
+        "no recommendation known yet: the model in use"
+    );
+    s.invoke_preset_picked(2);
+    assert!(lines().iter().all(|l| l.1), "All");
+    s.invoke_model_ticked(1);
+    assert_eq!(s.get_preset(), -1, "by hand");
+    assert!(!lines()[1].1);
+    s.invoke_model_ticked(1);
+    assert_eq!(s.get_preset(), 2, "the ticks of All again");
+
+    s.invoke_goal_picked(0);
+    f.record_and_stop();
+    s.invoke_run();
+    assert_eq!(s.get_rows().row_count(), listed);
+    let errors = f.errors();
+    assert_eq!(errors[0], "Running…");
+    assert!(
+        errors[1..].iter().all(|e| e == "Not downloaded"),
+        "{errors:?}"
+    );
+    let (id, _, _) = f.one_job();
+    f.answer(id, heard(first_phrase()));
+    assert!(f.take_sent().is_empty(), "the missing ones are never sent");
+    assert!(!s.get_running());
+    assert!(s.get_rows().row_data(0).unwrap().best);
+}
+
+/// Cancel stops after the job out; what was heard so far still competes.
+#[test]
+fn cancel_keeps_what_was_heard() {
+    let f = Fixture::new("cancel", None);
+    let s = f.state();
+    f.record_and_stop();
+    s.invoke_run();
+    let (id, _, _) = f.one_job();
+    f.answer(id, heard(first_phrase()));
+    let (left, _, _) = f.one_job();
+    s.invoke_cancel();
+    assert!(!s.get_running());
+    assert_eq!(f.toast(), "Test cancelled.");
+    assert_eq!(f.errors(), ["0.0 %", "Not run", "Not run", "Not run"]);
+    assert!(s.get_rows().row_data(0).unwrap().best);
+    assert_eq!(s.get_apply_off(), "");
+    f.answer(left, heard("late"));
+    assert_eq!(f.errors()[1], "Not run", "the late answer scores nothing");
+    assert!(f.take_sent().is_empty(), "and starts nothing");
+}
+
+/// A finished run offers to delete the downloaded models that lost, with their size, after a
+/// question in the row; never the model in use.
+#[test]
+fn a_finished_run_offers_to_delete_the_models_that_lost() {
+    let f = Fixture::new("losers", None);
+    let s = f.state();
+    fake(&f.layout, "small");
+    s.invoke_shown();
+    let _ = f.take_sent();
+    s.invoke_goal_picked(0);
+    f.record_and_stop();
+    s.invoke_run();
+    let (id, set, _) = f.one_job();
+    assert_eq!(set.model, "turbo");
+    f.answer(id, heard(first_phrase()));
+    let (id, set, _) = f.one_job();
+    assert_eq!(set.model, "small");
+    f.answer(id, heard("совсем не то"));
+    assert!(s.get_rows().row_data(0).unwrap().best);
+    let small = models::find("small").unwrap();
+    let frees = oxi_core::strings::gb(small.size);
+    assert_eq!(s.get_drop_text(), format!("Delete Whisper small ({frees})"));
+    assert_eq!(
+        s.get_drop_ask(),
+        format!("Delete Whisper small? Frees {frees}.")
+    );
+    assert_eq!(s.get_drop_off(), "");
+    s.invoke_drop();
+    let deletes: Vec<Request> = f
+        .sent
+        .try_iter()
+        .filter_map(|cmd| match cmd {
+            Cmd::Send(r @ Request::DeleteModel { .. }) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deletes, [Request::DeleteModel { id: "small".into() }]);
+    assert_eq!(s.get_drop_text(), "", "offered once");
+}
+
+/// Review c07: Delete was clicked (the row asks), then the next run leaves no model that lost:
+/// the question row goes with the offer, and a Delete with nothing left sends nothing.
+#[test]
+fn the_delete_question_goes_with_the_next_run() {
+    let f = Fixture::new("losers-again", None);
+    let s = f.state();
+    fake(&f.layout, "small");
+    s.invoke_shown();
+    let _ = f.take_sent();
+    s.invoke_goal_picked(0);
+    f.record_and_stop();
+    s.invoke_run();
+    let (id, _, _) = f.one_job();
+    f.answer(id, heard(first_phrase()));
+    let (id, _, _) = f.one_job();
+    f.answer(id, heard("совсем не то"));
+    assert_ne!(s.get_drop_text(), "");
+    s.set_dropping(true);
+
+    let small = models::find("small").unwrap().display_name;
+    let line = s.get_models().iter().position(|m| m.name == small).unwrap();
+    s.invoke_model_ticked(i32::try_from(line).unwrap());
+    s.invoke_run();
+    let (id, set, _) = f.one_job();
+    assert_eq!(set.model, "turbo", "one model, so none can lose");
+    f.answer(id, heard(first_phrase()));
+    assert!(!s.get_running());
+    assert_eq!(s.get_drop_text(), "");
+    assert!(!s.get_dropping(), "no question about nothing");
+    s.invoke_drop();
+    assert!(
+        !f.sent
+            .try_iter()
+            .any(|c| matches!(c, Cmd::Send(Request::DeleteModel { .. }))),
+        "nothing to delete"
+    );
+    assert_ne!(f.toast(), "Deleting the other models.");
+}
+
+/// Review c07: the recommended model, ticked but not on disk, is skipped by the run and offered as
+/// Download, which only opens the Model page (never a download on its own); once it is downloaded
+/// the offer goes. The machine: an integrated GPU from the daemon, so the system memory picks
+/// turbo compact (16 GB of memory, 100 GB free, given to the page, so no hardware is read).
+#[test]
+fn a_run_offers_to_download_the_recommended_model_it_skipped() {
+    const GB: u64 = 1 << 30;
+    let f = Fixture::with_hardware("get-offer", (Some(16 * GB), vec![], Some(100 * GB)));
+    let s = f.state();
+    f.ipc.deliver(&Event::Push(Push::Devices {
+        mics: vec![],
+        gpus: vec![Device {
+            name: "Vulkan0".into(),
+            description: "Integrated".into(),
+            uma: true,
+        }],
+    }));
+    let compact = models::find("turbo-compact").unwrap();
+    let marked: Vec<String> = s
+        .get_models()
+        .iter()
+        .filter(|m| m.recommended)
+        .map(|m| m.name.to_string())
+        .collect();
+    assert_eq!(marked, [compact.display_name]);
+    s.invoke_goal_picked(0);
+    s.invoke_preset_picked(1);
+    f.record_and_stop();
+    s.invoke_run();
+    let (id, set, _) = f.one_job();
+    assert_eq!(set.model, "turbo", "the model on disk runs");
+    f.answer(id, heard(first_phrase()));
+    assert!(!s.get_running());
+    assert_eq!(
+        s.get_get_text(),
+        format!("Download {}", compact.display_name)
+    );
+
+    s.invoke_get();
+    assert_eq!(f.window.get_page(), Page::Model);
+    assert!(
+        !f.sent
+            .try_iter()
+            .any(|c| matches!(c, Cmd::Send(Request::DownloadModel { .. }))),
+        "Download only opens the Model page"
+    );
+
+    fake(&f.layout, "turbo-compact");
+    f.ipc.deliver(&Event::Push(Push::DownloadDone {
+        id: "turbo-compact".into(),
+        result: DownloadResult::Ok,
+    }));
+    assert_eq!(s.get_get_text(), "", "the model is on disk now");
 }
 
 /// An edit of another setting from outside rebinds the pages, and this one must go on.
@@ -848,7 +1202,7 @@ fn an_outside_config_edit_keeps_the_recordings_and_the_run() {
     };
     fs::write(f.layout.config_file(), "version = 2\n# one and two\n").unwrap();
     f.window.invoke_files_check();
-    assert_eq!(s.get_view(), 1, "the results stay open");
+    assert_eq!(s.get_view(), 2, "the results stay open");
     assert_eq!(f.errors()[0], "Running…");
     assert_eq!(f.takes().len(), 1);
     f.answer(*id, heard(first_phrase()));
@@ -965,13 +1319,13 @@ fn losing_the_daemon_ends_the_run() {
     f.state().invoke_run();
     let (id, _, _) = f.one_job();
     f.progress(id, 50, Some(1000));
-    std::thread::sleep(Duration::from_millis(100));
+    thread::sleep(Duration::from_millis(100));
     mock_elapsed_time(Duration::from_millis(40));
     f.ipc.deliver(&Event::Link(Link::Offline));
     assert!(f.errors().iter().all(|e| e == "Not run"));
     assert_eq!(f.toast(), "OxiYapper stopped answering, so the test ended.");
     // DS-26: the bar of a failed run stops where it is, it never glides to 100 %.
-    std::thread::sleep(Duration::from_millis(250));
+    thread::sleep(Duration::from_millis(250));
     mock_elapsed_time(Duration::from_millis(100));
     let after = f.state().get_progress();
     assert!(after < 0.5, "{after}");
@@ -1004,7 +1358,10 @@ fn closing_while_recording_discards_it() {
         .dispatch_event(WindowEvent::CloseRequested);
     assert!(!f.state().get_recording());
     assert!(f.takes().is_empty());
-    assert_eq!(f.state().get_run_off(), "Add a recording first");
+    assert_eq!(
+        f.state().get_run_off(),
+        "No recordings yet: dictate a few times with History on, or add one on Recordings"
+    );
 }
 
 /// Runs the recordings held, with one more, every job heard as the first phrase.
@@ -1079,7 +1436,7 @@ fn a_read_only_config_keeps_the_test_but_not_apply() {
     f.state().set_view(0);
     assert_eq!(f.state().get_run_off(), "", "the test writes nothing");
     assert_eq!(
-        with_role(&f.window, "Scenario", AccessibleRole::Combobox).accessible_enabled(),
+        with_role(&f.window, "Run", AccessibleRole::Button).accessible_enabled(),
         Some(true)
     );
 }
@@ -1110,8 +1467,9 @@ fn ctrl_tab(window: &AppWindow) {
 fn ctrl_tab_works_after_run_from_the_keyboard() {
     let f = Fixture::new("run-keys", None);
     f.record_and_stop();
-    // The rail, the view switch, Scenario, the "i" after Compare settings, Run.
-    for _ in 0..5 {
+    f.state().set_view(0);
+    // The rail, the view switch, the goal cards, the quick pick, the "i" after Run, Run.
+    for _ in 0..6 {
         press(&f.window, Key::Tab);
     }
     for space in [
@@ -1120,7 +1478,7 @@ fn ctrl_tab_works_after_run_from_the_keyboard() {
     ] {
         f.window.window().dispatch_event(space);
     }
-    assert_eq!(f.state().get_view(), 1, "Space on Run opened the results");
+    assert_eq!(f.state().get_view(), 2, "Space on Run opened the results");
     mock_elapsed_time(Duration::from_millis(1));
     ctrl_tab(&f.window);
     assert_eq!(f.window.get_page(), Page::System);
@@ -1156,9 +1514,19 @@ fn lowest(window: &AppWindow) -> f32 {
         "Copy",
         "0.0 %",
     ];
+    // The wizard's model list scrolls too: its names, badges and sizes.
+    let in_model_list = |label: &str| {
+        MODELS.iter().any(|m| m.display_name == label)
+            || label.ends_with(" GB")
+            || ["Recommended", "Not downloaded"].contains(&label)
+    };
     spots(window)
         .iter()
-        .filter(|(label, _, _)| !IN_LISTS.contains(&label.as_str()) && !label.contains("ecording"))
+        .filter(|(label, _, _)| {
+            !IN_LISTS.contains(&label.as_str())
+                && !label.contains("ecording")
+                && !in_model_list(label)
+        })
         .map(|(_, _, [_, y, _, h])| y + h)
         .fold(0.0, f32::max)
 }
@@ -1168,11 +1536,6 @@ fn lowest(window: &AppWindow) -> f32 {
 #[test]
 fn no_scroll_at_the_minimum_or_the_default_size() {
     let f = Fixture::new("no-scroll", None);
-    let scenario = Profile::ALL
-        .iter()
-        .position(|p| *p == Profile::BadMicrophone)
-        .unwrap();
-    f.state().set_profile(i32::try_from(scenario).unwrap());
     for i in 0..4 {
         f.record_and_stop();
         f.state().invoke_reference_edited(i, first_phrase().into());
@@ -1180,7 +1543,7 @@ fn no_scroll_at_the_minimum_or_the_default_size() {
     finish_a_run(&f);
     for (w, h) in [(720.0, 520.0), (1000.0, 700.0), (1280.0, 800.0)] {
         f.window.window().set_size(LogicalSize::new(w, h));
-        for view in [0, 1] {
+        for view in [0, 1, 2] {
             f.state().set_view(view);
             assert!(
                 lowest(&f.window) <= h,
@@ -1192,9 +1555,9 @@ fn no_scroll_at_the_minimum_or_the_default_size() {
         f.state().set_view(0);
         spots(&f.window);
         assert!(has(&f.window, "Run"), "Run at {w}x{h}");
-        f.state().set_view(1);
+        f.state().set_view(2);
         spots(&f.window);
-        let rows = Profile::BadMicrophone.sets().len();
+        let rows = sets().len();
         // Table cells are a line high; the transcripts' captions are not.
         let cells = ElementHandle::find_by_accessible_label(&f.window, "0.0 %")
             .filter(|e| e.size().height > 20.0)
@@ -1262,7 +1625,8 @@ fn real_shots_of_the_states() {
         }
     }
 
-    /// Answers every job with `text`, up to `limit` of them, so the table fills in.
+    /// Answers every job with `text`, up to `limit` of them, so the table fills in; each job
+    /// first says its estimate, as the daemon does.
     fn answer_all(ipc: &Ipc, sent: &Receiver<Cmd>, text: &str, limit: usize) {
         let mut ms = 900;
         let mut answered = 0;
@@ -1273,6 +1637,11 @@ fn real_shots_of_the_states() {
                 Cmd::Send(Request::HistoryRetranscribe { run, .. }) => run,
                 _ => continue,
             };
+            ipc.deliver(&Event::Push(Push::TestProgress {
+                id,
+                percent: 0,
+                est_ms: Some(1500),
+            }));
             ms += 700;
             answered += 1;
             ipc.deliver(&Event::Push(Push::TestResult {
@@ -1309,6 +1678,8 @@ fn real_shots_of_the_states() {
 
     oxi_settings::use_skia();
     let layout = layout("real-shots", None);
+    fake(&layout, "turbo");
+    fake(&layout, "small");
     let wav = layout.history_dir().join(format!("{HISTORY_ID}.wav"));
     fs::create_dir_all(wav.parent().unwrap()).unwrap();
     let speech: Vec<f32> = (0..40_000_u16)
@@ -1323,20 +1694,13 @@ fn real_shots_of_the_states() {
     window
         .window()
         .set_position(PhysicalPosition::new(-20_000, -20_000));
-    let bad_mic = i32::try_from(
-        Profile::ALL
-            .iter()
-            .position(|p| *p == Profile::BadMicrophone)
-            .unwrap(),
-    )
-    .unwrap();
     let long_text = "A long reference text that wraps over many lines. ".repeat(12);
     let history = vec![
         item(HISTORY_ID, "Добрый день, это проверка истории записей."),
         item(OLDER_ID, "Older one"),
     ];
     let mut shots: Vec<(&str, f32, f32, ThemeChoice)> = Vec::new();
-    for name in ["empty", "picked", "running", "results"] {
+    for name in ["wizard", "empty", "picked", "running", "results"] {
         for (w, h) in [(720.0, 520.0), (1280.0, 860.0), (1920.0, 1080.0)] {
             for theme in [ThemeChoice::Dark, ThemeChoice::Light] {
                 shots.push((name, w, h, theme));
@@ -1362,7 +1726,7 @@ fn real_shots_of_the_states() {
         if wait.get() == 0 {
             wait.set(1);
             ctx.config.borrow_mut().config.history.enabled = name != "history-off";
-            bind_test_page(&window, &ctx, fake_mic, fake_play);
+            bind_test_page(&window, &ctx, fake_mic, fake_play, None);
             let s = window.global::<TestState>();
             s.invoke_shown();
             ipc.deliver(&Event::Link(Link::Online));
@@ -1372,9 +1736,9 @@ fn real_shots_of_the_states() {
             }));
             window.set_theme(theme);
             window.window().set_size(LogicalSize::new(w, h));
+            s.set_view(i32::from(name != "wizard"));
             if matches!(name, "picked" | "running" | "results" | "recording") {
-                s.set_profile(bad_mic);
-                s.invoke_profile_picked();
+                s.invoke_goal_picked(1);
                 s.invoke_record();
                 s.invoke_record();
                 s.set_history_pick(1);

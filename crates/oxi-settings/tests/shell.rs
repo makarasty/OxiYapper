@@ -14,7 +14,7 @@ use i_slint_backend_testing::{
 use oxi_core::config::{ConfigFile, Theme};
 use oxi_core::ipc::Push;
 use oxi_settings::ipc::{Cmd, Event, Link};
-use oxi_settings::{AppWindow, ChipLevel, Ipc, Page, Shell, ThemeChoice, Toast, Tokens};
+use oxi_settings::{AppWindow, ChipLevel, Ipc, Page, Shell, TestState, ThemeChoice, Toast, Tokens};
 use slint::ComponentHandle;
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
@@ -1149,11 +1149,15 @@ fn headers_wear_the_underline_and_cover_the_badge() {
         assert!(line.size().width > 0.0, "{page:?}: underline has a width");
     }
     window.set_page(Page::Test);
+    // The page opens on Test (no badge); open Recordings, the tab with the count.
+    window.global::<TestState>().set_view(1);
     let badge = ElementHandle::find_by_element_id(&window, "SubTabs::badge")
         .next()
         .expect("Recordings shows its count at 0");
+    // Every tab has an underline (it fades in when open): take the badge's own tab's.
     let line = ElementHandle::find_by_element_id(&window, "SubTabs::underline")
-        .next()
+        .filter(|l| l.absolute_position().x <= badge.absolute_position().x)
+        .last()
         .expect("the open tab's underline");
     let right = |e: &ElementHandle| e.absolute_position().x + e.size().width;
     assert!(
