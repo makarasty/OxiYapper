@@ -176,7 +176,7 @@ impl Host for Fake {
     fn history_edit(&self, id: &HistoryId, _text: &str) -> io::Result<()> {
         self.history_audio(id).map(drop)
     }
-    fn history_restore(&self, id: &HistoryId) -> io::Result<()> {
+    fn history_restore(&self, id: &HistoryId, _original: bool) -> io::Result<()> {
         self.history_audio(id).map(drop)
     }
     fn history_delete(&self, id: &HistoryId) -> io::Result<()> {
@@ -467,7 +467,11 @@ fn history_requests_reach_the_host_and_answer() {
                 ok
             })
         );
-        conn.send(&Request::HistoryRestore { id: hid(id) }).unwrap();
+        conn.send(&Request::HistoryRestore {
+            id: hid(id),
+            original: false,
+        })
+        .unwrap();
         assert_eq!(
             conn.recv::<Push>().unwrap(),
             Some(Push::HistoryResult {
@@ -719,6 +723,7 @@ fn entry(
         language: String::new(),
         settings: None,
         previous: None,
+        original: None,
         words: Vec::new(),
         timings: None,
         raw: false,
@@ -787,6 +792,7 @@ fn only_done_and_cancelled_audio_counts_as_processed() {
             language: String::new(),
             settings: None,
             previous: None,
+            original: None,
             words: Vec::new(),
             timings: None,
             raw: false,

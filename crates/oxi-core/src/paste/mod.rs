@@ -68,8 +68,8 @@ pub const HISTORY_TIMEOUT: Millis = Millis(2000);
 /// Item 52: one paste's history work (list, deletes, waiting for the new entry, not counting the
 /// restore delay) stops once this much time has passed; what is left waits for the next paste.
 pub const HISTORY_BUDGET: Millis = Millis(3000);
-/// Item 52: Win+V holds this many entries and pushes the oldest out for a new one, so the
-/// dictation enters it only while it holds fewer (owner 2026-11-10: no entry is ever pushed out).
+/// Item 52: Win+V holds this many entries and pushes the oldest out for a new one; the dictations
+/// push at most one entry of the user's out, ever (owner 2026-11-13, item 22).
 pub const HISTORY_CAP: usize = 25;
 /// Item 52: pastes that look for an unseen write of ours and find another entry in its place
 /// before the mark is given up (that write most likely never registered).
@@ -475,6 +475,12 @@ pub struct OurEntries {
     seq: Option<u32>,
     /// The newest history entry our last paste knew (`None`: unknown or an empty history).
     top: Option<String>,
+    /// A dictation of ours pushed a user entry out of the full history and the history has not
+    /// been seen empty since: a full history then takes a dictation only in the place of one of
+    /// ours we delete, so an entry of ours we lost track of (a late write whose mark went, a
+    /// restart) never costs the user a second entry, whatever the user deletes (review
+    /// 2026-11-13).
+    pushed: bool,
 }
 
 impl OurEntries {
@@ -484,8 +490,8 @@ impl OurEntries {
 
     /// What outlives the daemon, so the next session's first paste still deletes the last
     /// dictation of this one: one `key value` line each for the clipboard number, the newest
-    /// history entry and every id of ours. Ids and a number only; the marks of unseen writes
-    /// (a hash of the text) are not kept.
+    /// history entry, every id of ours and `pushed 1` when [`pushed`](Self::pushed) is set. Ids
+    /// and numbers only; the marks of unseen writes (a hash of the text) are not kept.
     // shortcut: a number of an earlier boot can equal the new session's by chance and hide a
     // copy still registering; upgrade by saving the boot time with it.
     #[must_use]
@@ -501,6 +507,12 @@ impl OurEntries {
                 let _ = writeln!(out, "{key} {id}");
             }
         }
+        if self.pushed {
+            out.push_str(
+                "pushed 1
+",
+            );
+        }
         out
     }
 
@@ -512,6 +524,7 @@ impl OurEntries {
         for line in text.lines() {
             match line.trim_end().split_once(' ') {
                 Some(("seq", n)) => ours.seq = n.parse().ok(),
+                Some(("pushed", "1")) => ours.pushed = true,
                 Some(("top", id)) if is_id(id) => ours.top = Some(id.to_owned()),
                 Some(("id", id)) if is_id(id) && !ours.ids.iter().any(|x| x == id) => {
                     ours.ids.push(id.to_owned());
@@ -541,10 +554,11 @@ fn is_id(id: &str) -> bool {
 enum Room {
     /// History off, or an OS without one: the setting alone decides.
     Off,
-    /// Full, unreadable or out of time: the dictation stays out, so no entry of the user's is
-    /// pushed out of the history.
+    /// Unreadable, out of time, or full while an entry of ours or a copy still registering takes
+    /// a slot, or after a dictation already pushed a user entry out: the dictation stays out.
     Closed,
-    /// One more entry fits; the newest entry's id (`None`: the history is empty).
+    /// The dictation goes in (into a full history only in the place of our last one); the newest
+    /// entry's id (`None`: the history is empty).
     Free(Option<String>),
 }
 
@@ -652,8 +666,9 @@ fn missed(mut mark: Unseen, ours: &mut OurEntries) {
 }
 
 /// Step 1 of the history order (owner 2026-11-10): our earlier entries go, by id, before the new
-/// write, so the count never rises above the one before the dictation and no entry of the user's
-/// is pushed out of the [`HISTORY_CAP`]. One list call, then one delete per entry of ours.
+/// write, so the dictations hold one slot of the [`HISTORY_CAP`]: only the first one into a full
+/// history pushes its oldest entry out (owner 2026-11-13, item 22). One list call, then one
+/// delete per entry of ours.
 ///
 /// `seq` is the clipboard number before the snapshot, `excluded` whether the user's copy stays
 /// out of the history. A copy made since our last paste may still be registering: a delete would
@@ -699,6 +714,14 @@ fn clear_ours(
     }
     // Places are read before any delete: the entry an unseen write sits above may be ours too.
     let all = list.clone();
+    // Only an empty history proves no entry of ours we lost track of is left in it; room a user
+    // delete made does not (re-review 2026-11-13: each delete reopened one more push-out).
+    // shortcut: after such a loss a full history keeps dictations out until one of ours is
+    // tracked again (any paste into room below the cap) or the history is seen empty. Upgrade:
+    // entry timestamps.
+    if all.is_empty() {
+        ours.pushed = false;
+    }
     for mark in std::mem::take(&mut ours.unseen) {
         // A copy still registering: no delete now (it would drop that copy), the next paste looks.
         if pending {
@@ -750,10 +773,16 @@ fn clear_ours(
         }
     }
     ours.top = list.first().cloned();
-    let cap = HISTORY_CAP - usize::from(pending);
-    if clip.now() >= deadline || list.len() >= cap {
+    let full = list.len() >= HISTORY_CAP - usize::from(pending);
+    // Item 22 (owner 2026-11-13): a full Win+V takes the dictation as it takes a copy, dropping
+    // its oldest entry, once: later dictations go only into the room a delete of ours made. A
+    // copy still registering, an entry of ours not deleted, or an earlier push-out (an entry of
+    // ours may sit there unknown) keeps the dictation out.
+    let ours_left = pending || !ours.ids.is_empty() || !ours.unseen.is_empty() || ours.pushed;
+    if clip.now() >= deadline || (full && ours_left) {
         Room::Closed
     } else {
+        ours.pushed |= full;
         Room::Free(list.into_iter().next())
     }
 }
@@ -769,10 +798,13 @@ fn make_room(
     input: &mut impl Input,
 ) -> Room {
     if keep {
+        let pushed = ours.pushed;
         let room = clear_ours(ours, seq, excluded, deadline, clip, input);
         // The user copied while the history work ran: Win+V may still be registering that copy,
         // so the dictation stays out and nothing is pushed out.
         return if matches!(room, Room::Free(_)) && clip.sequence() != seq {
+            // No write into the history: no push-out to count.
+            ours.pushed &= pushed;
             Room::Closed
         } else {
             room
@@ -781,7 +813,9 @@ fn make_room(
     if ours.is_empty() {
         ours.top = None;
     } else {
+        let pushed = ours.pushed;
         clear_ours(ours, seq, excluded, deadline, clip, input);
+        ours.pushed &= pushed;
     }
     Room::Off
 }
@@ -909,11 +943,11 @@ fn restore_retrying<C: Clipboard>(
 }
 
 /// Delivers `text` to the foreground app: ARCHITECTURE section 10, steps 1-7 and type mode.
-/// History order (item 52, owner 2026-11-10): our earlier entries are deleted by id, the
-/// dictation is written into the history (when one more entry fits) and pasted, the worker waits
+/// History order (item 52, owner 2026-11-10; item 22, 2026-11-13): our earlier entries are
+/// deleted by id, the dictation is written into the history and pasted, the worker waits
 /// until the history shows it and lists it in `ours` (kept by the caller), and the user's copy
 /// goes back outside the history. Ctrl+V gives the user's copy, Win+V shows this dictation on
-/// top, and no entry of the user's is pushed out. A copy that cannot be kept is never
+/// top, and the dictations hold one slot of it. A copy that cannot be kept is never
 /// overwritten: the text is typed instead. `report` hears why the text is typed, its typing
 /// progress and the moment it has landed (never for `Failed` or `ClipboardOnly`).
 pub fn paste_with<C: Clipboard>(

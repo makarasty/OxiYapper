@@ -196,6 +196,45 @@ fn loud_bars_are_taller_than_silence() {
     assert!(count(&l, accent()) > 2 * count(&q, accent()));
 }
 
+/// The level meter must read at a glance (hold item 02): a full-scale bar is at least 70 % of the
+/// pill high and the wave box at least 70 px wide, at every scale.
+#[test]
+fn the_recording_meter_is_big() {
+    let rec = OverlayState::Recording {
+        locked: false,
+        ending_soon: false,
+    };
+    let mut full = Meter::new(40, 0.0);
+    for i in 0..60u16 {
+        let level = Level {
+            peak: 0.5,
+            rms: 1.0,
+        };
+        full.push(level, Millis(u64::from(i) * 34));
+    }
+    let now = Millis(60 * 34);
+    for scale in SCALES {
+        let r = rect(scale);
+        let pm = pill(rec, &full, now, r, None).unwrap();
+        // Skip the icon (left padding + icon): the meter is on the right half.
+        let (x0, x1) = (pm.width() / 2, pm.width() - pm.height() / 4);
+        let hit = |x, y| {
+            let p = pm.pixel(x, y).unwrap();
+            let a = accent();
+            (p.red(), p.green(), p.blue()) == (a.0, a.1, a.2)
+        };
+        let ys: Vec<u32> = (0..pm.height())
+            .filter(|&y| (x0..x1).any(|x| hit(x, y)))
+            .collect();
+        let tall = ys.last().unwrap() - ys.first().unwrap() + 1;
+        assert!(
+            tall as f32 >= 0.7 * pm.height() as f32,
+            "bar {tall} px of {} @{scale}",
+            pm.height()
+        );
+    }
+}
+
 #[test]
 fn label_is_drawn_when_the_font_is_there() {
     let Some(bytes) = font_bytes() else {

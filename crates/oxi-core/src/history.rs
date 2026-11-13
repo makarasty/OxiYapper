@@ -190,6 +190,11 @@ pub struct Meta {
     /// what a restore put aside. Absent until a text was replaced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous: Option<Previous>,
+    /// The first text of the entry (the dictation's own) and its run, kept through every
+    /// transcribe-again, edit and restore so it can always be brought back. Absent until a text
+    /// was replaced, and in an entry from before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original: Option<Previous>,
     /// The words of the audio with the confidence of each (and times once they were computed).
     /// Empty for an entry from before this field; see [`Word`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -224,6 +229,7 @@ impl Meta {
             language: language.to_owned(),
             settings: None,
             previous: None,
+            original: None,
             words: Vec::new(),
             timings: None,
             raw: false,
@@ -368,6 +374,42 @@ impl Meta {
             ..self.clone()
         };
         Some((meta, kept.text.clone()))
+    }
+
+    /// The first text to keep when `text`, the current one, is replaced: the one already kept;
+    /// for an entry from before [`Meta::original`] the older version `previous` holds, else `text`
+    /// itself. `None` while the entry never had a text.
+    #[must_use]
+    pub fn original_of(&self, text: &str) -> Option<Previous> {
+        self.original
+            .clone()
+            .or_else(|| self.previous.clone().filter(|p| !p.newer))
+            .or_else(|| (!text.is_empty()).then(|| self.as_previous(text)))
+    }
+
+    /// The entry after Restore original: the first text and its run come back and stay kept. The
+    /// newer version is kept as the other one (the newest a Restore put aside, else `text`), so
+    /// Use new undoes it. `None` when no original is kept or it is the text shown.
+    #[must_use]
+    pub fn back_to_original(&self, text: &str) -> Option<(Self, String)> {
+        let first = self.original.as_ref().filter(|o| o.text != text)?;
+        let kept = self
+            .previous
+            .clone()
+            .filter(|p| p.newer)
+            .unwrap_or_else(|| Previous {
+                newer: true,
+                ..self.as_previous(text)
+            });
+        let meta = Self {
+            status: Status::Done,
+            model: first.model.clone(),
+            language: first.language.clone(),
+            settings: first.settings.clone(),
+            previous: Some(kept),
+            ..self.clone()
+        };
+        Some((meta, first.text.clone()))
     }
 
     /// # Errors
@@ -1164,6 +1206,7 @@ mod tests {
                 model: "small".into(),
             }),
             previous: None,
+            original: None,
             words: Vec::new(),
             timings: None,
             raw: false,
@@ -1403,6 +1446,73 @@ mod tests {
         let kept = again.previous.unwrap();
         assert_eq!(kept.text, "old text");
         assert!(!kept.newer, "the new text is shown again");
+    }
+
+    /// b01 review: the dictated text survives any number of replacements and restores, and an
+    /// entry from before `original` gets the best one it still has.
+    #[test]
+    fn the_original_is_kept_through_every_replacement_and_comes_back() {
+        let dictated = meta(Status::Done);
+        assert_eq!(dictated.original_of(""), None, "never had a text");
+        let first = dictated.original_of("dictated").unwrap();
+        assert_eq!(
+            (first.text.as_str(), first.model.as_str()),
+            ("dictated", "small")
+        );
+        // Apply twice: `previous` moves on, the original stays.
+        let once = Meta {
+            model: "turbo".into(),
+            previous: Some(dictated.as_previous("dictated")),
+            original: dictated.original_of("dictated"),
+            ..dictated.clone()
+        };
+        let twice = Meta {
+            previous: Some(once.as_previous("draft one")),
+            original: once.original_of("draft one"),
+            ..once.clone()
+        };
+        assert_eq!(twice.previous.as_ref().unwrap().text, "draft one");
+        assert_eq!(twice.original.as_ref().unwrap().text, "dictated");
+        // A swap keeps it too.
+        let (swapped, text) = twice.swapped("draft two").unwrap();
+        assert_eq!(text, "draft one");
+        assert_eq!(swapped.original, twice.original);
+        // Restore original: the newest version is kept for Use new.
+        let (back, text) = swapped.back_to_original(&text).unwrap();
+        assert_eq!(text, "dictated");
+        assert_eq!(
+            (back.model.as_str(), back.language.as_str()),
+            ("small", "ru")
+        );
+        let kept = back.previous.as_ref().unwrap();
+        assert_eq!(kept.text, "draft two", "the newest a Restore put aside");
+        assert!(kept.newer);
+        assert_eq!(back.original, twice.original);
+        assert!(back.back_to_original("dictated").is_none(), "already shown");
+        let (new, text) = back.swapped("dictated").unwrap();
+        assert_eq!(
+            (text.as_str(), new.original.as_ref().unwrap().text.as_str()),
+            ("draft two", "dictated")
+        );
+        let (back, _) = twice.back_to_original("draft two").unwrap();
+        assert_eq!(
+            back.previous.unwrap().text,
+            "draft two",
+            "the shown one, newer"
+        );
+        // An entry from before the field: the older `previous`, or the shown text after a Restore.
+        let before = Meta {
+            original: None,
+            ..once
+        };
+        assert_eq!(before.original_of("draft one").unwrap().text, "dictated");
+        let restored = before.swapped("draft one").unwrap().0;
+        assert_eq!(restored.original_of("dictated").unwrap().text, "dictated");
+        // Written only when kept; an old file reads without it.
+        let json = twice.to_json().unwrap();
+        assert!(json.contains("\"original\""), "{json}");
+        assert_eq!(Meta::from_json(&json).unwrap(), twice);
+        assert!(!dictated.to_json().unwrap().contains("original"));
     }
 
     #[test]

@@ -48,6 +48,58 @@ struct Found {
     name: String,
     exe: String,
     icon: Option<SharedPixelBuffer<Rgba8Pixel>>,
+    /// Where the scan found it ("Steam", "Start menu"), and whether that makes it a game.
+    source: &'static str,
+    game: bool,
+    /// Bytes on disk when known, else 0.
+    size: u64,
+}
+
+/// What the popup's filters need of a found app, by lowercase exe: a tile has no room for it.
+#[derive(Clone)]
+struct Meta {
+    source: &'static str,
+    game: bool,
+    size: u64,
+}
+
+thread_local! {
+    /// Filled when a scan lands, read when the grid is drawn: both on the UI thread.
+    static META: std::cell::RefCell<HashMap<String, Meta>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// The popup's three filters, read from the state.
+struct Filter {
+    /// 0 all, 1 apps, 2 games.
+    kind: i32,
+    /// The source's name; empty for all.
+    source: String,
+    by_size: bool,
+}
+
+impl Filter {
+    fn of(s: &TextState<'_>) -> Self {
+        let source = usize::try_from(s.get_popup_source())
+            .ok()
+            .filter(|&i| i > 0)
+            .and_then(|i| s.get_source_names().row_data(i))
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        Self {
+            kind: s.get_popup_type(),
+            source,
+            by_size: s.get_popup_sort() == 1,
+        }
+    }
+}
+
+/// "4.2 GB", "310 MB"; the tooltip of an app whose size is known.
+fn size_text(bytes: u64) -> String {
+    if bytes >= 100_000_000 {
+        strings::gb(bytes)
+    } else {
+        format!("{} MB", bytes.div_ceil(1_000_000))
+    }
 }
 
 /// Runs again after Reset to defaults: an editor with unsaved edits keeps them, the rest reload.
@@ -376,6 +428,31 @@ pub(super) fn file_warning(warnings: &[String]) -> String {
         .unwrap_or_default()
 }
 
+/// An exe the person picks in the file dialog.
+#[cfg(all(windows, not(test)))]
+fn pick_exe() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("Program", &["exe"])
+        .pick_file()
+}
+
+/// No dialog in a test: the exe it was told to answer with, once.
+#[cfg(test)]
+fn pick_exe() -> Option<PathBuf> {
+    TEST_EXE.with_borrow_mut(Option::take)
+}
+
+/// No native dialog on this OS: the exe is typed in the field.
+#[cfg(all(not(windows), not(test)))]
+fn pick_exe() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_EXE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(windows)]
 fn pick_folder(start: &Path) -> Option<PathBuf> {
     rfd::FileDialog::new().set_directory(start).pick_folder()
@@ -595,6 +672,24 @@ fn bind_rules(window: &AppWindow, ctx: &Ctx) {
         }
     });
     // The filters read the fields' text from the state: the callbacks only say it changed.
+    // An .exe from anywhere (a stick, a folder no scan reads): its rule is the same as a pick's.
+    let (w, c) = (window.as_weak(), ctx.clone());
+    s.on_browse_exe(move || {
+        let Some(path) = pick_exe() else { return };
+        let Some(file) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            return;
+        };
+        // A person knows it as "Overwatch", not "Overwatch.exe" (UI rule 30).
+        if let Some(stem) = path.file_stem() {
+            let mut cfg = c.config.borrow_mut();
+            cfg.config
+                .ui
+                .app_names
+                .entry(file.to_lowercase())
+                .or_insert_with(|| stem.to_string_lossy().into_owned());
+        }
+        with(&w, |s| s.invoke_rule_picked(file.into()));
+    });
     let (w, c) = (window.as_weak(), ctx.clone());
     s.on_query_edited(move |_| redraw(&w, &c));
     let (w, c) = (window.as_weak(), ctx.clone());
@@ -656,6 +751,7 @@ fn forget_exe(ctx: &Ctx, exe: &str) {
 fn bind_scan(window: &AppWindow, ctx: &Ctx) {
     let s = window.global::<TextState>();
     s.set_scanning(false);
+    s.set_source_names(shared(vec!["All sources".to_owned()]));
     let timer = Rc::new(Timer::default());
     let (w, c) = (window.as_weak(), ctx.clone());
     let start = Rc::new(move || {
@@ -683,6 +779,20 @@ fn bind_scan(window: &AppWindow, ctx: &Ctx) {
                 timer.stop();
             }
             with(&w, |s| {
+                let mut sources: Vec<&'static str> = found.iter().map(|f| f.source).collect();
+                sources.sort_unstable();
+                sources.dedup();
+                META.with_borrow_mut(|meta| {
+                    meta.clear();
+                    meta.extend(found.iter().map(|f| {
+                        let (source, game, size) = (f.source, f.game, f.size);
+                        (f.exe.to_lowercase(), Meta { source, game, size })
+                    }));
+                });
+                // The filters' choices are what this scan found: the old index may not exist now.
+                let names = ["All sources"].into_iter().chain(sources).map(String::from);
+                s.set_source_names(shared(names.collect()));
+                s.set_popup_source(0);
                 let tiles: Vec<GalleryTile> = found
                     .into_iter()
                     .map(|f| GalleryTile {
@@ -748,6 +858,9 @@ fn find_apps(roots: Option<Vec<PathBuf>>) -> Vec<Found> {
             .map(|i| SharedPixelBuffer::clone_from_slice(&i.rgba, i.width, i.height)),
         name: app.name,
         exe: app.exe,
+        source: app.source.label(),
+        game: app.source.is_game(),
+        size: app.size.unwrap_or(0),
     })
     .collect()
 }
@@ -869,7 +982,12 @@ fn show_rules(s: &TextState<'_>, rules: &[PasteRule], known: &BTreeMap<String, S
         s.set_rules(model);
     }
     let by_exe = |a: &GalleryTile, b: &GalleryTile| a.caption == b.caption && a.hint == b.hint;
-    let grid = grid(&found, &s.get_popup_query());
+    let grid = grid(
+        &found,
+        &s.get_popup_query(),
+        &Filter::of(s),
+        s.get_browse_icon(),
+    );
     if let Some(model) = sync(&s.get_grid(), grid, by_exe) {
         s.set_grid(model);
     }
@@ -905,11 +1023,57 @@ fn rows(
         .collect()
 }
 
-/// The apps popup's tiles: the scan's apps that match `query`.
-fn grid(found: &ModelRc<GalleryTile>, query: &str) -> Vec<GalleryTile> {
-    found
+/// The apps popup's tiles: the scan's apps that match `query` and the filters, by name or biggest
+/// first, with the tile that opens the file dialog before them (no exe: it is the one with no caption)
+/// whenever there is an app to show.
+fn grid(
+    found: &ModelRc<GalleryTile>,
+    query: &str,
+    filter: &Filter,
+    browse_icon: Image,
+) -> Vec<GalleryTile> {
+    let meta = |t: &GalleryTile| META.with_borrow(|m| m.get(&t.caption.to_lowercase()).cloned());
+    let mut apps: Vec<(GalleryTile, u64)> = found
         .iter()
         .filter(|t| matches(query, &t.title, &t.caption))
+        .filter_map(|t| {
+            let m = meta(&t);
+            let kind_fits = match (&m, filter.kind) {
+                (Some(m), 1) => !m.game,
+                (Some(m), 2) => m.game,
+                (None, 2) => false,
+                _ => true,
+            };
+            let source_fits =
+                filter.source.is_empty() || m.as_ref().is_some_and(|m| m.source == filter.source);
+            // The tooltip says where it came from, and how big it is when that is known.
+            let hint = m.as_ref().map(|m| match m.size {
+                0 => m.source.to_owned(),
+                size => format!("{}, {}", m.source, size_text(size)),
+            });
+            let t = GalleryTile {
+                hint: hint.unwrap_or_default().into(),
+                ..t
+            };
+            (kind_fits && source_fits).then(|| (t, m.map_or(0, |m| m.size)))
+        })
+        .collect();
+    if filter.by_size {
+        // Stable: the name order stays among equals, and the unknown (0) come last.
+        apps.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
+    }
+    if apps.is_empty() {
+        return Vec::new();
+    }
+    let browse = GalleryTile {
+        icon: browse_icon,
+        title: "Choose an .exe file".into(),
+        caption: SharedString::new(),
+        hint: "Add an app by picking its .exe, for one a scan does not list".into(),
+        ..GalleryTile::default()
+    };
+    std::iter::once(browse)
+        .chain(apps.into_iter().map(|(t, _)| t))
         .collect()
 }
 
@@ -1361,7 +1525,8 @@ mod tests {
         assert!(rules(&layout).contains(&"synthtyped.exe".to_owned()));
         wait_scan(&window);
         assert_eq!(s.get_found().row_count(), 300);
-        assert_eq!(s.get_grid().row_count(), 300);
+        // The tile that opens the file dialog is the first of them.
+        assert_eq!(s.get_grid().row_count(), 301);
         assert!(s.get_scanned());
         // A tab that was shown once does not scan again by itself.
         s.invoke_per_app_shown();
@@ -1420,7 +1585,7 @@ mod tests {
         assert!(grid == s.get_grid(), "the grid model was replaced");
         assert_eq!(rules(&layout), ["EDITOR.EXE", "SynthChat.exe"]);
         assert!(found(&window)[0].2, "the picked app is ticked now");
-        assert!(s.get_grid().row_data(0).unwrap().checked);
+        assert!(s.get_grid().row_data(1).unwrap().checked);
         let row = s.get_rules().row_data(1).unwrap();
         assert_eq!((row.name.as_str(), row.mode), ("Synth Chat", 2));
         mock_elapsed_time(Duration::from_millis(1));
@@ -1552,8 +1717,14 @@ mode = \"clipboard\"
         let (window, _layout) = per_app("grid", None, shortcuts("grid", &links));
         wait_scan(&window);
         let s = window.global::<TextState>();
-        let titles =
-            || -> Vec<String> { s.get_grid().iter().map(|t| t.title.to_string()).collect() };
+        // Without the first tile, which opens the file dialog.
+        let titles = || -> Vec<String> {
+            s.get_grid()
+                .iter()
+                .skip(1)
+                .map(|t| t.title.to_string())
+                .collect()
+        };
         assert_eq!(titles(), ["Other Tool", "Synth Chat", "Synth Editor"]);
         s.set_popup_query("EDITOR".into());
         mock_elapsed_time(Duration::from_millis(1));
@@ -1563,6 +1734,119 @@ mode = \"clipboard\"
         assert_eq!(titles(), Vec::<String>::new());
         // Found apps are all still there for the other field.
         assert_eq!(s.get_found().row_count(), 3);
+    }
+
+    /// Owner item 40: the first tile of the popup opens the file dialog (here answered with a
+    /// synthetic exe), and the picked exe gets a rule named by its file, whatever a scan found.
+    #[test]
+    fn the_first_tile_picks_an_exe_by_dialog_and_a_cancel_adds_nothing() {
+        let links = [(
+            "Synth Chat".to_owned(),
+            r"C:\S\chat.exe".to_owned(),
+            String::new(),
+        )];
+        let (window, layout) = per_app("browse", None, shortcuts("browse", &links));
+        wait_scan(&window);
+        let s = window.global::<TextState>();
+        let first = s.get_grid().row_data(0).unwrap();
+        assert_eq!(
+            (first.caption.as_str(), first.title.as_str()),
+            ("", "Choose an .exe file")
+        );
+        assert!(first.icon.size().width > 0, "the tile has its glyph");
+        // The dialog was cancelled: nothing is added.
+        s.invoke_browse_exe();
+        assert_eq!(rules(&layout), ["mstsc.exe"]);
+        super::TEST_EXE.set(Some(PathBuf::from(r"E:\stick\Overwatch.exe")));
+        s.invoke_browse_exe();
+        assert_eq!(rules(&layout), ["mstsc.exe", "Overwatch.exe"]);
+        assert_eq!(saved_names(&layout)["overwatch.exe"], "Overwatch");
+        // The same exe again is a duplicate: refused, its rule flashes.
+        super::TEST_EXE.set(Some(PathBuf::from(r"E:\stick\overwatch.EXE")));
+        s.invoke_browse_exe();
+        assert_eq!(rules(&layout), ["mstsc.exe", "Overwatch.exe"]);
+        assert_eq!(s.get_flash_app(), "Overwatch.exe");
+    }
+
+    /// Owner items 37 and 39: the popup's filters keep apps or games, one source, and sort by size
+    /// on disk with the unknown last; the choices of the source list are what the scan found.
+    #[test]
+    fn the_popup_filters_by_kind_and_source_and_sorts_by_size() {
+        use std::rc::Rc;
+
+        use slint::{Image, ModelRc, VecModel};
+
+        use super::{Filter, Meta, grid};
+        use crate::generated::GalleryTile;
+        let tile = |name: &str, exe: &str| GalleryTile {
+            title: name.into(),
+            caption: exe.into(),
+            ..GalleryTile::default()
+        };
+        let found = ModelRc::from(Rc::new(VecModel::from(vec![
+            tile("Alpha", "alpha.exe"),
+            tile("Overwatch", "Overwatch.exe"),
+            tile("Portal", "portal2.exe"),
+            tile("Zed", "zed.exe"),
+        ])));
+        super::META.with_borrow_mut(|m| {
+            m.clear();
+            for (exe, source, game, size) in [
+                ("alpha.exe", "Start menu", false, 0),
+                ("overwatch.exe", "Battle.net", true, 60_000_000_000),
+                ("portal2.exe", "Steam", true, 12_000_000_000),
+                ("zed.exe", "Installed", false, 5_000),
+            ] {
+                m.insert(exe.into(), Meta { source, game, size });
+            }
+        });
+        let names = |kind, source: &str, by_size| -> Vec<String> {
+            let filter = Filter {
+                kind,
+                source: source.into(),
+                by_size,
+            };
+            grid(&found, "", &filter, Image::default())
+                .into_iter()
+                .skip(1)
+                .map(|t| t.title.to_string())
+                .collect()
+        };
+        assert_eq!(names(0, "", false), ["Alpha", "Overwatch", "Portal", "Zed"]);
+        assert_eq!(names(1, "", false), ["Alpha", "Zed"]);
+        assert_eq!(names(2, "", false), ["Overwatch", "Portal"]);
+        assert_eq!(names(0, "Steam", false), ["Portal"]);
+        assert_eq!(names(2, "Start menu", false), Vec::<String>::new());
+        assert_eq!(names(0, "", true), ["Overwatch", "Portal", "Zed", "Alpha"]);
+        // Nothing to show: not even the file dialog's tile, the empty state has its own button.
+        let none = Filter {
+            kind: 2,
+            source: "Installed".into(),
+            by_size: false,
+        };
+        assert_eq!(grid(&found, "", &none, Image::default()).len(), 0);
+    }
+
+    /// The source list after a scan: "All sources" and each source that found something.
+    #[test]
+    fn the_source_list_names_what_the_scan_found() {
+        let links = [(
+            "Synth Chat".to_owned(),
+            r"C:\S\chat.exe".to_owned(),
+            String::new(),
+        )];
+        let (window, _layout) = per_app("sources", None, shortcuts("sources", &links));
+        wait_scan(&window);
+        let s = window.global::<TextState>();
+        let names: Vec<String> = s.get_source_names().iter().map(|n| n.to_string()).collect();
+        assert_eq!(names, ["All sources", "Start menu"]);
+        // A scan app is from the Start menu, so it is an app and not a game.
+        s.set_popup_type(2);
+        s.invoke_popup_search("".into());
+        assert_eq!(s.get_grid().row_count(), 0);
+        s.set_popup_type(1);
+        s.invoke_popup_search("".into());
+        assert_eq!(s.get_grid().row_count(), 2);
     }
 
     /// The keyboard reaches the field, a letter lands in it, the arrows and Enter take a row.

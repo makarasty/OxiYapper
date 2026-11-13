@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization as _;
 
 use crate::audio::SAMPLE_RATE;
-use crate::config::{Advanced, AudioCtx, Auto, Config, Decoding};
+use crate::config::{Advanced, AudioCtx, Auto, Config, Decoding, PromptSource};
 use crate::ipc::MAX_LINE;
 use crate::types::Language;
 
@@ -372,12 +372,61 @@ pub fn resolve(adv: &Advanced, on_gpu: bool, logical: usize) -> RunParams {
     }
 }
 
-/// The prompt of a run: the person's own text first, then the dictionary words.
+/// The prompt of a run: what `prompt_source` says (the dictionary words, nothing, or the
+/// person's own text first and then the dictionary words).
 pub fn prompt(adv: &Advanced, dictionary: &str) -> String {
-    match (adv.initial_prompt.trim(), dictionary) {
-        ("", d) => d.to_owned(),
-        (p, "") => p.to_owned(),
-        (p, d) => format!("{p} {d}"),
+    match adv.prompt_source() {
+        PromptSource::Dictionary => dictionary.to_owned(),
+        PromptSource::None => String::new(),
+        PromptSource::Custom => match (adv.initial_prompt.trim(), dictionary) {
+            ("", d) => d.to_owned(),
+            (p, "") => p.to_owned(),
+            (p, d) => format!("{p} {d}"),
+        },
+    }
+}
+
+/// Named values of the Advanced numbers, the choices between Auto and Custom. The values only
+/// fill the number: the config keeps the number, so a file never needs the names.
+pub const TEMPERATURE_PRESETS: [f32; 2] = [0.3, 0.7];
+/// Keep more speech (a segment is dropped only when almost surely silence), drop more silence.
+pub const NO_SPEECH_PRESETS: [f32; 2] = [0.9, 0.3];
+/// Retry more (stricter), retry less (looser).
+pub const LOGPROB_PRESETS: [f32; 2] = [-0.5, -2.0];
+/// Retry more (a segment repeating itself is tried again sooner), retry less.
+pub const ENTROPY_PRESETS: [f32; 2] = [1.8, 3.5];
+
+/// Max (every logical thread) and Half of them, put in the range `threads` takes.
+pub fn thread_presets(logical: usize) -> [f32; 2] {
+    let n = |n: usize| {
+        let range = Advanced::THREADS;
+        f32::from(
+            u8::try_from(n)
+                .unwrap_or(u8::MAX)
+                .clamp(*range.start(), *range.end()),
+        )
+    };
+    [n(logical), n(logical / 2)]
+}
+
+/// The choice a number shows: 0 Auto, 1.. the preset it equals, then Custom (`presets.len() + 1`).
+/// `custom` keeps Custom picked while the typed number happens to equal a preset.
+pub fn preset_mode(value: Auto<f32>, presets: &[f32], custom: bool) -> usize {
+    match value {
+        Auto::Auto => 0,
+        Auto::Set(_) if custom => presets.len() + 1,
+        Auto::Set(v) => presets
+            .iter()
+            .position(|p| (p - v).abs() < 1e-4)
+            .map_or(presets.len() + 1, |i| i + 1),
+    }
+}
+
+/// What choice `mode` writes: Auto, its preset, or the number typed beside it (Custom).
+pub fn preset_value(mode: usize, presets: &[f32], typed: f32) -> Auto<f32> {
+    match mode {
+        0 => Auto::Auto,
+        m => Auto::Set(presets.get(m - 1).copied().unwrap_or(typed)),
     }
 }
 
@@ -466,5 +515,63 @@ mod tests {
         assert_eq!(prompt(&adv(" Meeting notes. "), ""), "Meeting notes.");
         assert_eq!(prompt(&adv("Notes."), "Oxi"), "Notes. Oxi");
         assert_eq!(prompt(&adv(""), ""), "");
+    }
+
+    #[test]
+    fn the_prompt_source_decides_what_whisper_reads_first() {
+        let adv = |source, p: &str| Advanced {
+            initial_prompt: p.into(),
+            prompt_source: source,
+            ..Advanced::default()
+        };
+        // A file from before the choice: the typed text is Custom, none is the dictionary.
+        assert_eq!(adv(None, "").prompt_source(), PromptSource::Dictionary);
+        assert_eq!(adv(None, "Notes.").prompt_source(), PromptSource::Custom);
+        // The dictionary alone keeps the text for later; None drops both; Custom is today's.
+        let dictionary = Some(PromptSource::Dictionary);
+        let none = Some(PromptSource::None);
+        let custom = Some(PromptSource::Custom);
+        assert_eq!(prompt(&adv(dictionary, "Notes."), "Oxi"), "Oxi");
+        assert_eq!(prompt(&adv(none, "Notes."), "Oxi"), "");
+        assert_eq!(prompt(&adv(custom, "Notes."), "Oxi"), "Notes. Oxi");
+        assert_eq!(prompt(&adv(custom, ""), "Oxi"), "Oxi");
+    }
+
+    #[test]
+    fn number_choices_map_to_presets_and_back() {
+        let presets = TEMPERATURE_PRESETS;
+        assert_eq!(preset_mode(Auto::Auto, &presets, false), 0);
+        assert_eq!(preset_mode(Auto::Set(0.3), &presets, false), 1);
+        assert_eq!(preset_mode(Auto::Set(0.7), &presets, false), 2);
+        assert_eq!(preset_mode(Auto::Set(0.5), &presets, false), 3, "Custom");
+        // Custom picked while the number equals a preset stays Custom.
+        assert_eq!(preset_mode(Auto::Set(0.3), &presets, true), 3);
+        assert_eq!(preset_value(0, &presets, 0.9), Auto::Auto);
+        assert_eq!(preset_value(2, &presets, 0.9), Auto::Set(0.7));
+        assert_eq!(preset_value(3, &presets, 0.9), Auto::Set(0.9));
+        // Every preset is in the range its parameter takes.
+        for (presets, range) in [
+            (TEMPERATURE_PRESETS, Advanced::TEMPERATURE),
+            (NO_SPEECH_PRESETS, Advanced::NO_SPEECH),
+            (LOGPROB_PRESETS, Advanced::LOGPROB),
+            (ENTROPY_PRESETS, Advanced::ENTROPY),
+        ] {
+            assert!(presets.iter().all(|p| range.contains(p)), "{presets:?}");
+        }
+    }
+
+    #[test]
+    fn thread_presets_are_max_and_half_of_the_logical_threads() {
+        assert_eq!(thread_presets(16), [16.0, 8.0]);
+        assert_eq!(thread_presets(1), [1.0, 1.0]);
+        assert_eq!(thread_presets(3), [3.0, 1.0]);
+        assert_eq!(
+            thread_presets(64),
+            [32.0, 32.0],
+            "put in the range threads takes"
+        );
+        assert_eq!(thread_presets(500), [32.0, 32.0]);
+        // Max wins when both are one number.
+        assert_eq!(preset_mode(Auto::Set(1.0), &thread_presets(1), false), 1);
     }
 }

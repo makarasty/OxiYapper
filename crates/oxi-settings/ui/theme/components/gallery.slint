@@ -7,7 +7,7 @@ import { Theme, Shell } from "../tokens.slint";
 import { Icons } from "../icons.slint";
 import { CardFrame, Caption, KeyFocus, Tip, ScrollBox } from "base.slint";
 import { Tile } from "tiles.slint";
-import { EmptyState } from "feedback.slint";
+import { EmptyState, Badge, BadgeKind } from "feedback.slint";
 
 export struct GalleryTile {
     // Monochrome glyph, tinted like a `TileItem`; `icon-selected` (filled) is drawn while picked.
@@ -29,6 +29,8 @@ export struct GalleryTile {
     mark: int,
     // A percent drawn in that slot, right-aligned, while the tile's file downloads.
     mark-text: string,
+    // An accent `Badge` beside the glyph ("Recommended"); empty shows none. Said before `hint`.
+    badge: string,
 }
 
 // One-way like `TilePicker`: `picked` fires, the owner updates `selected` (-1: none). The arrows
@@ -37,6 +39,16 @@ export struct GalleryTile {
 export component CardGrid {
     in property <[GalleryTile]> tiles;
     in property <int> selected: -1;
+    // A window onto `tiles`: the `count` tiles from `first` (-1: all the rest), so two grids can
+    // share one list (the Off and Own file row above the sounds). `selected` and `picked` keep
+    // counting from the list's start.
+    in property <int> first: 0;
+    in property <int> count: -1;
+    // Cells as wide as those of a fuller grid beside it (the Off and Own file row above the
+    // gallery): `pack` keeps the columns it has room for even when there are fewer tiles, and
+    // `reserve-gutter` leaves the other grid's scrollbar gutter.
+    in property <bool> pack: false;
+    in property <bool> reserve-gutter: false;
     // Centred in the box when `tiles` is empty, as an `EmptyState` (DS-12); the glyph is optional.
     in property <string> empty-text;
     in property <image> empty-icon;
@@ -48,31 +60,35 @@ export component CardGrid {
     callback picked(int);
 
     // Read by `tests/gallery.rs`.
-    out property <int> cursor: clamp(root.raw-cursor, 0, max(0, root.tiles.length - 1));
+    out property <int> cursor: clamp(root.raw-cursor, 0, max(0, root.total - 1));
     out property <int> columns: root.cols;
     out property <length> scrolled: -list.viewport-y;
     // The height at which no tile row scrolls, whatever the height given.
-    out property <length> full-height: ceil(root.tiles.length / root.fit(root.width)) * root.row-height;
+    out property <length> full-height: ceil(root.total / root.fit(root.width)) * root.row-height;
     // The height that holds the empty state: a page may give an empty gallery just this.
     out property <length> empty-height: empty-measure.preferred-height;
 
     // The widest column that still fits, so a wider window gets more tiles, not stretched ones
-    // (until every tile has its own column).
-    property <length> min-cell: Theme.tile-min-width;
-    property <length> tile-height: Theme.tile-height;
+    // (until every tile has its own column). Settable for a short list of one-line cards (the
+    // sound events): narrower and shorter.
+    in property <length> min-cell: Theme.tile-min-width;
+    in property <length> tile-height: Theme.tile-height;
     property <length> gap: Theme.tile-gap;
     // Half a gap around every tile inside the scroller: the focus ring must not be clipped.
     property <length> edge: root.gap / 2;
     property <length> row-height: root.tile-height + root.gap;
     // The tiles step aside for the bar's gutter only when there is one (DS-18.2), by the scroller's
     // own rule and width: rows at full width that overflow it still overflow once narrowed.
-    property <bool> overflows: list.overflow-for(ceil(root.tiles.length / root.fit(root.width)) * root.row-height);
-    property <length> usable: root.width - (root.overflows ? Theme.scrollbar-gutter : 0);
+    out property <bool> overflows: list.overflow-for(ceil(root.total / root.fit(root.width)) * root.row-height);
+    property <length> usable: root.width - (root.overflows || root.reserve-gutter ? Theme.scrollbar-gutter : 0);
     // Never more columns than tiles, so a short gallery has no empty columns that cut every title
     // (t21b); the cells share the width up to `tile-max-width`, then pack left (DS-15.2).
-    property <int> cols: min(root.fit(root.usable), max(1, root.tiles.length));
+    property <int> cols: root.pack ? root.fit(root.usable) : min(root.fit(root.usable), max(1, root.total));
     property <length> cell: min(Theme.tile-max-width, (root.usable - (root.cols - 1) * root.gap) / root.cols);
-    property <int> rows: ceil(root.tiles.length / root.cols);
+    property <int> rows: ceil(root.total / root.cols);
+    property <int> total: root.count < 0 ? max(0, root.tiles.length - root.first) : min(root.count, max(0, root.tiles.length - root.first));
+    // `selected` in this window's own count, -1 outside it.
+    property <int> sel: root.selected >= root.first && root.selected < root.first + root.total ? root.selected - root.first : -1;
     property <int> raw-cursor;
     property <bool> key-focus;
 
@@ -88,8 +104,8 @@ export component CardGrid {
     }
 
     function pick(i: int) {
-        if (!root.locked && i >= 0 && i < root.tiles.length && !root.tiles[i].disabled && i != root.selected) {
-            root.picked(i);
+        if (!root.locked && i >= 0 && i < root.total && !root.tiles[root.first + i].disabled && i != root.sel) {
+            root.picked(root.first + i);
         }
     }
 
@@ -109,7 +125,7 @@ export component CardGrid {
     }
 
     function move-to(i: int) {
-        if (i >= 0 && i < root.tiles.length) {
+        if (i >= 0 && i < root.total) {
             root.raw-cursor = i;
             root.key-focus = true;
             root.reveal(i);
@@ -117,9 +133,9 @@ export component CardGrid {
     }
 
     function follow-selection() {
-        if (root.selected >= 0) {
-            root.raw-cursor = root.selected;
-            root.reveal(root.selected);
+        if (root.sel >= 0) {
+            root.raw-cursor = root.sel;
+            root.reveal(root.sel);
         }
     }
 
@@ -143,7 +159,7 @@ export component CardGrid {
     accessible-role: radio-group;
 
     fs := FocusScope {
-        enabled: !root.locked && root.tiles.length > 0;
+        enabled: !root.locked && root.total > 0;
         focus-on-click: false;
         focus-gained(reason) => {
             root.key-focus = KeyFocus.after(reason, root.key-focus);
@@ -165,7 +181,7 @@ export component CardGrid {
             if (event.text == Key.DownArrow) {
                 // From above a short last row, Down lands on its last tile.
                 if (floor(root.cursor / root.cols) + 1 < root.rows) {
-                    root.move-to(min(root.cursor + root.cols, root.tiles.length - 1));
+                    root.move-to(min(root.cursor + root.cols, root.total - 1));
                 }
                 return accept;
             }
@@ -185,7 +201,7 @@ export component CardGrid {
         accessible-role: none;
     }
 
-    if root.tiles.length == 0: CardFrame {
+    if root.total == 0: CardFrame {
         EmptyState {
             text: root.empty-text;
             icon: root.empty-icon;
@@ -199,16 +215,16 @@ export component CardGrid {
         height: root.height + 2 * root.edge;
         // The thumb centred in the grid's gutter: the scroller overhangs the grid by `edge`.
         bar-inset: root.edge + (Theme.scrollbar-gutter - Theme.scrollbar-width) / 2;
-        visible: root.tiles.length > 0;
+        visible: root.total > 0;
         content-height: root.rows * root.row-height;
         for row in root.rows: Rectangle {
             y: row * root.row-height;
             height: root.row-height;
             // shortcut: an empty `Tile` draws frame, fill, badge and ring, and the content goes on top, because
             // `Tile` wraps and always tints; move elide and `picture` into `Tile` when tiles.slint is in scope.
-            for col in min(root.cols, root.tiles.length - row * root.cols): tile := Tile {
+            for col in min(root.cols, root.total - row * root.cols): tile := Tile {
                 property <int> i: row * root.cols + col;
-                property <GalleryTile> data: root.tiles[self.i];
+                property <GalleryTile> data: root.tiles[root.first + self.i];
                 property <bool> cut: title.preferred-width > title.width;
                 // Holds "100 %" at the caption size.
                 property <length> percent-slot: 40px;
@@ -216,14 +232,14 @@ export component CardGrid {
                 y: root.edge;
                 width: root.cell;
                 height: root.tile-height;
-                selected: self.i == root.selected || self.data.checked;
+                selected: self.i == root.sel || self.data.checked;
                 hover: touch.has-hover || root.force-hover == self.i;
                 pressed: touch.pressed;
                 read-only: root.locked || self.data.disabled;
                 focused: self.i == root.cursor && (root.force-focus || (root.key-focus && fs.has-focus));
                 accessible-role: radio-button;
                 accessible-label: self.data.title;
-                accessible-description: self.data.hint;
+                accessible-description: self.data.badge == "" ? self.data.hint : self.data.hint == "" ? self.data.badge : self.data.badge + ". " + self.data.hint;
                 accessible-checkable: true;
                 accessible-checked: self.selected;
                 accessible-enabled: !self.read-only;
@@ -238,6 +254,7 @@ export component CardGrid {
                     alignment: start;
                     HorizontalLayout {
                         alignment: start;
+                        spacing: Theme.space-2;
                         Image {
                             source: tile.data.picture.width > 0 ? tile.data.picture : tile.selected && tile.data.icon-selected.width > 0 ? tile.data.icon-selected : tile.data.icon.width > 0 ? tile.data.icon : root.fallback-icon;
                             width: Theme.icon-size-large;
@@ -247,6 +264,16 @@ export component CardGrid {
                             // A full-colour picture has no ink to grey: it fades instead (an image, no text).
                             opacity: tile.read-only && tile.data.picture.width > 0 ? 0.4 : 1;
                             accessible-role: none;
+                        }
+                        // Not beside a download's percent: in the least cell the two would meet.
+                        // The glyph keeps the row's height, so nothing moves when it goes.
+                        if tile.data.badge != "" && tile.data.mark-text == "": VerticalLayout {
+                            alignment: center;
+                            Badge {
+                                text: tile.data.badge;
+                                kind: BadgeKind.accent;
+                                accessible-role: none;
+                            }
                         }
                     }
                     title := Text {
@@ -300,6 +327,7 @@ export component CardGrid {
                     // A cut title stands in full here (rule 28).
                     text: !tile.cut ? tile.data.hint : tile.data.hint == "" ? tile.data.title : tile.data.title + "\n" + tile.data.hint;
                     hovered: touch.has-hover;
+                    pressed: touch.pressed;
                 }
             }
         }

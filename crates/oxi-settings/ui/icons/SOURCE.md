@@ -88,6 +88,12 @@ entries out again.
 | sound-wave-circle | waveform bold | About nnnoiseless tile |
 | icons | shapes bold | About icon set tile |
 | paint-brush | paint-brush bold | About tiny-skia tile |
+| audio-file | file-audio bold | About symphonia tile |
+| sine-wave | wave-sine bold | About rubato tile |
+| ear | ear bold | About earshot tile |
+| windows-api | windows-logo bold | About windows-rs tile |
+| file-dialog | browsers bold | About rfd tile |
+| cloud-down | cloud-arrow-down bold | About ureq tile |
 
 ## Icon semantics (DESIGN-SYSTEM section 24)
 

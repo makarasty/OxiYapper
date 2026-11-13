@@ -30,6 +30,12 @@ component TechCard inherits ClickCard {
         // The whole tile under its padding: the card body packs at the top, and the page sets the
         // height so the mark box sits as far from the top and bottom as from the left.
         height: root.height - 2 * Theme.card-padding-v;
+        // The short tile's mark sits `space-2` from every edge: the card body's padding is pulled back
+        // by the difference, the layout's height unchanged.
+        padding-left: root.short ? Theme.space-2 - Theme.card-padding-h : 0px;
+        padding-right: self.padding-left;
+        padding-top: root.short ? Theme.space-2 - Theme.card-padding-v : 0px;
+        padding-bottom: self.padding-top;
         spacing: Theme.space-3;
         VerticalLayout {
             alignment: center;
@@ -121,11 +127,12 @@ component AuthorCard inherits Card {
     callback open(string);
     // Under the second tile column the line shows "Made in Ukraine" alone.
     in property <bool> compact;
+    in property <length> logo-size;
     HorizontalLayout {
         spacing: Theme.icon-gap;
         Rectangle {
-            width: Theme.about-logo-size;
-            height: Theme.about-logo-size;
+            width: root.logo-size;
+            height: root.logo-size;
             border-radius: Theme.radius-round;
             clip: true;
             Image {
@@ -205,6 +212,12 @@ export component AboutPage inherits VerticalLayout {
         { name: "Phosphor Icons", note: @tr("Every icon in the app"), mark: Icons.icons, brand: Theme.brand-phosphor, url: "https://github.com/phosphor-icons/core" },
         { name: "Claude Code", note: @tr("Pair programming"), mark: Icons.claude-mark, brand: Theme.brand-claude, url: "https://github.com/anthropics/claude-code" },
         { name: "tiny-skia", note: @tr("Draws the overlay pill"), mark: Icons.paint-brush, brand: Theme.brand-tiny-skia, url: "https://github.com/RazrFalcon/tiny-skia" },
+        { name: "symphonia", note: @tr("Reads audio files"), mark: Icons.audio-file, brand: Theme.brand-symphonia, url: "https://github.com/pdeljanov/Symphonia" },
+        { name: "rubato", note: @tr("Resamples audio"), mark: Icons.sine-wave, brand: Theme.brand-rubato, url: "https://github.com/HEnquist/rubato" },
+        { name: "earshot", note: @tr("Detects speech"), mark: Icons.ear, brand: Theme.brand-earshot, url: "https://github.com/pykeio/earshot" },
+        { name: "windows-rs", note: @tr("Talks to Windows"), mark: Icons.windows-api, brand: Theme.brand-windows-rs, url: "https://github.com/microsoft/windows-rs" },
+        { name: "rfd", note: @tr("File dialogs"), mark: Icons.file-dialog, brand: Theme.brand-rfd, url: "https://github.com/PolyMeilex/rfd" },
+        { name: "ureq", note: @tr("Model downloads"), mark: Icons.cloud-down, brand: Theme.brand-ureq, url: "https://github.com/algesten/ureq" },
     ];
     property <int> columns: 3;
     property <int> rows: ceil(root.techs.length / root.columns);
@@ -222,7 +235,10 @@ export component AboutPage inherits VerticalLayout {
     property <length> tall-tile: 2 * Theme.card-padding-h + Theme.control-height;
     property <length> card-height: 2 * Theme.card-padding-v + Theme.about-logo-size;
     property <length> group-head: Theme.icon-size + Theme.header-gap;
-    property <length> short-tile: 2 * Theme.card-padding-h + Theme.icon-size;
+    // Under the full height the logo shrinks to a control height; `card-height` stays the full size so `tight` does not depend on itself.
+    property <length> logo-size: root.tight ? Theme.control-height : Theme.about-logo-size;
+    // The short tile is the mark between 8 px on all sides (DS-15.4); the cards shrink their logo when tight, so five rows fit 720 x 520 under a banner.
+    property <length> short-tile: 2 * Theme.space-2 + Theme.icon-size;
     // The page as drawn: two cards, the tile grid, two group titles and the gaps.
     property <length> drawn-height: 2 * root.card-height + root.rows * (root.notes-fit ? root.tall-tile : root.short-tile) + (root.rows - 1) * Theme.tile-gap + 2 * root.group-head + 2 * Theme.group-gap;
     // Too low for that (UI rule 25): no group titles, short tiles.
@@ -230,12 +246,12 @@ export component AboutPage inherits VerticalLayout {
     property <bool> short: root.tight || !root.notes-fit;
     property <length> tile-height: root.short ? root.short-tile : root.tall-tile;
     alignment: start;
-    spacing: root.tight ? Theme.space-3 : Theme.group-gap;
+    spacing: root.tight ? Theme.space-1 : Theme.group-gap;
     Card {
         HorizontalLayout {
             spacing: Theme.icon-gap;
             AppMark {
-                width: Theme.about-logo-size;
+                width: root.logo-size;
             }
             VerticalLayout {
                 alignment: center;
@@ -348,6 +364,7 @@ export component AboutPage inherits VerticalLayout {
     Group {
         title: root.tight ? "" : @tr("Author");
         AuthorCard {
+            logo-size: root.logo-size;
             open(url) => {
                 root.open(url);
             }

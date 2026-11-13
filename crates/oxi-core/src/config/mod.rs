@@ -6,7 +6,7 @@ mod schema;
 
 pub use extra::{
     Accent, Advanced, AudioChannel, AudioCtx, Auto, BadAccent, Decoding, FileFormat, FileMode,
-    LanguageKey, Output, Rgb, Snippet, Text, TypeSpeed, VadSensitivity,
+    LanguageKey, Output, PromptSource, Rgb, Snippet, Text, TypeSpeed, VadSensitivity,
 };
 pub use schema::{
     AppLanguage, Audio, Config, Debug, History, Hotkey, Model, OtherKey, Overlay, OverlayPosition,

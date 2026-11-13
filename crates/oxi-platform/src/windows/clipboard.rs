@@ -184,7 +184,7 @@ impl WinClipboard {
     /// owner without a time limit, so the wait here gives up after `DELAYED_RENDER_TIMEOUT`.
     /// A helper that gave up keeps the clipboard open until the owner answers or exits (the
     /// thread cannot be cut short); an owner Windows already marks hung is never asked.
-    fn read_whole(&self) -> Result<Saved, Miss> {
+    fn read_whole(&self) -> Result<(Saved, Vec<u32>), Miss> {
         // SAFETY: no arguments; a null owner is passed on as null.
         if unsafe { IsHungAppWindow(GetClipboardOwner()) } != 0 {
             return Err(Miss::Incomplete(IncompleteWhy::HungOwner));
@@ -336,7 +336,7 @@ impl Clipboard for WinClipboard {
     /// [`WinClipboard::read_whole`]; a miss is logged with its reason (names and sizes only).
     fn snapshot(&mut self) -> Snap<Saved> {
         let started = Instant::now();
-        let read = self.read_whole();
+        let read = report(self.read_whole(), log_dropped);
         self.last_why = None;
         match read {
             Ok(saved) => Snap::Complete(saved),
@@ -640,57 +640,156 @@ fn carries_exclusion(saved: &[(u32, Vec<u8>)], [monitor, in_history, _]: [u32; 3
 /// bitmap) or nothing but markers. Anything else may register, however big (Win+V's size limit
 /// is not documented), so a doubt means waiting for the entry, never deleting under it.
 fn history_skips(saved: &[(u32, Vec<u8>)], markers: [u32; 3]) -> bool {
-    let shown = |f: u32| {
-        [CF_UNICODETEXT, CF_TEXT, CF_OEMTEXT, CF_DIB, CF_DIBV5]
-            .iter()
-            .any(|x| u32::from(*x) == f)
-    };
     let files_only = saved.iter().any(|(f, _)| *f == u32::from(CF_HDROP))
         && !saved.iter().any(|(f, _)| shown(*f));
     files_only || saved.iter().all(|(f, _)| markers.contains(f))
 }
 
+/// A text or bitmap format: what Win+V shows and a paste of the restored copy can use.
+fn shown(format: u32) -> bool {
+    [CF_UNICODETEXT, CF_TEXT, CF_OEMTEXT, CF_DIB, CF_DIBV5]
+        .iter()
+        .any(|x| u32::from(*x) == format)
+}
+
+/// The formats of a virtual file (a Win+V screenshot item, an Outlook attachment): its contents
+/// live only behind OLE, so `GetClipboardData` never returns `FileContents`.
+const VIRTUAL_FILE: [&str; 3] = [
+    "FileContents",
+    "FileGroupDescriptorW",
+    "FileGroupDescriptor",
+];
+
 /// What the snapshot thread reports: about to read this format (a call that can block on its
 /// owner), or finished (closed).
 enum Step {
     Reading(u32),
-    Done(Result<Saved, Miss>),
+    Done(Result<(Saved, Vec<u32>), Miss>),
 }
 
 /// Copies every copyable format, sending `Reading` before each call that can block on an owner.
-/// The clipboard is closed when this returns.
-fn read_all(tx: &Sender<Step>, exclude: [u32; 3]) -> Result<Saved, Miss> {
-    let incomplete = |why| Err(Miss::Incomplete(why));
+/// The clipboard is closed when this returns. The formats left out come back with the copy.
+fn read_all(tx: &Sender<Step>, exclude: [u32; 3]) -> Result<(Saved, Vec<u32>), Miss> {
     let Ok(window) = Window::new() else {
-        return incomplete(IncompleteWhy::NoHelper);
+        return Err(Miss::Incomplete(IncompleteWhy::NoHelper));
     };
-    let Ok(_open) = Open::new(&window) else {
+    let Ok(open) = Open::new(&window) else {
         return Err(Miss::Locked);
     };
+    let read = read_formats(&mut Live { _open: &open }, tx, exclude);
+    drop(open);
+    read
+}
+
+/// Passes `read` on; `log` sees the formats left out only for a snapshot the caller takes, so a
+/// read that finished after the caller gave up (a `RenderTimeout`) never claims a save.
+fn report(read: Result<(Saved, Vec<u32>), Miss>, log: impl FnOnce(&[u32])) -> Result<Saved, Miss> {
+    let (saved, dropped) = read?;
+    if !dropped.is_empty() {
+        log(&dropped);
+    }
+    Ok(saved)
+}
+
+/// One line for a copy saved without its virtual file: format names and the owner exe only.
+fn log_dropped(dropped: &[u32]) {
+    let names: Vec<String> = dropped.iter().copied().map(format_name).collect();
+    tracing::info!(
+        formats = ?names,
+        clip_owner_exe = owner_exe(),
+        "clipboard saved without its virtual file: unreadable outside OLE, text and image kept"
+    );
+}
+
+/// The calls [`read_formats`] makes on the open clipboard, so a test can fake one.
+trait Formats {
+    /// The format after `format` (0: the first); `Ok(0)` at the end, `Err(code)` on a failure.
+    fn next(&mut self, format: u32) -> Result<u32, u32>;
+    /// The bytes of `format`, at most `room` of them.
+    fn read(&mut self, format: u32, room: usize) -> Result<Vec<u8>, IncompleteWhy>;
+    /// The registered name of `format`; empty for a standard one.
+    fn name(&self, format: u32) -> String;
+}
+
+/// The real clipboard, held open by the borrowed [`Open`].
+struct Live<'a> {
+    _open: &'a Open<'a>,
+}
+
+impl Formats for Live<'_> {
+    fn next(&mut self, format: u32) -> Result<u32, u32> {
+        // Cleared first: the end of the list is told from a failure by the last error, and an
+        // earlier call (a retried open, say) may have left one behind.
+        // SAFETY: the clipboard is open on this thread (`_open`); the last error is this thread's.
+        unsafe {
+            SetLastError(0);
+            let next = EnumClipboardFormats(format);
+            let code = if next == 0 { GetLastError() } else { 0 };
+            if code == 0 { Ok(next) } else { Err(code) }
+        }
+    }
+
+    fn read(&mut self, format: u32, room: usize) -> Result<Vec<u8>, IncompleteWhy> {
+        // SAFETY: the clipboard is open on this thread; a delayed render runs in the owner.
+        let handle = unsafe {
+            SetLastError(0);
+            GetClipboardData(format)
+        };
+        if handle.is_null() {
+            // SAFETY: reads this thread's last-error value, no arguments.
+            let code = unsafe { GetLastError() };
+            return Err(IncompleteWhy::NoData { format, code });
+        }
+        read_global(handle, format, room)
+    }
+
+    fn name(&self, format: u32) -> String {
+        format_name(format)
+    }
+}
+
+/// Every copyable format of `clip` with its bytes, sending `Reading` before each read, and the
+/// formats left out. Item 21 (owner 2026-11-13, q3 b): a virtual file whose `FileContents` cannot
+/// be read is left out with its descriptors when text or an image remains, so the dictation is
+/// pasted and the copy comes back as that; alone, or with any other unreadable format, the copy
+/// is not whole (SPEC:42: typed, left alone).
+fn read_formats(
+    clip: &mut impl Formats,
+    tx: &Sender<Step>,
+    exclude: [u32; 3],
+) -> Result<(Saved, Vec<u32>), Miss> {
+    let incomplete = |why| Err(Miss::Incomplete(why));
     let mut saved: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut skipped_handle = false;
+    let mut no_file = None;
     let mut room = SNAPSHOT_CAP;
     let mut format = 0;
     loop {
-        // Cleared first: the end of the list is told from a failure by the last error, and an
-        // earlier call (a retried open, say) may have left one behind.
-        // SAFETY: the clipboard is open on this thread (`_open`).
-        format = unsafe {
-            SetLastError(0);
-            EnumClipboardFormats(format)
+        format = match clip.next(format) {
+            Ok(next) => next,
+            Err(code) => return incomplete(IncompleteWhy::EnumFailed { code }),
         };
         if format == 0 {
-            // SAFETY: reads this thread's last-error value, no arguments.
-            let code = unsafe { GetLastError() };
-            if code != 0 {
-                return incomplete(IncompleteWhy::EnumFailed { code });
-            }
             // A clipboard of handle formats only (a lone metafile, markers aside) would
             // restore as nothing.
             if skipped_handle && saved.iter().all(|(f, _)| exclude.contains(f)) {
                 return incomplete(IncompleteWhy::OnlyHandles);
             }
-            return Ok(Saved(saved));
+            let Some((file, why)) = no_file else {
+                return Ok((Saved(saved), Vec::new()));
+            };
+            let (descriptors, rest): (Vec<_>, Vec<_>) = saved
+                .into_iter()
+                .partition(|(f, _)| VIRTUAL_FILE.contains(&clip.name(*f).as_str()));
+            if !rest
+                .iter()
+                .any(|(f, _)| shown(*f) || clip.name(*f) == "PNG")
+            {
+                return incomplete(why);
+            }
+            let mut dropped: Vec<u32> = descriptors.into_iter().map(|(f, _)| f).collect();
+            dropped.push(file);
+            return Ok((Saved(rest), dropped));
         }
         if tx.send(Step::Reading(format)).is_err() {
             return incomplete(IncompleteWhy::NoHelper); // the caller gave up already
@@ -699,21 +798,16 @@ fn read_all(tx: &Sender<Step>, exclude: [u32; 3]) -> Result<Saved, Miss> {
         match kind(format, &kept) {
             Kind::Handle => skipped_handle = true,
             Kind::Synthesised => {}
-            Kind::Copy => {
-                // SAFETY: the clipboard is open on this thread; a delayed render runs in the owner.
-                let handle = unsafe {
-                    SetLastError(0);
-                    GetClipboardData(format)
-                };
-                if handle.is_null() {
-                    // SAFETY: reads this thread's last-error value, no arguments.
-                    let code = unsafe { GetLastError() };
-                    return incomplete(IncompleteWhy::NoData { format, code });
+            Kind::Copy => match clip.read(format, room) {
+                Ok(bytes) => {
+                    room -= bytes.len();
+                    saved.push((format, bytes));
                 }
-                let bytes = read_global(handle, format, room).map_err(Miss::Incomplete)?;
-                room -= bytes.len();
-                saved.push((format, bytes));
-            }
+                Err(why @ IncompleteWhy::NoData { .. }) if clip.name(format) == VIRTUAL_FILE[0] => {
+                    no_file = Some((format, why));
+                }
+                Err(why) => return incomplete(why),
+            },
         }
     }
 }
@@ -1290,6 +1384,127 @@ mod tests {
     const IDS: [u32; 3] = [0xC001, 0xC002, 0xC003];
     /// A clipboard format id and its bytes.
     type Format = (u32, Vec<u8>);
+
+    /// A clipboard of `(format, name, bytes)`; `None` bytes: `GetClipboardData` gives nothing,
+    /// as for a virtual file's `FileContents`.
+    struct Fake(Vec<(u32, &'static str, Option<&'static [u8]>)>);
+
+    impl Formats for Fake {
+        fn next(&mut self, format: u32) -> Result<u32, u32> {
+            let at = self
+                .0
+                .iter()
+                .position(|(f, ..)| *f == format)
+                .map_or(0, |i| i + 1);
+            Ok(self.0.get(at).map_or(0, |(f, ..)| *f))
+        }
+        fn read(&mut self, format: u32, _: usize) -> Result<Vec<u8>, IncompleteWhy> {
+            let (_, _, bytes) = self.0.iter().find(|(f, ..)| *f == format).unwrap();
+            bytes
+                .map(<[u8]>::to_vec)
+                .ok_or(IncompleteWhy::NoData { format, code: 0 })
+        }
+        fn name(&self, format: u32) -> String {
+            let (_, name, _) = self.0.iter().find(|(f, ..)| *f == format).unwrap();
+            (*name).to_owned()
+        }
+    }
+
+    /// `read_formats` on `formats`; a whole read also proves every offered format was either
+    /// saved or listed as dropped, so a restore never loses one silently.
+    fn read_fake(
+        formats: &[(u32, &'static str, Option<&'static [u8]>)],
+    ) -> Result<(Vec<u32>, Vec<u32>), Miss> {
+        let (tx, _rx) = mpsc::channel();
+        let (Saved(saved), dropped) = read_formats(&mut Fake(formats.to_vec()), &tx, IDS)?;
+        let saved: Vec<u32> = saved.into_iter().map(|(f, _)| f).collect();
+        for (f, ..) in formats {
+            assert!(
+                saved.contains(f) ^ dropped.contains(f),
+                "format {f:#x} neither saved nor dropped once"
+            );
+        }
+        Ok((saved, dropped))
+    }
+
+    /// Item 21 (owner 2026-11-13, q3 b): a Win+V screenshot item or an Outlook message keeps every
+    /// readable format; only the virtual file goes, listed (and so logged) by format.
+    #[test]
+    fn a_virtual_file_is_dropped_and_listed_the_readable_formats_kept() {
+        const DESC: u32 = 0xC100;
+        const FILE: u32 = 0xC101;
+        const PNG: u32 = 0xC102;
+        let dib = u32::from(CF_DIB);
+        let text = u32::from(CF_UNICODETEXT);
+        let shot = [
+            (DESC, "FileGroupDescriptorW", Some(&b"d"[..])),
+            (FILE, "FileContents", None),
+            (dib, "", Some(&b"bmp"[..])),
+            (PNG, "PNG", Some(&b"png"[..])),
+        ];
+        assert_eq!(read_fake(&shot), Ok((vec![dib, PNG], vec![DESC, FILE])));
+        let mail = [
+            (text, "", Some(&b"t"[..])),
+            (DESC, "FileGroupDescriptor", Some(&b"d"[..])),
+            (FILE, "FileContents", None),
+        ];
+        assert_eq!(read_fake(&mail), Ok((vec![text], vec![DESC, FILE])));
+    }
+
+    /// A copy of a virtual file and a PNG only (no `CF_DIB`, no text) is an image all the same:
+    /// pasted, and restored as that PNG.
+    #[test]
+    fn a_virtual_file_next_to_a_png_alone_is_dropped_and_the_png_kept() {
+        let copy = [
+            (0xC100, "FileGroupDescriptorW", Some(&b"d"[..])),
+            (0xC101, "FileContents", None),
+            (0xC102, "PNG", Some(&b"png"[..])),
+        ];
+        assert_eq!(read_fake(&copy), Ok((vec![0xC102], vec![0xC100, 0xC101])));
+    }
+
+    /// The "saved without its virtual file" line is for a snapshot the caller got: a read that
+    /// finished after a timeout, or failed, reaches no log.
+    #[test]
+    fn the_dropped_formats_are_logged_only_for_a_snapshot_that_was_returned() {
+        let mut seen = None;
+        let kept = report(Ok((Saved(vec![(1, vec![])]), vec![7, 8])), |d| {
+            seen = Some(d.to_vec());
+        });
+        assert!(kept.is_ok());
+        assert_eq!(seen, Some(vec![7, 8]));
+        let mut logged = false;
+        let _ = report(Ok((Saved(vec![]), vec![])), |_| logged = true);
+        let timeout = Miss::Incomplete(IncompleteWhy::RenderTimeout { format: 9 });
+        assert_eq!(report(Err(timeout), |_| logged = true).err(), Some(timeout));
+        assert!(!logged);
+    }
+
+    /// A lone virtual file, or any other unreadable format, is never dropped: the copy is not
+    /// whole, so the text is typed and the clipboard left alone (SPEC:42).
+    #[test]
+    fn no_other_unreadable_format_is_ever_dropped() {
+        let no_data = |format| Err(Miss::Incomplete(IncompleteWhy::NoData { format, code: 0 }));
+        let text = u32::from(CF_UNICODETEXT);
+        let lone = [
+            (0xC100, "FileGroupDescriptorW", Some(&b"d"[..])),
+            (0xC101, "FileContents", None),
+        ];
+        assert_eq!(read_fake(&lone), no_data(0xC101));
+        let html = [(text, "", Some(&b"t"[..])), (0xC103, "HTML Format", None)];
+        assert_eq!(read_fake(&html), no_data(0xC103));
+        let both = [
+            (text, "", Some(&b"t"[..])),
+            (0xC101, "FileContents", None),
+            (0xC104, "Rich Text Format", None),
+        ];
+        assert_eq!(read_fake(&both), no_data(0xC104));
+        let plain = [
+            (text, "", Some(&b"t"[..])),
+            (0xC105, "HTML Format", Some(&b"h"[..])),
+        ];
+        assert_eq!(read_fake(&plain), Ok((vec![text, 0xC105], vec![])));
+    }
 
     #[test]
     fn markers_put_history_on_or_exclude_everything_and_never_allow_the_cloud() {

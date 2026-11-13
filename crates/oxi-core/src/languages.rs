@@ -145,19 +145,61 @@ pub fn slots(shown: [Language; 2], current: Language, recent: [Language; 2]) -> 
     }
 }
 
-/// The whisper languages `query` finds by code, English or native name: the exact code first, then
-/// names starting with it, then names containing it, each in table order. Empty finds them all.
+/// What people type for a language that is not its ISO 639-1 code: mostly the country's code
+/// (`ua` for Ukrainian, `jp` for Japanese). None of them is a whisper code, so none hides a real one.
+const ALIASES: [(&str, &str); 32] = [
+    ("ua", "uk"),
+    ("cz", "cs"),
+    ("gr", "el"),
+    ("jp", "ja"),
+    ("kr", "ko"),
+    ("cn", "zh"),
+    ("tw", "zh"),
+    ("hk", "yue"),
+    ("se", "sv"),
+    ("dk", "da"),
+    ("ge", "ka"),
+    ("il", "he"),
+    ("ir", "fa"),
+    ("ph", "tl"),
+    ("by", "be"),
+    ("al", "sq"),
+    ("rs", "sr"),
+    ("ee", "et"),
+    ("vn", "vi"),
+    ("gb", "en"),
+    ("us", "en"),
+    ("mx", "es"),
+    ("at", "de"),
+    ("mm", "my"),
+    ("np", "ne"),
+    ("kz", "kk"),
+    // Old ISO 639-1 codes, still used by Java and others.
+    ("in", "id"),
+    ("iw", "he"),
+    ("ji", "yi"),
+    ("jv", "jw"),
+    ("mo", "ro"),
+    ("nb", "no"),
+];
+
+/// The whisper languages `query` finds by code, an alias, or English or native name: the exact
+/// code or alias first, then codes starting with it, then names starting with it, then names
+/// containing it, each in table order. Empty finds them all.
 #[must_use]
 pub fn search(query: &str) -> Vec<&'static LanguageInfo> {
     let query = query.trim().to_lowercase();
+    let alias = ALIASES.iter().find(|(a, _)| *a == query).map(|(_, c)| *c);
     let rank = |info: &LanguageInfo| {
         let names = [info.english.to_lowercase(), info.native.to_lowercase()];
-        if info.code == query {
+        if info.code == query || Some(info.code) == alias {
             Some(0)
-        } else if names.iter().any(|n| n.starts_with(&query)) {
+        } else if info.code.starts_with(&query) {
             Some(1)
-        } else if names.iter().any(|n| n.contains(&query)) {
+        } else if names.iter().any(|n| n.starts_with(&query)) {
             Some(2)
+        } else if names.iter().any(|n| n.contains(&query)) {
+            Some(3)
         } else {
             None
         }
@@ -172,7 +214,7 @@ pub fn search(query: &str) -> Vec<&'static LanguageInfo> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LANGUAGES, search, slots};
+    use super::{ALIASES, LANGUAGES, find, search, slots};
     use crate::types::Language;
 
     #[test]
@@ -194,6 +236,38 @@ mod tests {
         let position = |code: &str| ta.iter().position(|c| *c == code).unwrap();
         assert!(position("tl") < position("ca") && position("tl") < position("it"));
         assert_eq!(codes("zzzz"), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn language_search_finds_by_code_and_by_what_people_type() {
+        let codes = |q: &str| -> Vec<&str> { search(q).iter().map(|i| i.code).collect() };
+        // The owner's case: "ua" is a country code, Ukrainian is "uk"; Lithuanian only contains "ua".
+        assert_eq!(codes("ua")[0], "uk");
+        assert_eq!(codes("UA")[0], "uk");
+        assert_eq!(codes("uk")[0], "uk");
+        for (typed, want) in [
+            ("cz", "cs"),
+            ("gr", "el"),
+            ("jp", "ja"),
+            ("kr", "ko"),
+            ("cn", "zh"),
+            ("in", "id"),
+            ("iw", "he"),
+            ("jv", "jw"),
+        ] {
+            assert_eq!(codes(typed)[0], want, "{typed}");
+        }
+        // A real code beats any alias and name.
+        assert_eq!(codes("de")[0], "de");
+        assert_eq!(codes("ru")[0], "ru");
+        // A code prefix comes after the exact code and before names that merely start with it.
+        let h = codes("h");
+        assert!(h[..8].iter().all(|c| c.starts_with('h')), "{h:?}");
+        // Every alias points at a language of the table and shadows no code.
+        for (alias, code) in ALIASES {
+            assert!(find(code).is_some(), "{alias} -> {code}");
+            assert!(find(alias).is_none(), "{alias} is a whisper code");
+        }
     }
 
     #[test]

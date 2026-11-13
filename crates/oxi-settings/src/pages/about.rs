@@ -9,11 +9,16 @@ pub fn bind(window: &AppWindow, _ctx: &Ctx) {
     window.set_repository(env!("CARGO_PKG_REPOSITORY").into());
 }
 
-/// Sets the scale the title-bar icon is sized at. `open_inner` calls it right after the window
-/// is made, before any page binds: the accent (`set_accent`, bound by System) builds the icon at
-/// this scale, so no bind order can build it at 1.0.
-pub fn set_scale(window: &AppWindow) {
-    window.set_icon_scale(opening_scale());
+/// Sets the scale the title-bar icon is sized at, and returns it. `open_inner` calls it right after
+/// the window is made, before any page binds: the accent (`set_accent`, bound by System) builds the
+/// icon at this scale, so no bind order can build it at 1.0. With no window (`None`) it only reads
+/// the scale: the OS window's creation hook runs before there is one.
+pub fn set_scale(window: Option<&AppWindow>) -> f32 {
+    let scale = opening_scale();
+    if let Some(window) = window {
+        window.set_icon_scale(scale);
+    }
+    scale
 }
 
 #[cfg(test)]

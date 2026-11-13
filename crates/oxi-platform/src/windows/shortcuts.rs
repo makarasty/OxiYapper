@@ -8,6 +8,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use super::launchers::{self, Source};
 use windows::Win32::System::Com::{CoTaskMemFree, IBindCtx};
 use windows::Win32::UI::Shell::{
     BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem, KF_FLAG_DEFAULT,
@@ -58,6 +59,11 @@ const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
 const UNINSTALL_32: &str = r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall";
 const APP_PATHS: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths";
 const APP_PATHS_32: &str = r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths";
+const GOG: &str = r"SOFTWARE\WOW6432Node\GOG.com\Games";
+const STEAM_KEY: &str = r"Software\Valve\Steam";
+const STEAM_KEY_32: &str = r"SOFTWARE\WOW6432Node\Valve\Steam";
+/// Registry install folders opened for an exe per scan at most (each is a short walk).
+const MAX_LOCATIONS: usize = 600;
 const PACKAGES: &str = r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
 
 /// One app found by a scan.
@@ -71,6 +77,11 @@ pub struct App {
     pub icon_source: Option<IconSource>,
     /// Filled by [`scan`]; `None` when the shell has none for it.
     pub icon: Option<Icon>,
+    /// Where it was found: the scanner's source and Games/Apps filters.
+    pub source: Source,
+    /// Bytes on disk when a launcher or the registry says so; `None` otherwise (the folder of an
+    /// app the Start menu lists is never walked).
+    pub size: Option<u64>,
 }
 
 /// Where an app's icon is read from. Always a path on a local disk, never a network one.
@@ -141,9 +152,95 @@ pub fn scan_installed() -> Vec<App> {
     let mut walk = walk_roots(&roots(), &desktops());
     let store = with_ole(|| store_apps(&mut walk.drives));
     walk.apps.extend(store);
+    // Games before the registry: a launcher names the source, the registry only says "Installed".
+    let games = launcher_apps(&mut walk.drives);
+    walk.apps.extend(games);
     let registry = registry_apps(&mut walk.drives);
     walk.apps.extend(registry);
     with_icons(finish(walk.apps))
+}
+
+/// Where this machine's launchers and game folders are: Steam's folder from its registry key,
+/// `%ProgramData%`, and the folders games are usually put in on each local disk.
+fn places(drives: &mut Drives) -> launchers::Places {
+    const GAME_FOLDERS: [&str; 6] = [
+        r"Games",
+        r"Program Files\EA Games",
+        r"Program Files (x86)\Origin Games",
+        r"Program Files\Ubisoft\Ubisoft Game Launcher\games",
+        r"Program Files (x86)\Ubisoft\Ubisoft Game Launcher\games",
+        r"Riot Games",
+    ];
+    let steam = [
+        (HKEY_CURRENT_USER, STEAM_KEY, "SteamPath"),
+        (HKEY_LOCAL_MACHINE, STEAM_KEY_32, "InstallPath"),
+    ]
+    .into_iter()
+    .filter_map(|(root, key, value)| reg_string(root, key, Some(value)))
+    .map(PathBuf::from)
+    .collect();
+    let game_roots = (b'C'..=b'Z')
+        .filter(|&l| drives.fixed(l))
+        .flat_map(|l| {
+            GAME_FOLDERS
+                .iter()
+                .map(move |f| PathBuf::from(format!("{}:\\{f}", char::from(l))))
+        })
+        .filter(|p| p.is_dir())
+        .collect();
+    launchers::Places {
+        steam,
+        program_data: std::env::var_os("ProgramData").map(PathBuf::from),
+        game_roots,
+    }
+}
+
+/// The games of Steam, Epic, Battle.net, GOG and the game folders, as apps.
+fn launcher_apps(drives: &mut Drives) -> Vec<(App, bool)> {
+    let places = places(drives);
+    let mut games = launchers::find(&places, &mut |p| {
+        is_local_path(&p.to_string_lossy(), &mut |l| drives.fixed(l))
+    });
+    games.extend(gog_games(drives));
+    games
+        .into_iter()
+        .filter_map(|g| {
+            let exe = g.exe.file_name()?.to_string_lossy().into_owned();
+            let app = App {
+                name: g.name,
+                exe,
+                icon_source: Some(IconSource::Resource(g.exe, 0)),
+                icon: None,
+                source: g.source,
+                size: g.size,
+            };
+            Some((app, true))
+        })
+        .collect()
+}
+
+/// GOG's games: `GOG.com\Games\<id>` holds a game's name and its exe.
+fn gog_games(drives: &mut Drives) -> Vec<launchers::Game> {
+    let mut out = Vec::new();
+    for id in reg_subkeys(HKEY_LOCAL_MACHINE, GOG) {
+        let key = format!(r"{GOG}\{id}");
+        let (Some(exe), Some(name)) = (
+            reg_string(HKEY_LOCAL_MACHINE, &key, Some("exe")),
+            reg_string(HKEY_LOCAL_MACHINE, &key, Some("gameName")),
+        ) else {
+            continue;
+        };
+        let exe = PathBuf::from(exe);
+        if is_local_path(&exe.to_string_lossy(), &mut |l| drives.fixed(l)) && exe.is_file() {
+            out.push(launchers::Game {
+                size: exe.parent().and_then(launchers::dir_size),
+                name,
+                exe,
+                source: Source::Gog,
+            });
+        }
+    }
+    out
 }
 
 fn with_icons(mut apps: Vec<App>) -> Vec<App> {
@@ -291,6 +388,8 @@ fn app_at(path: &Path, drives: &mut Drives) -> Option<(App, bool)> {
         exe,
         icon_source,
         icon: None,
+        source: Source::StartMenu,
+        size: None,
     };
     Some((app, plain))
 }
@@ -441,6 +540,8 @@ fn store_apps(drives: &mut Drives) -> Vec<(App, bool)> {
             exe,
             icon_source,
             icon: None,
+            source: Source::Store,
+            size: None,
         };
         out.push((app, true));
     }
@@ -452,6 +553,7 @@ fn store_apps(drives: &mut Drives) -> Vec<(App, bool)> {
 /// name. The Start menu is read first, so a name from there wins ([`finish`]).
 fn registry_apps(drives: &mut Drives) -> Vec<(App, bool)> {
     let mut out = Vec::new();
+    let mut located = 0;
     for (root, base) in [
         (HKEY_LOCAL_MACHINE, UNINSTALL),
         (HKEY_LOCAL_MACHINE, UNINSTALL_32),
@@ -462,14 +564,41 @@ fn registry_apps(drives: &mut Drives) -> Vec<(App, bool)> {
             if reg_dword(root, &key, "SystemComponent") == Some(1) {
                 continue;
             }
-            let (Some(name), Some(icon)) = (
-                reg_string(root, &key, Some("DisplayName")),
-                reg_string(root, &key, Some("DisplayIcon")),
-            ) else {
+            let Some(name) = reg_string(root, &key, Some("DisplayName")) else {
                 continue;
             };
-            let (file, index) = split_display_icon(&icon);
-            out.extend(registry_app(name, file, index, drives));
+            // The icon names the exe; with none (most games), the install folder holds it.
+            let named = reg_string(root, &key, Some("DisplayIcon")).and_then(|icon| {
+                let (file, index) = split_display_icon(&icon);
+                registry_app(name.clone(), file, index, drives)
+            });
+            let found = named.or_else(|| {
+                if located >= MAX_LOCATIONS {
+                    return None;
+                }
+                located += 1;
+                install_location_app(root, &key, name, drives)
+            });
+            let size = reg_dword(root, &key, "EstimatedSize").map(|kb| u64::from(kb) * 1024);
+            // Battle.net writes one Uninstall entry per game, published by Blizzard (its own too).
+            let blizzard = reg_string(root, &key, Some("Publisher"))
+                .is_some_and(|p| p.contains("Blizzard"))
+                && found.as_ref().is_none_or(|(a, _)| a.name != "Battle.net");
+            let source = if blizzard {
+                Source::BattleNet
+            } else {
+                Source::Installed
+            };
+            out.extend(found.map(|(app, plain)| {
+                (
+                    App {
+                        source,
+                        size,
+                        ..app
+                    },
+                    plain,
+                )
+            }));
         }
     }
     for (root, base) in [
@@ -495,6 +624,42 @@ fn registry_apps(drives: &mut Drives) -> Vec<(App, bool)> {
         }
     }
     out
+}
+
+/// The app of an Uninstall entry that names no exe: the main exe of its `InstallLocation` (a game
+/// installed by Battle.net, GOG or an installer), when it holds an icon. A folder that is no one
+/// app's (a drive's top, Program Files, Windows) is not looked into.
+fn install_location_app(
+    root: HKEY,
+    key: &str,
+    name: String,
+    drives: &mut Drives,
+) -> Option<(App, bool)> {
+    let location = reg_string(root, key, Some("InstallLocation"))?;
+    let dir = install_folder(&location, &mut |l| drives.fixed(l))?;
+    let exe = launchers::main_exe(&dir)?;
+    let found = registry_app(name, exe.to_string_lossy().into_owned(), 0, drives)?;
+    has_icon_resource(&found.0).then_some(found)
+}
+
+/// The folder an Uninstall entry's `InstallLocation` names, when it is one app's own folder on a
+/// local disk: not a drive's top (`C:\` cut to `C:` would be the process's current folder), not
+/// Program Files, Windows or the like.
+fn install_folder(location: &str, fixed: &mut impl FnMut(u8) -> bool) -> Option<PathBuf> {
+    let dir = PathBuf::from(location.trim().trim_end_matches(['\\', '/']));
+    let lower = dir.to_string_lossy().to_lowercase();
+    let shared = [
+        "program files",
+        "program files (x86)",
+        "programdata",
+        "users",
+    ];
+    let refused = !launchers::own_folder(&dir)
+        || shared.iter().any(|s| lower.ends_with(&format!("\\{s}")))
+        || lower.ends_with("\\windows")
+        || lower.contains("\\windows\\")
+        || !is_local_path(&format!("{lower}\\"), fixed);
+    (!refused).then_some(dir)
 }
 
 /// Whether the exe of `app` holds at least one icon (asked of the shell, nothing extracted).
@@ -537,6 +702,8 @@ fn registry_app(
         exe,
         icon_source: Some(IconSource::Resource(PathBuf::from(file), index)),
         icon: None,
+        source: Source::Installed,
+        size: None,
     };
     Some((app, true))
 }
@@ -738,13 +905,25 @@ fn expand(path: &str) -> String {
     out
 }
 
-/// One app per exe, case-insensitive, the first wins; sorted by name, then exe.
+/// One app per exe, case-insensitive, the first wins (its name, its icon); a later copy that is a
+/// game from a launcher makes it a game of that source, and one with a size gives it when it has none.
+/// Sorted by name, then exe.
 pub fn dedupe(apps: Vec<App>) -> Vec<App> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out: Vec<App> = apps
-        .into_iter()
-        .filter(|a| seen.insert(a.exe.to_lowercase()))
-        .collect();
+    let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut out: Vec<App> = Vec::new();
+    for app in apps {
+        let key = app.exe.to_lowercase();
+        if let Some(&i) = at.get(&key) {
+            let kept = &mut out[i];
+            if app.source.is_game() && !kept.source.is_game() {
+                kept.source = app.source;
+            }
+            kept.size = kept.size.or(app.size);
+        } else {
+            at.insert(key, out.len());
+            out.push(app);
+        }
+    }
     out.sort_by_cached_key(|a| (a.name.to_lowercase(), a.exe.to_lowercase()));
     out
 }
@@ -1120,6 +1299,20 @@ mod tests {
 
     fn write(dir: &Path, name: &str, target: &str, args: &str) {
         fs::write(dir.join(format!("{name}.lnk")), link_bytes(target, args)).unwrap();
+    }
+
+    #[test]
+    fn an_install_location_of_a_drive_top_is_not_looked_into() {
+        let any = &mut |_: u8| true;
+        for top in ["C:\\", "D:/", "C:", "", "\\", "C:\\\\"] {
+            assert_eq!(install_folder(top, any), None, "{top:?}");
+        }
+        let app = dir("install-folder").join("Synth App");
+        fs::create_dir_all(&app).unwrap();
+        let at = format!("{}\\", app.display());
+        assert_eq!(install_folder(&at, any), Some(app));
+        assert_eq!(install_folder(r"C:\Program Files", any), None);
+        assert_eq!(install_folder(r"\\host\share\App", any), None);
     }
 
     #[test]
@@ -1667,5 +1860,26 @@ mod tests {
             assert!(file.is_file(), "{}: {file:?}", app.name);
             assert!(app.exe.to_lowercase().ends_with(".exe"));
         }
+    }
+
+    #[test]
+    fn a_game_found_twice_keeps_the_first_name_and_takes_the_launcher_and_the_size() {
+        let app = |name: &str, source, size| App {
+            name: name.to_owned(),
+            exe: "Overwatch.exe".to_owned(),
+            icon_source: None,
+            icon: None,
+            source,
+            size,
+        };
+        let apps = dedupe(vec![
+            app("Overwatch shortcut", Source::StartMenu, None),
+            app("Overwatch", Source::BattleNet, Some(7)),
+            app("Overwatch again", Source::Installed, Some(9)),
+        ]);
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].name, "Overwatch shortcut");
+        assert_eq!(apps[0].source, Source::BattleNet);
+        assert_eq!(apps[0].size, Some(7));
     }
 }

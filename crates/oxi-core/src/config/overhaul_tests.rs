@@ -403,3 +403,32 @@ fn config_load_error_names_the_key() {
     };
     assert!(message.starts_with("threads:"), "{message}");
 }
+
+/// The prompt choice is optional: a file without it keeps what it did, and the key is written only
+/// once it is picked.
+#[test]
+fn the_prompt_source_is_optional_and_written_when_picked() {
+    let old = ConfigFile::parse(
+        "version = 2
+[model.advanced]
+initial_prompt = \"Notes.\"
+",
+    )
+    .unwrap();
+    assert_eq!(old.config.model.advanced.prompt_source, None);
+    assert_eq!(
+        old.config.model.advanced.prompt_source(),
+        PromptSource::Custom
+    );
+    assert!(old.warnings.is_empty(), "{:?}", old.warnings);
+    let mut file = ConfigFile::parse(OLD).unwrap();
+    assert!(!file.to_toml_string().unwrap().contains("prompt_source"));
+    file.config.model.advanced.prompt_source = Some(PromptSource::None);
+    let text = file.to_toml_string().unwrap();
+    assert!(text.contains("prompt_source = \"none\""), "{text}");
+    let back = ConfigFile::parse(&text).unwrap();
+    assert_eq!(
+        back.config.model.advanced.prompt_source,
+        Some(PromptSource::None)
+    );
+}

@@ -102,6 +102,18 @@ pub enum Decoding {
     Beam,
 }
 
+/// Where the text Whisper reads first comes from (`model.advanced.prompt_source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptSource {
+    /// The dictionary words alone.
+    Dictionary,
+    /// No prompt at all.
+    None,
+    /// `initial_prompt`, then the dictionary words.
+    Custom,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AudioCtx {
@@ -171,6 +183,10 @@ pub struct Advanced {
     pub temperature_fallback: Auto<bool>,
     /// Put before the dictionary words.
     pub initial_prompt: String,
+    /// Absent from a file written before the choice existed (and from the defaults): see
+    /// [`Advanced::prompt_source`]. Written only once the person picks one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_source: Option<PromptSource>,
     pub audio_ctx: Auto<AudioCtx>,
     pub no_speech_threshold: Auto<f32>,
     pub logprob_threshold: Auto<f32>,
@@ -189,6 +205,7 @@ impl Default for Advanced {
             temperature: Auto::Auto,
             temperature_fallback: Auto::Auto,
             initial_prompt: String::new(),
+            prompt_source: None,
             audio_ctx: Auto::Auto,
             no_speech_threshold: Auto::Auto,
             logprob_threshold: Auto::Auto,
@@ -206,6 +223,18 @@ impl Advanced {
     pub const NO_SPEECH: RangeInclusive<f32> = 0.0..=1.0;
     pub const LOGPROB: RangeInclusive<f32> = -5.0..=0.0;
     pub const ENTROPY: RangeInclusive<f32> = 0.0..=10.0;
+
+    /// The prompt in use. A file from before the choice existed keeps what it did: a typed prompt
+    /// is `Custom`, none is the dictionary.
+    #[must_use]
+    pub fn prompt_source(&self) -> PromptSource {
+        self.prompt_source
+            .unwrap_or(if self.initial_prompt.trim().is_empty() {
+                PromptSource::Dictionary
+            } else {
+                PromptSource::Custom
+            })
+    }
 
     /// Puts every number back in range (NaN becomes `auto`) and says so.
     pub(crate) fn normalise(&mut self) -> Vec<String> {

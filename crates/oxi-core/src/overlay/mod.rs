@@ -22,7 +22,7 @@ pub use place::{
     pill_label, place, progress_span, visible,
 };
 pub use progress::{
-    CHASE_MS, DEFAULT_EST, EST_CEIL, EST_TAU, FINISH_MS, HOLD_MS, KICK, KICK_MS, MIN_EST,
-    PROJECT_AHEAD, REAL_MIN, SPEED_LIMIT, Smooth, State as ProgressState, TARGET_CAP, learn,
+    CHASE_MS, DEFAULT_EST, EST_CEIL, FINISH_MS, HOLD_MS, KICK, KICK_MS, KNEE, MIN_EST, REAL_MIN,
+    SPEED_LIMIT, Smooth, State as ProgressState, TARGET_CAP, learn, learn_first, soft,
     transcribe_base_ms, transcribe_est, typing_est,
 };

@@ -879,7 +879,7 @@ fn a_new_text_keeps_the_old_one_as_the_other_version_and_restore_swaps_them() {
     fs::write(base.with_extension(TXT), "first").unwrap();
     write_meta(&base, &meta(id, 1000, Status::Done, &ctx())).unwrap();
     let text = || fs::read_to_string(base.with_extension(TXT)).unwrap();
-    assert!(restore(&dir, id).is_err(), "nothing kept yet");
+    assert!(restore(&dir, id, false).is_err(), "nothing kept yet");
 
     let other = Context {
         model: "turbo".into(),
@@ -904,13 +904,30 @@ fn a_new_text_keeps_the_old_one_as_the_other_version_and_restore_swaps_them() {
         "same text, no write"
     );
 
-    restore(&dir, id).unwrap();
+    restore(&dir, id, false).unwrap();
     assert_eq!(text(), "second");
-    restore(&dir, id).unwrap();
+    restore(&dir, id, false).unwrap();
     assert_eq!(text(), "second fixed", "the swap undoes itself");
 
+    // b01 review: after two Applies (and an edit) the dictated text is still kept and comes back.
+    set_text(&dir, id, "third", &other).unwrap();
+    assert_eq!(meta_of(&base).previous.unwrap().text, "second fixed");
+    let first = meta_of(&base).original.unwrap();
+    assert_eq!(
+        (first.text.as_str(), first.model.as_str()),
+        ("first", ctx().model.as_str())
+    );
+    restore(&dir, id, true).unwrap();
+    assert_eq!(text(), "first");
+    let now = meta_of(&base);
+    assert_eq!(now.model, ctx().model, "the run of the original comes back");
+    assert_eq!(now.original.unwrap().text, "first", "and stays kept");
+    assert!(restore(&dir, id, true).is_err(), "already shown");
+    restore(&dir, id, false).unwrap();
+    assert_eq!(text(), "third", "Use new undoes it");
+
     let bad = &hid("2026-11-08/090000-001");
-    assert!(edit_text(&dir, bad, "x").is_err() && restore(&dir, bad).is_err());
+    assert!(edit_text(&dir, bad, "x").is_err() && restore(&dir, bad, false).is_err());
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -1193,7 +1210,7 @@ fn a_save_keeps_the_held_parts_and_how_it_was_delivered() {
     assert_eq!(meta_of(&base).held, held);
     assert_eq!(meta_of(&base).delivered, Some(history::Delivered::Filtered));
     edit_text(&dir, id, "edited").unwrap();
-    restore(&dir, id).unwrap();
+    restore(&dir, id, false).unwrap();
     assert_eq!(meta_of(&base).held, held);
     assert_eq!(meta_of(&base).delivered, Some(history::Delivered::Filtered));
     let _ = fs::remove_dir_all(&dir);

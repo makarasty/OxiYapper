@@ -53,14 +53,14 @@ const NO_SIGNAL: Millis = Millis(3_000);
 const TEST_LENGTH: Millis = Millis(3_000);
 /// Tile of Off, the first of every sound (the Preview button in `audio.slint` knows it is 0).
 const OFF_TILE: usize = 0;
-/// Tile of a built-in: Off is before it.
+/// Tile of the own file: second, so Off and Own file are the first row of the gallery (`audio.slint`).
+const OWN_FILE_TILE: usize = 1;
+/// Tile of a built-in: Off and the own file are before it.
 fn builtin_tile(i: usize) -> usize {
-    i + 1
+    i + OWN_FILE_TILE + 1
 }
-/// Tile of the own file: after the built-in sounds.
-const OWN_FILE_TILE: usize = Builtin::ALL.len() + 1;
-/// Tile of the first file of the sound folder: after the own file.
-const FOLDER_TILE: usize = OWN_FILE_TILE + 1;
+/// Tile of the first file of the sound folder: after the built-in sounds.
+const FOLDER_TILE: usize = Builtin::ALL.len() + OWN_FILE_TILE + 1;
 /// The sounds of the Sounds tab, in the order of its picker: `AudioState.view` 2 to 6.
 const ROLES: [Sound; 5] = [
     Sound::Start,
@@ -514,7 +514,7 @@ impl<C: Capture + 'static> PageState<C> {
             return;
         }
         match tile
-            .and_then(|i| i.checked_sub(1))
+            .and_then(|i| i.checked_sub(builtin_tile(0)))
             .and_then(|i| Builtin::ALL.get(i))
         {
             Some(builtin) => self.set_sound(builtin.id().to_owned()),
@@ -827,7 +827,7 @@ fn by_role(sounds: &Sounds) -> [&str; 5] {
     ]
 }
 
-/// The tiles of one sound, Off, `Builtin::ALL`, then the own file, and the one its setting `text`
+/// The tiles of one sound, Off, the own file, then `Builtin::ALL`, and the one its setting `text`
 /// picks (-1: none); `off` picks Off whatever the text is. The built-in that is the sound's
 /// `default` says so.
 fn sound_tiles(
@@ -848,6 +848,25 @@ fn sound_tiles(
         title: "Off".into(),
         ..GalleryTile::default()
     }];
+    let own = match &choice {
+        Some(Choice::Custom(path)) => path.file_name().map_or_else(
+            || path.to_string_lossy().into_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        ),
+        _ => String::new(),
+    };
+    tiles.push(GalleryTile {
+        icon: file_icon.clone(),
+        title: "Own file".into(),
+        caption: own.as_str().into(),
+        hint: if own.is_empty() {
+            "Choose a .wav or .ogg file of up to 5 seconds.".into()
+        } else {
+            text.into()
+        },
+        disabled: !cfg!(windows),
+        ..GalleryTile::default()
+    });
     tiles.extend(Builtin::ALL.iter().map(|b| GalleryTile {
         icon: sound_icon.clone(),
         title: friendly(b.id()).into(),
@@ -860,26 +879,7 @@ fn sound_tiles(
         },
         ..GalleryTile::default()
     }));
-    let own = match &choice {
-        Some(Choice::Custom(path)) => path.file_name().map_or_else(
-            || path.to_string_lossy().into_owned(),
-            |n| n.to_string_lossy().into_owned(),
-        ),
-        _ => String::new(),
-    };
-    tiles.push(GalleryTile {
-        icon: file_icon.clone(),
-        title: "Own file".into(),
-        hint: if own.is_empty() {
-            "Choose a .wav or .ogg file of up to 5 seconds.".into()
-        } else {
-            text.into()
-        },
-        caption: own.into(),
-        disabled: !cfg!(windows),
-        ..GalleryTile::default()
-    });
-    // The files of the sound folder: tiles after the own file, named by their file.
+    // The files of the sound folder: tiles after the built-ins, named by their file.
     tiles.extend(folder.iter().map(|f| GalleryTile {
         icon: sound_icon.clone(),
         title: f.name.as_str().into(),

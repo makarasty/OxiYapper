@@ -21,7 +21,7 @@ use oxi_core::machine::{
     EngineWarning, Event, JobId, MachineConfig, ModelFailure, ModelIdentity, Phase, PhaseCell,
 };
 use oxi_core::models;
-use oxi_core::overlay::{learn, transcribe_est};
+use oxi_core::overlay::{learn, learn_first, transcribe_est};
 use oxi_core::paste::Profile;
 use oxi_core::paths::Layout;
 use oxi_core::strings;
@@ -39,6 +39,9 @@ use crate::pipeline::{self, TextAssets};
 /// logs a warning: whisper may have dropped most of it (counts only).
 const SPARSE_MIN_MS: u64 = 5000;
 const SPARSE_CPS: u64 = 5;
+
+/// A learned speed's key: model file and the device name the engine runs on (`None` is CPU).
+type SpeedKey = (String, Option<String>);
 
 /// A finished dictation: the text, whisper's words, the parts held back.
 type Transcribed = (
@@ -181,9 +184,9 @@ struct Worker<R, L> {
     reported: Option<EngineWarning>,
     /// Where the progress of the running job or test goes.
     tap: Tap,
-    /// How much slower (or faster) than the first-guess fit this machine ran the last tests,
-    /// for the estimate a test run starts its bar with.
-    test_speed: f32,
+    /// How much slower (or faster) than the first-guess fit each model ran on its device here,
+    /// dictations and tests alike, for the estimate a test or History run starts its bar with.
+    speeds: Vec<(SpeedKey, f32)>,
     /// The run in hand is a word-times run ([`Worker::word_times`]); a dictation never is.
     want_times: bool,
     /// The model the next `Preload` loads (`UseModel`, from the app in front at key-down).
@@ -227,7 +230,7 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<
             cpu_reason: None,
             reported: None,
             tap: Tap::None,
-            test_speed: 1.0,
+            speeds: Vec::new(),
             want_times: false,
             next_model: None,
             uses: Uses::ALL,
@@ -960,7 +963,19 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<
         }
     }
 
+    /// The speed is kept per model file and the device that RUNS it (the engine's, not the
+    /// configured one): after a GPU failure the CPU timings are CPU's.
+    fn speed_key(&self) -> Option<SpeedKey> {
+        let file = self.loaded_for.as_ref()?.file.clone();
+        Some((file, self.loaded.as_ref()?.info().device.clone()))
+    }
+
     fn run(&mut self, samples: &[f32]) -> anyhow::Result<Transcript> {
+        let key = self.speed_key();
+        let scale = key
+            .as_ref()
+            .and_then(|k| self.speeds.iter().find(|(m, _)| m == k))
+            .map_or(1.0, |(_, s)| *s);
         let engine = self
             .loaded
             .as_mut()
@@ -971,7 +986,7 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<
         let audio_ms = samples.len() as u64 * 1000 / u64::from(audio::SAMPLE_RATE);
         if let Tap::Test { id, reply, .. } = &tap {
             // The window's bar starts from this, before whisper says anything.
-            let est = transcribe_est(audio_ms, self.test_speed).0;
+            let est = transcribe_est(audio_ms, scale).0;
             reply.send(Push::TestProgress {
                 id: *id,
                 percent: 0,
@@ -1023,9 +1038,14 @@ impl<R: Recognizer, L: FnMut(&Path, &DeviceChoice, &Advanced) -> anyhow::Result<
         let prompt = tuning::prompt(&self.cfg.model.advanced, dictionary);
         let started = Instant::now();
         let transcript = engine.transcribe(samples, self.cfg.model.language, &prompt, hooks);
-        if matches!(tap, Tap::Test { .. }) && transcript.is_ok() {
+        if transcript.is_ok()
+            && let Some(key) = key
+        {
             let took = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            self.test_speed = learn(self.test_speed, audio_ms, took);
+            match self.speeds.iter_mut().find(|(m, _)| *m == key) {
+                Some((_, s)) => *s = learn(*s, audio_ms, took),
+                None => self.speeds.push((key, learn_first(audio_ms, took))),
+            }
         }
         transcript
     }

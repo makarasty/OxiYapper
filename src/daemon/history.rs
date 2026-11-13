@@ -808,7 +808,8 @@ fn write_version(base: &Path, text: &str, meta: &Meta) -> io::Result<()> {
 
 /// A transcript of recording `id` made again: the text replaces the old one, the meta says it is
 /// done and names the model, language and settings of this run. The old text and its run stay
-/// as the other version (`Meta::previous`), unless there was no text.
+/// as the other version (`Meta::previous`), unless there was no text; the first text stays as
+/// `Meta::original`.
 #[cfg(test)]
 pub fn set_text(dir: &Path, id: &HistoryId, text: &str, ctx: &Context) -> io::Result<()> {
     set_text_with_words(dir, id, text, ctx, Vec::new())
@@ -844,8 +845,9 @@ pub fn set_text_with_words(
         }
         None => new.words = words,
     }
+    let old = old.unwrap_or_else(|| meta(id, duration_ms, Status::Done, &Context::default()));
+    new.original = old.original_of(&old_text);
     if !old_text.is_empty() {
-        let old = old.unwrap_or_else(|| meta(id, duration_ms, Status::Done, &Context::default()));
         new.previous = Some(old.as_previous(&old_text));
     }
     write_version(&base, text, &new)
@@ -866,6 +868,7 @@ pub fn edit_text(dir: &Path, id: &HistoryId, text: &str) -> io::Result<()> {
     let new = Meta {
         status: Status::Done,
         previous: (!old_text.is_empty()).then(|| old.as_previous(&old_text)),
+        original: old.original_of(&old_text),
         ..old
     };
     write_version(&base, text, &new)
@@ -941,12 +944,19 @@ pub fn store_timed_words(
     )
 }
 
-/// Swaps the transcript of recording `id` with its other version; `NotFound` when none is kept.
-pub fn restore(dir: &Path, id: &HistoryId) -> io::Result<()> {
+/// Swaps the transcript of recording `id` with its other version, or with `original` brings back
+/// its first text; `NotFound` when there is nothing to bring back.
+pub fn restore(dir: &Path, id: &HistoryId, original: bool) -> io::Result<()> {
     let base = entry_base(dir, id)?;
     let (text, old) = read_version(&base);
     let (meta, text) = old
-        .and_then(|m| m.swapped(&text))
+        .and_then(|m| {
+            if original {
+                m.back_to_original(&text)
+            } else {
+                m.swapped(&text)
+            }
+        })
         .ok_or(io::ErrorKind::NotFound)?;
     write_version(&base, &text, &meta)
 }

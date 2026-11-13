@@ -32,6 +32,41 @@ fn the_slint_tile_opens_the_made_with_slint_badge() {
     );
 }
 
+/// Item 23: Built with names the notable dependencies of the workspace `Cargo.toml`, and the grid
+/// ends on a full row.
+#[test]
+fn built_with_names_the_key_dependencies() {
+    let window = open(&layout("about-deps", None), Page::About);
+    settle();
+    let cargo = include_str!("../../../Cargo.toml");
+    for name in [
+        "symphonia",
+        "rubato",
+        "earshot",
+        "windows",
+        "rfd",
+        "ureq",
+        "cpal",
+        "nnnoiseless",
+    ] {
+        assert!(
+            cargo.contains(&format!(
+                "
+{name} = "
+            )),
+            "{name} left the workspace"
+        );
+        let tile = if name == "windows" {
+            "windows-rs"
+        } else {
+            name
+        };
+        with_role(&window, tile, AccessibleRole::Button);
+    }
+    let tiles = ElementHandle::find_by_element_type_name(&window, "TechCard").count();
+    assert_eq!(tiles % 3, 0, "{tiles} tiles leave a short last row");
+}
+
 /// DS-24.1: `open-external` means "opens another app". Every link tile carries it; the Slint tile,
 /// which opens the in-app badge, carries none.
 #[test]
@@ -63,7 +98,7 @@ fn every_mark_box_sits_at_equal_insets_in_its_tile() {
         let boxes: Vec<_> =
             ElementHandle::find_by_element_id(&window, "TechCard::mark-box").collect();
         let marks: Vec<_> = ElementHandle::find_by_element_id(&window, "TechCard::mark").collect();
-        assert_eq!(tiles.len(), 9, "{w}x{h}: tiles");
+        assert_eq!(tiles.len(), 15, "{w}x{h}: tiles");
         assert_eq!(boxes.len(), tiles.len(), "{w}x{h}: boxes");
         assert_eq!(marks.len(), tiles.len(), "{w}x{h}: marks");
         for ((t, b), m) in tiles.iter().zip(&boxes).zip(&marks) {

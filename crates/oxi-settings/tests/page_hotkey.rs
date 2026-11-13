@@ -361,6 +361,115 @@ fn a_short_chord_is_not_folded_and_reads_as_a_person_says_it() {
 }
 
 #[test]
+fn the_old_chord_keeps_its_caps_while_the_new_one_is_typed_and_folds_only_on_overflow() {
+    let l = layout("editing-fold", None);
+    let window = open(&l);
+    click(&window, "Change hotkey");
+    for key in ["Left Ctrl", "Left Alt", "Left Shift", "F13"] {
+        click(&window, key);
+    }
+    for size in SIZES {
+        resized(&window, size);
+        // The saved Ctrl + Win and the four keys being typed: six caps, none folded.
+        assert_eq!(chips(&window, "chip").len(), 6, "{size:?}");
+        assert!(
+            chips(&window, "more").is_empty(),
+            "{size:?}: a +N cap with room to spare"
+        );
+        let button = rect(&one(&window, "Change hotkey"));
+        for chip in chips(&window, "chip") {
+            let r = rect(&chip);
+            assert!(
+                r[2] <= button[0],
+                "{size:?}: chip {r:?} over Change {button:?}"
+            );
+        }
+    }
+    // A fifth key goes past the four-cap slot: the slot grows, no "+N" while the room is there.
+    click(&window, "Left Win");
+    resized(&window, (1280.0, 860.0));
+    assert_eq!(chips(&window, "chip").len(), 7, "five keys at 1280");
+    assert!(chips(&window, "more").is_empty(), "five keys at 1280 fold");
+    resized(&window, (720.0, 520.0));
+    assert_eq!(chips(&window, "chip").len(), 7, "five keys at 720");
+    assert!(chips(&window, "more").is_empty(), "five keys at 720 fold");
+    // Too many keys for the room: the new chord folds, the old one keeps its caps.
+    for key in [
+        "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+    ] {
+        click(&window, key);
+    }
+    for size in SIZES {
+        resized(&window, size);
+        assert_eq!(
+            chips(&window, "more").len(),
+            1,
+            "{size:?}: no +N cap on overflow"
+        );
+    }
+}
+
+#[test]
+fn a_long_saved_chord_folds_while_editing() {
+    let l = layout("editing-long", Some(LONG));
+    let window = open(&l);
+    click(&window, "Change hotkey");
+    for size in SIZES {
+        resized(&window, size);
+        // 15 caps are 708 px: the smallest window folds them, a wide one may have the room.
+        let folded = chips(&window, "more").len();
+        assert_eq!(
+            folded,
+            usize::from(chips(&window, "chip").len() < 15),
+            "{size:?}"
+        );
+        if size.0 < 800.0 {
+            assert_eq!(folded, 1, "{size:?}: 15 keys cannot fit");
+        }
+        let button = rect(&one(&window, "Change hotkey"));
+        for chip in chips(&window, "chip").iter().chain(&chips(&window, "more")) {
+            assert!(rect(chip)[2] <= button[0], "{size:?}: a cap over Change");
+        }
+    }
+}
+
+#[test]
+fn cancel_and_apply_sit_on_the_last_row_of_the_board_without_covering_a_key() {
+    let l = layout("buttons-up", None);
+    let window = open(&l);
+    click(&window, "Change hotkey");
+    for size in SIZES {
+        resized(&window, size);
+        let (cancel, apply) = (
+            rect(&one(&window, "Cancel hotkey change")),
+            rect(&one(&window, "Apply hotkey")),
+        );
+        let f24 = rect(&one(&window, "F24"));
+        let ctrl = rect(&one(&window, "Left Ctrl"));
+        assert!(
+            cancel[0] >= f24[2],
+            "{size:?}: Cancel {cancel:?} over F24 {f24:?}"
+        );
+        // On the F13-F24 row: under the Ctrl row, not in a row of its own below the board.
+        assert!(
+            cancel[1] > ctrl[3] && cancel[1] < f24[3],
+            "{size:?}: {cancel:?}"
+        );
+        assert_eq!(cancel[1], apply[1], "{size:?}: one line");
+        assert!(
+            cancel[3] <= f24[3] + 4.0,
+            "{size:?}: Cancel {cancel:?}, F24 {f24:?}"
+        );
+        // The card ends with the board: nothing but its padding under the buttons.
+        let card_bottom = rect(&one(&window, "Hotkey keyboard"))[3];
+        assert!(
+            card_bottom - apply[3] < 24.0,
+            "{size:?}: a row under the board"
+        );
+    }
+}
+
+#[test]
 fn twin_keys_of_a_saved_chord_read_apart() {
     let saved = |keys: &str| {
         format!(

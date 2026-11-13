@@ -1047,6 +1047,52 @@ fn gpu_failure_during_a_job_retries_that_job_on_cpu() {
     );
 }
 
+/// The speed is learned for the device that RAN the job: after a GPU failure and the CPU retry
+/// it is the CPU's entry, never the configured GPU's (ARCHITECTURE: that model on that device).
+#[test]
+fn a_run_after_a_gpu_failure_teaches_the_cpu_speed_not_the_gpus() {
+    let (r, mut s) = (rig("speedkey"), Script::new());
+    s.gpu_run_fails = true;
+    let (mut w, rx) = worker(&s, &r);
+    w.handle(WhisperCmd::Config(r.cfg(DeviceChoice::Auto)));
+    job(&mut w);
+    assert_eq!(text(&rx).as_deref(), Some("hello "));
+    let file = r.cfg(DeviceChoice::Auto).model.custom_path;
+    let keys: Vec<_> = w.speeds.iter().map(|(k, _)| k.clone()).collect();
+    assert_eq!(keys, [(file, None)], "CPU ran it: the CPU's entry only");
+}
+
+/// A speed is kept per model and device: the same model estimates differently on each.
+#[test]
+fn a_test_starts_its_bar_from_the_speed_learned_on_that_device() {
+    let (r, s) = (rig("speeddev"), Script::new());
+    let (mut w, _rx) = worker(&s, &r);
+    let file = r.cfg(DeviceChoice::Cpu).model.custom_path;
+    w.speeds = vec![(file.clone(), None), (file, Some("Vulkan0".into()))]
+        .into_iter()
+        .zip([2.0, 6.0])
+        .collect();
+    let est_of = |w: &mut TestWorker, gpu: DeviceChoice| {
+        w.handle(WhisperCmd::Config(r.cfg(gpu)));
+        let pushes = Pushes::default();
+        let (_, window) = pushes.claim(0);
+        w.handle(test_job(&pushes, "custom"));
+        match window.try_iter().next() {
+            Some(Push::TestProgress { est_ms, .. }) => est_ms,
+            other => panic!("expected the estimate first: {other:?}"),
+        }
+    };
+    // The test clip is 1 s long.
+    assert_eq!(
+        est_of(&mut w, DeviceChoice::Cpu),
+        Some(u32::try_from(transcribe_est(1000, 2.0).0).unwrap())
+    );
+    assert_eq!(
+        est_of(&mut w, DeviceChoice::Auto),
+        Some(u32::try_from(transcribe_est(1000, 6.0).0).unwrap())
+    );
+}
+
 /// An audible second of raw samples and a set that runs the rig's custom model.
 fn test_job(reply: &Pushes, model: &str) -> WhisperCmd {
     WhisperCmd::Test(TestJob {
@@ -1454,6 +1500,7 @@ fn history_record(r: &Rig, cfg: &Config) -> (PathBuf, &'static str) {
         language: String::new(),
         settings: None,
         previous: None,
+        original: None,
         words: Vec::new(),
         timings: None,
         raw: false,

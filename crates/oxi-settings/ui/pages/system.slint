@@ -198,6 +198,9 @@ export component SystemPage inherits VerticalLayout {
     property <bool> confirm-update-off;
     // The swap removes the focused control, so focus moves with it, ringed only for the keyboard.
     property <bool> confirm-by-key;
+    // Browse, Open, Settings and Logs are one width, wide enough for the longest label with its
+    // icon (item 9): the labels alone would make four widths.
+    property <length> folder-button-w: Theme.button-min-width + Theme.space-4;
     // Text was typed into the folder field and not yet saved (Enter) or put back.
     property <bool> path-typed;
     // Puts the saved path back over unsaved text in the folder field; Enter is the only save.
@@ -429,6 +432,7 @@ export component SystemPage inherits VerticalLayout {
                     spacing: Theme.control-gap;
                     if SystemState.can-browse: Button {
                         text: @tr("Browse");
+                        min-width: root.folder-button-w;
                         icon: Icons.browse-folder;
                         accessible-label: @tr("Change recordings folder");
                         enabled: !Shell.locked;
@@ -443,6 +447,7 @@ export component SystemPage inherits VerticalLayout {
                     // Only opens Explorer: live while the config is locked.
                     Button {
                         text: @tr("Open");
+                        min-width: root.folder-button-w;
                         kind: ButtonKind.soft;
                         icon: Icons.folder-open;
                         accessible-label: @tr("Open recordings folder");
@@ -459,6 +464,7 @@ export component SystemPage inherits VerticalLayout {
                 info: @tr("Settings holds config.toml and your dictionary; Logs holds the log files.");
                 Button {
                     text: @tr("Settings");
+                    min-width: root.folder-button-w;
                     kind: ButtonKind.soft;
                     icon: Icons.folder-open;
                     accessible-label: @tr("Open settings folder");
@@ -469,6 +475,7 @@ export component SystemPage inherits VerticalLayout {
                 }
                 Button {
                     text: @tr("Logs");
+                    min-width: root.folder-button-w;
                     kind: ButtonKind.soft;
                     icon: Icons.folder-open;
                     accessible-label: @tr("Open logs folder");

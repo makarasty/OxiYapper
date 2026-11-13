@@ -126,6 +126,33 @@ pub fn list_partials(models_dir: &Path) -> io::Result<Vec<PartialDownload>> {
     Ok(out)
 }
 
+/// What the finished files of `models_dir` take: their bytes (`.part` files left out, they are
+/// [`list_partials`]'s) and how many `.bin` models there are. A missing folder is `(0, 0)`; an
+/// entry that cannot be read is skipped. Reads metadata only, yet a network folder can stall:
+/// call it off the UI thread.
+pub fn models_size(models_dir: &Path) -> io::Result<(u64, usize)> {
+    let entries = match fs::read_dir(models_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) => return Err(e),
+    };
+    let (mut bytes, mut models) = (0, 0);
+    for entry in entries.flatten() {
+        let path = PathBuf::from(entry.file_name());
+        if path.to_string_lossy().ends_with(PART_SUFFIX) {
+            continue;
+        }
+        if let Some(meta) = entry.metadata().ok().filter(fs::Metadata::is_file) {
+            bytes += meta.len();
+            let bin = path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("bin"));
+            models += usize::from(bin);
+        }
+    }
+    Ok((bytes, models))
+}
+
 /// Startup sweep: delete the model `.part` files older than [`PART_KEEP`]. Returns the count.
 /// A file that cannot be removed (locked) is logged and kept; the others are still swept.
 pub fn sweep_partials(models_dir: &Path, now: SystemTime) -> io::Result<usize> {
@@ -157,6 +184,18 @@ mod tests {
     use super::*;
     use crate::scratch::scratch_dir;
     use std::time::Duration;
+
+    #[test]
+    fn models_size_counts_finished_files_and_leaves_out_parts() {
+        let dir = scratch_dir(&format!("oxi-models-size-{}", std::process::id()));
+        assert_eq!(models_size(&dir.join("none")).unwrap(), (0, 0));
+        fs::write(dir.join("a.bin"), [0u8; 300]).unwrap();
+        fs::write(dir.join("a.bin.ok"), [0u8; 20]).unwrap();
+        fs::write(dir.join("b.bin.part"), [0u8; 1000]).unwrap();
+        fs::create_dir(dir.join("sub.bin")).unwrap();
+        assert_eq!(models_size(&dir).unwrap(), (320, 1));
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_file_that_cannot_be_removed_does_not_stop_the_sweep() {

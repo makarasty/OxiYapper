@@ -155,9 +155,12 @@ pub enum Request {
     },
     /// Swap the transcript of recording `id` with its other version (Restore old, Use new); the
     /// swap undoes itself. Answered with [`Push::HistoryResult`] (`Restore`), `ok` false when no
-    /// other version is kept.
+    /// other version is kept. With `original` it brings back the first text instead (Restore
+    /// original): the shown one is kept as the other version, `ok` false when none is kept.
     HistoryRestore {
         id: HistoryId,
+        #[serde(default)]
+        original: bool,
     },
     /// Delete recording `id` (audio, text and meta). Answered with [`Push::HistoryResult`].
     HistoryDelete {
@@ -997,6 +1000,11 @@ mod tests {
             },
             Request::HistoryRestore {
                 id: HistoryId::parse("2026-11-10/101500-123").unwrap(),
+                original: false,
+            },
+            Request::HistoryRestore {
+                id: HistoryId::parse("2026-11-10/101500-123").unwrap(),
+                original: true,
             },
             Request::HistoryDelete {
                 id: HistoryId::parse("2026-11-10/101500-123").unwrap(),

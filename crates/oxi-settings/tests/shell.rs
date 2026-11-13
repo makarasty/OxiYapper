@@ -175,8 +175,8 @@ fn about_links_open_from_the_keyboard() {
     tab(5);
     press(&window, " ");
     assert_eq!(opened(), "https://github.com/ggml-org/whisper.cpp");
-    // The six tiles left, then the author's button.
-    tab(7);
+    // The twelve tiles left, then the author's button.
+    tab(13);
     press(&window, Key::Return);
     assert_eq!(opened(), "https://github.com/makarasty");
 }

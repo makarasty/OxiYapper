@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use common::{config, has, layout, open, open_again, open_linked, with_role};
 use i_slint_backend_testing::{AccessibleRole, ElementHandle};
-use oxi_core::config::{ConfigFile, Model};
+use oxi_core::config::{Auto, ConfigFile, Model, PromptSource};
 use oxi_core::device::Device;
 use oxi_core::ipc::Push;
 use oxi_core::models::MODELS;
@@ -18,8 +18,8 @@ use oxi_core::paths::Layout;
 use oxi_core::types::Language;
 use oxi_settings::ipc::{Event, Link};
 use oxi_settings::{AppWindow, Ipc, ModelState, Page, Toast};
-use slint::ComponentHandle;
 use slint::platform::{Key, PointerEventButton, WindowEvent};
+use slint::{ComponentHandle, Model as _};
 
 /// Wait for the path worker: step the mocked clock (which runs the page's poll timer) until
 /// `ready`.
@@ -53,13 +53,24 @@ fn sub_tab(window: &AppWindow, label: &str) {
     with_role(window, label, AccessibleRole::Tab).invoke_accessible_default_action();
 }
 
-/// Picks a gallery tile: its card shows below the gallery. It writes no config.
+/// Picks a gallery tile: its card shows below the gallery. It writes no config. The tick first
+/// lets the window's height reach the gallery, which shows the rows it has room for.
 fn view(window: &AppWindow, name: &str) {
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
     radio(window, name).invoke_accessible_default_action();
 }
 
 fn button(window: &AppWindow, label: &str) -> ElementHandle {
     with_role(window, label, AccessibleRole::Button)
+}
+
+/// Some element's label holds `part`: the card's state line joins the state, its note and where
+/// the model runs.
+fn shows(window: &AppWindow, part: &str) -> bool {
+    i_slint_backend_testing::ElementQuery::from_root(window)
+        .find_all()
+        .into_iter()
+        .any(|e| e.accessible_label().is_some_and(|l| l.contains(part)))
 }
 
 #[test]
@@ -71,11 +82,11 @@ fn rows_show_size_and_status_from_the_files() {
     let window = open(&l, Page::Model);
     // The gallery opens on the model in use.
     assert!(has(&window, "1.6 GB · Fast · 99 languages"));
-    assert!(has(&window, "Whisper large-v3 turbo: Not downloaded"));
+    assert!(shows(&window, "Whisper large-v3 turbo: Not downloaded"));
     // The badge says "Damaged"; the caption only says what to do.
     view(&window, "Whisper large-v3");
-    assert!(has(&window, "download it again"));
-    assert!(has(&window, "Whisper large-v3: Damaged"));
+    assert!(shows(&window, "Damaged · download it again"));
+    assert!(shows(&window, "Whisper large-v3: Damaged"));
     for name in ["Whisper large-v3 turbo", "Whisper large-v3"] {
         view(&window, name);
         button(&window, &format!("Download {name}"));
@@ -205,15 +216,15 @@ fn typing_a_good_path_picks_the_custom_model() {
 fn gpu_picker_shows_the_configured_choice() {
     i_slint_backend_testing::init_no_event_loop();
     for (config, shown) in [
-        ("gpu = \"cpu\"", "CPU"),
-        ("gpu = \"auto\"", "Auto"),
+        ("gpu = \"cpu\"", "Processor (CPU)"),
+        ("gpu = \"auto\"", "Auto (best available)"),
         // No daemon to list the GPUs: the name is shown, not called missing.
-        ("gpu = \"Vulkan7\"", "Vulkan7"),
+        ("gpu = \"Vulkan7\"", "Vulkan7 (graphics card)"),
     ] {
         let l = layout("gpu", Some(&format!("version = 2\n[model]\n{config}\n")));
         let window = open_again(&l, Page::Model);
         sub_tab(&window, "Settings");
-        let picker = with_role(&window, "GPU", AccessibleRole::Combobox);
+        let picker = with_role(&window, "Run on", AccessibleRole::Combobox);
         assert_eq!(
             picker.accessible_value().as_deref(),
             Some(shown),
@@ -263,13 +274,14 @@ fn sub_tabs_show_one_part_of_the_page() {
     let window = open(&l, Page::Model);
     let tab = |label| with_role(&window, label, AccessibleRole::Tab);
     assert_eq!(tab("Models").accessible_item_selected(), Some(true));
-    assert!(has(&window, "Use my own .bin") && !has(&window, "GPU"));
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    assert!(has(&window, "Use my own .bin") && !has(&window, "Run on"));
     sub_tab(&window, "Settings");
     assert_eq!(tab("Settings").accessible_item_selected(), Some(true));
-    assert!(has(&window, "GPU") && has(&window, "Unload after idle"));
+    assert!(has(&window, "Run on") && has(&window, "Unload after idle"));
     assert!(!has(&window, "Use my own .bin"));
     sub_tab(&window, "Advanced");
-    assert!(has(&window, "Processor threads") && !has(&window, "GPU"));
+    assert!(has(&window, "Processor use") && !has(&window, "Run on"));
 }
 
 #[test]
@@ -319,10 +331,10 @@ fn locked_config_disables_the_controls() {
     off("Model file", AccessibleRole::TextInput);
     off("Use the model file", AccessibleRole::Button);
     view(&window, "Whisper large-v3 turbo");
-    assert!(has(&window, "Whisper large-v3 turbo: Not downloaded"));
+    assert!(shows(&window, "Whisper large-v3 turbo: Not downloaded"));
     // The sub-tabs only navigate: they stay on.
     sub_tab(&window, "Settings");
-    off("GPU", AccessibleRole::Combobox);
+    off("Run on", AccessibleRole::Combobox);
     off("Unload after idle", AccessibleRole::Combobox);
     assert_eq!(fs::read_to_string(l.config_file()).unwrap(), original);
 }
@@ -356,6 +368,38 @@ fn press(window: &AppWindow, key: impl Into<slint::SharedString>) {
 
 fn popup_open(window: &AppWindow) -> bool {
     has(window, "Search languages")
+}
+
+/// Item 01: the search finds a language by its code and by what people type for it. "ua" is a
+/// country code, Ukrainian is "uk": it is the first row, ahead of Lithuanian, which only contains it.
+#[test]
+fn the_language_search_finds_by_code_and_by_alias() {
+    let l = layout("search-code", None);
+    let window = open(&l, Page::Model);
+    for (typed, first) in [("ua", "Ukrainian"), ("uk", "Ukrainian"), ("JP", "Japanese")] {
+        more_languages(&window);
+        search(&window, typed);
+        let rows: Vec<_> = i_slint_backend_testing::ElementQuery::from_root(&window)
+            .match_accessible_role(AccessibleRole::ListItem)
+            .find_all();
+        assert_eq!(
+            rows[0].accessible_label().as_deref(),
+            Some(first),
+            "{typed}"
+        );
+        // The code and the native name sit in the muted note of the row, once.
+        let model = window.global::<ModelState>();
+        assert!(
+            model
+                .get_language_native()
+                .row_data(0)
+                .unwrap()
+                .contains(" · ")
+        );
+        pick_row(&window, first);
+        assert!(!popup_open(&window));
+    }
+    assert_eq!(saved(&l).language, "ja".parse::<Language>().unwrap());
 }
 
 #[test]
@@ -615,24 +659,42 @@ fn a_language_code_says_its_name_in_a_tooltip() {
     }
 }
 
-/// UI rule 25: Models, with the Language row on top, needs no scrollbar at the minimum size.
+/// UI rules 25, 26: Models never scrolls the page, from the least window up, with either card
+/// below the gallery; the gallery takes the room there is (at 720 x 860 all four rows show).
 #[test]
-fn the_models_tab_does_not_scroll_at_the_minimum_size() {
+fn the_models_tab_never_scrolls_and_the_gallery_takes_the_room() {
     let l = layout("language-fit", None);
     let window = open(&l, Page::Model);
+    let own = i32::try_from(MODELS.len() - 1).unwrap();
+    for viewed in [0, own] {
+        window.global::<ModelState>().set_viewed(viewed);
+        for h in (520..=1000).step_by(20) {
+            #[expect(clippy::cast_precision_loss, reason = "a window height")]
+            let size = slint::LogicalSize::new(720.0, h as f32);
+            window.window().set_size(size);
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+            window
+                .window()
+                .dispatch_event(WindowEvent::PointerScrolled {
+                    position: slint::LogicalPosition::new(500.0, 300.0),
+                    delta_x: 0.0,
+                    delta_y: -400.0,
+                });
+            assert_eq!(window.get_scroll_y(), 0.0, "card {viewed} at 720 x {h}");
+        }
+    }
+    // From the top: a grid scrolled in a lower window stays scrolled when it grows (gallery.slint).
+    window.global::<ModelState>().set_viewed(0);
     window
         .window()
-        .set_size(slint::LogicalSize::new(720.0, 520.0));
+        .set_size(slint::LogicalSize::new(720.0, 860.0));
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
-    window
-        .window()
-        .dispatch_event(WindowEvent::PointerScrolled {
-            position: slint::LogicalPosition::new(500.0, 300.0),
-            delta_x: 0.0,
-            delta_y: -400.0,
-        });
-    assert!(has(&window, "Use my own .bin"), "the last card is there");
-    assert_eq!(window.get_scroll_y(), 0.0, "Models scrolls at 720 x 520");
+    assert!(has(&window, "Use my own .bin"), "the last tile shows");
+    let last = radio(&window, "Use my own .bin").absolute_position().y;
+    let first = radio(&window, "Whisper large-v3 turbo")
+        .absolute_position()
+        .y;
+    assert!(last - first > 300.0, "four rows: {first} -> {last}");
 }
 
 #[test]
@@ -774,31 +836,149 @@ fn a_state_change_moves_no_column_of_the_card() {
     );
 }
 
-/// The gallery holds every model and the own file, as tall as its rows: two at the least
-/// window, one where four tiles fit side by side; the page does not scroll.
+/// The gallery holds every offered model and the own file: four to a row in three rows at
+/// 1280 x 860, all shown; three to a row at the least window, two rows shown and the rest
+/// scrolled inside the grid. The page does not scroll either way (UI rules 25, 26).
 #[test]
-fn the_gallery_is_as_tall_as_its_rows() {
+fn the_gallery_shows_the_rows_that_fit_and_scrolls_the_rest_inside() {
     let l = layout("gallery-rows", None);
     let window = open(&l, Page::Model);
-    let tiles = |window: &AppWindow| {
-        let mut ys: Vec<f32> = [
-            "Whisper large-v3 turbo",
-            "Whisper large-v3",
-            "Whisper large-v3 Russian",
-            "Use my own .bin",
-        ]
+    let offered: Vec<&str> = MODELS
         .iter()
-        .map(|n| radio(window, n).absolute_position().y)
+        .filter(|m| m.id != "tiny")
+        .map(|m| m.display_name)
+        .chain(["Use my own .bin"])
         .collect();
+    assert_eq!(offered.len(), 10);
+    let rows = |window: &AppWindow, names: &[&str]| {
+        let mut ys: Vec<f32> = names
+            .iter()
+            .map(|n| radio(window, n).absolute_position().y)
+            .collect();
+        ys.sort_by(f32::total_cmp);
         ys.dedup();
         ys.len()
     };
-    for (w, h, rows) in [(720.0, 520.0, 2), (1280.0, 860.0, 1)] {
-        window.window().set_size(slint::LogicalSize::new(w, h));
-        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
-        assert_eq!(tiles(&window), rows, "{w} x {h}");
-        assert_eq!(window.get_scroll_y(), 0.0);
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(1280.0, 860.0));
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    assert_eq!(rows(&window, &offered), 3, "1280 x 860");
+    assert_eq!(window.get_scroll_y(), 0.0);
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(720.0, 520.0));
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    assert_eq!(
+        rows(&window, &offered[..6]),
+        2,
+        "three to a row at 720 x 520"
+    );
+    assert_eq!(window.get_scroll_y(), 0.0);
+}
+
+/// Wait for the models folder measure. No event loop runs here, so the test wakes the page as
+/// the worker's `upgrade_in_event_loop` would.
+fn measured(window: &AppWindow) {
+    let state = window.global::<ModelState>();
+    wait_for(|| {
+        state.invoke_measured();
+        state.get_folder_size() != "Measuring"
+    });
+}
+
+/// A tile shows the "Recommended" badge only with a machine to judge: no GPU list from the daemon
+/// (no daemon here) means no badge rather than a guess.
+#[test]
+fn no_badge_without_the_daemon_gpu_list() {
+    let l = layout("no-badge", None);
+    let window = open(&l, Page::Model);
+    let tiles = window.global::<ModelState>().get_tiles();
+    measured(&window);
+    assert!(tiles.iter().all(|t| t.badge.is_empty()));
+}
+
+/// Hold 24: with only an integrated GPU listed the model runs on shared memory, so a light model
+/// is recommended by the system memory (any Windows machine has the 2.6 GB turbo compact needs),
+/// and the card's "i" says why.
+#[test]
+fn an_integrated_gpu_gets_a_light_model_recommended() {
+    let l = layout("badge-igpu", None);
+    let (ipc, _sent) = Ipc::fake();
+    let window = open_linked(&l, Page::Model, ipc.clone());
+    ipc.deliver(&Event::Push(Push::Devices {
+        mics: vec![],
+        gpus: vec![Device {
+            name: "Vulkan0".into(),
+            description: "Integrated".into(),
+            uma: true,
+        }],
+    }));
+    let state = window.global::<ModelState>();
+    measured(&window);
+    let marked: Vec<String> = state
+        .get_tiles()
+        .iter()
+        .filter(|t| t.badge == "Recommended")
+        .map(|t| t.title.to_string())
+        .collect();
+    if cfg!(windows) {
+        assert_eq!(marked, ["Whisper turbo compact"]);
+        // A badge of its own, said with the tile; the caption keeps the facts.
+        assert!(shows(&window, "Recommended"));
+        assert!(
+            state
+                .get_tiles()
+                .iter()
+                .all(|t| !t.caption.contains("Recommended"))
+        );
+        view(&window, "Whisper turbo compact");
+        assert!(shows(&window, "light enough for the processor"));
+        assert!(shows(&window, "runs on Integrated"));
+    } else {
+        assert!(marked.is_empty(), "no hardware read on this OS: {marked:?}");
     }
+}
+
+/// Hold 42: the Files rows say what the models folder and the partial downloads take.
+#[test]
+fn files_rows_say_the_sizes() {
+    let l = layout("files-sizes", None);
+    let _part = part_of(&l, 3_000_000);
+    let turbo = MODELS.iter().find(|m| m.id == "turbo").unwrap();
+    common::fake_model(&l.models_dir().join(turbo.file_name), turbo.size);
+    let window = open(&l, Page::Model);
+    sub_tab(&window, "Settings");
+    let state = window.global::<ModelState>();
+    measured(&window);
+    let folder = state.get_folder_size();
+    assert!(folder.starts_with("1.6 GB in 1 model"), "{folder}");
+    assert!(has(&window, "3 MB in 1 file"));
+    assert!(shows(&window, "1.6 GB in 1 model"));
+    assert_eq!(state.get_folder_error(), "");
+    // Hold 42 "on both tabs": the Models tab header says it too.
+    sub_tab(&window, "Models");
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    assert!(shows(&window, "1.6 GB in 1 model"));
+}
+
+/// Review b04: a models folder that cannot be read (here the path is a file) says so, with the
+/// reason on the row's "!", instead of "Measuring" for ever.
+#[test]
+fn an_unreadable_models_folder_shows_an_error() {
+    let l = layout("files-unreadable", None);
+    fs::create_dir_all(l.models_dir().parent().unwrap()).unwrap();
+    fs::write(l.models_dir(), b"not a folder").unwrap();
+    let window = open(&l, Page::Model);
+    sub_tab(&window, "Settings");
+    let state = window.global::<ModelState>();
+    measured(&window);
+    assert_eq!(state.get_folder_size(), "Can't read the folder");
+    let error = state.get_folder_error();
+    assert!(
+        error.starts_with("Can't read the models folder: "),
+        "{error}"
+    );
 }
 
 /// UI rule 16: a button that cancels turns red on hover, which only the danger kind does.
@@ -832,11 +1012,14 @@ fn row_titles_start_at_one_x_and_text_rows_use_the_width() {
     for (tab, title) in [
         (None, "Whisper large-v3 turbo: Not downloaded"),
         (Some("Use my own .bin"), "Use my own .bin"),
-        (Some("Settings"), "GPU"),
-        (Some("Advanced"), "Processor threads"),
+        (Some("Settings"), "Run on"),
+        (Some("Advanced"), "Processor use"),
     ] {
         match tab {
-            Some("Use my own .bin") => view(&window, "Use my own .bin"),
+            // Past the two rows shown at 720: picked as the arrows and Enter would.
+            Some("Use my own .bin") => window
+                .global::<ModelState>()
+                .set_viewed(i32::try_from(MODELS.len() - 1).unwrap()),
             Some(tab) => sub_tab(&window, tab),
             None => {}
         }
@@ -848,33 +1031,169 @@ fn row_titles_start_at_one_x_and_text_rows_use_the_width() {
     }
     let line = with_role(
         &window,
-        "Auto: 4 now, a GPU does the heavy work. On the processor alone: half its threads, at most 8.",
+        "How many processor threads transcription may use. Auto: 4 now, a graphics card does the heavy work. Max: all of them, the fastest, other programs may slow down. Half: half of them.",
         AccessibleRole::Text,
     );
     assert!(line.size().height < 24.0, "wraps: {:?}", line.size());
 }
 
-/// The Prompt field is typed in, so its binding to the config ends: "Reset all to Auto" must
-/// still empty it, and a saved prompt shows again after the page reads the config.
+/// The prompt is a select (your dictionary, none, custom); Custom swaps it for a text field of the
+/// same place and size, and the text is kept while another choice is on. The field is typed in, so
+/// its binding to the config ends: "Reset all to Auto" must still empty it.
 #[test]
-fn reset_all_to_auto_empties_the_typed_prompt() {
+fn the_prompt_select_swaps_for_a_field_of_the_same_size_and_keeps_the_text() {
     let l = layout("prompt-reset", None);
     let window = open(&l, Page::Model);
-    sub_tab(&window, "Advanced");
-    let field = with_role(&window, "Prompt", AccessibleRole::TextInput);
-    field.set_accessible_value("Notes.".to_owned());
-    // Enter or leaving the field commits it.
     window
-        .global::<ModelState>()
-        .invoke_adv_prompt_edited("Notes.".into());
-    assert_eq!(saved(&l).advanced.initial_prompt, "Notes.");
+        .window()
+        .set_size(slint::LogicalSize::new(720.0, 520.0));
+    sub_tab(&window, "Advanced");
     // Slint runs `changed` handlers on the next tick, as the running app does between two clicks.
     let tick = || i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
     tick();
+    let state = window.global::<ModelState>();
+    let select = with_role(&window, "Hint for the model", AccessibleRole::Combobox);
+    assert_eq!(
+        select.accessible_value().as_deref(),
+        Some("Your dictionary (auto)")
+    );
+    let place = (select.absolute_position(), select.size());
+    state.invoke_adv_prompt_source_picked(2);
+    tick();
+    assert_eq!(saved(&l).advanced.prompt_source, Some(PromptSource::Custom));
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "Hint for the model")
+            .all(|e| e.accessible_role() != Some(AccessibleRole::Combobox)),
+        "the select is gone"
+    );
+    let field = with_role(&window, "Hint for the model", AccessibleRole::TextInput);
+    // The field and the arrow back fill the select's place.
+    let back = button(&window, "Choose from the list");
+    let (x, y) = (field.absolute_position(), back.absolute_position());
+    assert!((x.x - place.0.x).abs() < 0.5 && (x.y - place.0.y).abs() < 0.5);
+    assert!(
+        (y.x + back.size().width - (place.0.x + place.1.width)).abs() < 0.5,
+        "the arrow ends where the select did"
+    );
+    assert!((field.size().height - place.1.height).abs() < 0.5);
+    field.set_accessible_value("Notes.".to_owned());
+    // Enter or leaving the field commits it.
+    state.invoke_adv_prompt_edited("Notes.".into());
+    assert_eq!(saved(&l).advanced.initial_prompt, "Notes.");
+    // Back to the list: the text is kept for the next Custom.
+    back.invoke_accessible_default_action();
+    tick();
+    assert_eq!(
+        saved(&l).advanced.prompt_source,
+        Some(PromptSource::Dictionary)
+    );
+    assert_eq!(saved(&l).advanced.initial_prompt, "Notes.");
+    // A real pick from the open list: the select sets its own index, which ends its binding.
+    with_role(&window, "Hint for the model", AccessibleRole::Combobox)
+        .invoke_accessible_expand_action();
+    pick_row(&window, "None");
+    tick();
+    assert_eq!(saved(&l).advanced.prompt_source, Some(PromptSource::None));
+    assert_eq!(
+        with_role(&window, "Hint for the model", AccessibleRole::Combobox)
+            .accessible_value()
+            .as_deref(),
+        Some("None")
+    );
+    // Reset all while the select shows "None": the select follows the config back.
+    button(&window, "Reset all to Auto").invoke_accessible_default_action();
+    tick();
+    assert_eq!(saved(&l).advanced.prompt_source, None);
+    assert_eq!(
+        with_role(&window, "Hint for the model", AccessibleRole::Combobox)
+            .accessible_value()
+            .as_deref(),
+        Some("Your dictionary (auto)")
+    );
+    state.invoke_adv_prompt_source_picked(2);
+    tick();
+    // Reset all cleared the text too; type it again, then Reset all from Custom.
+    let field = with_role(&window, "Hint for the model", AccessibleRole::TextInput);
+    assert_eq!(field.accessible_value().as_deref(), Some(""));
+    field.set_accessible_value("Notes.".to_owned());
+    state.invoke_adv_prompt_edited("Notes.".into());
+    assert_eq!(saved(&l).advanced.initial_prompt, "Notes.");
     button(&window, "Reset all to Auto").invoke_accessible_default_action();
     assert_eq!(saved(&l).advanced.initial_prompt, "");
+    assert_eq!(saved(&l).advanced.prompt_source, None);
     tick();
-    assert_eq!(field.accessible_value().as_deref(), Some(""));
+    assert_eq!(
+        with_role(&window, "Hint for the model", AccessibleRole::Combobox)
+            .accessible_value()
+            .as_deref(),
+        Some("Your dictionary (auto)")
+    );
+}
+
+/// A config from before the choice: a typed prompt opens as Custom with its text in the field.
+#[test]
+fn an_old_config_with_a_prompt_opens_on_custom() {
+    let l = layout(
+        "prompt-old",
+        Some(
+            "version = 2
+[model.advanced]
+initial_prompt = \"Notes.\"
+",
+        ),
+    );
+    let window = open(&l, Page::Model);
+    sub_tab(&window, "Advanced");
+    let field = with_role(&window, "Hint for the model", AccessibleRole::TextInput);
+    assert_eq!(field.accessible_value().as_deref(), Some("Notes."));
+}
+
+/// Max and Half of the threads are choices of their own, and the number beside them shows what
+/// they give; Custom opens the number for typing, and an old number loads as Custom.
+#[test]
+fn the_threads_choices_name_max_and_half_and_old_numbers_load() {
+    let logical = thread::available_parallelism().map_or(1, usize::from);
+    let l = layout(
+        "threads",
+        Some(
+            "version = 2
+[model.advanced]
+threads = 3
+",
+        ),
+    );
+    let window = open(&l, Page::Model);
+    sub_tab(&window, "Advanced");
+    let shown = |window: &AppWindow| {
+        with_role(window, "Processor use", AccessibleRole::Combobox)
+            .accessible_value()
+            .map(|v| v.to_string())
+    };
+    // 3 is not Max or Half of every machine, unless the machine is that small.
+    let state = window.global::<ModelState>();
+    let tick = || i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    tick();
+    if logical != 3 && logical / 2 != 3 {
+        assert_eq!(shown(&window).as_deref(), Some("Custom"));
+    }
+    state.invoke_adv_changed(0, 1, 3.0);
+    tick();
+    assert_eq!(shown(&window).as_deref(), Some("Max"));
+    assert_eq!(
+        saved(&l).advanced.threads,
+        Auto::Set(u8::try_from(logical.clamp(1, 32)).unwrap())
+    );
+    state.invoke_adv_changed(0, 2, 3.0);
+    tick();
+    assert_eq!(shown(&window).as_deref(), Some("Half"));
+    // Custom stays Custom even when the number it starts from is Half's.
+    state.invoke_adv_changed(0, 3, state.get_adv_value().row_data(0).unwrap());
+    tick();
+    assert_eq!(shown(&window).as_deref(), Some("Custom"));
+    state.invoke_adv_changed(0, 0, 3.0);
+    tick();
+    assert_eq!(shown(&window).as_deref(), Some("Auto"));
+    assert_eq!(saved(&l).advanced.threads, Auto::Auto);
 }
 
 /// Every engine parameter has its Auto row, each with its own glyph (DS-24.1: one meaning, one
@@ -883,7 +1202,7 @@ fn reset_all_to_auto_empties_the_typed_prompt() {
 fn advanced_has_a_row_per_parameter_and_none_shares_a_glyph() {
     let window = open(&layout("adv-rows", None), Page::Model);
     sub_tab(&window, "Advanced");
-    for title in ["Temperature", "Repetition threshold"] {
+    for title in ["Word variety", "Repeat check"] {
         assert!(has(&window, title), "{title}");
     }
     assert!(!has(&window, "Audio window"), "a choice the engine ignores");
@@ -961,7 +1280,11 @@ fn the_advanced_choices_leave_room_for_the_number_at_the_least_window() {
         .match_accessible_role(AccessibleRole::Combobox)
         .find_all();
     assert!(combos.len() >= 6, "{} choices", combos.len());
-    for c in combos {
+    // The hint select is the whole column: it is swapped for a text field of that size.
+    for c in combos
+        .into_iter()
+        .filter(|c| c.accessible_label().as_deref() != Some("Hint for the model"))
+    {
         let w = c.size().width;
         assert!(
             w <= 240.0 - 8.0 - 88.0 + 0.5,
@@ -986,8 +1309,8 @@ fn the_advanced_rows_draw_distinct_glyph_files() {
         name.split(';').next().unwrap().to_owned()
     };
     for (title, want) in [
-        ("Processor threads", "threads"),
-        ("Flash attention", "flash-attention"),
+        ("Processor use", "threads"),
+        ("Speed boost", "flash-attention"),
         ("Retry doubtful segments", "retry-doubtful"),
     ] {
         assert_eq!(icon_of(title), want, "{title}");
@@ -1076,7 +1399,7 @@ fn the_card_keeps_its_height_in_every_state() {
         window.global::<ModelState>().invoke_shown();
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
         assert!(
-            has(&window, &format!("Whisper large-v3: {badge}")),
+            shows(&window, &format!("Whisper large-v3: {badge}")),
             "{badge}"
         );
         ElementHandle::find_by_element_type_name(&window, "ModelCard")
@@ -1093,9 +1416,9 @@ fn the_card_keeps_its_height_in_every_state() {
     fs::write(&file, b"synthetic").unwrap();
     let damaged = card("Damaged");
     common::fake_model(&file, entry.size);
-    let downloaded = card("Downloaded");
+    let downloaded = card("Downloaded · checked before first use");
     oxi_core::models::write_stamp(&file).unwrap();
-    let ready = card("Ready");
+    let ready = card("Downloaded · runs on Vulkan0");
     assert!(has(&window, SLOW), "Ready lost the slow warning");
     for (state, height) in [
         ("Damaged", damaged),
@@ -1128,14 +1451,21 @@ fn a_downloaded_or_damaged_card_does_not_repeat_the_tile() {
         ("Whisper large-v3", "Damaged", "download it again"),
     ] {
         view(&window, name);
-        assert!(has(&window, &format!("{name}: {badge}")), "{name}");
+        assert!(
+            shows(&window, &format!("{name}: {badge} · {note}")),
+            "{name}"
+        );
         let lines: Vec<_> = i_slint_backend_testing::ElementQuery::from_root(&window)
             .find_all()
             .into_iter()
             .filter_map(|e| e.accessible_label())
             .filter(|t| t.contains(note))
             .collect();
-        assert_eq!(lines, [note], "{name}");
+        assert_eq!(lines.len(), 1, "{name}: {lines:?}");
+        assert!(
+            !lines[0].contains("99 languages"),
+            "{name}: the tile's facts again"
+        );
     }
 }
 
@@ -1153,10 +1483,7 @@ fn the_language_chevron_has_a_word_and_auto_is_not_a_disabled_box() {
         "a bare chevron"
     );
     sub_tab(&window, "Advanced");
-    assert!(
-        has(&window, "Auto uses 4"),
-        "Auto's value is a line of its own"
-    );
+    assert!(has(&window, "4 now"), "Auto's value is a line of its own");
     assert!(
         !i_slint_backend_testing::ElementQuery::from_root(&window)
             .find_all()
@@ -1269,7 +1596,7 @@ fn the_advanced_tab_has_no_loose_caption() {
     let tab = &slint[slint.find("ModelState.tab == 2").expect("the Advanced tab")..];
     assert!(!tab.contains("Caption {"), "a loose Caption on Advanced");
     assert!(
-        tab.contains("info: @tr(\"Expert settings. Auto means"),
+        tab.contains("info: @tr(\"For experts. Auto means"),
         "no \"i\""
     );
 }

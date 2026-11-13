@@ -271,6 +271,31 @@ fn open_is_labelled_and_stays_live_when_the_config_is_locked() {
     assert_eq!(fs::read_to_string(l.config_file()).unwrap(), original);
 }
 
+/// Item 9: Browse, Open, Settings and Logs are one size, whatever their labels.
+#[test]
+fn the_four_folder_buttons_are_one_size() {
+    let window = recordings(&layout("folder-buttons", None));
+    let mut sizes = vec![];
+    for label in [
+        "Change recordings folder",
+        "Open recordings folder",
+        "Open settings folder",
+        "Open logs folder",
+    ] {
+        // Browse is only on a box that has a file dialog.
+        if let Some(b) = ElementHandle::find_by_accessible_label(&window, label).next() {
+            sizes.push((label, b.size().width, b.size().height));
+        }
+    }
+    assert!(sizes.len() >= 3, "{sizes:?}");
+    for (label, w, h) in &sizes {
+        assert!(
+            (w - sizes[0].1).abs() < 0.5 && (h - sizes[0].2).abs() < 0.5,
+            "{label} is {w}x{h}, not {sizes:?}"
+        );
+    }
+}
+
 /// DS-3.1: the path field fills the control column, so its edges are those of the Save recordings
 /// switch's column end and of the Open button under it.
 #[test]

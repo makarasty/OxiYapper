@@ -10,17 +10,18 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use std::time::SystemTime;
 
-use oxi_core::config::{Advanced, Auto, Decoding, LanguageKey};
+use oxi_core::config::{Advanced, Auto, Decoding, LanguageKey, PromptSource};
 use oxi_core::device::{Device, DeviceChoice, pick};
 use oxi_core::ipc::{DeleteResult, DownloadResult, Push, Request};
 use oxi_core::languages::{self, LanguageInfo};
-use oxi_core::models::{self, MODELS, ModelEntry, ModelStatus, PartialDownload};
+use oxi_core::models::{self, Adapter, MODELS, Machine, ModelEntry, ModelStatus, PartialDownload};
 use oxi_core::paste::file::WRITE_FAILED;
 use oxi_core::paths::PART_SUFFIX;
 use oxi_core::strings::{self, gb};
-use oxi_core::tuning::{self, Sampling};
+use oxi_core::tuning::{self, Sampling, preset_mode, preset_value};
 use oxi_core::types::Language;
-use oxi_platform::fs::list_partials;
+use oxi_platform::fs::{list_partials, models_size};
+use oxi_platform::sysinfo;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
 use super::progress::{Bars, DOWNLOAD_EST};
@@ -60,7 +61,6 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     let dir = ctx.layout.models_dir();
     let now = SystemTime::now();
     let rows: Vec<ModelRow> = entries.iter().map(|e| row(e, &dir, None, now)).collect();
-    let (tx, rx) = channel();
     let page = Rc::new_cyclic(|me: &RcWeak<PageState>| PageState {
         me: me.clone(),
         // A rebind (Reset) replaces the callbacks below, which drops this page and with it
@@ -79,6 +79,7 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         rows: Rc::new(VecModel::from(rows)),
         tiles: Rc::new(VecModel::default()),
         partials: RefCell::new(Vec::new()),
+        seen: RefCell::default(),
         listed: RefCell::new(None),
         backend: RefCell::new(String::new()),
         loaded: Cell::new(false),
@@ -88,6 +89,7 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         // Not a pair the config can hold: the first `push_language` takes the config's.
         slots: Cell::new([Language::AUTO; 2]),
         found: RefCell::new(Vec::new()),
+        custom: Cell::new(0),
         bars: Bars::new({
             let me = me.clone();
             move |&i, shown| {
@@ -96,13 +98,8 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
                 }
             }
         }),
-        checks: Checks {
-            latest: Cell::new(0),
-            running: Cell::new(0),
-            tx,
-            rx,
-            timer: Timer::default(),
-        },
+        checks: Checks::new(),
+        measuring: Measuring::new(),
     });
     s.set_rows(ModelRc::from(page.rows.clone()));
     s.set_tiles(ModelRc::from(page.tiles.clone()));
@@ -123,6 +120,8 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     s.on_language_chosen(move |i| p.language_chosen(i));
     let p = Rc::clone(&page);
     s.on_shown(move || p.shown());
+    let p = Rc::clone(&page);
+    s.on_measured(move || p.measured());
     let p = Rc::clone(&page);
     s.on_picked(move |i| p.picked(i));
     let p = Rc::clone(&page);
@@ -152,6 +151,8 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     let p = Rc::clone(&page);
     s.on_adv_prompt_edited(move |text| p.adv_prompt_edited(&text));
     let p = Rc::clone(&page);
+    s.on_adv_prompt_source_picked(move |i| p.adv_prompt_source_picked(i));
+    let p = Rc::clone(&page);
     s.on_adv_reset(move || p.adv_reset());
 
     // Reset to defaults rebinds while the page may be open; its `init` does not run again.
@@ -172,6 +173,8 @@ struct PageState {
     tiles: Rc<VecModel<GalleryTile>>,
     /// The `.part` files of the models folder as last read.
     partials: RefCell<Vec<PartialDownload>>,
+    /// The machine and the models folder as the measuring worker last read them.
+    seen: RefCell<Seen>,
     /// The daemon's GPU list; `None` until it answers `ListDevices`.
     listed: RefCell<Option<Vec<Device>>>,
     /// The daemon's `Status.backend` (`cpu`, `Vulkan0`, `none`); empty until it answers.
@@ -188,10 +191,14 @@ struct PageState {
     slots: Cell<[Language; 2]>,
     /// The rows of the language popup: what the search matched.
     found: RefCell<Vec<&'static LanguageInfo>>,
+    /// The Advanced numbers whose Custom the person picked (bit per parameter): Custom stays
+    /// picked while the number equals a preset's, and clears with any other choice.
+    custom: Cell<u16>,
     /// The download bars by row: they show what the one progress driver answers, not the bytes
     /// as they come.
     bars: Rc<Bars<usize>>,
     checks: Checks,
+    measuring: Measuring,
 }
 
 /// A path's existence check, run on a worker thread: a UNC path to an offline host can block
@@ -204,6 +211,63 @@ struct Checks {
     tx: Sender<Checked>,
     rx: Receiver<Checked>,
     timer: Timer,
+}
+
+impl Checks {
+    fn new() -> Self {
+        let (tx, rx) = channel();
+        Self {
+            latest: Cell::new(0),
+            running: Cell::new(0),
+            tx,
+            rx,
+            timer: Timer::default(),
+        }
+    }
+}
+
+/// The models folder measure, on a worker: one at a time, so a folder on a share that went
+/// offline holds one stuck thread, not one per file change. The worker's answer wakes the page
+/// through the event loop (`ModelState.measured`), with no timer.
+struct Measuring {
+    /// A worker is out.
+    busy: Cell<bool>,
+    /// A file change came while it was out: measure again when it answers.
+    again: Cell<bool>,
+    tx: Sender<Measured>,
+    rx: Receiver<Measured>,
+}
+
+impl Measuring {
+    fn new() -> Self {
+        let (tx, rx) = channel();
+        Self {
+            busy: Cell::new(false),
+            again: Cell::new(false),
+            tx,
+            rx,
+        }
+    }
+}
+
+/// What the measuring worker read last.
+#[derive(Default)]
+struct Seen {
+    /// The graphics adapters, `None` until the first answer (read once per page).
+    adapters: Option<Vec<Adapter>>,
+    ram: Option<u64>,
+    /// Free space of the models drive.
+    free: Option<u64>,
+    /// The finished files of the models folder (bytes, `.bin` count) or why it cannot be read;
+    /// `None` until the first answer.
+    folder: Option<Result<(u64, usize), String>>,
+}
+
+struct Measured {
+    folder: Result<(u64, usize), String>,
+    free: Option<u64>,
+    /// The system memory and the adapters, when they were asked for (the first measure only).
+    hardware: Option<(Option<u64>, Vec<Adapter>)>,
 }
 
 struct Checked {
@@ -411,15 +475,25 @@ impl PageState {
         ];
         s.set_adv_mode(ModelRc::from(Rc::new(VecModel::from(adv_modes(
             &model.advanced,
+            logical,
+            self.custom.get(),
         )))));
         s.set_adv_value(ModelRc::from(Rc::new(VecModel::from(values.to_vec()))));
         s.set_adv_prompt(model.advanced.initial_prompt.as_str().into());
+        s.set_adv_prompt_source(prompt_source_index(model.advanced.prompt_source()));
     }
 
     fn adv_changed(&self, param: i32, mode: i32, value: f32) {
+        let logical = thread::available_parallelism().map_or(1, usize::from);
+        if let Some(bit) = u32::try_from(param).ok().filter(|b| *b < 9) {
+            // Custom of a number with presets is the choice after them.
+            let custom = preset_count(param).is_some_and(|n| mode == int(n + 1));
+            let bits = self.custom.get() & !(1 << bit);
+            self.custom.set(bits | (u16::from(custom) << bit));
+        }
         {
             let mut file = self.ctx.config.borrow_mut();
-            adv_apply(&mut file.config.model.advanced, param, mode, value);
+            adv_apply(&mut file.config.model.advanced, param, mode, value, logical);
         }
         report(&self.window, self.ctx.save());
         self.state(|s| self.push_advanced(s));
@@ -439,8 +513,28 @@ impl PageState {
         report(&self.window, self.ctx.save());
     }
 
+    /// The prompt select: 0 the dictionary, 1 none, 2 the person's own text (kept while it is not
+    /// the one in use).
+    fn adv_prompt_source_picked(&self, i: i32) {
+        let source = match i {
+            1 => PromptSource::None,
+            2 => PromptSource::Custom,
+            _ => PromptSource::Dictionary,
+        };
+        self.ctx
+            .config
+            .borrow_mut()
+            .config
+            .model
+            .advanced
+            .prompt_source = Some(source);
+        report(&self.window, self.ctx.save());
+        self.state(|s| s.set_adv_prompt_source(prompt_source_index(source)));
+    }
+
     /// "Reset all to Auto": every parameter, the candidates and the prompt back to the defaults.
     fn adv_reset(&self) {
+        self.custom.set(0);
         self.ctx.config.borrow_mut().config.model.advanced = Advanced::default();
         report(&self.window, self.ctx.save());
         self.state(|s| self.push_advanced(s));
@@ -488,7 +582,23 @@ impl PageState {
             let rows: Vec<SharedString> = found.iter().map(|i| f(i).into()).collect();
             ModelRc::from(Rc::new(VecModel::from(rows)))
         };
-        let (rows, native) = (column(|i| i.english), column(|i| i.native));
+        // The code in front of the native name, muted: why a search for "ua" or "jp" matched.
+        let notes: Vec<SharedString> = found
+            .iter()
+            .map(|i| {
+                let code = i.code.to_uppercase();
+                // "EN · English" says the name twice.
+                if i.native == i.english {
+                    code.into()
+                } else {
+                    format!("{code} · {}", i.native).into()
+                }
+            })
+            .collect();
+        let (rows, native) = (
+            column(|i| i.english),
+            ModelRc::from(Rc::new(VecModel::from(notes))),
+        );
         *self.found.borrow_mut() = found;
         let current = self.ctx.config.borrow().config.model.language;
         self.state(|s| {
@@ -521,6 +631,8 @@ impl PageState {
             model.use_language(lang);
         }
         self.state(|s| self.push_language(s));
+        // The recommendation follows the language.
+        self.judge();
         report(&self.window, self.ctx.save());
     }
 
@@ -563,6 +675,11 @@ impl PageState {
                     title: r.name.clone(),
                     caption: r.facts.clone(),
                     hint: hint.into(),
+                    badge: if r.recommended {
+                        RECOMMENDED.into()
+                    } else {
+                        SharedString::new()
+                    },
                     icon: icon(r.class),
                     mark,
                     mark_text: mark_text.into(),
@@ -737,6 +854,54 @@ impl PageState {
                 save,
             });
         });
+        self.wait();
+    }
+
+    /// Measures the models folder and the free space of its drive on a worker (a network folder
+    /// can stall), and the first time the system memory and graphics adapters; the answer updates
+    /// the Files rows, the disk warnings and the recommendation. Runs on every file change the
+    /// page hears of (open, download, delete), never on a timer of its own.
+    fn measure(&self) {
+        let m = &self.measuring;
+        if m.busy.replace(true) {
+            m.again.set(true);
+            return;
+        }
+        let hardware = self.seen.borrow().adapters.is_none();
+        let (tx, dir, window) = (
+            m.tx.clone(),
+            self.ctx.layout.models_dir(),
+            self.window.clone(),
+        );
+        thread::spawn(move || {
+            let measured = Measured {
+                folder: models_size(&dir).map_err(|e| e.to_string()),
+                free: sysinfo::free_space(&dir),
+                hardware: hardware.then(|| (sysinfo::ram(), sysinfo::adapters())),
+            };
+            // A failed send: the page is gone (closed or rebound).
+            if tx.send(measured).is_ok() {
+                // Err: the window closed, or no event loop runs (tests call `invoke_measured`).
+                let _ =
+                    window.upgrade_in_event_loop(|w| w.global::<ModelState>().invoke_measured());
+            }
+        });
+    }
+
+    /// The measuring worker answered: apply it, and measure again if a file changed meanwhile.
+    fn measured(&self) {
+        let m = &self.measuring;
+        while let Ok(answer) = m.rx.try_recv() {
+            m.busy.set(false);
+            self.apply_measure(answer);
+        }
+        if !m.busy.get() && m.again.replace(false) {
+            self.measure();
+        }
+    }
+
+    /// Polls the path checks' answers while any is out; the timer stops with the last answer.
+    fn wait(&self) {
         let me = self.me.clone();
         self.checks
             .timer
@@ -758,6 +923,74 @@ impl PageState {
         }
         if self.checks.running.get() == 0 {
             self.checks.timer.stop();
+        }
+    }
+
+    fn apply_measure(&self, m: Measured) {
+        {
+            let mut seen = self.seen.borrow_mut();
+            if let Some((ram, adapters)) = m.hardware {
+                seen.ram = ram;
+                seen.adapters = Some(adapters);
+            }
+            seen.free = m.free;
+            seen.folder = Some(m.folder);
+        }
+        self.judge();
+        self.push_partials();
+    }
+
+    /// Each row's recommendation, disk warning and "i" from the machine, the device "Run on"
+    /// picks and the dictation language (`models::recommend`).
+    fn judge(&self) {
+        let (gpu, language) = {
+            let file = self.ctx.config.borrow();
+            (file.config.model.gpu.clone(), file.config.model.language)
+        };
+        let machine = {
+            let seen = self.seen.borrow();
+            Machine {
+                ram: seen.ram,
+                vram: seen.adapters.as_deref().and_then(|adapters| {
+                    models::graphics_memory(self.listed.borrow().as_deref(), &gpu, adapters)
+                }),
+                free_disk: seen.free,
+            }
+        };
+        let ready: Vec<bool> = self.rows.iter().map(|r| r.ready).collect();
+        let parts: Vec<u64> = {
+            let partials = self.partials.borrow();
+            self.entries
+                .iter()
+                .map(|e| {
+                    partials
+                        .iter()
+                        .find(|p| p.file_name == e.file_name)
+                        .map_or(0, |p| p.size)
+                })
+                .collect()
+        };
+        // What each model has on disk: the whole file, its paused `.part`, or nothing.
+        let pick = models::recommend(&machine, language, |id| {
+            self.index_of(id).map_or(0, |i| {
+                if ready[i] {
+                    self.entries[i].size
+                } else {
+                    parts[i]
+                }
+            })
+        });
+        for (i, entry) in self.entries.iter().enumerate() {
+            let recommended = pick.filter(|p| p.id == entry.id);
+            let disk = models::disk_short(entry, parts[i], machine.free_disk)
+                .map(|need| disk_note(need, machine.free_disk.unwrap_or(0)))
+                .unwrap_or_default();
+            let info = card_info(entry, recommended.map(|p| p.gpu));
+            self.update(i, |r| {
+                r.recommended = recommended.is_some();
+                r.disk_off = disk.into();
+                r.info = info.into();
+            });
         }
     }
 
@@ -900,6 +1133,7 @@ impl PageState {
                 if *self.backend.borrow() != *backend || was_loaded != *loaded {
                     backend.clone_into(&mut self.backend.borrow_mut());
                     self.state(|s| self.push_advanced(s));
+                    self.push_runs_on();
                 }
                 // The sound lines are the Audio page's (audio::sound_warning), the to-file line the
                 // Text page's file row.
@@ -973,7 +1207,10 @@ impl PageState {
         }
         drop(listed);
         *self.partials.borrow_mut() = partials;
+        self.push_runs_on();
+        self.judge();
         self.push_partials();
+        self.measure();
         // The by-language list offers only downloaded models: a download or delete changes it.
         self.state(|s| {
             let shown = usize::try_from(s.get_by_language())
@@ -997,15 +1234,39 @@ impl PageState {
             ""
         };
         let bytes = partials.iter().map(|p| p.size).sum();
-        let files = match partials.len() {
-            1 => "1 file".to_owned(),
-            n => format!("{n} files"),
+        let shown = match partials.len() {
+            0 => "None".to_owned(),
+            1 => format!("{} in 1 file", size(bytes)),
+            n => format!("{} in {n} files", size(bytes)),
         };
-        let tip = format!("{} in {files}", size(bytes));
+        let (folder, error) = {
+            let seen = self.seen.borrow();
+            (
+                folder_size(seen.folder.as_ref(), seen.free),
+                match &seen.folder {
+                    Some(Err(e)) => format!("Can't read the models folder: {e}"),
+                    _ => String::new(),
+                },
+            )
+        };
         self.state(|s| {
             s.set_partials_off(off.into());
-            s.set_partials(tip.into());
+            s.set_partials(shown.into());
+            s.set_folder_size(folder.into());
+            s.set_folder_error(error.into());
         });
+    }
+
+    /// The card's "runs on" from "Run on", the daemon's GPU list and the device it loaded on.
+    fn push_runs_on(&self) {
+        let gpu = self.ctx.config.borrow().config.model.gpu.clone();
+        let text = runs_on(
+            self.listed.borrow().as_deref(),
+            &gpu,
+            &self.backend.borrow(),
+            self.loaded.get(),
+        );
+        self.state(|s| s.set_runs_on(text.into()));
     }
 }
 
@@ -1066,7 +1327,12 @@ fn row(
         facts: facts.into(),
         class: i32::try_from(f.class.index()).unwrap_or(OWN_CLASS),
         progress_text: SharedString::new(),
-        badge: strings::model_badge(status).into(),
+        // "Ready" said little (hold 35): a usable model is "Downloaded", checked or not.
+        badge: match status {
+            ModelStatus::Ready => DOWNLOADED,
+            other => strings::model_badge(other),
+        }
+        .into(),
         ready: matches!(status, ModelStatus::Ready | ModelStatus::NeedsHash),
         can_download: matches!(
             status,
@@ -1079,8 +1345,79 @@ fn row(
         heavy: false,
         can_delete: status != ModelStatus::Missing,
         frees: size(on_disk).into(),
+        info: card_info(entry, None).into(),
+        disk_off: SharedString::new(),
+        recommended: false,
     }
 }
+
+/// The models folder's line (the Files row, the Models tab header): what its finished files take
+/// and the drive's free space; "Measuring" until the worker answers, a short error if it failed.
+fn folder_size(folder: Option<&Result<(u64, usize), String>>, free: Option<u64>) -> String {
+    let free = free
+        .map(|f| format!(" · {} free", size(f)))
+        .unwrap_or_default();
+    let folder = match folder {
+        None => return FOLDER_MEASURING.to_owned(),
+        Some(Err(_)) => return FOLDER_UNREADABLE.to_owned(),
+        Some(Ok(folder)) => *folder,
+    };
+    match folder {
+        (0, _) => format!("Empty{free}"),
+        (bytes, 1) => format!("{} in 1 model{free}", size(bytes)),
+        (bytes, n) => format!("{} in {n} models{free}", size(bytes)),
+    }
+}
+
+/// Why Download is off on a drive too full for the model: the card's "!" and the button's tip.
+fn disk_note(need: u64, free: u64) -> String {
+    format!(
+        "Not enough disk space: needs {}, this drive has {} free.",
+        size(need),
+        size(free)
+    )
+}
+
+/// The card's "i": what the model is for and the memory it needs, and why it is recommended
+/// (`Some(true)` judged for a graphics card, `Some(false)` for the processor).
+fn card_info(entry: &ModelEntry, recommended: Option<bool>) -> String {
+    let f = models::facts(entry.id);
+    let why = match recommended {
+        Some(true) => "\nRecommended for this PC: it fits your graphics card's memory.",
+        Some(false) => "\nRecommended for this PC: light enough for the processor.",
+        None => "",
+    };
+    format!(
+        "{}. Needs about {} of memory to run.{why}",
+        f.note,
+        size(f.memory)
+    )
+}
+
+/// Where the models run, for the card: with a model loaded, the device the daemon says it loaded
+/// on (`backend`: "cpu" after a GPU failure too, as `auto_on_gpu`); else the device "Run on" picks
+/// among the listed GPUs; empty until the daemon lists them.
+fn runs_on(
+    listed: Option<&[Device]>,
+    choice: &DeviceChoice,
+    backend: &str,
+    loaded: bool,
+) -> String {
+    if loaded && backend == "cpu" {
+        return PROCESSOR.to_owned();
+    }
+    let Some(gpus) = listed else {
+        return String::new();
+    };
+    let on = gpus.iter().position(|d| loaded && d.name == backend);
+    match on.or(pick(gpus, choice).index) {
+        Some(i) => format!("runs on {}", gpus[i].display_name()),
+        None => PROCESSOR.to_owned(),
+    }
+}
+
+/// The card's "runs on" on the CPU.
+const PROCESSOR: &str = "runs on the processor";
 
 /// The parameters of the Advanced tab, the order of `ModelState.adv-mode` and `adv-value`.
 const P_THREADS: i32 = 0;
@@ -1095,64 +1432,100 @@ const P_SUPPRESS: i32 = 8;
 /// The number beside Decoding; it has a value but no choice of its own.
 const P_CANDIDATES: i32 = 9;
 
+/// The named values between Auto and Custom of a number's choice (the choices of the page in
+/// order: Auto, these, Custom); `None` for a parameter that is not a number or has only Auto.
+fn presets(param: i32, logical: usize) -> Option<[f32; 2]> {
+    match param {
+        P_THREADS => Some(tuning::thread_presets(logical)),
+        P_TEMPERATURE => Some(tuning::TEMPERATURE_PRESETS),
+        P_NO_SPEECH => Some(tuning::NO_SPEECH_PRESETS),
+        P_LOGPROB => Some(tuning::LOGPROB_PRESETS),
+        P_ENTROPY => Some(tuning::ENTROPY_PRESETS),
+        _ => None,
+    }
+}
+
+/// How many presets `param` has, so Custom is the choice after them.
+fn preset_count(param: i32) -> Option<usize> {
+    presets(param, 1).map(|p| p.len())
+}
+
 /// The choice each parameter shows: 0 is Auto; a yes/no one then reads 1 On, 2 Off; decoding 1
-/// Greedy, 2 Beam; the numbers 1 Custom.
-fn adv_modes(a: &Advanced) -> Vec<i32> {
+/// Fast (greedy), 2 Accurate (beam); a number its presets, then Custom (see [`presets`]).
+/// `custom` has a bit per parameter whose Custom the person picked.
+fn adv_modes(a: &Advanced, logical: usize, custom: u16) -> Vec<i32> {
     let flag = |v: Auto<bool>| match v {
         Auto::Auto => 0,
         Auto::Set(true) => 1,
         Auto::Set(false) => 2,
     };
-    let custom = |set: bool| i32::from(set);
+    let number = |param: i32, v: Auto<f32>| {
+        let presets = presets(param, logical).unwrap_or_default();
+        int(preset_mode(v, &presets, custom >> param & 1 == 1))
+    };
+    let threads = match a.threads {
+        Auto::Auto => Auto::Auto,
+        Auto::Set(n) => Auto::Set(f32::from(n)),
+    };
     vec![
-        custom(matches!(a.threads, Auto::Set(_))),
+        number(P_THREADS, threads),
         flag(a.flash_attn),
         match a.decoding {
             Auto::Auto => 0,
             Auto::Set(Decoding::Greedy) => 1,
             Auto::Set(Decoding::Beam) => 2,
         },
-        custom(matches!(a.temperature, Auto::Set(_))),
+        number(P_TEMPERATURE, a.temperature),
         flag(a.temperature_fallback),
-        custom(matches!(a.no_speech_threshold, Auto::Set(_))),
-        custom(matches!(a.logprob_threshold, Auto::Set(_))),
-        custom(matches!(a.entropy_threshold, Auto::Set(_))),
+        number(P_NO_SPEECH, a.no_speech_threshold),
+        number(P_LOGPROB, a.logprob_threshold),
+        number(P_ENTROPY, a.entropy_threshold),
         flag(a.suppress_non_speech),
     ]
 }
 
+/// The select of the prompt: 0 the dictionary, 1 none, 2 the person's own text.
+fn prompt_source_index(source: PromptSource) -> i32 {
+    match source {
+        PromptSource::Dictionary => 0,
+        PromptSource::None => 1,
+        PromptSource::Custom => 2,
+    }
+}
+
 /// Writes what the user chose for `param` (see [`adv_modes`]); numbers are put in range.
-fn adv_apply(a: &mut Advanced, param: i32, mode: i32, value: f32) {
+fn adv_apply(a: &mut Advanced, param: i32, mode: i32, value: f32, logical: usize) {
     let flag = |mode| match mode {
         1 => Auto::Set(true),
         2 => Auto::Set(false),
         _ => Auto::Auto,
     };
     let number = |range: &std::ops::RangeInclusive<f32>| {
-        if mode == 0 {
-            Auto::Auto
-        } else {
-            Auto::Set(value.clamp(*range.start(), *range.end()))
+        let presets = presets(param, logical).unwrap_or_default();
+        match preset_value(usize::try_from(mode).unwrap_or(0), &presets, value) {
+            Auto::Auto => Auto::Auto,
+            Auto::Set(v) => Auto::Set(v.clamp(*range.start(), *range.end())),
         }
     };
-    let whole = |range: &std::ops::RangeInclusive<u8>| {
+    let whole = |v: f32, range: &std::ops::RangeInclusive<u8>| {
         // The range is a handful of small numbers, so the cast cannot lose any.
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
             reason = "clamped to a u8 range"
         )]
-        let n = value
+        let n = v
             .round()
             .clamp(f32::from(*range.start()), f32::from(*range.end())) as u8;
         n
     };
     match param {
         P_THREADS => {
-            a.threads = if mode == 0 {
-                Auto::Auto
-            } else {
-                Auto::Set(whole(&Advanced::THREADS))
+            let range = Advanced::THREADS;
+            let (low, high) = (f32::from(*range.start()), f32::from(*range.end()));
+            a.threads = match number(&(low..=high)) {
+                Auto::Auto => Auto::Auto,
+                Auto::Set(n) => Auto::Set(whole(n, &range)),
             };
         }
         P_FLASH => a.flash_attn = flag(mode),
@@ -1166,9 +1539,9 @@ fn adv_apply(a: &mut Advanced, param: i32, mode: i32, value: f32) {
         // The number beside Decoding: the candidates of the mode it is on (Auto is greedy).
         P_CANDIDATES => {
             if a.decoding == Auto::Set(Decoding::Beam) {
-                a.beam_size = whole(&Advanced::BEAM_SIZE);
+                a.beam_size = whole(value, &Advanced::BEAM_SIZE);
             } else {
-                a.best_of = whole(&Advanced::BEST_OF);
+                a.best_of = whole(value, &Advanced::BEST_OF);
             }
         }
         P_TEMPERATURE => a.temperature = number(&Advanced::TEMPERATURE),
@@ -1185,6 +1558,12 @@ fn adv_apply(a: &mut Advanced, param: i32, mode: i32, value: f32) {
 const IN_USE: &str = "In use";
 /// A ready model that is not the one in use.
 const DOWNLOADED: &str = "Downloaded";
+/// The recommendation badge's word, on the tile.
+const RECOMMENDED: &str = "Recommended";
+/// The models folder's size until the worker measured it.
+const FOLDER_MEASURING: &str = "Measuring";
+/// The models folder line when the folder cannot be read; the row's "!" says why.
+const FOLDER_UNREADABLE: &str = "Can't read the folder";
 /// The marks of `GalleryTile.mark`.
 const MARK_DONE: i32 = 1;
 const MARK_GET: i32 = 2;
@@ -1343,7 +1722,21 @@ fn custom_problem(path: &str) -> Option<&'static str> {
     }
 }
 
-/// Picker labels and what each writes: Auto, CPU, the listed GPUs by their display name, then the configured GPU
+/// The first two rows of the "Run on" picker.
+const DEVICE_AUTO: &str = "Auto (best available)";
+const DEVICE_CPU: &str = "Processor (CPU)";
+
+/// A listed GPU as a person calls it: the name its driver gives, then what it is (unless the
+/// name already says "Graphics").
+fn graphics_card(name: &str) -> String {
+    if name.to_lowercase().contains("graphics") {
+        name.to_owned()
+    } else {
+        format!("{name} (graphics card)")
+    }
+}
+
+/// Picker labels and what each writes: Auto, the processor, the listed graphics cards by their display name, then the configured one
 /// when it is not listed, so it stays picked. Before the daemon answers (`listed` is `None`) a
 /// configured name is not called missing.
 fn gpu_rows(
@@ -1351,12 +1744,12 @@ fn gpu_rows(
     current: &DeviceChoice,
 ) -> (Vec<SharedString>, Vec<DeviceChoice>) {
     let mut rows = vec![
-        ("Auto".to_owned(), DeviceChoice::Auto),
-        ("CPU".to_owned(), DeviceChoice::Cpu),
+        (DEVICE_AUTO.to_owned(), DeviceChoice::Auto),
+        (DEVICE_CPU.to_owned(), DeviceChoice::Cpu),
     ];
     for d in listed.unwrap_or_default() {
         rows.push((
-            d.display_name().to_owned(),
+            graphics_card(d.display_name()),
             DeviceChoice::Named(d.name.clone()),
         ));
     }
@@ -1366,7 +1759,7 @@ fn gpu_rows(
         let label = if listed.is_some() {
             strings::not_connected(name)
         } else {
-            name.clone()
+            graphics_card(name)
         };
         rows.push((label, current.clone()));
     }

@@ -26,6 +26,15 @@ use crate::generated::Toast;
 use crate::ipc::{Cmd, Ipc};
 use crate::testing::{has, linked, spots, with_role};
 
+/// Some element's label holds `part`: the card's state line joins the state, its note and where
+/// the model runs.
+fn shows(window: &AppWindow, part: &str) -> bool {
+    i_slint_backend_testing::ElementQuery::from_root(window)
+        .find_all()
+        .into_iter()
+        .any(|e| e.accessible_label().is_some_and(|l| l.contains(part)))
+}
+
 /// The settings window on a fresh config dir and a fake daemon link, on the Model page.
 fn window(name: &str) -> (AppWindow, Ipc, Receiver<Cmd>, Layout) {
     let opened = linked("model", name, Page::Model);
@@ -148,7 +157,7 @@ fn failed_download_shows_its_text() {
     let text = strings::download_failed(message);
     assert!(has(&window, &text));
     assert_eq!(bar(&window), None);
-    assert!(has(&window, "Whisper large-v3: Not downloaded"));
+    assert!(shows(&window, "Whisper large-v3: Not downloaded"));
     // Trying again clears the old error.
     download_large(&window);
     assert!(!has(&window, &text));
@@ -200,7 +209,7 @@ fn a_card_keeps_its_place_in_every_state() {
     fs::create_dir_all(layout.models_dir()).unwrap();
     fs::write(layout.models_dir().join("ggml-large-v3.bin.part"), b"half").unwrap();
     push(&ipc, done("large-v3", DownloadResult::Cancelled));
-    assert!(has(&window, "Whisper large-v3: Paused"));
+    assert!(shows(&window, "Whisper large-v3: Paused"));
     kept(&window);
 }
 
@@ -274,7 +283,7 @@ fn partial_downloads_are_listed_and_deleted() {
     assert_eq!(s.get_partials(), "0 MB in 2 files");
     assert_eq!(size(3_000_000), "3 MB");
     assert_eq!(size(1_600_000_000), "1.6 GB");
-    assert!(has(&window, "1 MB of 3.1 GB · kept 7 more days"));
+    assert!(shows(&window, "1 MB of 3.1 GB · kept 7 more days"));
     // A running download writes its `.part`: the button waits.
     push(&ipc, progress("turbo", 5, 10));
     assert_eq!(s.get_partials_off(), PARTIALS_BUSY);
@@ -285,7 +294,7 @@ fn partial_downloads_are_listed_and_deleted() {
     s.invoke_delete_partials();
     assert!(!part.exists() && !other.exists());
     assert_eq!(s.get_partials_off(), PARTIALS_NONE);
-    assert!(has(&window, "Whisper large-v3: Not downloaded"));
+    assert!(shows(&window, "Whisper large-v3: Not downloaded"));
     assert_eq!(
         window.global::<Toast>().get_text(),
         "Deleted 0 MB of partial downloads"
@@ -321,11 +330,11 @@ fn cancelled_download_with_a_part_file_shows_paused() {
     fs::write(layout.models_dir().join("ggml-large-v3.bin.part"), b"half").unwrap();
     push(&ipc, done("large-v3", DownloadResult::Cancelled));
     // How much is there and how long it stays.
-    assert!(has(&window, "1 MB of 3.1 GB · kept 7 more days"));
+    assert!(shows(&window, "1 MB of 3.1 GB · kept 7 more days"));
     with_role(&window, "Resume Whisper large-v3", AccessibleRole::Button);
     // A model with no `.part` stays "Not downloaded".
     view(&window, "Whisper large-v3 turbo");
-    assert!(has(&window, "Whisper large-v3 turbo: Not downloaded"));
+    assert!(shows(&window, "Whisper large-v3 turbo: Not downloaded"));
 }
 
 #[test]
@@ -474,7 +483,7 @@ fn lost_daemon_ends_the_downloads() {
     push(&ipc, progress("large-v3", 5, 10));
     ipc.deliver(&Event::Link(Link::Offline));
     assert_eq!(bar(&window), None);
-    assert!(has(&window, "Whisper large-v3: Not downloaded"));
+    assert!(shows(&window, "Whisper large-v3: Not downloaded"));
 }
 
 #[test]
@@ -500,9 +509,9 @@ fn daemon_gpus_are_listed_by_name_and_picked() {
     let rows: Vec<SharedString> = s.get_gpus().iter().collect();
     // The marketing names (UI rule 30); the ggml name stays the config key.
     let want = [
-        "Auto",
-        "CPU",
-        "NVIDIA GeForce RTX 4070 SUPER",
+        "Auto (best available)",
+        "Processor (CPU)",
+        "NVIDIA GeForce RTX 4070 SUPER (graphics card)",
         "AMD Radeon(TM) Graphics",
     ];
     assert_eq!(rows, want);
@@ -545,18 +554,47 @@ fn gpu_rows_keep_a_missing_choice() {
     }];
     let named = |n: &str| DeviceChoice::Named(n.into());
     let table: [Case<'_>; 5] = [
-        (None, DeviceChoice::Auto, &["Auto", "CPU"]),
-        (None, named("Vulkan1"), &["Auto", "CPU", "Vulkan1"]),
+        (
+            None,
+            DeviceChoice::Auto,
+            &["Auto (best available)", "Processor (CPU)"],
+        ),
+        (
+            None,
+            named("Vulkan1"),
+            &[
+                "Auto (best available)",
+                "Processor (CPU)",
+                "Vulkan1 (graphics card)",
+            ],
+        ),
         (
             Some(&listed),
             DeviceChoice::Cpu,
-            &["Auto", "CPU", "Vulkan0"],
+            &[
+                "Auto (best available)",
+                "Processor (CPU)",
+                "Vulkan0 (graphics card)",
+            ],
         ),
-        (Some(&listed), named("Vulkan0"), &["Auto", "CPU", "Vulkan0"]),
+        (
+            Some(&listed),
+            named("Vulkan0"),
+            &[
+                "Auto (best available)",
+                "Processor (CPU)",
+                "Vulkan0 (graphics card)",
+            ],
+        ),
         (
             Some(&listed),
             named("Vulkan1"),
-            &["Auto", "CPU", "Vulkan0", "Not connected: Vulkan1"],
+            &[
+                "Auto (best available)",
+                "Processor (CPU)",
+                "Vulkan0 (graphics card)",
+                "Not connected: Vulkan1",
+            ],
         ),
     ];
     for (listed, current, want) in table {
@@ -615,7 +653,7 @@ fn custom_path_answers_come_from_the_worker() {
     assert!(!has(&window, "File not found"));
     with_role(&window, "Own model file in use", AccessibleRole::Button);
     let tiles = window.global::<ModelState>().get_tiles();
-    assert_eq!(tiles.row_data(3).unwrap().hint, IN_USE);
+    assert_eq!(tiles.row_data(tiles.row_count() - 1).unwrap().hint, IN_USE);
 }
 
 /// A model file of the registry's size: "ready" without a hash (the stamp is not there).
@@ -675,7 +713,7 @@ fn delete_asks_first_then_frees_the_space() {
         window.global::<Toast>().get_text(),
         "Deleted Whisper large-v3, freed 3.1 GB"
     );
-    assert!(has(&window, "Whisper large-v3: Not downloaded"));
+    assert!(shows(&window, "Whisper large-v3: Not downloaded"));
     assert!(!has(&window, question));
     with_role(&window, "Download Whisper large-v3", AccessibleRole::Button);
 }
@@ -714,7 +752,7 @@ fn the_focus_stays_on_the_card_after_the_question() {
         freed: large().size,
     };
     push(&ipc, deleted("large-v3", freed));
-    assert!(has(&window, "Whisper large-v3: Not downloaded"));
+    assert!(shows(&window, "Whisper large-v3: Not downloaded"));
     slint::platform::update_timers_and_animations();
     enter(&window);
     let want = Request::DownloadModel {
@@ -754,7 +792,7 @@ fn a_failed_delete_does_not_steal_the_focus_later() {
             gpus: Vec::new(),
         },
     );
-    assert!(has(&window, "Whisper large-v3: Not downloaded"));
+    assert!(shows(&window, "Whisper large-v3: Not downloaded"));
     slint::platform::update_timers_and_animations();
     let _ = requests(&sent);
     enter(&window);
@@ -786,7 +824,7 @@ fn a_refused_delete_does_not_steal_the_focus_later() {
             gpus: Vec::new(),
         },
     );
-    assert!(has(&window, "Whisper large-v3: Not downloaded"));
+    assert!(shows(&window, "Whisper large-v3: Not downloaded"));
     slint::platform::update_timers_and_animations();
     let _ = requests(&sent);
     enter(&window);
@@ -802,6 +840,10 @@ fn shots_model_card() {
     thread::spawn(draw_cards).join().unwrap();
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear render walk over the states; splitting it would only pass state around"
+)]
 fn draw_cards() {
     use slint::platform::software_renderer::{
         MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
@@ -829,7 +871,8 @@ fn draw_cards() {
     let dir = std::env::var_os("OXI_SHOTS_DIR").map(std::path::PathBuf::from);
     for state in ["paused", "ready", "question"] {
         let layout = crate::testing::layout("model", &format!("shot-{state}"));
-        let window = crate::open_with(layout.clone(), Ipc::fake().0).unwrap();
+        let ipc = Ipc::fake().0;
+        let window = crate::open_with(layout.clone(), ipc.clone()).unwrap();
         let surface = LAST.with_borrow(Clone::clone).unwrap();
         window.set_page(Page::Model);
         if state == "paused" {
@@ -843,7 +886,34 @@ fn draw_cards() {
         }
         surface.set_size(slint::PhysicalSize::new(1280, 860));
         window.show().unwrap();
-        window.global::<ModelState>().invoke_shown();
+        let model = window.global::<ModelState>();
+        model.invoke_shown();
+        // An integrated GPU listed: this PC's memory gets a light model its "Recommended" badge.
+        push(
+            &ipc,
+            Push::Devices {
+                mics: Vec::new(),
+                gpus: vec![Device {
+                    name: "Vulkan0".into(),
+                    description: "Integrated".into(),
+                    uma: true,
+                }],
+            },
+        );
+        // No event loop here: wake the page as the measuring worker would, until the measure
+        // started after the file was written has answered.
+        let want = if state == "paused" {
+            "Empty"
+        } else {
+            "3.1 GB in 1 model"
+        };
+        for _ in 0..400 {
+            model.invoke_measured();
+            if model.get_folder_size().starts_with(want) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
         view(&window, "Whisper large-v3");
         slint::platform::update_timers_and_animations();
         if state == "question" {
@@ -906,7 +976,7 @@ fn a_refused_delete_says_why() {
     };
     push(&ipc, deleted("large-v3", failed));
     assert!(has(&window, "Not deleted: Access is denied. (os error 5)"));
-    assert!(has(&window, "Whisper large-v3: Downloaded"));
+    assert!(shows(&window, "Whisper large-v3: Downloaded"));
 }
 
 /// In use: no Use, and Delete is off with the reason; another model in use frees it.
@@ -989,25 +1059,49 @@ fn delete_is_offered_only_for_files_and_needs_the_daemon() {
 
 #[test]
 fn advanced_choices_write_the_config_and_read_back() {
+    // 16 logical threads: Max is 16, Half 8.
+    let logical = 16;
     let mut a = Advanced::default();
-    assert_eq!(adv_modes(&a), [0; 9]);
-    adv_apply(&mut a, P_THREADS, 1, 99.0);
-    assert_eq!(a.threads, Auto::Set(32), "put in range");
-    adv_apply(&mut a, P_FLASH, 2, 0.0);
-    adv_apply(&mut a, P_DECODING, 2, 0.0);
-    adv_apply(&mut a, P_CANDIDATES, 1, 7.0);
+    assert_eq!(adv_modes(&a, logical, 0), [0; 9]);
+    adv_apply(&mut a, P_THREADS, 3, 99.0, logical);
+    assert_eq!(a.threads, Auto::Set(32), "Custom: put in range");
+    adv_apply(&mut a, P_THREADS, 1, 99.0, logical);
+    assert_eq!(a.threads, Auto::Set(16), "Max");
+    assert_eq!(adv_modes(&a, logical, 0)[0], 1);
+    adv_apply(&mut a, P_THREADS, 2, 99.0, logical);
+    assert_eq!(a.threads, Auto::Set(8), "Half");
+    assert_eq!(adv_modes(&a, logical, 0)[0], 2);
+    // The same eight typed by the person under Custom stays Custom.
+    assert_eq!(adv_modes(&a, logical, 1)[0], 3);
+    // Another machine's number is Custom here.
+    a.threads = Auto::Set(5);
+    assert_eq!(adv_modes(&a, logical, 0)[0], 3);
+    adv_apply(&mut a, P_FLASH, 2, 0.0, logical);
+    adv_apply(&mut a, P_DECODING, 2, 0.0, logical);
+    adv_apply(&mut a, P_CANDIDATES, 1, 7.0, logical);
     assert_eq!(
         (a.decoding, a.beam_size, a.best_of),
         (Auto::Set(Decoding::Beam), 7, 1)
     );
-    adv_apply(&mut a, P_TEMPERATURE, 1, 0.3);
-    adv_apply(&mut a, P_LOGPROB, 1, -9.0);
+    adv_apply(&mut a, P_TEMPERATURE, 3, 0.4, logical);
+    assert_eq!(a.temperature, Auto::Set(0.4));
+    adv_apply(&mut a, P_TEMPERATURE, 2, 0.4, logical);
+    assert_eq!(a.temperature, Auto::Set(0.7), "Very varied");
+    adv_apply(&mut a, P_LOGPROB, 3, -9.0, logical);
     assert_eq!(a.logprob_threshold, Auto::Set(-5.0));
-    assert_eq!(adv_modes(&a), [1, 2, 2, 1, 0, 0, 1, 0, 0]);
+    adv_apply(&mut a, P_NO_SPEECH, 1, 0.0, logical);
+    adv_apply(&mut a, P_ENTROPY, 2, 0.0, logical);
+    assert_eq!(
+        (a.no_speech_threshold, a.entropy_threshold),
+        (Auto::Set(0.9), Auto::Set(3.5))
+    );
+    assert_eq!(adv_modes(&a, logical, 0), [3, 2, 2, 2, 0, 1, 3, 2, 0]);
     for p in [P_THREADS, P_FLASH, P_DECODING, P_TEMPERATURE, P_LOGPROB] {
-        adv_apply(&mut a, p, 0, 1.0);
+        adv_apply(&mut a, p, 0, 1.0, logical);
     }
-    assert_eq!(adv_modes(&a), [0; 9]);
+    adv_apply(&mut a, P_NO_SPEECH, 0, 1.0, logical);
+    adv_apply(&mut a, P_ENTROPY, 0, 1.0, logical);
+    assert_eq!(adv_modes(&a, logical, 0), [0; 9]);
 }
 
 /// What `auto` is judged for: the loaded device first, the CPU choice always the processor.
@@ -1127,4 +1221,72 @@ fn fractions() {
     assert!((fraction(1, 4) - 0.25).abs() < f32::EPSILON);
     assert!(fraction(1, 0).abs() < f32::EPSILON);
     assert!((fraction(9, 4) - 1.0).abs() < f32::EPSILON);
+}
+
+/// Review b04: "runs on" names where the loaded model is, the processor after a GPU failure too,
+/// and what "Run on" picks while nothing is loaded.
+#[test]
+fn runs_on_follows_the_loaded_device() {
+    let dev = |name: &str, description: &str| Device {
+        name: name.into(),
+        description: description.into(),
+        uma: false,
+    };
+    let gpus = [dev("Vulkan0", "RTX"), dev("Vulkan1", "Radeon")];
+    let auto = DeviceChoice::Auto;
+    assert_eq!(runs_on(None, &auto, "", false), "");
+    assert_eq!(runs_on(Some(&gpus), &auto, "", false), "runs on RTX");
+    assert_eq!(
+        runs_on(Some(&gpus), &auto, "cpu", true),
+        "runs on the processor"
+    );
+    assert_eq!(runs_on(None, &auto, "cpu", true), "runs on the processor");
+    assert_eq!(
+        runs_on(Some(&gpus), &auto, "Vulkan1", true),
+        "runs on Radeon"
+    );
+    assert_eq!(
+        runs_on(Some(&gpus), &auto, "cpu", false),
+        "runs on RTX",
+        "nothing loaded"
+    );
+    assert_eq!(
+        runs_on(Some(&gpus), &DeviceChoice::Cpu, "", false),
+        "runs on the processor"
+    );
+}
+
+/// The card's "runs on" follows a Status that says the model fell back to the processor.
+#[test]
+fn the_card_says_processor_after_a_gpu_fallback() {
+    let (window, ipc, _sent, _layout) = window("runs-on-fallback");
+    gpus(&ipc, &[("Vulkan0", false)]);
+    let state = window.global::<ModelState>();
+    assert!(state.get_runs_on().starts_with("runs on ") && state.get_runs_on() != PROCESSOR);
+    push(
+        &ipc,
+        Push::Status {
+            phase: Phase::Idle,
+            model: "turbo".into(),
+            device: DeviceChoice::Auto,
+            backend: "cpu".into(),
+            loaded: true,
+            warnings: vec![],
+        },
+    );
+    assert_eq!(state.get_runs_on(), PROCESSOR);
+}
+
+#[test]
+fn folder_line_says_measuring_sizes_and_errors() {
+    assert_eq!(folder_size(None, Some(5)), "Measuring");
+    assert_eq!(
+        folder_size(Some(&Err("denied".into())), Some(5)),
+        "Can't read the folder"
+    );
+    assert_eq!(folder_size(Some(&Ok((0, 0))), None), "Empty");
+    assert_eq!(
+        folder_size(Some(&Ok((1_600_000_000, 1))), Some(2_000_000_000)),
+        "1.6 GB in 1 model · 2.0 GB free"
+    );
 }

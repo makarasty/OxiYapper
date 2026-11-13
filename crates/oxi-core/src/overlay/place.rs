@@ -10,7 +10,7 @@ use crate::types::Millis;
 use super::look::TOO_LOUD;
 
 /// Pill width in device-independent pixels (1 DIP = 1 px at 96 dpi).
-pub const PILL_W_DIP: i32 = 168;
+pub const PILL_W_DIP: i32 = 200;
 pub const PILL_H_DIP: i32 = 40;
 /// Gap between the pill and the work-area edge.
 pub const MARGIN_DIP: i32 = 16;
@@ -32,8 +32,8 @@ pub const PILL_EM_MIN: f32 = 0.85;
 /// Narrowest meter beside a label; a longer label shrinks its font instead.
 pub const PILL_METER_MIN: f32 = 0.7;
 /// Tallest meter bar.
-pub const PILL_BAR_MAX: f32 = 0.5;
-pub const PILL_BAR_W: f32 = 0.065;
+pub const PILL_BAR_MAX: f32 = 0.75;
+pub const PILL_BAR_W: f32 = 0.1;
 pub const PILL_BAR_GAP: f32 = 0.05;
 /// Progress track under the label while loading or transcribing: its thickness, and its gap to
 /// the pill's bottom edge. It runs from the left to the right padding.

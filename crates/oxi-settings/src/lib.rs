@@ -126,6 +126,7 @@ pub fn use_skia() -> bool {
         let select = |name: &str| {
             slint::BackendSelector::new()
                 .renderer_name(name.into())
+                .with_winit_window_attributes_hook(icons_at_creation)
                 .select()
         };
         if select(name).is_ok() {
@@ -259,17 +260,99 @@ pub fn set_accent(window: &AppWindow, dark: AccentColors, light: AccentColors) {
 
 /// The title-bar icon with its record dot in `accent` (`0xRRGGBB`), at the size the window's
 /// display scale picks from the PNGs (`Icons.window-logo`). The tile is paper, so the light
-/// theme's accent is the one that holds on it.
+/// theme's accent is the one that holds on it. The OS gets it twice: the small one for the title
+/// bar and the big one for the taskbar and Alt+Tab, each at its own size for the scale.
 fn set_window_icon(window: &AppWindow, accent: u32) {
-    let size = icon_size(window.get_icon_scale());
-    let [_, r, g, b] = accent.to_be_bytes();
-    let Some(pm) = oxi_platform::draw::logo_with(size, oxi_core::overlay::Rgba(r, g, b, 0xFF))
-    else {
+    let Some(icons) = render_os_icons(window.get_icon_scale(), accent) else {
         return;
     };
+    let [(pixels, side), _] = &icons;
     let buffer =
-        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(pm.data(), size, size);
+        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(pixels, *side, *side);
     window.set_window_icon(slint::Image::from_rgba8_premultiplied(buffer));
+    OS_ICONS.set(Some(icons));
+    push_window_icon(window);
+}
+
+/// The small and the big icon with the record dot in `accent` (`0xRRGGBB`) for display scale `scale`.
+fn render_os_icons(scale: f32, accent: u32) -> Option<OsIcons> {
+    let [_, r, g, b] = accent.to_be_bytes();
+    let dot = oxi_core::overlay::Rgba(r, g, b, 0xFF);
+    let [small, big] = [icon_size(scale), big_icon_size(scale)];
+    let pixels = |side| {
+        Some((
+            oxi_platform::draw::logo_with(side, dot)?.data().to_vec(),
+            side,
+        ))
+    };
+    Some([pixels(small)?, pixels(big)?])
+}
+
+/// `(pixels, side)` of the small and the big window icon, for the OS window.
+type OsIcons = [(Vec<u8>, u32); 2];
+
+thread_local! {
+    /// The icons the OS window is made with and gets again when they change (the UI thread's).
+    static OS_ICONS: std::cell::RefCell<Option<OsIcons>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The icons as winit wants them (`[small, big]`), none before the first build.
+#[cfg(windows)]
+fn os_icons() -> Option<[slint::winit_030::winit::window::Icon; 2]> {
+    use slint::winit_030::winit::window::Icon;
+    OS_ICONS.with_borrow(|icons| {
+        let [(s, ss), (b, bs)] = icons.as_ref()?;
+        Some([
+            Icon::from_rgba(s.clone(), *ss, *ss).ok()?,
+            Icon::from_rgba(b.clone(), *bs, *bs).ok()?,
+        ])
+    })
+}
+
+/// Gives the title bar and the taskbar their icons through winit itself: Slint hands an image to
+/// the OS only when its cache key changes, and a pixel buffer has none (`None` against the
+/// backend's `None`), so the window kept the OS default. A no-op before the OS window exists (the
+/// window is also made with them, [`icons_at_creation`]) and under the testing backend.
+// shortcut: winit's window behind the pinned `slint =1.18.1` (`unstable-winit-030`); re-check it on
+// every Slint bump.
+fn push_window_icon(window: &AppWindow) {
+    #[cfg(windows)]
+    {
+        use slint::winit_030::WinitWindowAccessor as _;
+        use slint::winit_030::winit::platform::windows::WindowExtWindows as _;
+        let Some([small, big]) = os_icons() else {
+            return;
+        };
+        window.window().with_winit_window(|win| {
+            win.set_window_icon(Some(small));
+            win.set_taskbar_icon(Some(big));
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = window;
+}
+
+/// The OS window is made with the icons, so the first frame already has them (the push after the
+/// loop starts can come later than the first look at the window).
+#[cfg(windows)]
+fn icons_at_creation(
+    attributes: slint::winit_030::winit::window::WindowAttributes,
+) -> slint::winit_030::winit::window::WindowAttributes {
+    use slint::winit_030::winit::platform::windows::WindowAttributesExtWindows as _;
+    // The hook runs as the window is made, before any page has built the icons: the default red at
+    // the opening scale; the first `set_accent` push replaces them with the user's.
+    if OS_ICONS.with_borrow(Option::is_none) {
+        OS_ICONS.set(render_os_icons(
+            pages::set_scale(None),
+            AccentColors::RED_LIGHT.accent,
+        ));
+    }
+    match os_icons() {
+        Some([small, big]) => attributes
+            .with_window_icon(Some(small))
+            .with_taskbar_icon(Some(big)),
+        None => attributes,
+    }
 }
 
 /// The title-bar icon's side in pixels at display scale `scale`.
@@ -283,6 +366,14 @@ fn icon_size(scale: f32) -> u32 {
     } else {
         16
     }
+}
+
+/// The taskbar icon's side: the OS's big icon (32 px at 100 %) scaled for the display.
+fn big_icon_size(scale: f32) -> u32 {
+    let side = [32_u16, 40, 48, 64]
+        .into_iter()
+        .find(|side| f32::from(*side) >= 32.0 * scale);
+    u32::from(side.unwrap_or(64))
 }
 
 /// Back to the brand Red.
@@ -364,8 +455,15 @@ fn open_inner(
 ) -> Result<AppWindow, Error> {
     let window = AppWindow::new()?;
     // Before any page: the accent builds the title-bar icon at this scale.
-    pages::set_scale(&window);
+    pages::set_scale(Some(&window));
     own_accent(&window);
+    // The OS window is made once the loop runs, after every bind: give it the icon then.
+    let weak = window.as_weak();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            push_window_icon(&window);
+        }
+    });
     draw_whole_frames(&window);
     watch_os_events(&window);
     follow_os_motion(&window);
@@ -803,6 +901,13 @@ mod tests {
         crate::pages::force_scale(None);
         assert!((window.get_icon_scale() - 2.0).abs() < f32::EPSILON);
         assert_eq!(window.get_window_icon().size().width, 32);
+        // Stored for the OS window: the small icon and the big one (64 px at 200 %).
+        let icons = super::OS_ICONS.with_borrow(Clone::clone).expect("built");
+        for ((rgba, side), want) in icons.iter().zip([32, 64]) {
+            assert_eq!((*side, rgba.len()), (want, (want * want * 4) as usize));
+        }
+        assert_eq!(super::big_icon_size(1.5), 48);
+        assert_eq!(super::big_icon_size(1.0), 32);
         assert_eq!(super::icon_size(1.5), 24);
         assert_eq!(super::icon_size(1.0), 16);
     }

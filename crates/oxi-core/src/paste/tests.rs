@@ -309,9 +309,10 @@ impl Input for Keys {
     }
 }
 
-/// One dictation; asserts it pushed no entry out of the history.
+/// One dictation; asserts it pushed no entry out of the history, or one when no dictation was in
+/// it (item 22: the dictations hold one slot of a full Win+V).
 fn dictate(clip: &mut HistClip, cfg: &Paste, ours: &mut OurEntries, n: u32) -> PasteOutcome {
-    let evicted = clip.evicted;
+    let evicted = clip.evicted + u32::from(clip.dictations() == 0 && clip.pending.is_empty());
     let out = paste_with(
         &format!("dictation {n}"),
         cfg,
@@ -320,7 +321,7 @@ fn dictate(clip: &mut HistClip, cfg: &Paste, ours: &mut OurEntries, n: u32) -> P
         ours,
         &mut |_| {},
     );
-    assert_eq!(clip.evicted, evicted, "dictation {n} pushed an entry out");
+    assert!(clip.evicted <= evicted, "dictation {n} pushed an entry out");
     out
 }
 
@@ -497,6 +498,34 @@ fn a_copy_that_cannot_be_saved_whole_is_left_alone_and_the_text_typed() {
     assert_eq!(ours.ids, ["id0"], "nothing deleted");
 }
 
+/// Review 2026-11-13: a format the snapshot cannot read (a lone virtual `FileContents`; one
+/// next to text or an image is left out by the platform, item 21 q3 b) is never restored
+/// without it: the text is typed, the copy and Win+V stay as they were, and the reason names the
+/// format only.
+#[test]
+fn a_copy_with_an_unreadable_virtual_file_is_left_whole_and_the_text_typed() {
+    let mut clip = HistClip::new("img:screenshot + file");
+    clip.incomplete = true;
+    clip.why = Some(IncompleteWhy::NoData {
+        format: 0xC0CF,
+        code: 0,
+    });
+    let (mut keys, mut steps) = (Keys::default(), Vec::new());
+    let out = paste_with(
+        "hi there",
+        &Paste::default(),
+        &mut clip,
+        &mut keys,
+        &mut OurEntries::default(),
+        &mut |s| steps.push(s),
+    );
+    assert_eq!(out, PasteOutcome::Typed);
+    assert_eq!(keys.typed.as_deref(), Some("hi there"));
+    assert_eq!(clip.seq, 1, "the clipboard was never written");
+    assert_eq!(clip.texts(), ["img:screenshot + file"]);
+    assert_eq!(steps[0], PasteStep::Typed(TypedWhy::Incomplete(clip.why)));
+}
+
 /// Defect 3: a clipboard held open right after the paste is waited out.
 #[test]
 fn a_restore_that_finds_the_clipboard_held_is_retried() {
@@ -628,10 +657,11 @@ fn a_slow_history_service_stops_at_the_overall_limit() {
     }
 }
 
-/// NEW 3: 30 dictations into a full or nearly full history push none of the user's entries out
-/// (checked in `dictate`), and nothing of ours is left.
+/// NEW 3 and item 22 (owner 2026-11-13): 30 dictations into a nearly full history push nothing
+/// out; into a full one (the owner's Win+V held 25) the first pushes the oldest entry out, as a
+/// copy does, and the rest take its slot. The latest dictation is on top, nothing else of ours.
 #[test]
-fn a_full_history_loses_no_entry() {
+fn a_full_history_takes_the_dictation_in_one_slot() {
     for start in [24, 25] {
         let mut clip = HistClip::with_entries(start, "my copy");
         let before: Vec<_> = clip.list.clone();
@@ -641,17 +671,87 @@ fn a_full_history_loses_no_entry() {
             assert_eq!(clip.current, "my copy");
             assert!(clip.list.len() <= HISTORY_CAP);
         }
-        assert!(
-            before.iter().all(|e| clip.list.contains(e)),
-            "start {start}"
-        );
-        // Room for one: the latest dictation on top. Full: the dictation stays out.
-        let want = usize::from(start < 25);
-        assert_eq!(clip.dictations(), want, "start {start}");
-        if want == 1 {
-            assert_eq!(clip.texts()[0], "dictation 30");
-        }
+        let kept = &before[..before.len() - usize::from(start == 25)];
+        assert!(kept.iter().all(|e| clip.list.contains(e)), "start {start}");
+        assert_eq!(clip.evicted, u32::from(start == 25), "start {start}");
+        assert_eq!(clip.dictations(), 1, "start {start}");
+        assert_eq!(clip.texts()[0], "dictation 30");
     }
+}
+
+/// A restart that keeps everything of `ours` but its ids: the dictation in Win+V is lost track of.
+fn restart_losing_ids(ours: &OurEntries) -> OurEntries {
+    let kept: String = ours
+        .to_text()
+        .lines()
+        .filter(|l| !l.starts_with("id "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    OurEntries::from_text(&kept)
+}
+
+/// Review and re-review 2026-11-13: an entry of ours lost track of in a full history (a restart
+/// without its id, a late write whose mark went) never pushes a second user entry out, a copy in
+/// between included, and neither does a user delete followed by a second such loss. Only a
+/// history seen empty lets a full one take a dictation by a push-out again.
+#[test]
+fn a_lost_entry_of_ours_never_pushes_a_second_entry_out() {
+    let mut clip = HistClip::with_entries(25, "my copy");
+    let (cfg, mut ours) = (Paste::default(), OurEntries::default());
+    // The first paste knows no clipboard number yet, so it waits for a copy and stays out.
+    for n in 1..=2 {
+        dictate(&mut clip, &cfg, &mut ours, n);
+    }
+    assert_eq!(clip.evicted, 1);
+    assert_eq!(clip.texts()[0], "dictation 2");
+    let user: Vec<_> = clip.list[1..].to_vec();
+    // A restart that lost the dictation's id: the number, the top and the push-out are kept.
+    assert!(ours.to_text().lines().any(|l| l == "pushed 1"));
+    ours = restart_losing_ids(&ours);
+    for n in 3..=6 {
+        assert_eq!(dictate(&mut clip, &cfg, &mut ours, n), PasteOutcome::Pasted);
+        assert_eq!(clip.current, "my copy");
+    }
+    assert_eq!(clip.evicted, 1);
+    assert!(user.iter().all(|e| clip.list.contains(e)));
+    clip.write("copy x", true);
+    let evicted = clip.evicted;
+    for n in 7..=9 {
+        dictate(&mut clip, &cfg, &mut ours, n);
+        settle(&mut clip);
+        assert_eq!(clip.current, "copy x");
+    }
+    assert_eq!(clip.evicted, evicted, "{:?}", clip.texts());
+    assert_eq!(clip.texts()[..2], ["copy x", "dictation 2"]);
+    // The user deletes an entry: the dictation goes into that room, the next one into ours.
+    clip.list.remove(5);
+    for n in 10..=11 {
+        dictate(&mut clip, &cfg, &mut ours, n);
+        assert_eq!(clip.evicted, evicted, "dictation {n}");
+        assert_eq!(clip.texts()[0], format!("dictation {n}"));
+    }
+    // Re-review: the history is full again with two of ours in it; a second loss must not reopen
+    // a push-out (the room the user's delete made was taken, not a slot of ours).
+    assert_eq!(clip.list.len(), HISTORY_CAP);
+    ours = restart_losing_ids(&ours);
+    for n in 12..=14 {
+        assert_eq!(dictate(&mut clip, &cfg, &mut ours, n), PasteOutcome::Pasted);
+        assert_eq!(clip.evicted, evicted, "dictation {n}: {:?}", clip.texts());
+        assert_eq!(clip.current, "copy x");
+    }
+    // Win+V cleared (nothing of ours can be left), then filled by the user's copies: the first
+    // dictation pushes one entry out again, the next takes its slot.
+    clip.list.clear();
+    dictate(&mut clip, &cfg, &mut ours, 15);
+    for k in 0..HISTORY_CAP {
+        clip.write(&format!("copy {k}"), true);
+    }
+    let evicted = clip.evicted;
+    for n in 16..=17 {
+        dictate(&mut clip, &cfg, &mut ours, n);
+        assert_eq!(clip.texts()[0], format!("dictation {n}"));
+    }
+    assert_eq!(clip.evicted, evicted + 1);
 }
 
 #[test]

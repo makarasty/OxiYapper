@@ -4,6 +4,10 @@
 //! The estimate drives the bar and a real fraction only corrects it, so a job that reports nothing
 //! until it is done (whisper under 30 s) never sits at 0 and never jumps. A caller that has neither
 //! an estimate nor a real fraction holds no `Smooth` at all: `None` is the indeterminate sweep.
+//!
+//! Whisper reports once per 30 s window, so a real fraction can be the only one for half the job
+//! (a 60 s clip says 0.5 once). After a real value the bar keeps the measured pace and bends into
+//! a tail that slows but never stops ([`soft`]); it never waits at a fixed distance above it.
 
 use crate::types::Millis;
 
@@ -11,16 +15,15 @@ use crate::types::Millis;
 pub const KICK: f32 = 0.03;
 /// The kick takes this long, ease-out.
 pub const KICK_MS: f32 = 200.0;
-/// The estimate curve never passes this.
-pub const EST_CEIL: f32 = 0.90;
-/// The estimate curve's time constant, as a share of the estimate.
-pub const EST_TAU: f32 = 0.30;
+/// With no real fraction the bar never passes this.
+pub const EST_CEIL: f32 = 0.95;
+/// The share of the way from the start (or the last real value) to the cap that the bar runs at
+/// the plain pace; past it the tail slows and approaches the cap without reaching it.
+pub const KNEE: f32 = 0.70;
 /// The estimate of a job whose caller has none.
 pub const DEFAULT_EST: Millis = Millis(4000);
 /// The estimate of a transcription is at least this long.
 pub const MIN_EST: Millis = Millis(400);
-/// Between two real updates the bar runs at most this far ahead of the last real value.
-pub const PROJECT_AHEAD: f32 = 0.10;
 /// A real fraction below this is not used for the projection yet.
 pub const REAL_MIN: f32 = 0.01;
 /// The bar never aims above this before the finish.
@@ -70,8 +73,15 @@ pub fn transcribe_est(audio_ms: u64, scale: f32) -> Millis {
 /// The scale after a run of `audio_ms` that took `took_ms`: an exponential average.
 #[must_use]
 pub fn learn(scale: f32, audio_ms: u64, took_ms: u64) -> f32 {
-    let seen = ms(took_ms) / transcribe_base_ms(audio_ms);
-    (scale * (1.0 - LEARN_WEIGHT) + seen * LEARN_WEIGHT).clamp(SCALE_RANGE.0, SCALE_RANGE.1)
+    (scale * (1.0 - LEARN_WEIGHT) + learn_first(audio_ms, took_ms) * LEARN_WEIGHT)
+        .clamp(SCALE_RANGE.0, SCALE_RANGE.1)
+}
+
+/// The scale after the first run of a model on a device: that run whole, since the fit is only
+/// the dev machine's guess (tiny on a CPU here runs 3 to 4 times faster than it says).
+#[must_use]
+pub fn learn_first(audio_ms: u64, took_ms: u64) -> f32 {
+    (ms(took_ms) / transcribe_base_ms(audio_ms)).clamp(SCALE_RANGE.0, SCALE_RANGE.1)
 }
 
 /// What typing `units` UTF-16 units takes at the fast or the safe pace.
@@ -103,13 +113,42 @@ enum End {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Real {
+    fraction: f32,
+    at: Millis,
+    /// Where the bar goes on from: the bar if it was ahead (it never goes back), else `fraction`.
+    from: f32,
+    /// Fraction per ms between the first report and this one; `None` for the first report,
+    /// which alone says nothing of the pace (a resumed download starts at half).
+    pace: Option<f32>,
+}
+
+/// `p` as drawn: itself up to the knee between `from` and `cap`, then a tail with the same slope
+/// at the knee that approaches `cap` and never reaches it (`cap - g^2 / (g + over)`), so a job
+/// that runs long keeps the bar moving, slower and slower, instead of stopping it.
+#[must_use]
+pub fn soft(p: f32, from: f32, cap: f32) -> f32 {
+    let knee = from + KNEE * (cap - from);
+    if p <= knee {
+        return p;
+    }
+    let g = cap - knee;
+    if g <= f32::EPSILON {
+        return cap;
+    }
+    cap - g * g / (g + (p - knee))
+}
+
 /// One job's progress as DESIGN-SYSTEM section 26 defines it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Smooth {
     started: Millis,
     est_ms: f32,
-    /// The last real fraction and when it came.
-    real: Option<(f32, Millis)>,
+    /// The first real fraction and when it came: the pace is measured from it.
+    first: Option<(f32, Millis)>,
+    /// The last real fraction.
+    real: Option<Real>,
     shown: f32,
     shown_at: Millis,
     end: End,
@@ -130,6 +169,7 @@ impl Smooth {
         Self {
             started: now,
             est_ms: ms(est.unwrap_or(DEFAULT_EST).0.max(1)),
+            first: None,
             real: None,
             shown: 0.0,
             shown_at: now,
@@ -137,17 +177,24 @@ impl Smooth {
         }
     }
 
-    /// A real fraction 0..=1; one lower than an earlier one is ignored.
+    /// A real fraction 0..=1; one not above an earlier one is ignored.
     pub fn real(&mut self, fraction: f32, now: Millis) {
         if fraction.is_nan() {
             return;
         }
         let fraction = fraction.clamp(0.0, 1.0);
-        if self.end != End::Running || self.real.is_some_and(|(f, _)| fraction < f) {
+        // The same value again is no news: it must not restart the pace from a later time.
+        if self.end != End::Running || self.real.is_some_and(|r| fraction <= r.fraction) {
             return;
         }
         self.advance(now);
-        self.real = Some((fraction, now));
+        let (f0, t0) = *self.first.get_or_insert((fraction, now));
+        self.real = Some(Real {
+            fraction,
+            at: now,
+            from: self.shown.max(fraction).min(TARGET_CAP),
+            pace: (now > t0).then(|| (fraction - f0) / ms(now.0 - t0.0)),
+        });
     }
 
     /// The job is done: the bar runs to 1.0 from where it is.
@@ -222,17 +269,41 @@ impl Smooth {
     /// Where the bar aims at `now`, before the speed limit.
     fn target(&self, now: Millis) -> f32 {
         let t = ms(now.0.saturating_sub(self.started.0));
-        let eased =
-            EST_CEIL * (1.0 - (-t / (EST_TAU * self.est_ms) * std::f32::consts::LN_2).exp());
         let target = match self.real {
-            Some((real, at)) if real >= REAL_MIN => {
-                let t_real = ms(at.0.saturating_sub(self.started.0)).max(1.0);
-                let dt = (t - t_real).max(0.0);
-                (real + real / t_real * dt).min(real + PROJECT_AHEAD)
+            // The measured pace (the estimate's until a second report), from where the bar was.
+            Some(r) if r.fraction >= REAL_MIN => {
+                let dt = ms(now.0.saturating_sub(r.at.0));
+                soft(r.from + self.pace(r) * dt, r.from, TARGET_CAP)
             }
-            _ => eased,
+            _ => soft(t / self.est_ms, 0.0, EST_CEIL),
         };
         target.min(TARGET_CAP)
+    }
+
+    fn pace(&self, r: Real) -> f32 {
+        r.pace.unwrap_or(1.0 / self.est_ms)
+    }
+
+    /// What the job still takes at the pace so far (the estimate's until a second report);
+    /// `None` once that has run out with the job still going, or once it ended: an honest blank
+    /// rather than a number that sits there.
+    #[must_use]
+    pub fn left(&self, now: Millis) -> Option<Millis> {
+        if self.end != End::Running {
+            return None;
+        }
+        let ms_left = match self.real {
+            Some(r) if r.fraction >= REAL_MIN => {
+                (1.0 - r.fraction) / self.pace(r) - ms(now.0.saturating_sub(r.at.0))
+            }
+            _ => self.est_ms - ms(now.0.saturating_sub(self.started.0)),
+        };
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "positive, a few hours of ms at most"
+        )]
+        (ms_left >= 1.0).then(|| Millis(ms_left.round() as u64))
     }
 
     fn kick(&self, now: Millis) -> f32 {
@@ -295,10 +366,116 @@ mod tests {
     }
 
     #[test]
-    fn the_estimate_curve_is_about_081_at_the_estimate_and_never_above_090() {
+    fn the_estimate_curve_is_about_080_at_the_estimate_and_never_above_095() {
         let at_est = run(Some(4000), 4000, FRAME);
-        assert!((0.70..=0.81).contains(&at_est), "{at_est}");
-        assert!(run(Some(4000), 600_000, 100) <= 0.90 + 1e-4);
+        assert!((0.75..=0.83).contains(&at_est), "{at_est}");
+        assert!(run(Some(4000), 600_000, 100) <= EST_CEIL + 1e-4);
+    }
+
+    /// The owner's freeze (2026-11-13): a 60 s clip, whisper says 0 at the start, 0.5 when the
+    /// first 30 s window is done, 1.0 just before the end. The old projection stopped at
+    /// `0.5 + 0.10` and sat there for the whole second window.
+    #[test]
+    fn a_single_mid_job_report_does_not_freeze_the_bar_for_the_rest_of_the_job() {
+        let mut s = Smooth::start(Some(Millis(10_000)), Millis(0));
+        s.real(0.0, Millis(0));
+        s.shown(Millis(5000));
+        s.real(0.5, Millis(5000));
+        let mut last = s.shown(Millis(5500));
+        for t in (6000..=9900).step_by(500) {
+            let v = s.shown(Millis(t));
+            assert!(v - last >= 0.005, "stuck at {t} ms: {last} -> {v}");
+            last = v;
+        }
+        assert!(
+            last >= 0.85,
+            "near the end of the job the bar is near the end: {last}"
+        );
+        s.real(1.0, Millis(9950));
+        assert!(s.shown(Millis(9990)) <= TARGET_CAP);
+    }
+
+    #[test]
+    fn regular_reports_are_followed_at_their_pace() {
+        // A 2 min clip in four windows of 3 s each, the estimate twice too long.
+        let mut s = Smooth::start(Some(Millis(24_000)), Millis(0));
+        for (i, t) in [3000, 6000, 9000].into_iter().enumerate() {
+            let truth = 0.25 * (i as f32 + 1.0);
+            s.shown(Millis(t));
+            s.real(truth, Millis(t));
+            let v = s.shown(Millis(t + 1000));
+            assert!((v - truth).abs() <= 0.12, "{t}: {v} against {truth}");
+        }
+    }
+
+    #[test]
+    fn an_estimate_ten_times_too_short_still_moves_the_bar_without_a_report() {
+        let mut s = Smooth::start(Some(Millis(1000)), Millis(0));
+        let mut last = s.shown(Millis(1000));
+        for t in (2000..=10_000).step_by(1000) {
+            let v = s.shown(Millis(t));
+            assert!(v > last && v < EST_CEIL, "stuck at {t} ms: {v}");
+            last = v;
+        }
+    }
+
+    #[test]
+    fn a_report_below_a_bar_that_ran_ahead_slows_it_but_never_stops_it() {
+        let mut s = Smooth::start(Some(Millis(2000)), Millis(0));
+        let ahead = s.shown(Millis(4000));
+        s.real(0.3, Millis(4000));
+        assert!(s.shown(Millis(4033)) >= ahead, "never back");
+        let mut last = ahead;
+        for t in (4500..=12_000).step_by(500) {
+            let v = s.shown(Millis(t));
+            assert!(v > last, "stuck at {t} ms: {v}");
+            last = v;
+        }
+        assert!(last <= TARGET_CAP);
+    }
+
+    #[test]
+    fn the_time_left_follows_the_measured_pace_and_goes_blank_when_overdue() {
+        let mut s = Smooth::start(Some(Millis(10_000)), Millis(0));
+        assert_eq!(
+            s.left(Millis(4000)),
+            Some(Millis(6000)),
+            "the estimate before any report"
+        );
+        s.real(0.0, Millis(0));
+        s.real(0.5, Millis(8000));
+        assert_eq!(
+            s.left(Millis(8000)),
+            Some(Millis(8000)),
+            "the pace, not the estimate"
+        );
+        assert_eq!(s.left(Millis(16_000)), None, "overdue: no number");
+        // One report alone says nothing of the pace: a resumed download at half.
+        let mut d = Smooth::start(Some(Millis(10_000)), Millis(0));
+        d.real(0.5, Millis(50));
+        assert_eq!(d.left(Millis(50)), Some(Millis(5000)));
+        // The estimate's pace (0.1 a second), not "half in 50 ms" (the knee at once).
+        let v = d.shown(Millis(1000));
+        assert!(v < 0.6, "it does not race ahead of the one report: {v}");
+        d.finish(Millis(1000));
+        assert_eq!(d.left(Millis(1000)), None);
+    }
+
+    #[test]
+    fn the_tail_keeps_the_slope_at_the_knee_and_never_reaches_the_cap() {
+        let knee = 0.5 + KNEE * (0.99 - 0.5);
+        assert!(
+            (soft(0.6, 0.5, 0.99) - 0.6).abs() < 1e-6,
+            "plain pace below the knee"
+        );
+        let d = 1e-3;
+        let slope = (soft(knee + d, 0.5, 0.99) - soft(knee, 0.5, 0.99)) / d;
+        assert!((slope - 1.0).abs() < 0.01, "{slope}");
+        assert!(soft(1000.0, 0.5, 0.99) < 0.99);
+        assert!(
+            (soft(5.0, 1.0, 0.99) - 0.99).abs() < 1e-6,
+            "a start past the cap"
+        );
     }
 
     #[test]
@@ -346,15 +523,17 @@ mod tests {
         a.real(0.5, Millis(1000));
         let mut b = a;
         b.real(0.2, Millis(1100));
+        b.real(0.5, Millis(1500));
         assert_eq!(a.shown(Millis(2000)), b.shown(Millis(2000)));
     }
 
     #[test]
-    fn the_projection_stays_within_ten_points_of_the_last_real_value() {
+    fn with_no_report_after_the_last_the_bar_stays_below_the_cap() {
         let mut s = Smooth::start(Some(Millis(60_000)), Millis(0));
         s.real(0.30, Millis(10_000));
-        // No report for a long time: the pace is 0.03 per second but the cap is 0.40.
-        assert!(run_to(&mut s, 60_000) <= 0.40 + 1e-3);
+        // Twenty times the job the pace promised and no word: close to the cap, never at it.
+        let v = run_to(&mut s, 600_000);
+        assert!(v > 0.9 && v < TARGET_CAP, "{v}");
     }
 
     fn run_to(s: &mut Smooth, until: u64) -> f32 {
@@ -424,7 +603,102 @@ mod tests {
         }
         assert!((scale - 2.0).abs() < 0.01, "{scale}");
         assert!(learn(1.0, 10_000, 10_000_000) <= 8.0);
+        assert!(
+            (learn_first(10_000, 2324) - 2.0).abs() < 0.01,
+            "the first run whole"
+        );
+        assert!(
+            (learn_first(10_000, 1) - 0.25).abs() < 1e-6,
+            "within the range"
+        );
         assert_eq!(typing_est(300, true), Millis(1800));
+    }
+
+    /// The edge cases the owner named, at the progress model: each bar is monotonic, never at 100
+    /// before its finish, and moves in every frame-sized step by at most the speed limit.
+    fn drive(s: &mut Smooth, until: u64, from: u64, reports: &[(u64, f32)]) -> f32 {
+        let mut last = s.shown(Millis(from));
+        for t in (from + FRAME..=until).step_by(STEP) {
+            for &(at, f) in reports.iter().filter(|(at, _)| (t - FRAME..t).contains(at)) {
+                s.real(f, Millis(at));
+            }
+            let v = s.shown(Millis(t));
+            assert!(
+                (0.0..=0.04 + 1e-4).contains(&(v - last)),
+                "t {t}: {last} -> {v}"
+            );
+            assert!(s.percent() <= 99, "no 100 before the finish at {t}");
+            last = v;
+        }
+        last
+    }
+
+    #[test]
+    fn a_first_model_load_is_not_part_of_the_bar() {
+        // The bar starts when the model is loaded (the pill sweeps before): 5 s of load, then it
+        // starts from 0 like any other and moves in its first frames.
+        let load = 5000;
+        let mut s = Smooth::start(Some(transcribe_est(10_000, 1.0)), Millis(load));
+        assert_eq!(s.shown(Millis(load)), 0.0);
+        assert!(s.shown(Millis(load + 200)) >= 0.02);
+        assert!(
+            s.shown(Millis(load + 600)) < 0.5,
+            "the load time did not count"
+        );
+    }
+
+    #[test]
+    fn a_retranscribe_run_follows_whispers_reports_to_a_full_bar() {
+        // A 45 s clip from History: the estimate, 0 at the start, 30 s of 45 done, then the end.
+        let est = transcribe_est(45_000, 1.0);
+        let mut s = Smooth::start(Some(est), Millis(0));
+        s.real(0.0, Millis(0));
+        let end = est.0 * 3 / 2;
+        let v = drive(&mut s, end, 0, &[(est.0, 30.0 / 45.0)]);
+        assert!(v > 0.7 && v <= TARGET_CAP, "{v}");
+        s.real(1.0, Millis(end));
+        s.finish(Millis(end));
+        assert_eq!(s.shown(Millis(end + FINISH_MS)), 1.0);
+        assert_eq!(s.percent(), 100);
+    }
+
+    #[test]
+    fn a_long_clip_with_many_windows_never_stalls_or_overshoots() {
+        // 10 min of audio, twenty windows; the run takes 2.5 times the estimate.
+        let est = transcribe_est(600_000, 1.0);
+        let took = est.0 * 5 / 2;
+        let reports: Vec<_> = (1u8..20)
+            .map(|i| (took * u64::from(i) / 20, f32::from(i) / 20.0))
+            .collect();
+        let mut s = Smooth::start(Some(est), Millis(0));
+        let v = drive(&mut s, took * 19 / 20 + 1000, 0, &reports);
+        assert!(
+            (0.8..=TARGET_CAP).contains(&v),
+            "close to the last report: {v}"
+        );
+        // Between two reports (about 6.6 s apart) the bar always moved.
+        let mut a = s.shown(Millis(took * 19 / 20 + 2000));
+        for t in (took * 19 / 20 + 3000..took).step_by(1000) {
+            let b = s.shown(Millis(t));
+            // Within 0.01 of the cap the f32 steps are the only thing left to see.
+            assert!(b > a || a > TARGET_CAP - 0.01, "stuck at {t}: {a}");
+            a = b;
+        }
+    }
+
+    #[test]
+    fn a_job_of_unknown_length_runs_long_without_ever_reaching_full() {
+        let one_min = run(None, 60_000, 100);
+        let ten_min = run(None, 600_000, 100);
+        assert!(
+            one_min < ten_min && ten_min < EST_CEIL,
+            "{one_min} {ten_min}"
+        );
+        let mut s = Smooth::start(None, Millis(0));
+        s.shown(Millis(600_000));
+        assert!(s.percent() <= 99);
+        assert_eq!(s.state(Millis(600_000)), State::Running);
+        assert_eq!(s.left(Millis(600_000)), None, "overdue: no number");
     }
 
     #[test]

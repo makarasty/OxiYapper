@@ -11,6 +11,7 @@ pub mod open;
 #[cfg(test)]
 mod scratch;
 pub mod stats_store;
+pub mod sysinfo;
 pub mod wav;
 
 // Every OS module is reached as `os`, so callers never name the OS.

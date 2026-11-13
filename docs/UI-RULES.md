@@ -87,7 +87,7 @@ How to look:
 | Screen | Few, empty | Many, long |
 |---|---|---|
 | Home | no dictations yet | very large numbers, a full six months (26 weeks) of activity |
-| Hotkey | one key, no key picked | 15 keys in the chord: chips stay in the Keys row |
+| Hotkey | one key, no key picked | 15 keys in the chord: chips stay in the Keys row; a "+N" cap shows only when the caps really do not fit (Ctrl + Win never folds, also while the keyboard is open and keys are typed: the chords reach back over the title column's free part); Cancel and Apply sit in the free end of the keyboard's F13-F24 row, no row of their own |
 | Audio | no microphone, saved device unplugged | many microphones, a very long device name |
 | Language popup | search finds nothing | every whisper language |
 | Model | nothing downloaded, no GPU | all states at once (ready, downloading, paused, failed), long model and GPU names |

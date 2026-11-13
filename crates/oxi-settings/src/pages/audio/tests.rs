@@ -993,6 +993,7 @@ fn choosing_an_own_file_saves_its_path_and_cancelling_changes_nothing() {
     assert_eq!(start(), snd("my.wav"));
     let own = own_tile(&state, 0);
     assert_eq!(picked_tile(&state, 0), OWN_FILE_TILE);
+    assert_eq!(own.title, "Own file");
     assert_eq!(own.caption, "my.wav");
     assert_eq!(own.hint, snd("my.wav"));
     // The stop sound's own file does not touch the start sound.

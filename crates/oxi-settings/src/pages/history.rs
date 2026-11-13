@@ -32,7 +32,7 @@ use crate::generated::{HistoryRow, HistoryState, SystemState, Theme, WordSpan};
 use crate::ipc::{Event, Link, Subscription};
 use crate::{AppWindow, Ctx, Error, Page, report};
 
-use super::progress::Bars;
+use super::progress::{Bars, left_label};
 use super::toast;
 use super::tuning::{BARS, clock, peaks, when};
 
@@ -192,21 +192,13 @@ pub fn bind_with(window: &AppWindow, ctx: &Ctx, player: Player) {
         words_run: RefCell::new(None),
         words_tried: Cell::new(false),
         run: RefCell::new(None),
-        bar: Bars::new({
-            let window = window.as_weak();
-            move |bar, shown| {
-                if let Some(window) = window.upgrade() {
-                    let s = window.global::<HistoryState>();
-                    match bar {
-                        Bar::Run => s.set_progress(shown),
-                        Bar::Times => s.set_timing_progress(shown),
-                        Bar::File => s.set_file_progress(shown),
-                    }
-                }
-            }
-        }),
+        draft: RefCell::new(None),
+        applying: Cell::new(false),
+        bar: bars(window),
         next_run: Cell::new(FIRST_RUN),
         other: RefCell::new(None),
+        original: RefCell::new(None),
+        to_original: Cell::new(false),
         restored: Cell::new(false),
         diff_open: Cell::new(false),
         edit: RefCell::new(None),
@@ -240,6 +232,12 @@ pub fn bind_with(window: &AppWindow, ctx: &Ctx, player: Player) {
     let p = Rc::clone(&page);
     s.on_restore(move || p.restore());
     let p = Rc::clone(&page);
+    s.on_restore_original(move || p.restore_original());
+    let p = Rc::clone(&page);
+    s.on_apply_draft(move || p.apply_draft());
+    let p = Rc::clone(&page);
+    s.on_drop_draft(move || p.drop_draft());
+    let p = Rc::clone(&page);
     s.on_toggle_diff(move || p.toggle_diff());
     let p = Rc::clone(&page);
     s.on_restyle(move || p.restyle());
@@ -256,7 +254,40 @@ pub fn bind_with(window: &AppWindow, ctx: &Ctx, player: Player) {
     bind_search(&s, &page);
 }
 
-/// The player: a click on a word, Listen, speed, loop and skip pauses.
+/// The bars of the run, the word times and the file run, with their times left.
+fn bars(window: &AppWindow) -> Rc<Bars<Bar>> {
+    Bars::with_left(
+        {
+            let window = window.as_weak();
+            move |bar, shown| {
+                if let Some(window) = window.upgrade() {
+                    let s = window.global::<HistoryState>();
+                    match bar {
+                        Bar::Run => s.set_progress(shown),
+                        Bar::Times => s.set_timing_progress(shown),
+                        Bar::File => s.set_file_progress(shown),
+                    }
+                }
+            }
+        },
+        {
+            let window = window.as_weak();
+            move |bar, secs| {
+                if let Some(window) = window.upgrade() {
+                    let s = window.global::<HistoryState>();
+                    let left = left_label(secs).into();
+                    match bar {
+                        Bar::Run => s.set_progress_left(left),
+                        Bar::Times => s.set_timing_left(left),
+                        Bar::File => s.set_file_left(left),
+                    }
+                }
+            }
+        },
+    )
+}
+
+/// The player: a click on a word (it selects), Listen, speed, loop and skip pauses.
 fn bind_player(s: &HistoryState<'_>, page: &Rc<PageState>) {
     let p = Rc::clone(page);
     s.on_word_click(move |at| p.word_click(at));
@@ -294,13 +325,13 @@ fn bind_search(s: &HistoryState<'_>, page: &Rc<PageState>) {
     s.on_open_day(move |day| p.open_day(day.parse().ok()));
 }
 
-/// A Transcribe again that is out.
+/// A Transcribe again that is out; once heard, the draft Apply writes.
 struct Run {
     id: u32,
     entry: HistoryId,
     set: SettingsSet,
     language: Language,
-    /// The new text, once heard; then `HistorySetText` is out.
+    /// The new text, once heard: then it is the draft.
     text: Option<String>,
     /// The words of the run, which the daemon sends before its text.
     words: Words,
@@ -351,6 +382,11 @@ struct PageState {
     /// The picked entry's word times were asked for (once per pick, so a Busy makes no loop).
     words_tried: Cell<bool>,
     run: RefCell<Option<Run>>,
+    /// The new text a run heard, written by Apply only (owner 2026-11-13): kept in memory while
+    /// its entry stays picked; a new run replaces it, Restore or another pick drops it.
+    draft: RefCell<Option<Run>>,
+    /// Apply sent the draft's `HistorySetText`; the answer is out.
+    applying: Cell<bool>,
     /// The bars of the run and of the word times: the one progress driver, not a percent of
     /// their own.
     bar: Rc<Bars<Bar>>,
@@ -358,6 +394,10 @@ struct PageState {
     /// The other version of the picked entry's text: the one before the last new text, or the one
     /// a Restore put aside (`Meta::previous`, read from its json when it is picked).
     other: RefCell<Option<String>>,
+    /// The first text of the picked entry, kept through every replacement (`Meta::original`).
+    original: RefCell<Option<String>>,
+    /// The restore that is out is Restore original.
+    to_original: Cell<bool>,
     /// The text shown is the old version.
     restored: Cell<bool>,
     /// The text area shows what changed from `other`.
@@ -579,7 +619,7 @@ impl PageState {
         let run = self.run.borrow();
         let redo_off = if !self.online() {
             self.ctx.ipc.link().off_reason(REDO_NEEDS_DAEMON)
-        } else if run.is_some() {
+        } else if run.is_some() || self.applying.get() {
             RUNNING
         } else {
             ""
@@ -854,6 +894,10 @@ impl PageState {
         let id = self.selected_id();
         if *self.shown_id.borrow() != id {
             self.stop_playing();
+            // Closing the record is Restore; an Apply that is out keeps its draft for the answer.
+            if !self.applying.get() {
+                *self.draft.borrow_mut() = None;
+            }
             self.load_other(id.as_deref());
             let audio = id.as_deref().and_then(|id| self.read(id));
             self.audible.set(audio.is_some());
@@ -1140,38 +1184,39 @@ impl PageState {
         }
     }
 
-    /// A click on the text at byte `at`: on a word with a time the sound starts from it; on a
-    /// doubtful word the answer is its range, which the text area selects, so the fix bar opens.
+    /// A click on the text at byte `at`: the answer is the range of the word there, without the
+    /// punctuation around it, which the text area selects, so the bar opens. Nothing plays (owner
+    /// 2026-11-13): Listen in the bar does; the word times it needs are asked for here.
     fn word_click(&self, at: i32) -> WordSpan {
         let none = WordSpan { a: 0, b: 0 };
         let Some(at) = usize::try_from(at).ok() else {
             return none;
         };
-        let (start, doubtful) = {
+        let span = {
             let marks = self.marks.borrow();
             let Some(word) = marks.at_offset(at) else {
                 return none;
             };
-            (
-                marks.times[word].map(|(t0, _)| t0),
-                marks.doubtful[word].then(|| marks.spans[word].clone()),
-            )
+            marks.spans[word].clone()
         };
-        if start.is_none() {
+        if !self.marks.borrow().timed() {
             self.need_words();
         }
-        if let Some(t0) = start {
-            self.play_plan(Plan {
-                from: Duration::from_millis(t0.0).saturating_sub(LEAD_IN),
-                to: None,
-                speed: SPEEDS[self.speed.get()],
-                looping: self.looping.get(),
-            });
+        let Some(text) = self.shown_text() else {
+            return none;
+        };
+        let Some(word) = text.get(span.clone()) else {
+            return none;
+        };
+        let bare = word.trim_matches(|c: char| !c.is_alphanumeric());
+        if bare.is_empty() {
+            return none;
         }
-        doubtful.map_or(none, |r| WordSpan {
-            a: i32::try_from(r.start).unwrap_or(0),
-            b: i32::try_from(r.end).unwrap_or(0),
-        })
+        let a = span.start + word.find(bare).unwrap_or(0);
+        WordSpan {
+            a: i32::try_from(a).unwrap_or(0),
+            b: i32::try_from(a + bare.len()).unwrap_or(0),
+        }
     }
 
     /// Listen: plays the selected words, over and over when the loop is on.
@@ -1193,7 +1238,7 @@ impl PageState {
 
     /// Transcribe the picked entry again with the settings as they are now.
     fn redo(&self) {
-        if !self.online() || self.run.borrow().is_some() {
+        if !self.online() || self.run.borrow().is_some() || self.applying.get() {
             return;
         }
         let Some(entry) = self.selected_id() else {
@@ -1238,14 +1283,18 @@ impl PageState {
         let why = match outcome {
             TestOutcome::Heard { text, .. } if !text.trim().is_empty() => {
                 run.text = Some(text.clone());
-                self.ctx.ipc.send(Request::HistorySetText {
-                    id: run.entry.clone(),
-                    text: Spoken(text.clone()),
-                    set: run.set.clone(),
-                    language: run.language,
-                    words: run.words.clone(),
-                });
+                let run = slot.take();
+                drop(slot);
+                // A draft, written by Apply only; a record no longer picked was closed: dropped.
+                if !self.applying.get() {
+                    *self.draft.borrow_mut() =
+                        run.filter(|r| self.selected_id().as_ref() == Some(&r.entry));
+                }
                 self.bar.finish(&Bar::Run);
+                self.state(|s| {
+                    self.refresh(s);
+                    self.show_versions(s);
+                });
                 return;
             }
             TestOutcome::Heard { .. } => NOTHING_HEARD,
@@ -1262,35 +1311,62 @@ impl PageState {
     fn changed(&self, id: &str, op: HistoryOp, ok: bool) {
         match op {
             HistoryOp::SetText => {
-                let run = self
-                    .run
-                    .borrow_mut()
-                    .take_if(|r| r.entry == id && r.text.is_some());
+                if !self.applying.get() {
+                    return;
+                }
+                let run = self.draft.borrow_mut().take_if(|r| r.entry == id);
                 let Some(run) = run else {
                     return;
                 };
+                self.applying.set(false);
                 if ok {
+                    let first = self.first_text(id);
                     // The daemon kept the run's words unless the record had timed ones.
                     self.load_other(Some(id));
+                    self.keep_first(first);
                     self.new_text(id, run.text.unwrap_or_default(), |item| {
                         item.model = run.set.model;
                         run.language.as_str().clone_into(&mut item.language);
                     });
                 } else {
+                    // Kept: Apply can be pressed again.
+                    *self.draft.borrow_mut() = Some(run);
                     self.toast(NOT_SAVED);
-                    self.state(|s| self.refresh(s));
+                    self.state(|s| {
+                        self.refresh(s);
+                        self.show_versions(s);
+                    });
                 }
             }
             HistoryOp::Edit => {
                 let edit = self.edit.borrow_mut().take_if(|(entry, _)| entry == id);
                 match edit {
                     Some((_, text)) if ok => {
+                        self.keep_first(self.first_text(id));
                         self.offer_rule(id, &text);
                         self.new_text(id, text, |_| {});
                     }
                     Some(_) => self.toast(NOT_SAVED),
                     None => {}
                 }
+            }
+            HistoryOp::Restore if ok && self.to_original.replace(false) => {
+                let Some(first) = self.original.borrow().clone() else {
+                    return;
+                };
+                let shown = self
+                    .items
+                    .borrow_mut()
+                    .iter_mut()
+                    .find(|i| i.id == id)
+                    .map(|item| std::mem::replace(&mut item.text, Spoken(first)).0);
+                // The newer version is kept: the one a Restore put aside, else the one shown.
+                if !self.restored.get() {
+                    *self.other.borrow_mut() = shown;
+                }
+                self.restored.set(true);
+                self.diff_open.set(false);
+                self.show_rows(Some(id), 0);
             }
             HistoryOp::Restore if ok => {
                 let Some(other) = self.other.borrow_mut().take() else {
@@ -1307,7 +1383,10 @@ impl PageState {
                 self.diff_open.set(false);
                 self.show_rows(Some(id), 0);
             }
-            HistoryOp::Restore => self.toast(NOT_SAVED),
+            HistoryOp::Restore => {
+                self.to_original.set(false);
+                self.toast(NOT_SAVED);
+            }
             HistoryOp::Delete if ok => {
                 let at = self.items.borrow().iter().position(|i| i.id == id);
                 if let Some(at) = at {
@@ -1339,6 +1418,29 @@ impl PageState {
         self.show_rows(Some(id), 0);
     }
 
+    /// The text the daemon keeps as the original of entry `id` when its text is replaced now
+    /// (`Meta::original_of`): the one kept, else the older other version, else the shown text.
+    fn first_text(&self, id: &str) -> Option<String> {
+        let picked = self.selected_id().as_deref() == Some(id);
+        let kept = picked.then(|| {
+            let other = self.other.borrow().clone().filter(|_| !self.restored.get());
+            self.original.borrow().clone().or(other)
+        });
+        kept.flatten().or_else(|| {
+            let items = self.items.borrow();
+            let text = &items.iter().find(|i| i.id == id)?.text.0;
+            (!text.is_empty()).then(|| text.clone())
+        })
+    }
+
+    /// `first` becomes the original of the picked entry unless it has one.
+    fn keep_first(&self, first: Option<String>) {
+        let mut original = self.original.borrow_mut();
+        if original.is_none() {
+            *original = first;
+        }
+    }
+
     /// The other version of entry `id` and its words, from its json; also resets what the page
     /// shows of them.
     fn load_other(&self, id: Option<&str>) {
@@ -1347,7 +1449,10 @@ impl PageState {
             let json = fs::read_to_string(entry_path(&folder, id, history::JSON)).ok()?;
             Meta::from_json(&json).ok()
         });
-        let (kept, words) = meta.map_or((None, Vec::new()), |m| (m.previous, m.words));
+        let (kept, first, words) = meta.map_or((None, None, Vec::new()), |m| {
+            (m.previous, m.original, m.words)
+        });
+        *self.original.borrow_mut() = first.map(|p| p.text);
         // The record says which version is shown, so a re-pick does not forget a Restore.
         self.restored.set(kept.as_ref().is_some_and(|p| p.newer));
         *self.other.borrow_mut() = kept.map(|p| p.text);
@@ -1355,14 +1460,40 @@ impl PageState {
         self.diff_open.set(false);
     }
 
-    /// What the page says of the versions: the strip, and the diff while it is open.
+    /// The draft's text while it is for the picked entry.
+    fn draft_text(&self) -> Option<String> {
+        let picked = self.selected_id()?;
+        self.draft
+            .borrow()
+            .as_ref()
+            .filter(|r| r.entry == picked)
+            .and_then(|r| r.text.clone())
+    }
+
+    /// What the page says of the versions: the strip, and the diff while it is open. A draft is
+    /// always shown as the changes from the current text.
     fn show_versions(&self, s: &HistoryState<'_>) {
         let other = self.other.borrow();
+        let draft = self.draft_text();
+        s.set_draft_on(draft.is_some());
         s.set_has_other(other.is_some());
         s.set_restored(self.restored.get());
-        let open = self.diff_open.get() && other.is_some();
-        s.set_diff_open(open);
-        if let (true, Some(other), Some(shown)) = (open, other.as_deref(), self.shown_text()) {
+        let shown = self.shown_text();
+        // Offered only when it is neither text the page already offers.
+        let first = self.original.borrow();
+        let first = first.as_deref().map(str::trim);
+        s.set_has_original(first.is_some_and(|f| {
+            Some(f) != shown.as_deref() && Some(f) != other.as_deref().map(str::trim)
+        }));
+        let pair = match (&draft, shown) {
+            (Some(new), Some(shown)) => Some((shown, new.trim().to_owned())),
+            (None, Some(shown)) if self.diff_open.get() => {
+                other.as_deref().map(|old| (old.to_owned(), shown))
+            }
+            _ => None,
+        };
+        s.set_diff_open(pair.is_some());
+        if let Some((old, new)) = pair {
             let colours = self.window.upgrade().map(|w| {
                 let theme = w.global::<Theme>();
                 (
@@ -1371,17 +1502,50 @@ impl PageState {
                 )
             });
             let (removed, added) = colours.unwrap_or_default();
-            let markup = diff_markup(other, &shown, &removed, &added);
+            let markup = diff_markup(&old, &new, &removed, &added);
             s.set_diff(
                 StyledText::from_markdown(&markup)
-                    .unwrap_or_else(|_| StyledText::from_plain_text(&shown)),
+                    .unwrap_or_else(|_| StyledText::from_plain_text(&new)),
             );
         }
     }
 
+    /// Apply: the draft becomes the entry's text; the current one is kept as the other version.
+    fn apply_draft(&self) {
+        if self.applying.get() || self.draft_text().is_none() {
+            return;
+        }
+        if !self.online() {
+            self.toast(self.ctx.ipc.link().off_reason(EDIT_NEEDS_DAEMON));
+            return;
+        }
+        let draft = self.draft.borrow();
+        let Some((run, text)) = draft.as_ref().and_then(|r| Some((r, r.text.clone()?))) else {
+            return;
+        };
+        self.ctx.ipc.send(Request::HistorySetText {
+            id: run.entry.clone(),
+            text: Spoken(text),
+            set: run.set.clone(),
+            language: run.language,
+            words: run.words.clone(),
+        });
+        self.applying.set(true);
+    }
+
+    /// Restore: the draft goes; nothing was written.
+    fn drop_draft(&self) {
+        if self.applying.get() {
+            return;
+        }
+        *self.draft.borrow_mut() = None;
+        self.diff_open.set(false);
+        self.state(|s| self.show_versions(s));
+    }
+
     /// The theme changed: the diff carries colours of its own, so it is made again.
     fn restyle(&self) {
-        if self.diff_open.get() {
+        if self.diff_open.get() || self.draft_text().is_some() {
             self.state(|s| self.show_versions(s));
         }
         self.state(|s| self.show_words(s));
@@ -1399,7 +1563,24 @@ impl PageState {
         } else if self.other.borrow().is_some()
             && let Some(id) = self.selected_id()
         {
-            self.ctx.ipc.send(Request::HistoryRestore { id });
+            self.ctx.ipc.send(Request::HistoryRestore {
+                id,
+                original: false,
+            });
+        }
+    }
+
+    /// Restore original: the first text of the picked entry comes back.
+    fn restore_original(&self) {
+        if !self.online() {
+            self.toast(self.ctx.ipc.link().off_reason(EDIT_NEEDS_DAEMON));
+        } else if self.original.borrow().is_some()
+            && let Some(id) = self.selected_id()
+        {
+            self.to_original.set(true);
+            self.ctx
+                .ipc
+                .send(Request::HistoryRestore { id, original: true });
         }
     }
 
@@ -1682,6 +1863,10 @@ impl PageState {
                     });
                     if self.run.borrow_mut().take().is_some() {
                         self.bar.fail(&Bar::Run);
+                        self.toast(LINK_LOST);
+                    }
+                    // The draft stays: Apply again once the link is back.
+                    if self.applying.replace(false) {
                         self.toast(LINK_LOST);
                     }
                     if self.file.take().is_some() {
@@ -2287,7 +2472,11 @@ enabled = false
     }
 
     #[test]
-    fn transcribe_again_stores_the_new_text() {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one run from the ask to the stored text, read top to bottom"
+    )]
+    fn transcribe_again_stores_the_new_text_on_apply() {
         let (window, ipc, sent, _ctx) = page("redo");
         let s = window.global::<HistoryState>();
         s.invoke_shown();
@@ -2362,6 +2551,9 @@ enabled = false
                 ms: 900,
             },
         }));
+        assert_eq!(sent_now(&sent), [], "written before Apply");
+        assert!(s.get_draft_on() && s.get_diff_open());
+        s.invoke_apply_draft();
         match sent_now(&sent).as_slice() {
             [
                 Request::HistorySetText {
@@ -2853,7 +3045,8 @@ enabled = false
         assert_eq!(
             sent_now(&sent),
             [Request::HistoryRestore {
-                id: HistoryId::parse("2026-11-08/134501-123").unwrap()
+                id: HistoryId::parse("2026-11-08/134501-123").unwrap(),
+                original: false,
             }]
         );
         reply(&ipc, HistoryOp::Restore, true);
@@ -2876,7 +3069,7 @@ enabled = false
     }
 
     #[test]
-    fn a_new_run_shows_its_diff_at_once_and_offline_edits_say_why() {
+    fn an_applied_run_shows_its_diff_and_offline_edits_say_why() {
         let (window, ipc, sent, _ctx) = picked_page("diff", "one two three");
         let s = window.global::<HistoryState>();
         s.invoke_redo();
@@ -2890,9 +3083,12 @@ enabled = false
                 ms: 5,
             },
         }));
+        assert_eq!(sent_now(&sent), [], "a draft until Apply");
+        assert_eq!(rows(&window)[0].text, "one two three");
+        s.invoke_apply_draft();
         sent_now(&sent);
         reply(&ipc, HistoryOp::SetText, true);
-        assert_eq!(rows(&window)[0].text, "one 2 three", "applied at once");
+        assert_eq!(rows(&window)[0].text, "one 2 three", "applied");
         assert!(s.get_has_other() && s.get_diff_open());
         assert_eq!(
             window.global::<Toast>().get_text(),
@@ -2905,6 +3101,130 @@ enabled = false
         ipc.deliver(&Event::Link(Link::Offline));
         assert!(!s.invoke_fix_here(0, 3, "1".into()));
         assert_eq!(window.global::<Toast>().get_text(), EDIT_NEEDS_DAEMON);
+    }
+
+    /// Delivers the answer "heard `text`" to the run just sent.
+    fn heard(ipc: &Ipc, sent: &Receiver<Cmd>, text: &str) {
+        let Some(Request::HistoryRetranscribe { run, .. }) = sent_now(sent).pop() else {
+            panic!("no run");
+        };
+        ipc.deliver(&Event::Push(Push::TestResult {
+            id: run,
+            outcome: TestOutcome::Heard {
+                text: text.into(),
+                ms: 5,
+            },
+        }));
+    }
+
+    #[test]
+    fn a_run_is_a_draft_until_apply_and_restore_or_another_pick_drops_it() {
+        let (window, ipc, sent, _ctx) = picked_page("draft", "one two three");
+        let s = window.global::<HistoryState>();
+        let id = HistoryId::parse("2026-11-08/134501-123").unwrap();
+        // Restore: nothing written, the text as it was.
+        s.invoke_redo();
+        heard(&ipc, &sent, "one 2 three");
+        assert!(s.get_draft_on() && s.get_diff_open());
+        assert_eq!(sent_now(&sent), []);
+        s.invoke_drop_draft();
+        assert!(!s.get_draft_on() && !s.get_diff_open() && !s.get_has_other());
+        assert_eq!(rows(&window)[0].text, "one two three");
+        assert_eq!(sent_now(&sent), [], "Restore writes nothing");
+        // Run again as often as wanted: each answer replaces the draft.
+        s.invoke_redo();
+        heard(&ipc, &sent, "one 2 three");
+        assert_eq!(s.get_redo_off(), "", "another run is allowed over a draft");
+        s.invoke_redo();
+        heard(&ipc, &sent, "won two three");
+        assert_eq!(sent_now(&sent), []);
+        s.invoke_apply_draft();
+        s.invoke_apply_draft();
+        match sent_now(&sent).as_slice() {
+            [Request::HistorySetText { id: to, text, .. }] => {
+                assert_eq!(to, &id);
+                assert_eq!(text.0, "won two three", "the last draft, sent once");
+            }
+            other => panic!("{other:?}"),
+        }
+        reply(&ipc, HistoryOp::SetText, true);
+        assert_eq!(rows(&window)[0].text, "won two three");
+        assert!(!s.get_draft_on() && s.get_has_other() && !s.get_restored());
+        // The original stays: Restore old brings it back.
+        s.invoke_restore();
+        assert_eq!(
+            sent_now(&sent),
+            [Request::HistoryRestore {
+                id: id.clone(),
+                original: false,
+            }]
+        );
+        reply(&ipc, HistoryOp::Restore, true);
+        assert_eq!(rows(&window)[0].text, "one two three");
+        // A draft of a record that is closed goes with it.
+        s.invoke_redo();
+        heard(&ipc, &sent, "three");
+        assert!(s.get_draft_on());
+        listed(
+            &ipc,
+            vec![
+                item("2026-11-08/134501-123", Status::Done, "one two three"),
+                item("2026-11-08/120000-000", Status::Done, "x"),
+            ],
+            false,
+        );
+        s.invoke_select(1);
+        s.invoke_select(0);
+        assert!(!s.get_draft_on(), "closing the record is Restore");
+        s.invoke_apply_draft();
+        assert_eq!(sent_now(&sent), []);
+    }
+
+    /// b01 review: after two Applies the dictated text is still offered and comes back; Use new
+    /// undoes it.
+    #[test]
+    fn the_original_stays_restorable_after_two_applies() {
+        let (window, ipc, sent, _ctx) = picked_page("original", "one two three");
+        let s = window.global::<HistoryState>();
+        let id = HistoryId::parse("2026-11-08/134501-123").unwrap();
+        for draft in ["one 2 three", "won 2 three"] {
+            s.invoke_redo();
+            heard(&ipc, &sent, draft);
+            s.invoke_apply_draft();
+            sent_now(&sent);
+            reply(&ipc, HistoryOp::SetText, true);
+            assert!(
+                !s.get_has_original() || draft != "one 2 three",
+                "the other one already"
+            );
+        }
+        assert_eq!(rows(&window)[0].text, "won 2 three");
+        assert!(
+            s.get_has_original(),
+            "neither the shown text nor the other one"
+        );
+        // A failed one says so and changes nothing.
+        s.invoke_restore_original();
+        sent_now(&sent);
+        reply(&ipc, HistoryOp::Restore, false);
+        assert_eq!(window.global::<Toast>().get_text(), NOT_SAVED);
+        assert_eq!(rows(&window)[0].text, "won 2 three");
+        s.invoke_restore_original();
+        assert_eq!(
+            sent_now(&sent),
+            [Request::HistoryRestore { id, original: true }]
+        );
+        reply(&ipc, HistoryOp::Restore, true);
+        assert_eq!(rows(&window)[0].text, "one two three");
+        assert!(s.get_restored() && s.get_has_other() && !s.get_has_original());
+        s.invoke_restore();
+        sent_now(&sent);
+        reply(&ipc, HistoryOp::Restore, true);
+        assert_eq!(rows(&window)[0].text, "won 2 three", "Use new");
+        assert!(
+            !s.get_restored() && !s.get_has_original(),
+            "Restore old brings it back now"
+        );
     }
 
     #[test]
@@ -2932,6 +3252,13 @@ enabled = false
                 settings: None,
                 newer: true,
             }),
+            original: Some(history::Previous {
+                text: "dictated".into(),
+                model: String::new(),
+                language: String::new(),
+                settings: None,
+                newer: false,
+            }),
             words: Vec::new(),
             timings: None,
             raw: false,
@@ -2949,10 +3276,11 @@ enabled = false
             false,
         );
         assert!(s.get_has_other(), "kept in the record");
+        assert!(s.get_has_original(), "the first text too");
         assert!(s.get_restored(), "the record says the old text is shown");
         assert!(!s.get_diff_open(), "the changes open on a click");
         s.invoke_select(1);
-        assert!(!s.get_has_other());
+        assert!(!s.get_has_other() && !s.get_has_original());
         assert!(!s.get_restored());
         s.invoke_select(0);
         assert!(
@@ -3047,6 +3375,7 @@ enabled = false
             language: String::new(),
             settings: None,
             previous: None,
+            original: None,
             words,
             timings: timed.then(|| history::Timings {
                 by: history::TimingBy::Tokens,
@@ -3069,31 +3398,40 @@ enabled = false
     }
 
     #[test]
-    fn a_click_on_a_timed_word_plays_from_it_and_a_doubtful_one_also_offers_the_fix() {
+    fn a_click_on_a_word_selects_it_and_plays_nothing() {
         let (window, _ipc, _sent, _ctx) = recorded("click", four(true));
         let s = window.global::<HistoryState>();
         assert!(s.get_timed());
         assert!(s.get_marks_on(), "the doubtful word is underlined at rest");
         let span = s.invoke_word_click(14);
-        assert_eq!((span.a, span.b), (0, 0), "gamma is not doubtful");
-        assert!(s.get_playing());
-        let [plan] = plans()[..] else {
-            panic!("{:?}", plans());
-        };
-        assert_eq!(
-            plan.from,
-            Duration::from_millis(850),
-            "150 ms before the word"
-        );
-        assert_eq!((plan.to, plan.speed, plan.looping), (None, 1.0, false));
-        // The doubtful beta: it plays from there, and its range comes back to be selected.
+        assert_eq!((span.a, span.b), (11, 16), "gamma");
         let span = s.invoke_word_click(7);
-        assert_eq!((span.a, span.b), (6, 10));
-        assert_eq!(plans().last().unwrap().from, Duration::from_millis(350));
-        // Between nothing and the first word: no word, no play.
-        let before = plans().len();
-        s.invoke_word_click(-1);
-        assert_eq!(plans().len(), before);
+        assert_eq!((span.a, span.b), (6, 10), "the doubtful beta too");
+        assert!(plans().is_empty() && !s.get_playing(), "a click played");
+        // Between nothing and the first word: no word.
+        let span = s.invoke_word_click(-1);
+        assert_eq!((span.a, span.b), (0, 0));
+    }
+
+    #[test]
+    fn a_clicked_word_comes_without_the_punctuation_around_it() {
+        let (window, _ipc, _sent, _ctx) =
+            picked_page("click-punct", "Well, \u{ab}yes\u{bb}! \u{2014} ok.");
+        let s = window.global::<HistoryState>();
+        let text = "Well, \u{ab}yes\u{bb}! \u{2014} ok.";
+        let word = |at: usize| {
+            let span = s.invoke_word_click(i32::try_from(at).unwrap());
+            let (a, b) = (
+                usize::try_from(span.a).unwrap(),
+                usize::try_from(span.b).unwrap(),
+            );
+            text[a..b].to_owned()
+        };
+        assert_eq!(word(1), "Well");
+        assert_eq!(word(text.find("yes").unwrap()), "yes");
+        assert_eq!(word(text.find("ok").unwrap()), "ok");
+        let dash = s.invoke_word_click(i32::try_from(text.find('\u{2014}').unwrap()).unwrap());
+        assert_eq!((dash.a, dash.b), (0, 0), "a dash is no word");
     }
 
     #[test]
@@ -3393,7 +3731,7 @@ enabled = false
     }
 
     #[test]
-    fn a_click_on_the_first_character_or_after_ctrl_c_still_plays() {
+    fn one_click_opens_the_bar_on_the_word_and_never_plays() {
         let (window, _ipc, _sent, _ctx) = recorded("clicks", four(true));
         window
             .window()
@@ -3402,14 +3740,14 @@ enabled = false
         let text = crate::testing::one(&window, "Transcript");
         let (at, size) = (text.absolute_position(), text.size());
         assert!(size.width > 100.0, "the text area is laid out");
+        assert_eq!(count(&window, "Copy"), 0, "no bar at rest");
         // The left edge of the first character: caret 0, the first word.
         let first = slint::LogicalPosition::new(at.x + 13.0, at.y + 16.0);
         click(&window, first);
-        let [plan] = plans()[..] else {
-            panic!("the first character did not play: {:?}", plans());
-        };
-        assert_eq!(plan.from, Duration::ZERO);
-        // An arrow key moves both ends of the parked caret: neither change is a click.
+        assert_eq!(count(&window, "Copy"), 1, "one click opened the bar");
+        assert_eq!(count(&window, "Listen"), 1, "Play is in the bar");
+        assert!(plans().is_empty(), "the click played: {:?}", plans());
+        // Esc closes it; an arrow key moves both ends of the parked caret: no click.
         let w = window.window();
         let key = |text: slint::SharedString, down: bool| {
             use slint::platform::WindowEvent::{KeyPressed, KeyReleased};
@@ -3420,13 +3758,16 @@ enabled = false
             });
             i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(50));
         };
+        key(slint::platform::Key::Escape.into(), true);
+        key(slint::platform::Key::Escape.into(), false);
+        assert_eq!(count(&window, "Copy"), 0, "Esc closed the bar");
         i_slint_backend_testing::mock_elapsed_time(Duration::from_secs(1));
         key(slint::platform::Key::LeftArrow.into(), true);
         key(slint::platform::Key::LeftArrow.into(), false);
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(300));
-        assert_eq!(plans().len(), 1, "an arrow key played a word");
-        // Select from the first character, copy, then click where the drag ended (one end of the
-        // caret moves): Ctrl+C moved nothing, so that click plays.
+        assert_eq!(count(&window, "Copy"), 0, "an arrow key opened the bar");
+        // A drag still selects what it covers, and opens the bar; Ctrl+C after it, then a click
+        // where the drag ended, still opens it on that word.
         let end = slint::LogicalPosition::new(first.x + 40.0, first.y);
         i_slint_backend_testing::mock_elapsed_time(Duration::from_secs(1));
         {
@@ -3444,14 +3785,56 @@ enabled = false
             });
         }
         i_slint_backend_testing::mock_elapsed_time(Duration::from_secs(1));
-        assert_eq!(plans().len(), 1, "a drag is no click");
+        assert_eq!(count(&window, "Copy"), 1, "a drag opens the bar");
         key(slint::platform::Key::Control.into(), true);
         key("c".into(), true);
         key("c".into(), false);
         key(slint::platform::Key::Control.into(), false);
         i_slint_backend_testing::mock_elapsed_time(Duration::from_secs(1));
         click(&window, end);
-        assert_eq!(plans().len(), 2, "the click after Ctrl+C was swallowed");
+        assert_eq!(count(&window, "Copy"), 1);
+        assert!(plans().is_empty(), "nothing ever played: {:?}", plans());
+    }
+
+    /// b01 review: a click held past the timer, with the pointer jittering a pixel before the
+    /// release, keeps the whole word selected (a drag moved the caret back to the press).
+    #[test]
+    fn a_held_click_that_jitters_keeps_the_whole_word() {
+        use slint::platform::{PointerEventButton, WindowEvent};
+        let (window, _ipc, _sent, ctx) = recorded("jitter", four(true));
+        window
+            .window()
+            .set_size(slint::LogicalSize::new(1280.0, 860.0));
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(50));
+        let at = crate::testing::one(&window, "Transcript").absolute_position();
+        // Inside "alpha", past its second letter.
+        let press = slint::LogicalPosition::new(at.x + 30.0, at.y + 16.0);
+        let w = window.window();
+        let button = PointerEventButton::Left;
+        w.dispatch_event(WindowEvent::PointerMoved { position: press });
+        w.dispatch_event(WindowEvent::PointerPressed {
+            position: press,
+            button,
+        });
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+        let moved = slint::LogicalPosition::new(press.x + 1.0, press.y);
+        w.dispatch_event(WindowEvent::PointerMoved { position: moved });
+        w.dispatch_event(WindowEvent::PointerReleased {
+            position: moved,
+            button,
+        });
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(300));
+        crate::testing::with_role(
+            &window,
+            "Add to dictionary",
+            i_slint_backend_testing::AccessibleRole::Button,
+        )
+        .invoke_accessible_default_action();
+        assert_eq!(
+            fs::read_to_string(ctx.layout.dictionary_file()).unwrap(),
+            "alpha
+"
+        );
     }
 
     /// How many elements are labelled `label`.
@@ -3661,20 +4044,21 @@ enabled = false
         let spoken = few[0].text.0.clone();
         for state in [
             "empty", "off", "few", "many", "changes", "selected", "doubtful", "playing", "search",
-            "nothing", "file",
+            "nothing", "file", "draft", "running", "clicked",
         ] {
             let layout = crate::testing::layout("history", &format!("shot-{state}"));
             if state == "changes" {
-                // The first entry was transcribed again: its json keeps the earlier text.
+                // The first entry was transcribed again twice: its json keeps the earlier text
+                // and the dictated one.
                 let day = layout.history_dir().join("2026-11-08");
                 fs::create_dir_all(&day).unwrap();
                 let kept = "Send the report to Hanna before lunch and ask her about the ticket.";
                 let json = format!(
-                    "{{\"version\":1,\"started\":\"\",\"duration_ms\":4500,\"status\":\"done\",\"model\":\"\",\"language\":\"\",\"settings\":null,\"previous\":{{\"text\":\"{kept}\",\"model\":\"\",\"language\":\"\",\"settings\":null}}}}"
+                    "{{\"version\":1,\"started\":\"\",\"duration_ms\":4500,\"status\":\"done\",\"model\":\"\",\"language\":\"\",\"settings\":null,\"previous\":{{\"text\":\"{kept}\",\"model\":\"\",\"language\":\"\",\"settings\":null}},\"original\":{{\"text\":\"Send report Anna lunch.\",\"model\":\"\",\"language\":\"\",\"settings\":null}}}}"
                 );
                 fs::write(day.join("134501-123.json"), json).unwrap();
             }
-            if matches!(state, "doubtful" | "playing" | "selected") {
+            if matches!(state, "doubtful" | "playing" | "selected" | "clicked") {
                 // The first entry has audio and words: two the model doubted, every word timed.
                 let day = layout.history_dir().join("2026-11-08");
                 fs::create_dir_all(&day).unwrap();
@@ -3700,6 +4084,7 @@ enabled = false
                     language: String::new(),
                     settings: None,
                     previous: None,
+                    original: None,
                     words,
                     timings: Some(history::Timings {
                         by: history::TimingBy::Tokens,
@@ -3732,7 +4117,7 @@ enabled = false
                     .collect();
                 oxi_platform::wav::write_wav(&day.join("120000-000.wav"), &speech).unwrap();
             }
-            let (ipc, _sent) = Ipc::fake();
+            let (ipc, sent) = Ipc::fake();
             let window = crate::open_with(layout, ipc.clone()).unwrap();
             let surface = LAST.with_borrow(Clone::clone).unwrap();
             surface.set_size(slint::PhysicalSize::new(1280, 860));
@@ -3741,7 +4126,7 @@ enabled = false
             has(&window, "History");
             let items = match state {
                 "few" | "changes" | "selected" | "doubtful" | "playing" | "search" | "nothing"
-                | "file" => few.clone(),
+                | "file" | "draft" | "running" | "clicked" => few.clone(),
                 "many" => many.clone(),
                 _ => Vec::new(),
             };
@@ -3769,18 +4154,35 @@ enabled = false
                 let s = window.global::<HistoryState>();
                 s.set_file_running(true);
                 s.set_file_progress(0.45);
+                s.set_file_left("12 s left".into());
+            }
+            if state == "draft" {
+                // Transcribe again heard a new text: the draft against the current one.
+                window.global::<HistoryState>().invoke_redo();
+                heard(
+                    &ipc,
+                    &sent,
+                    "Send the report to Hanna before lunch and ask her about the ticket.",
+                );
+            }
+            if state == "running" {
+                let s = window.global::<HistoryState>();
+                s.set_running_id(few[0].id.as_str().into());
+                s.set_progress(0.42);
+                s.set_progress_left("8 s left".into());
             }
             if state == "changes" {
                 window.global::<HistoryState>().invoke_toggle_diff();
             }
             if state == "playing" {
-                // A click on "report" while the sound is on it.
-                let at = i32::try_from(spoken.find("report").unwrap()).unwrap() + 2;
-                window.global::<HistoryState>().invoke_word_click(at);
+                // Listen on "report" while the sound is on it.
+                let at = i32::try_from(spoken.find("report").unwrap()).unwrap();
+                window.global::<HistoryState>().invoke_listen(at, at + 6);
                 TEST_PLAYER.set(None);
             }
-            if state == "selected" {
-                // Drag across the first words of the text, as a hand would.
+            if matches!(state, "selected" | "clicked") {
+                // Drag across the first words of the text, as a hand would; or one click on the
+                // last word of the line, near the text's right edge.
                 CLOCK.set(CLOCK.get() + Duration::from_millis(300));
                 slint::platform::update_timers_and_animations();
                 surface.draw_if_needed(|r| {
@@ -3789,10 +4191,15 @@ enabled = false
                         1280,
                     );
                 });
-                let (from, to) = (
-                    slint::LogicalPosition::new(655.0, 185.0),
-                    slint::LogicalPosition::new(780.0, 185.0),
-                );
+                let (from, to) = if state == "selected" {
+                    (
+                        slint::LogicalPosition::new(640.0, 242.0),
+                        slint::LogicalPosition::new(780.0, 242.0),
+                    )
+                } else {
+                    let at = slint::LogicalPosition::new(1030.0, 242.0);
+                    (at, at)
+                };
                 let button = slint::platform::PointerEventButton::Left;
                 let w = window.window();
                 w.dispatch_event(slint::platform::WindowEvent::PointerMoved { position: from });
@@ -4013,6 +4420,7 @@ enabled = false
             language: "ru".into(),
             settings: None,
             previous: None,
+            original: None,
             words: heard.clone(),
             timings: None,
             raw: false,

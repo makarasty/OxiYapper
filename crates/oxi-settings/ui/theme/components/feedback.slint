@@ -355,13 +355,18 @@ export component Meter inherits Rectangle {
 // of the rail in a slot at least as wide as "100 %", right-aligned, so a ticking number moves
 // nothing (DS-25.7); an empty label shows no slot, unless the bar is `indeterminate` or sets
 // `reserve-label`: then the slot is there from the start, so the rail does not shrink when a
-// percent arrives (DS-25.2).
+// percent arrives (DS-25.2). `show-percent` (off by default) adds the percent of `value` and
+// `left` (the time left, "12 s left"; empty while not known) in slots of their own between the rail
+// and the label, both there from the start, so nothing moves as they tick or arrive. The percent
+// never reads 0 while the bar runs: empty while indeterminate, then 1 to 99, 100 only when full.
 export component ProgressBar inherits HorizontalLayout {
     in property <float> value;
     in property <bool> error;
     in property <bool> indeterminate;
     in property <string> label;
     in property <bool> reserve-label;
+    in property <bool> show-percent;
+    in property <string> left;
     spacing: Theme.space-2;
     accessible-role: progress-indicator;
     accessible-value: root.indeterminate ? "" : round(clamp(root.value, 0, 1) * 100) + " %";
@@ -399,6 +404,26 @@ export component ProgressBar inherits HorizontalLayout {
                 background: root.error ? Theme.error-text : Theme.accent;
             }
         }
+    }
+    if root.show-percent: Text {
+        text: root.indeterminate ? "" : (root.value >= 1 ? 100 : clamp(floor(root.value * 100), 1, 99)) + " %";
+        font-size: Theme.caption-size;
+        color: root.error ? Theme.error-text : Theme.text-secondary;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+        min-width: Theme.progress-label-width;
+        horizontal-stretch: 0;
+        accessible-role: none;
+    }
+    // Two label slots wide ("10 min left" fits), from its left: read with the percent.
+    if root.show-percent: Text {
+        text: root.left;
+        font-size: Theme.caption-size;
+        color: Theme.text-secondary;
+        horizontal-alignment: TextHorizontalAlignment.left;
+        vertical-alignment: center;
+        min-width: 2 * Theme.progress-label-width;
+        horizontal-stretch: 0;
     }
     if root.label != "" || root.indeterminate || root.reserve-label: Text {
         text: root.label;

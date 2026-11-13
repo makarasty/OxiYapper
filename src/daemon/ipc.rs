@@ -144,7 +144,7 @@ pub trait Host: Send + Sync + 'static {
     /// Replaces the transcript of recording `id` with the user's edit; the run stays.
     fn history_edit(&self, id: &HistoryId, text: &str) -> io::Result<()>;
     /// Swaps the transcript of recording `id` with its other version.
-    fn history_restore(&self, id: &HistoryId) -> io::Result<()>;
+    fn history_restore(&self, id: &HistoryId, original: bool) -> io::Result<()>;
     fn history_delete(&self, id: &HistoryId) -> io::Result<()>;
     /// Does this host take the daemon's announcements ([`announce`])? Only the real one does, so
     /// a thread under test never reaches another test's window.
@@ -719,8 +719,8 @@ impl Ctx {
                 let done = self.host.history_edit(&id, &text);
                 history_result(conn, id, HistoryOp::Edit, done)
             }
-            Request::HistoryRestore { id } => {
-                let done = self.host.history_restore(&id);
+            Request::HistoryRestore { id, original } => {
+                let done = self.host.history_restore(&id, original);
                 history_result(conn, id, HistoryOp::Restore, done)
             }
             Request::HistoryDelete { id } => {
@@ -1676,8 +1676,8 @@ impl Host for SystemHost {
         history::edit_text(&self.history_dir()?, id, text)
     }
 
-    fn history_restore(&self, id: &HistoryId) -> io::Result<()> {
-        history::restore(&self.history_dir()?, id)
+    fn history_restore(&self, id: &HistoryId, original: bool) -> io::Result<()> {
+        history::restore(&self.history_dir()?, id, original)
     }
 
     fn history_delete(&self, id: &HistoryId) -> io::Result<()> {

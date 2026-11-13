@@ -249,29 +249,30 @@ export component AudioPage inherits VerticalLayout {
         }
     }
     if AudioState.view >= 2: VerticalLayout {
-        // Followed by hand: picking a row of the Combo sets its index and so drops a binding.
-        property <int> role: root.role;
-        changed role => {
-            roles.current-index = self.role;
-        }
-        spacing: Theme.space-4;
-        sound-card := Card {
-            Row {
-                title: @tr("Sound for");
-                warning: AudioState.sound-warning;
-                fill-controls: true;
-                roles := Combo {
-                    // Only the view changes: the sounds stay readable on a locked config.
-                    locked: false;
-                    model: [@tr("Start"), @tr("Stop"), @tr("Text ready"), @tr("Cancel"), @tr("Error")];
-                    current-index: root.role;
-                    accessible-label: @tr("Sound for");
-                    selected => {
-                        AudioState.view = 2 + self.current-index;
-                    }
-                }
+        // Tighter than the page's 16: the cards, the first row and the gallery fit 720x520 with it.
+        spacing: Theme.space-3;
+        // One card per event, like the model cards; picking one only changes the view, so the sounds
+        // stay readable on a locked config.
+        events := CardGrid {
+            accessible-label: @tr("Sound for");
+            locked: false;
+            min-cell: 100px;
+            tile-height: Theme.tile-height-short;
+            // `full-height` counts the gap after the last row; the page spaces the grids itself.
+            height: self.full-height - Theme.tile-gap;
+            tiles: [
+                { icon: Icons.play, title: @tr("Start") },
+                { icon: Icons.stop, title: @tr("Stop") },
+                { icon: Icons.text-t, title: @tr("Text ready") },
+                { icon: Icons.dismiss-16, title: @tr("Cancel") },
+                { icon: Icons.warning, title: @tr("Error") },
+            ];
+            selected: root.role;
+            picked(i) => {
+                AudioState.view = 2 + i;
             }
-            Divider { }
+        }
+        sound-card := Card {
             Row {
                 title: @tr("Own sounds");
                 // The folder's name is in the tip: a line under the title made this row taller than its neighbours.
@@ -310,6 +311,7 @@ export component AudioPage inherits VerticalLayout {
             // Preview plays the tile picked below, so it is not in the own-file row.
             Row {
                 title: @tr("Picked sound");
+                warning: AudioState.sound-warning;
                 Button {
                     text: @tr("Preview");
                     icon: Icons.play;
@@ -334,17 +336,36 @@ export component AudioPage inherits VerticalLayout {
                 }
             }
         }
-        CardGrid {
-            accessible-label: @tr("Sounds");
-            // All the room the window leaves, at least one row of tiles; more scroll inside the grid.
-            // Under banners not even one row fits and the page scrolls: then the grid shows every
-            // row, so only one thing scrolls (UI rule 26).
-            property <length> room: root.free-height - tabs.preferred-height - sound-card.preferred-height - 2 * Theme.space-4;
-            height: self.room < self.min-height ? self.full-height : clamp(self.room, self.min-height, self.full-height);
-            tiles: AudioState.role-tiles[root.role];
-            selected: AudioState.role-tile[root.role];
-            picked(i) => {
-                AudioState.sound-picked(i);
+        // Off and Own file are the first row, easy to find; the rest of the gallery is below (the
+        // same list, two windows onto it).
+        VerticalLayout {
+            spacing: Theme.tile-gap;
+            top := CardGrid {
+                accessible-label: @tr("Off and own file");
+                count: 2;
+                pack: true;
+                reserve-gutter: gallery.overflows;
+                height: self.full-height - Theme.tile-gap;
+                tiles: AudioState.role-tiles[root.role];
+                selected: AudioState.role-tile[root.role];
+                picked(i) => {
+                    AudioState.sound-picked(i);
+                }
+            }
+            // All the room the window leaves, so the page itself does not scroll at 720x520: the
+            // tiles scroll inside the grid, a row may show cut. Under banners not even half a row
+            // fits and the page scrolls: then the grid shows every row, so only one thing scrolls
+            // (UI rule 26).
+            gallery := CardGrid {
+                accessible-label: @tr("Sounds");
+                first: 2;
+                property <length> room: root.free-height - tabs.preferred-height - events.height - sound-card.preferred-height - top.height - Theme.space-4 - 2 * Theme.space-3 - Theme.tile-gap;
+                height: self.room < self.min-height / 2 ? self.full-height : min(self.room, self.full-height);
+                tiles: AudioState.role-tiles[root.role];
+                selected: AudioState.role-tile[root.role];
+                picked(i) => {
+                    AudioState.sound-picked(i);
+                }
             }
         }
     }

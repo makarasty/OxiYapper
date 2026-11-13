@@ -113,6 +113,15 @@ export global TextState {
     // `found` filtered by `popup-query`, the apps popup's grid.
     in property <[GalleryTile]> grid;
     in-out property <string> popup-query;
+    // The popup's filters beside its search, applied by `pages::text`: the kind (0 all, 1 apps, 2
+    // games), the source (an index into `source-names`, 0 all) and the order (0 by name, 1 biggest first).
+    in-out property <int> popup-type;
+    in-out property <int> popup-source;
+    in-out property <int> popup-sort;
+    // "All sources", then every source the last scan found something from.
+    in property <[string]> source-names;
+    // The glyph of the popup's first tile, which opens the file dialog for an .exe.
+    out property <image> browse-icon: Icons.browse-file;
     // The rule a duplicate pick points at, for 600 ms: its row shows the accent tint and scrolls into view.
     in property <string> flash-app;
     // A scan runs on a worker; `scanned` once one has finished in this window.
@@ -158,6 +167,8 @@ export global TextState {
     // A tile of the popup: its app gets a rule, or loses it. The exe, not the index: the grid is filtered.
     callback found-toggled(string);
     callback scan();
+    // An .exe picked in a file dialog gets a rule.
+    callback browse-exe();
 }
 
 // An editor for one text file on its card: the text and one status line that never grows: an "i"
@@ -332,6 +343,41 @@ component AppsPopup inherits PopupWindow {
                             accessible-label: @tr("Search apps");
                         }
                     }
+                    // The filters: what kind, from where, in which order. Each change draws the grid again.
+                    Segmented {
+                        horizontal-stretch: 0;
+                        accessible-label: @tr("Show");
+                        items: [@tr("All"), @tr("Apps"), @tr("Games")];
+                        tips: [@tr("Apps and games"), @tr("Apps, no games"), @tr("Games from Steam, Battle.net, Epic, GOG and game folders")];
+                        selected: TextState.popup-type;
+                        picked(i) => {
+                            TextState.popup-type = i;
+                            TextState.popup-search(TextState.popup-query);
+                        }
+                    }
+                    Combo {
+                        min-width: Theme.rule-mode-width;
+                        max-width: Theme.rule-mode-width;
+                        horizontal-stretch: 0;
+                        model: TextState.source-names;
+                        current-index: TextState.popup-source;
+                        accessible-label: @tr("Source");
+                        selected => {
+                            TextState.popup-source = self.current-index;
+                            TextState.popup-search(TextState.popup-query);
+                        }
+                    }
+                    Segmented {
+                        horizontal-stretch: 0;
+                        accessible-label: @tr("Order");
+                        items: [@tr("Name"), @tr("Size")];
+                        tips: [@tr("Sort by name"), @tr("Biggest on disk first; apps whose size is not known come last")];
+                        selected: TextState.popup-sort;
+                        picked(i) => {
+                            TextState.popup-sort = i;
+                            TextState.popup-search(TextState.popup-query);
+                        }
+                    }
                     IconButton {
                         icon: Icons.close;
                         label: @tr("Close");
@@ -360,7 +406,12 @@ component AppsPopup inherits PopupWindow {
                         tiles: TextState.grid;
                         fallback-icon: Icons.app-generic;
                         picked(i) => {
-                            TextState.found-toggled(TextState.grid[i].caption);
+                            // The first tile, the one with no exe, opens the file dialog.
+                            if (TextState.grid[i].caption == "") {
+                                TextState.browse-exe();
+                            } else {
+                                TextState.found-toggled(TextState.grid[i].caption);
+                            }
                         }
                     }
                     if TextState.grid.length == 0: EmptyState {
@@ -372,6 +423,15 @@ component AppsPopup inherits PopupWindow {
                             enabled: !Shell.locked;
                             clicked => {
                                 TextState.scan();
+                            }
+                        }
+                        // With no tile to hold it, the file dialog is a button here.
+                        Button {
+                            text: @tr("Choose an .exe file");
+                            icon: Icons.browse-file;
+                            enabled: !Shell.locked;
+                            clicked => {
+                                TextState.browse-exe();
                             }
                         }
                     }
@@ -446,6 +506,10 @@ export component TextPage inherits VerticalLayout {
     }
     function open-apps() {
         TextState.popup-query = "";
+        TextState.popup-type = 0;
+        TextState.popup-source = 0;
+        TextState.popup-sort = 0;
+        TextState.popup-search("");
         apps.show();
     }
     alignment: start;
@@ -755,7 +819,7 @@ export component TextPage inherits VerticalLayout {
                             info: @tr("Each dictation is added to a file of the day, YYYY-MM-DD, in the folder. With Write only nothing is pasted. Without a folder nothing is written.");
                             Combo {
                                 model: [@tr("Off"), @tr("Paste and write"), @tr("Write only")];
-                                current-index: TextState.file-mode;
+                                current-index <=> TextState.file-mode;
                                 accessible-label: @tr("Also write to a file");
                                 selected => {
                                     TextState.file-mode-picked(self.current-index);
@@ -766,28 +830,35 @@ export component TextPage inherits VerticalLayout {
                         // The format beside the folder: one row less, so the rules card keeps its room.
                         Row {
                             title: @tr("Folder");
-                            // Greyed while no file is written, as Processing greys the rows under an Off switch.
-                            enabled: TextState.file-mode != 0;
-                            off-tip: @tr("Turn on writing to a file first");
                             info: TextState.file-folder == "" ? @tr("Choose the folder the files go to. Markdown adds a list line, - 09:05 text; Text adds 09:05  text.") : TextState.file-folder;
                             HorizontalLayout {
                                 alignment: end;
                                 spacing: Theme.control-gap;
-                                Segmented {
+                                // Off: the row offers the one thing to do, as a button, instead of controls that
+                                // are greyed with their reason in a tooltip nobody sees. Same row, same height.
+                                if TextState.file-mode == 0: Button {
+                                    text: @tr("Turn on file writing");
+                                    enabled: !Shell.locked;
+                                    tooltip: Shell.locked ? Shell.locked-tip : @tr("Write each dictation to a file as well as pasting it");
+                                    clicked => {
+                                        TextState.file-mode = 1;
+                                        TextState.file-mode-picked(1);
+                                    }
+                                }
+                                if TextState.file-mode != 0: Segmented {
                                     accessible-label: @tr("File format");
                                     items: [".md", ".txt"];
                                     spoken: [@tr("Markdown"), @tr("Text")];
                                     tips: [@tr("Markdown: a list line, - 09:05 text"), @tr("Text: 09:05  text")];
                                     selected: TextState.file-format;
-                                    enabled: TextState.file-mode != 0;
                                     picked(i) => {
                                         TextState.file-format-picked(i);
                                     }
                                 }
-                                Button {
+                                if TextState.file-mode != 0: Button {
                                     text: TextState.file-folder-name == "" ? @tr("Choose folder") : TextState.file-folder-name;
                                     icon: Icons.browse-folder;
-                                    enabled: !Shell.locked && TextState.file-mode != 0;
+                                    enabled: !Shell.locked;
                                     tooltip: Shell.locked-tip;
                                     clicked => {
                                         TextState.file-folder-choose();
@@ -851,6 +922,16 @@ export component TextPage inherits VerticalLayout {
                             enabled: !Shell.locked;
                             clicked => {
                                 root.open-apps();
+                            }
+                        }
+                        // An app on a stick or in a folder no scan reaches: pick its .exe yourself.
+                        IconButton {
+                            icon: Icons.browse-file;
+                            label: @tr("Choose an .exe file");
+                            tooltip: Shell.locked ? Shell.locked-tip : @tr("Choose an .exe file");
+                            enabled: !Shell.locked;
+                            clicked => {
+                                TextState.browse-exe();
                             }
                         }
                         VerticalLayout {

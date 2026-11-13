@@ -224,24 +224,15 @@ fn locked_config_disables_the_controls() {
     off("Trim silence", AccessibleRole::Switch);
     // The sub-tabs still work; only the settings are locked.
     tab(&window, "Sounds");
-    let picker = with_role(&window, "Sound for", AccessibleRole::Combobox);
-    assert_eq!(picker.accessible_enabled(), Some(true), "the sound picker");
-    // A real click opens the list, Down and Enter take Stop: the view follows, nothing is saved.
-    picker.mock_single_click(PointerEventButton::Left);
-    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(350));
-    for key in [Key::DownArrow, Key::Return] {
-        window
-            .window()
-            .dispatch_event(WindowEvent::KeyPressed { text: key.into() });
-        window
-            .window()
-            .dispatch_event(WindowEvent::KeyReleased { text: key.into() });
-    }
+    let stop = with_role(&window, "Stop", AccessibleRole::RadioButton);
+    assert_eq!(stop.accessible_enabled(), Some(true), "the sound cards");
+    // A real click on the Stop card: the view follows, nothing is saved.
+    stop.mock_single_click(PointerEventButton::Left);
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(350));
     assert_eq!(
         window.global::<AudioState>().get_view(),
         3,
-        "the Combo moved off Start"
+        "the card did not move off Start"
     );
     off("Hit 4", AccessibleRole::RadioButton);
     assert_eq!(fs::read_to_string(l.config_file()).unwrap(), original);
@@ -296,7 +287,6 @@ fn control_columns_start_at_one_x_at_the_minimum_width() {
     same("Max length", AccessibleRole::Slider);
     sounds(&window, 1);
     same("Volume", AccessibleRole::Slider);
-    same("Sound for", AccessibleRole::Combobox);
 }
 
 /// The level track starts under the Device select and the Test button beside it ends where the
@@ -455,11 +445,11 @@ fn picking_a_built_in_saves_it_and_plays_it() {
     with_role(&window, "Hit 5", AccessibleRole::RadioButton).invoke_accessible_default_action();
     assert_eq!(saved(&l).sounds.stop, "apa-hit-5");
     assert_eq!(saved(&l).sounds.start, "apa-hit-4");
-    // The sound picker follows a view set from outside (the status chip opens the stop sound).
-    let picker = || with_role(&window, "Sound for", AccessibleRole::Combobox);
-    assert_eq!(picker().accessible_value().as_deref(), Some("Stop"));
+    // The event cards follow a view set from outside (the status chip opens the stop sound).
+    assert_eq!(checked(&window, "Stop"), Some(true));
     sounds(&window, 4);
-    assert_eq!(picker().accessible_value().as_deref(), Some("Error"));
+    assert_eq!(checked(&window, "Error"), Some(true));
+    assert_eq!(checked(&window, "Stop"), Some(false));
 }
 
 /// The cards read as words, the file name stays as the id in the tooltip, and "Default" marks the
@@ -527,13 +517,23 @@ fn own_file_shows_on_its_tile() {
     let window = open(&l, Page::Audio);
     sounds(&window, 0);
     assert_eq!(checked(&window, "Own file"), Some(true));
+    let own = window
+        .global::<AudioState>()
+        .get_role_tiles()
+        .row_data(0)
+        .unwrap();
+    assert_eq!(own.row_data(1).unwrap().caption, "my start.wav");
     let tile = with_role(&window, "Own file", AccessibleRole::RadioButton);
     assert_eq!(
         tile.accessible_description().as_deref(),
         Some(r"C:\Sounds\my start.wav")
     );
     sounds(&window, 1);
-    assert_eq!(checked(&window, "Own file"), Some(false));
+    assert_eq!(
+        checked(&window, "Own file"),
+        Some(false),
+        "the other sound has none"
+    );
 }
 
 /// The volume is a percent on the page and a fraction in the file.
@@ -646,4 +646,29 @@ fn sound_tabs_never_scroll_inside_a_scroll() {
             }
         }
     }
+}
+
+/// Hold items 19 and 20: the events are five cards in one row, and Off and Own file are a row of
+/// their own above the rest of the gallery.
+#[test]
+fn events_are_cards_and_off_and_own_file_are_the_first_row() {
+    let l = layout("first-row", None);
+    let window = open(&l, Page::Audio);
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(1280.0, 860.0));
+    sounds(&window, 0);
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    let y = |label: &str| {
+        with_role(&window, label, AccessibleRole::RadioButton)
+            .absolute_position()
+            .y
+    };
+    for event in ["Stop", "Text ready", "Cancel", "Error"] {
+        assert_eq!(y(event), y("Start"), "{event} is on the row of the cards");
+    }
+    assert_eq!(y("Off"), y("Own file"), "one row");
+    assert!(y("Off") > y("Start"), "below the event cards");
+    assert!(y("Hit 2") > y("Off"), "the gallery is below the first row");
+    assert_eq!(checked(&window, "Start"), Some(true));
 }

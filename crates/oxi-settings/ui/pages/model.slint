@@ -3,7 +3,7 @@
 // it: its state on disk and what can be done now (download, resume, cancel, use, delete), or the
 // path of "use my own .bin". Settings: the GPU, the unload, the models folder and its partial
 // downloads. Advanced: what the engine does on its own.
-import { Theme, Shell, Icons, CapText, Group, Card, Row, Divider, Caption, Combo, Segmented, TextField, NumberField, Button, ButtonKind, IconButton, InfoTip, PathField, ProgressBar, WarningSlot, SubTabs, SubTabPane, CardGrid, GalleryTile } from "../theme/index.slint";
+import { Theme, Shell, Icons, CapText, Group, Card, Row, Divider, Caption, IconLabel, Combo, Segmented, TextField, NumberField, Button, ButtonKind, IconButton, InfoTip, PathField, ProgressBar, WarningSlot, SubTabs, SubTabPane, CardGrid, GalleryTile } from "../theme/index.slint";
 import { SearchPopup } from "../theme/components/search_popup.slint";
 
 export struct ModelRow {
@@ -36,6 +36,12 @@ export struct ModelRow {
     can-delete: bool,
     // What a delete frees: "3.1 GB".
     frees: string,
+    // The card's "i": what the model is for, the memory it needs, why it is recommended.
+    info: string,
+    // Why Download is off on a drive too full for the model (also the card's "!"); empty when it fits.
+    disk-off: string,
+    // `models::recommend` picked it for this PC and language: the tile's caption says so.
+    recommended: bool,
 }
 
 // Filled and read by `pages::model`.
@@ -57,9 +63,17 @@ export global ModelState {
     in property <bool> can-browse;
     // Why "Delete partial downloads" is off; empty while it is on.
     in property <string> partials-off;
-    // Its tooltip while on: "0.4 GB in 1 file".
+    // The Partial downloads row's caption: "120 MB in 2 files", "None".
     in property <string> partials;
-    // "Auto", "CPU", then the GPUs the daemon lists.
+    // The models folder's line, on the Files row and the Models tab header: "4.7 GB in 2 models ·
+    // 120.3 GB free", "Measuring" until the worker answers, a short error if it cannot read it.
+    in property <string> folder-size;
+    // Why the models folder cannot be read, the Files row's "!"; empty while it can.
+    in property <string> folder-error;
+    // Where the models run, for the card's status line: "runs on <graphics card>"; empty until
+    // the daemon lists its GPUs.
+    in property <string> runs-on;
+    // "Auto (best available)", "Processor (CPU)", then the graphics cards the daemon lists.
     in property <[string]> gpus;
     in-out property <int> gpu;
     // "Right away", the minutes, "Never".
@@ -91,6 +105,8 @@ export global ModelState {
     callback language-search(string);
     callback language-chosen(int);
     callback shown();
+    // The models folder measure answered (the worker wakes the event loop with it).
+    callback measured();
     // Use: the model of `rows` (or `rows.length`, the own file) becomes the one in use.
     callback picked(int);
     callback download(int);
@@ -109,28 +125,33 @@ export global ModelState {
     // (language, model) of the by-language row; model 0 is Default, which removes the language.
     callback by-language-picked(int, int);
     // Advanced: per parameter (0 threads, 1 flash attention, 2 decoding, 3 temperature, 4 retry,
-    // 5 silence, 6 confidence, 7 repetition, 8 non-speech) its choice (0 is Auto)
-    // and its number.
+    // 5 silence, 6 confidence, 7 repetition, 8 non-speech) its choice (0 is Auto; a number's
+    // choices then name values, Custom last) and its number (what the choice gives).
     in property <[int]> adv-mode;
     in property <[float]> adv-value;
     in property <string> adv-prompt;
+    // The prompt select: 0 your dictionary, 1 none, 2 your own text (`adv-prompt`).
+    in property <int> adv-prompt-source;
     // The device `Auto` is judged for: a GPU is loaded (or would be picked), not the processor.
     in property <bool> adv-gpu;
     // (parameter, choice, number); parameter 9 is the number beside Decoding.
     callback adv-changed(int, int, float);
     callback adv-prompt-edited(string);
+    callback adv-prompt-source-picked(int);
     callback adv-reset();
 }
 
 // One engine parameter's control: a choice whose first entry is Auto, and for a number the field
-// beside it (off while the choice is Auto, then showing what Auto gives). The page pushes the
-// values; what the person picks is sent up and pushed back.
+// beside it: a quiet inset showing what the choice gives (Auto or a named value), an editable
+// field on Custom. The page pushes the values; what the person picks is sent up and pushed back.
 component AdvControl inherits HorizontalLayout {
     in property <int> index;
     in property <[string]> choices;
     in property <string> label;
     // A number beside the choice; `number-index` is the parameter it reports as.
     in property <bool> number;
+    // The first choice whose number is typed: Custom, the last choice (Decoding: from Fast on).
+    in property <int> editable-from: root.choices.length - 1;
     in property <int> number-index: root.index;
     in property <float> minimum;
     in property <float> maximum: 1;
@@ -163,15 +184,15 @@ component AdvControl inherits HorizontalLayout {
     if !root.number: Rectangle {
         width: Theme.control-side;
     }
-    // Auto is not a broken box: what Auto gives now, in a quiet inset instead of a greyed field.
-    if root.number && root.shown-mode == 0: Rectangle {
+    // Auto is not a broken box: what the choice gives now, in a quiet inset instead of a greyed field.
+    if root.number && root.shown-mode < root.editable-from: Rectangle {
         width: Theme.control-side;
         height: Theme.control-height;
         y: (parent.height - self.height) / 2;
         background: Theme.bg-inset;
         border-radius: Theme.radius-control;
         accessible-role: text;
-        accessible-label: @tr("Auto uses {}", root.shown-value.to-fixed(root.decimals));
+        accessible-label: @tr("{} now", root.shown-value.to-fixed(root.decimals));
         Text {
             text: root.shown-value.to-fixed(root.decimals);
             font-size: Theme.body-size;
@@ -180,7 +201,7 @@ component AdvControl inherits HorizontalLayout {
             vertical-alignment: center;
         }
     }
-    if root.number && root.shown-mode > 0: NumberField {
+    if root.number && root.shown-mode >= root.editable-from: NumberField {
         value <=> root.shown-value;
         width: Theme.control-side;
         minimum: root.minimum;
@@ -193,18 +214,23 @@ component AdvControl inherits HorizontalLayout {
     }
 }
 
-// The curated model under the gallery's check: name and size (or the download's bar), its "!", and
-// two action slots, get (Download, Resume, Cancel, Use) and remove (Delete), each one width.
-// Delete asks first, in place of the line.
+// The curated model under the gallery's check: its name with an "i" (what it is for, the memory it
+// needs), its state and where it runs (or the download's bar), its "!", and two action slots, get
+// (Download, Resume, Cancel, Use) and remove (Delete), each one width. Delete asks first, in place
+// of the line.
 component ModelCard inherits VerticalLayout {
     in property <ModelRow> data;
     in property <int> index;
     property <bool> in-use: ModelState.selected == root.index;
     property <string> missing: root.in-use && root.data.can-download && !root.data.downloading ? @tr("Dictation will not start until this is downloaded.") : "";
     property <string> slow: root.data.heavy ? @tr("Likely slow without a dedicated graphics card. Whisper large-v3 turbo is faster.") : "";
-    property <string> first: root.data.error != "" ? root.data.error : root.missing;
-    property <string> second: root.data.error != "" && root.missing != "" ? root.missing : root.slow;
+    property <string> disk: root.data.can-download && !root.data.downloading ? root.data.disk-off : "";
+    property <string> first: root.data.error != "" && root.missing != "" ? root.data.error + "\n" + root.missing : root.data.error + root.missing;
+    property <string> second: root.disk != "" && root.slow != "" ? root.disk + "\n" + root.slow : root.disk + root.slow;
     property <string> notice: root.first != "" && root.second != "" ? root.first + "\n" + root.second : root.first + root.second;
+    // The state, what the tile does not say (paused: how much is there; damaged: what to do) and
+    // where it runs, on one caption line.
+    property <string> state-line: root.data.badge + (root.data.detail != "" ? " · " + root.data.detail : "") + (ModelState.runs-on != "" ? " · " + ModelState.runs-on : "");
     // The model a dictation loads is not deleted from under it: another one is put in use first.
     property <string> delete-tip: ModelState.delete-off != "" ? ModelState.delete-off : root.in-use && root.data.ready ? @tr("In use. Use another model first to delete this one.") : "";
     property <bool> confirming;
@@ -253,16 +279,25 @@ component ModelCard inherits VerticalLayout {
                         min-height: Theme.body-line + Theme.title-gap + Theme.caption-line;
                         alignment: center;
                         spacing: Theme.title-gap;
-                        // The tile above already says which model and its facts: the card says
-                        // where it stands (its name is for a screen reader).
-                        CapText {
-                            text: root.data.badge;
-                            spoken: @tr("{}: {}", root.data.name, root.data.badge);
-                            overflow: elide;
+                        // The name again (hold 35: "Ready" alone said little); the facts stay on
+                        // the tile, the card says what it is for, where it stands and runs.
+                        HorizontalLayout {
+                            alignment: start;
+                            spacing: Theme.pair-gap;
+                            CapText {
+                                text: root.data.name;
+                                overflow: elide;
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                InfoTip {
+                                    text: root.data.info;
+                                }
+                            }
                         }
-                        // What the tile does not say (paused: how much is there; damaged: what to do).
-                        if root.data.detail != "": CapText {
-                            text: root.data.detail;
+                        CapText {
+                            text: root.state-line;
+                            spoken: @tr("{}: {}", root.data.name, root.state-line);
                             font-size: Theme.caption-size;
                             ink: Theme.text-secondary;
                             overflow: elide;
@@ -310,8 +345,8 @@ component ModelCard inherits VerticalLayout {
                             get := Button {
                                 text: root.data.paused ? @tr("Resume") : @tr("Download");
                                 icon: Icons.download;
-                                enabled: ModelState.download-off == "";
-                                tooltip: ModelState.download-off;
+                                enabled: ModelState.download-off == "" && root.data.disk-off == "";
+                                tooltip: ModelState.download-off != "" ? ModelState.download-off : root.data.disk-off;
                                 accessible-label: root.data.paused ? @tr("Resume {}", root.data.name) : @tr("Download {}", root.data.name);
                                 clicked => {
                                     ModelState.download(root.index);
@@ -518,6 +553,10 @@ export component ModelPage inherits VerticalLayout {
     spacing: Theme.header-bottom;
     // The popup reports its own `is-open` only to the component that holds it; open, it dims the window.
     property <bool> languages-open: all-languages.is-open;
+    // What the Models tab spends outside the gallery at most (the window's top, the tabs, the
+    // language card, the group title, the taller own-file card, the bottom margin), measured by
+    // `the_models_tab_never_scrolls_and_the_gallery_takes_the_room`.
+    property <length> gallery-chrome: 300px;
     changed languages-open => {
         Shell.modal(root.languages-open);
     }
@@ -595,11 +634,33 @@ export component ModelPage inherits VerticalLayout {
                     }
                 }
                 Group {
-                    title: @tr("Models");
-                    // On the page, not in a card: a tile is a card (UI rule 10). Four tiles take
-                    // two rows at the least window width, so the grid is as tall as its rows.
+                    // The header of every Group, with what the downloaded models take at its end
+                    // (hold 42: on both tabs).
+                    HorizontalLayout {
+                        padding-bottom: Theme.header-gap - Theme.card-gap;
+                        IconLabel {
+                            text: @tr("Models");
+                            font-weight: Theme.weight-strong;
+                        }
+                        Rectangle {
+                            horizontal-stretch: 1;
+                        }
+                        Caption {
+                            text: ModelState.folder-size;
+                            vertical-alignment: center;
+                        }
+                    }
+                    // On the page, not in a card: a tile is a card (UI rule 10). It shows the rows
+                    // the window has room for under the rest of the page, at least two, and
+                    // scrolls the others inside itself, so the page does not (UI rules 25, 26).
                     CardGrid {
-                        height: self.full-height;
+                        property <length> row-room: Theme.tile-height + Theme.tile-gap;
+                        property <length> room: Shell.window-height - root.gallery-chrome;
+                        // Less the gap after the last row: the next row must not peek in under the grid.
+                        height: min(self.full-height, max(2, floor(self.room / self.row-room)) * self.row-room) - Theme.tile-gap;
+                        // Wider than the token's least cell, so a name and its facts fit beside
+                        // the badge: four to a row at 1280, three at the least window.
+                        min-cell: 200px;
                         accessible-label: @tr("Models");
                         tiles: ModelState.tiles;
                         selected: ModelState.viewed;
@@ -629,14 +690,15 @@ export component ModelPage inherits VerticalLayout {
                     Card {
                         Row {
                             icon: Icons.desktop;
-                            title: @tr("GPU");
+                            title: @tr("Run on");
+                            info: @tr("Where the model does its work. Auto picks the graphics card when there is one, else the processor. A graphics card is much faster; the processor works everywhere.");
                             warning: ModelState.warning;
                             fill-controls: true;
                             full-text: ModelState.gpus[ModelState.gpu];
                             Combo {
                                 model: ModelState.gpus;
                                 current-index <=> ModelState.gpu;
-                                accessible-label: @tr("GPU");
+                                accessible-label: @tr("Run on");
                                 selected => {
                                     ModelState.gpu-picked(self.current-index);
                                 }
@@ -646,7 +708,7 @@ export component ModelPage inherits VerticalLayout {
                         Row {
                             icon: Icons.timer;
                             title: @tr("Unload after idle");
-                            info: @tr("Frees the memory while you are not dictating.");
+                            info: @tr("Takes the model out of memory while you are not dictating. The next dictation then starts a little slower.");
                             fill-controls: true;
                             Combo {
                                 model: ModelState.unload-options;
@@ -698,7 +760,9 @@ export component ModelPage inherits VerticalLayout {
                         Row {
                             icon: Icons.models-folder;
                             title: @tr("Models folder");
-                            info: @tr("Where the downloaded models are kept.");
+                            info: @tr("Where the downloaded models are kept. The size counts the finished models; the free space is that of its drive.");
+                            description: ModelState.folder-size;
+                            warning: ModelState.folder-error;
                             // The look of every open-folder button (System, Home): subtle, folder glyph.
                             Button {
                                 text: @tr("Open");
@@ -715,13 +779,14 @@ export component ModelPage inherits VerticalLayout {
                             icon: Icons.partial-downloads;
                             title: @tr("Partial downloads");
                             info: @tr("Unfinished downloads, kept so they can resume.");
+                            description: ModelState.partials;
                             Button {
                                 text: @tr("Delete");
                                 icon: Icons.delete;
                                 accessible-label: @tr("Delete partial downloads");
                                 kind: ButtonKind.danger;
                                 enabled: ModelState.partials-off == "";
-                                tooltip: ModelState.partials-off != "" ? ModelState.partials-off : ModelState.partials;
+                                tooltip: ModelState.partials-off;
                                 clicked => {
                                     ModelState.delete-partials();
                                 }
@@ -737,10 +802,10 @@ export component ModelPage inherits VerticalLayout {
                 alignment: start;
                 spacing: Theme.group-gap;
                 Group {
-                    title: @tr("Decoding");
-                    info: @tr("Expert settings. Auto means the app decides: the grey value is what it uses now.");
+                    title: @tr("Recognition");
+                    info: @tr("For experts. Auto means the app decides: the grey value is what it uses now.");
                     action-text: @tr("Reset all to Auto");
-                    action-tip: @tr("Every setting here back to Auto, the prompt cleared.");
+                    action-tip: @tr("Every setting here back to Auto, the hint cleared.");
                     action-enabled: !Shell.locked;
                     action => {
                         ModelState.adv-reset();
@@ -748,13 +813,13 @@ export component ModelPage inherits VerticalLayout {
                     Card {
                         Row {
                             icon: Icons.threads;
-                            title: @tr("Processor threads");
-                            info: ModelState.adv-gpu ? @tr("Auto: 4 now, a GPU does the heavy work. On the processor alone: half its threads, at most 8.") : @tr("Auto: half the processor's threads, at most 8, now. With a GPU: 4.");
+                            title: @tr("Processor use");
+                            info: ModelState.adv-gpu ? @tr("How many processor threads transcription may use. Auto: 4 now, a graphics card does the heavy work. Max: all of them, the fastest, other programs may slow down. Half: half of them.") : @tr("How many processor threads transcription may use. Auto: half of them, at most 8, now. Max: all of them, the fastest, other programs may slow down. Half: half of them.");
                             fill-controls: true;
                             AdvControl {
                                 index: 0;
-                                label: @tr("Processor threads");
-                                choices: [@tr("Auto"), @tr("Custom")];
+                                label: @tr("Processor use");
+                                choices: [@tr("Auto"), @tr("Max"), @tr("Half"), @tr("Custom")];
                                 number: true;
                                 minimum: 1;
                                 maximum: 32;
@@ -763,26 +828,27 @@ export component ModelPage inherits VerticalLayout {
                         Divider { }
                         Row {
                             icon: Icons.flash-attention;
-                            title: @tr("Flash attention");
-                            info: ModelState.adv-gpu ? @tr("Auto: on now, a GPU is in use. Off on the processor. Changing what runs loads the model again for the next dictation.") : @tr("Auto: off now, the processor is in use. On with a GPU that supports it. Changing what runs loads the model again for the next dictation.");
+                            title: @tr("Speed boost");
+                            info: ModelState.adv-gpu ? @tr("A quicker way to compute (flash attention). Auto: on now, a graphics card is in use. Changing it loads the model again for the next dictation.") : @tr("A quicker way to compute (flash attention). Auto: off now, the processor is in use. On with a graphics card that supports it. Changing it loads the model again for the next dictation.");
                             fill-controls: true;
                             AdvControl {
                                 index: 1;
-                                label: @tr("Flash attention");
+                                label: @tr("Speed boost");
                                 choices: [@tr("Auto"), @tr("On"), @tr("Off")];
                             }
                         }
                         Divider { }
                         Row {
                             icon: Icons.code;
-                            title: @tr("Decoding");
-                            info: @tr("Auto: greedy, the fastest. Beam search is slower and can be more accurate. The number is how many candidates are kept: best-of for greedy, the beam width for beam.");
+                            title: @tr("Speed or accuracy");
+                            info: @tr("Auto: Fast, the quickest. Accurate is slower and can be more accurate. The number is how many wordings are compared before one is picked.");
                             fill-controls: true;
                             AdvControl {
                                 index: 2;
-                                label: @tr("Decoding");
-                                choices: [@tr("Auto"), @tr("Greedy"), @tr("Beam")];
+                                label: @tr("Speed or accuracy");
+                                choices: [@tr("Auto"), @tr("Fast"), @tr("Accurate")];
                                 number: true;
+                                editable-from: 1;
                                 number-index: 9;
                                 minimum: 1;
                                 maximum: 8;
@@ -791,13 +857,13 @@ export component ModelPage inherits VerticalLayout {
                         Divider { }
                         Row {
                             icon: Icons.temperature;
-                            title: @tr("Temperature");
-                            info: @tr("Auto: 0, the most predictable words. Higher values vary them.");
+                            title: @tr("Word variety");
+                            info: @tr("Auto: 0, the most predictable words. Varied and Very varied let Whisper try less likely words.");
                             fill-controls: true;
                             AdvControl {
                                 index: 3;
-                                label: @tr("Temperature");
-                                choices: [@tr("Auto"), @tr("Custom")];
+                                label: @tr("Word variety");
+                                choices: [@tr("Auto"), @tr("Varied"), @tr("Very varied"), @tr("Custom")];
                                 number: true;
                                 maximum: 1;
                                 step: 0.1;
@@ -808,7 +874,7 @@ export component ModelPage inherits VerticalLayout {
                         Row {
                             icon: Icons.retry-doubtful;
                             title: @tr("Retry doubtful segments");
-                            info: @tr("Auto: on. A segment Whisper doubts is tried again at a higher temperature.");
+                            info: @tr("Auto: on. A phrase Whisper doubts is tried again with a little more variety.");
                             fill-controls: true;
                             AdvControl {
                                 index: 4;
@@ -823,25 +889,50 @@ export component ModelPage inherits VerticalLayout {
                     Card {
                         Row {
                             icon: Icons.book-letter;
-                            title: @tr("Prompt");
-                            info: @tr("Text Whisper reads first, to set the style or the spelling. Your dictionary follows it. Empty: the dictionary alone.");
+                            title: @tr("Hint for the model");
+                            info: @tr("Words or a sentence Whisper reads before it listens, to set the style or the spelling. Your dictionary: its words alone. Custom: your text, then your dictionary.");
                             fill-controls: true;
-                            TextField {
-                                text: ModelState.adv-prompt;
-                                placeholder-text: @tr("Auto: your dictionary");
-                                accessible-label: @tr("Prompt");
-                                // Typing ends the binding: a prompt pushed from outside (Reset all) still reaches the field.
-                                property <string> pushed: ModelState.adv-prompt;
+                            // The select and the text field take the same place and size, so
+                            // nothing around them moves; the arrow goes back to the select.
+                            if ModelState.adv-prompt-source != 2: Combo {
+                                model: [@tr("Your dictionary (auto)"), @tr("None"), @tr("Custom")];
+                                current-index: ModelState.adv-prompt-source;
+                                accessible-label: @tr("Hint for the model");
+                                // A pick ends the binding above: a source pushed from outside (Reset all) still reaches the select.
+                                property <int> pushed: ModelState.adv-prompt-source;
                                 changed pushed => {
-                                    self.text = self.pushed;
+                                    self.current-index = self.pushed;
                                 }
-                                // Saved when the person is done, not on every key.
-                                accepted(text) => {
-                                    ModelState.adv-prompt-edited(text);
+                                selected => {
+                                    ModelState.adv-prompt-source-picked(self.current-index);
                                 }
-                                changed has-focus => {
-                                    if !self.has-focus {
-                                        ModelState.adv-prompt-edited(self.text);
+                            }
+                            if ModelState.adv-prompt-source == 2: HorizontalLayout {
+                                spacing: Theme.control-gap;
+                                TextField {
+                                    text: ModelState.adv-prompt;
+                                    placeholder-text: @tr("Your own text");
+                                    accessible-label: @tr("Hint for the model");
+                                    // Typing ends the binding: a prompt pushed from outside (Reset all) still reaches the field.
+                                    property <string> pushed: ModelState.adv-prompt;
+                                    changed pushed => {
+                                        self.text = self.pushed;
+                                    }
+                                    // Saved when the person is done, not on every key.
+                                    accepted(text) => {
+                                        ModelState.adv-prompt-edited(text);
+                                    }
+                                    changed has-focus => {
+                                        if !self.has-focus {
+                                            ModelState.adv-prompt-edited(self.text);
+                                        }
+                                    }
+                                }
+                                IconButton {
+                                    icon: Icons.revert;
+                                    label: @tr("Choose from the list");
+                                    clicked => {
+                                        ModelState.adv-prompt-source-picked(0);
                                     }
                                 }
                             }
@@ -849,13 +940,13 @@ export component ModelPage inherits VerticalLayout {
                         Divider { }
                         Row {
                             icon: Icons.silence-threshold;
-                            title: @tr("Silence threshold");
-                            info: @tr("Auto: 0.6. A segment more likely to be silence than this is dropped.");
+                            title: @tr("Silence cut-off");
+                            info: @tr("Auto: 0.6. A phrase more likely to be silence than this is dropped. Keep more drops only near-certain silence, Cut more drops doubtful quiet too.");
                             fill-controls: true;
                             AdvControl {
                                 index: 5;
-                                label: @tr("Silence threshold");
-                                choices: [@tr("Auto"), @tr("Custom")];
+                                label: @tr("Silence cut-off");
+                                choices: [@tr("Auto"), @tr("Keep more"), @tr("Cut more"), @tr("Custom")];
                                 number: true;
                                 maximum: 1;
                                 step: 0.05;
@@ -865,13 +956,13 @@ export component ModelPage inherits VerticalLayout {
                         Divider { }
                         Row {
                             icon: Icons.confidence;
-                            title: @tr("Confidence threshold");
-                            info: @tr("Auto: -1.0. A segment Whisper is less sure of than this is tried again.");
+                            title: @tr("Doubt check");
+                            info: @tr("Auto: -1.0. A phrase Whisper is less sure of than this is tried again. Stricter retries more phrases, Looser fewer.");
                             fill-controls: true;
                             AdvControl {
                                 index: 6;
-                                label: @tr("Confidence threshold");
-                                choices: [@tr("Auto"), @tr("Custom")];
+                                label: @tr("Doubt check");
+                                choices: [@tr("Auto"), @tr("Stricter"), @tr("Looser"), @tr("Custom")];
                                 number: true;
                                 minimum: -5;
                                 maximum: 0;
@@ -882,13 +973,13 @@ export component ModelPage inherits VerticalLayout {
                         Divider { }
                         Row {
                             icon: Icons.repetition;
-                            title: @tr("Repetition threshold");
-                            info: @tr("Auto: 2.4. A segment that repeats itself more than this is tried again.");
+                            title: @tr("Repeat check");
+                            info: @tr("Auto: 2.4. A phrase that repeats itself more than this is tried again. Stricter retries sooner, Looser later.");
                             fill-controls: true;
                             AdvControl {
                                 index: 7;
-                                label: @tr("Repetition threshold");
-                                choices: [@tr("Auto"), @tr("Custom")];
+                                label: @tr("Repeat check");
+                                choices: [@tr("Auto"), @tr("Stricter"), @tr("Looser"), @tr("Custom")];
                                 number: true;
                                 maximum: 10;
                                 step: 0.1;

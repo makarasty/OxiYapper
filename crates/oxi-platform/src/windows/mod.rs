@@ -6,6 +6,7 @@ pub mod foreground;
 pub mod hook;
 pub mod input;
 pub mod keys;
+pub mod launchers;
 pub mod overlay;
 pub mod pipe;
 pub mod shortcuts;

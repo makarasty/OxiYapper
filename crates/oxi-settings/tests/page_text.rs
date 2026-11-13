@@ -13,7 +13,7 @@ use oxi_core::dictionary::{BUDGET, build_prompt};
 use oxi_core::paths::Layout;
 use oxi_settings::{AppWindow, Page, TextState};
 use slint::ComponentHandle;
-use slint::platform::{Key, WindowEvent};
+use slint::platform::{Key, PointerEventButton, WindowEvent};
 
 /// The Text page in a window tall enough for all of it: the element search finds only what is in
 /// view.
@@ -694,11 +694,13 @@ fn paste_tab_links_to_the_per_app_rules() {
     assert!(has(&window, "New rule app"), "the rules list is in view");
 }
 
-/// e12-fix: the file rows sit on Per-app rules, between the line-join switch and the rule list;
-/// the Folder row is greyed while no file is written, as Processing greys rows under an Off
-/// switch, live once file writing is on, and both rows save the same `[output]` keys.
+/// Owner item 15: the file rows sit on Per-app rules, between the line-join switch and the rule
+/// list. While no file is written the Folder row offers one button, "Turn on file writing", and
+/// has no greyed controls whose reason is hidden; choosing a mode in the Combo (what the owner
+/// did, and the state then stayed Off) or pressing the button makes the format and folder live,
+/// and both rows save the same `[output]` keys.
 #[test]
-fn file_rows_are_on_per_app_rules_greyed_while_off_and_saved() {
+fn file_rows_are_on_per_app_rules_and_say_what_to_turn_on() {
     let l = layout("folder-grey", None);
     let window = open_tall(&l);
     sub_tab(&window, "Per-app rules");
@@ -713,20 +715,40 @@ fn file_rows_are_on_per_app_rules_greyed_while_off_and_saved() {
     assert!(y("Join lines in command prompts") < file && file < y("Scan for apps"));
     let state = window.global::<TextState>();
     assert_eq!(state.get_file_mode(), 0);
-    let live = || {
-        [
-            one(&window, "File format").accessible_enabled(),
-            one(&window, "Choose folder").accessible_enabled(),
-        ]
-    };
-    assert_eq!(live(), [Some(false), Some(false)], "Off: greyed");
-    state.invoke_file_mode_picked(1);
-    state.set_file_mode(1);
-    assert_eq!(live(), [Some(true), Some(true)], "Paste and write: live");
+    let live = || [has(&window, "File format"), has(&window, "Choose folder")];
+    assert_eq!(live(), [false, false], "Off: no controls to wonder about");
+    assert!(
+        has(&window, "Turn on file writing"),
+        "Off: the way to turn it on"
+    );
+    // The Combo's own pick reaches the state (it did not: the row stayed Off) and the file.
+    let combo = with_role(&window, "Also write to a file", AccessibleRole::Combobox);
+    combo.mock_single_click(PointerEventButton::Left);
+    window.window().dispatch_event(WindowEvent::KeyPressed {
+        text: Key::DownArrow.into(),
+    });
+    assert_eq!(state.get_file_mode(), 1);
+    assert_eq!(config(&l).config.output.file_mode, FileMode::Also);
+    assert_eq!(live(), [true, true], "Paste and write: live");
+    assert!(!has(&window, "Turn on file writing"));
+    assert_eq!(one(&window, "File format").accessible_enabled(), Some(true));
     state.invoke_file_format_picked(1);
     let out = config(&l).config.output;
     assert_eq!(out.file_mode, FileMode::Also);
     assert_eq!(out.file_format, FileFormat::Txt);
+}
+
+/// Owner item 15: the button of the Off state turns writing on, as Paste and write.
+#[test]
+fn the_turn_on_button_of_the_folder_row_turns_file_writing_on() {
+    let l = layout("folder-turn-on", None);
+    let window = open_tall(&l);
+    sub_tab(&window, "Per-app rules");
+    one(&window, "Turn on file writing").invoke_accessible_default_action();
+    let state = window.global::<TextState>();
+    assert_eq!(state.get_file_mode(), 1);
+    assert_eq!(config(&l).config.output.file_mode, FileMode::Also);
+    assert!(has(&window, "Choose folder"));
 }
 
 /// e12-fix, DS-15.1: the Paste mode tiles carry their captions, at the tile's own height (no
@@ -869,7 +891,7 @@ fn every_tab_fits_the_minimum_size_with_long_lists() {
             ("Replacements", "Save replace.txt"),
             ("Paste", "Restore your copy after"),
             ("Per-app rules", "Scan for apps"),
-            ("Per-app rules", "File format"),
+            ("Per-app rules", "Turn on file writing"),
             ("Per-app rules", "Join lines in command prompts"),
             ("Processing", "Doubt level"),
             ("Words", "Snippets"),

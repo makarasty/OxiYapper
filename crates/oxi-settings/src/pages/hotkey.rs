@@ -220,9 +220,6 @@ impl Picker {
         if self.capturing.replace(on) != on {
             self.ctx.ipc.send(Request::CaptureHotkey { on });
         }
-        if on {
-            self.with(|s| s.set_move_focus(0));
-        }
         if on && !self.watch.running() {
             let me = self.me.clone();
             self.watch.start(TimerMode::Repeated, WATCH, move || {
@@ -252,13 +249,6 @@ impl Picker {
         }
     }
 
-    /// Ends the capture from the keyboard (the hook swallows Tab and Esc, so the board would
-    /// trap the focus) and moves the focus to Apply (1) or Cancel (2).
-    fn hand_back(&self, to: i32) {
-        self.capture(false);
-        self.with(|s| s.set_move_focus(to));
-    }
-
     fn check_page(&self) {
         let shown = self
             .window
@@ -281,17 +271,30 @@ impl Picker {
         self.show();
     }
 
-    /// A key from the hook. The first key down after all were up starts a new chord. Esc alone
-    /// goes to Cancel; releasing every key of a valid chord goes to Apply.
+    /// A key from the hook; capture runs the whole time the keyboard is open, so the chord just
+    /// pressed is always the last one held together. The first key down after all were up starts a
+    /// new chord. With nothing held, Esc clears the pending chord (Esc again, with nothing pending,
+    /// cancels) and Enter applies a valid pending chord; held with another key, both are chord keys.
     fn pressed(&self, key: Key, down: bool) {
         if !self.capturing.get() {
             return;
         }
-        if down && key == Key::Esc && self.held.borrow().is_empty() {
-            self.hand_back(2);
-            return;
+        if down && self.held.borrow().is_empty() {
+            if key == Key::Esc {
+                if self.pending.borrow().is_empty() {
+                    self.close();
+                } else {
+                    self.pending.borrow_mut().clear();
+                    self.show();
+                }
+                return;
+            }
+            if key == Key::Enter && Chord::from_keys(&self.pending.borrow()).is_ok() {
+                self.apply();
+                return;
+            }
         }
-        let released = {
+        {
             let mut held = self.held.borrow_mut();
             let mut pending = self.pending.borrow_mut();
             if down {
@@ -307,13 +310,8 @@ impl Picker {
             } else {
                 held.retain(|&k| k != key);
             }
-            !down && held.is_empty() && Chord::from_keys(&pending).is_ok()
-        };
-        if released {
-            self.hand_back(1);
-        } else {
-            self.show();
         }
+        self.show();
     }
 
     fn apply(&self) {
@@ -543,50 +541,75 @@ mod tests {
         assert_eq!(one(&window, "Left Shift").accessible_checked(), Some(false));
     }
 
-    fn press(window: &AppWindow, k: slint::platform::Key) {
-        // The focus moves in a change handler, which runs with the timers.
-        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
-        let text: slint::SharedString = k.into();
-        let w = window.window();
-        w.dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
-        w.dispatch_event(WindowEvent::KeyReleased { text });
-    }
-
     #[test]
-    fn releasing_a_chord_ends_capture_and_space_applies_it() {
+    fn capture_goes_on_after_a_release_and_the_next_chord_replaces_the_last() {
         let (window, ipc, sent) = open("release");
         one(&window, "Change hotkey").invoke_accessible_default_action();
         let _ = one(&window, "Left Ctrl");
         for (k, down) in [(Key::LShift, true), (Key::F13, true), (Key::F13, false)] {
             key(&ipc, k, down);
         }
-        assert_eq!(captures(&sent), [true]);
         key(&ipc, Key::LShift, false);
-        assert_eq!(captures(&sent), [false]);
-        // The hook is off, so the window gets the keys: the focus is on Apply.
-        press(&window, slint::platform::Key::Space);
-        assert!(!board_open(&window));
-        assert!(one(&window, "Shift + F13").is_valid());
+        // Every key is up: the chord stays on show, capture is still on, no click was needed.
+        assert!(one(&window, "New hotkey: Shift + F13").is_valid());
+        assert_eq!(captures(&sent), [true]);
+        key(&ipc, Key::LAlt, true);
+        key(&ipc, Key::F14, true);
+        assert!(one(&window, "New hotkey: Alt + F14").is_valid());
+        assert_eq!(one(&window, "Left Shift").accessible_checked(), Some(false));
+        key(&ipc, Key::F14, false);
+        key(&ipc, Key::LAlt, false);
         assert_eq!(captures(&sent), Vec::<bool>::new());
+        one(&window, "Apply hotkey").invoke_accessible_default_action();
+        assert!(!board_open(&window));
+        assert!(one(&window, "Alt + F14").is_valid());
+        assert_eq!(captures(&sent), [false]);
     }
 
     #[test]
-    fn esc_alone_ends_capture_and_space_cancels() {
+    fn esc_alone_clears_the_chord_and_a_second_one_cancels() {
         let (window, ipc, sent) = open("escape");
         one(&window, "Change hotkey").invoke_accessible_default_action();
         let _ = one(&window, "Left Ctrl");
         key(&ipc, Key::F13, true);
         key(&ipc, Key::F13, false);
-        assert_eq!(captures(&sent), [true, false]);
-        // Back on the board, capture runs again; Esc alone hands the focus to Cancel.
-        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
-        one(&window, "F5").mock_single_click(slint::platform::PointerEventButton::Left);
+        key(&ipc, Key::Esc, true);
+        key(&ipc, Key::Esc, false);
+        // Cleared, still listening: the next chord is taken at once.
+        assert!(one(&window, "No keys yet").is_valid());
         assert_eq!(captures(&sent), [true]);
+        key(&ipc, Key::F14, true);
+        assert!(one(&window, "New hotkey: F14").is_valid());
+        key(&ipc, Key::F14, false);
+        key(&ipc, Key::Esc, true);
+        key(&ipc, Key::Esc, false);
         key(&ipc, Key::Esc, true);
         assert_eq!(captures(&sent), [false]);
-        press(&window, slint::platform::Key::Space);
         assert!(!board_open(&window));
         assert!(one(&window, "Ctrl + Win").is_valid());
+    }
+
+    #[test]
+    fn enter_alone_applies_a_valid_chord_but_is_a_key_inside_one() {
+        let (window, ipc, sent) = open("enter");
+        one(&window, "Change hotkey").invoke_accessible_default_action();
+        let _ = one(&window, "Left Ctrl");
+        // Nothing pending: Enter is a plain key of the chord.
+        key(&ipc, Key::Enter, true);
+        key(&ipc, Key::Enter, false);
+        assert!(one(&window, "New hotkey: Enter").is_valid());
+        // Held with Ctrl it is part of the chord.
+        key(&ipc, Key::LCtrl, true);
+        key(&ipc, Key::Enter, true);
+        assert!(one(&window, "New hotkey: Ctrl + Enter").is_valid());
+        key(&ipc, Key::Enter, false);
+        key(&ipc, Key::LCtrl, false);
+        assert!(board_open(&window));
+        // All up and the chord valid: Enter alone applies it.
+        key(&ipc, Key::Enter, true);
+        assert!(!board_open(&window));
+        assert!(one(&window, "Ctrl + Enter").is_valid());
+        assert_eq!(captures(&sent), [true, false]);
     }
 
     #[test]
@@ -772,26 +795,6 @@ mod tests {
         ipc.deliver(&Event::Link(Link::Online));
         assert_eq!(captures(&sent), [true]);
         assert_eq!(apply(), Some(true));
-    }
-
-    #[test]
-    fn a_chord_ending_hands_the_focus_to_apply_and_esc_to_cancel() {
-        let (window, ipc, _sent) = open("focus-move");
-        let state = window.global::<HotkeyState>();
-        one(&window, "Change hotkey").invoke_accessible_default_action();
-        let _ = one(&window, "Left Ctrl");
-        assert_eq!(state.get_move_focus(), 0);
-        key(&ipc, Key::F13, true);
-        key(&ipc, Key::F13, false);
-        // The board's change handler moves the focus; `releasing_a_chord_ends_capture_and_space_
-        // applies_it` shows that Space then presses Apply.
-        assert_eq!(state.get_move_focus(), 1);
-        // Back on the board, Esc alone points at Cancel.
-        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
-        one(&window, "F5").mock_single_click(slint::platform::PointerEventButton::Left);
-        assert_eq!(state.get_move_focus(), 0);
-        key(&ipc, Key::Esc, true);
-        assert_eq!(state.get_move_focus(), 2);
     }
 
     #[test]

@@ -857,10 +857,12 @@ impl<H: ChordHook> Coordinator<H> {
                 }) = self.run.take()
                 {
                     let key = (self.active.model.id.clone(), self.backend.clone());
-                    let scale = self.speed.get(&key).copied().unwrap_or(1.0);
                     let took = (self.clock - at).0;
-                    self.speed
-                        .insert(key, overlay::learn(scale, audio_ms, took));
+                    let scale = match self.speed.get(&key) {
+                        Some(&s) => overlay::learn(s, audio_ms, took),
+                        None => overlay::learn_first(audio_ms, took),
+                    };
+                    self.speed.insert(key, scale);
                 }
                 bar.finish(OverlayState::Transcribing);
                 self.bar = Bar::None;
