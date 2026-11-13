@@ -15,7 +15,7 @@ use std::time::Duration;
 use oxi_core::audio::{SAMPLE_RATE, voiced_runs};
 use oxi_core::dictionary::{Suggestion, suggest};
 use oxi_core::history::{
-    self, DiffKind, Filter, Meta, Searched, Status, Word, align, export, word_diff,
+    self, DiffKind, Filter, HistoryId, Meta, Searched, Status, Word, align, export, word_diff,
 };
 use oxi_core::ipc::{
     FileFailure, FileResult, HistoryItem, HistoryOp, Push, Request, Spoken, TestFailure,
@@ -28,11 +28,12 @@ use oxi_core::types::{Language, Millis};
 use oxi_platform::capture::{CaptureError, Playback};
 use slint::{ComponentHandle, ModelRc, StyledText, Timer, TimerMode, VecModel, Weak};
 
-use crate::generated::{HistoryRow, HistoryState, SystemState, Theme, Toast, WordSpan};
+use crate::generated::{HistoryRow, HistoryState, SystemState, Theme, WordSpan};
 use crate::ipc::{Event, Link, Subscription};
 use crate::{AppWindow, Ctx, Error, Page, report};
 
 use super::progress::Bars;
+use super::toast;
 use super::tuning::{BARS, clock, peaks, when};
 
 /// The samples of a recording and their rate.
@@ -296,7 +297,7 @@ fn bind_search(s: &HistoryState<'_>, page: &Rc<PageState>) {
 /// A Transcribe again that is out.
 struct Run {
     id: u32,
-    entry: String,
+    entry: HistoryId,
     set: SettingsSet,
     language: Language,
     /// The new text, once heard; then `HistorySetText` is out.
@@ -322,7 +323,7 @@ struct PageState {
     added_since: RefCell<Vec<HistoryItem>>,
     loading: Cell<bool>,
     /// The entry whose waveform is drawn.
-    shown_id: RefCell<Option<String>>,
+    shown_id: RefCell<Option<HistoryId>>,
     /// Its audio could be read.
     audible: Cell<bool>,
     /// The samples of that audio and their rate, kept while the entry is picked: a click on a word
@@ -346,7 +347,7 @@ struct PageState {
     /// The word the sound is on.
     current: Cell<Option<usize>>,
     /// The word-times run that is out: its id and the entry it is for.
-    words_run: RefCell<Option<(u32, String)>>,
+    words_run: RefCell<Option<(u32, HistoryId)>>,
     /// The picked entry's word times were asked for (once per pick, so a Busy makes no loop).
     words_tried: Cell<bool>,
     run: RefCell<Option<Run>>,
@@ -362,7 +363,7 @@ struct PageState {
     /// The text area shows what changed from `other`.
     diff_open: Cell<bool>,
     /// An edit that is out: the entry and the whole new text.
-    edit: RefCell<Option<(String, String)>>,
+    edit: RefCell<Option<(HistoryId, String)>>,
     /// The "Always fix" offer an edit made: the entry and the pair (arch-plan 9.1, idea 7).
     offer: RefCell<Option<(String, Suggestion)>>,
     /// Pairs offered once already: never offered again in this window.
@@ -410,7 +411,7 @@ impl Search {
         }
     }
 
-    fn request(&self, older_than: Option<String>) -> Request {
+    fn request(&self, older_than: Option<HistoryId>) -> Request {
         let (min_ms, max_ms) = self.bounds();
         Request::HistorySearch {
             seq: self.seq,
@@ -554,7 +555,7 @@ impl PageState {
 
     fn toast(&self, text: &str) {
         if let Some(window) = self.window.upgrade() {
-            window.global::<Toast>().invoke_show(text.into());
+            toast(&window, text);
         }
     }
 
@@ -609,7 +610,7 @@ impl PageState {
         });
     }
 
-    fn list(&self, older_than: Option<String>) {
+    fn list(&self, older_than: Option<HistoryId>) {
         if self.open() && self.online() {
             self.loading.set(true);
             let search = self.search.borrow();
@@ -809,7 +810,7 @@ impl PageState {
 
     /// The limits removed recordings: their rows go. A removed pick moves to the row that took
     /// its place.
-    fn removed(&self, ids: &[String]) {
+    fn removed(&self, ids: &[HistoryId]) {
         let at = self
             .selected_id()
             .and_then(|id| self.items.borrow().iter().position(|i| i.id == id))
@@ -837,7 +838,7 @@ impl PageState {
         self.picked();
     }
 
-    fn selected_id(&self) -> Option<String> {
+    fn selected_id(&self) -> Option<HistoryId> {
         let window = self.window.upgrade()?;
         let i = usize::try_from(window.global::<HistoryState>().get_selected()).ok()?;
         self.items.borrow().get(i).map(|item| item.id.clone())
@@ -904,16 +905,16 @@ impl PageState {
         self.send_words_ask(&id);
     }
 
-    fn send_words_ask(&self, id: &str) {
+    fn send_words_ask(&self, id: &HistoryId) {
         if self.selected_id().as_deref() != Some(id) || !self.online() {
             return;
         }
         let run = self.next_run.get();
         self.next_run.set(run.wrapping_add(1).max(FIRST_RUN));
-        *self.words_run.borrow_mut() = Some((run, id.to_owned()));
+        *self.words_run.borrow_mut() = Some((run, id.clone()));
         self.ctx.ipc.send(Request::HistoryWords {
             run,
-            id: id.to_owned(),
+            id: id.clone(),
         });
         self.bar.clear(&Bar::Times);
         // The SRT/VTT tooltip says the times are on their way.
@@ -1474,7 +1475,7 @@ impl PageState {
     }
 
     /// Sends `new` as the edited text of entry `id`; false when the daemon is not there.
-    fn edit_text(&self, id: String, new: String) -> bool {
+    fn edit_text(&self, id: HistoryId, new: String) -> bool {
         if !self.online() {
             self.toast(self.ctx.ipc.link().off_reason(EDIT_NEEDS_DAEMON));
             return false;
@@ -2024,6 +2025,7 @@ mod tests {
     use slint::{ComponentHandle, Model};
 
     use super::*;
+    use crate::generated::Toast;
     use crate::ipc::{Cmd, Ipc};
     use crate::testing::{has, linked};
 
@@ -2043,7 +2045,7 @@ mod tests {
 
     fn item(id: &str, status: Status, text: &str) -> HistoryItem {
         HistoryItem {
-            id: id.into(),
+            id: HistoryId::parse(id).unwrap(),
             status,
             duration_ms: 4_500,
             model: String::new(),
@@ -2124,7 +2126,7 @@ mod tests {
         assert_eq!(ids(&window).len(), 3);
         // The limits removed the picked one: its row goes, the list stays.
         ipc.deliver(&Event::Push(Push::HistoryRemoved {
-            ids: vec!["2026-11-08/110000-000".into()],
+            ids: vec![HistoryId::parse("2026-11-08/110000-000").unwrap()],
         }));
         assert_eq!(
             ids(&window),
@@ -2151,7 +2153,7 @@ mod tests {
         assert_eq!(
             sent_now(&sent),
             [Request::HistoryList {
-                older_than: Some("2026-11-08/120000-000".into())
+                older_than: Some(HistoryId::parse("2026-11-08/120000-000").unwrap())
             }],
             "asks for the next page"
         );
@@ -2373,7 +2375,7 @@ enabled = false
             other => panic!("{other:?}"),
         }
         ipc.deliver(&Event::Push(Push::HistoryResult {
-            id: "2026-11-08/120000-000".into(),
+            id: HistoryId::parse("2026-11-08/120000-000").unwrap(),
             op: HistoryOp::SetText,
             ok: true,
         }));
@@ -2439,11 +2441,11 @@ enabled = false
         assert_eq!(
             sent_now(&sent),
             [Request::HistoryDelete {
-                id: "2026-11-08/134501-123".into()
+                id: HistoryId::parse("2026-11-08/134501-123").unwrap()
             }]
         );
         ipc.deliver(&Event::Push(Push::HistoryResult {
-            id: "2026-11-08/134501-123".into(),
+            id: HistoryId::parse("2026-11-08/134501-123").unwrap(),
             op: HistoryOp::Delete,
             ok: true,
         }));
@@ -2452,7 +2454,7 @@ enabled = false
         assert_eq!(rows[0].id, "2026-11-08/120000-000");
         assert_eq!(s.get_selected(), 0);
         ipc.deliver(&Event::Push(Push::HistoryResult {
-            id: "2026-11-08/120000-000".into(),
+            id: HistoryId::parse("2026-11-08/120000-000").unwrap(),
             op: HistoryOp::Delete,
             ok: false,
         }));
@@ -2514,6 +2516,8 @@ enabled = false
     }
 
     /// d12: after Copy (a long single line) nothing of the page passes the window's right edge.
+    /// e16: the Detail card's `min-width: 0` alone keeps this green with the copier's caps reverted;
+    /// both together removed, Copy text ends at 6584 px (720 window): the test sees the overflow.
     fn copy_fits(name: &str, w: f32, h: f32) {
         let (window, _ipc, _sent, _ctx) = picked_page(name, &"word".repeat(400));
         window.window().set_size(slint::LogicalSize::new(w, h));
@@ -2534,6 +2538,53 @@ enabled = false
                 "{label} ends at {right}, past the {w} px window"
             );
         }
+    }
+
+    /// d12: after the selection bar's Copy of a long selection (everything, by Ctrl+A) nothing of
+    /// the page passes the window's right edge.
+    /// e16: either the Text view's or the Detail card's own width caps keep this green with the
+    /// copier's caps reverted; all three removed, it fails.
+    fn selection_copy_fits(name: &str, w: f32, h: f32) {
+        use slint::platform::{Key, WindowEvent};
+        let (window, _ipc, _sent, _ctx) = picked_page(name, &"word".repeat(400));
+        // It sizes the window itself (1280x860): the size under test comes after.
+        select_first_word(&window);
+        window.window().set_size(slint::LogicalSize::new(w, h));
+        let key = |event: fn(slint::SharedString) -> WindowEvent, text: slint::SharedString| {
+            window.window().dispatch_event(event(text));
+        };
+        let ctrl: slint::SharedString = Key::Control.into();
+        key(|text| WindowEvent::KeyPressed { text }, ctrl.clone());
+        key(|text| WindowEvent::KeyPressed { text }, "a".into());
+        key(|text| WindowEvent::KeyReleased { text }, "a".into());
+        key(|text| WindowEvent::KeyReleased { text }, ctrl);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(300));
+        let button = crate::testing::with_role(
+            &window,
+            "Copy",
+            i_slint_backend_testing::AccessibleRole::Button,
+        );
+        button.invoke_accessible_default_action();
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(50));
+        assert_eq!(window.global::<Toast>().get_text(), "Copied.");
+        for label in ["Copy", "Delete", "Transcript"] {
+            let e = crate::testing::one(&window, label);
+            let right = e.absolute_position().x + e.size().width;
+            assert!(
+                right <= w,
+                "{label} ends at {right}, past the {w} px window"
+            );
+        }
+    }
+
+    #[test]
+    fn the_selection_bars_copy_leaves_the_detail_inside_a_small_window() {
+        selection_copy_fits("sel-copy-720", 720.0, 520.0);
+    }
+
+    #[test]
+    fn the_selection_bars_copy_leaves_the_detail_inside_a_large_window() {
+        selection_copy_fits("sel-copy-1280", 1280.0, 860.0);
     }
 
     #[test]
@@ -2561,7 +2612,7 @@ enabled = false
 
     fn reply(ipc: &Ipc, op: HistoryOp, ok: bool) {
         ipc.deliver(&Event::Push(Push::HistoryResult {
-            id: "2026-11-08/134501-123".into(),
+            id: HistoryId::parse("2026-11-08/134501-123").unwrap(),
             op,
             ok,
         }));
@@ -2624,13 +2675,111 @@ enabled = false
         assert_eq!(
             sent_now(&sent),
             [Request::HistoryEdit {
-                id: "2026-11-08/134501-123".into(),
+                id: HistoryId::parse("2026-11-08/134501-123").unwrap(),
                 text: Spoken("call Anna at noon".into()),
             }]
         );
         s.set_selected(1);
         s.invoke_add_held();
         assert_eq!(sent_now(&sent), [], "already the text");
+    }
+
+    /// The page on one entry whose held part is `held`, picked.
+    fn held_page(name: &str, held: &str) -> AppWindow {
+        let (window, ipc, sent, _ctx) = page(name);
+        window.global::<HistoryState>().invoke_shown();
+        let mut entry = item("2026-11-08/134501-123", Status::Done, "call Anna");
+        entry.held = vec![HeldText {
+            text: Spoken(held.into()),
+            why: HeldWhy::LowConfidence,
+        }];
+        listed(&ipc, vec![entry], false);
+        sent_now(&sent);
+        window
+    }
+
+    fn resize(window: &AppWindow, w: f32, h: f32) {
+        window.window().set_size(slint::LogicalSize::new(w, h));
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(50));
+    }
+
+    /// e11: the held text, the owner's lost words, is readable: it wraps on a line of its own
+    /// (it was squeezed to "sample he..." between three buttons) and never passes three lines.
+    #[test]
+    fn the_held_text_is_readable_at_every_size() {
+        let held = "word ".repeat(60);
+        let held = held.trim();
+        let window = held_page("held-room", held);
+        for (w, h) in [(720.0, 520.0), (1280.0, 860.0), (1920.0, 1080.0)] {
+            resize(&window, w, h);
+            let text = crate::testing::one(&window, held);
+            let detail = crate::testing::one(&window, "Transcript");
+            assert!(
+                text.size().width >= detail.size().width - 1.0,
+                "{w}: the held text is {} wide, the card's text {}",
+                text.size().width,
+                detail.size().width
+            );
+            assert!(
+                text.size().height <= 60.5,
+                "{w}: {} high",
+                text.size().height
+            );
+            assert!(text.size().height > 20.0, "{w}: wraps to more than a line");
+        }
+    }
+
+    /// e11: the detail card takes the width the list leaves, as the search field above does
+    /// (it stopped at 360 px at 1920).
+    #[test]
+    fn the_detail_card_uses_the_width_of_the_window() {
+        let window = held_page("detail-width", "at noon");
+        for (w, h) in [(720.0, 520.0), (1280.0, 860.0), (1920.0, 1080.0)] {
+            resize(&window, w, h);
+            let search = crate::testing::one(&window, "Transcribe a file");
+            let text = crate::testing::one(&window, "Transcript");
+            let right = |e: &i_slint_backend_testing::ElementHandle| {
+                e.absolute_position().x + e.size().width
+            };
+            assert!(
+                (right(&search) - right(&text)).abs() < 40.0,
+                "{w}: the toolbar ends at {}, the text at {}",
+                right(&search),
+                right(&text)
+            );
+        }
+    }
+
+    /// e11: the actions read as words (a row of five bare glyphs could not be told apart), and
+    /// Delete is the right-most of them; the search row's file button and length filter are named.
+    #[test]
+    fn the_actions_carry_words_and_delete_is_last() {
+        let window = held_page("actions", "at noon");
+        for (w, h) in [(720.0, 520.0), (1280.0, 860.0)] {
+            resize(&window, w, h);
+            let right = |label: &str| {
+                let e = crate::testing::one(&window, label);
+                (e.size().width, e.absolute_position().x + e.size().width)
+            };
+            let delete = right("Delete");
+            for label in [
+                "Copy text",
+                "Show in folder",
+                "Export",
+                "Transcribe again",
+                "Transcribe a file",
+            ] {
+                let (width, edge) = right(label);
+                assert!(width > 48.0, "{w}: {label} is {width} wide, a bare glyph");
+                if label != "Transcribe a file" {
+                    assert!(
+                        delete.1 >= edge - 0.5,
+                        "{w}: Delete is not last next to {label}"
+                    );
+                }
+            }
+            assert!(has(&window, "Length"), "{w}: the length filter has no name");
+        }
     }
 
     /// Review d03 (d): an edit that reads as a misheard word offers "Always fix" once; a click
@@ -2686,7 +2835,7 @@ enabled = false
         assert_eq!(
             sent_now(&sent),
             [Request::HistoryEdit {
-                id: "2026-11-08/134501-123".into(),
+                id: HistoryId::parse("2026-11-08/134501-123").unwrap(),
                 text: Spoken("call Hanna at noon".into()),
             }]
         );
@@ -2704,7 +2853,7 @@ enabled = false
         assert_eq!(
             sent_now(&sent),
             [Request::HistoryRestore {
-                id: "2026-11-08/134501-123".into()
+                id: HistoryId::parse("2026-11-08/134501-123").unwrap()
             }]
         );
         reply(&ipc, HistoryOp::Restore, true);
@@ -3048,7 +3197,7 @@ enabled = false
         assert!(s.get_timing_progress() < 0.5, "{}", s.get_timing_progress());
         ipc.deliver(&Event::Push(Push::HistoryWords {
             run,
-            id: ID.into(),
+            id: HistoryId::parse(ID).unwrap(),
             result: WordsResult::Ready {
                 words: Words(four(true)),
                 timed: true,
@@ -3103,7 +3252,7 @@ enabled = false
         };
         ipc.deliver(&Event::Push(Push::HistoryWords {
             run,
-            id: ID.into(),
+            id: HistoryId::parse(ID).unwrap(),
             result: WordsResult::Busy,
         }));
         i_slint_backend_testing::mock_elapsed_time(Duration::from_secs(5));
@@ -3116,7 +3265,7 @@ enabled = false
         // An answer for a run the pick left (it was cancelled) asks for nothing.
         ipc.deliver(&Event::Push(Push::HistoryWords {
             run: run + 77,
-            id: "2026-11-01/000000-000".into(),
+            id: HistoryId::parse("2026-11-01/000000-000").unwrap(),
             result: WordsResult::Busy,
         }));
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(500));
@@ -3156,7 +3305,7 @@ enabled = false
         // Its late answer changes nothing.
         ipc.deliver(&Event::Push(Push::HistoryWords {
             run,
-            id: ID.into(),
+            id: HistoryId::parse(ID).unwrap(),
             result: WordsResult::Busy,
         }));
         assert!(!s.get_timing() && sent_now(&sent).is_empty());
@@ -3362,6 +3511,9 @@ enabled = false
         let (window, ipc, _sent, _ctx) = page("bar-silent");
         listed(&ipc, vec![item(ID, Status::Interrupted, SAID)], false);
         assert_eq!(count(&window, "Speed, loop and pauses"), 0);
+        // Not the old always-visible row either.
+        assert_eq!(count(&window, "Playback speed"), 0);
+        assert_eq!(count(&window, "Loop"), 0);
     }
 
     #[test]
@@ -3998,7 +4150,9 @@ enabled = false
         }));
         ipc.deliver(&Event::Push(Push::FileResult {
             run,
-            result: FileResult::Done { id: A.into() },
+            result: FileResult::Done {
+                id: HistoryId::parse(A).unwrap(),
+            },
         }));
         assert_eq!(rows_len(&window), 1);
         assert!(!s.get_file_running());

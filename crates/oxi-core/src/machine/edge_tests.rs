@@ -708,8 +708,53 @@ fn a_re_press_inside_the_tail_goes_on_with_the_same_recording() {
 fn the_paste_waits_for_the_end_of_the_gap_when_whisper_is_faster() {
     let mut s = first(gap_cfg());
     assert_eq!(transcribed(&mut s, J0, 1150), []);
+    // Nothing pastes yet and the user may still continue: not the Pasting look.
+    assert_eq!(s.phase(), Phase::Transcribing);
     assert_eq!(s.0.next_deadline(), Some(Millis(1400)));
     assert_eq!(s.core(1400, Event::Tick), [Effect::Paste(J0)]);
+    assert_eq!(s.phase(), Phase::Pasting);
+}
+
+#[test]
+fn a_typing_job_shows_pasting_while_the_next_one_waits_behind_it() {
+    let mut s = first(gap_cfg());
+    transcribed(&mut s, J0, 1150);
+    assert_eq!(s.core(1400, Event::Tick), [Effect::Paste(J0)]);
+    // J1 is recorded and transcribed while J0 still types; its own gap ends at 2400.
+    s.at(1500, Event::ChordDown);
+    s.at(1600, Event::SpeechHeard);
+    s.at(2000, Event::ChordUp);
+    assert_eq!(s.core(2100, Event::Tick), stop(J1));
+    transcribed(&mut s, J1, 2150);
+    assert_eq!(
+        s.phase(),
+        Phase::Pasting,
+        "J0 types: the Pasting look stays"
+    );
+    s.at(
+        2300,
+        Event::PasteDone {
+            job: J0,
+            outcome: PasteOutcome::Pasted,
+        },
+    );
+    assert_eq!(s.phase(), Phase::Transcribing, "J1 waits for its gap");
+    assert_eq!(s.core(2400, Event::Tick), [Effect::Paste(J1)]);
+    assert_eq!(s.phase(), Phase::Pasting);
+}
+
+#[test]
+fn a_typing_job_shows_transcribing_while_the_next_one_is_in_whisper() {
+    let mut s = first(gap_cfg());
+    transcribed(&mut s, J0, 1150);
+    assert_eq!(s.core(1400, Event::Tick), [Effect::Paste(J0)]);
+    s.at(1500, Event::ChordDown);
+    s.at(1600, Event::SpeechHeard);
+    s.at(2000, Event::ChordUp);
+    assert_eq!(s.core(2100, Event::Tick), stop(J1));
+    s.at(2150, Event::JobAudioReady(J1));
+    // J0 types, J1 is in whisper: the Transcribing look carries J1's progress.
+    assert_eq!(s.phase(), Phase::Transcribing);
 }
 
 #[test]

@@ -2,11 +2,19 @@
 //! through lewton, `.mp3`, `.m4a`, `.mp4`, `.flac` through symphonia. One call gives mono samples
 //! at the rate asked for, resampled block by block as the file is read: the file's own rate is
 //! never held whole, and a header that tells the length refuses a too-long file before any
-//! decoding. Never panics on a bad file.
+//! decoding. Never panics on a bad file of its own, but symphonia can (an `.m4a` with one bad
+//! atom panics, or asks for 64 GB and aborts): the daemon decodes in a child process of its own
+//! exe ([`decode_in_child`]), so a damaged file costs the child, not the tray app.
 
 use std::fs::File;
-use std::io::{self, BufReader, Read, Seek};
+use std::io::{self, BufReader, Read, Seek, Write};
+use std::ops::RangeInclusive;
 use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
+use std::time::Duration;
 
 use hound::{SampleFormat, WavReader};
 use lewton::inside_ogg::OggStreamReader;
@@ -34,6 +42,10 @@ const BLOCK_SECONDS: usize = 30;
 /// Samples taken from a wav reader at a time.
 const READ: usize = 4096;
 
+/// The file rates taken: a rate outside would ask the resampler for absurd sizes (a 1 Hz wav grows
+/// 16000x), as `oxi_core::sounds` limits custom sounds.
+const RATES: RangeInclusive<u32> = 4_000..=384_000;
+
 #[derive(Debug, Error)]
 pub enum DecodeError {
     /// A format or codec this build cannot read; `what` names it.
@@ -45,6 +57,9 @@ pub enum DecodeError {
     TooLong,
     #[error("the file cannot be opened")]
     Io(#[from] io::Error),
+    /// The decoding child was stopped (Stop, window closed); only [`decode_in_child`] gives it.
+    #[error("stopped")]
+    Stopped,
 }
 
 fn unsupported(what: &str) -> DecodeError {
@@ -95,6 +110,9 @@ impl Sink {
     fn new(from: u32, to: u32, frames: Option<u64>) -> Result<Self, DecodeError> {
         if from == 0 || to == 0 {
             return Err(DecodeError::Corrupt);
+        }
+        if !RATES.contains(&from) {
+            return Err(unsupported(&format!("{from} Hz audio")));
         }
         if let Some(frames) = frames {
             check_length(frames, from)?;
@@ -153,9 +171,89 @@ impl Sink {
     }
 }
 
+/// A streamed wav (`ffmpeg -f wav -`, `arecord` to stdout) tells a placeholder data size,
+/// 0xFFFFFFFF, which hound refuses as corrupt before any frame is read (hound 3.5.1 read.rs:608).
+/// Returns where the data chunk's size field is and the size that fits the bytes really there,
+/// rounded down to a whole frame; `None` when the told size already fits or the header is not
+/// one this can read (hound then judges the file as it is).
+fn data_size_fix(file: &mut File, len: u64) -> Option<(u64, u32)> {
+    let mut head = [0_u8; 12];
+    file.read_exact(&mut head).ok()?;
+    if &head[..4] != b"RIFF" || &head[8..] != b"WAVE" {
+        return None;
+    }
+    let (mut pos, mut block) = (12_u64, 0_u64);
+    // A real header has a handful of chunks; a file of thousands of tiny ones is judged by hound.
+    for _ in 0..64 {
+        file.seek(io::SeekFrom::Start(pos)).ok()?;
+        let mut chunk = [0_u8; 8];
+        file.read_exact(&mut chunk).ok()?;
+        let size = u64::from(u32::from_le_bytes(chunk[4..].try_into().ok()?));
+        match &chunk[..4] {
+            b"fmt " if size >= 16 => {
+                let mut fmt = [0_u8; 16];
+                file.read_exact(&mut fmt).ok()?;
+                block = u64::from(u16::from_le_bytes([fmt[12], fmt[13]]));
+            }
+            b"data" => {
+                let remaining = len.checked_sub(pos + 8)?;
+                if block == 0 || (size <= remaining && size % block == 0) {
+                    return None;
+                }
+                return Some((pos + 4, u32::try_from(remaining - remaining % block).ok()?));
+            }
+            _ => {}
+        }
+        pos += 8 + size + (size & 1);
+    }
+    None
+}
+
+/// `inner` with four bytes replaced at an offset: the corrected data size of [`data_size_fix`].
+struct Patch<R> {
+    inner: R,
+    at: u64,
+    bytes: [u8; 4],
+    pos: u64,
+}
+
+impl<R> Patch<R> {
+    fn new(inner: R, fix: Option<(u64, u32)>) -> Self {
+        let (at, size) = fix.unwrap_or((u64::MAX - 4, 0));
+        Self {
+            inner,
+            at,
+            bytes: size.to_le_bytes(),
+            pos: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for Patch<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        for (i, byte) in buf[..n].iter_mut().enumerate() {
+            let offset = self.pos + i as u64;
+            if let Some(&patched) = offset
+                .checked_sub(self.at)
+                .and_then(|d| usize::try_from(d).ok())
+                .and_then(|d| self.bytes.get(d))
+            {
+                *byte = patched;
+            }
+        }
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
 fn decode_wav(file: File, rate: u32) -> Result<Vec<f32>, DecodeError> {
+    let mut file = file;
     let bytes = file.metadata()?.len();
-    let mut reader = WavReader::new(BufReader::new(file)).map_err(|_| DecodeError::Corrupt)?;
+    let fix = data_size_fix(&mut file, bytes);
+    file.rewind()?;
+    let source = Patch::new(file, fix);
+    let mut reader = WavReader::new(BufReader::new(source)).map_err(|_| DecodeError::Corrupt)?;
     let spec = reader.spec();
     let channels = usize::from(spec.channels);
     if channels == 0 {
@@ -329,9 +427,420 @@ fn decode_stream(file: File, ext: &str, rate: u32) -> Result<Vec<f32>, DecodeErr
     sink.ok_or(DecodeError::Corrupt)?.finish()
 }
 
+/// The hidden first argument that makes the exe a decoding child: `<exe> --decode-child <path>`.
+pub const CHILD_ARG: &str = "--decode-child";
+
+/// How often the wait for a child looks at the stop flag (as the daemon's file run does).
+const POLL: Duration = Duration::from_millis(50);
+
+/// Reply tags: the first byte the child writes.
+const OK: u8 = 0;
+const UNSUPPORTED: u8 = 1;
+const CORRUPT: u8 = 2;
+const TOO_LONG: u8 = 3;
+const IO: u8 = 4;
+
+/// The child's whole life: decodes `path` at `rate` and writes the reply to stdout. Returns the
+/// process exit code.
+#[must_use]
+pub fn child_main(path: &Path, rate: u32) -> i32 {
+    i32::from(write_reply(io::stdout().lock(), &decode_file(path, rate)).is_err())
+}
+
+/// Decodes `path` at `rate` in a child process of this exe, whose `main` hands [`CHILD_ARG`] to
+/// [`child_main`]: a panic, an abort or any other bad end of the child is
+/// [`DecodeError::Corrupt`]. `stop` set: the child is killed and `Stopped` comes back.
+///
+/// # Errors
+/// As [`decode_file`], plus `Stopped`; a child that cannot be started is `Io`.
+pub fn decode_in_child(path: &Path, rate: u32, stop: &AtomicBool) -> Result<Vec<f32>, DecodeError> {
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg(CHILD_ARG)
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        /// No console window for a child of the console-subsystem debug build.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command.spawn()?;
+    #[cfg(windows)]
+    job::guard(&child);
+    let Some(out) = child.stdout.take() else {
+        end(&mut child);
+        return Err(DecodeError::Corrupt);
+    };
+    wait(child, out, rate, stop)
+}
+
+/// Reads the reply of `child` from `out` on a thread of its own and waits for it, killing the
+/// child when `stop` is set. The reply counts only from a child that exited well.
+fn wait(
+    mut child: Child,
+    out: impl Read + Send + 'static,
+    rate: u32,
+    stop: &AtomicBool,
+) -> Result<Vec<f32>, DecodeError> {
+    let (tx, rx) = mpsc::channel();
+    let reader = thread::Builder::new()
+        .name("file-decode".into())
+        .spawn(move || {
+            let _ = tx.send(read_reply(out, rate));
+        });
+    if reader.is_err() {
+        end(&mut child);
+        return Err(DecodeError::Corrupt);
+    }
+    loop {
+        if stop.load(Ordering::Acquire) || QUIT.load(Ordering::Acquire) {
+            end(&mut child);
+            return Err(DecodeError::Stopped);
+        }
+        match rx.recv_timeout(POLL) {
+            // The reader saw the pipe close: the child has ended or is ending.
+            Ok(reply) => {
+                return match child.wait() {
+                    Ok(status) if status.success() => reply,
+                    _ => Err(DecodeError::Corrupt),
+                };
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                end(&mut child);
+                return Err(DecodeError::Corrupt);
+            }
+        }
+    }
+}
+
+/// Set by the daemon's orderly quit: every decode in hand kills its child and ends as `Stopped`.
+static QUIT: AtomicBool = AtomicBool::new(false);
+
+/// Ends every decoding child of this process within [`POLL`] (tray Quit, IPC Shutdown, session
+/// end). Any other end of the process kills them too, through the job they sit in.
+pub fn stop_all() {
+    QUIT.store(true, Ordering::Release);
+}
+
+/// The kill-on-close Job object every decoding child joins, so no child outlives the daemon (a
+/// decode left running would hold memory and lock the exe against an update).
+#[cfg(windows)]
+mod job {
+    use std::io;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::process::Child;
+    use std::sync::OnceLock;
+
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    /// Made at the first decode and never closed: the kernel closes it when the process ends,
+    /// however it ends (Quit, session end, a crash), and that kills every child in it.
+    static JOB: OnceLock<Option<OwnedHandle>> = OnceLock::new();
+
+    /// Puts `child` in the process's job. A job that cannot be made or joined leaves the child
+    /// unguarded: the decode still runs, and Stop still kills it.
+    pub(super) fn guard(child: &Child) {
+        let job = JOB.get_or_init(|| {
+            kill_on_close()
+                .inspect_err(|e| tracing::warn!("decode job not made: {e}"))
+                .ok()
+        });
+        if let Some(job) = job
+            && let Err(e) = assign(job, child)
+        {
+            tracing::warn!("decoding child not put in the job: {e}");
+        }
+    }
+
+    /// A new Job object that kills its processes when its last handle closes.
+    pub(super) fn kill_on_close() -> io::Result<OwnedHandle> {
+        // SAFETY: no attributes, no name; a null return is the error.
+        let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if raw.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `raw` is a fresh handle that nothing else owns.
+        let job = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: `info` is the struct the class names and outlives the call; the size is its own.
+        let ok = unsafe {
+            SetInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                (&raw const info).cast(),
+                u32::try_from(size_of_val(&info)).unwrap_or(u32::MAX),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(job)
+    }
+
+    pub(super) fn assign(job: &OwnedHandle, child: &Child) -> io::Result<()> {
+        // SAFETY: both handles are live for the call.
+        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+fn end(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn write_reply(out: impl Write, reply: &Result<Vec<f32>, DecodeError>) -> io::Result<()> {
+    let mut out = io::BufWriter::new(out);
+    match reply {
+        Ok(samples) => {
+            out.write_all(&[OK])?;
+            out.write_all(&(samples.len() as u64).to_le_bytes())?;
+            for sample in samples {
+                out.write_all(&sample.to_le_bytes())?;
+            }
+        }
+        Err(DecodeError::Unsupported { what }) => {
+            out.write_all(&[UNSUPPORTED])?;
+            out.write_all(what.as_bytes())?;
+        }
+        Err(DecodeError::TooLong) => out.write_all(&[TOO_LONG])?,
+        Err(DecodeError::Io(_)) => out.write_all(&[IO])?,
+        Err(DecodeError::Corrupt | DecodeError::Stopped) => out.write_all(&[CORRUPT])?,
+    }
+    out.flush()
+}
+
+/// The child's reply; anything this exe would not write is `Corrupt`. The sample count is checked
+/// against the cap before anything is reserved, so a wrong child cannot make the daemon allocate.
+fn read_reply(mut out: impl Read, rate: u32) -> Result<Vec<f32>, DecodeError> {
+    let mut tag = [0_u8];
+    out.read_exact(&mut tag).map_err(|_| DecodeError::Corrupt)?;
+    let reply = match tag[0] {
+        OK => read_samples(&mut out, rate),
+        UNSUPPORTED => {
+            let mut what = String::new();
+            (&mut out)
+                .take(256)
+                .read_to_string(&mut what)
+                .map_err(|_| DecodeError::Corrupt)?;
+            Err(DecodeError::Unsupported { what })
+        }
+        TOO_LONG => Err(DecodeError::TooLong),
+        IO => Err(DecodeError::Io(io::Error::other(
+            "not opened by the decoding child",
+        ))),
+        _ => Err(DecodeError::Corrupt),
+    };
+    // To the end: the pipe closes when the child ends, and nothing may follow the reply.
+    match out.read(&mut [0]) {
+        Ok(0) => reply,
+        _ => Err(DecodeError::Corrupt),
+    }
+}
+
+fn read_samples(out: &mut impl Read, rate: u32) -> Result<Vec<f32>, DecodeError> {
+    let mut len = [0_u8; 8];
+    out.read_exact(&mut len).map_err(|_| DecodeError::Corrupt)?;
+    // The cap and a second of codec padding.
+    let cap = (MAX_MINUTES * 60 + 1) * u64::from(rate);
+    let len = u64::from_le_bytes(len);
+    if len > cap {
+        return Err(DecodeError::TooLong);
+    }
+    let len = usize::try_from(len).map_err(|_| DecodeError::TooLong)?;
+    let mut samples = Vec::with_capacity(len);
+    let mut buf = vec![0_u8; 64 * 1024];
+    while samples.len() < len {
+        let want = ((len - samples.len()) * 4).min(buf.len());
+        out.read_exact(&mut buf[..want])
+            .map_err(|_| DecodeError::Corrupt)?;
+        samples.extend(
+            buf[..want]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&b| f32::from_le_bytes(b)),
+        );
+    }
+    Ok(samples)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The env var that makes [`child_entry`] a decoding child: a path, or `hang`.
+    const CHILD_ENV: &str = "OXI_DECODE_CHILD_TEST";
+
+    /// The child of the tests below: this test binary runs it alone. libtest writes to stdout, so
+    /// the reply goes to stderr; a panic fails the test and the process exits 101.
+    #[test]
+    #[ignore = "run only as a child by the tests below"]
+    fn child_entry() {
+        let Ok(arg) = std::env::var(CHILD_ENV) else {
+            return;
+        };
+        if arg == "hang" {
+            thread::sleep(Duration::from_secs(60));
+        }
+        let reply = decode_file(Path::new(&arg), 16_000);
+        std::process::exit(i32::from(write_reply(io::stderr(), &reply).is_err()));
+    }
+
+    /// A command that runs [`child_entry`] with `arg`, its reply on stderr.
+    fn child_command(arg: &std::ffi::OsStr) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "decode::tests::child_entry",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, arg)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    /// Runs [`child_entry`] with `arg` in a child process and waits for its reply.
+    fn in_child(arg: &std::ffi::OsStr, stop: &AtomicBool) -> Result<Vec<f32>, DecodeError> {
+        let mut child = child_command(arg).spawn().unwrap();
+        let out = child.stderr.take().unwrap();
+        wait(child, out, 16_000, stop)
+    }
+
+    #[test]
+    fn a_damaged_m4a_that_panics_or_aborts_the_decoder_ends_only_the_child() {
+        let go = AtomicBool::new(false);
+        // The fixture whole comes back through the pipe.
+        let good = Temp::new("child.m4a", M4A);
+        let got = in_child(good.0.as_os_str(), &go).unwrap();
+        assert_eq!(got, decode_file(&good.0, 16_000).unwrap());
+        // esds.rs:79 `descriptor.unwrap()`: the ES descriptor tag 0x03 made 0x07.
+        let mut esds = M4A.to_vec();
+        let at = esds.windows(4).position(|w| w == b"esds").unwrap() + 8;
+        assert_eq!(esds[at], 0x03);
+        esds[at] = 0x07;
+        // stsc entry_count ff ff ff ff: a 64 GB `Vec::with_capacity`, an abort in any profile.
+        let mut stsc = M4A.to_vec();
+        let at = stsc.windows(4).position(|w| w == b"stsc").unwrap() + 8;
+        stsc[at..at + 4].copy_from_slice(&[0xff; 4]);
+        for (name, bytes) in [("esds.m4a", esds), ("stsc.m4a", stsc)] {
+            let file = Temp::new(name, &bytes);
+            let got = in_child(file.0.as_os_str(), &go);
+            assert!(matches!(got, Err(DecodeError::Corrupt)), "{name}: {got:?}");
+        }
+        // A refusal crosses the pipe as it is.
+        let opus = Temp::new("child.opus", OPUS);
+        let got = in_child(opus.0.as_os_str(), &go);
+        assert!(
+            matches!(&got, Err(DecodeError::Unsupported { what }) if what == "Opus"),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn stop_during_a_decode_kills_the_child() {
+        let stop = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let got = thread::scope(|s| {
+            s.spawn(|| {
+                thread::sleep(Duration::from_millis(300));
+                stop.store(true, Ordering::Release);
+            });
+            in_child("hang".as_ref(), &stop)
+        });
+        assert!(matches!(got, Err(DecodeError::Stopped)), "{got:?}");
+        // The child sleeps 60 s: the wait came back because it was killed.
+        assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
+    /// The daemon's crash or exit closes its job handle: the child in the job dies with it.
+    #[cfg(windows)]
+    #[test]
+    fn a_child_in_the_job_dies_when_the_job_closes() {
+        let job = job::kill_on_close().unwrap();
+        let mut child = child_command("hang".as_ref()).spawn().unwrap();
+        job::assign(&job, &child).unwrap();
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the child runs before the close"
+        );
+        let started = std::time::Instant::now();
+        drop(job);
+        child.wait().unwrap();
+        // The child sleeps 60 s: the wait came back because the job's close killed it.
+        assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_reply_is_read_back_as_written_and_a_wrong_one_is_refused() {
+        let round = |reply: Result<Vec<f32>, DecodeError>| {
+            let mut bytes = Vec::new();
+            write_reply(&mut bytes, &reply).unwrap();
+            read_reply(bytes.as_slice(), 16_000)
+        };
+        let samples: Vec<f32> = (0..40_000).map(|i| i as f32 / 40_000.0).collect();
+        assert_eq!(round(Ok(samples.clone())).unwrap(), samples);
+        assert!(matches!(
+            round(Err(DecodeError::TooLong)),
+            Err(DecodeError::TooLong)
+        ));
+        assert!(matches!(
+            round(Err(DecodeError::Corrupt)),
+            Err(DecodeError::Corrupt)
+        ));
+        let io = round(Err(DecodeError::Io(io::ErrorKind::NotFound.into())));
+        assert!(matches!(io, Err(DecodeError::Io(_))));
+        // Nothing, a count over the cap (refused before reserving), a short body, trailing bytes.
+        let mut over = vec![OK];
+        over.extend(u64::MAX.to_le_bytes());
+        let mut short = vec![OK];
+        short.extend(2_u64.to_le_bytes());
+        short.extend(1.0_f32.to_le_bytes());
+        let extra = vec![TOO_LONG, 0];
+        for (bytes, want) in [
+            (Vec::new(), "Corrupt"),
+            (over, "TooLong"),
+            (short, "Corrupt"),
+            (extra, "Corrupt"),
+        ] {
+            let got = format!("{:?}", read_reply(bytes.as_slice(), 16_000));
+            assert!(got.starts_with(&format!("Err({want}")), "{got}");
+        }
+    }
+
+    #[test]
+    fn a_wav_at_an_absurd_rate_is_refused_before_it_is_resampled() {
+        let slow = wav("r1.wav", 1, 1, &[(1000, 0); 300]);
+        let got = decode_file(&slow.0, 16_000);
+        assert!(
+            matches!(&got, Err(DecodeError::Unsupported { what }) if what == "1 Hz audio"),
+            "{got:?}"
+        );
+        let fast = wav("r2.wav", 400_000, 1, &[(1000, 0); 300]);
+        assert!(matches!(
+            decode_file(&fast.0, 16_000),
+            Err(DecodeError::Unsupported { .. })
+        ));
+        let low = wav("r3.wav", 4_000, 1, &[(1000, 0); 400]);
+        assert_eq!(decode_file(&low.0, 16_000).unwrap().len(), 1600);
+    }
 
     // Each is a 0.1 s, 440 Hz sine at 8 kHz, mono, made once with ffmpeg (`-f lavfi -i sine=...`;
     // the flac with its padding block cut): a few hundred bytes. No encoder is in the tree.
@@ -421,6 +930,44 @@ mod tests {
         assert_eq!(own.len(), 441);
         assert!((own[0] - 0.125).abs() < 1e-3, "{}", own[0]);
         assert_eq!(decode_file(&file.0, 16_000).unwrap().len(), 160);
+    }
+
+    /// A mono wav of `data` whose data chunk tells 0xFFFFFFFF bytes, as a streamed one does.
+    fn streamed(bits: u16, data: &[u8]) -> Vec<u8> {
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend(u32::MAX.to_le_bytes());
+        bytes.extend(b"WAVEfmt ");
+        bytes.extend(16_u32.to_le_bytes());
+        bytes.extend([1, 0, 1, 0]); // PCM, mono
+        bytes.extend(8000_u32.to_le_bytes());
+        bytes.extend((8000 * u32::from(bits / 8)).to_le_bytes());
+        bytes.extend((bits / 8).to_le_bytes()); // block align
+        bytes.extend(bits.to_le_bytes());
+        bytes.extend(b"data");
+        bytes.extend(u32::MAX.to_le_bytes());
+        bytes.extend(data);
+        bytes
+    }
+
+    #[test]
+    fn a_streamed_wav_with_the_placeholder_data_size_decodes_what_is_there() {
+        // 16 bit: 10 frames and one stray byte (a cut stream); 8 bit: 10 frames, the biased bytes.
+        let sixteen = Temp::new("s16.wav", &streamed(16, &[[0x00, 0x20]; 10].concat()));
+        assert_eq!(decode_file(&sixteen.0, 8000).unwrap().len(), 10);
+        let stray = Temp::new(
+            "s16b.wav",
+            &streamed(
+                16,
+                &[[0x00, 0x20]; 10]
+                    .concat()
+                    .into_iter()
+                    .chain([7])
+                    .collect::<Vec<u8>>(),
+            ),
+        );
+        assert_eq!(decode_file(&stray.0, 8000).unwrap().len(), 10);
+        let eight = Temp::new("s8.wav", &streamed(8, &[0x80; 10]));
+        assert_eq!(decode_file(&eight.0, 8000).unwrap().len(), 10);
     }
 
     #[test]

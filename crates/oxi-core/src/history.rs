@@ -76,6 +76,74 @@ pub fn is_id(id: &str) -> bool {
         .is_some_and(|(day, file)| day_dir(day).is_some() && is_file_stem(file))
 }
 
+/// The id of an entry, checked by [`is_id`]: the form every history request and answer carries,
+/// so no handler can join an unchecked string to the folder. A plain string on the wire; one of
+/// another form fails to decode. Derefs to the `YYYY-MM-DD/HHMMSS-mmm` text.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct HistoryId(String);
+
+impl HistoryId {
+    /// `id` when it is a well-formed entry id.
+    pub fn parse(id: &str) -> Option<Self> {
+        is_id(id).then(|| Self(id.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for HistoryId {
+    type Error = &'static str;
+
+    fn try_from(id: String) -> Result<Self, Self::Error> {
+        if is_id(&id) {
+            Ok(Self(id))
+        } else {
+            Err("not a history id (YYYY-MM-DD/HHMMSS-mmm)")
+        }
+    }
+}
+
+impl From<HistoryId> for String {
+    fn from(id: HistoryId) -> Self {
+        id.0
+    }
+}
+
+impl std::ops::Deref for HistoryId {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for HistoryId {
+    fn as_ref(&self) -> &Path {
+        Path::new(&self.0)
+    }
+}
+
+impl PartialEq<str> for HistoryId {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for HistoryId {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl std::fmt::Display for HistoryId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// `2026-11-08T13:00:00.123`: the local time an entry's stem stands for; `None` for a bad id.
 pub fn started(id: &str) -> Option<String> {
     let (day, t) = id.split_once('/').filter(|_| is_id(id))?;
@@ -1154,6 +1222,22 @@ mod tests {
             Some("2026-11-08T13:45:01.123")
         );
         assert_eq!(started("nope"), None);
+    }
+
+    #[test]
+    fn a_history_id_is_checked_when_made_and_when_decoded() {
+        let id = HistoryId::parse("2026-11-08/134501-123").unwrap();
+        assert_eq!(&*id, "2026-11-08/134501-123");
+        assert_eq!(HistoryId::parse("../x/134501-123"), None);
+        assert_eq!(
+            serde_json::to_string(&id).unwrap(),
+            r#""2026-11-08/134501-123""#
+        );
+        assert_eq!(
+            serde_json::from_str::<HistoryId>(r#""2026-11-08/134501-123""#).unwrap(),
+            id
+        );
+        assert!(serde_json::from_str::<HistoryId>(r#""2026-11-08/../134501-123""#).is_err());
     }
 
     #[test]

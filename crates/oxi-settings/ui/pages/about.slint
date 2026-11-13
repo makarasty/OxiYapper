@@ -20,9 +20,9 @@ component TechCard inherits ClickCard {
     in property <string> note;
     in property <image> mark;
     in property <color> brand;
-    // Opens something in the app, not a link: no external-link arrow.
-    in property <bool> inner;
     in property <bool> short;
+    // The tile opens a link in the browser, not something inside the app.
+    in property <bool> external: true;
     accessible-label: root.name;
     accessible-description: root.note;
     border-color: root.hover ? Theme.stroke-control : Theme.stroke-card;
@@ -72,10 +72,13 @@ component TechCard inherits ClickCard {
                 accessible-role: none;
             }
         }
+        // `open-external` only on a tile that opens another app (DS-24.1); the Slint tile opens the
+        // in-app badge, which has no glyph in the DS-24 table, so its slot stays empty at full width.
         VerticalLayout {
             alignment: center;
-            Image {
-                source: root.inner ? Icons.caret-down : Icons.open-external;
+            width: Theme.icon-size-small;
+            if root.external: external-mark := Image {
+                source: Icons.open-external;
                 width: Theme.icon-size-small;
                 height: Theme.icon-size-small;
                 colorize: root.hover ? Theme.accent-text : Theme.text-secondary;
@@ -296,8 +299,8 @@ export component AboutPage inherits VerticalLayout {
                 note: tech.note;
                 mark: tech.mark;
                 brand: tech.brand;
-                inner: tech.url == "";
                 short: root.short;
+                external: tech.url != "";
                 clicked => {
                     if (tech.url == "") {
                         slint-badge.show();

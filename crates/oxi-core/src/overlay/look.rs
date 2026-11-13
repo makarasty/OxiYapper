@@ -118,6 +118,7 @@ fn notice_look(notice: Notice) -> (Rgba, Icon) {
         | Notice::OutOfMemory
         | Notice::DeviceLost
         | Notice::CaptureFailed
+        | Notice::NoMicrophone
         | Notice::TranscriptionFailed
         | Notice::PasteFailed
         | Notice::FileFailed

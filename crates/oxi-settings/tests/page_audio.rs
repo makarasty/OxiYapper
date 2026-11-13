@@ -15,8 +15,8 @@ use oxi_core::machine::Phase;
 use oxi_core::paths::Layout;
 use oxi_settings::ipc::{Cmd, Event};
 use oxi_settings::{AppWindow, AudioState, Ipc, Page};
-use slint::ComponentHandle;
 use slint::platform::{Key, PointerEventButton, WindowEvent};
+use slint::{ComponentHandle, Model};
 
 fn saved(layout: &Layout) -> Config {
     config(layout).config
@@ -94,8 +94,14 @@ fn every_control_writes_its_key() {
 fn gain_and_sensitivity_have_info_tips() {
     let l = layout("hints", None);
     let window = open(&l, Page::Audio);
-    assert!(has(&window, "Changes what Whisper hears."));
-    assert!(has(&window, "Changes only the meter, not the recording."));
+    assert!(has(
+        &window,
+        "Makes your voice louder or quieter in the recording Whisper hears."
+    ));
+    assert!(has(
+        &window,
+        "Only changes how far the Level bar moves; the recording stays as it is."
+    ));
 }
 
 #[test]
@@ -237,7 +243,7 @@ fn locked_config_disables_the_controls() {
         3,
         "the Combo moved off Start"
     );
-    off("Apa hit 4", AccessibleRole::RadioButton);
+    off("Hit 4", AccessibleRole::RadioButton);
     assert_eq!(fs::read_to_string(l.config_file()).unwrap(), original);
 }
 
@@ -431,11 +437,11 @@ fn picking_a_built_in_saves_it_and_plays_it() {
     let (ipc, sent) = Ipc::fake();
     let window = open_linked(&l, Page::Audio, ipc);
     sounds(&window, 0);
-    assert_eq!(checked(&window, "Apa hit 3"), Some(true), "the default");
-    with_role(&window, "Apa hit 4", AccessibleRole::RadioButton).invoke_accessible_default_action();
+    assert_eq!(checked(&window, "Hit 3"), Some(true), "the default");
+    with_role(&window, "Hit 4", AccessibleRole::RadioButton).invoke_accessible_default_action();
     assert_eq!(saved(&l).sounds.start, "apa-hit-4");
     assert_eq!(saved(&l).sounds.stop, "apa-hit-2", "the other sound stays");
-    assert_eq!(checked(&window, "Apa hit 4"), Some(true));
+    assert_eq!(checked(&window, "Hit 4"), Some(true));
     let previews: Vec<Cmd> = sent.try_iter().collect();
     assert!(
         previews.contains(&Cmd::Send(Request::PreviewSound {
@@ -445,8 +451,8 @@ fn picking_a_built_in_saves_it_and_plays_it() {
         "{previews:?}"
     );
     sounds(&window, 1);
-    assert_eq!(checked(&window, "Apa hit 2"), Some(true));
-    with_role(&window, "Apa hit 5", AccessibleRole::RadioButton).invoke_accessible_default_action();
+    assert_eq!(checked(&window, "Hit 2"), Some(true));
+    with_role(&window, "Hit 5", AccessibleRole::RadioButton).invoke_accessible_default_action();
     assert_eq!(saved(&l).sounds.stop, "apa-hit-5");
     assert_eq!(saved(&l).sounds.start, "apa-hit-4");
     // The sound picker follows a view set from outside (the status chip opens the stop sound).
@@ -454,6 +460,35 @@ fn picking_a_built_in_saves_it_and_plays_it() {
     assert_eq!(picker().accessible_value().as_deref(), Some("Stop"));
     sounds(&window, 4);
     assert_eq!(picker().accessible_value().as_deref(), Some("Error"));
+}
+
+/// The cards read as words, the file name stays as the id in the tooltip, and "Default" marks the
+/// sound's own default whichever card is picked.
+#[test]
+fn cards_have_friendly_names_and_default_marks_the_default_card() {
+    let l = layout(
+        "friendly",
+        Some(
+            "version = 2
+[sounds]
+start = \"apa-hit-4\"
+",
+        ),
+    );
+    let window = open(&l, Page::Audio);
+    sounds(&window, 0);
+    let card = with_role(&window, "Hit 4", AccessibleRole::RadioButton);
+    assert_eq!(card.accessible_description().as_deref(), Some("apa-hit-4"));
+    assert!(!has(&window, "Apa hit 4"), "the id is not the name");
+    let tiles = window.global::<AudioState>().get_role_tiles();
+    let start = tiles.row_data(0).unwrap();
+    let marked: Vec<_> = start
+        .iter()
+        .filter(|t| t.caption == "Default")
+        .map(|t| t.title.to_string())
+        .collect();
+    // Hit 4 is picked, yet the mark is on the default card (apa-hit-3).
+    assert_eq!(marked, ["Hit 3"]);
 }
 
 /// Every sound has an Off tile; on text ready it is the old switch.

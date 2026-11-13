@@ -8,10 +8,10 @@ use std::time::Duration;
 
 use common::{config, has, layout, one, open, with_role};
 use i_slint_backend_testing::AccessibleRole;
-use oxi_core::config::PasteMode;
+use oxi_core::config::{FileFormat, FileMode, PasteMode};
 use oxi_core::dictionary::{BUDGET, build_prompt};
 use oxi_core::paths::Layout;
-use oxi_settings::{AppWindow, Page};
+use oxi_settings::{AppWindow, Page, TextState};
 use slint::ComponentHandle;
 use slint::platform::{Key, WindowEvent};
 
@@ -191,7 +191,7 @@ fn editor_fills_the_maximum_window_and_hints_the_format() {
     let dictionary = editor(&window, "Dictionary");
     assert_eq!(
         dictionary.accessible_placeholder_text().as_deref(),
-        Some("One word or name per line")
+        Some("Names and rare words Whisper should know, one per line")
     );
     let save = one(&window, "Save dictionary.txt");
     let bottom = save.absolute_position().y + save.size().height;
@@ -660,6 +660,100 @@ fn win_v_history_is_on_by_default_and_saved_off() {
     assert!(!config(&l).config.paste.keep_in_clipboard_history);
 }
 
+/// e08, owner 2026-11-12: lines are joined in a cmd.exe console by default; the switch sits over
+/// the per-app rules that override it, and saves off.
+#[test]
+fn join_lines_in_command_prompts_is_on_by_default_and_saved_off() {
+    let l = layout("join-lines", None);
+    let window = open_tall(&l);
+    sub_tab(&window, "Per-app rules");
+    let switch = || {
+        with_role(
+            &window,
+            "Join lines in command prompts",
+            AccessibleRole::Switch,
+        )
+    };
+    assert_eq!(switch().accessible_checked(), Some(true));
+    switch().invoke_accessible_default_action();
+    assert_eq!(switch().accessible_checked(), Some(false));
+    assert!(!config(&l).config.paste.join_console_lines);
+}
+
+/// e12: the Paste tab links to Per-app rules with a button that switches the tab.
+#[test]
+fn paste_tab_links_to_the_per_app_rules() {
+    let l = layout("paste-link", None);
+    let window = open_tall(&l);
+    sub_tab(&window, "Paste");
+    let tab = |label| with_role(&window, label, AccessibleRole::Tab);
+    assert_eq!(tab("Paste").accessible_item_selected(), Some(true));
+    with_role(&window, "Per-app rules", AccessibleRole::Button).invoke_accessible_default_action();
+    assert_eq!(tab("Per-app rules").accessible_item_selected(), Some(true));
+    assert_eq!(tab("Paste").accessible_item_selected(), Some(false));
+    assert!(has(&window, "New rule app"), "the rules list is in view");
+}
+
+/// e12-fix: the file rows sit on Per-app rules, between the line-join switch and the rule list;
+/// the Folder row is greyed while no file is written, as Processing greys rows under an Off
+/// switch, live once file writing is on, and both rows save the same `[output]` keys.
+#[test]
+fn file_rows_are_on_per_app_rules_greyed_while_off_and_saved() {
+    let l = layout("folder-grey", None);
+    let window = open_tall(&l);
+    sub_tab(&window, "Per-app rules");
+    let y = |label: &str| {
+        i_slint_backend_testing::ElementHandle::find_by_accessible_label(&window, label)
+            .next()
+            .unwrap_or_else(|| panic!("no {label}"))
+            .absolute_position()
+            .y
+    };
+    let file = y("Also write to a file");
+    assert!(y("Join lines in command prompts") < file && file < y("Scan for apps"));
+    let state = window.global::<TextState>();
+    assert_eq!(state.get_file_mode(), 0);
+    let live = || {
+        [
+            one(&window, "File format").accessible_enabled(),
+            one(&window, "Choose folder").accessible_enabled(),
+        ]
+    };
+    assert_eq!(live(), [Some(false), Some(false)], "Off: greyed");
+    state.invoke_file_mode_picked(1);
+    state.set_file_mode(1);
+    assert_eq!(live(), [Some(true), Some(true)], "Paste and write: live");
+    state.invoke_file_format_picked(1);
+    let out = config(&l).config.output;
+    assert_eq!(out.file_mode, FileMode::Also);
+    assert_eq!(out.file_format, FileFormat::Txt);
+}
+
+/// e12-fix, DS-15.1: the Paste mode tiles carry their captions, at the tile's own height (no
+/// pin): each caption ends inside its tile, above the tile's 12 px padding.
+#[test]
+fn paste_tiles_have_captions_inside_the_tile() {
+    let l = layout("paste-tiles", None);
+    let window = open_min(&l);
+    sub_tab(&window, "Paste");
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    for (title, caption) in [
+        ("Clipboard", "Pastes with Ctrl+V"),
+        ("Type", "Types key by key, for games"),
+    ] {
+        let tile = with_role(&window, title, AccessibleRole::RadioButton);
+        let text = one(&window, caption);
+        let bottom =
+            |e: &i_slint_backend_testing::ElementHandle| e.absolute_position().y + e.size().height;
+        assert!(
+            bottom(&text) <= bottom(&tile) - 12.0 + 0.5,
+            "{caption} spills: caption {} tile {}",
+            bottom(&text),
+            bottom(&tile)
+        );
+    }
+}
+
 /// A config with `n` synthetic per-app rules.
 fn many_rules(n: usize) -> String {
     let mut text = String::from("version = 2\n");
@@ -775,6 +869,8 @@ fn every_tab_fits_the_minimum_size_with_long_lists() {
             ("Replacements", "Save replace.txt"),
             ("Paste", "Restore your copy after"),
             ("Per-app rules", "Scan for apps"),
+            ("Per-app rules", "File format"),
+            ("Per-app rules", "Join lines in command prompts"),
             ("Processing", "Doubt level"),
             ("Words", "Snippets"),
         ] {
@@ -828,7 +924,7 @@ fn opening_a_profile_keeps_the_card_size() {
         if h > 520.0 {
             let bottom = i_slint_backend_testing::ElementHandle::find_by_accessible_label(
                 &window,
-                "Pause punctuation",
+                "Join lines",
             )
             .map(|e| e.absolute_position().y + e.size().height)
             .fold(0.0_f32, f32::max);
@@ -923,4 +1019,23 @@ fn apps_popup_is_window_wide_when_the_page_scrolls() {
     let close = one(&window, "Close");
     let right = close.absolute_position().x + close.size().width;
     assert!((right - 640.0).abs() < 0.5, "close button ends at {right}");
+}
+
+/// The Filler words editor is greyed while "Remove filler words" is Off, as Processing's
+/// dependents are, and live again when it is turned on.
+#[test]
+fn the_filler_editor_follows_the_filter() {
+    let window = open_tall(&layout("filler-grey", None));
+    sub_tab(&window, "Words");
+    let state = window.global::<TextState>();
+    state.set_filler_filter(false);
+    assert_eq!(
+        editor(&window, "Filler words").accessible_enabled(),
+        Some(false)
+    );
+    state.set_filler_filter(true);
+    assert_eq!(
+        editor(&window, "Filler words").accessible_enabled(),
+        Some(true)
+    );
 }

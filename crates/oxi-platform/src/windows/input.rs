@@ -6,19 +6,24 @@ use std::thread;
 use std::time::Duration;
 
 use oxi_core::hotkey::Key;
-use oxi_core::paste::{Focus, Foreground, Input, InputBlocked};
+use oxi_core::paste::{Console, Focus, Foreground, Input, InputBlocked};
 use oxi_core::types::Millis;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM,
+};
 use windows_sys::Win32::Security::{
     GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_MANDATORY_LABEL,
     TOKEN_QUERY, TokenIntegrityLevel,
+};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo,
+    EnumChildWindows, GUITHREADINFO, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo,
     GetWindowThreadProcessId,
 };
 use windows_sys::core::BOOL;
@@ -40,6 +45,10 @@ pub(super) const MODIFIERS: [Key; 8] = [
 /// Hosts the frame window of every UWP app, so the app itself is a child window's process.
 const FRAME_HOST: &str = "ApplicationFrameHost.exe";
 
+/// The window class of conhost, the classic console; Windows Terminal's is another
+/// (`CASCADIA_HOSTING_WINDOW_CLASS`), and a console's window reports its shell's process.
+const CONSOLE_CLASS: &str = "ConsoleWindowClass";
+
 /// The longest Win32 path in UTF-16 units.
 const MAX_PATH_UNITS: usize = 32_768;
 
@@ -53,7 +62,19 @@ impl Input for Keyboard {
     }
 
     fn foreground(&self) -> Foreground {
-        foreground()
+        // SAFETY: no arguments.
+        foreground(unsafe { GetForegroundWindow() })
+    }
+
+    fn foreground_console(&self) -> (Foreground, Console) {
+        // SAFETY: no arguments.
+        let window = unsafe { GetForegroundWindow() };
+        let console = if is_console(window) {
+            console(window_pid(window))
+        } else {
+            Console::None
+        };
+        (foreground(window), console)
     }
 
     fn focus(&mut self) -> Option<Focus> {
@@ -108,9 +129,7 @@ fn focus() -> Option<Focus> {
     })
 }
 
-fn foreground() -> Foreground {
-    // SAFETY: no arguments.
-    let window = unsafe { GetForegroundWindow() };
+fn foreground(window: HWND) -> Foreground {
     let frame = window_pid(window);
     let (mut app, mut theirs) = process_facts(frame);
     if app.eq_ignore_ascii_case(FRAME_HOST)
@@ -124,6 +143,67 @@ fn foreground() -> Foreground {
         app,
         elevated: elevated(theirs, ours),
     }
+}
+
+/// Whether `window` is a conhost console window. A null or stale handle is not.
+fn is_console(window: HWND) -> bool {
+    let mut buf = [0u16; 64];
+    // SAFETY: `buf` holds the length passed in units; a null or stale window returns 0.
+    let len = unsafe { GetClassNameW(window, buf.as_mut_ptr(), 64) };
+    usize::try_from(len).is_ok_and(|n| {
+        CONSOLE_CLASS
+            .encode_utf16()
+            .eq(buf[..n.min(64)].iter().copied())
+    })
+}
+
+/// The process tree of console window process `pid` (its shell) from a process snapshot. No
+/// attach to the console: while attached, its Ctrl+C or close would end the daemon. The snapshot
+/// opens no process, so an elevated shell reads like any other. A failed snapshot is
+/// [`Console::Unknown`]. Only exe names and error codes are logged, never dictated text.
+fn console(pid: u32) -> Console {
+    let Some(processes) = processes() else {
+        // SAFETY: no arguments.
+        let error = unsafe { GetLastError() };
+        tracing::info!(
+            error,
+            "classic console: no process snapshot, line breaks kept"
+        );
+        return Console::Unknown;
+    };
+    let console = Console::from_processes(pid, &processes);
+    tracing::info!(?console, "classic console");
+    console
+}
+
+/// Every process as `(pid, parent pid, exe name)`; `None` when the snapshot fails.
+fn processes() -> Option<Vec<(u32, u32, String)>> {
+    // SAFETY: no pointers; a failure is INVALID_HANDLE_VALUE.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let snapshot = Owned(snapshot);
+    let mut entry = PROCESSENTRY32W {
+        dwSize: u32::try_from(size_of::<PROCESSENTRY32W>()).ok()?,
+        ..PROCESSENTRY32W::default()
+    };
+    let mut list = Vec::new();
+    // SAFETY: `entry` is a live local with its size set; the snapshot handle is open.
+    let mut more = unsafe { Process32FirstW(snapshot.0, &raw mut entry) } != 0;
+    while more {
+        let name = &entry.szExeFile;
+        let len = name.iter().position(|&u| u == 0).unwrap_or(name.len());
+        list.push((
+            entry.th32ProcessID,
+            entry.th32ParentProcessID,
+            String::from_utf16_lossy(&name[..len]),
+        ));
+        // SAFETY: as above.
+        more = unsafe { Process32NextW(snapshot.0, &raw mut entry) } != 0;
+    }
+    // The first call failing (ERROR_NO_MORE_FILES on an empty list) is no snapshot.
+    (!list.is_empty()).then_some(list)
 }
 
 /// The app inside a UWP frame: the first child window another process owns. A suspended or
@@ -288,6 +368,38 @@ mod tests {
         for ((theirs, ours), want) in cases {
             assert_eq!(elevated(theirs, ours), want, "{theirs:?} vs {ours:?}");
         }
+    }
+
+    #[test]
+    fn a_null_window_is_no_console() {
+        assert!(!is_console(ptr::null_mut()));
+    }
+
+    /// A real snapshot: a child we start (no window, blocked on its stdin) is in our tree.
+    #[test]
+    fn a_started_child_is_a_descendant() {
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut child = Command::new("cmd.exe")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .expect("cmd.exe starts");
+        let tree = console(std::process::id());
+        child.kill().ok();
+        child.wait().ok();
+        let Console::Classic { descendants, .. } = &tree else {
+            panic!("{tree:?}");
+        };
+        assert!(
+            descendants
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case("cmd.exe")),
+            "{tree:?}"
+        );
     }
 
     #[test]

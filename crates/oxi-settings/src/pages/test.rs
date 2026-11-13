@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use oxi_core::audio::{AudioError, SAMPLE_RATE};
 use oxi_core::config::Audio;
-use oxi_core::history;
+use oxi_core::history::{self, HistoryId};
 use oxi_core::ipc::{HistoryItem, HistoryOp, Push, Request, TestFailure, TestOutcome};
 use oxi_core::machine::Notice;
 use oxi_core::models;
@@ -33,11 +33,12 @@ use slint::{
     VecModel, Weak,
 };
 
-use crate::generated::{TestHeard, TestRow, TestState, TestTake, Toast};
+use crate::generated::{TestHeard, TestRow, TestState, TestTake};
 use crate::ipc::{Event, Link, Subscription};
 use crate::{AppWindow, Ctx, Page, report};
 
 use super::progress::Bars;
+use super::toast;
 use super::tuning as tuning_view;
 use tuning_view::{BARS, clock, history_label, peaks, total};
 
@@ -220,7 +221,7 @@ enum Source {
     /// Recorded on this page: sent to the daemon with `TestAudio`.
     New,
     /// A history entry, by id: the daemon reads it from its folder.
-    History(String),
+    History(HistoryId),
 }
 
 /// A picked recording.
@@ -298,7 +299,7 @@ struct PageState {
     /// The history as the daemon listed it, newest first.
     history: RefCell<Vec<HistoryItem>>,
     /// The ids in the picker: the history not picked yet.
-    offered: RefCell<Vec<String>>,
+    offered: RefCell<Vec<HistoryId>>,
     offered_model: Rc<VecModel<SharedString>>,
     run: RefCell<Option<Run>>,
     /// The bar of the whole run: the one progress driver, not a percent of its own.
@@ -321,7 +322,7 @@ impl PageState {
 
     fn toast(&self, text: &str) {
         if let Some(window) = self.window.upgrade() {
-            window.global::<Toast>().invoke_show(text.into());
+            toast(&window, text);
         }
     }
 
@@ -626,7 +627,7 @@ impl PageState {
 
     /// Fills the picker with the history not picked yet.
     fn offer(&self) {
-        let picked: Vec<String> = self
+        let picked: Vec<HistoryId> = self
             .takes
             .borrow()
             .iter()
@@ -635,7 +636,7 @@ impl PageState {
                 Source::New => None,
             })
             .collect();
-        let (ids, labels): (Vec<String>, Vec<SharedString>) = self
+        let (ids, labels): (Vec<HistoryId>, Vec<SharedString>) = self
             .history
             .borrow()
             .iter()

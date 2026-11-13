@@ -14,7 +14,15 @@ pub mod test;
 mod text;
 pub(crate) mod tuning;
 
+use slint::ComponentHandle;
+
+use crate::generated::Toast;
 use crate::{AppWindow, Ctx};
+
+/// Shows `text` in the window's toast; every page says it this one way.
+fn toast(window: &AppWindow, text: &str) {
+    window.global::<Toast>().invoke_show(text.into());
+}
 
 /// Called on the file poll: the pages that show a file follow it.
 pub fn poll(window: &AppWindow, ctx: &Ctx) {

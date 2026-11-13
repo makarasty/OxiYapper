@@ -238,6 +238,7 @@ fn config_rule_with_every_new_field_round_trips_and_a_bare_rule_writes_only_app(
         voice_commands: Some(true),
         filler_filter: Some(false),
         pause_punctuation: Some(true),
+        join_lines: Some(true),
     };
     let mut file = ConfigFile::parse("version = 2\n").unwrap();
     file.config.paste.rules = vec![
@@ -261,7 +262,11 @@ fn config_rule_with_every_new_field_round_trips_and_a_bare_rule_writes_only_app(
         ..PasteRule::default()
     };
     let cleared = again.to_toml_string().unwrap();
-    assert!(!cleared.contains("type_speed") && !cleared.contains("pause_punctuation"));
+    assert!(
+        !cleared.contains("type_speed")
+            && !cleared.contains("pause_punctuation")
+            && !cleared.contains("join_lines")
+    );
 }
 
 #[test]

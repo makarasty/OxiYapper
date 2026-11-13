@@ -1287,14 +1287,13 @@ fn the_warning_is_a_tab_stop_that_opens_its_tooltip() {
     };
     press_switch(&window, "Log dictated text");
     assert_eq!(copies(), 1);
-    // The rail, the sub-tabs, the "i" of Keep recordings, its two limits and their switch, the
-    // folder field, the two folder buttons, Settings, Logs, the "!". Change folder shows only
-    // where a folder dialog exists (can-browse).
-    let stops = if cfg!(windows) { 12 } else { 11 };
-    for _ in 0..stops {
+    // Tab walks the page's stops (their count varies with the "i" hints and can-browse) until the
+    // "!" opens its tooltip; the bound only stops a page with no such stop from looping forever.
+    let reached = (0..40).any(|_| {
         press(&window, Key::Tab);
-    }
-    assert_eq!(copies(), 2, "focus on the \"!\" opens the tooltip");
+        copies() == 2
+    });
+    assert!(reached, "focus on the \"!\" opens the tooltip");
     press(&window, Key::Tab);
     assert_eq!(copies(), 1, "leaving it closes the tooltip");
     // The focus went on to the row's switch, not back to the top of the window.

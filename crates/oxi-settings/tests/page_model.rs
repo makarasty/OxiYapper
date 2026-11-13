@@ -11,6 +11,7 @@ use std::time::Duration;
 use common::{config, has, layout, open, open_again, open_linked, with_role};
 use i_slint_backend_testing::{AccessibleRole, ElementHandle};
 use oxi_core::config::{ConfigFile, Model};
+use oxi_core::device::Device;
 use oxi_core::ipc::Push;
 use oxi_core::models::MODELS;
 use oxi_core::paths::Layout;
@@ -73,10 +74,7 @@ fn rows_show_size_and_status_from_the_files() {
     assert!(has(&window, "Whisper large-v3 turbo: Not downloaded"));
     // The badge says "Damaged"; the caption only says what to do.
     view(&window, "Whisper large-v3");
-    assert!(has(
-        &window,
-        "3.1 GB · Slower · 99 languages · download it again"
-    ));
+    assert!(has(&window, "download it again"));
     assert!(has(&window, "Whisper large-v3: Damaged"));
     for name in ["Whisper large-v3 turbo", "Whisper large-v3"] {
         view(&window, name);
@@ -896,7 +894,7 @@ fn advanced_has_a_row_per_parameter_and_none_shares_a_glyph() {
         .skip(1)
         .filter_map(|t| t.split(';').next())
         .collect();
-    assert!(icons.len() >= 11, "{icons:?}");
+    assert!(icons.len() >= 10, "{icons:?}");
     let mut seen = std::collections::HashSet::new();
     for icon in icons {
         assert!(seen.insert(icon), "{icon} is on two Advanced controls");
@@ -1020,4 +1018,361 @@ fn the_advanced_rows_draw_distinct_glyph_files() {
             "{file} is on two Advanced controls"
         );
     }
+}
+
+const NOT_ON_DISK: &str = "Dictation will not start until this is downloaded.";
+const SLOW: &str =
+    "Likely slow without a dedicated graphics card. Whisper large-v3 turbo is faster.";
+
+/// UI rule 2: the selected model that is not on disk is shown once (its facts are on the tile)
+/// and its warning is the row's "!" with the words as its tooltip and label, not a line under it.
+#[test]
+fn a_model_not_on_disk_is_named_once_and_warns_in_its_slot() {
+    let window = open(&layout("once", None), Page::Model);
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(720.0, 520.0));
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    assert_eq!(
+        copies(&window, "1.6 GB · Fast · 99 languages"),
+        1,
+        "the model's facts are on its tile and again on the card"
+    );
+    assert_eq!(copies(&window, NOT_ON_DISK), 1, "the warning is a line too");
+    let slot = with_role(&window, NOT_ON_DISK, AccessibleRole::Text);
+    assert!(
+        slot.size().width < 24.0,
+        "the warning is a {} px line, not the slot",
+        slot.size().width
+    );
+}
+
+/// DS-25, UI rule 1: the card of a heavy (slow) model in use keeps its height in every state at
+/// the least window: the warnings are in the "!" slot, the status note on its one line.
+#[test]
+fn the_card_keeps_its_height_in_every_state() {
+    let l = layout(
+        "card-height",
+        Some("version = 2\n[model]\nid = \"large-v3\"\n"),
+    );
+    let (ipc, _sent) = Ipc::fake();
+    let window = open_linked(&l, Page::Model, ipc.clone());
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(720.0, 520.0));
+    // Only an integrated GPU: the 3.1 GB model is likely slow.
+    ipc.deliver(&Event::Push(Push::Devices {
+        mics: vec![],
+        gpus: vec![Device {
+            name: "Vulkan0".into(),
+            description: String::new(),
+            uma: true,
+        }],
+    }));
+    let entry = MODELS.iter().find(|m| m.id == "large-v3").unwrap();
+    fs::create_dir_all(l.models_dir()).unwrap();
+    let file = l.models_dir().join(entry.file_name);
+    let card = |badge: &str| {
+        window.global::<ModelState>().invoke_shown();
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+        assert!(
+            has(&window, &format!("Whisper large-v3: {badge}")),
+            "{badge}"
+        );
+        ElementHandle::find_by_element_type_name(&window, "ModelCard")
+            .next()
+            .expect("the card")
+            .size()
+            .height
+    };
+    let missing = card("Not downloaded");
+    assert!(
+        has(&window, &format!("{NOT_ON_DISK}\n{SLOW}")),
+        "both warnings"
+    );
+    fs::write(&file, b"synthetic").unwrap();
+    let damaged = card("Damaged");
+    common::fake_model(&file, entry.size);
+    let downloaded = card("Downloaded");
+    oxi_core::models::write_stamp(&file).unwrap();
+    let ready = card("Ready");
+    assert!(has(&window, SLOW), "Ready lost the slow warning");
+    for (state, height) in [
+        ("Damaged", damaged),
+        ("Downloaded", downloaded),
+        ("Ready", ready),
+    ] {
+        assert!(
+            (height - missing).abs() < 0.5,
+            "{state}: {height} px, Not downloaded: {missing} px"
+        );
+    }
+}
+
+/// e11: a downloaded (unchecked) or damaged model's card says its status and what to do, not the
+/// tile's facts again.
+#[test]
+fn a_downloaded_or_damaged_card_does_not_repeat_the_tile() {
+    let l = layout("card-note", None);
+    fs::create_dir_all(l.models_dir()).unwrap();
+    let turbo = MODELS.iter().find(|m| m.id == "turbo").unwrap();
+    common::fake_model(&l.models_dir().join(turbo.file_name), turbo.size);
+    fs::write(l.models_dir().join("ggml-large-v3.bin"), b"synthetic").unwrap();
+    let window = open(&l, Page::Model);
+    for (name, badge, note) in [
+        (
+            "Whisper large-v3 turbo",
+            "Downloaded",
+            "checked before first use",
+        ),
+        ("Whisper large-v3", "Damaged", "download it again"),
+    ] {
+        view(&window, name);
+        assert!(has(&window, &format!("{name}: {badge}")), "{name}");
+        let lines: Vec<_> = i_slint_backend_testing::ElementQuery::from_root(&window)
+            .find_all()
+            .into_iter()
+            .filter_map(|e| e.accessible_label())
+            .filter(|t| t.contains(note))
+            .collect();
+        assert_eq!(lines, [note], "{name}");
+    }
+}
+
+/// e11: the chevron beside the language segments says what it opens, and an Auto value is a
+/// shown value, not a greyed input.
+#[test]
+fn the_language_chevron_has_a_word_and_auto_is_not_a_disabled_box() {
+    let window = open(&layout("e11-words", None), Page::Model);
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(720.0, 520.0));
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    assert!(
+        button(&window, "More languages").size().width > 48.0,
+        "a bare chevron"
+    );
+    sub_tab(&window, "Advanced");
+    assert!(
+        has(&window, "Auto uses 4"),
+        "Auto's value is a line of its own"
+    );
+    assert!(
+        !i_slint_backend_testing::ElementQuery::from_root(&window)
+            .find_all()
+            .iter()
+            .any(|e| e.accessible_role() == Some(AccessibleRole::Spinbox)),
+        "a greyed number box beside Auto"
+    );
+}
+
+/// The page sources, for the checks of what the Slint text says (the glyphs are not in the
+/// accessibility tree).
+fn pages() -> Vec<(String, Vec<String>)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/pages");
+    let mut all: Vec<_> = fs::read_dir(dir)
+        .expect("ui/pages")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "slint"))
+        .map(|p| {
+            let text = fs::read_to_string(&p).expect("page source");
+            (
+                p.file_name().unwrap().to_string_lossy().into_owned(),
+                text.lines().map(str::to_owned).collect(),
+            )
+        })
+        .collect();
+    all.sort();
+    all
+}
+
+/// DS-7.8 and DS-24.1: the labelled buttons of a meaning in the table carry its glyph on every
+/// page: Delete the trash, Browse and Choose folder the folder dialog's, Open file the
+/// open-in-another-app arrow. Flow words (Save, Cancel, Use) carry none.
+#[test]
+fn labelled_buttons_follow_the_icon_table() {
+    let table = [
+        ("text: @tr(\"Delete\")", Some("Icons.delete")),
+        ("text: @tr(\"Browse\")", Some("Icons.browse-folder")),
+        ("@tr(\"Choose folder\")", Some("Icons.browse-folder")),
+        ("text: @tr(\"Open file\")", Some("Icons.open-external")),
+        ("text: @tr(\"Save\")", None),
+        ("text: @tr(\"Cancel\")", None),
+        ("text: root.in-use ? @tr(\"In use\")", None),
+    ];
+    let mut seen = 0;
+    for (page, lines) in pages() {
+        for (n, line) in lines.iter().enumerate() {
+            for (needle, glyph) in table {
+                if !line.contains(needle) {
+                    continue;
+                }
+                seen += 1;
+                // The button's own properties: the lines around its text up to the next brace.
+                let around = lines[n.saturating_sub(2)..(n + 4).min(lines.len())].join("\n");
+                let icon = around.lines().find(|l| l.trim_start().starts_with("icon:"));
+                match glyph {
+                    Some(g) => assert!(
+                        icon.is_some_and(|l| l.contains(g)),
+                        "{page}:{}: {needle} wants {g}, has {icon:?}",
+                        n + 1
+                    ),
+                    None => assert!(icon.is_none(), "{page}:{}: {needle} has {icon:?}", n + 1),
+                }
+            }
+        }
+    }
+    assert!(
+        seen >= 8,
+        "only {seen} buttons matched: the table went stale"
+    );
+}
+
+/// DS-7.9: a row never leads with a glyph of the table: no button in it can repeat it.
+#[test]
+fn rows_do_not_lead_with_an_action_glyph() {
+    let action = [
+        "delete",
+        "folder-open",
+        "copy",
+        "download",
+        "retry",
+        "edit",
+        "add",
+        "browse-folder",
+        "open-external",
+        "scan",
+        "revert",
+        "close",
+    ];
+    for (page, lines) in pages() {
+        for (n, pair) in lines.windows(2).enumerate() {
+            if !pair[0].trim_end().ends_with("Row {") {
+                continue;
+            }
+            let icon = pair[1].trim();
+            for name in action {
+                for suffix in ["", "-16"] {
+                    let glyph = format!("icon: Icons.{name}{suffix};");
+                    assert!(icon != glyph, "{page}:{}: a row leads with {glyph}", n + 2);
+                }
+            }
+        }
+    }
+}
+
+/// UI rule 35 (DS-11.1): Advanced says what Auto means in the "i" of its first group, not in a
+/// line of its own.
+#[test]
+fn the_advanced_tab_has_no_loose_caption() {
+    let slint = include_str!("../ui/pages/model.slint");
+    let tab = &slint[slint.find("ModelState.tab == 2").expect("the Advanced tab")..];
+    assert!(!tab.contains("Caption {"), "a loose Caption on Advanced");
+    assert!(
+        tab.contains("info: @tr(\"Expert settings. Auto means"),
+        "no \"i\""
+    );
+}
+
+/// The file each `Icons.` constant draws, from `theme/icons.slint`.
+fn icon_file(name: &str) -> String {
+    include_str!("../ui/theme/icons.slint")
+        .lines()
+        .find(|l| l.contains(&format!("property <image> {name}:")))
+        .unwrap_or_else(|| panic!("no icon {name}"))
+        .split("icons/")
+        .nth(1)
+        .and_then(|t| t.split('"').next())
+        .expect("an icon file")
+        .to_owned()
+}
+
+/// DS-24.1, DS-7.9: on Model > Settings no two rows lead with the same glyph file, and the Files
+/// rows lead with no glyph of a model class or an action (the review found the brain of "most
+/// accurate" on Models folder and the idle-unload timer on Partial downloads).
+#[test]
+fn settings_rows_lead_with_distinct_glyphs() {
+    let slint = include_str!("../ui/pages/model.slint");
+    let tab = &slint[slint.find("ModelState.tab == 1").expect("the Settings tab")
+        ..slint.find("ModelState.tab == 2").expect("the Advanced tab")];
+    let lines: Vec<&str> = tab.lines().collect();
+    let leads: Vec<&str> = lines
+        .windows(2)
+        .filter(|p| p[0].trim_end().ends_with("Row {"))
+        .filter_map(|p| p[1].trim().strip_prefix("icon: Icons.")?.strip_suffix(';'))
+        .collect();
+    assert!(leads.len() >= 5, "{leads:?}");
+    let mut seen = std::collections::HashMap::new();
+    for name in &leads {
+        let file = icon_file(name);
+        if let Some(other) = seen.insert(file.clone(), *name) {
+            panic!("{other} and {name} both draw {file}");
+        }
+    }
+    let taken: Vec<String> = [
+        "model-accurate",
+        "model-fast",
+        "model-small",
+        "model-own",
+        "timer",
+        "browse-folder",
+        "browse-file",
+        "folder-open",
+        "delete",
+        "download",
+    ]
+    .iter()
+    .map(|n| icon_file(n))
+    .collect();
+    for name in ["models-folder", "partial-downloads"] {
+        assert!(leads.contains(&name), "no row leads with {name}");
+        assert!(!taken.contains(&icon_file(name)), "{name} reuses a glyph");
+    }
+}
+
+// Slint's generated code trips the workspace `unused_qualifications` lint; it is not ours to fix.
+#[allow(unused_qualifications)]
+mod browse_probe {
+    slint::slint! {
+        import { Icons, PathField } from "../ui/theme/index.slint";
+        export component BrowseProbe inherits Window {
+            in property <bool> file;
+            out property <image> glyph: f.browse-icon;
+            out property <image> file-glyph: Icons.browse-file;
+            out property <image> folder-glyph: Icons.browse-folder;
+            width: 400px;
+            height: 100px;
+            f := PathField {
+                path: "C:/models/a.bin";
+                browse-text: "Browse";
+                picks-file: root.file;
+            }
+        }
+    }
+}
+
+/// DS-24: Browse for the own model picks a `.bin` file, so it shows `browse-file`; a folder
+/// picker keeps `browse-folder`.
+#[test]
+fn a_file_picking_path_field_shows_the_file_glyph() {
+    i_slint_backend_testing::init_no_event_loop();
+    let probe = browse_probe::BrowseProbe::new().unwrap();
+    assert_ne!(probe.get_file_glyph(), probe.get_folder_glyph());
+    probe.set_file(true);
+    assert!(
+        probe.get_glyph() == probe.get_file_glyph(),
+        "a file picker shows browse-folder"
+    );
+    probe.set_file(false);
+    assert!(
+        probe.get_glyph() == probe.get_folder_glyph(),
+        "a folder picker lost browse-folder"
+    );
+    let slint = include_str!("../ui/pages/model.slint");
+    let field = &slint[slint.find("PathField {").expect("the own model field")..];
+    let field = &field[..field.find("browse(path)").expect("its Browse")];
+    assert!(
+        field.contains("picks-file: true;"),
+        "the .bin Browse shows browse-folder"
+    );
 }

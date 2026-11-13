@@ -542,8 +542,6 @@ fn light_theme_is_concept_c() {
         ("on-accent", t.get_on_accent(), 0xFFFF_FFFF),
         ("accent-tint", t.get_accent_tint(), 0xFFF8_E4E2),
         ("accent-badge", t.get_accent_badge(), 0xFFF8_E4E2),
-        // Deprecated alias of the accent (DS-21.5).
-        ("recording", t.get_recording(), 0xFFD9_3A3F),
         ("accent-hover", t.get_accent_hover(), 0xFFC3_3439),
         ("accent-pressed", t.get_accent_pressed(), 0xFFAE_2E32),
         ("accent-text", t.get_accent_text(), 0xFFBF_3337),

@@ -267,6 +267,10 @@ impl Clipboard for HistClip {
 struct Keys {
     held: bool,
     elevated: bool,
+    /// The foreground app, notepad.exe when `None`.
+    app: Option<&'static str>,
+    /// The foreground window as a classic console.
+    console: Console,
     typed: Option<String>,
     /// Every `send_units` batch, in order.
     sent: Vec<Vec<u16>>,
@@ -281,9 +285,12 @@ impl Input for Keys {
     }
     fn foreground(&self) -> Foreground {
         Foreground {
-            app: "notepad.exe".into(),
+            app: self.app.unwrap_or("notepad.exe").into(),
             elevated: self.elevated,
         }
+    }
+    fn foreground_console(&self) -> (Foreground, Console) {
+        (self.foreground(), self.console.clone())
     }
     fn send_chord(&mut self, _: &[Key]) -> Result<(), InputBlocked> {
         Ok(())
@@ -1349,6 +1356,8 @@ fn a_text_put_for_the_enter_proof_still_reaches_win_v_and_the_copy_comes_back() 
 /// Review d08-fix2 #1: the target still holds the clipboard when `settle` tries, and its delayed
 /// render has moved the number. The number `settle` answers is the current one, so the restore
 /// takes the render for ours and puts the user's copy back (never `Theirs`, never lost).
+/// Covers the core decision against the fake (`settle_held`) only; the platform guard is
+/// `after_unopened` in `oxi-platform/src/windows/clipboard.rs`, tested there.
 #[test]
 fn a_clipboard_still_held_at_settle_still_gets_the_users_copy_back() {
     let mut clip = HistClip {
@@ -1360,4 +1369,166 @@ fn a_clipboard_still_held_at_settle_still_gets_the_users_copy_back() {
     assert_eq!(dictate(&mut clip, &cfg, &mut ours, 1), PasteOutcome::Pasted);
     assert_eq!(clip.current, "my copy");
     assert_eq!(clip.restores, 1);
+}
+
+/// Owner 2026-11-12, e08: line breaks become spaces only where one runs a command, a classic
+/// console whose cmd.exe has no descendant but its console host (its window says cmd.exe even
+/// with Claude Code inside); the app's rule wins either way, and the setting off leaves the
+/// default alone.
+#[test]
+fn lines_are_joined_only_in_a_plain_cmd_console_unless_a_rule_says_otherwise() {
+    let rule = |app: &str, on| PasteRule {
+        app: app.into(),
+        join_lines: Some(on),
+        ..PasteRule::default()
+    };
+    let classic = |shell: &str, names: &[&str]| Console::Classic {
+        shell: shell.into(),
+        descendants: names.iter().map(|&n| n.into()).collect(),
+    };
+    let on = Paste::default();
+    assert!(on.join_console_lines, "on by default");
+    for (app, console, want) in [
+        ("cmd.exe", classic("cmd.exe", &[]), true),
+        ("CMD.EXE", classic("CMD.EXE", &["conhost.exe"]), true),
+        ("cmd.exe", classic("cmd.exe", &["OpenConsole.exe"]), true),
+        // An elevated cmd whose image name we may not read: the snapshot's name decides.
+        ("", classic("cmd.exe", &["conhost.exe"]), true),
+        // Claude Code, node, pwsh or python run from cmd: the window still says cmd.exe.
+        (
+            "cmd.exe",
+            classic("cmd.exe", &["conhost.exe", "claude.exe"]),
+            false,
+        ),
+        ("cmd.exe", classic("cmd.exe", &["node.exe"]), false),
+        ("cmd.exe", classic("cmd.exe", &["pwsh.exe"]), false),
+        ("cmd.exe", classic("cmd.exe", &["python.exe"]), false),
+        // A descendant whose name is unreadable, an unreadable tree, another shell.
+        ("cmd.exe", classic("cmd.exe", &[""]), false),
+        ("cmd.exe", Console::Unknown, false),
+        ("powershell.exe", classic("powershell.exe", &[]), false),
+        // cmd.exe hosted by Windows Terminal: its window is WindowsTerminal.exe's, not a console.
+        ("cmd.exe", Console::None, false),
+        ("WindowsTerminal.exe", Console::None, false),
+        ("notepad.exe", Console::None, false),
+    ] {
+        assert_eq!(join_lines(&on, app, &console), want, "{app} {console:?}");
+    }
+    let off = Paste {
+        join_console_lines: false,
+        ..Paste::default()
+    };
+    assert!(
+        !join_lines(&off, "cmd.exe", &classic("cmd.exe", &[])),
+        "the setting off"
+    );
+    let rules = Paste {
+        rules: vec![rule("WindowsTerminal.exe", true), rule("cmd.exe", false)],
+        ..off.clone()
+    };
+    assert!(
+        join_lines(&rules, "windowsterminal.exe", &Console::None),
+        "rule on"
+    );
+    assert!(!join_lines(
+        &Paste {
+            join_console_lines: true,
+            ..rules
+        },
+        "cmd.exe",
+        &classic("cmd.exe", &[])
+    ));
+}
+
+/// The process tree under the console window's process: children and grandchildren, not the
+/// root, not strangers; a parent-pid loop ends; pid 0 or an exited root is unknown.
+#[test]
+fn a_console_tree_holds_every_descendant_of_its_window_process() {
+    let snapshot: Vec<(u32, u32, String)> = [
+        (0, 0, "[System Process]"),
+        (4, 0, "System"),
+        (90, 104, "explorer.exe"), // root's parent pid reused by its grandchild: a loop
+        (100, 90, "cmd.exe"),
+        (101, 100, "conhost.exe"),
+        (102, 100, "claude.exe"),
+        (103, 102, "node.exe"),
+        (104, 103, "pwsh.exe"),
+        (200, 4, "smss.exe"),
+    ]
+    .into_iter()
+    .map(|(pid, parent, name)| (pid, parent, name.to_owned()))
+    .collect();
+    let names = |names: &[&str]| names.iter().map(|&n| n.to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        Console::from_processes(100, &snapshot),
+        Console::Classic {
+            shell: "cmd.exe".into(),
+            descendants: names(&[
+                "conhost.exe",
+                "claude.exe",
+                "node.exe",
+                "pwsh.exe",
+                "explorer.exe"
+            ]),
+        }
+    );
+    assert_eq!(
+        Console::from_processes(101, &snapshot),
+        Console::Classic {
+            shell: "conhost.exe".into(),
+            descendants: Vec::new(),
+        }
+    );
+    assert_eq!(Console::from_processes(0, &snapshot), Console::Unknown);
+    assert_eq!(Console::from_processes(555, &snapshot), Console::Unknown);
+}
+
+/// The joined text is what reaches the window, by Ctrl+V or on the clipboard only; other windows
+/// get the line breaks.
+#[test]
+fn a_cmd_console_gets_the_dictation_on_one_line() {
+    let cmd = || Keys {
+        app: Some("cmd.exe"),
+        console: Console::Classic {
+            shell: "cmd.exe".into(),
+            descendants: vec!["conhost.exe".into()],
+        },
+        ..Keys::default()
+    };
+    let text = "dir\r\nnext\n\nend";
+    let mut clip = HistClip::new("my copy");
+    let (out, _) = with_steps(text, &Paste::default(), &mut clip, &mut cmd());
+    assert_eq!(out, PasteOutcome::Pasted);
+    assert!(
+        clip.list.iter().any(|(_, d)| d == "dir next end"),
+        "{:?}",
+        clip.list.len()
+    );
+    assert_eq!(clip.current, "my copy");
+    let mut clip = HistClip::new("my copy");
+    let mut admin = Keys {
+        elevated: true,
+        ..cmd()
+    };
+    let (out, _) = with_steps(text, &Paste::default(), &mut clip, &mut admin);
+    assert!(matches!(out, PasteOutcome::ClipboardOnly(_)), "{out:?}");
+    assert_eq!(clip.current, "dir next end");
+    // Modifiers still down after the wait: the clipboard-only text is joined too.
+    let mut clip = HistClip::new("my copy");
+    let mut held = Keys {
+        held: true,
+        ..cmd()
+    };
+    let (out, _) = with_steps(text, &Paste::default(), &mut clip, &mut held);
+    assert_eq!(
+        out,
+        PasteOutcome::ClipboardOnly(ClipboardOnlyWhy::ModifiersHeld)
+    );
+    assert_eq!(clip.current, "dir next end");
+    let mut clip = HistClip::new("my copy");
+    with_steps(text, &Paste::default(), &mut clip, &mut Keys::default());
+    assert!(
+        clip.list.iter().any(|(_, d)| d == text),
+        "notepad keeps them"
+    );
 }

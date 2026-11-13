@@ -44,6 +44,8 @@ export global HomeState {
     callback fit();
     callback pick(int);
     callback open-history();
+    // The History page (not its folder).
+    callback show-history();
     // Heatmap cell `i` (an index into `levels`) was clicked: History opens on that day.
     callback open-day(int);
 }
@@ -110,7 +112,7 @@ export component HomePage inherits VerticalLayout {
     property <bool> blank: root.trend-open ? HomeState.trend-days == 0 : HomeState.empty;
     // The hint behind the activity card's "i" (UI rule 35: no loose explanatory text).
     property <string> how: HomeState.toggle ? @tr("Press {} once to start, again to stop.", HomeState.chord) : @tr("Hold {} and speak.", HomeState.chord);
-    property <string> hint: root.how + " " + (HomeState.empty ? @tr("Your words, pace and streak show up here after the first dictation.") : @tr("Click a card above to see it day by day."));
+    property <string> hint: root.trend-open ? root.how : root.how + " " + (HomeState.empty ? @tr("Your words, pace and streak show up here after the first dictation.") : @tr("Click a card above to see it day by day."));
     // Indexes into `stats`: a new number must update the cards, not rebuild them (focus and hover
     // live in the instances).
     property <[[int]]> rows: root.one-row ? [[0, 1, 2, 3]] : [[0, 1], [2, 3]];
@@ -137,11 +139,11 @@ export component HomePage inherits VerticalLayout {
         title: root.trend-open ? root.stats[HomeState.selected].trend : @tr("Speaking activity");
         icon: root.trend-open ? root.stats[HomeState.selected].icon : Icons.calendar;
         info: root.hint;
-        action-text: @tr("History folder");
-        action-icon: Icons.folder-open-16;
-        action-tip: HomeState.history-on ? @tr("Opens the folder with your dictated text and audio. Statistics keep only dates and counts.") : @tr("Opens the History folder. Statistics keep only dates and counts, never the text.");
+        // Past dictations live on the History page; the folder itself opens from System > Recordings.
+        action-text: @tr("Open History");
+        action-tip: @tr("Your past dictations, with text and audio when saving is on. Statistics keep only dates and counts.");
         action => {
-            HomeState.open-history();
+            HomeState.show-history();
         }
         CardFrame {
             vertical-stretch: 0;

@@ -872,6 +872,22 @@ fn mic_open_failure_gives_error_and_no_whisper_call() {
     assert_eq!(s.phase(), Phase::Idle);
 }
 
+#[test]
+fn no_input_device_gives_its_own_notice() {
+    let mut s = Sim::loaded();
+    s.at(0, Event::ChordDown);
+    let fx = s.core(40, Event::NoMicrophone);
+    assert_eq!(
+        fx,
+        [
+            Effect::DiscardCapture,
+            Effect::Play(Sound::Error),
+            Effect::Notify(Notice::NoMicrophone)
+        ]
+    );
+    assert_eq!(s.phase(), Phase::Idle);
+}
+
 // Triage #12: a mic that fails after speech keeps its audio, as a job whisper never sees.
 #[test]
 fn mic_failure_after_speech_keeps_the_audio() {

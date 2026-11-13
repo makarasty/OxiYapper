@@ -12,8 +12,8 @@ use interprocess::os::windows::security_descriptor::{
     AsSecurityDescriptorExt, BorrowedSecurityDescriptor, SecurityDescriptor,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE,
-    INVALID_HANDLE_VALUE, LocalFree,
+    ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED,
+    ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
@@ -25,12 +25,14 @@ use windows_sys::Win32::Security::{
     TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
     SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
 };
-use windows_sys::Win32::System::IO::CancelIoEx;
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, WaitNamedPipeW};
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, GetCurrentProcess, OpenProcessToken, WaitForSingleObject,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, GetForegroundWindow, GetWindowThreadProcessId,
 };
@@ -331,4 +333,59 @@ pub fn with_deadline<R>(
             r => r,
         }
     })
+}
+
+/// One overlapped read on `h` (a pipe opened with `FILE_FLAG_OVERLAPPED`, as both ends here
+/// are) that gives up after `limit` with `TimedOut`. It waits on the read's own event, so a
+/// poll costs no thread (F7). `Ok(0)` is the peer's close, as interprocess reads it.
+pub fn read_within(h: BorrowedHandle<'_>, buf: &mut [u8], limit: Duration) -> io::Result<usize> {
+    // SAFETY: no attributes or name; manual reset, as an OVERLAPPED event must be.
+    let event = unsafe { CreateEventW(null(), 1, 0, null()) };
+    if event.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: CreateEventW succeeded, so we own the handle.
+    let event = unsafe { OwnedHandle::from_raw_handle(event) };
+    let mut ov = OVERLAPPED {
+        hEvent: event.as_raw_handle(),
+        ..OVERLAPPED::default()
+    };
+    let raw = h.as_raw_handle();
+    let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+    // SAFETY: `buf` and `ov` outlive the read: GetOverlappedResult below waits for its end on
+    // every path, a cancelled one included.
+    if unsafe { ReadFile(raw, buf.as_mut_ptr(), len, null_mut(), &raw mut ov) } == 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(ERROR_IO_PENDING.cast_signed()) {
+            return eof_or(err);
+        }
+        // Rounded down: a sub-millisecond rest is a last look, never INFINITE (u32::MAX).
+        let ms = u32::try_from(limit.as_millis()).unwrap_or(u32::MAX - 1);
+        // SAFETY: `event` is open; a failed wait cancels like a timeout.
+        if unsafe { WaitForSingleObject(event.as_raw_handle(), ms) } != WAIT_OBJECT_0 {
+            // SAFETY: aborts only this read; it may already have ended, which is fine.
+            unsafe { CancelIoEx(raw, &raw const ov) };
+        }
+    }
+    let mut n = 0u32;
+    // SAFETY: bWait = TRUE: returns only once the read has ended, so nothing writes `buf` later.
+    if unsafe { GetOverlappedResult(raw, &raw const ov, &raw mut n, 1) } == 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_OPERATION_ABORTED.cast_signed()) {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "IPC I/O timed out"));
+        }
+        return eof_or(err);
+    }
+    Ok(n as usize)
+}
+
+/// A closed pipe (`ERROR_BROKEN_PIPE`, `ERROR_PIPE_NOT_CONNECTED`) reads as end of file.
+fn eof_or(err: io::Error) -> io::Result<usize> {
+    if err.kind() == io::ErrorKind::BrokenPipe
+        || err.raw_os_error() == Some(ERROR_PIPE_NOT_CONNECTED.cast_signed())
+    {
+        Ok(0)
+    } else {
+        Err(err)
+    }
 }

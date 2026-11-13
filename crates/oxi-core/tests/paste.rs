@@ -7,7 +7,7 @@ use oxi_core::config::{Paste, PasteMode, PasteRule};
 use oxi_core::hotkey::Key;
 use oxi_core::paste::{
     ClipError, Clipboard, ClipboardOnlyWhy, Foreground, Input, InputBlocked, OurEntries,
-    PasteOutcome, Plan, Snap, TYPE_GAP, copy_only, paste, plan,
+    PasteOutcome, Plan, Snap, copy_only, paste, plan,
 };
 use oxi_core::types::Millis;
 
@@ -115,8 +115,7 @@ impl Input for FakeInput {
             Ok(())
         }
     }
-    fn type_units(&mut self, units: &[u16], gap: Millis) -> Result<(), InputBlocked> {
-        assert_eq!(gap, TYPE_GAP);
+    fn send_units(&mut self, units: &[u16]) -> Result<(), InputBlocked> {
         self.log.borrow_mut().push(Call::Type(units.to_vec()));
         if self.type_blocked {
             Err(InputBlocked)

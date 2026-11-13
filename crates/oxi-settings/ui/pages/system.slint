@@ -336,7 +336,7 @@ export component SystemPage inherits VerticalLayout {
     }
     }
     if SystemState.tab == 1: Card {
-            // Its own row: two limit fields and the switch (252 px) overflow the 240 px column.
+            // Its own row: the limit fields and the switch overflow the 240 px column.
             ToggleRow {
                 flat: true;
                 title: @tr("Save recordings");
@@ -347,12 +347,13 @@ export component SystemPage inherits VerticalLayout {
                 }
             }
             Divider { }
+            // Two rows, one limit each: a pair of bare boxes did not say which was age and which size.
             Row {
-                title: @tr("Keep recordings");
+                title: @tr("Keep for");
                 // Limits act on the folder below, saving on or off; an earlier folder is never touched
                 // (SPEC History, owner 2026-11-10).
+                // The words are asserted by tests/page_overlay_system.rs.
                 info: @tr("Keeps audio and text in the folder below up to these limits. Older ones are deleted, even while off.");
-                warning: SystemState.history-limit-note;
                 NumberField {
                     value <=> SystemState.history-days;
                     maximum: 999;
@@ -368,6 +369,12 @@ export component SystemPage inherits VerticalLayout {
                         SystemState.history-days-changed(days);
                     }
                 }
+            }
+            Divider { }
+            Row {
+                title: @tr("Size limit");
+                info: @tr("When the folder below grows past this size, the oldest recordings are deleted.");
+                warning: SystemState.history-limit-note;
                 NumberField {
                     value <=> SystemState.history-gb;
                     maximum: 999;
@@ -421,6 +428,7 @@ export component SystemPage inherits VerticalLayout {
                     spacing: Theme.control-gap;
                     if SystemState.can-browse: Button {
                         text: @tr("Browse");
+                        icon: Icons.browse-folder;
                         accessible-label: @tr("Change recordings folder");
                         enabled: !Shell.locked;
                         tooltip: Shell.locked-tip;
@@ -447,6 +455,7 @@ export component SystemPage inherits VerticalLayout {
             Divider { }
             Row {
                 title: @tr("Open a folder");
+                info: @tr("Settings holds config.toml and your dictionary; Logs holds the log files.");
                 Button {
                     text: @tr("Settings");
                     kind: ButtonKind.soft;
@@ -472,6 +481,7 @@ export component SystemPage inherits VerticalLayout {
             ToggleRow {
                 flat: true;
                 title: @tr("Log dictated text");
+                info: @tr("Writes what you dictate into the log files, to help find a bug. Off by default.");
                 warning: SystemState.log-text ? @tr("Dictated text is written to the log files while this is on. Turn it off when you are done.") : "";
                 checked <=> SystemState.log-text;
                 toggled(on) => {

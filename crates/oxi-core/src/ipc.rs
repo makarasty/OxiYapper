@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::APP_NAME;
 use crate::config::OverlayPosition;
 use crate::device::{Device, DeviceChoice};
+pub use crate::history::HistoryId;
 use crate::history::Status as HistoryStatus;
 use crate::hotkey::Key;
 use crate::machine::{Phase, Sound};
@@ -85,7 +86,7 @@ pub enum Request {
     /// The saved recordings, newest first, answered with [`Push::History`]. `older_than` is the
     /// `id` of the last item already held (the next page); `None` starts at the newest.
     HistoryList {
-        older_than: Option<String>,
+        older_than: Option<HistoryId>,
     },
     /// The recordings that hold every word of `query` and pass the filters, newest first, answered
     /// with [`Push::HistoryFound`] carrying `seq` (a newer search makes the older answers stale).
@@ -97,7 +98,7 @@ pub enum Request {
         day: Option<String>,
         min_ms: Option<u64>,
         max_ms: Option<u64>,
-        older_than: Option<String>,
+        older_than: Option<HistoryId>,
     },
     /// Transcribe the audio file at `path` in `language`: the daemon decodes and cuts it, runs the
     /// pieces one by one in the test slot, and saves the text as a History record. Progress is
@@ -116,14 +117,14 @@ pub enum Request {
     /// same one-run-at-a-time slot. The result is stored only by [`Request::HistorySetText`].
     HistoryRetranscribe {
         run: u32,
-        id: String,
+        id: HistoryId,
         set: SettingsSet,
         language: Language,
     },
     /// Store `text` as the transcript of recording `id`, made by `set` in `language`. Answered
     /// with [`Push::HistoryResult`].
     HistorySetText {
-        id: String,
+        id: HistoryId,
         text: Spoken,
         set: SettingsSet,
         language: Language,
@@ -137,7 +138,7 @@ pub enum Request {
     /// [`Push::TestProgress`] carries `run` meanwhile.
     HistoryWords {
         run: u32,
-        id: String,
+        id: HistoryId,
     },
     /// The word-times run `run` is no longer wanted (the pick moved on): the worker stops it and
     /// it answers [`Push::HistoryWords`] `Busy`, and the slot is free at once. Nothing when that
@@ -149,18 +150,18 @@ pub enum Request {
     /// it (model, language, settings) stays. The old text is kept as the other version. Answered
     /// with [`Push::HistoryResult`] (`Edit`).
     HistoryEdit {
-        id: String,
+        id: HistoryId,
         text: Spoken,
     },
     /// Swap the transcript of recording `id` with its other version (Restore old, Use new); the
     /// swap undoes itself. Answered with [`Push::HistoryResult`] (`Restore`), `ok` false when no
     /// other version is kept.
     HistoryRestore {
-        id: String,
+        id: HistoryId,
     },
     /// Delete recording `id` (audio, text and meta). Answered with [`Push::HistoryResult`].
     HistoryDelete {
-        id: String,
+        id: HistoryId,
     },
     /// Delete the downloaded model `id` and any partial download of it. Answered with
     /// [`Push::ModelDeleted`].
@@ -226,7 +227,7 @@ pub enum WordsFailure {
 pub enum FileResult {
     /// Saved as History record `id`.
     Done {
-        id: String,
+        id: HistoryId,
     },
     Failed {
         why: FileFailure,
@@ -261,8 +262,8 @@ pub enum FileFailure {
 /// One saved recording as the History page lists it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryItem {
-    /// `YYYY-MM-DD/HHMMSS-mmm`, the id every history request takes.
-    pub id: String,
+    /// The id every history request takes.
+    pub id: HistoryId,
     pub status: HistoryStatus,
     pub duration_ms: u64,
     /// Registry id of the model that made the text; empty when unknown.
@@ -607,7 +608,7 @@ pub enum Push {
     /// Answer to [`Request::HistoryWords`] with the same `run`.
     HistoryWords {
         run: u32,
-        id: String,
+        id: HistoryId,
         result: WordsResult,
     },
     /// The words of the history run `id` (a Transcribe again), sent just before its
@@ -619,7 +620,7 @@ pub enum Push {
     /// Answer to [`Request::HistorySetText`], [`Request::HistoryEdit`], [`Request::HistoryRestore`]
     /// and [`Request::HistoryDelete`].
     HistoryResult {
-        id: String,
+        id: HistoryId,
         op: HistoryOp,
         ok: bool,
     },
@@ -634,7 +635,7 @@ pub enum Push {
     },
     /// Recordings the retention limits removed. Sent unasked, one message per pass.
     HistoryRemoved {
-        ids: Vec<String>,
+        ids: Vec<HistoryId>,
     },
     /// The watcher saw `file` change on disk (after its debounce).
     FileChanged {
@@ -951,16 +952,16 @@ mod tests {
         let requests = vec![
             Request::HistoryList { older_than: None },
             Request::HistoryList {
-                older_than: Some("2026-11-10/101500-123".into()),
+                older_than: Some(HistoryId::parse("2026-11-10/101500-123").unwrap()),
             },
             Request::HistoryRetranscribe {
                 run: 4,
-                id: "2026-11-10/101500-123".into(),
+                id: HistoryId::parse("2026-11-10/101500-123").unwrap(),
                 set: set.clone(),
                 language: Language::RU,
             },
             Request::HistorySetText {
-                id: "2026-11-10/101500-123".into(),
+                id: HistoryId::parse("2026-11-10/101500-123").unwrap(),
                 text: Spoken("secret words".into()),
                 set,
                 language: Language::RU,
@@ -973,7 +974,7 @@ mod tests {
             },
             Request::HistoryWords {
                 run: 3,
-                id: "2026-11-10/101500-123".into(),
+                id: HistoryId::parse("2026-11-10/101500-123").unwrap(),
             },
             Request::HistoryWordsCancel { run: 3 },
             Request::HistorySearch {
@@ -982,7 +983,7 @@ mod tests {
                 day: Some("2026-11-10".into()),
                 min_ms: Some(500),
                 max_ms: None,
-                older_than: Some("2026-11-10/101500-123".into()),
+                older_than: Some(HistoryId::parse("2026-11-10/101500-123").unwrap()),
             },
             Request::TranscribeFile {
                 run: 5,
@@ -991,14 +992,14 @@ mod tests {
             },
             Request::TranscribeFileCancel { run: 5 },
             Request::HistoryEdit {
-                id: "2026-11-10/101500-123".into(),
+                id: HistoryId::parse("2026-11-10/101500-123").unwrap(),
                 text: Spoken("secret words".into()),
             },
             Request::HistoryRestore {
-                id: "2026-11-10/101500-123".into(),
+                id: HistoryId::parse("2026-11-10/101500-123").unwrap(),
             },
             Request::HistoryDelete {
-                id: "2026-11-10/101500-123".into(),
+                id: HistoryId::parse("2026-11-10/101500-123").unwrap(),
             },
             Request::DeleteModel { id: "turbo".into() },
         ];
@@ -1019,7 +1020,7 @@ mod tests {
             },
             Push::History {
                 items: vec![HistoryItem {
-                    id: "2026-11-10/101500-123".into(),
+                    id: HistoryId::parse("2026-11-10/101500-123").unwrap(),
                     status: HistoryStatus::Done,
                     duration_ms: 1500,
                     model: "turbo".into(),
@@ -1048,17 +1049,17 @@ mod tests {
             Push::FileResult {
                 run: 5,
                 result: FileResult::Done {
-                    id: "2026-11-10/101500-123".into(),
+                    id: HistoryId::parse("2026-11-10/101500-123").unwrap(),
                 },
             },
             Push::HistoryResult {
-                id: "2026-11-10/101500-123".into(),
+                id: HistoryId::parse("2026-11-10/101500-123").unwrap(),
                 op: HistoryOp::Delete,
                 ok: true,
             },
             Push::HistoryWords {
                 run: 3,
-                id: "2026-11-10/101500-123".into(),
+                id: HistoryId::parse("2026-11-10/101500-123").unwrap(),
                 result: WordsResult::Ready {
                     words: Words(vec![crate::history::Word {
                         w: "secret".into(),
@@ -1071,14 +1072,14 @@ mod tests {
             },
             Push::HistoryWords {
                 run: 4,
-                id: "2026-11-10/101500-123".into(),
+                id: HistoryId::parse("2026-11-10/101500-123").unwrap(),
                 result: WordsResult::Unavailable {
                     why: WordsFailure::NoAudio,
                 },
             },
             Push::HistoryWords {
                 run: 5,
-                id: "2026-11-10/101500-123".into(),
+                id: HistoryId::parse("2026-11-10/101500-123").unwrap(),
                 result: WordsResult::Busy,
             },
             Push::HistoryRunWords {
@@ -1116,7 +1117,7 @@ mod words_tests {
     fn a_set_text_from_an_older_window_has_no_words() {
         // The line of a window that sent no `words` field.
         let with = encode(&Request::HistorySetText {
-            id: "2026-11-10/101500-123".into(),
+            id: HistoryId::parse("2026-11-10/101500-123").unwrap(),
             text: Spoken("x".into()),
             set: SettingsSet::defaults(),
             language: Language::RU,

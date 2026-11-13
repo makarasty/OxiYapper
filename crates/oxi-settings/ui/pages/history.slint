@@ -654,6 +654,9 @@ component Detail inherits CardFrame {
     property <bool> busy: root.running || HistoryState.timing;
     // Set by the page from its own width: the detail's width depends on what it holds.
     in property <bool> narrow;
+    // The card takes what the list leaves; what it holds (a row of buttons) caps no width of it.
+    min-width: 0;
+    max-width: 100000px;
     changed entry => {
         root.asking = false;
     }
@@ -663,7 +666,7 @@ component Detail inherits CardFrame {
         padding-top: Theme.card-padding-v;
         padding-bottom: Theme.card-padding-v;
         spacing: Theme.space-3;
-        // Start: Play, then the length; end: Copy, folder, Transcribe again, Delete last (DS-23).
+        // The player: Play, how it plays, the wave, the length; Delete last (DS-23).
         HorizontalLayout {
             spacing: Theme.control-gap;
             height: Theme.control-height;
@@ -708,44 +711,7 @@ component Detail inherits CardFrame {
                 vertical-alignment: center;
                 horizontal-stretch: 0;
             }
-            IconButton {
-                icon: Icons.copy;
-                label: @tr("Copy text");
-                enabled: root.entry.text != "";
-                clicked => {
-                    copier.text = root.entry.text;
-                    copier.select-all();
-                    copier.copy();
-                    copier.clear-selection();
-                    Toast.show(@tr("Copied."));
-                }
-            }
-            IconButton {
-                icon: Icons.folder-open;
-                label: @tr("Show in folder");
-                clicked => {
-                    HistoryState.show-folder();
-                }
-            }
-            IconButton {
-                icon: Icons.download;
-                label: @tr("Export");
-                enabled: root.entry.text != "";
-                clicked => {
-                    HistoryState.export-opened();
-                    exporting.show();
-                }
-            }
-            IconButton {
-                icon: Icons.retry;
-                // An entry with no text stands out: transcribing it is the next step.
-                label: root.entry.text == "" ? @tr("Transcribe") : @tr("Transcribe again");
-                enabled: HistoryState.redo-off == "";
-                tooltip: HistoryState.redo-off;
-                clicked => {
-                    HistoryState.redo();
-                }
-            }
+            // Last and apart from the actions below (DS-23).
             IconButton {
                 icon: Icons.delete;
                 label: @tr("Delete");
@@ -756,61 +722,132 @@ component Detail inherits CardFrame {
                 }
             }
         }
+        // What can be done with it, each with its word (a row of bare glyphs was unreadable).
+        // Narrow: two rows of two, since five labelled buttons do not fit a row there.
+        // Wide: the buttons at their own width, not stretched over the card.
+        HorizontalLayout {
+            alignment: root.narrow ? stretch : start;
+            GridLayout {
+                spacing: Theme.control-gap;
+                Button {
+                    row: 0;
+                    col: 0;
+                    horizontal-stretch: root.narrow ? 1 : 0;
+                    icon: Icons.copy;
+                    text: @tr("Copy");
+                    accessible-label: @tr("Copy text");
+                    enabled: root.entry.text != "";
+                    clicked => {
+                        copier.text = root.entry.text;
+                        copier.select-all();
+                        copier.copy();
+                        copier.clear-selection();
+                        Toast.show(@tr("Copied."));
+                    }
+                }
+                Button {
+                    row: 0;
+                    col: 1;
+                    horizontal-stretch: root.narrow ? 1 : 0;
+                    icon: Icons.folder-open;
+                    text: @tr("Show folder");
+                    accessible-label: @tr("Show in folder");
+                    clicked => {
+                        HistoryState.show-folder();
+                    }
+                }
+                export-button := Button {
+                    row: root.narrow ? 1 : 0;
+                    col: root.narrow ? 0 : 2;
+                    horizontal-stretch: root.narrow ? 1 : 0;
+                    icon: Icons.download;
+                    text: @tr("Export");
+                    accessible-label: @tr("Export");
+                    enabled: root.entry.text != "";
+                    clicked => {
+                        HistoryState.export-opened();
+                        exporting.show();
+                    }
+                }
+                Button {
+                    row: root.narrow ? 1 : 0;
+                    col: root.narrow ? 1 : 3;
+                    horizontal-stretch: root.narrow ? 1 : 0;
+                    icon: Icons.retry;
+                    // An entry with no text stands out: transcribing it is the next step.
+                    text: root.entry.text == "" ? @tr("Transcribe") : @tr("Transcribe again");
+                    accessible-label: self.text;
+                    enabled: HistoryState.redo-off == "";
+                    tooltip: HistoryState.redo-off;
+                    clicked => {
+                        HistoryState.redo();
+                    }
+                }
+            }
+        }
         TextView {
             vertical-stretch: 1;
             narrow: root.narrow;
             text: root.entry.text;
         }
-        // What was held back and never inserted (arch-plan 9.1): kept here, never lost.
-        if root.entry.held != "": HorizontalLayout {
-            spacing: Theme.control-gap;
-            height: Theme.control-height;
-            Badge {
-                text: @tr("Not inserted");
-                kind: BadgeKind.accent;
-                y: (parent.height - self.height) / 2;
+        // What was held back and never inserted (arch-plan 9.1): kept here, never lost. The text
+        // has the whole width on lines of its own, up to three; Copy has it in full.
+        if root.entry.held != "": VerticalLayout {
+            spacing: Theme.space-2;
+            HorizontalLayout {
+                spacing: Theme.control-gap;
+                height: Theme.control-height;
+                Badge {
+                    text: @tr("Not inserted");
+                    kind: BadgeKind.accent;
+                    y: (parent.height - self.height) / 2;
+                }
+                InfoTip {
+                    text: root.entry.held-why;
+                    y: (parent.height - self.height) / 2;
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    min-width: 0;
+                }
+                Button {
+                    icon: Icons.copy;
+                    text: @tr("Copy");
+                    accessible-label: @tr("Copy what was not inserted");
+                    clicked => {
+                        copier.text = root.entry.held;
+                        copier.select-all();
+                        copier.copy();
+                        copier.clear-selection();
+                        Toast.show(@tr("Copied."));
+                    }
+                }
+                if root.entry.held-add && !root.narrow: Button {
+                    icon: Icons.add;
+                    text: @tr("Add to the text");
+                    kind: ButtonKind.soft;
+                    enabled: !root.running;
+                    clicked => {
+                        HistoryState.add-held();
+                    }
+                }
+                // Narrow: the icon alone.
+                if root.entry.held-add && root.narrow: IconButton {
+                    icon: Icons.add;
+                    label: @tr("Add to the text");
+                    enabled: !root.running;
+                    clicked => {
+                        HistoryState.add-held();
+                    }
+                }
             }
             Text {
                 text: root.entry.held;
                 font-size: Theme.body-size;
-                color: Theme.text-secondary;
-                vertical-alignment: center;
+                color: Theme.text-primary;
+                wrap: word-wrap;
                 overflow: elide;
-                horizontal-stretch: 1;
-                min-width: 0;
-            }
-            InfoTip {
-                text: root.entry.held-why;
-                y: (parent.height - self.height) / 2;
-            }
-            IconButton {
-                icon: Icons.copy;
-                label: @tr("Copy what was not inserted");
-                clicked => {
-                    copier.text = root.entry.held;
-                    copier.select-all();
-                    copier.copy();
-                    copier.clear-selection();
-                    Toast.show(@tr("Copied."));
-                }
-            }
-            if root.entry.held-add && !root.narrow: Button {
-                icon: Icons.add;
-                text: @tr("Add to the text");
-                kind: ButtonKind.soft;
-                enabled: !root.running;
-                clicked => {
-                    HistoryState.add-held();
-                }
-            }
-            // Narrow: the icon alone, so the held text keeps its room.
-            if root.entry.held-add && root.narrow: IconButton {
-                icon: Icons.add;
-                label: @tr("Add to the text");
-                enabled: !root.running;
-                clicked => {
-                    HistoryState.add-held();
-                }
+                height: min(self.preferred-height, 3 * Theme.body-line);
             }
         }
         // Reserved, so nothing moves when a run starts or ends (DS-25). Never an empty layout: the
@@ -901,10 +938,10 @@ component Detail inherits CardFrame {
         max-width: 0;
         accessible-role: none;
     }
-    // Under the action bar's end, where the Export button is: one format per line.
+    // Under the Export button, its left edge on the button's: one format per line.
     exporting := PopupWindow {
-        x: root.width - 2 * Theme.card-padding-h - 140px;
-        y: Theme.card-padding-v + Theme.control-height + Theme.space-1;
+        x: export-button.absolute-position.x - root.absolute-position.x;
+        y: export-button.absolute-position.y - root.absolute-position.y + export-button.height + Theme.space-1;
         close-policy: close-on-click-outside;
         CardFrame {
             VerticalLayout {
@@ -1015,6 +1052,14 @@ export component HistoryPage inherits VerticalLayout {
                     HistoryState.clear-day();
                 }
             }
+            // Says what the control beside it filters by (it was four bare words).
+            Text {
+                text: @tr("Length");
+                font-size: Theme.body-size;
+                color: Theme.text-secondary;
+                vertical-alignment: center;
+                horizontal-stretch: 0;
+            }
             Segmented {
                 width: 232px;
                 accessible-label: @tr("Recording length");
@@ -1025,9 +1070,12 @@ export component HistoryPage inherits VerticalLayout {
                     HistoryState.length-picked(i);
                 }
             }
-            IconButton {
+            Button {
                 icon: HistoryState.file-running ? Icons.stop : Icons.browse-file;
-                label: HistoryState.file-running ? @tr("Stop transcribing the file") : @tr("Transcribe a file");
+                // One width for both words, so a run starting moves nothing (DS-25).
+                min-width: root.width < 700px ? 80px : 168px;
+                text: HistoryState.file-running ? @tr("Stop") : root.width < 700px ? @tr("File") : @tr("Transcribe a file");
+                accessible-label: HistoryState.file-running ? @tr("Stop transcribing the file") : @tr("Transcribe a file");
                 enabled: HistoryState.file-running || HistoryState.file-off == "";
                 tooltip: HistoryState.file-running ? "" : HistoryState.file-off;
                 clicked => {

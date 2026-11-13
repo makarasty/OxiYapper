@@ -4,9 +4,8 @@
 import { Theme } from "../tokens.slint";
 import { FocusRing, KeyFocus, Tip } from "base.slint";
 
-// `soft` is the low-weight button with a rest fill; `subtle` is its deprecated alias (it used to be
-// bare text) and draws the same, so pages that still say `subtle` get the fill too.
-export enum ButtonKind { primary, secondary, subtle, danger, icon, soft }
+// `soft` is the low-weight button with a rest fill.
+export enum ButtonKind { primary, secondary, danger, icon, soft }
 
 // Height 32, radius 4, padding 12, min width 88 so action rows align. Icon and label are one group
 // centred at whole pixels, 8 px apart (DS-7.1, crisp text [22]). `icon` buttons are 32x32 with

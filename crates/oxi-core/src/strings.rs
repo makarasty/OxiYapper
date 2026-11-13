@@ -21,6 +21,7 @@ pub const fn notice(notice: Notice) -> &'static str {
         Notice::ModelBad => "The speech model file is damaged. Download it again in Settings",
         Notice::DeviceLost => "Microphone disconnected",
         Notice::CaptureFailed => "Could not record from the microphone",
+        Notice::NoMicrophone => "No microphone found",
         Notice::TranscriptionFailed => "Transcription failed",
         Notice::PressPaste => "Text is on the clipboard, press Ctrl+V",
         Notice::AdminWindow => "Admin window: press Ctrl+V",
@@ -130,6 +131,7 @@ pub const fn notice_short(notice: Notice) -> &'static str {
         Notice::ModelBad => "Model error",
         Notice::DeviceLost => "Mic lost",
         Notice::CaptureFailed => "Mic error",
+        Notice::NoMicrophone => "No mic",
         Notice::TranscriptionFailed => "Speech failed",
         Notice::PressPaste => "Press Ctrl+V",
         Notice::AdminWindow => "Admin window",
@@ -194,8 +196,7 @@ pub const PIPE_UNTRUSTED: &str =
     "The OxiYapper pipe is held by an untrusted program. Not connecting.";
 pub const PIPE_FOREIGN: &str = "The OxiYapper pipe is held by another account. Not connecting.";
 
-// Beside the disabled Preview button there is room for a few words, not the banner's two sentences.
-pub const PREVIEW_OFFLINE: &str = "OxiYapper is not running";
+// Beside the position tiles there is room for a few words, not the banner's two sentences.
 pub const PREVIEW_MISMATCH: &str = "Restart OxiYapper first";
 
 /// Banner of a config reload that failed; `line` is 1-based. Reads like the parser's own

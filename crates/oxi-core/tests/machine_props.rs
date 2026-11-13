@@ -53,6 +53,7 @@ fn quiet_event() -> impl Strategy<Value = Event> {
         1 => Just(Event::SpeechHeard),
         1 => Just(Event::DeviceLost),
         1 => Just(Event::CaptureFailed),
+        1 => Just(Event::NoMicrophone),
         4 => job().prop_map(Event::JobAudioReady),
         2 => (job(), prop_oneof![
             Just(EmptyAudio::NothingHeard),

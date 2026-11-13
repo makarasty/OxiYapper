@@ -165,6 +165,8 @@ pub enum Event {
     DeviceLost,
     /// Capture could not run (no permission, device error); nothing is kept.
     CaptureFailed,
+    /// Capture could not run because there is no input device at all.
+    NoMicrophone,
     /// The audio of a job is trimmed and ready for whisper.
     JobAudioReady(JobId),
     /// The job has no audio for whisper; it ends here, without a whisper call.
@@ -269,6 +271,7 @@ pub enum Notice {
     ModelBad,
     DeviceLost,
     CaptureFailed,
+    NoMicrophone,
     TranscriptionFailed,
     /// Modifiers stayed held: the text is on the clipboard, the user presses Ctrl+V (item 35).
     PressPaste,
@@ -391,8 +394,8 @@ pub enum Effect {
     KeepCancelled(JobId),
     /// Free the audio of a job that will never be transcribed.
     DropJob(JobId),
-    /// A new press carries this job on: its text is never used, its audio waits for the
-    /// [`Effect::Merge`] that names it.
+    /// A new press carries this job on: its text is not pasted unless the carrying recording
+    /// fails (then `resume` pastes it); its audio waits for the [`Effect::Merge`] that names it.
     Supersede(JobId),
     /// The recording that carried the jobs `from` on (oldest first) became job `into`: the audio
     /// of `from` goes in front of the audio of `into`, which is transcribed as one dictation.

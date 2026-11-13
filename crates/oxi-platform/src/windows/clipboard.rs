@@ -1664,7 +1664,7 @@ mod tests {
             fn send_chord(&mut self, _: &[Key]) -> Result<(), InputBlocked> {
                 Ok(())
             }
-            fn type_units(&mut self, _: &[u16], _: Millis) -> Result<(), InputBlocked> {
+            fn send_units(&mut self, _: &[u16]) -> Result<(), InputBlocked> {
                 Ok(())
             }
             fn sleep(&mut self, time: Millis) {

@@ -116,7 +116,10 @@ fn run_in<'s, C: Capture + Send + 'static>(
                     }
                     Err(e) => {
                         tracing::warn!("microphone not opened: {e}");
-                        let event = Event::CaptureFailed;
+                        let event = match e {
+                            CaptureError::NoDevice => Event::NoMicrophone,
+                            _ => Event::CaptureFailed,
+                        };
                         say(to_end.as_ref(), inbox, Inbox::Capture { session, event });
                     }
                 }
@@ -283,8 +286,8 @@ mod tests {
     }
 
     /// No microphone: `opts.device` is "kind" or "kind:group" and the kind picks the behaviour.
-    /// "fail" cannot open, "fallback" reports the default device, "lose" loses the device right
-    /// after opening, "bad-finish" fails in `finish`, "quiet" hears no speech, "mute" gives all
+    /// "fail" cannot open, "nomic" has no device, "fallback" reports the default device, "lose" loses the device right
+    /// after opening, "streamfail" reports a mid-stream failure the same way, "bad-finish" fails in `finish`, "quiet" hears no speech, "mute" gives all
     /// zeros, "spooled" streamed to history, "speech" hears the user speak right after opening,
     /// "hold" ends (finish or drop) only after [`release`] of its group. A grouped stream hears
     /// what is [`speak`]-ed until its stream stops; its audio is [`FULL`] and then that.
@@ -311,10 +314,16 @@ mod tests {
         ) -> Result<Self, CaptureError> {
             let (kind, group) = split(&opts.device);
             if kind == "fail" {
+                return Err(CaptureError::PermissionDenied);
+            }
+            if kind == "nomic" {
                 return Err(CaptureError::NoDevice);
             }
             if kind == "lose" {
                 on_event(CaptureEvent::DeviceLost);
+            }
+            if kind == "streamfail" {
+                on_event(CaptureEvent::Failed);
             }
             if kind == "speech" {
                 on_event(CaptureEvent::SpeechHeard);
@@ -507,6 +516,12 @@ mod tests {
     }
 
     #[test]
+    fn no_input_device_gives_no_microphone() {
+        let msgs = drive(vec![cfg("nomic"), start(3)]);
+        assert_eq!(captures(&msgs), [(3, Event::NoMicrophone)]);
+    }
+
+    #[test]
     fn fallback_device_reports_mic_fell_back() {
         let msgs = drive(vec![cfg("fallback"), start(1), AudioCmd::Stop(J)]);
         assert_eq!(captures(&msgs), [(1, Event::MicFellBack)]);
@@ -611,6 +626,10 @@ mod tests {
         let cases = [
             ("fallback", "2 MicFellBack", 3),
             ("fail", "2 CaptureFailed", 2),
+            // Both fire inside `open`, before OPENED.put: sent straight to `direct` they would
+            // overtake "audio 7".
+            ("lose", "2 DeviceLost", 3),
+            ("streamfail", "2 CaptureFailed", 3),
         ];
         for (kind, event, opens) in cases {
             let group = format!("order-{kind}");

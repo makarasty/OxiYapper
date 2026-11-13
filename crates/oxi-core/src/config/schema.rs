@@ -256,11 +256,15 @@ pub struct PasteRule {
     pub filler_filter: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_punctuation: Option<bool>,
+    /// Line breaks become spaces in this app (`Some(true)`) or stay (`Some(false)`), whatever
+    /// `paste.join_console_lines` and the window kind say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_lines: Option<bool>,
 }
 
 impl PasteRule {
     /// Every key a rule can have; a save drops the optional ones a rule no longer sets.
-    pub(crate) const KEYS: [&str; 13] = [
+    pub(crate) const KEYS: [&str; 14] = [
         "app",
         "mode",
         "chord",
@@ -274,21 +278,27 @@ impl PasteRule {
         "voice_commands",
         "filler_filter",
         "pause_punctuation",
+        "join_lines",
     ];
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[allow(clippy::struct_excessive_bools, reason = "one switch per config key")]
 pub struct Paste {
     pub mode: PasteMode,
     pub restore_delay_ms: u32,
     pub trailing_space: bool,
     /// Dictated text stays in the OS clipboard history (Win+V). Cloud upload is never allowed.
     pub keep_in_clipboard_history: bool,
-    /// Press Enter once after the whole dictation was typed, if the focus did not change and the
-    /// person typed nothing since the record start (`paste::enter_decision`). Off: the app sends
-    /// no Enter by itself.
+    /// Press Enter once after the whole dictation landed, if the focus did not change and the
+    /// person typed nothing since the record start (`paste::enter_decision`). After a Ctrl+V
+    /// paste it also needs the proof that the target read the clipboard text after our Ctrl+V
+    /// and before the restore (delayed rendering). Off: the app sends no Enter by itself.
     pub press_enter: bool,
+    /// Owner 2026-11-12: line breaks become spaces in a classic cmd.exe console window, where a
+    /// pasted line break runs the line as a command (`paste::join_lines`).
+    pub join_console_lines: bool,
     /// Pace of typed output; a rule can set its own.
     pub type_speed: TypeSpeed,
     pub rules: Vec<PasteRule>,
@@ -302,6 +312,7 @@ impl Default for Paste {
             trailing_space: true,
             keep_in_clipboard_history: true,
             press_enter: false,
+            join_console_lines: true,
             type_speed: TypeSpeed::Fast,
             // Remote desktop drops a synthetic Ctrl+V, so type there.
             rules: vec![PasteRule {
@@ -572,6 +583,7 @@ mod tests {
             voice_commands: Some(false),
             filler_filter: Some(false),
             pause_punctuation: Some(false),
+            join_lines: Some(false),
         };
         let table = toml::Table::try_from(&full).unwrap();
         let keys: Vec<&str> = table.keys().map(String::as_str).collect();

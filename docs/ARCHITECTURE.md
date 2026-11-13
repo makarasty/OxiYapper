@@ -125,6 +125,8 @@ Framing: one JSON object per line (`serde_json`), max 1 MiB per line, tagged enu
 | `PreviewSound { choice, volume_percent }` | the daemon plays `choice` once; a sound that cannot be used shows as a `sounds.preview: ...` line in `Status.warnings` |
 | `TestAudio { reset, pcm }` | no reply; the connection holds the raw 16 kHz mono recording in memory until it closes, never on disk |
 | `TestTranscribe { id, set, language }` | `TestResult { id, outcome }`: `Heard { text, ms }` or `Failed { why }` for one settings set on the held recording, preceded by `TestProgress { id, percent, est_ms }` (0 to 100 while whisper runs; the first carries `est_ms`, the estimated length of the run, so the bar moves before whisper reports; optional, serde default); one run in flight per connection, the rest and any run a dictation overtakes answer `Busy`. A model only a test loaded is dropped after 60 s with no test request |
+| `HistoryWords { run, id }` | `HistoryWords { run, id, ... }`: the words of record `id` with their times, at once when the record has them, else made by the whisper worker in the slot of a test run (one at a time, a dictation first) with `TestProgress` carrying `run` meanwhile |
+| `HistoryWordsCancel { run }` | the run `run` ends and answers `HistoryWords` `Busy`; nothing when it is not the one out |
 | `Shutdown` | daemon exits |
 | | `ConfigError { file, line, message }` pushed on a bad reload |
 
@@ -170,7 +172,8 @@ mode = "clipboard"             # clipboard | type
 restore_delay_ms = 300
 trailing_space = true
 keep_in_clipboard_history = true   # dictation stays in Win+V history; false excludes it (cloud is always excluded)
-press_enter = false            # true: one Enter after the whole text was typed (never after Ctrl+V), only if the foreground window and focused control are those of the record start and no own key was pressed since
+press_enter = false            # true: one Enter after the whole text was typed, or after a Ctrl+V paste only when the target app was seen to read the clipboard text (delayed rendering) after our Ctrl+V and before the restore began, and only if the foreground window and focused control are those of the record start and no own key was pressed since
+join_console_lines = true      # line breaks become spaces in cmd.exe in a classic console window (conhost), where one runs the line as a command
 rules = [{ app = "mstsc.exe", mode = "type" }]   # per-app overrides: mode, chord, delay
 [overlay]
 enabled = true
@@ -230,7 +233,7 @@ suppress_non_speech = "auto"   # or true | false
 [paste]
 type_speed = "fast"            # fast (16 units per call, 2 ms apart) | safe (one character, 5 ms apart)
 # a rule may also set: type_speed, language, model, to_file, dictionary, replacements,
-# voice_commands, filler_filter, pause_punctuation
+# voice_commands, filler_filter, pause_punctuation, join_lines (true/false wins over join_console_lines)
 # pace of an app: the rule's type_speed; else safe when a rule for the app (the user's, or the
 # built-in mstsc.exe one) has mode = "type"; else the type_speed above. No file is migrated.
 [text]                         # everything here changes the text and is off by default
@@ -269,7 +272,7 @@ From `directories::ProjectDirs`. Portable mode: if a file named `portable` sits 
 | `state.toml`, `stats.json`, `models/`, `history/` | `%LOCALAPPDATA%\OxiYapper\data\` | `~/Library/Application Support/<bundle id>/` | `$XDG_DATA_HOME/OxiYapper/` |
 | `logs/` (daily files, 7 kept) | `%LOCALAPPDATA%\OxiYapper\data\logs\` | `~/Library/Logs/OxiYapper/` | `$XDG_STATE_HOME/OxiYapper/logs/` |
 
-Models are local, not roaming (gigabytes). History entries are `history/YYYY-MM-DD/HHMMSS-mmm.{wav,txt,json}`. `stats.json` (usage stats for the Home page, `oxi-core::stats`, versioned) holds one row per local day: date, dictations, words, audio ms; rows older than about 3 years fold into one totals row. The daemon's stats thread rewrites it atomically after each dictation that reached the field or the clipboard; a corrupt file is renamed `stats.bad` and counting starts fresh. On Unix the data directory is created 0700. The macOS bundle id is chosen in ROADMAP M12 and never changes after the first release: TCC permissions and paths hang on it.
+Models are local, not roaming (gigabytes). History entries are `history/YYYY-MM-DD/HHMMSS-mmm.{wav,txt,json}`. `stats.json` (usage stats for the Home page, `oxi-core::stats`, versioned) holds one row per local day: date, dictations, words, audio ms (`speech_ms`) and voiced ms (`voiced_ms`, the part of the audio the voice gate scored as voice; 0 for a row counted before it was kept). The words per minute are measured over `voiced_ms` when it is known, else over the audio length, and the pause share is `(speech_ms - voiced_ms) / speech_ms`, left out for a row without `voiced_ms`; rows older than about 3 years fold into one totals row. The daemon's stats thread rewrites it atomically after each dictation that reached the field or the clipboard; a corrupt file is renamed `stats.bad` and counting starts fresh. On Unix the data directory is created 0700. The macOS bundle id is chosen in ROADMAP M12 and never changes after the first release: TCC permissions and paths hang on it.
 
 ## 8. Model lifecycle
 
@@ -285,7 +288,7 @@ Models are local, not roaming (gigabytes). History entries are `history/YYYY-MM-
 
 Order, and where each step can fail:
 
-1. **Open** the device (configured or system default) on key-down, in its native format. Fails: device gone, no permission, exclusive mode held by another app. Result: `Error` with a deep link to the OS privacy page. The mic is not kept open between dictations (privacy indicator, Bluetooth headsets stuck in call quality).
+1. **Open** the device (configured or system default) on key-down, in its native format. Which one is decided at every key-down from the devices present then (`oxi_core::audio::pick_input`, e09): a Windows default changed while the app runs, a newly plugged mic that became the default, or a picked mic that came back is the next recording's; the config is never rewritten. The default is opened as the concrete endpoint it is at the press, not as cpal's default handle, so a default change mid-recording leaves that recording on its device to the key-up instead of ending it as an unplug. Fails: device gone, no permission, exclusive mode held by another app. Result: `Error` with a deep link to the OS privacy page. The mic is not kept open between dictations (privacy indicator, Bluetooth headsets stuck in call quality).
 2. **Capture** callback: convert i16/u16/f32 to f32, push to the ring, update `LEVEL`. Fails: ring full (drain starved) - samples dropped and counted; device lost mid-stream - capture stops, what was captured is kept.
 3. **Mono**: average the channels. Manual gain applied here, so the meter shows it.
 4. **Denoise** (optional, off): RNNoise needs 48 kHz mono in 480-sample frames, so it runs before the 16 kHz resample, after a resample to 48 kHz if the device rate differs.
@@ -297,11 +300,15 @@ Steps 3-7 are pure functions in `oxi-core::audio`, tested on synthetic signals. 
 
 History (on by default, R1.3): the audio is written to disk while recording (streaming, `<name>.wav.part` through hound), so a crash or power loss keeps what was recorded; at start the daemon recovers a leftover `.part`. On a normal stop the file is finalized (`finalize()`) and renamed. The coordinator hands the final text to the history thread (`src/daemon/history.rs`) once it is known; it writes the `.txt` and a `.json` meta file beside the `.wav` (a documented, stable wav + txt + json entry format, so other tools can read it; the settings History page offers Copy path), then applies `oxi-core::history::expired` (age, then size, oldest first) to the day folders. Everything lives in one app-owned folder: `OxiYapper history` inside `[history] folder`, or `history/` in the data dir when that is empty or relative. It is created with a `.oxiyapper-history` marker; a folder without the marker is never listed or changed, and a non-empty one of that name is refused. Inside it, only `YYYY-MM-DD/HHMMSS-mmm.wav|txt|json` names with a real date and time are ever listed or deleted, and at start (and on every config change) the leftovers of a killed write directly in a day folder are handled: a `HHMMSS-mmm.wav.part` with audio in it is recovered (finalized and renamed, the entry has no text), an empty one and any `HHMMSS-mmm.txt.tmp` are swept. The age limit sits out a pass with an entry dated after today, or with today more than 31 days past every earlier entry (a clock jump); the size limit always applies. A clean-up failure is logged per entry, the pass goes on, and it shows as its own "Old history not removed" warning. A write error becomes a status warning and never stops the paste; the text is never logged.
 
+File transcription: "Transcribe a file" decodes in a child process of the same exe (`OxiYapper --decode-child <path>`, no console window), because symphonia can panic or abort on a damaged file (one bad `.m4a` atom) and the release build aborts on panic. The child writes one reply to its stdout: 16 kHz mono f32 samples with their count, or the reason it refused the file. The daemon checks the count against the 120-minute cap before reserving memory, treats a crash, an abort, a non-zero exit or a malformed reply as "the file is damaged", and kills the child on Stop or when the settings window closes. File sample rates outside 4..384 kHz are refused. Every decoding child joins one kill-on-close Job object the daemon holds for its whole life, so a child never outlives the daemon, whether it quits or crashes; an orderly quit also kills the child at once.
+
 ## 10. Paste pipeline
 
 Text pipeline first (`oxi-core::text`, pure): remove `\n` without adding spaces, trim, drop hallucinated segments, apply `replace.txt`, add the trailing space. Empty result: "nothing heard", nothing pasted.
 
 Then, in the paste worker (Windows shown; other OSes below):
+
+0. **Join lines** (owner 2026-11-12, `paste::join_lines`), decided after the modifier wait (step 2) on the same foreground read that steps 1 and 3 use, and applied to every path that leaves the text for a Ctrl+V: the paste itself, type mode and both clipboard-only paths (modifiers still held, elevated window). The app's rule `join_lines` decides; else, with `paste.join_console_lines` on (default), the line breaks become spaces only in a classic console window (`ConsoleWindowClass`) whose process is `cmd.exe` with no descendant but its console host (`conhost.exe`, `OpenConsole.exe`), where a pasted line break runs the line as a command. Such a window reports the console's first process (cmd.exe) even while `claude`, `node`, `pwsh` or `python` runs in it, so the daemon takes one process snapshot (`CreateToolhelp32Snapshot`) and walks parent pids from the window's process; anything run from that cmd.exe keeps the breaks. The daemon never attaches to the console (while attached, its Ctrl+C or close would end the daemon), and the snapshot opens no process, so an elevated cmd and a debug build read like any other. A failed snapshot or a window process missing from it keeps the breaks and is logged with exe names and error codes only. Windows Terminal, PowerShell (PSReadLine) and TUIs such as Claude Code take a multi-line paste whole and keep the breaks.
 
 1. **Pick the mode**: per-app rule for the foreground app, else `paste.mode`.
 2. **Wait for modifiers**: poll the physical state of Ctrl, Shift, Alt, Win (both sides) every 5 ms. A pending Ctrl+V with Win still held would open Win+V. If they are still down after 1.5 s: put the text on the clipboard, do not restore, notify "Text is on the clipboard, press Ctrl+V".
@@ -330,7 +337,7 @@ Recording and hotkey
 2. Double tap (push-to-talk): two presses shorter than 250 ms with a gap under 300 ms lock recording on; audio counts from the second press; the next full press stops it.
 3. Single press under 300 ms: a tap, discarded without transcription (taps produce "Thank you." hallucinations).
 4. Toggle mode: key-up ignored, no double tap; under 300 ms of audio between presses is discarded.
-5. Recording reaches `max_seconds` (default 3600, set by the owner on 2026-11-11): the overlay warns 30 s before, then stop and transcribe, never discard. Long audio goes to whisper in chunks so one job never holds minutes of state (chunk length set in M5).
+5. Recording reaches `max_seconds` (default 3600, set by the owner on 2026-11-11): the overlay warns 30 s before, then stop and transcribe, never discard. Long audio goes to whisper whole in one call: whisper.cpp windows it itself (30 s steps), so the app keeps no chunker for a dictation (a transcribed file is cut into pieces by the IPC file run).
 6. Esc while recording: cancels and is swallowed only when `hotkey.esc_cancels` is on (default off: Esc may be meant for another app); otherwise it passes through. A cancel after speech is saved to history with the notice of item 7. Esc while transcribing: not ours, passes through.
 7. Another key pressed while the chord is held (Ctrl+Win+D and friends): the key always passes through to the system (R2.1). What happens to the recording is decided by VAD and `hotkey.other_key`. `auto` (default): no speech heard yet, so the user meant a shortcut and the recording is cancelled silently; speech already heard, so the recording goes on (a short phrase is not lost). `never`: never cancels. `always`: always cancels. A cancel after speech saves the audio to history and shows the notice "cancelled, can be restored". The logic is pure, in `oxi-core::machine`, with a test per edge case.
 8. Key-up lost (UAC prompt, Ctrl+Alt+Del, secure desktop): a 100 ms watchdog reads the physical key state while recording; chord not held means key-up.
@@ -341,8 +348,8 @@ Recording and hotkey
 13. Foreground app runs elevated: whether the low-level hook still sees keys is unverified (QA item); paste handles it per section 10.
 
 Audio
-14. Mic unplugged mid-recording: stop, transcribe what was captured, notify; the next key-down opens the system default.
-15. Configured mic missing at key-down: use the system default, notify once per session.
+14. Mic unplugged mid-recording: stop, transcribe what was captured, notify; the next key-down opens the system default. On Windows an `IMMNotificationClient` watches the opened endpoint while the recording runs (`oxi_core::audio::endpoint_lost`), so a pulled jack (`UNPLUGGED`) or a removed USB or Bluetooth hands-free endpoint ends it even when the stream itself reports no error. The Windows default changing mid-recording is not an unplug: the recording goes on on its device; the next key-down opens the new default.
+15. Configured mic missing at key-down: use the system default, notify once per session; once it is back, the next key-down uses it again. No input device at all: the recording is refused (capture failed notice; the tray and settings show "No microphone").
 16. No mic permission (Windows privacy switch, macOS denied): error with a link to the OS page; no whisper call.
 17. All-zero audio (hardware mute, privacy switch on some drivers): "microphone gives silence".
 18. Bluetooth headset switches profile on open and loses the first half second: known; documented, measured in QA.

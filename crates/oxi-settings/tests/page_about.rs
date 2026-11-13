@@ -32,6 +32,25 @@ fn the_slint_tile_opens_the_made_with_slint_badge() {
     );
 }
 
+/// DS-24.1: `open-external` means "opens another app". Every link tile carries it; the Slint tile,
+/// which opens the in-app badge, carries none.
+#[test]
+fn only_link_tiles_carry_the_open_external_glyph() {
+    let window = open(&layout("about-glyph", None), Page::About);
+    settle();
+    let tiles: Vec<_> = ElementHandle::find_by_element_type_name(&window, "TechCard").collect();
+    let glyphs: Vec<_> =
+        ElementHandle::find_by_element_id(&window, "TechCard::external-mark").collect();
+    assert_eq!(glyphs.len(), tiles.len() - 1, "one glyph per link tile");
+    let slint = rect(&with_role(&window, "Slint", AccessibleRole::Button));
+    for g in &glyphs {
+        let [x, y, _, _] = rect(g);
+        let inside =
+            x >= slint[0] && x < slint[0] + slint[2] && y >= slint[1] && y < slint[1] + slint[3];
+        assert!(!inside, "the Slint tile shows the open-external glyph");
+    }
+}
+
 /// Item 11 (DS-15.4): every mark box sits as far from its tile's left edge as from its top and
 /// bottom, within 0.5 px, tall and short tiles alike; and every mark is centred in its box.
 #[test]

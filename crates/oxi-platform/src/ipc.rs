@@ -296,15 +296,26 @@ impl Conn {
             if left == Some(Duration::ZERO) {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "IPC I/O timed out"));
             }
-            let stream = &self.stream;
-            match timed(stream, left, || {
-                let mut stream = stream;
-                stream.read(&mut buf)
-            })? {
+            match self.read_some(&mut buf, left)? {
                 0 => return Ok(None),
                 n => self.dec.push(&buf[..n]),
             }
         }
+    }
+
+    /// One read, at most `limit` long when set.
+    fn read_some(&self, buf: &mut [u8], limit: Option<Duration>) -> io::Result<usize> {
+        #[cfg(windows)]
+        if let Some(limit) = limit {
+            use std::os::windows::io::AsHandle;
+            let Stream::NamedPipe(pipe) = &self.stream;
+            return crate::os::pipe::read_within(pipe.inner().as_handle(), buf, limit);
+        }
+        let stream = &self.stream;
+        timed(stream, limit, || {
+            let mut stream = stream;
+            stream.read(buf)
+        })
     }
 
     /// Process id of the client, on the server end of a connection from [`Server::accept`].

@@ -46,6 +46,8 @@ unicode-normalization = "0.1.26"
 windows-sys = "0.61"
 # WinRT clipboard history (Win+V) beside windows-sys; features are set where it is used.
 windows = { version = "0.62", default-features = false }
+# `#[implement]` of `windows` expands to `::windows_core` paths (oxi-platform capture/watch.rs).
+windows-core = { version = "0.62", default-features = false }
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd", "png-format"] }
 ab_glyph = "0.2"
 rfd = { version = "0.17", default-features = false }

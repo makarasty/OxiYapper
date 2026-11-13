@@ -113,6 +113,7 @@ export component AudioPage inherits VerticalLayout {
         // the column's (DS-3.3).
         Row {
             title: @tr("Level");
+            info: @tr("How loud your microphone is right now. Speak to see it move.");
             // The "!" carries the words of the clip line (DS-21.3).
             warning: Warnings.both(AudioState.silence, AudioState.clipping ? @tr("Too loud: lower the gain.") : "");
             fill-controls: true;
@@ -137,7 +138,7 @@ export component AudioPage inherits VerticalLayout {
         Divider { }
         SliderRow {
             title: @tr("Gain");
-            info: @tr("Changes what Whisper hears.");
+            info: @tr("Makes your voice louder or quieter in the recording Whisper hears.");
             minimum: -20;
             maximum: 20;
             bipolar: true;
@@ -152,7 +153,7 @@ export component AudioPage inherits VerticalLayout {
         Divider { }
         SliderRow {
             title: @tr("Meter sensitivity");
-            info: @tr("Changes only the meter, not the recording.");
+            info: @tr("Only changes how far the Level bar moves; the recording stays as it is.");
             minimum: -20;
             maximum: 20;
             bipolar: true;

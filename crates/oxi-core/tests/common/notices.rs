@@ -28,6 +28,7 @@ notices! {
     ModelBad,
     DeviceLost,
     CaptureFailed,
+    NoMicrophone,
     TranscriptionFailed,
     PressPaste,
     AdminWindow,

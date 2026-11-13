@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, I24, InputCallbackInfo, Sample, SampleFormat, SizedSample, Stream};
-use oxi_core::audio::{AudioError, CHUNK, Level, Pipeline, downmix, samples_for};
+use oxi_core::audio::{
+    AudioError, CHUNK, InputDevice, InputPick, Level, Pipeline, downmix, pick_input, samples_for,
+};
 use oxi_core::config::{Audio, AudioChannel};
 use rtrb::{Consumer, Producer, RingBuffer};
 
@@ -39,6 +41,61 @@ pub fn list_input_devices() -> Result<Vec<String>, CaptureError> {
         .collect())
 }
 
+/// Name of the system default input now; `None` without one. The settings page reads it with
+/// its device list to follow a default changed while its meter runs.
+#[must_use]
+pub fn default_input_name() -> Option<String> {
+    let dev = cpal::default_host().default_input_device()?;
+    dev.description().ok().map(|d| d.name().to_owned())
+}
+
+/// The device for `configured` (`audio.device`) among those present now, and whether it is the
+/// default standing in for a missing one ([`pick_input`]). Read at every open, never cached, so a
+/// Windows default changed while the app runs is the next recording's (e09).
+///
+/// The default is opened as the endpoint it is now, not as cpal's default handle: on WASAPI that
+/// handle is activated through `DEVINTERFACE_AUDIO_CAPTURE` (Windows picks the endpoint then, apart
+/// from the `GetDefaultAudioEndpoint` read that gives its name), and a default change mid-recording
+/// ends its stream as `StreamInvalidated`, which reads as an unplugged mic. A concrete endpoint
+/// records on to the key-up; only a real unplug ends it.
+fn resolve_input(
+    host: &cpal::Host,
+    configured: &str,
+) -> Result<(cpal::Device, bool), CaptureError> {
+    let default = host.default_input_device();
+    let default_id = default.as_ref().and_then(|d| d.id().ok());
+    let mut devices: Vec<(cpal::Device, String, bool)> = host
+        .input_devices()?
+        .map(|d| {
+            let is_default = default_id.is_some() && d.id().ok() == default_id;
+            // A name costs a property-store read; only a configured device is matched by it.
+            let name = if configured.is_empty() {
+                String::new()
+            } else {
+                d.description()
+                    .map(|n| n.name().to_owned())
+                    .unwrap_or_default()
+            };
+            (d, name, is_default)
+        })
+        .collect();
+    let present: Vec<InputDevice<'_>> = devices
+        .iter()
+        .map(|(_, name, is_default)| InputDevice {
+            name,
+            is_default: *is_default,
+        })
+        .collect();
+    match pick_input(configured, &present) {
+        InputPick::Open { index, fell_back } => Ok((devices.swap_remove(index).0, fell_back)),
+        // No listed device is the default (a host without device ids, or Windows between two
+        // defaults): cpal's own default handle is the last try, as before e09.
+        InputPick::NoDevice => default
+            .map(|d| (d, !configured.is_empty()))
+            .ok_or(CaptureError::NoDevice),
+    }
+}
+
 /// cpal implementation of [`Capture`] (one for all OSes).
 pub struct CpalCapture {
     /// Dropped first in [`CpalCapture::stop`]: no callback runs after that.
@@ -50,6 +107,9 @@ pub struct CpalCapture {
     rate: u32,
     fell_back: bool,
     name: String,
+    /// Ends the recording as a lost device when its endpoint goes; dropped with the stream.
+    #[cfg(windows)]
+    watch: Option<super::watch::EndpointWatch>,
 }
 
 impl CpalCapture {
@@ -62,7 +122,7 @@ impl CpalCapture {
     /// Stop the callbacks, then the drain thread, and zero the meter; idempotent. With `cancel`
     /// the drain skips the pipeline flush and returns nothing.
     fn stop(&mut self, cancel: bool) -> Result<Recorded, CaptureError> {
-        drop(self.stream.take());
+        self.stop_stream();
         self.shared.cancel.store(cancel, Ordering::Relaxed);
         // Release also publishes `cancel` to the drain's Acquire load of `stop`.
         self.shared.stop.store(true, Ordering::Release);
@@ -106,22 +166,13 @@ impl Capture for CpalCapture {
     ) -> Result<Self, CaptureError> {
         let opened = Instant::now();
         let lead_us = micros(opened.saturating_duration_since(pressed));
-        let device = opts.device.as_str();
-        let host = cpal::default_host();
-        let named = if device.is_empty() {
-            None
-        } else {
-            host.input_devices()?
-                .find(|d| d.description().is_ok_and(|d| d.name() == device))
-        };
-        let fell_back = !device.is_empty() && named.is_none();
-        let dev = named
-            .or_else(|| host.default_input_device())
-            .ok_or(CaptureError::NoDevice)?;
+        let (dev, fell_back) = resolve_input(&cpal::default_host(), &opts.device)?;
         let name = dev
             .description()
             .map(|d| d.name().to_owned())
             .unwrap_or_default();
+        // The device name, never audio: a later "it recorded the old mic" is read off this line.
+        tracing::info!(device = %name, fell_back, "input device picked");
 
         let supported = dev.default_input_config()?;
         let (channels, rate, format) = (
@@ -145,16 +196,23 @@ impl Capture for CpalCapture {
             }
         };
 
-        let err_shared = Arc::clone(&shared);
+        // Once per recording, from cpal's error thread or the endpoint watch.
+        let lost_shared = Arc::clone(&shared);
+        let lose = Arc::new(move || {
+            if !lost_shared.lost.swap(true, Ordering::AcqRel)
+                && let Ok(mut f) = on_event.lock()
+            {
+                f(CaptureEvent::DeviceLost);
+            }
+        });
+        let err_lose = Arc::clone(&lose);
         let on_error = move |e: cpal::Error| {
             // Other kinds (xrun, rerouted default) leave the stream running.
             if matches!(
                 e.kind(),
                 cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::StreamInvalidated
-            ) && !err_shared.lost.swap(true, Ordering::AcqRel)
-                && let Ok(mut f) = on_event.lock()
-            {
-                f(CaptureEvent::DeviceLost);
+            ) {
+                err_lose();
             }
         };
 
@@ -198,6 +256,14 @@ impl Capture for CpalCapture {
                 drain.run(rx, sink, notify)
             })
             .map_err(CaptureError::Thread)?;
+        // After the stream runs, so the press waits for none of it; nothing fails after it.
+        #[cfg(windows)]
+        let watch = dev
+            .id()
+            .ok()
+            .and_then(|id| super::watch::EndpointWatch::start(id.id(), lose));
+        #[cfg(not(windows))]
+        drop(lose);
         Ok(Self {
             stream: Some(stream),
             shared,
@@ -206,11 +272,15 @@ impl Capture for CpalCapture {
             rate,
             fell_back,
             name,
+            #[cfg(windows)]
+            watch,
         })
     }
 
     fn stop_stream(&mut self) {
         drop(self.stream.take());
+        #[cfg(windows)]
+        drop(self.watch.take());
     }
 
     fn input_rate(&self) -> u32 {
@@ -1023,6 +1093,35 @@ mod tests {
             pick_channel(&[0.25, 0.5], 1, AudioChannel::Right),
             [0.25, 0.5]
         );
+    }
+
+    /// What resolving the default at every press costs (e09): cpal's default handle alone (before)
+    /// and the walk to its concrete endpoint (after), 50 times each; prints p50/p95 in µs. No
+    /// stream is opened, so the mic stays off. Run alone with `--nocapture`.
+    #[test]
+    fn resolve_cost_live() {
+        if std::env::var_os("OXI_DEVICE_PROBE").is_none_or(|v| v != "1") {
+            eprintln!("skipped: set OXI_DEVICE_PROBE=1");
+            return;
+        }
+        let host = cpal::default_host();
+        let time = |f: &dyn Fn() -> Option<String>| {
+            let mut v: Vec<u128> = (0..50)
+                .map(|_| {
+                    let t = Instant::now();
+                    assert!(f().is_some(), "no default input");
+                    t.elapsed().as_micros()
+                })
+                .collect();
+            v.sort_unstable();
+            (v[25], v[47])
+        };
+        let name = |d: cpal::Device| d.description().ok().map(|d| d.name().to_owned());
+        let before = time(&|| host.default_input_device().and_then(name));
+        let after = time(&|| resolve_input(&host, "").ok().and_then(|(d, _)| name(d)));
+        eprintln!("default handle p50/p95 {before:?} us; concrete endpoint p50/p95 {after:?} us");
+        let picked = resolve_input(&host, "").ok().and_then(|(d, _)| name(d));
+        assert_eq!(picked, default_input_name(), "the endpoint is the default");
     }
 
     /// A capture whose first sample has come, and the time from `t` to that sample.

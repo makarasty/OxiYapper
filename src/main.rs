@@ -48,6 +48,15 @@ fn run_daemon() {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // "Transcribe a file" decodes in a child of the daemon: a damaged file ends only the child.
+    if let [arg, path] = args.as_slice()
+        && arg == oxi_platform::decode::CHILD_ARG
+    {
+        std::process::exit(oxi_platform::decode::child_main(
+            std::path::Path::new(path),
+            oxi_core::audio::SAMPLE_RATE,
+        ));
+    }
     match oxi_core::parse_command(&args) {
         Ok(Command::Daemon) => run_daemon(),
         Ok(Command::Settings) => {

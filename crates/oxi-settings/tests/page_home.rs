@@ -99,6 +99,17 @@ fn home_is_the_default_page() {
     assert!(has(&window, "Speaking activity"));
 }
 
+/// A new user looking for yesterday's dictation: Home has a plain "Open History" button that
+/// switches to the History page (not to its folder).
+#[test]
+fn open_history_switches_to_the_history_page() {
+    let window = open(&layout("open-history", None), Page::Home);
+    settle();
+    with_role(&window, "Open History", AccessibleRole::Button).invoke_accessible_default_action();
+    settle();
+    assert_eq!(window.get_page(), Page::History);
+}
+
 #[test]
 fn the_daemons_numbers_fill_the_cards() {
     let (ipc, _rx) = Ipc::fake();
@@ -211,7 +222,7 @@ fn no_data_says_to_hold_the_current_chord() {
     ));
 }
 
-/// UI rules 1 and 5: the first dictation does not resize the activity card, so the History folder
+/// UI rules 1 and 5: the first dictation does not resize the activity card, so the Open History
 /// button in its title row stays where it was.
 #[test]
 fn the_first_dictation_moves_nothing_below_the_heatmap() {
@@ -222,7 +233,7 @@ fn the_first_dictation_moves_nothing_below_the_heatmap() {
         .set_size(slint::LogicalSize::new(1280.0, 860.0));
     settle();
     let folder = || {
-        with_role(&window, "History folder", AccessibleRole::Button)
+        with_role(&window, "Open History", AccessibleRole::Button)
             .absolute_position()
             .y
     };
@@ -237,7 +248,7 @@ fn the_first_dictation_moves_nothing_below_the_heatmap() {
     let after = folder();
     assert!(
         (before - after).abs() < 0.5,
-        "History folder moved from {before} to {after}"
+        "Open History moved from {before} to {after}"
     );
 }
 
@@ -582,10 +593,10 @@ fn opening_a_chart_moves_nothing() {
             window
                 .window()
                 .set_size(slint::LogicalSize::new(width, 900.0));
-            let closed = common::one(&window, "History folder").absolute_position();
+            let closed = common::one(&window, "Open History").absolute_position();
             click_words(&window);
             assert!(has(&window, "Words by day"));
-            let open = common::one(&window, "History folder").absolute_position();
+            let open = common::one(&window, "Open History").absolute_position();
             assert_eq!((closed.x, closed.y), (open.x, open.y), "{days} {width}");
         }
     }
@@ -706,7 +717,9 @@ fn the_folder_tip_follows_history() {
 fn click_with_nothing_to_open(l: &Layout, window: &AppWindow) {
     fs::remove_dir_all(&l.data_dir).unwrap();
     assert_eq!(window.get_action_error(), "");
-    click_card(window, "History folder");
+    window
+        .global::<oxi_settings::HomeState>()
+        .invoke_open_history();
     for _ in 0..400 {
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(30));
         if window.get_action_error() != "" {
@@ -752,7 +765,7 @@ fn the_page_fits_the_minimum_window_without_scrolling() {
         .set_size(slint::LogicalSize::new(720.0, 520.0));
     let whole = |window: &AppWindow| {
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
-        let button = ElementHandle::find_by_accessible_label(window, "History folder")
+        let button = ElementHandle::find_by_accessible_label(window, "Open History")
             .next()
             .expect("the folder button");
         let (at, size) = (button.absolute_position(), button.size());
@@ -902,6 +915,19 @@ fn fills_the_card(name: &str, sizes: &[(f32, f32)]) {
             (gap_left - gap_right).abs() <= 1.0,
             "{w}x{h}: the grid is off-centre: {gap_left} left, {gap_right} right"
         );
+        // At 1280x860 the width is the limit, not the cap or the height: the cells fill the card
+        // down to whole pixels (a shrink to `heat-cell-floor` would leave a wide empty strip).
+        if (w, h) == (1280.0, 860.0) {
+            assert!(
+                card_right - right < 60.0 + t.get_card_padding_h(),
+                "{w}x{h}: the grid leaves {} px of the card empty (cell {cell})",
+                card_right - right
+            );
+            assert!(
+                cell > t.get_heat_cell_floor(),
+                "{w}x{h}: cell {cell} at the floor"
+            );
+        }
         ends_inside(&window, &map, w, h);
     }
 }
@@ -909,7 +935,7 @@ fn fills_the_card(name: &str, sizes: &[(f32, f32)]) {
 /// The grid starts below the folder button (in the card's title row) and ends inside the window:
 /// the page does not overflow or scroll.
 fn ends_inside(window: &AppWindow, map: &ElementHandle, w: f32, h: f32) {
-    let button = ElementHandle::find_by_accessible_label(window, "History folder")
+    let button = ElementHandle::find_by_accessible_label(window, "Open History")
         .next()
         .expect("the folder button");
     let top = map.absolute_position().y;
@@ -922,4 +948,25 @@ fn ends_inside(window: &AppWindow, map: &ElementHandle, w: f32, h: f32) {
     let pad = window.global::<oxi_settings::Tokens>().get_page_padding();
     assert!(end + pad <= h, "{w}x{h}: the page ends at {}", end + pad);
     assert_eq!(window.get_scroll_y(), 0.0, "{w}x{h} scrolled");
+}
+
+/// The "i" beside an open chart must not send the reader to a card: the chart is already open.
+#[test]
+fn an_open_chart_does_not_say_to_click_a_card() {
+    let l = layout("chart-hint", Some(CHORD));
+    write_stats(&l, 42);
+    let window = open(&l, Page::Home);
+    poll(&window);
+    let click = |window: &AppWindow| {
+        ElementQuery::from_root(window)
+            .match_descendants()
+            .match_accessible_role(AccessibleRole::Text)
+            .find_all()
+            .into_iter()
+            .any(|e| e.accessible_label().is_some_and(|l| l.contains(CLICK)))
+    };
+    assert!(click(&window), "no chart open: the hint says to click");
+    window.global::<oxi_settings::HomeState>().set_selected(0);
+    settle();
+    assert!(!click(&window), "a chart is open");
 }

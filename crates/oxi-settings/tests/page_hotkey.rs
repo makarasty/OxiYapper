@@ -160,13 +160,13 @@ esc_cancels = true
     }
 }
 
-/// R2.1: "Another key while holding" and "Esc cancels a recording" start from the file and
+/// R2.1: "Cancel on another key" and "Esc cancels a recording" start from the file and
 /// write it back.
 #[test]
 fn other_key_and_esc_round_trip() {
     let fresh = open(&layout("recording-default", None));
     let esc = |w: &AppWindow| with_role(w, "Esc cancels a recording", AccessibleRole::Switch);
-    let other = |w: &AppWindow| with_role(w, "Another key while holding", AccessibleRole::Combobox);
+    let other = |w: &AppWindow| with_role(w, "Cancel on another key", AccessibleRole::Combobox);
     assert_eq!(esc(&fresh).accessible_checked(), Some(false));
     assert_eq!(other(&fresh).accessible_value().as_deref(), Some("Auto"));
     // The Auto hint is the "i" after the title (Row.info), not text on the page.

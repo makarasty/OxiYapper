@@ -14,7 +14,7 @@ use std::time::Duration;
 use common::{assert_nothing_moved, config, has, layout, open_linked, spots, with_role};
 use i_slint_backend_testing::{AccessibleRole, ElementHandle, mock_elapsed_time};
 use oxi_core::config::Audio;
-use oxi_core::history::Status;
+use oxi_core::history::{HistoryId, Status};
 use oxi_core::ipc::{HistoryItem, HistoryOp, Push, Request, Spoken, TestFailure, TestOutcome};
 use oxi_core::paths::Layout;
 use oxi_core::tuning::{self, PCM_CHUNK_SAMPLES, Profile, SettingsSet, word_errors};
@@ -141,7 +141,7 @@ impl Fixture {
     }
 
     /// The one request that is out: nothing else was sent since the last look but the audio.
-    fn one_job(&self) -> (u32, SettingsSet, Option<String>) {
+    fn one_job(&self) -> (u32, SettingsSet, Option<HistoryId>) {
         let sent: Vec<Request> = self
             .take_sent()
             .into_iter()
@@ -195,7 +195,7 @@ impl Fixture {
 
 fn item(id: &str, text: &str) -> HistoryItem {
     HistoryItem {
-        id: id.to_owned(),
+        id: HistoryId::parse(id).unwrap(),
         status: Status::Done,
         duration_ms: 2_500,
         model: String::new(),
@@ -234,6 +234,12 @@ fn starts_empty_with_run_off() {
     let s = f.state();
     assert!(f.takes().is_empty());
     assert!(has(&f.window, "No recordings picked"));
+    // The row names what Run does, and its "i" says what the page is for (nothing is pasted).
+    assert!(has(&f.window, "Compare settings"));
+    assert!(has(
+        &f.window,
+        "Tries each settings set on the recordings below and shows which hears you best. Nothing is pasted anywhere."
+    ));
     assert_eq!(s.get_profiles().row_count(), Profile::ALL.len());
     assert_eq!(s.get_run_off(), "Add a recording first");
     assert!(s.get_history_on());
@@ -447,7 +453,7 @@ fn history_recordings_are_offered_picked_and_given_back() {
 
     // Another page of the list joins it; a delete from the History page leaves it.
     f.ipc.deliver(&Event::Push(Push::HistoryResult {
-        id: HISTORY_ID.to_owned(),
+        id: HistoryId::parse(HISTORY_ID).unwrap(),
         op: HistoryOp::Delete,
         ok: true,
     }));
@@ -1016,6 +1022,52 @@ fn finish_a_run(f: &Fixture) {
     }
 }
 
+/// d12: after Copy of a long single-line transcript (the page's clipboard helper holds the whole
+/// text) nothing of the page passes the window's right edge. The testing backend's clipboard is in
+/// memory: the real one is never touched.
+/// e16: the card is placed by x/y/width in the scroll box, outside any layout: even a copier with
+/// `min-width: 5000px` changes nothing here, while a 5000 px Transcript fails this test.
+fn copy_fits(name: &str, w: f32, h: f32) {
+    let f = Fixture::new(name, None);
+    f.record_and_stop();
+    f.state().invoke_reference_edited(0, first_phrase().into());
+    f.state().invoke_run();
+    while let Some(id) = f.take_sent().into_iter().rev().find_map(|r| match r {
+        Request::TestTranscribe { id, .. } => Some(id),
+        _ => None,
+    }) {
+        f.answer(id, heard(&"word".repeat(400)));
+    }
+    f.window.window().set_size(LogicalSize::new(w, h));
+    mock_elapsed_time(Duration::from_millis(50));
+    let button = ElementHandle::find_by_accessible_label(&f.window, "Copy")
+        .next()
+        .expect("the transcript card's Copy");
+    button.invoke_accessible_default_action();
+    mock_elapsed_time(Duration::from_millis(50));
+    assert_eq!(f.window.global::<Toast>().get_text(), "Copied.");
+    for label in ["Copy", "Transcript"] {
+        let e = ElementHandle::find_by_accessible_label(&f.window, label)
+            .next()
+            .unwrap_or_else(|| panic!("no element labelled {label}"));
+        let right = e.absolute_position().x + e.size().width;
+        assert!(
+            right <= w,
+            "{label} ends at {right}, past the {w} px window"
+        );
+    }
+}
+
+#[test]
+fn copying_a_long_transcript_leaves_the_page_inside_a_small_window() {
+    copy_fits("copy-fits-720", 720.0, 520.0);
+}
+
+#[test]
+fn copying_a_long_transcript_leaves_the_page_inside_a_large_window() {
+    copy_fits("copy-fits-1280", 1280.0, 860.0);
+}
+
 #[test]
 fn a_read_only_config_keeps_the_test_but_not_apply() {
     let f = Fixture::new("locked", Some("version = 99\n"));
@@ -1058,8 +1110,8 @@ fn ctrl_tab(window: &AppWindow) {
 fn ctrl_tab_works_after_run_from_the_keyboard() {
     let f = Fixture::new("run-keys", None);
     f.record_and_stop();
-    // The rail, the view switch, Scenario, Run.
-    for _ in 0..4 {
+    // The rail, the view switch, Scenario, the "i" after Compare settings, Run.
+    for _ in 0..5 {
         press(&f.window, Key::Tab);
     }
     for space in [

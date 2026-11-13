@@ -603,6 +603,21 @@ fn press_enter_defaults_off_without_the_key_and_on_survives_a_save() {
     assert!(ConfigFile::parse(&out).unwrap().config.paste.press_enter);
 }
 
+/// e08, owner 2026-11-12: on without the key; off and a rule's override survive a save.
+#[test]
+fn join_console_lines_defaults_on_and_off_or_a_rule_survives_a_save() {
+    let mut file = ConfigFile::parse("version = 2\n").unwrap();
+    assert!(file.config.paste.join_console_lines);
+    assert!(!file.to_toml_string().unwrap().contains("join"));
+    file.config.paste.join_console_lines = false;
+    file.config.paste.rules[0].join_lines = Some(true);
+    let out = file.to_toml_string().unwrap();
+    assert!(out.contains("join_console_lines = false"), "{out}");
+    let back = ConfigFile::parse(&out).unwrap().config.paste;
+    assert!(!back.join_console_lines);
+    assert_eq!(back.rules[0].join_lines, Some(true));
+}
+
 #[test]
 fn keep_in_clipboard_history_off_survives_a_save() {
     let mut file = ConfigFile::parse(

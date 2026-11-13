@@ -3,11 +3,13 @@
 //! or [`process`] (bench), so the steps cannot run in the wrong order.
 
 mod denoise;
+mod device;
 mod pipeline;
 mod resample;
 mod speech;
 mod trim;
 
+pub use device::{EndpointNote, InputDevice, InputPick, endpoint_lost, pick_input};
 pub use pipeline::{EdgeStats, Finished, Pipeline, Trim, process};
 pub use speech::{DETECTOR_LATENCY, SpeechDetector};
 pub use trim::voiced_runs;

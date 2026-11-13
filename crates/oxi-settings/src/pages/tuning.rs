@@ -68,7 +68,7 @@ pub fn total(cells: &[Option<WordErrors>]) -> Option<WordErrors> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxi_core::history::Status;
+    use oxi_core::history::{HistoryId, Status};
     use oxi_core::ipc::Spoken;
 
     #[test]
@@ -94,7 +94,7 @@ mod tests {
     #[test]
     fn a_history_line_names_when_how_long_and_what() {
         let item = |text: &str| HistoryItem {
-            id: "2026-11-08/130005-123".into(),
+            id: HistoryId::parse("2026-11-08/130005-123").unwrap(),
             status: Status::Done,
             duration_ms: 12_400,
             model: String::new(),

@@ -45,6 +45,7 @@ mod tests {
             | Notice::OutOfMemory
             | Notice::DeviceLost
             | Notice::CaptureFailed
+            | Notice::NoMicrophone
             | Notice::TranscriptionFailed
             | Notice::PasteFailed
             | Notice::FileFailed

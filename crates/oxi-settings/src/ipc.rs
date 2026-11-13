@@ -196,9 +196,19 @@ impl Options {
     }
 }
 
+/// A test or probe instance (`OXI_PIPE_SUFFIX`, tests only) must not start a daemon: it would
+/// install the keyboard hook and react to the owner's real hotkey.
+fn refuse_test_instance(suffix: Option<&std::ffi::OsStr>) -> io::Result<()> {
+    if suffix.is_some() {
+        return Err(io::Error::other("test instance: no daemon is started"));
+    }
+    Ok(())
+}
+
 /// `current_exe` with no argument is the daemon.
 fn spawn_daemon() -> io::Result<()> {
     use std::process::{Command, Stdio};
+    refuse_test_instance(std::env::var_os(oxi_platform::ipc::PIPE_SUFFIX_ENV).as_deref())?;
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -654,6 +664,12 @@ impl Ipc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_test_instance_starts_no_daemon() {
+        assert!(refuse_test_instance(Some("probe".as_ref())).is_err());
+        assert!(refuse_test_instance(None).is_ok());
+    }
 
     #[test]
     fn errors_map_to_links() {

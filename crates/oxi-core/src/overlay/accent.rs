@@ -51,7 +51,7 @@ pub fn preset_index(seed: Rgb) -> Option<usize> {
     PRESETS.iter().position(|p| p.seed == seed)
 }
 
-/// `#RRGGBB` or `RRGGBB`, any case; nothing else (DS-20.2).
+/// `#RRGGBB` or `RRGGBB`, any case; nothing else (DS-20.7).
 #[must_use]
 pub fn parse_seed(text: &str) -> Option<Rgb> {
     let hex = text.trim();

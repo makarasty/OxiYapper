@@ -31,9 +31,14 @@ features = [
     "Foundation",                    # IAsyncOperation, DateTime
     "Foundation_Collections",        # IVectorView
     "Win32_System_Com",              # CoInitializeEx: the clipboard calls need a COM apartment; IBindCtx, CoTaskMemFree
+    "Win32_Media_Audio",             # IMMNotificationClient: a recording's endpoint unplugged or removed (capture/watch.rs)
     "Win32_Foundation",              # HANDLE, the known-folder call's token
     "Win32_UI_Shell",                # SHGetKnownFolderItem, IShellItem, IEnumShellItems: the Store apps of shell:AppsFolder
 ]
+
+# The crate `#[windows::core::implement]` expands to; same version as `windows`, already in the tree via cpal.
+[target.'cfg(windows)'.dependencies.windows-core]
+workspace = true
 
 # Each feature is the module of the listed API in windows-sys 0.61.2 (src/Windows/Win32/...).
 [target.'cfg(windows)'.dependencies.windows-sys]
@@ -45,7 +50,9 @@ features = [
     "Win32_Graphics_Gdi",              # CreateDIBSection, MonitorFromWindow, GetMonitorInfoW
     "Win32_Storage_FileSystem",        # FILE_FLAGS_AND_ATTRIBUTES for CreateNamedPipeW
     "Win32_System_DataExchange",       # OpenClipboard, EnumClipboardFormats, GetClipboardData, SetClipboardData, EmptyClipboard, GetClipboardSequenceNumber, RegisterClipboardFormatW
+    "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot, Process32FirstW, Process32NextW: the process tree of a classic console
     "Win32_System_IO",                 # ConnectNamedPipe, OVERLAPPED (ReadFile/WriteFile sit in Win32_Storage_FileSystem)
+    "Win32_System_JobObjects",         # CreateJobObjectW, SetInformationJobObject, AssignProcessToJobObject: decoding children die with the daemon
     "Win32_System_LibraryLoader",      # GetModuleHandleW
     "Win32_System_Memory",             # GlobalAlloc, GlobalLock, GlobalSize
     "Win32_System_Ole",                # CF_UNICODETEXT

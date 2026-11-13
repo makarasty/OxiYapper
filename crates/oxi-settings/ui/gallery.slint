@@ -196,7 +196,6 @@ component GallerySheet inherits VerticalLayout {
         { name: "caret-down", image: Icons.caret-down },
         { name: "dots-three", image: Icons.dots-three },
         { name: "folder-open", image: Icons.folder-open },
-        { name: "warning-circle", image: Icons.warning-circle },
         { name: "checkmark-12", image: Icons.checkmark-12 },
         { name: "checkmark-circle-16", image: Icons.checkmark-circle-16 },
         { name: "checkmark-circle", image: Icons.checkmark-circle },
@@ -1853,7 +1852,7 @@ component GallerySheet inherits VerticalLayout {
                                 if m.progress >= 0: VerticalLayout {
                                     alignment: center;
                                     Button {
-                                        kind: ButtonKind.subtle;
+                                        kind: ButtonKind.soft;
                                         text: "Cancel";
                                         icon: Icons.dismiss-16;
                                     }
@@ -1937,7 +1936,7 @@ component GallerySheet inherits VerticalLayout {
                     severity: Severity.warning;
                     text: "Update checks will stop.";
                     Button {
-                        kind: ButtonKind.subtle;
+                        kind: ButtonKind.soft;
                         text: "Turn off";
                     }
                     Button {

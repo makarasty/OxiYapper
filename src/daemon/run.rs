@@ -205,6 +205,7 @@ fn serve(layout: &oxi_core::paths::Layout) -> anyhow::Result<()> {
             tracing::info!("windows is ending the session, quitting");
             exit.end_by(Instant::now() + END_SESSION_WAIT);
             host.stop_opening_settings();
+            oxi_platform::decode::stop_all();
             let _ = inbox.send(Inbox::Shutdown);
             if !exit.wait_within(WORKERS_DONE, exit.left(END_SESSION_WAIT)) {
                 tracing::warn!("session end: the exit did not finish in time");
@@ -224,6 +225,8 @@ fn serve(layout: &oxi_core::paths::Layout) -> anyhow::Result<()> {
 
     // Whatever ended the loop (tray Quit, IPC Shutdown, a panic), no settings window starts now.
     quit_host.stop_opening_settings();
+    // Nor does a file decode run on: its child is killed (a crash kills it through the job).
+    oxi_platform::decode::stop_all();
     // In order: the coordinator, whose end closed every worker's channel, then the tray icon
     // and the overlay (gone at once, not after the workers), then the workers and the watcher.
     exit.wait(COORDINATOR_DONE);

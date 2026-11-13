@@ -3745,6 +3745,7 @@ dependencies = [
  "tiny-skia 0.11.4",
  "tracing",
  "windows",
+ "windows-core",
  "windows-sys 0.61.2",
 ]
 

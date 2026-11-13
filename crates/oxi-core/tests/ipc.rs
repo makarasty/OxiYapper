@@ -1,5 +1,6 @@
 use oxi_core::config::OverlayPosition;
 use oxi_core::device::{Device, DeviceChoice};
+use oxi_core::history::HistoryId;
 use oxi_core::hotkey::Key;
 use oxi_core::ipc::{
     DecodeError, Decoder, DownloadResult, HistoryItem, MAX_LINE, PROTO, Push, Request, Spoken,
@@ -123,7 +124,7 @@ fn pushes() -> Vec<Push> {
         },
         Push::HistoryAdded {
             item: HistoryItem {
-                id: "2026-11-11/101500-123".into(),
+                id: HistoryId::parse("2026-11-11/101500-123").unwrap(),
                 status: oxi_core::history::Status::Done,
                 duration_ms: 2500,
                 model: "turbo".into(),
@@ -134,8 +135,8 @@ fn pushes() -> Vec<Push> {
         },
         Push::HistoryRemoved {
             ids: vec![
-                "2026-11-01/090000-000".into(),
-                "2026-11-01/090100-000".into(),
+                HistoryId::parse("2026-11-01/090000-000").unwrap(),
+                HistoryId::parse("2026-11-01/090100-000").unwrap(),
             ],
         },
         Push::FileChanged {

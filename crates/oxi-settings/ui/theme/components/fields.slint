@@ -533,6 +533,8 @@ export component PathField {
     in property <string> display;
     in property <string> placeholder-text;
     in property <string> browse-text;
+    // Browse picks a file, not a folder: its button shows `browse-file` (DS-24).
+    in property <bool> picks-file;
     in property <bool> enabled: true;
     in property <bool> locked: Shell.locked;
     in property <bool> force-hover;
@@ -549,7 +551,7 @@ export component PathField {
     out property <string> shown: root.display != "" ? root.display : root.elided != "" ? root.elided : root.path;
     // A shown default is secondary ink (DS-13.3), a real path primary; `tests/gallery.rs` reads both.
     out property <color> shown-color: !root.live ? Theme.text-disabled : root.display != "" ? Theme.text-secondary : Theme.text-primary;
-    out property <image> browse-icon: Icons.browse-folder;
+    out property <image> browse-icon: root.picks-file ? Icons.browse-file : Icons.browse-folder;
     property <bool> live: root.enabled && !root.locked;
     property <bool> focused: field.has-focus || root.force-focus;
     property <length> room: field.width - 2 * Theme.space-3;

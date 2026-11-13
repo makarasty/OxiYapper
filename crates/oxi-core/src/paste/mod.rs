@@ -283,11 +283,61 @@ pub struct Foreground {
     pub elevated: bool,
 }
 
+/// The foreground window as a classic console (conhost `ConsoleWindowClass`, not Windows
+/// Terminal), where a pasted line break is an Enter. Its window reports the console's first
+/// process (`cmd.exe`) even while `claude`, `node` or `pwsh` runs in it: its descendants tell.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Console {
+    /// Not a classic console window, or this input cannot tell.
+    #[default]
+    None,
+    /// A classic console: the exe name of the window's process and of every process descended
+    /// from it (by parent pid), from a process snapshot that needs no handle to any of them.
+    Classic {
+        shell: String,
+        descendants: Vec<String>,
+    },
+    /// A classic console whose processes could not be read.
+    Unknown,
+}
+
+impl Console {
+    /// The console of window process `root` in a snapshot of `(pid, parent pid, exe name)`.
+    /// Pid 0 or a `root` missing from the snapshot (it has exited) is [`Self::Unknown`]. Each pid
+    /// is visited once, so parent pids that a reused pid turns into a loop still end the walk.
+    #[must_use]
+    pub fn from_processes(root: u32, processes: &[(u32, u32, String)]) -> Self {
+        let Some((_, _, shell)) = processes.iter().find(|(pid, ..)| *pid == root && root != 0)
+        else {
+            return Self::Unknown;
+        };
+        let (mut seen, mut descendants, mut next) = (vec![root], Vec::new(), 0);
+        while let Some(&parent) = seen.get(next) {
+            next += 1;
+            for (pid, ppid, name) in processes {
+                if *ppid == parent && !seen.contains(pid) {
+                    seen.push(*pid);
+                    descendants.push(name.clone());
+                }
+            }
+        }
+        Self::Classic {
+            shell: shell.clone(),
+            descendants,
+        }
+    }
+}
+
 /// Synthetic input and the facts about the foreground window, implemented per OS.
 pub trait Input {
     /// Whether any of Ctrl, Shift, Alt, Win (either side) is physically down.
     fn modifiers_held(&self) -> bool;
     fn foreground(&self) -> Foreground;
+    /// [`Self::foreground`] and, from that same window, its process tree when it is a classic
+    /// console. The default: no console.
+    fn foreground_console(&self) -> (Foreground, Console) {
+        (self.foreground(), Console::None)
+    }
     /// The foreground window, its focused control and the person's own key-down count; `None`
     /// when the OS gives none (a locked or secure desktop, no key hook) or this input cannot tell
     /// (the default), which stops the optional Enter.
@@ -296,28 +346,9 @@ pub trait Input {
     }
     /// Presses `keys` in order and releases them in reverse.
     fn send_chord(&mut self, keys: &[Key]) -> Result<(), InputBlocked>;
-    /// One input batch: key-down and key-up for each UTF-16 unit, in order. No sleep inside.
-    /// The default is one [`type_units`](Self::type_units) call at [`TYPE_GAP`].
-    // shortcut: `send_units` and `type_units` default to each other so inputs written against
-    // the old per-character call still build; an input must override at least one. Upgrade:
-    // make `send_units` required and drop `type_units` once no input implements only it.
-    fn send_units(&mut self, units: &[u16]) -> Result<(), InputBlocked> {
-        self.type_units(units, TYPE_GAP)
-    }
-    /// Types each UTF-16 unit as a Unicode key event pair, characters `gap` apart; the two
-    /// units of a surrogate pair go together with no gap.
-    fn type_units(&mut self, units: &[u16], gap: Millis) -> Result<(), InputBlocked> {
-        let mut from = 0;
-        while from < units.len() {
-            if from > 0 {
-                self.sleep(gap);
-            }
-            let end = chunk_end(units, from, 1);
-            self.send_units(&units[from..end])?;
-            from = end;
-        }
-        Ok(())
-    }
+    /// One input batch: key-down and key-up for each UTF-16 unit, in order. No sleep inside; the
+    /// pace between batches is the caller's ([`TypePace`]).
+    fn send_units(&mut self, units: &[u16]) -> Result<(), InputBlocked>;
     fn sleep(&mut self, time: Millis);
 }
 
@@ -345,6 +376,29 @@ pub fn plan(paste: &Paste, fg: &Foreground) -> Plan {
                 .unwrap_or(paste.restore_delay_ms),
         )),
     }
+}
+
+/// Owner 2026-11-12: whether the line breaks of a dictation for `app` become spaces. The app's
+/// rule (`join_lines`) wins; else, with `paste.join_console_lines` on, only a classic console
+/// whose process is `cmd.exe` with no descendant but its console host (`conhost.exe`,
+/// `OpenConsole.exe`), where a pasted line break runs the line as a command. Anything run from it
+/// (Claude Code, `node`, `pwsh`, `python`), an unreadable name or tree, Windows Terminal and every
+/// other window keep the line breaks.
+pub fn join_lines(paste: &Paste, app: &str, console: &Console) -> bool {
+    const HOSTS: [&str; 2] = ["conhost.exe", "OpenConsole.exe"];
+    rule_for(&paste.rules, app)
+        .and_then(|r| r.join_lines)
+        .unwrap_or_else(|| {
+            paste.join_console_lines
+                && matches!(console, Console::Classic { shell, descendants }
+                    if shell.eq_ignore_ascii_case("cmd.exe")
+                    && descendants.iter().all(|n| HOSTS.iter().any(|h| n.eq_ignore_ascii_case(h))))
+        })
+}
+
+/// `text` on one line: each line break (`\r\n`, `\r`, `\n`) as one space.
+fn one_line(text: &str) -> String {
+    crate::text::flatten(&text.replace("\r\n", "\n").replace('\r', "\n"))
 }
 
 /// The first rule in `rules` whose app matches `app` (case-insensitive).
@@ -872,16 +926,30 @@ pub fn paste_with<C: Clipboard>(
 ) -> PasteOutcome {
     let keep = paste.keep_in_clipboard_history;
     let mut waited = Millis(0);
-    while input.modifiers_held() {
+    let held = loop {
+        if !input.modifiers_held() {
+            break false;
+        }
         if waited >= MODIFIER_TIMEOUT {
-            let why = ClipboardOnlyWhy::ModifiersHeld;
-            return clipboard_only(text, keep, clip, input, ours, why);
+            break true;
         }
         input.sleep(MODIFIER_POLL);
         waited = waited + MODIFIER_POLL;
+    };
+    // Read after the wait: the text goes where focus is at paste time (item 41). Joined before
+    // every path, the clipboard-only ones too: the user's own Ctrl+V into cmd runs a line break.
+    let (fg, console) = input.foreground_console();
+    let joined;
+    let text = if join_lines(paste, &fg.app, &console) {
+        joined = one_line(text);
+        joined.as_str()
+    } else {
+        text
+    };
+    if held {
+        let why = ClipboardOnlyWhy::ModifiersHeld;
+        return clipboard_only(text, keep, clip, input, ours, why);
     }
-    // Read after the wait: the text goes where focus is at paste time (item 41).
-    let fg = input.foreground();
     if fg.elevated {
         return clipboard_only(text, keep, clip, input, ours, ClipboardOnlyWhy::Elevated);
     }
@@ -992,7 +1060,7 @@ fn type_text(
     // SPEC: no auto-Enter but the opt-in `paste.press_enter` after the whole text (`enter.rs`). A
     // typed line break is an Enter key (sends a message, runs a command), so on every typed path
     // (mode, app rule, clipboard fallback) it goes as one space.
-    let text = crate::text::flatten(&text.replace("\r\n", "\n").replace('\r', "\n"));
+    let text = one_line(text);
     let units: Vec<u16> = text.encode_utf16().collect();
     let total = units.len();
     let mut from = 0;

@@ -395,7 +395,9 @@ export component TestPage inherits VerticalLayout {
         }
         Divider { }
         Row {
-            title: @tr("Test");
+            title: @tr("Compare settings");
+            // What the page is for, in the "i" (UI rule 35): nothing is pasted or typed anywhere.
+            info: @tr("Tries each settings set on the recordings below and shows which hears you best. Nothing is pasted anywhere.");
             Button {
                 text: @tr("Run");
                 kind: ButtonKind.primary;

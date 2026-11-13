@@ -3,13 +3,14 @@
 // it: its state on disk and what can be done now (download, resume, cancel, use, delete), or the
 // path of "use my own .bin". Settings: the GPU, the unload, the models folder and its partial
 // downloads. Advanced: what the engine does on its own.
-import { Theme, Shell, Icons, Group, Card, Row, Divider, Combo, Segmented, TextField, NumberField, Button, ButtonKind, IconButton, InfoTip, PathField, ProgressBar, WarningSlot, SubTabs, SubTabPane, CardGrid, GalleryTile } from "../theme/index.slint";
+import { Theme, Shell, Icons, Group, Card, Row, Divider, Caption, Combo, Segmented, TextField, NumberField, Button, ButtonKind, IconButton, InfoTip, PathField, ProgressBar, WarningSlot, SubTabs, SubTabPane, CardGrid, GalleryTile } from "../theme/index.slint";
 import { SearchPopup } from "../theme/components/search_popup.slint";
 
 export struct ModelRow {
     id: string,
     name: string,
-    // Under the name: "1.6 GB · Fast · 99 languages"; paused: "0.4 of 3.1 GB · kept 7 more days".
+    // Under the status, what the tile does not say: paused "0.4 of 3.1 GB · kept 7 more days",
+    // damaged "download it again"; empty when there is nothing to add.
     detail: string,
     // The facts alone, a tile's caption and tooltip.
     facts: string,
@@ -162,14 +163,30 @@ component AdvControl inherits HorizontalLayout {
     if !root.number: Rectangle {
         width: Theme.control-side;
     }
-    if root.number: NumberField {
+    // Auto is not a broken box: what Auto gives now, in a quiet inset instead of a greyed field.
+    if root.number && root.shown-mode == 0: Rectangle {
+        width: Theme.control-side;
+        height: Theme.control-height;
+        y: (parent.height - self.height) / 2;
+        background: Theme.bg-inset;
+        border-radius: Theme.radius-control;
+        accessible-role: text;
+        accessible-label: @tr("Auto uses {}", root.shown-value.to-fixed(root.decimals));
+        Text {
+            text: root.shown-value.to-fixed(root.decimals);
+            font-size: Theme.body-size;
+            color: Theme.text-secondary;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    if root.number && root.shown-mode > 0: NumberField {
         value <=> root.shown-value;
         width: Theme.control-side;
         minimum: root.minimum;
         maximum: root.maximum;
         step: root.step;
         decimals: root.decimals;
-        enabled: root.shown-mode > 0;
         changed(v) => {
             ModelState.adv-changed(root.number-index, root.shown-mode, v);
         }
@@ -187,6 +204,7 @@ component ModelCard inherits VerticalLayout {
     property <string> slow: root.data.heavy ? @tr("Likely slow without a dedicated graphics card. Whisper large-v3 turbo is faster.") : "";
     property <string> first: root.data.error != "" ? root.data.error : root.missing;
     property <string> second: root.data.error != "" && root.missing != "" ? root.missing : root.slow;
+    property <string> notice: root.first != "" && root.second != "" ? root.first + "\n" + root.second : root.first + root.second;
     // The model a dictation loads is not deleted from under it: another one is put in use first.
     property <string> delete-tip: ModelState.delete-off != "" ? ModelState.delete-off : root.in-use && root.data.ready ? @tr("In use. Use another model first to delete this one.") : "";
     property <bool> confirming;
@@ -228,26 +246,34 @@ component ModelCard inherits VerticalLayout {
                 HorizontalLayout {
                     spacing: Theme.control-gap;
                     horizontal-stretch: 1;
+                    // The status and its caption line are kept in every state, so the card keeps its
+                    // height (DS-25); a status alone sits in the middle of them.
                     VerticalLayout {
+                        min-height: Theme.body-line + Theme.title-gap + Theme.caption-line;
                         alignment: center;
                         spacing: Theme.title-gap;
                         horizontal-stretch: 1;
+                        // The tile above already says which model and its facts: the card says
+                        // where it stands (its name is for a screen reader).
                         Text {
-                            text: root.data.name;
+                            text: root.data.badge;
                             font-size: Theme.body-size;
                             color: Theme.text-primary;
                             overflow: elide;
                             accessible-label: @tr("{}: {}", root.data.name, root.data.badge);
                         }
-                        Text {
+                        // What the tile does not say (paused: how much is there; damaged: what to do).
+                        if root.data.detail != "": Text {
                             text: root.data.detail;
                             font-size: Theme.caption-size;
                             color: Theme.text-secondary;
-                            wrap: word-wrap;
+                            overflow: elide;
                         }
                     }
+                    // UI rule 2: the warning is the "!" of the row, its words in the tooltip and
+                    // the accessible label, never a line under the row.
                     WarningSlot {
-                        text: root.first != "" && root.second != "" ? root.first + "\n" + root.second : root.first + root.second;
+                        text: root.notice;
                     }
                     // DS-28.2: the bar's slot, kept so nothing moves when a download starts. With the
                     // two action slots it fills the control column (200 wide, 80 in the 240 column).
@@ -285,7 +311,7 @@ component ModelCard inherits VerticalLayout {
                             alignment: center;
                             get := Button {
                                 text: root.data.paused ? @tr("Resume") : @tr("Download");
-                                icon: Icons.arrow-download-16;
+                                icon: Icons.download;
                                 enabled: ModelState.download-off == "";
                                 tooltip: ModelState.download-off;
                                 accessible-label: root.data.paused ? @tr("Resume {}", root.data.name) : @tr("Download {}", root.data.name);
@@ -299,7 +325,6 @@ component ModelCard inherits VerticalLayout {
                             alignment: center;
                             Button {
                                 text: @tr("Cancel");
-                                icon: Icons.dismiss-16;
                                 kind: ButtonKind.danger;
                                 accessible-label: @tr("Cancel {}", root.data.name);
                                 clicked => {
@@ -312,7 +337,6 @@ component ModelCard inherits VerticalLayout {
                             alignment: center;
                             Button {
                                 text: root.in-use ? @tr("In use") : @tr("Use");
-                                icon: Icons.checkmark-12;
                                 kind: root.in-use ? ButtonKind.secondary : ButtonKind.primary;
                                 enabled: !root.in-use && !Shell.locked;
                                 tooltip: Shell.locked ? Shell.locked-tip : "";
@@ -362,7 +386,7 @@ component ModelCard inherits VerticalLayout {
                 VerticalLayout {
                     alignment: center;
                     Image {
-                        source: Icons.delete;
+                        source: Icons.warning;
                         width: Theme.icon-size;
                         height: Theme.icon-size;
                         colorize: Theme.text-primary;
@@ -384,6 +408,7 @@ component ModelCard inherits VerticalLayout {
                         alignment: center;
                         Button {
                             text: @tr("Delete");
+                            icon: Icons.delete;
                             kind: ButtonKind.danger;
                             accessible-label: @tr("Confirm: delete {}", root.data.name);
                             clicked => {
@@ -466,7 +491,6 @@ component CustomCard inherits VerticalLayout {
                         alignment: center;
                         Button {
                             text: root.in-use ? @tr("In use") : @tr("Use");
-                            icon: Icons.checkmark-12;
                             kind: root.in-use ? ButtonKind.secondary : ButtonKind.primary;
                             enabled: !root.in-use && !Shell.locked && ModelState.custom-path != "" && ModelState.custom-error == "";
                             tooltip: Shell.locked ? Shell.locked-tip : ModelState.custom-path == "" ? @tr("Choose a .bin model file") : "";
@@ -481,6 +505,7 @@ component CustomCard inherits VerticalLayout {
                     path <=> ModelState.custom-path;
                     placeholder-text: @tr("Path to a .bin file");
                     browse-text: ModelState.can-browse ? @tr("Browse") : "";
+                    picks-file: true;
                     // The field inside takes the label; the frame itself is no element of its own.
                     accessible-role: none;
                     accessible-label: @tr("Model file");
@@ -541,9 +566,10 @@ export component ModelPage inherits VerticalLayout {
                                         ModelState.language-picked(i);
                                     }
                                 }
-                                // "More" is a glyph, not typed dots (DS-17.1).
-                                IconButton {
-                                    label: @tr("More languages");
+                                // A glyph, not typed dots (DS-17.1), with a word: the chevron alone said nothing.
+                                Button {
+                                    text: @tr("More");
+                                    accessible-label: @tr("More languages");
                                     icon: Icons.caret-down;
                                     enabled: !Shell.locked;
                                     clicked => {
@@ -674,7 +700,7 @@ export component ModelPage inherits VerticalLayout {
                     title: @tr("Files");
                     Card {
                         Row {
-                            icon: Icons.folder-open-16;
+                            icon: Icons.models-folder;
                             title: @tr("Models folder");
                             info: @tr("Where the downloaded models are kept.");
                             // The look of every open-folder button (System, Home): subtle, folder glyph.
@@ -690,11 +716,12 @@ export component ModelPage inherits VerticalLayout {
                         }
                         Divider { }
                         Row {
-                            icon: Icons.delete;
+                            icon: Icons.partial-downloads;
                             title: @tr("Partial downloads");
                             info: @tr("Unfinished downloads, kept so they can resume.");
                             Button {
                                 text: @tr("Delete");
+                                icon: Icons.delete;
                                 accessible-label: @tr("Delete partial downloads");
                                 kind: ButtonKind.danger;
                                 enabled: ModelState.partials-off == "";
@@ -715,8 +742,8 @@ export component ModelPage inherits VerticalLayout {
                 spacing: Theme.group-gap;
                 Group {
                     title: @tr("Decoding");
+                    info: @tr("Expert settings. Auto means the app decides: the grey value is what it uses now.");
                     action-text: @tr("Reset all to Auto");
-                    action-icon: Icons.reset-auto;
                     action-tip: @tr("Every setting here back to Auto, the prompt cleared.");
                     action-enabled: !Shell.locked;
                     action => {

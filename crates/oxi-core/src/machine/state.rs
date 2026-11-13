@@ -71,14 +71,29 @@ enum Stage {
     Pasting,
 }
 
+/// What became of a job while its audio was still coming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fate {
+    /// Nothing: the audio goes to whisper.
+    Live,
+    /// Cancelled after speech: the audio goes to the history, never to whisper.
+    Cancelled,
+    /// Ended by a mic or model failure: its audio is kept as failed.
+    Failed,
+}
+
+impl Fate {
+    const fn is_live(self) -> bool {
+        matches!(self, Self::Live)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Job {
     id: JobId,
     stage: Stage,
-    /// Cancelled after speech: the audio goes to the history, never to whisper. Not a phase.
-    cancelled: bool,
-    /// Ended by a mic or model failure (`cancelled` too): its audio is kept as failed.
-    failed: bool,
+    /// How the job ended before its audio came, if it did. Not a phase.
+    fate: Fate,
     /// A new press inside the hold gap carries this job on in a longer one: it neither goes to
     /// whisper nor pastes. The [`Effect::Merge`] of that recording takes its audio and ends it;
     /// a recording that fails gives it back instead ([`State::resume`]).
@@ -181,10 +196,16 @@ impl State {
     pub fn phase(&self) -> Phase {
         if self.rec.is_some() {
             Phase::Recording
-        } else if self.jobs.iter().all(|j| j.cancelled || j.superseded) {
+        } else if self.jobs.iter().all(|j| !j.fate.is_live() || j.superseded) {
             Phase::Idle
         } else if self.jobs.iter().any(|j| {
-            !j.cancelled && !j.superseded && !matches!(j.stage, Stage::Transcribed | Stage::Pasting)
+            j.fate.is_live()
+                && !j.superseded
+                && !matches!(j.stage, Stage::Transcribed | Stage::Pasting)
+        }) || self.jobs.front().is_some_and(|j| {
+            // The front job still waits for its hold gap: a set `hold_until` on a transcribed
+            // front job means the last step saw `now` before it (it pastes as soon as it ends).
+            j.stage == Stage::Transcribed && !j.superseded && j.hold_until.is_some()
         }) {
             Phase::Transcribing
         } else {
@@ -293,12 +314,8 @@ impl State {
                     fx.push(Effect::Notify(Notice::DeviceLost));
                 }
             }
-            Event::CaptureFailed => {
-                if self.rec.is_some() {
-                    self.end_failed_recording(now, &mut fx);
-                    self.fail(Notice::CaptureFailed, now, &mut fx);
-                }
-            }
+            Event::CaptureFailed => self.capture_failed(Notice::CaptureFailed, now, &mut fx),
+            Event::NoMicrophone => self.capture_failed(Notice::NoMicrophone, now, &mut fx),
             Event::JobAudioReady(id) => self.audio_ready(id, now, &mut fx),
             Event::JobAudioEmpty { .. }
             | Event::TranscriptionDone { .. }
@@ -443,12 +460,12 @@ impl State {
         let Some(job) = self.job_in(id, Stage::AwaitingAudio) else {
             return;
         };
-        if job.failed {
+        if job.fate == Fate::Failed {
             // No transcript will come: the coordinator files the audio as failed.
             self.jobs.retain(|j| j.id != id);
             fx.push(Effect::DropJob(id));
             self.show_unless_recording(Notice::FailedKept, now);
-        } else if job.cancelled {
+        } else if job.fate == Fate::Cancelled {
             self.jobs.retain(|j| j.id != id);
             fx.push(Effect::KeepCancelled(id));
             // With history off nothing is written: "kept" would be false (triage #69).
@@ -468,16 +485,16 @@ impl State {
         let Some(found) = self.job_in(job, Stage::AwaitingAudio) else {
             return;
         };
-        let (cancelled, failed) = (found.cancelled, found.failed);
+        let fate = found.fate;
         self.jobs.retain(|j| j.id != job);
-        if failed {
+        if fate == Fate::Failed {
             // A broken capture still filed what it streamed; otherwise the failure notice stands.
             if why == EmptyAudio::Failed {
                 self.show_unless_recording(Notice::FailedKept, now);
             }
             return;
         }
-        if cancelled {
+        if fate == Fate::Cancelled {
             // Nothing to keep after all: the cancel stands, whatever the audio side says.
             return self.show_unless_recording(Notice::Cancelled, now);
         }
@@ -539,7 +556,7 @@ impl State {
         let Some(r) = self.rec.take() else { return };
         self.resume(&r.continues, now, fx);
         if r.speech && self.cfg.keep_history {
-            let id = self.push_job(true, true);
+            let id = self.push_job(Fate::Failed);
             fx.push(Effect::StopCapture(id));
         } else {
             fx.push(Effect::DiscardCapture);
@@ -577,14 +594,13 @@ impl State {
     }
 
     /// A new job awaiting the audio of the recording that just ended.
-    fn push_job(&mut self, cancelled: bool, failed: bool) -> JobId {
+    fn push_job(&mut self, fate: Fate) -> JobId {
         let id = JobId(self.next_job);
         self.next_job += 1;
         self.jobs.push_back(Job {
             id,
             stage: Stage::AwaitingAudio,
-            cancelled,
-            failed,
+            fate,
             superseded: false,
             answer: None,
             hold_until: None,
@@ -608,7 +624,7 @@ impl State {
             speech: r.speech,
         });
         if r.speech {
-            let id = self.push_job(true, false);
+            let id = self.push_job(Fate::Cancelled);
             fx.push(Effect::StopCapture(id));
             self.hand_over(r.continues, id, fx);
         } else {
@@ -683,7 +699,7 @@ impl State {
         self.jobs
             .back()
             .filter(|j| {
-                !j.cancelled
+                j.fate.is_live()
                     && !j.superseded
                     && j.stage != Stage::Pasting
                     && j.hold_until.is_some_and(|t| t > now)
@@ -694,7 +710,7 @@ impl State {
     /// Too many jobs wait for a press at `now` to record.
     fn queue_full(&self, now: Millis) -> bool {
         let waiting = self.jobs.iter().filter(|j| {
-            !j.cancelled
+            j.fate.is_live()
                 && !j.superseded
                 && matches!(
                     j.stage,
@@ -831,6 +847,14 @@ impl State {
         }
     }
 
+    /// Capture could not run; nothing is kept. `notice` says why.
+    fn capture_failed(&mut self, notice: Notice, now: Millis, fx: &mut Effects) {
+        if self.rec.is_some() {
+            self.end_failed_recording(now, fx);
+            self.fail(notice, now, fx);
+        }
+    }
+
     /// End the recording and make it a job. `discard_short`: audio under `tap_max` is dropped.
     fn stop_recording(&mut self, now: Millis, discard_short: bool, fx: &mut Effects) {
         let Some(r) = self.rec.take() else { return };
@@ -839,7 +863,7 @@ impl State {
             fx.push(Effect::DiscardCapture);
             return;
         }
-        let id = self.push_job(false, false);
+        let id = self.push_job(Fate::Live);
         let gap = self.cfg.hold_gap;
         let released = r.released_at.filter(|_| gap > Millis(0));
         if let (Some(t), Some(j)) = (released, self.jobs.back_mut()) {
@@ -1016,6 +1040,56 @@ mod tests {
         assert_eq!(model_notice(ModelFailure::Missing), Notice::NoModel);
         assert_eq!(model_notice(ModelFailure::Bad), Notice::ModelBad);
         assert_eq!(model_notice(ModelFailure::OutOfMemory), Notice::OutOfMemory);
+    }
+
+    /// Every two-job state: `phase()` is the rule before the hold gap (oracle below), except a
+    /// transcribed front job waiting for its gap, which is Transcribing.
+    #[test]
+    fn phase_keeps_the_old_rule_but_for_the_hold_gap_wait() {
+        use Stage::{AwaitingAudio, Pasting, Queued, Transcribed, Transcribing};
+        let old = |jobs: &[Job]| {
+            if jobs.iter().all(|j| !j.fate.is_live() || j.superseded) {
+                Phase::Idle
+            } else if jobs.iter().any(|j| {
+                j.fate.is_live() && !j.superseded && !matches!(j.stage, Transcribed | Pasting)
+            }) {
+                Phase::Transcribing
+            } else {
+                Phase::Pasting
+            }
+        };
+        let stages = [AwaitingAudio, Queued, Transcribing, Transcribed, Pasting];
+        let job = |id, stage, fate, superseded, hold: bool| Job {
+            id: JobId(id),
+            stage,
+            fate,
+            superseded,
+            answer: None,
+            hold_until: hold.then_some(Millis(1)),
+        };
+        let mut s = State::new(MachineConfig::default());
+        for (a, b) in stages
+            .iter()
+            .flat_map(|a| stages.iter().map(move |b| (*a, *b)))
+        {
+            for fate in [Fate::Live, Fate::Cancelled, Fate::Failed] {
+                for bits in 0..8u8 {
+                    let (sup, hold0, hold1) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+                    let jobs = [
+                        job(0, a, Fate::Live, sup, hold0),
+                        job(1, b, fate, false, hold1),
+                    ];
+                    s.jobs = jobs.iter().cloned().collect();
+                    let waits = a == Transcribed && !sup && hold0;
+                    let want = if waits {
+                        Phase::Transcribing
+                    } else {
+                        old(&jobs)
+                    };
+                    assert_eq!(s.phase(), want, "{jobs:?}");
+                }
+            }
+        }
     }
 
     // Quit waits on `busy`: a cancelled job is Idle by phase, but its kept audio is still due.

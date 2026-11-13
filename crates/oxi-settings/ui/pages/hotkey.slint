@@ -2,7 +2,7 @@
 // full keyboard (click keys or press them, held keys light up); while it is open the same row reads
 // "current -> new". Closing the keyboard with keys picked keeps them as a draft (a dot on the
 // pencil) until the page is left. Then the mode.
-import { Theme, Shell, Icons, Group, Card, Row, Divider, ToggleRow, SliderRow, Combo, KeycapRow, TilePicker, Button, ButtonKind, IconButton } from "../theme/index.slint";
+import { Theme, Shell, Icons, Group, Card, Row, Divider, ToggleRow, SliderRow, Combo, KeycapRow, TilePicker, Button, ButtonKind } from "../theme/index.slint";
 import { WarningSlot } from "../theme/components/feedback.slint";
 import { Keyboard, KeyCap } from "../keyboard.slint";
 
@@ -69,25 +69,18 @@ export component HotkeyPage inherits VerticalLayout {
                 icon: Icons.keyboard;
                 title: @tr("Keys");
                 info: @tr("Click keys or press them. Left and right modifiers both count.");
-                // The saved chord; while editing it reads as the old value in secondary ink. In the
-                // narrow 240 px column it folds into a "+N" cap (DS-28.3) instead of leaving.
+                // The saved chord, a display and no control (the labelled Change button is the one way
+                // in); while editing it reads as the old value in secondary ink. In the narrow 240 px
+                // column it folds into a "+N" cap (DS-28.3) instead of leaving.
                 Rectangle {
                     preferred-width: chord.preferred-width;
                     min-width: HotkeyState.keyboard-open ? Theme.keycap-width : 0px;
                     chord := KeycapRow {
                         width: parent.width;
                         pack-end: true;
-                        hovered: chord-area.has-hover;
                         keys: HotkeyState.chord-keys;
                         label: HotkeyState.chord;
                         muted: HotkeyState.keyboard-open;
-                    }
-                    chord-area := TouchArea {
-                        enabled: !Shell.locked && !HotkeyState.keyboard-open;
-                        mouse-cursor: self.enabled ? pointer : default;
-                        clicked => {
-                            HotkeyState.change();
-                        }
                     }
                 }
                 if HotkeyState.keyboard-open: VerticalLayout {
@@ -116,9 +109,10 @@ export component HotkeyPage inherits VerticalLayout {
                 // Centre the button on the keycaps (DS-3.4).
                 VerticalLayout {
                     alignment: center;
-                    IconButton {
-                        icon: Icons.edit-16;
-                        label: @tr("Change hotkey");
+                    Button {
+                        text: @tr("Change");
+                        icon: Icons.edit;
+                        accessible-label: @tr("Change hotkey");
                         enabled: !Shell.locked;
                         toggled: HotkeyState.keyboard-open;
                         kept-dot: HotkeyState.draft && !HotkeyState.keyboard-open;
@@ -211,13 +205,13 @@ export component HotkeyPage inherits VerticalLayout {
         // Gives way to the open keyboard like the tiles: the page must not scroll (UI rule 25).
         if !HotkeyState.keyboard-open: Card {
             Row {
-                title: @tr("Another key while holding");
+                title: @tr("Cancel on another key");
                 info: @tr("The key always reaches the app. Auto cancels only if you have not spoken yet.");
                 fill-controls: true;
                 Combo {
                     model: [@tr("Auto"), @tr("Never cancel"), @tr("Always cancel")];
                     current-index <=> HotkeyState.other-key;
-                    accessible-label: @tr("Another key while holding");
+                    accessible-label: @tr("Cancel on another key");
                     selected => {
                         HotkeyState.other-key-picked(self.current-index);
                     }
@@ -235,7 +229,7 @@ export component HotkeyPage inherits VerticalLayout {
             // Only a held key can be let go and pressed again by accident.
             if HotkeyState.mode == 0: Divider { }
             if HotkeyState.mode == 0: SliderRow {
-                title: @tr("Continue after a short re-press");
+                title: @tr("Continue if pressed again within");
                 info: @tr("Let go of the keys and press them again within this time, and the same dictation goes on. Off starts a new one.");
                 minimum: 0;
                 maximum: 1500;

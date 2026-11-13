@@ -6,6 +6,8 @@
 
 mod play;
 mod stream;
+#[cfg(windows)]
+mod watch;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,7 +19,7 @@ use oxi_core::config::Audio;
 use thiserror::Error;
 
 pub use play::{Output, Playback, play};
-pub use stream::{CpalCapture, list_input_devices};
+pub use stream::{CpalCapture, default_input_name, list_input_devices};
 
 /// Post-gain peak and RMS of the last 20 ms window, for the overlay meter (ARCHITECTURE section 2).
 /// Clones share one value; reading is one atomic load, so the UI thread polls it lock-free.
@@ -110,8 +112,8 @@ pub struct Recorded {
 /// One microphone recording: open on key-down, [`Capture::finish`] on key-up.
 pub trait Capture: Sized {
     /// Open the device named `opts.device`; an empty name, or a name that is not found, opens the
-    /// system default (see [`Capture::fell_back_to_default`]). `meter` gets the level while capture
-    /// runs and is zeroed when it stops. `on_event` runs on a cpal thread.
+    /// system default as it is at this call (see [`Capture::fell_back_to_default`]). `meter` gets
+    /// the level while capture runs and is zeroed when it stops. `on_event` runs on a cpal thread.
     fn open(
         opts: &Audio,
         meter: LevelMeter,

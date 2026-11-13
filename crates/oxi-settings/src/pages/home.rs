@@ -20,8 +20,9 @@ use oxi_core::stats::{
 use oxi_platform::stats_store;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
+use super::toast;
 use crate::constants::FOLDER_POLL;
-use crate::generated::{HistoryState, HomeState, MonthLabel, Shell, Toast};
+use crate::generated::{HistoryState, HomeState, MonthLabel, Shell};
 use crate::ipc::{Event, Link};
 use crate::{AppWindow, Ctx, Error, Page, report};
 
@@ -162,6 +163,18 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
         window.set_page(Page::History);
     });
 
+    let w = window.as_weak();
+    window.global::<HomeState>().on_show_history(move || {
+        if let Some(window) = w.upgrade() {
+            window.set_page(Page::History);
+        }
+    });
+
+    bind_open_history(window, ctx);
+}
+
+/// The History folder button: the folder is looked up off the UI thread and opened when found.
+fn bind_open_history(window: &AppWindow, ctx: &Ctx) {
     let (w, c) = (window.as_weak(), ctx.clone());
     let check = Rc::new(Timer::default());
     window.global::<HomeState>().on_open_history(move || {
@@ -195,7 +208,7 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
 /// A folder to open and the note that goes with it.
 type Target = Option<(PathBuf, Option<&'static str>)>;
 
-/// What the History folder button opens: `dir`, else its parent (the data directory or the chosen
+/// What the History folder button (System > Recordings, Open) opens: `dir`, else its parent (the data directory or the chosen
 /// folder), else the data directory. Creates nothing: a folder made here would lack the app's
 /// marker and later block saving. Touches the disk, so it runs off the UI thread.
 fn history_target(cfg: &History, dir: &Path, data_dir: &Path) -> Target {
@@ -221,7 +234,7 @@ fn open_target(w: &slint::Weak<AppWindow>, target: Target) {
         .and_then(|(path, note)| {
             oxi_platform::open::open(&path)?;
             if let (Some(note), Some(window)) = (note, w.upgrade()) {
-                window.global::<Toast>().invoke_show(note.into());
+                toast(&window, note);
             }
             Ok(())
         });

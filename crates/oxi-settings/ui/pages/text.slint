@@ -59,6 +59,8 @@ export global TextState {
     in-out property <bool> keep-history;
     // One Enter after the whole text landed (`paste.press_enter`).
     in-out property <bool> press-enter;
+    // Line breaks become spaces in a classic cmd.exe console (`paste.join_console_lines`).
+    in-out property <bool> join-console-lines;
     in-out property <float> restore-delay-ms;
     in property <float> default-restore-delay-ms;
     // Processing (`[text]`): every switch is off until the person turns it on.
@@ -129,6 +131,7 @@ export global TextState {
     callback trailing-space-toggled(bool);
     callback keep-history-toggled(bool);
     callback press-enter-toggled(bool);
+    callback join-console-lines-toggled(bool);
     callback restore-delay-changed(float);
     callback pause-punctuation-toggled(bool);
     callback pause-sentence-changed(float);
@@ -141,7 +144,7 @@ export global TextState {
     callback confidence-min-changed(float);
     callback rule-mode-picked(int, int);
     // 0 language, 1 model, 2 to file, 3 dictionary, 4 replacements, 5 voice commands, 6 filler
-    // words, 7 pause punctuation; the index into that field's list.
+    // words, 7 pause punctuation, 8 join lines; the index into that field's list.
     callback profile-picked(int, int);
     callback profile-opened(int);
     callback file-mode-picked(int);
@@ -261,7 +264,7 @@ component FileEditor inherits Card {
             alignment: center;
             Button {
                 text: @tr("Open file");
-                icon: Icons.open-folder-16;
+                icon: Icons.open-external;
                 kind: ButtonKind.soft;
                 accessible-label: @tr("Open {}", root.name);
                 clicked => {
@@ -273,7 +276,6 @@ component FileEditor inherits Card {
             alignment: center;
             Button {
                 text: @tr("Save");
-                icon: Icons.save-16;
                 kind: root.info.dirty ? ButtonKind.primary : ButtonKind.secondary;
                 enabled: root.can-save;
                 tooltip: root.readable ? @tr("No changes to save") : @tr("The file could not be read");
@@ -389,10 +391,12 @@ export component TextPage inherits VerticalLayout {
     // Per-app rules: one card, the search bar over the list. The list takes its rows, between three
     // rows (the empty states) and what the room leaves.
     property <length> bar-block: Theme.control-height + Theme.space-3;
-    property <length> list-room: max(root.room - 2 * Theme.card-padding-v - root.bar-block, 3 * Theme.row-height);
-    // The profile editor of a rule: its header, then eight rows; it takes what the room leaves, so a short
+    // Per-app rules: the line-join switch's card first; the rules card gets the room under it.
+    property <length> rules-room: root.room - join-card.preferred-height - Theme.card-gap;
+    property <length> list-room: max(root.rules-room - 2 * Theme.card-padding-v - root.bar-block, 3 * Theme.row-height);
+    // The profile editor of a rule: its header, then nine rows; it takes what the room leaves, so a short
     // window scrolls inside it (rule 26).
-    property <length> profile-height: min(root.room, 2 * Theme.card-padding-v + Theme.control-height + 2 * Theme.space-3 + 8 * Theme.control-height + 7 * Theme.space-3 + Theme.space-2);
+    property <length> profile-height: min(root.rules-room, 2 * Theme.card-padding-v + Theme.control-height + 2 * Theme.space-3 + 9 * Theme.control-height + 8 * Theme.space-3 + Theme.space-2);
     property <length> list-height: min(root.list-room, max(TextState.rule-matches * Theme.row-height, 3 * Theme.row-height));
     // The card is as tall with a profile open as with the list, the taller of the two, so opening one
     // moves nothing (UI rule 1); the list keeps its rows at the top.
@@ -461,12 +465,13 @@ export component TextPage inherits VerticalLayout {
             shown: TextState.tab == 0;
             VerticalLayout {
                 alignment: start;
+                // The purpose is in the empty editor and the "i", not a loose line (UI rule 35).
                 FileEditor {
                     file: TextFile.dictionary;
                     name: "dictionary.txt";
                     label: @tr("Dictionary");
-                    description: @tr("Words that help Whisper spell names and terms, one per line.");
-                    hint: @tr("One word or name per line");
+                    description: @tr("Names and rare words Whisper should know, one per line. A word it always mishears? Fix it in Replacements.");
+                    hint: @tr("Names and rare words Whisper should know, one per line");
                     info: TextState.dictionary-info;
                     warning: TextState.dropped-from > 0 ? @tr("Over the limit: line {} and after are not sent.", TextState.dropped-from) : "";
                     room: root.room;
@@ -488,8 +493,8 @@ export component TextPage inherits VerticalLayout {
                     file: TextFile.replacements;
                     name: "replace.txt";
                     label: @tr("Replacements");
-                    description: @tr("heard => wanted, one per line. Applied after transcription.");
-                    hint: @tr("heard => wanted");
+                    description: @tr("Fixes a word Whisper always gets wrong: heard => wanted, one per line. Applied after transcription.");
+                    hint: @tr("heard => wanted, like wisper => Whisper: fixes a word it always gets wrong");
                     info: TextState.replacements-info;
                     warning: TextState.bad-lines;
                     room: root.room;
@@ -505,13 +510,22 @@ export component TextPage inherits VerticalLayout {
             shown: TextState.tab == 2;
             VerticalLayout {
                 alignment: start;
+                // The link to Per-app rules is the group's trailing action (Home's History folder, DS-28.6).
                 Group {
+                    title: @tr("Paste mode");
+                    info: @tr("Clipboard puts your own copy back after the paste. Type also works where Ctrl+V does not, like remote desktops.");
+                    action-text: @tr("Per-app rules");
+                    action-tip: @tr("Different for one app or a command prompt, or writing to a file? Set it in Per-app rules.");
+                    action => {
+                        TextState.tab = 3;
+                    }
                     TilePicker {
                         accessible-label: @tr("Paste mode");
                         columns: 2;
+                        tile-height: Theme.tile-height-short;
                         tiles: [
-                            { icon: Icons.clipboard-paste-24, icon-selected: Icons.clipboard-paste-24-filled, title: @tr("Clipboard"), caption: @tr("Pastes with Ctrl+V and keeps your own copy") },
-                            { icon: Icons.keyboard-24, icon-selected: Icons.keyboard-24-filled, title: @tr("Type"), caption: @tr("Types the text, for games and remote desktops") },
+                            { icon: Icons.clipboard-paste-24, icon-selected: Icons.clipboard-paste-24-filled, title: @tr("Clipboard"), caption: @tr("Pastes with Ctrl+V") },
+                            { icon: Icons.keyboard-24, icon-selected: Icons.keyboard-24-filled, title: @tr("Type"), caption: @tr("Types key by key, for games") },
                         ];
                         selected: TextState.paste-mode;
                         picked(i) => {
@@ -551,51 +565,6 @@ export component TextPage inherits VerticalLayout {
                             value <=> TextState.restore-delay-ms;
                             changed(v) => {
                                 TextState.restore-delay-changed(v);
-                            }
-                        }
-                        // In the same card: a card of its own does not fit the least window with a banner
-                        // (UI rule 25).
-                        Divider { }
-                        Row {
-                            title: @tr("Also write to a file");
-                            warning: TextState.file-warning;
-                            info: @tr("Each dictation is added to a file of the day, YYYY-MM-DD, in the folder. With Write only nothing is pasted. Without a folder nothing is written.");
-                            Combo {
-                                model: [@tr("Off"), @tr("Paste and write"), @tr("Write only")];
-                                current-index: TextState.file-mode;
-                                accessible-label: @tr("Also write to a file");
-                                selected => {
-                                    TextState.file-mode-picked(self.current-index);
-                                }
-                            }
-                        }
-                        Divider { }
-                        // The format beside the folder: one row less, for the same reason.
-                        Row {
-                            title: @tr("Folder");
-                            info: TextState.file-folder == "" ? @tr("Choose the folder the files go to. Markdown adds a list line, - 09:05 text; Text adds 09:05  text.") : TextState.file-folder;
-                            HorizontalLayout {
-                                alignment: end;
-                                spacing: Theme.control-gap;
-                                Segmented {
-                                    accessible-label: @tr("File format");
-                                    items: [".md", ".txt"];
-                                    spoken: [@tr("Markdown"), @tr("Text")];
-                                    tips: [@tr("Markdown: a list line, - 09:05 text"), @tr("Text: 09:05  text")];
-                                    selected: TextState.file-format;
-                                    picked(i) => {
-                                        TextState.file-format-picked(i);
-                                    }
-                                }
-                                Button {
-                                    text: TextState.file-folder-name == "" ? @tr("Choose folder") : TextState.file-folder-name;
-                                    icon: Icons.folder-open;
-                                    enabled: !Shell.locked;
-                                    tooltip: Shell.locked-tip;
-                                    clicked => {
-                                        TextState.file-folder-choose();
-                                    }
-                                }
                             }
                         }
                     }
@@ -718,15 +687,16 @@ export component TextPage inherits VerticalLayout {
                         }
                         Row {
                             title: @tr("Filler words");
-                            info: @tr("One word per line, any case. Whole words only.");
+                            info: @tr("Filler words to drop, like um or ну: one per line, any case, whole words only.");
                             text-only: true;
                         }
                         TextArea {
                             width: 100%;
                             preferred-height: root.words-height;
                             min-height: root.words-min;
+                            enabled: TextState.filler-filter;
                             text <=> TextState.fillers;
-                            placeholder-text: @tr("One word per line");
+                            placeholder-text: @tr("Filler words to drop, one per line: um, ну");
                             accessible-label: @tr("Filler words");
                             edited(text) => {
                                 TextState.fillers-edited(text);
@@ -744,7 +714,7 @@ export component TextPage inherits VerticalLayout {
                             preferred-height: root.words-height;
                             min-height: root.words-min;
                             text <=> TextState.snippets;
-                            placeholder-text: @tr("trigger => text");
+                            placeholder-text: @tr("trigger => text: a short phrase that turns into a full text");
                             accessible-label: @tr("Snippets");
                             edited(text) => {
                                 TextState.snippets-edited(text);
@@ -758,6 +728,70 @@ export component TextPage inherits VerticalLayout {
             shown: TextState.tab == 3;
             VerticalLayout {
                 alignment: start;
+                // Owner 2026-11-12 (e08): the defaults the rules below can override per app (a profile's
+                // own "Write to a file" too). Here, not on the Paste tab: there they do not fit 720 x 520
+                // with a banner beside the captioned tiles (UI rule 25, DS-15.1).
+                VerticalLayout {
+                    padding-bottom: Theme.card-gap;
+                    join-card := Card {
+                        ToggleRow {
+                            flat: true;
+                            title: @tr("Join lines in command prompts");
+                            info: @tr("Only a classic console window with nothing but cmd.exe running in it, where a line break runs the line as a command: there the lines are joined with spaces. Claude Code, PowerShell or any other program started in it, Windows Terminal and every other app get them as dictated. An app's profile can turn it on or off for that app.");
+                            checked <=> TextState.join-console-lines;
+                            toggled(on) => {
+                                TextState.join-console-lines-toggled(on);
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            title: @tr("Also write to a file");
+                            warning: TextState.file-warning;
+                            info: @tr("Each dictation is added to a file of the day, YYYY-MM-DD, in the folder. With Write only nothing is pasted. Without a folder nothing is written.");
+                            Combo {
+                                model: [@tr("Off"), @tr("Paste and write"), @tr("Write only")];
+                                current-index: TextState.file-mode;
+                                accessible-label: @tr("Also write to a file");
+                                selected => {
+                                    TextState.file-mode-picked(self.current-index);
+                                }
+                            }
+                        }
+                        Divider { }
+                        // The format beside the folder: one row less, so the rules card keeps its room.
+                        Row {
+                            title: @tr("Folder");
+                            // Greyed while no file is written, as Processing greys the rows under an Off switch.
+                            enabled: TextState.file-mode != 0;
+                            off-tip: @tr("Turn on writing to a file first");
+                            info: TextState.file-folder == "" ? @tr("Choose the folder the files go to. Markdown adds a list line, - 09:05 text; Text adds 09:05  text.") : TextState.file-folder;
+                            HorizontalLayout {
+                                alignment: end;
+                                spacing: Theme.control-gap;
+                                Segmented {
+                                    accessible-label: @tr("File format");
+                                    items: [".md", ".txt"];
+                                    spoken: [@tr("Markdown"), @tr("Text")];
+                                    tips: [@tr("Markdown: a list line, - 09:05 text"), @tr("Text: 09:05  text")];
+                                    selected: TextState.file-format;
+                                    enabled: TextState.file-mode != 0;
+                                    picked(i) => {
+                                        TextState.file-format-picked(i);
+                                    }
+                                }
+                                Button {
+                                    text: TextState.file-folder-name == "" ? @tr("Choose folder") : TextState.file-folder-name;
+                                    icon: Icons.browse-folder;
+                                    enabled: !Shell.locked && TextState.file-mode != 0;
+                                    tooltip: Shell.locked-tip;
+                                    clicked => {
+                                        TextState.file-folder-choose();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 card := CardFrame {
                     height: root.rules-card;
                     // Search, add and scan in one field: it filters the rules below, lists the installed
@@ -1074,7 +1108,7 @@ export component TextPage inherits VerticalLayout {
                         profile-box := ScrollBox {
                             vertical-stretch: 1;
                             reserve-gutter: true;
-                            content-height: 8 * Theme.control-height + 7 * Theme.space-3;
+                            content-height: 9 * Theme.control-height + 8 * Theme.space-3;
                             VerticalLayout {
                                 alignment: start;
                                 spacing: Theme.space-3;
@@ -1172,6 +1206,18 @@ export component TextPage inherits VerticalLayout {
                                         accessible-label: @tr("Pause punctuation");
                                         selected => {
                                             TextState.profile-picked(7, self.current-index);
+                                        }
+                                    }
+                                }
+                                Row {
+                                    title: @tr("Join lines");
+                                    info: @tr("On joins the lines with spaces in this app, Off keeps them, whatever the \"Join lines in command prompts\" switch at the top of Per-app rules says.");
+                                    Combo {
+                                        model: [@tr("Default"), @tr("On"), @tr("Off")];
+                                        current-index: TextState.profile-values[8];
+                                        accessible-label: @tr("Join lines");
+                                        selected => {
+                                            TextState.profile-picked(8, self.current-index);
                                         }
                                     }
                                 }

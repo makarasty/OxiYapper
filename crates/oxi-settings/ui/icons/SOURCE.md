@@ -48,7 +48,6 @@ entries out again.
 | settings, settings-filled | gear-six bold, fill | nav System |
 | info, info-16, info-filled | info bold, fill | nav About, info tip, note |
 | warning, warning-16 | warning bold | warning banner/note |
-| warning-circle | warning-circle bold | kept for old call sites; the "!" slot uses `warning` (DESIGN-SYSTEM section 24) |
 | error-circle, error-circle-16 | x-circle bold | error banner/note |
 | checkmark-circle, -16 | check-circle bold | success note |
 | checkmark-12 | check bold | check badge |
@@ -115,10 +114,11 @@ elements checked, same licence):
 | confidence | target bold | Model Advanced, Confidence threshold |
 | repetition | repeat bold | Model Advanced, Repetition threshold |
 | non-speech | ear-slash bold | Model Advanced, Skip non-speech sounds |
-| audio-window | ruler bold | Model Advanced, Audio window |
 | threads | cpu bold | Model Advanced, Processor threads |
 | flash-attention | flashlight bold | Model Advanced, Flash attention |
 | retry-doubtful | seal-question bold | Model Advanced, Retry doubtful segments |
+| models-folder | hard-drives bold | Model Settings, Models folder row |
+| partial-downloads | file-dashed bold | Model Settings, Partial downloads row |
 | reset-auto | eraser bold | Model Advanced, Reset all to Auto |
 | replace | swap bold | always replace (History selection) |
 

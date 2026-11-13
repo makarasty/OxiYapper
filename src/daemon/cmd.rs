@@ -40,7 +40,7 @@ use oxi_core::tuning::SettingsSet;
 use oxi_core::types::Language;
 use oxi_platform::os::overlay::Progress;
 
-use super::ipc::Pushes;
+use super::ipc::{Origin, Pushes};
 
 /// Everything the coordinator hears, on one channel with many senders.
 pub enum Inbox {
@@ -134,6 +134,8 @@ pub struct TestJob {
     pub set: SettingsSet,
     pub language: Language,
     pub samples: Vec<f32>,
+    /// Where `samples` came from: a stored, processed recording is not processed again.
+    pub origin: Origin,
     /// The worker queues its `TestResult` here and never waits for the window.
     pub reply: Pushes,
 }

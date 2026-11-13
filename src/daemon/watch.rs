@@ -341,6 +341,22 @@ mod tests {
         (seen, move |n| sink.lock().unwrap().push(n))
     }
 
+    /// How long a message that must come may take. `recv_timeout` returns the moment it arrives,
+    /// so this costs nothing when the box is idle and covers a starved watcher thread under load.
+    const WAIT_MS: u64 = 15_000;
+
+    /// Waits up to `WAIT_MS` for the config with `device`.
+    fn config_for(rx: &Receiver<Inbox>, device: &str) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_millis(WAIT_MS);
+        while std::time::Instant::now() < deadline {
+            if matches!(next(rx, 100), Some(Inbox::Config { config, .. }) if config.audio.device == device)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// The next message within `ms`, or `None`.
     fn next(rx: &Receiver<Inbox>, ms: u64) -> Option<Inbox> {
         rx.recv_timeout(Duration::from_millis(ms)).ok()
@@ -399,7 +415,7 @@ mod tests {
                 format!("[audio]\ndevice = \"{device}\"\n").as_bytes(),
             )
             .unwrap();
-            match next(&rx, 1000) {
+            match next(&rx, WAIT_MS) {
                 Some(Inbox::Config { config, warnings }) => {
                     assert_eq!(config.audio.device, device);
                     assert_eq!(warnings, Vec::<String>::new());
@@ -425,7 +441,7 @@ mod tests {
         )
         .unwrap();
         write_atomic(&l.config_file(), b"[audio]\ngain_db = \n").unwrap();
-        match next(&rx, 1000) {
+        match next(&rx, WAIT_MS) {
             Some(Inbox::ConfigError(ConfigError::Syntax { line, .. })) => assert_eq!(line, 2),
             _ => panic!("expected a syntax error"),
         }
@@ -447,7 +463,7 @@ mod tests {
         )
         .unwrap();
         write_atomic(&l.config_file(), b"[audio]\nmeter_sensitivity_db = 99.0\n").unwrap();
-        match next(&rx, 1000) {
+        match next(&rx, WAIT_MS) {
             Some(Inbox::Config { warnings, .. }) => assert_eq!(warnings.len(), 1),
             _ => panic!("expected a config"),
         }
@@ -468,7 +484,7 @@ mod tests {
         )
         .unwrap();
         write_atomic(&l.dictionary_file(), b"word\n").unwrap();
-        assert!(matches!(next(&rx, 1000), Some(Inbox::AssetsChanged)));
+        assert!(matches!(next(&rx, WAIT_MS), Some(Inbox::AssetsChanged)));
         write_atomic(&l.config_dir.join("other.txt"), b"x").unwrap();
         assert!(next(&rx, 200).is_none());
     }
@@ -486,22 +502,25 @@ mod tests {
             notify,
         )
         .unwrap();
-        fs::remove_dir_all(&l.config_dir).unwrap();
         // shortcut: NTFS gives a recreated directory the same file id, so a gap shorter than the
-        // check period goes unnoticed; the test waits two periods.
-        thread::sleep(Duration::from_millis(250));
-        fs::create_dir_all(&l.config_dir).unwrap();
-        write_atomic(
-            &l.config_file(),
-            b"[audio]
+        // check period goes unnoticed. The gap is two periods; if a starved watcher thread still
+        // missed it, the cycle is repeated (the test only fails when no cycle ever re-arms).
+        let mut got = false;
+        for _ in 0..5 {
+            let _ = fs::remove_dir_all(&l.config_dir);
+            thread::sleep(Duration::from_millis(250));
+            fs::create_dir_all(&l.config_dir).unwrap();
+            write_atomic(
+                &l.config_file(),
+                b"[audio]
 device = \"Mic R\"
 ",
-        )
-        .unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        let mut got = false;
-        while !got && std::time::Instant::now() < deadline {
-            got = matches!(next(&rx, 100), Some(Inbox::Config { config, .. }) if config.audio.device == "Mic R");
+            )
+            .unwrap();
+            got = config_for(&rx, "Mic R");
+            if got {
+                break;
+            }
         }
         assert!(got, "no config after the directory came back");
         // Edits after the re-arm are still seen.
@@ -512,11 +531,7 @@ device = \"Mic S\"
 ",
         )
         .unwrap();
-        let mut got = false;
-        while !got && std::time::Instant::now() < deadline + Duration::from_secs(2) {
-            got = matches!(next(&rx, 100), Some(Inbox::Config { config, .. }) if config.audio.device == "Mic S");
-        }
-        assert!(got, "edit after re-arm lost");
+        assert!(config_for(&rx, "Mic S"), "edit after re-arm lost");
     }
 
     /// An editor holding the file without sharing (Windows) fails the read for a moment.

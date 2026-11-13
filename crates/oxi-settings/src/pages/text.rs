@@ -195,6 +195,7 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
     s.set_trailing_space(paste.trailing_space);
     s.set_keep_history(paste.keep_in_clipboard_history);
     s.set_press_enter(paste.press_enter);
+    s.set_join_console_lines(paste.join_console_lines);
     #[allow(
         clippy::cast_precision_loss,
         reason = "a delay in ms is far below 2^24"
@@ -225,6 +226,8 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
     s.on_keep_history_toggled(move |on| apply(&w, &c, |p| p.keep_in_clipboard_history = on));
     let (w, c) = (window.as_weak(), ctx.clone());
     s.on_press_enter_toggled(move |on| apply(&w, &c, |p| p.press_enter = on));
+    let (w, c) = (window.as_weak(), ctx.clone());
+    s.on_join_console_lines_toggled(move |on| apply(&w, &c, |p| p.join_console_lines = on));
     let (w, c) = (window.as_weak(), ctx.clone());
     let save = SaveDebounce::new(w, c.clone());
     s.on_restore_delay_changed(move |ms| {
@@ -270,7 +273,7 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
 
 /// The profile editor of a rule and the to-file settings. Profile fields in the order of
 /// `TextState::profile_values`: language, model, to file, dictionary, replacements, voice
-/// commands, filler words, pause punctuation.
+/// commands, filler words, pause punctuation, join lines.
 fn bind_profiles(window: &AppWindow, ctx: &Ctx) {
     let s = window.global::<TextState>();
     s.set_profile_rule(-1);
@@ -516,6 +519,7 @@ fn profile_values(r: &PasteRule, models: &[Option<String>]) -> Vec<i32> {
         tri(r.voice_commands),
         tri(r.filler_filter),
         tri(r.pause_punctuation),
+        tri(r.join_lines),
     ]
 }
 
@@ -536,6 +540,7 @@ fn set_profile_field(r: &mut PasteRule, field: i32, i: i32, models: &[Option<Str
         5 => r.voice_commands = from_tri(i),
         6 => r.filler_filter = from_tri(i),
         7 => r.pause_punctuation = from_tri(i),
+        8 => r.join_lines = from_tri(i),
         _ => {}
     }
 }
@@ -1962,7 +1967,7 @@ voice_commands = true
         assert_eq!(s.get_profile_app(), "a.exe");
         // The rule's own values show, the rest read Default.
         let values: Vec<i32> = s.get_profile_values().iter().collect();
-        assert_eq!(values, [0, 0, 0, 0, 0, 1, 0, 0]);
+        assert_eq!(values, [0, 0, 0, 0, 0, 1, 0, 0, 0]);
         let ru = super::language_names()
             .iter()
             .position(|n| n == "Russian")
@@ -1972,6 +1977,7 @@ voice_commands = true
         s.invoke_profile_picked(2, 3);
         s.invoke_profile_picked(3, 2);
         s.invoke_profile_picked(5, 0);
+        s.invoke_profile_picked(8, 1);
         mock_elapsed_time(Duration::from_millis(350));
         let text = fs::read_to_string(layout.config_file()).unwrap();
         let rule = oxi_core::config::ConfigFile::parse(&text)
@@ -1985,6 +1991,7 @@ voice_commands = true
         assert_eq!(rule.to_file, Some(oxi_core::config::FileMode::Only));
         assert_eq!(rule.dictionary, Some(false));
         assert_eq!(rule.voice_commands, None, "Default drops the key");
+        assert_eq!(rule.join_lines, Some(true));
         assert_eq!(
             rule.mode,
             Some(oxi_core::config::PasteMode::Type),

@@ -12,7 +12,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use oxi_core::hotkey::Key;
-use oxi_core::paste::Input;
+use oxi_core::paste::{Input, TypePace, chunk_end};
 use oxi_core::types::Millis;
 use oxi_platform::os::hook::INJECT_TAG;
 use oxi_platform::os::input::Keyboard;
@@ -41,7 +41,7 @@ fn enabled() -> bool {
 }
 
 #[test]
-fn type_units_sends_each_unit_as_a_packet_pair_in_order() {
+fn send_units_sends_each_unit_as_a_packet_pair_in_order() {
     if !enabled() {
         return;
     }
@@ -49,7 +49,7 @@ fn type_units_sends_each_unit_as_a_packet_pair_in_order() {
     let window = OurWindow::foreground();
     window.assert_foreground();
     Keyboard
-        .type_units(&"a😀".encode_utf16().collect::<Vec<_>>(), Millis(5))
+        .send_units(&"a😀".encode_utf16().collect::<Vec<_>>())
         .unwrap();
     let want: Vec<Seen> = [0x61, 0xD83D, 0xDE00]
         .into_iter()
@@ -73,9 +73,11 @@ fn a_surrogate_pair_goes_in_one_batch_and_characters_a_gap_apart() {
     let (spy, seen) = Spy::start();
     let window = OurWindow::foreground();
     window.assert_foreground();
-    Keyboard
-        .type_units(&"a😀".encode_utf16().collect::<Vec<_>>(), Millis(60))
-        .unwrap();
+    let pace = TypePace {
+        units_per_call: 1,
+        gap: Millis(60),
+    };
+    type_paced(&"a😀".encode_utf16().collect::<Vec<_>>(), pace);
     let at: Vec<Instant> = take_timed(&seen, 6).into_iter().map(|(_, t)| t).collect();
     let (a, high, low) = (at[0], at[2], at[4]);
     assert!(
@@ -123,6 +125,19 @@ fn foreground_is_our_exe_and_not_elevated() {
     assert_ne!(fg.app, "");
     assert!(fg.app.eq_ignore_ascii_case(ours), "{} vs {ours}", fg.app);
     assert!(!fg.elevated);
+}
+
+/// Core's typing loop (`paste::type_text`): batches of [`chunk_end`], `pace.gap` apart.
+fn type_paced(units: &[u16], pace: TypePace) {
+    let mut from = 0;
+    while from < units.len() {
+        if from > 0 {
+            Keyboard.sleep(pace.gap);
+        }
+        let end = chunk_end(units, from, pace.units_per_call);
+        Keyboard.send_units(&units[from..end]).unwrap();
+        from = end;
+    }
 }
 
 /// The next `n` swallowed events, or a panic after 2 s.

@@ -871,6 +871,36 @@ fn shot_model_weak() {
     );
 }
 
+#[test]
+fn shot_model_damaged() {
+    // A damaged file of the model in use, only an integrated GPU: the status, what to do, the "!".
+    shot_model_linked(
+        "model-damaged",
+        "version = 2
+[model]
+id = \"large-v3\"
+",
+        |l| {
+            let dir = l.models_dir();
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("ggml-large-v3.bin"), b"synthetic").unwrap();
+        },
+        |ipc| {
+            push(
+                ipc,
+                Push::Devices {
+                    mics: vec![],
+                    gpus: vec![Device {
+                        name: "Vulkan0".into(),
+                        description: "AMD Radeon(TM) Graphics".into(),
+                        uma: true,
+                    }],
+                },
+            );
+        },
+    );
+}
+
 /// A model page on a fake daemon link: `prepare` fills the layout, `drive` pushes what the daemon
 /// would send once the page is up.
 fn shot_model_linked(screen: &str, config: &str, prepare: fn(&Layout), drive: fn(&Ipc)) {
@@ -1329,7 +1359,7 @@ fn shot_system_update_off() {
 
 #[test]
 fn shot_overlay_mismatch() {
-    // An old daemon still runs after an update: Preview is off and says to restart.
+    // An old daemon still runs after an update: the position tiles are off and say to restart.
     matrix("overlay-mismatch", |choice| {
         let _ = slint::platform::set_platform(Box::new(Shots));
         let (ipc, _sent) = Ipc::fake();
@@ -1443,7 +1473,7 @@ fn history_after_copy_stays_inside_the_window() {
                 &ipc,
                 Push::History {
                     items: vec![HistoryItem {
-                        id: "2026-11-10/120000-000".into(),
+                        id: oxi_core::history::HistoryId::parse("2026-11-10/120000-000").unwrap(),
                         status: Status::Done,
                         duration_ms: 4_500,
                         model: String::new(),
