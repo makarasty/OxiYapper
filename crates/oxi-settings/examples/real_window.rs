@@ -242,6 +242,7 @@ fn seed(layout: &Layout) -> Result<Option<Summary>, Box<dyn std::error::Error>> 
                     language: "en".into(),
                     settings: None,
                     newer: false,
+                    edited: false,
                 }),
                 words: vec![Word {
                     w: " Zorblat".into(),
@@ -516,6 +517,7 @@ fn sample_history(records: Option<u32>) -> Vec<HistoryItem> {
         language: String::new(),
         text: Spoken(text.into()),
         held: Vec::new(),
+        edited: false,
     };
     // The newest has a part held back, so the "Not inserted" row can be shot.
     let mut first = item(

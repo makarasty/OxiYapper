@@ -80,7 +80,7 @@ struct Fixture {
     ipc: Ipc,
     sent: Receiver<Cmd>,
     layout: Layout,
-    _ctx: Ctx,
+    ctx: Ctx,
 }
 
 impl Fixture {
@@ -123,7 +123,7 @@ impl Fixture {
             ipc,
             sent,
             layout,
-            _ctx: ctx,
+            ctx,
         };
         // The history lists asked for on open.
         f.take_sent();
@@ -240,11 +240,30 @@ fn item(id: &str, text: &str) -> HistoryItem {
         id: HistoryId::parse(id).unwrap(),
         status: Status::Done,
         duration_ms: 2_500,
-        model: String::new(),
+        // Dictated with the model in use and never corrected: the typical history.
+        model: "turbo".to_owned(),
         language: "ru".to_owned(),
         text: Spoken(text.to_owned()),
         held: Vec::new(),
+        edited: false,
     }
+}
+
+/// [`item`] with its text corrected by hand on the History page.
+fn edited(id: &str, text: &str) -> HistoryItem {
+    HistoryItem {
+        edited: true,
+        ..item(id, text)
+    }
+}
+
+/// Registry models `ids` on disk too, and the page has looked again.
+fn also_on_disk(f: &Fixture, ids: &[&str]) {
+    for id in ids {
+        fake(&f.layout, id);
+    }
+    f.state().invoke_shown();
+    let _ = f.take_sent();
 }
 
 /// A repeating timer fires once per mocked step, so step at its own interval.
@@ -281,6 +300,11 @@ fn starts_empty_with_run_off() {
     for text in ["1. Goal", "Best model", "Best settings", "Quiet microphone"] {
         assert!(has(&f.window, text), "{text}");
     }
+    assert!(
+        has(&f.window, "2. Model"),
+        "best settings tune the model in use"
+    );
+    s.invoke_goal_picked(0);
     assert!(has(&f.window, "2. Models"));
     assert!(has(&f.window, "3. Run"));
     assert!(s.get_plan_tip().contains("nothing leaves this PC"));
@@ -688,7 +712,8 @@ per_device = true
     );
     let s = f.state();
     f.record_and_stop();
-    f.list_history(vec![item(HISTORY_ID, "раз два три")]);
+    // Corrected by hand, so it is its own reference and the judge has nothing to do here.
+    f.list_history(vec![edited(HISTORY_ID, "раз два три")]);
     f.add_first();
     assert_eq!(s.get_plan(), "2 picked recordings · 8 runs");
     s.invoke_run();
@@ -837,7 +862,7 @@ fn each_new_recording_goes_before_its_job() {
 #[test]
 fn a_gone_history_file_fails_its_line_and_the_run_goes_on() {
     let f = Fixture::new("gone", None);
-    f.list_history(vec![item(HISTORY_ID, "text")]);
+    f.list_history(vec![edited(HISTORY_ID, "text")]);
     f.add_first();
     f.state().invoke_run();
     let (id, _, from) = f.one_job();
@@ -899,11 +924,14 @@ fn the_goal_picks_the_sets() {
 }
 
 /// Three clicks from a first visit: a goal card, a quick pick, Run. The recordings come from
-/// History by themselves: recent ones of different lengths, scored against their saved text.
+/// History by themselves (recent ones of different lengths), all dictated with the model in use
+/// and never corrected, the typical case. The most accurate model on disk writes their reference
+/// and is not compared, so the model in use gets no head start from its own saved text.
 #[test]
 fn the_wizard_runs_on_recent_history_in_three_clicks() {
     let f = Fixture::new("wizard", None);
     let s = f.state();
+    also_on_disk(&f, &["large-v3", "large-v3-compact", "small"]);
     s.set_view(0);
     let at = |id: &str, ms: u64, text: &str| HistoryItem {
         duration_ms: ms,
@@ -918,16 +946,34 @@ fn the_wizard_runs_on_recent_history_in_three_clicks() {
     ]);
     s.invoke_goal_picked(0);
     s.invoke_preset_picked(0);
-    assert_eq!(s.get_plan(), "3 recordings from History · 3 runs");
+    assert_eq!(
+        s.get_plan(),
+        "3 recordings from History · 9 runs\nReference: your edits where you made them, otherwise Whisper large-v3"
+    );
     assert_eq!(s.get_run_off(), "");
     s.invoke_run();
     assert_eq!(s.get_view(), 2);
+    let models: Vec<String> = s.get_rows().iter().map(|r| r.model.to_string()).collect();
+    assert_eq!(
+        models,
+        ["Whisper large-v3 turbo", "Whisper small"],
+        "the judge is not compared"
+    );
+    let judge = SettingsSet {
+        model: "large-v3".into(),
+        ..SettingsSet::defaults()
+    };
+    let saved = ["тридцать секунд", "двенадцать секунд", "две"];
+    let judged = ["тридцать одна секунда", "двенадцать секунд", "две минуты"];
     let mut picked = Vec::new();
-    for _ in 0..3 {
+    for text in judged {
         let (id, set, from) = f.one_job();
-        assert_eq!(set, SettingsSet::defaults(), "the model in use, as set up");
+        assert_eq!(
+            set, judge,
+            "the judge hears each one first, at the default settings"
+        );
         picked.push(from.unwrap().to_string());
-        f.answer(id, heard("x"));
+        f.answer(id, heard(text));
     }
     assert_eq!(
         picked,
@@ -938,7 +984,356 @@ fn the_wizard_runs_on_recent_history_in_three_clicks() {
         ],
         "the longest, one between, the shortest; newest first"
     );
+    // Turbo hears what it once wrote, small what the judge heard.
+    for (model, texts) in [("turbo", saved), ("small", judged)] {
+        for text in texts {
+            let (id, set, _) = f.one_job();
+            assert_eq!(set.model, model);
+            f.answer(id, heard(text));
+        }
+    }
+    assert_eq!(f.errors(), ["42.9 %", "0.0 %"]);
+    assert!(
+        s.get_rows().row_data(1).unwrap().best,
+        "graded on the judge's text, not on its own"
+    );
     assert!(!s.get_running());
+}
+
+/// Each recording is scored against the person's text where they corrected it (on the History
+/// page or on Recordings), else against what the judge heard. A run with every text corrected
+/// needs no judge, so every model is compared.
+#[test]
+fn the_reference_is_the_edit_or_else_the_judge() {
+    let f = Fixture::new("reference", None);
+    let s = f.state();
+    also_on_disk(&f, &["small", "base"]);
+    s.set_view(0);
+    f.list_history(vec![
+        edited(HISTORY_ID, "своими словами"),
+        item(OLDER_ID, "как записал turbo"),
+    ]);
+    s.invoke_goal_picked(0);
+    s.invoke_preset_picked(0);
+    assert_eq!(
+        s.get_plan(),
+        "2 recordings from History · 5 runs\nReference: your edits where you made them, otherwise Whisper large-v3 turbo"
+    );
+    s.invoke_run();
+    let (id, set, from) = f.one_job();
+    assert_eq!(
+        set,
+        SettingsSet::defaults(),
+        "the judge: turbo, the best on disk"
+    );
+    assert_eq!(
+        from.unwrap().to_string(),
+        OLDER_ID,
+        "the corrected one needs no judge"
+    );
+    f.answer(id, heard("что услышал судья"));
+    for model in ["small", "base"] {
+        let (id, set, from) = f.one_job();
+        assert_eq!(set.model, model, "the judge is not compared");
+        assert_eq!(from.unwrap().to_string(), HISTORY_ID);
+        f.answer(id, heard("своими словами"));
+        let (id, _, _) = f.one_job();
+        f.answer(id, heard("что услышал судья"));
+    }
+    assert_eq!(f.errors(), ["0.0 %", "0.0 %"]);
+    assert!(!s.get_running());
+    assert!(
+        s.get_best_text().ends_with(
+            "\nReference: your edits where you made them, otherwise Whisper large-v3 turbo"
+        ),
+        "the result names what it was scored against: {}",
+        s.get_best_text()
+    );
+
+    // Both picked by hand, the uncorrected one corrected here: no judge, every model runs.
+    f.add_first();
+    f.add_first();
+    s.invoke_reference_edited(1, "как было сказано".into());
+    assert_eq!(s.get_plan(), "2 picked recordings · 6 runs");
+    s.invoke_run();
+    let (_, set, _) = f.one_job();
+    assert_eq!(set.model, "turbo", "the model in use is compared again");
+}
+
+/// Review 3 and 5: the best model needs two models beside the judge's family to compare, or every
+/// text corrected; a judge's compact file is not compared (it matches the judge almost word for
+/// word).
+#[test]
+fn best_model_needs_two_models_beside_the_judge_and_its_compact_file() {
+    let f = Fixture::new("two-models", None);
+    let s = f.state();
+    also_on_disk(&f, &["small"]);
+    s.set_view(0);
+    f.list_history(vec![item(HISTORY_ID, "как записал turbo")]);
+    s.invoke_goal_picked(0);
+    s.invoke_preset_picked(0);
+    let off = "Needs two models to compare besides Whisper large-v3 turbo, which writes the reference texts: download another model, or correct the texts on History";
+    assert_eq!(s.get_run_off(), off, "small alone would win unopposed");
+    assert_eq!(s.get_plan(), "");
+    s.invoke_run();
+    assert!(f.take_sent().is_empty(), "Run is off");
+    also_on_disk(&f, &["large-v3", "large-v3-compact"]);
+    assert_eq!(
+        s.get_run_off(),
+        "",
+        "large-v3 judges; turbo and small compete"
+    );
+    s.invoke_run();
+    let (id, set, _) = f.one_job();
+    assert_eq!(set.model, "large-v3");
+    f.answer(id, heard("как сказано"));
+    let models: Vec<String> = s.get_rows().iter().map(|r| r.model.to_string()).collect();
+    assert_eq!(
+        models,
+        ["Whisper large-v3 turbo", "Whisper small"],
+        "neither the judge nor its compact file"
+    );
+    for (want, text) in [("turbo", "как"), ("small", "как сказано")] {
+        let (id, set, _) = f.one_job();
+        assert_eq!(set.model, want);
+        f.answer(id, heard(text));
+    }
+    s.invoke_apply();
+    assert_eq!(
+        config(&f.layout).config.model.id,
+        "small",
+        "the best model's Apply switches the model"
+    );
+}
+
+/// Review 2 and 4: best settings and the quiet microphone always tune the model in use, judged by
+/// a model outside its family; with none, the recordings without the person's text cannot be
+/// scored and Run says what is missing. Apply never switches the model.
+#[test]
+fn best_settings_tune_the_model_in_use_judged_by_another_model() {
+    let f = Fixture::new("settings-judge", None);
+    let s = f.state();
+    s.set_view(0);
+    f.list_history(vec![item(HISTORY_ID, "как записал turbo")]);
+    for goal in [1, 2] {
+        s.invoke_goal_picked(goal);
+        assert_eq!(
+            s.get_run_off(),
+            "No second model to compare with: download another model, or correct the texts on History",
+            "turbo would judge its own sets"
+        );
+        assert_eq!(s.get_plan(), "");
+    }
+    also_on_disk(&f, &["turbo-compact"]);
+    assert_eq!(
+        s.get_run_off(),
+        "No second model to compare with: download another model, or correct the texts on History",
+        "its own compact file cannot judge it"
+    );
+    also_on_disk(&f, &["small"]);
+    s.invoke_goal_picked(1);
+    assert_eq!(s.get_run_off(), "");
+    assert_eq!(
+        s.get_plan(),
+        "1 recording from History · 5 runs\nReference: your edits where you made them, otherwise Whisper small"
+    );
+    s.invoke_run();
+    let (id, set, _) = f.one_job();
+    assert_eq!(
+        set,
+        SettingsSet {
+            model: "small".into(),
+            ..SettingsSet::defaults()
+        },
+        "the judge first, at the default settings"
+    );
+    f.answer(id, heard("раз два три"));
+    let mut tuned = Vec::new();
+    for text in ["раз два", "раз два три", "раз", "раз два"] {
+        let (id, set, _) = f.one_job();
+        tuned.push(set.model.clone());
+        f.answer(id, heard(text));
+    }
+    assert_eq!(tuned, ["turbo"; 4], "only the model in use is tuned");
+    assert!(!s.get_running());
+    // Risk (c): a model picked on the Model page after the run stays; Apply writes the settings.
+    f.ctx.config.borrow_mut().config.model.id = "small".into();
+    s.invoke_apply();
+    let saved = config(&f.layout).config;
+    assert_eq!(saved.model.id, "small", "Apply never writes the model");
+    assert_eq!(saved.audio.denoise, sets()[1].denoise, "the second set won");
+}
+
+/// Review 1: no downloaded model hears the language, so none can judge. The recordings without
+/// the person's text are left out with the reason, never scored against a candidate's own answer;
+/// with none corrected Run says so.
+#[test]
+fn with_no_judge_for_the_language_uncorrected_recordings_are_left_out() {
+    let f = Fixture::new(
+        "no-judge",
+        Some("version = 2\n[model]\nlanguage = \"ru\"\n"),
+    );
+    let s = f.state();
+    fake(&f.layout, "distil-en");
+    fs::remove_file(
+        f.layout
+            .models_dir()
+            .join(models::find("turbo").unwrap().file_name),
+    )
+    .unwrap();
+    s.invoke_shown();
+    let _ = f.take_sent();
+    s.set_view(0);
+    s.invoke_goal_picked(0);
+    s.invoke_preset_picked(0);
+    f.list_history(vec![item(HISTORY_ID, "как записал turbo")]);
+    assert_eq!(
+        s.get_run_off(),
+        "No downloaded model hears this language to write the reference texts: correct them on History, or download one that does"
+    );
+    f.list_history(vec![
+        edited(HISTORY_ID, "своими словами"),
+        item(OLDER_ID, "как записал turbo"),
+    ]);
+    assert_eq!(s.get_run_off(), "");
+    assert_eq!(
+        s.get_plan(),
+        "1 recording from History · 1 run\n1 recording left out: no second model to compare with. Correct its text on History, or download another model"
+    );
+    s.invoke_run();
+    let (id, set, from) = f.one_job();
+    assert_eq!(set.model, "distil-en");
+    assert_eq!(
+        from.unwrap().to_string(),
+        HISTORY_ID,
+        "the corrected one only"
+    );
+    f.answer(id, heard("своими словами"));
+    assert!(f.take_sent().is_empty(), "nothing else to run");
+    assert!(!s.get_running());
+    assert_eq!(f.errors(), ["0.0 %"]);
+}
+
+/// Re-review: no fair judge for the uncorrected recordings, but some are corrected. The corrected
+/// ones run alone, with the same rule and words as when no model hears the language; Run is off
+/// only when none is corrected.
+#[test]
+fn without_a_fair_judge_the_corrected_recordings_run_alone() {
+    let f = Fixture::new("mixed", None);
+    let s = f.state();
+    also_on_disk(&f, &["small"]);
+    s.set_view(0);
+    s.invoke_goal_picked(0);
+    s.invoke_preset_picked(0);
+    f.list_history(vec![
+        edited(HISTORY_ID, "своими словами"),
+        item(OLDER_ID, "как записал turbo"),
+    ]);
+    assert_eq!(s.get_run_off(), "", "turbo judges, small alone beside it");
+    assert_eq!(
+        s.get_plan(),
+        "1 recording from History · 2 runs\n1 recording left out: no second model to compare with. Correct its text on History, or download another model"
+    );
+    s.invoke_run();
+    let mut models = Vec::new();
+    for _ in 0..2 {
+        let (id, set, from) = f.one_job();
+        assert_eq!(
+            from.unwrap().to_string(),
+            HISTORY_ID,
+            "the corrected one only"
+        );
+        models.push(set.model.clone());
+        f.answer(id, heard("своими словами"));
+    }
+    assert_eq!(
+        models,
+        ["turbo", "small"],
+        "no judge: every ticked model competes"
+    );
+    assert!(f.take_sent().is_empty() && !s.get_running());
+}
+
+/// [`without_a_fair_judge_the_corrected_recordings_run_alone`] for best settings with only the
+/// compact file of the model in use beside it.
+#[test]
+fn without_a_judge_outside_the_family_the_corrected_recordings_run_alone() {
+    let f = Fixture::new("mixed-settings", None);
+    let s = f.state();
+    also_on_disk(&f, &["turbo-compact"]);
+    s.set_view(0);
+    f.list_history(vec![
+        edited(HISTORY_ID, "своими словами"),
+        item(OLDER_ID, "как записал turbo"),
+    ]);
+    assert_eq!(s.get_run_off(), "");
+    assert_eq!(
+        s.get_plan(),
+        "1 recording from History · 4 runs\n1 recording left out: no second model to compare with. Correct its text on History, or download another model"
+    );
+    s.invoke_run();
+    let (_, set, from) = f.one_job();
+    assert_eq!(
+        (set.model.as_str(), from.unwrap().to_string()),
+        ("turbo", HISTORY_ID.to_owned())
+    );
+}
+
+/// Re-review: the own model file in use is tuned by the settings goals, judged by a registry
+/// model; Run is off only with no file set, and then says what to do.
+#[test]
+fn the_settings_goals_tune_the_own_model_file_in_use() {
+    let f = Fixture::new(
+        "custom",
+        Some("version = 2\n[model]\nid = \"custom\"\ncustom_path = \"C:/nowhere/mine.bin\"\n"),
+    );
+    let s = f.state();
+    s.set_view(0);
+    f.list_history(vec![item(HISTORY_ID, "как записал свой")]);
+    assert_eq!(s.get_tunes(), "Tunes the model in use: Own model file");
+    assert_eq!(s.get_run_off(), "");
+    assert_eq!(
+        s.get_plan(),
+        "1 recording from History · 5 runs\nReference: your edits where you made them, otherwise Whisper large-v3 turbo"
+    );
+    s.invoke_run();
+    let (id, set, _) = f.one_job();
+    assert_eq!(set.model, "turbo", "a registry model judges");
+    f.answer(id, heard("раз два три"));
+    for _ in 0..4 {
+        let (id, set, _) = f.one_job();
+        assert_eq!(set.model, "custom");
+        f.answer(id, heard("раз два три"));
+    }
+    s.invoke_apply();
+    assert_eq!(config(&f.layout).config.model.id, "custom");
+
+    f.ctx.config.borrow_mut().config.model.custom_path = String::new();
+    s.invoke_goal_picked(1);
+    assert_eq!(
+        s.get_run_off(),
+        "These goals tune the model in use, and it is not on disk: download it, or pick its file, on the Model page"
+    );
+}
+
+/// Re-review: the settings goals compare no models, so step 2 shows which one they tune instead
+/// of ticks that would do nothing.
+#[test]
+fn the_settings_goals_show_the_model_they_tune_instead_of_the_list() {
+    let f = Fixture::new("step-two", None);
+    let s = f.state();
+    s.set_view(0);
+    s.invoke_goal_picked(0);
+    let models = || ElementHandle::find_by_accessible_label(&f.window, "Models").count();
+    let with_list = models();
+    for goal in [1, 2] {
+        s.invoke_goal_picked(goal);
+        assert_eq!(models(), with_list - 1, "no model list");
+        assert_eq!(
+            s.get_tunes(),
+            "Tunes the model in use: Whisper large-v3 turbo"
+        );
+    }
 }
 
 /// The quiet-microphone check needs no new recording: each one is heard again 6, 12 and 18 dB
@@ -1481,8 +1876,8 @@ fn ctrl_tab_works_after_run_from_the_keyboard() {
     let f = Fixture::new("run-keys", None);
     f.record_and_stop();
     f.state().set_view(0);
-    // The rail, the view switch, the goal cards, the quick pick, the "i" after Run, Run.
-    for _ in 0..6 {
+    // The rail, the view switch, the goal cards, the "i" after Run, Run (best settings: no list).
+    for _ in 0..5 {
         press(&f.window, Key::Tab);
     }
     for space in [
@@ -1709,7 +2104,7 @@ fn real_shots_of_the_states() {
         .set_position(PhysicalPosition::new(-20_000, -20_000));
     let long_text = "A long reference text that wraps over many lines. ".repeat(12);
     let history = vec![
-        item(HISTORY_ID, "Добрый день, это проверка истории записей."),
+        edited(HISTORY_ID, "Добрый день, это проверка истории записей."),
         item(OLDER_ID, "Older one"),
     ];
     let mut shots: Vec<(&str, f32, f32, ThemeChoice)> = Vec::new();

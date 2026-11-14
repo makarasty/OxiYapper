@@ -142,7 +142,7 @@ pub trait Host: Send + Sync + 'static {
         Option<oxi_core::history::Timings>,
     )>;
     /// Replaces the transcript of recording `id` with the user's edit; the run stays.
-    fn history_edit(&self, id: &HistoryId, text: &str) -> io::Result<()>;
+    fn history_edit(&self, id: &HistoryId, text: &str, typed: bool) -> io::Result<()>;
     /// Swaps the transcript of recording `id` with its other version.
     fn history_restore(&self, id: &HistoryId, original: bool) -> io::Result<()>;
     fn history_delete(&self, id: &HistoryId) -> io::Result<()>;
@@ -715,8 +715,9 @@ impl Ctx {
             Request::HistoryEdit {
                 id,
                 text: Spoken(text),
+                adds_held,
             } => {
-                let done = self.host.history_edit(&id, &text);
+                let done = self.host.history_edit(&id, &text, !adds_held);
                 history_result(conn, id, HistoryOp::Edit, done)
             }
             Request::HistoryRestore { id, original } => {
@@ -1347,6 +1348,7 @@ fn history_item(r: history::Recording) -> HistoryItem {
         language: r.meta.language,
         text: Spoken(r.text),
         held: r.meta.held.iter().map(HeldText::from).collect(),
+        edited: r.meta.edited,
     }
 }
 
@@ -1672,8 +1674,8 @@ impl Host for SystemHost {
         history::read_words(&self.history_dir()?, id)
     }
 
-    fn history_edit(&self, id: &HistoryId, text: &str) -> io::Result<()> {
-        history::edit_text(&self.history_dir()?, id, text)
+    fn history_edit(&self, id: &HistoryId, text: &str, typed: bool) -> io::Result<()> {
+        history::edit_text(&self.history_dir()?, id, text, typed)
     }
 
     fn history_restore(&self, id: &HistoryId, original: bool) -> io::Result<()> {

@@ -1547,6 +1547,7 @@ fn history_after_copy_stays_inside_the_window() {
                         language: String::new(),
                         text: Spoken(text.clone()),
                         held: Vec::new(),
+                        edited: false,
                     }],
                     more: false,
                 },

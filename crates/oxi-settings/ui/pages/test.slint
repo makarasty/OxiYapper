@@ -60,6 +60,8 @@ export global TestState {
     // Step 2: the quick pick, 0 Downloaded, 1 Recommended, 2 All; -1 a pick by hand.
     in property <int> preset;
     in property <[TestModel]> models;
+    // Step 2 of the settings goals, which compare no models: "Tunes the model in use: Whisper small".
+    in property <string> tunes;
     // Step 3: what Run takes ("3 recordings from History · 12 runs") and its "i".
     in property <string> plan;
     in property <string> plan-tip;
@@ -512,7 +514,7 @@ export component TestPage inherits VerticalLayout {
         }
     }
     // Step 2: the models to compare; the list scrolls inside the card.
-    if TestState.view == 0: CardFrame {
+    if TestState.view == 0 && TestState.goal == 0: CardFrame {
         vertical-stretch: 1;
         min-height: 2 * Theme.control-height + Theme.row-min-height + 2 * Theme.card-padding-v + 2 * Theme.space-2;
         // No taller than the whole list: Run follows it, the page's room is left below.
@@ -552,6 +554,15 @@ export component TestPage inherits VerticalLayout {
                     }
                 }
             }
+        }
+    }
+    // Step 2 of the settings goals: nothing to pick, they tune the model in use.
+    if TestState.view == 0 && TestState.goal != 0: Card {
+        vertical-stretch: 0;
+        max-height: self.preferred-height;
+        Row {
+            title: @tr("2. Model");
+            description: TestState.tunes;
         }
     }
     // Step 3: one button.

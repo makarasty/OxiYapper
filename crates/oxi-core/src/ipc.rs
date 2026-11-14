@@ -152,6 +152,10 @@ pub enum Request {
     HistoryEdit {
         id: HistoryId,
         text: Spoken,
+        /// The text only adds the held parts back (Add to the text): nothing was typed, so the
+        /// entry stays as `edited` as it was ([`crate::history::Meta::edited`]).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        adds_held: bool,
     },
     /// Swap the transcript of recording `id` with its other version (Restore old, Use new); the
     /// swap undoes itself. Answered with [`Push::HistoryResult`] (`Restore`), `ok` false when no
@@ -279,6 +283,9 @@ pub struct HistoryItem {
     /// Copy and "Add to the text" for each. Empty when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub held: Vec<HeldText>,
+    /// `text` is the person's own correction, not a model's output (`Meta::edited`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub edited: bool,
 }
 
 /// A part of a dictation that was held back, on the wire. `Debug` hides the text like [`Spoken`].
@@ -997,6 +1004,7 @@ mod tests {
             Request::HistoryEdit {
                 id: HistoryId::parse("2026-11-10/101500-123").unwrap(),
                 text: Spoken("secret words".into()),
+                adds_held: true,
             },
             Request::HistoryRestore {
                 id: HistoryId::parse("2026-11-10/101500-123").unwrap(),
@@ -1038,6 +1046,7 @@ mod tests {
                         text: Spoken("secret held".into()),
                         why: crate::text::HeldWhy::Hallucination,
                     }],
+                    edited: false,
                 }],
                 more: true,
             },

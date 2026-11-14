@@ -1294,6 +1294,7 @@ fn write_doubted_history(l: &Layout) {
                 language: "en".into(),
                 settings: None,
                 newer: false,
+                edited: false,
             }),
             words: vec![Word {
                 w: " Zorblat".into(),

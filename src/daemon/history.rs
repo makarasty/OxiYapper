@@ -411,6 +411,7 @@ fn save_with(
             language: ctx.language.clone(),
             text: Spoken(text.to_owned()),
             held: heard.held.iter().map(HeldText::from).collect(),
+            edited: false,
         })
         .inspect_err(|_| {
             let written = if spooled.is_some() {
@@ -538,6 +539,7 @@ fn recover_part(
         language: ctx.language.clone(),
         text: Spoken(String::new()),
         held: Vec::new(),
+        edited: false,
     }))
 }
 
@@ -860,8 +862,10 @@ pub fn set_text_with_words(
 }
 
 /// `text` the user edited replaces the transcript of recording `id`; the run that made it stays
-/// and the old text is kept as the other version. No change (and no write) when it is the same.
-pub fn edit_text(dir: &Path, id: &HistoryId, text: &str) -> io::Result<()> {
+/// and the old text is kept as the other version. `typed`: the person wrote it, so the entry is
+/// marked `edited` (the Test page grades on it); else (held parts added back, the model's own
+/// words) the mark stays as it was. No change (and no write) when it is the same.
+pub fn edit_text(dir: &Path, id: &HistoryId, text: &str, typed: bool) -> io::Result<()> {
     let base = entry_base(dir, id)?;
     let (old_text, old) = read_version(&base);
     if old_text == text {
@@ -875,6 +879,7 @@ pub fn edit_text(dir: &Path, id: &HistoryId, text: &str) -> io::Result<()> {
         status: Status::Done,
         previous: (!old_text.is_empty()).then(|| old.as_previous(&old_text)),
         original: old.original_of(&old_text),
+        edited: typed || old.edited,
         ..old
     };
     write_version(&base, text, &new)

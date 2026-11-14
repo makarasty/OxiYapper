@@ -29,8 +29,8 @@ use oxi_core::machine::Notice;
 use oxi_core::models::{self, Adapter, MODELS, Machine, ModelEntry, ModelStatus};
 use oxi_core::strings::{self, NO_MIC, gb};
 use oxi_core::tuning::{
-    self, Goal, MAX_TEST_SAMPLES, ModelChoice, ModelPreset, PCM_CHUNK_SAMPLES, PICK_COUNT,
-    SettingsSet, WordErrors, encode_pcm, word_errors,
+    self, Goal, MAX_TEST_SAMPLES, Missing, ModelChoice, ModelPreset, PCM_CHUNK_SAMPLES, PICK_COUNT,
+    Plan, SettingsSet, WordErrors, encode_pcm, word_errors,
 };
 use oxi_core::types::{Language, Millis};
 use oxi_platform::capture::{Capture, CaptureError, CaptureEvent, CpalCapture, LevelMeter, play};
@@ -72,11 +72,19 @@ const PICK: &str = "Pick a recording to add";
 const NO_HISTORY: &str = "No recordings in history";
 const PICKED_ALL: &str = "Every history recording is picked";
 const NOT_FOUND: &str = "The recording file is gone";
+/// The judge gave no text for a recording, so nothing there can be scored.
+const NO_REFERENCE: &str = "No reference text";
+/// `[model] id` of the person's own model file.
+const CUSTOM: &str = "custom";
 const OFF_RUNNING: &str = "The test is running";
 const OFF_RECORDING: &str = "Stop the recording first";
 const OFF_NO_RECORDINGS: &str =
     "No recordings yet: dictate a few times with History on, or add one on Recordings";
 const OFF_NO_MODEL: &str = "Tick a downloaded model";
+const OFF_IN_USE: &str = "These goals tune the model in use, and it is not on disk: download it, or pick its file, on the Model page";
+const OFF_SECOND_MODEL: &str =
+    "No second model to compare with: download another model, or correct the texts on History";
+const OFF_JUDGE: &str = "No downloaded model hears this language to write the reference texts: correct them on History, or download one that does";
 const OFF_NO_TEXT: &str = "Write what was said in every recording";
 const OFF_NEEDS_DAEMON: &str = "Start OxiYapper to run the test";
 const OFF_NO_BEST: &str = "Run the test first";
@@ -93,7 +101,7 @@ const APPLIED: &str = "Best set applied.";
 const CANCELLED: &str = "Test cancelled.";
 const NOT_DOWNLOADED: &str = "Not downloaded";
 const DROP_SENT: &str = "Deleting the other models.";
-const PLAN_TIP: &str = "Picked by hand on Recordings, or else a few recent recordings from History of different lengths, each scored against its saved text. Nothing is pasted anywhere and nothing leaves this PC.";
+const PLAN_TIP: &str = "Picked by hand on Recordings, or else a few recent recordings from History of different lengths, each scored against the text you wrote or corrected, or else against what the most accurate downloaded model hears in it. That model writes the reference, so it is not compared: no model is graded against its own output. Nothing is pasted anywhere and nothing leaves this PC.";
 const HISTORY_ON: &str = "History is on. New dictations are kept.";
 
 /// The goal of tile `i`; the first for anything else.
@@ -293,6 +301,9 @@ struct Take {
     label: String,
     /// What was said.
     reference: String,
+    /// `reference` is the person's own (a new recording's text, a history text edited on the
+    /// History page or here); else it is a model's output and the judge writes the reference.
+    written: bool,
     /// Mono samples at `rate`, to play and draw (and for a new one, to send); empty while it
     /// records, or when a history file could not be read.
     audio: Rc<Vec<f32>>,
@@ -317,6 +328,11 @@ enum Answer {
 /// The last run's table: the sets, the recordings' labels, and `cells[set][take]`.
 #[derive(Default)]
 struct Results {
+    /// The model that wrote the reference of the recordings without the person's text.
+    judge: Option<&'static str>,
+    /// A best model run: Apply switches the model. The settings goals' Apply writes the settings
+    /// alone, so a model picked on the Model page since the run stays.
+    switches_model: bool,
     sets: Vec<SettingsSet>,
     labels: Vec<String>,
     cells: Vec<Vec<Answer>>,
@@ -324,8 +340,9 @@ struct Results {
 
 /// One recording of a run: where it comes from, its samples (sent for a new one), what was said.
 type RunTake = (Source, Rc<Vec<f32>>, String);
-/// A recording a run starts from: its source, samples and their rate, what was said, its label.
-type BaseTake = (Source, Rc<Vec<f32>>, u32, String, String);
+/// A recording a run starts from: its source, samples and their rate, what the person says was
+/// said (`None`: the judge writes it), its label.
+type BaseTake = (Source, Rc<Vec<f32>>, u32, Option<String>, String);
 /// The system memory, the graphics adapters and the free space of the models drive.
 type Hardware = (Option<u64>, Vec<Adapter>, Option<u64>);
 
@@ -337,10 +354,17 @@ struct Run {
     id: u32,
     /// The job out: set `job / takes.len()`, recording `job % takes.len()`.
     job: usize,
-    /// Jobs answered, and the jobs the run sends in all.
-    done: usize,
+    /// The judge's answers so far; the sets that run (the table's first lines); the jobs the run
+    /// sends in all.
+    judged: usize,
+    sets: usize,
     jobs: usize,
     takes: Vec<RunTake>,
+    /// The recordings that wait for the judge's text, each as the takes that share it (the one as
+    /// recorded first, then its quieter copies). The judge hears them all before any set runs.
+    judging: Vec<Vec<usize>>,
+    /// The judge's set: the most accurate model on disk with the default settings.
+    judge: Option<SettingsSet>,
     /// The new recording whose audio the daemon holds.
     ///
     /// shortcut: with several new recordings each set sends each one again; keep them per id on the
@@ -495,26 +519,54 @@ impl PageState {
         } else {
             takes.len()
         };
-        let (sets, _) = self.sets(goal);
+        let (edited, unedited) = self.written();
+        let plan = self.plan(goal, edited, unedited);
+        let (sets, _) = plan
+            .as_ref()
+            .map(|p| self.sets(goal, &p.models))
+            .unwrap_or_default();
         let off = if running {
-            OFF_RUNNING
+            OFF_RUNNING.to_owned()
         } else if recording {
-            OFF_RECORDING
+            OFF_RECORDING.to_owned()
         } else if recordings == 0 {
-            OFF_NO_RECORDINGS
+            OFF_NO_RECORDINGS.to_owned()
         } else if takes
             .iter()
-            .any(|t| word_errors(&t.reference, "").words == 0)
+            .any(|t| t.written && word_errors(&t.reference, "").words == 0)
         {
             // Scored over no words, heard text is 100 % and silence 0 %: Apply would prefer silence.
-            OFF_NO_TEXT
+            OFF_NO_TEXT.to_owned()
+        } else if let Err(missing) = plan {
+            missing_text(missing)
         } else if sets.is_empty() {
-            OFF_NO_MODEL
+            OFF_NO_MODEL.to_owned()
         } else {
-            self.ctx.ipc.link().off_reason(OFF_NEEDS_DAEMON)
+            self.ctx.ipc.link().off_reason(OFF_NEEDS_DAEMON).to_owned()
         };
         s.set_run_off(off.into());
-        s.set_plan(plan_text(recordings, !takes.is_empty(), goal, sets.len()).into());
+        let in_use = model_name(&self.ctx.config.borrow().config.model.id).to_owned();
+        s.set_tunes(format!("Tunes the model in use: {in_use}").into());
+        let text = match &plan {
+            Ok(p) if p.unedited_out => format!(
+                "{}
+{}",
+                plan_text(
+                    recordings - unedited,
+                    !takes.is_empty(),
+                    goal,
+                    sets.len(),
+                    None
+                ),
+                left_out(unedited)
+            ),
+            Ok(p) => {
+                let judge = p.judge.map(|j| (unedited, j));
+                plan_text(recordings, !takes.is_empty(), goal, sets.len(), judge)
+            }
+            Err(_) => String::new(),
+        };
+        s.set_plan(text.into());
         s.set_playing(
             self.playing
                 .borrow()
@@ -602,6 +654,7 @@ impl PageState {
                         source: Source::New,
                         label: format!("New recording {}", n + 1),
                         reference,
+                        written: true,
                         audio: Rc::new(Vec::new()),
                         rate: SAMPLE_RATE,
                         duration_ms: 0,
@@ -705,6 +758,7 @@ impl PageState {
                 source: Source::History(item.id.clone()),
                 label: tuning_view::when(&item.id),
                 reference: item.text.0.trim().to_owned(),
+                written: item.edited,
                 audio: Rc::new(audio),
                 rate,
                 duration_ms: item.duration_ms,
@@ -865,6 +919,7 @@ impl PageState {
         };
         if let Some(take) = self.takes.borrow_mut().get_mut(i) {
             text.clone_into(&mut take.reference);
+            take.written = true;
         }
         // The card keeps the text, so a removal above hands the right one down.
         if let Some(mut card) = self.cards.row_data(i) {
@@ -906,13 +961,20 @@ impl PageState {
         }
         self.stop_playing();
         let goal = goal_at(s.get_goal());
-        let (runnable, skipped) = self.sets(goal);
-        let (takes, labels): (Vec<RunTake>, Vec<String>) = self.run_takes(goal).into_iter().unzip();
+        let (edited, unedited) = self.written();
+        let Ok(plan) = self.plan(goal, edited, unedited) else {
+            return;
+        };
+        let (runnable, skipped) = self.sets(goal, &plan.models);
+        let (takes, judging) = self.run_takes(goal, !plan.unedited_out);
+        let (takes, labels): (Vec<RunTake>, Vec<String>) = takes.into_iter().unzip();
         let n = takes.len();
         let mut cells = vec![vec![Answer::Waiting; n]; runnable.len()];
         cells.extend(vec![vec![Answer::Failed(NOT_DOWNLOADED); n]; skipped.len()]);
         let sets: Vec<SettingsSet> = runnable.iter().chain(&skipped).cloned().collect();
         *self.results.borrow_mut() = Results {
+            judge: plan.judge.filter(|_| !judging.is_empty()),
+            switches_model: goal == Goal::Model,
             cells,
             labels,
             sets: sets.clone(),
@@ -933,9 +995,16 @@ impl PageState {
         let run = Run {
             id: 0,
             job: 0,
-            done: 0,
-            jobs: runnable.len() * n,
+            judged: 0,
+            sets: runnable.len(),
+            // The judge hears each recording once more, before any set.
+            jobs: judging.len() + runnable.len() * n,
             takes,
+            judging,
+            judge: plan.judge.map(|model| SettingsSet {
+                model: model.to_owned(),
+                ..SettingsSet::defaults()
+            }),
             held: None,
             language: self.ctx.config.borrow().config.model.language,
         };
@@ -945,8 +1014,9 @@ impl PageState {
     /// The recordings of a run with their labels: the ones picked by hand, or else a few recent
     /// ones from History; each once per gain of `goal`. A quieter copy is made here and sent as a
     /// new recording; a history file that cannot be read, or is not at the engine's rate, gets
-    /// none.
-    fn run_takes(&self, goal: Goal) -> Vec<(RunTake, String)> {
+    /// none. Second, the takes whose reference the judge writes, grouped per recording. Without
+    /// `unedited` the recordings with no text of the person's are left out (no judge for them).
+    fn run_takes(&self, goal: Goal, unedited: bool) -> (Vec<(RunTake, String)>, Vec<Vec<usize>>) {
         let base: Vec<BaseTake> = {
             let takes = self.takes.borrow();
             if takes.is_empty() {
@@ -954,7 +1024,7 @@ impl PageState {
                     .into_iter()
                     .map(|item| {
                         let label = tuning_view::when(&item.id);
-                        let text = item.text.0.trim().to_owned();
+                        let text = item.edited.then(|| item.text.0.trim().to_owned());
                         let source = Source::History(item.id);
                         (source, Rc::new(Vec::new()), SAMPLE_RATE, text, label)
                     })
@@ -963,14 +1033,22 @@ impl PageState {
                 takes
                     .iter()
                     .map(|t| {
-                        let (audio, text) = (Rc::clone(&t.audio), t.reference.clone());
+                        let text = t.written.then(|| t.reference.clone());
+                        let audio = Rc::clone(&t.audio);
                         (t.source.clone(), audio, t.rate, text, t.label.clone())
                     })
                     .collect()
             }
         };
         let mut out = Vec::new();
-        for (source, mut audio, mut rate, reference, label) in base {
+        let mut judged = Vec::new();
+        for (source, mut audio, mut rate, written, label) in base {
+            if written.is_none() && !unedited {
+                continue;
+            }
+            let first = out.len();
+            // The judge's text comes in before any set needs it.
+            let reference = written.clone().unwrap_or_default();
             for &db in goal.gains() {
                 if db == 0.0 {
                     let take = (source.clone(), Rc::clone(&audio), reference.clone());
@@ -991,8 +1069,11 @@ impl PageState {
                 let take = (Source::New, Rc::new(quieter), reference.clone());
                 out.push((take, format!("{label} · {db:.0} dB")));
             }
+            if written.is_none() {
+                judged.push((first..out.len()).collect());
+            }
         }
-        out
+        (out, judged)
     }
 
     /// The history recordings a run takes when none is picked by hand: done, with words to score
@@ -1015,9 +1096,67 @@ impl PageState {
             .collect()
     }
 
-    /// The sets of `goal` over the ticked models: the ones on disk run, the others are listed as
-    /// skipped (one line each).
-    fn sets(&self, goal: Goal) -> (Vec<SettingsSet>, Vec<SettingsSet>) {
+    /// How many recordings of the next run have the person's own text (written here, or corrected
+    /// on the History page), and how many have a model's.
+    fn written(&self) -> (usize, usize) {
+        let takes = self.takes.borrow();
+        let (all, edited) = if takes.is_empty() {
+            let picks = self.auto_picks();
+            (picks.len(), picks.iter().filter(|item| item.edited).count())
+        } else {
+            (takes.len(), takes.iter().filter(|t| t.written).count())
+        };
+        (edited, all - edited)
+    }
+
+    /// Who writes the reference texts of a run of `goal` and which models it compares
+    /// (`tuning::plan`).
+    fn plan(
+        &self,
+        goal: Goal,
+        edited: usize,
+        unedited: usize,
+    ) -> Result<Plan<'static>, Missing<'static>> {
+        let mut on_disk = self.downloaded();
+        let config = self.ctx.config.borrow();
+        let model = &config.config.model;
+        // The own file in use runs as the "custom" set (the daemon resolves it as it dictates).
+        if model.id == CUSTOM && !model.custom_path.trim().is_empty() {
+            on_disk.push(CUSTOM);
+        }
+        let ticked: Vec<&'static str> = {
+            let ticks = self.ticked.borrow();
+            self.entries
+                .iter()
+                .zip(ticks.iter())
+                .filter(|(e, on)| **on && on_disk.contains(&e.id))
+                .map(|(e, _)| e.id)
+                .collect()
+        };
+        tuning::plan(
+            goal,
+            &on_disk,
+            &ticked,
+            &model.id,
+            model.language,
+            edited,
+            unedited,
+        )
+    }
+
+    /// The registry models on disk, in gallery order.
+    fn downloaded(&self) -> Vec<&'static str> {
+        self.entries
+            .iter()
+            .zip(self.choices.borrow().iter())
+            .filter(|(_, c)| c.downloaded)
+            .map(|(e, _)| e.id)
+            .collect()
+    }
+
+    /// The sets of `goal` over `models` (`Self::plan`); for the best model goal the ticked models
+    /// not on disk are listed as skipped (one line each).
+    fn sets(&self, goal: Goal, models: &[&str]) -> (Vec<SettingsSet>, Vec<SettingsSet>) {
         let base = {
             let audio = &self.ctx.config.borrow().config.audio;
             SettingsSet {
@@ -1029,34 +1168,39 @@ impl PageState {
         };
         let choices = self.choices.borrow();
         let ticks = self.ticked.borrow();
-        let ticked = || choices.iter().zip(ticks.iter()).filter(|(_, on)| **on);
-        let ready: Vec<&str> = ticked()
-            .filter(|(c, _)| c.downloaded)
-            .map(|(c, _)| c.id.as_str())
-            .collect();
-        let missing: Vec<&str> = ticked()
-            .filter(|(c, _)| !c.downloaded)
+        // The settings goals tune the model in use whatever is ticked.
+        let missing: Vec<&str> = choices
+            .iter()
+            .zip(ticks.iter())
+            .filter(|(c, on)| goal == Goal::Model && **on && !c.downloaded)
             .map(|(c, _)| c.id.as_str())
             .collect();
         (
-            tuning::wizard_sets(goal, &base, &ready),
+            tuning::wizard_sets(goal, &base, models),
             tuning::wizard_sets(Goal::Model, &base, &missing),
         )
     }
 
-    /// Sends the next job that waits; with none left the run is over.
+    /// Sends the next job that waits: the judge's first, then the sets'; with none left the run
+    /// is over.
     fn send_job(&self, mut run: Run) {
         let n = run.takes.len();
         let sets = self.results.borrow().sets.clone();
-        while run.job < sets.len() * n && !self.waiting(run.job / n, run.job % n) {
-            run.job += 1;
-        }
-        if n == 0 || run.job >= sets.len() * n {
-            self.finish_run();
-            self.bar.finish(&());
-            return;
-        }
-        let (set, take) = (run.job / n, run.job % n);
+        let (set, take) = if let (Some(group), Some(judge)) = (run.judging.first(), &run.judge) {
+            (judge.clone(), group[0])
+        } else {
+            while run.job < sets.len() * n && !self.waiting(run.job / n, run.job % n) {
+                run.job += 1;
+            }
+            if n == 0 || run.job >= sets.len() * n {
+                self.finish_run();
+                self.bar.finish(&());
+                return;
+            }
+            let (set, take) = (run.job / n, run.job % n);
+            self.set_cell(set, take, Answer::Running);
+            (sets[set].clone(), take)
+        };
         run.id = self.next_id.get();
         self.next_id.set(run.id.wrapping_add(1));
         let (source, audio, _) = &run.takes[take];
@@ -1073,19 +1217,18 @@ impl PageState {
                 }
                 Request::TestTranscribe {
                     id: run.id,
-                    set: sets[set].clone(),
+                    set,
                     language: run.language,
                 }
             }
             Source::History(id) => Request::HistoryRetranscribe {
                 run: run.id,
                 id: id.clone(),
-                set: sets[set].clone(),
+                set,
                 language: run.language,
             },
         };
         self.ctx.ipc.send(request);
-        self.set_cell(set, take, Answer::Running);
         // Only moves a bar that runs: the first push of the daemon starts it, with its estimate.
         self.progress(&run, 0, None);
         *self.run.borrow_mut() = Some(run);
@@ -1212,8 +1355,15 @@ impl PageState {
             self.bar
                 .start((), Some(Millis(u64::from(est) * jobs as u64)));
         }
+        let done = {
+            let results = self.results.borrow();
+            jobs_done(
+                run.judged,
+                results.cells.get(..run.sets).unwrap_or_default(),
+            )
+        };
         #[expect(clippy::cast_precision_loss, reason = "job counts are tiny")]
-        let done = (run.done as f32 + f32::from(percent.min(100)) / 100.0) / jobs as f32;
+        let done = (done as f32 + f32::from(percent.min(100)) / 100.0) / jobs as f32;
         self.bar.real(&(), done);
     }
 
@@ -1287,13 +1437,11 @@ impl PageState {
             return;
         };
         let n = run.takes.len();
-        let (set, take) = (run.job / n, run.job % n);
-        let cell = match outcome {
-            TestOutcome::Heard { text, ms } => Answer::Heard {
-                errors: word_errors(&run.takes[take].2, text),
-                text: text.clone(),
-                ms: *ms,
-            },
+        // As `send_job` chose: the judge's job while recordings wait for it.
+        let judging = run.judge.is_some() && !run.judging.is_empty();
+        let take = run.judging.first().map_or(run.job % n, |group| group[0]);
+        let heard = match outcome {
+            TestOutcome::Heard { text, ms } => Ok((text, *ms)),
             TestOutcome::Failed {
                 why: TestFailure::Busy,
             } => {
@@ -1310,20 +1458,56 @@ impl PageState {
                 why: TestFailure::NoAudio,
             } => {
                 if matches!(run.takes[take].0, Source::History(_)) {
-                    Answer::Failed(NOT_FOUND)
+                    Err(NOT_FOUND)
                 } else {
                     *self.run.borrow_mut() = Some(run);
                     self.abort_run(NO_AUDIO);
                     return;
                 }
             }
-            TestOutcome::Failed { why } => Answer::Failed(failed(*why)),
+            TestOutcome::Failed { .. } if judging => Err(NO_REFERENCE),
+            TestOutcome::Failed { why } => Err(failed(*why)),
         };
-        self.set_cell(set, take, cell);
-        run.job += 1;
-        run.done += 1;
+        if judging {
+            // The judge's text is the reference of the recording and of its quieter copies; with
+            // none, no set can score them.
+            let group = run.judging.remove(0);
+            run.judged += 1;
+            match heard {
+                Ok((text, _)) if word_errors(text, "").words > 0 => {
+                    for &t in &group {
+                        run.takes[t].2.clone_from(text);
+                    }
+                }
+                Ok(_) => self.fail_takes(&group, NO_REFERENCE),
+                Err(why) => self.fail_takes(&group, why),
+            }
+        } else {
+            let cell = match heard {
+                Ok((text, ms)) => Answer::Heard {
+                    errors: word_errors(&run.takes[take].2, text),
+                    text: text.clone(),
+                    ms,
+                },
+                Err(why) => Answer::Failed(why),
+            };
+            self.set_cell(run.job / n, take, cell);
+            run.job += 1;
+        }
         self.show_pace();
         self.send_job(run);
+    }
+
+    /// Every set's line of the takes `group` fails with `why`: none of them is sent.
+    fn fail_takes(&self, group: &[usize], why: &'static str) {
+        let sets = self.results.borrow().sets.len();
+        for set in 0..sets {
+            for &take in group {
+                if self.waiting(set, take) {
+                    self.set_cell(set, take, Answer::Failed(why));
+                }
+            }
+        }
     }
 
     /// Marks every job of `run` not answered yet.
@@ -1393,6 +1577,9 @@ impl PageState {
                 let mut text = format!("{} · {} errors", model_name(&set.model), percent(*errors));
                 if let Some(ms) = self.mean_ms(Some(*row)) {
                     text = format!("{text} · {}", per_recording(ms));
+                }
+                if let Some(judge) = self.results.borrow().judge {
+                    text = format!("{text}\n{}", reference_line(judge));
                 }
                 s.set_best_text(text.into());
                 s.set_apply_off(SharedString::new());
@@ -1742,7 +1929,9 @@ impl PageState {
             file.config
                 .audio
                 .remember_device(oxi_platform::capture::default_input_name().as_deref());
-            file.config.model.id = set.model;
+            if self.results.borrow().switches_model {
+                file.config.model.id = set.model;
+            }
         }
         let saved = self.ctx.save();
         if saved.is_ok() {
@@ -1754,6 +1943,9 @@ impl PageState {
 
 /// The display name of model `id`; the id itself when the registry does not know it.
 fn model_name(id: &str) -> &str {
+    if id == CUSTOM {
+        return "Own model file";
+    }
     models::find(id).map_or(id, |entry| entry.display_name)
 }
 
@@ -1780,8 +1972,16 @@ fn per_recording(ms: u64) -> String {
     format!("{:.1} s per recording", ms as f64 / 1000.0)
 }
 
-/// What Run takes: "3 recordings from History · 12 runs"; empty with nothing to run.
-fn plan_text(recordings: usize, by_hand: bool, goal: Goal, sets: usize) -> String {
+/// What Run takes: "3 recordings from History · 12 runs"; empty with nothing to run. With a
+/// `judge` (how many recordings it hears, its model) its runs count too, and a second line says
+/// what the reference is.
+fn plan_text(
+    recordings: usize,
+    by_hand: bool,
+    goal: Goal,
+    sets: usize,
+    judge: Option<(usize, &str)>,
+) -> String {
     if recordings == 0 || sets == 0 {
         return String::new();
     }
@@ -1792,17 +1992,68 @@ fn plan_text(recordings: usize, by_hand: bool, goal: Goal, sets: usize) -> Strin
         (false, n) => format!("{n} recordings from History"),
     };
     let levels = goal.gains().len();
-    let runs = recordings * levels * sets;
+    let runs = recordings * levels * sets + judge.map_or(0, |(n, _)| n);
     let runs = if runs == 1 {
         "1 run".to_owned()
     } else {
         format!("{runs} runs")
     };
-    if levels > 1 {
+    let plan = if levels > 1 {
         format!("{what} · {levels} loudness levels · {runs}")
     } else {
         format!("{what} · {runs}")
+    };
+    match judge {
+        Some((_, model)) => format!("{plan}\n{}", reference_line(model)),
+        None => plan,
     }
+}
+
+/// What the recordings are scored against when `judge` wrote some of the reference texts.
+fn reference_line(judge: &str) -> String {
+    format!(
+        "Reference: your edits where you made them, otherwise {}",
+        model_name(judge)
+    )
+}
+
+/// The plan's line for `n` recordings without the person's text left out of a run: no model on
+/// disk can grade them fairly.
+fn left_out(n: usize) -> String {
+    let (what, its) = if n == 1 {
+        ("1 recording".to_owned(), "its")
+    } else {
+        (format!("{n} recordings"), "their")
+    };
+    format!(
+        "{what} left out: no second model to compare with. Correct {its} text on History, or download another model"
+    )
+}
+
+/// Run's off reason for what the run lacks.
+fn missing_text(missing: Missing<'_>) -> String {
+    match missing {
+        Missing::Model => OFF_NO_MODEL.to_owned(),
+        Missing::InUse => OFF_IN_USE.to_owned(),
+        Missing::SecondModel => OFF_SECOND_MODEL.to_owned(),
+        Missing::TwoModels(judge) => format!(
+            "Needs two models to compare besides {}, which writes the reference texts: download another model, or correct the texts on History",
+            model_name(judge)
+        ),
+        Missing::Judge => OFF_JUDGE.to_owned(),
+    }
+}
+
+/// The jobs of a run answered so far: the judge's `judged` answers and every cell of the sets
+/// that run, heard or failed. A recording the judge heard nothing in fails its cells unsent, and
+/// they count as done too, so the bar and the time left never wait for them.
+fn jobs_done(judged: usize, cells: &[Vec<Answer>]) -> usize {
+    judged
+        + cells
+            .iter()
+            .flatten()
+            .filter(|c| matches!(c, Answer::Heard { .. } | Answer::Failed(_)))
+            .count()
 }
 
 /// A results line for `set`, not run yet.
@@ -1842,5 +2093,29 @@ fn failure(e: &CaptureError) -> String {
         CaptureError::NoDevice => NO_MIC.to_owned(),
         CaptureError::Audio(AudioError::MicSilence) => strings::no_signal("the microphone"),
         e => strings::mic_test_failed(&e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review 8: the cells a failed judge marks count as done, else the bar sits short of the end.
+    #[test]
+    fn failed_cells_count_as_done_jobs() {
+        let heard = Answer::Heard {
+            errors: WordErrors::default(),
+            text: String::new(),
+            ms: 0,
+        };
+        let cells = [
+            vec![heard, Answer::Failed(NO_REFERENCE), Answer::Running],
+            vec![
+                Answer::Waiting,
+                Answer::Failed(NO_REFERENCE),
+                Answer::NotRun,
+            ],
+        ];
+        assert_eq!(jobs_done(3, &cells), 6);
     }
 }

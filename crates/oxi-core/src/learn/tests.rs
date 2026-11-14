@@ -34,6 +34,7 @@ fn prev(text: &str, model: &str) -> Previous {
         language: "ru".into(),
         settings: None,
         newer: false,
+        edited: false,
     }
 }
 

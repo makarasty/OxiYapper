@@ -12,6 +12,7 @@ use unicode_normalization::UnicodeNormalization as _;
 use crate::audio::SAMPLE_RATE;
 use crate::config::{Advanced, AudioCtx, Auto, Config, Decoding, PromptSource};
 use crate::ipc::MAX_LINE;
+use crate::models;
 use crate::types::Language;
 
 /// Longest recording the daemon holds for a test: 5 minutes.
@@ -402,6 +403,101 @@ pub fn word_errors(reference: &str, hypothesis: &str) -> WordErrors {
     }
 }
 
+/// Who writes the reference texts of a run and which models it compares ([`plan`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan<'a> {
+    /// Writes the reference of every recording without the person's own text: the most accurate
+    /// downloaded model that hears the language, none of whose family is compared. `None` when
+    /// every recording that runs has the person's text.
+    pub judge: Option<&'a str>,
+    /// The models whose sets run.
+    pub models: Vec<&'a str>,
+    /// The recordings without the person's text stay out of the run, the ones with it run: no
+    /// downloaded model can grade them fairly (none hears the language, none is outside the tuned
+    /// model's family, or one model alone would be left to compare beside the judge).
+    pub unedited_out: bool,
+}
+
+/// Why a run cannot start ([`plan`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Missing<'a> {
+    /// Best model: no ticked model on disk.
+    Model,
+    /// Best settings, quiet microphone: the model in use is not on disk.
+    InUse,
+    /// Best settings, quiet microphone: no recording has the person's text, and no downloaded
+    /// model outside the model in use's family hears the language to write it.
+    SecondModel,
+    /// Best model: under two models left to compare beside the family of the judge (named), and no
+    /// recording has the person's text.
+    TwoModels(&'a str),
+    /// Best model: no recording has the person's text and no downloaded model hears the language.
+    Judge,
+}
+
+/// The plan of a run of `goal` over `edited` recordings with the person's own text and `unedited`
+/// with a model's (History keeps what the model in use wrote, so grading on it would hand that
+/// model the win). `downloaded`: the models on disk (with `"custom"` when the own file is in use);
+/// `ticked`: the ticked ones of them.
+///
+/// The settings goals tune the model in use, judged by the most accurate model outside its family;
+/// the best model goal compares the ticked models outside the judge's family, at least two of
+/// them, or all of them when every text is the person's. Without a fair judge the recordings with
+/// the person's text run alone (`unedited_out`); with none of those the run cannot start.
+///
+/// # Errors
+/// What the run lacks, one reason.
+pub fn plan<'a>(
+    goal: Goal,
+    downloaded: &[&'a str],
+    ticked: &[&'a str],
+    in_use: &str,
+    language: Language,
+    edited: usize,
+    unedited: usize,
+) -> Result<Plan<'a>, Missing<'a>> {
+    let judge = |not_of: Option<&str>| {
+        models::by_accuracy(language)
+            .filter(|id| not_of.is_none_or(|f| models::family(id) != f))
+            .find_map(|id| downloaded.iter().find(|d| **d == id).copied())
+    };
+    let (judge, models) = if goal == Goal::Model {
+        let judge = (unedited > 0).then(|| judge(None)).flatten();
+        let models: Vec<&str> = ticked
+            .iter()
+            .copied()
+            .filter(|m| judge.is_none_or(|j| models::family(m) != models::family(j)))
+            .collect();
+        match judge {
+            // One model left is no comparison: the person's texts alone grade every ticked one.
+            Some(_) if models.len() < 2 && edited > 0 => (None, ticked.to_vec()),
+            Some(judge) if models.len() < 2 => return Err(Missing::TwoModels(judge)),
+            None if unedited > 0 && edited == 0 => return Err(Missing::Judge),
+            _ => (judge, models),
+        }
+    } else {
+        let model = *downloaded
+            .iter()
+            .find(|d| **d == in_use)
+            .ok_or(Missing::InUse)?;
+        let judge = (unedited > 0)
+            .then(|| judge(Some(models::family(in_use))))
+            .flatten();
+        if judge.is_none() && unedited > 0 && edited == 0 {
+            return Err(Missing::SecondModel);
+        }
+        (judge, vec![model])
+    };
+    if models.is_empty() {
+        return Err(Missing::Model);
+    }
+    Ok(Plan {
+        judge,
+        models,
+        unedited_out: judge.is_none() && unedited > 0,
+    })
+}
+
 /// Index of the set to apply: the lowest error percent, then the fewest changes from the
 /// defaults, then the earliest. Equal fractions give equal `f64`s (division rounds exactly).
 pub fn best(results: &[(SettingsSet, WordErrors)]) -> Option<usize> {
@@ -681,6 +777,166 @@ mod tests {
         // A history recording over five minutes gets no quieter copy: the daemon would refuse it.
         assert!(with_gain(&vec![0.0; MAX_TEST_SAMPLES], -6.0).is_some());
         assert!(with_gain(&vec![0.0; MAX_TEST_SAMPLES + 1], -6.0).is_none());
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "compared with what `plan` answers"
+    )]
+    fn ok<'a>(
+        judge: Option<&'a str>,
+        models: &[&'a str],
+        unedited_out: bool,
+    ) -> Result<Plan<'a>, Missing<'a>> {
+        Ok(Plan {
+            judge,
+            models: models.to_vec(),
+            unedited_out,
+        })
+    }
+
+    /// The best model cases of the review of the honest reference, through [`plan`] itself.
+    #[test]
+    fn the_judge_is_never_compared_and_never_judges_its_own_family() {
+        use Goal::Model;
+        let ru = Language::RU;
+        // Best model: the most accurate on disk judges, and neither it nor its compact file is
+        // compared (the compact one would match it almost word for word).
+        let disk = ["turbo", "small", "large-v3", "large-v3-compact"];
+        assert_eq!(
+            plan(Model, &disk, &disk, "turbo", ru, 0, 3),
+            ok(Some("large-v3"), &["turbo", "small"], false)
+        );
+        let disk = ["turbo", "large-v3", "large-v3-compact"];
+        assert_eq!(
+            plan(Model, &disk, &disk, "turbo", ru, 0, 2),
+            Err(Missing::TwoModels("large-v3")),
+            "one model left is no comparison"
+        );
+        // A fair judge is missing, but some texts are the person's: those run alone, on every
+        // ticked model (the same rule as with no judge for the language).
+        assert_eq!(
+            plan(Model, &disk, &disk, "turbo", ru, 1, 2),
+            ok(None, &disk, true)
+        );
+        let disk = ["turbo", "small"];
+        assert_eq!(
+            plan(Model, &disk, &disk, "turbo", ru, 1, 2),
+            ok(None, &disk, true)
+        );
+        let disk = ["turbo", "small"];
+        assert_eq!(
+            plan(Model, &disk, &disk, "turbo", ru, 0, 1),
+            Err(Missing::TwoModels("turbo")),
+            "turbo judges, small alone would win unopposed"
+        );
+        let disk = ["turbo", "turbo-compact"];
+        assert_eq!(
+            plan(Model, &disk, &disk, "turbo", ru, 0, 1),
+            Err(Missing::TwoModels("turbo"))
+        );
+        // Every text the person's: no judge, every ticked model competes, one is enough.
+        assert_eq!(
+            plan(Model, &disk, &disk, "turbo", ru, 2, 0),
+            ok(None, &["turbo", "turbo-compact"], false)
+        );
+        assert_eq!(
+            plan(Model, &disk, &["turbo"], "turbo", ru, 2, 0),
+            ok(None, &["turbo"], false)
+        );
+        assert_eq!(
+            plan(Model, &disk, &[], "turbo", ru, 2, 0),
+            Err(Missing::Model)
+        );
+        // The judge must hear the language: none does, so the texts the person did not write are
+        // left out, and with none written there is nothing to score.
+        assert_eq!(
+            plan(Model, &["distil-en"], &["distil-en"], "turbo", ru, 1, 1),
+            ok(None, &["distil-en"], true)
+        );
+        assert_eq!(
+            plan(Model, &["distil-en"], &["distil-en"], "turbo", ru, 0, 1),
+            Err(Missing::Judge)
+        );
+        let disk = ["podlodka", "small"];
+        assert_eq!(
+            plan(Model, &disk, &disk, "small", Language::EN, 0, 1),
+            Err(Missing::TwoModels("small")),
+            "small judges English, podlodka cannot"
+        );
+        assert_eq!(
+            plan(
+                Model,
+                &["podlodka"],
+                &["podlodka"],
+                "podlodka",
+                Language::AUTO,
+                0,
+                1
+            ),
+            Err(Missing::Judge)
+        );
+    }
+
+    /// The settings goals tune the model in use whatever is ticked; its judge comes from outside
+    /// its family, even a less accurate one, and must hear the language.
+    #[test]
+    fn the_settings_goals_tune_the_model_in_use_judged_outside_its_family() {
+        let ru = Language::RU;
+        for goal in [Goal::Settings, Goal::QuietMic] {
+            let disk = ["turbo", "small"];
+            assert_eq!(
+                plan(goal, &disk, &["small"], "turbo", ru, 0, 2),
+                ok(Some("small"), &["turbo"], false)
+            );
+            let disk = ["turbo", "turbo-compact"];
+            assert_eq!(
+                plan(goal, &disk, &disk, "turbo", ru, 0, 1),
+                Err(Missing::SecondModel),
+                "its own compact file cannot judge it"
+            );
+            assert_eq!(
+                plan(goal, &disk, &disk, "turbo", ru, 1, 1),
+                ok(None, &["turbo"], true),
+                "the corrected recording runs alone"
+            );
+            assert_eq!(
+                plan(goal, &["turbo"], &["turbo"], "turbo", ru, 0, 1),
+                Err(Missing::SecondModel)
+            );
+            assert_eq!(
+                plan(
+                    goal,
+                    &["turbo", "podlodka"],
+                    &[],
+                    "turbo",
+                    Language::EN,
+                    0,
+                    1
+                ),
+                Err(Missing::SecondModel),
+                "podlodka does not hear English"
+            );
+            assert_eq!(
+                plan(goal, &["turbo"], &[], "turbo", ru, 3, 0),
+                ok(None, &["turbo"], false),
+                "the person's texts need no judge"
+            );
+            assert_eq!(
+                plan(goal, &["small"], &["small"], "turbo", ru, 3, 0),
+                Err(Missing::InUse)
+            );
+            // The own model file in use is tuned; it is its own family, so a registry model judges.
+            let disk = ["turbo", "custom"];
+            assert_eq!(
+                plan(goal, &disk, &["turbo"], "custom", ru, 0, 2),
+                ok(Some("turbo"), &["custom"], false)
+            );
+            assert_eq!(
+                plan(goal, &["custom"], &[], "custom", ru, 1, 1),
+                ok(None, &["custom"], true)
+            );
+        }
     }
 
     #[test]

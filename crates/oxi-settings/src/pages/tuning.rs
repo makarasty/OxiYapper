@@ -101,6 +101,7 @@ mod tests {
             language: String::new(),
             text: Spoken(text.into()),
             held: Vec::new(),
+            edited: false,
         };
         assert_eq!(
             history_label(&item(" hello ")),

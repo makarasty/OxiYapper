@@ -16,7 +16,7 @@ expression: lines(pushes().iter().map(encode).collect())
 {"t":"TestProgress","id":7,"percent":0,"est_ms":1200}
 {"t":"TestResult","id":7,"outcome":{"r":"Heard","text":"test","ms":840}}
 {"t":"TestResult","id":8,"outcome":{"r":"Failed","why":"ModelMissing"}}
-{"t":"HistoryAdded","item":{"id":"2026-11-11/101500-123","status":"done","duration_ms":2500,"model":"turbo","language":"auto","text":"test"}}
+{"t":"HistoryAdded","item":{"id":"2026-11-11/101500-123","status":"done","duration_ms":2500,"model":"turbo","language":"auto","text":"test","edited":true}}
 {"t":"HistoryRemoved","ids":["2026-11-01/090000-000","2026-11-01/090100-000"]}
 {"t":"FileChanged","file":"Replace"}
 {"t":"Woke"}

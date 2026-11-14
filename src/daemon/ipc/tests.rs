@@ -84,6 +84,7 @@ impl Host for Fake {
             language: "auto".into(),
             text: Spoken("words".into()),
             held: Vec::new(),
+            edited: false,
         };
         let (items, more) = history_page(
             [item("2026-11-10/120000-000"), item("2026-11-09/120000-000")],
@@ -173,7 +174,7 @@ impl Host for Fake {
             (vec![word], timed.then_some(how))
         })
     }
-    fn history_edit(&self, id: &HistoryId, _text: &str) -> io::Result<()> {
+    fn history_edit(&self, id: &HistoryId, _text: &str, _typed: bool) -> io::Result<()> {
         self.history_audio(id).map(drop)
     }
     fn history_restore(&self, id: &HistoryId, _original: bool) -> io::Result<()> {
@@ -457,6 +458,7 @@ fn history_requests_reach_the_host_and_answer() {
         conn.send(&Request::HistoryEdit {
             id: hid(id),
             text: Spoken("edited".into()),
+            adds_held: false,
         })
         .unwrap();
         assert_eq!(
@@ -730,6 +732,7 @@ fn entry(
         held: Vec::new(),
         delivered: None,
         levels: None,
+        edited: false,
     };
     std::fs::write(dir.join(id).with_extension("json"), meta.to_json().unwrap()).unwrap();
     (dir, id)
@@ -761,7 +764,7 @@ fn a_recovered_16k_recording_stays_raw_after_its_status_is_rewritten() {
     mark_raw(&dir, id);
     retranscribed(&dir, id);
     assert!(!entry_processed(&dir, &hid(id)), "after set_text");
-    history::edit_text(&dir, &hid(id), "edited").unwrap();
+    history::edit_text(&dir, &hid(id), "edited", true).unwrap();
     assert!(!entry_processed(&dir, &hid(id)), "after edit_text");
     // An older record with no marker: nothing on disk tells it from a processed one.
     let (dir, id) = entry("raw16-old", 16_000, oxi_core::history::Status::Failed);
@@ -800,6 +803,7 @@ fn only_done_and_cancelled_audio_counts_as_processed() {
             held: Vec::new(),
             delivered: None,
             levels: None,
+            edited: false,
         }
         .to_json()
         .unwrap()
@@ -928,6 +932,7 @@ fn a_history_page_is_capped_and_continues_after_its_last_id() {
         language: String::new(),
         text: Spoken("t".into()),
         held: Vec::new(),
+        edited: false,
     };
     let all: Vec<_> = (0..HISTORY_PAGE_ITEMS + 5).map(item).collect();
     let (first, more) = history_page(all.clone(), None);
@@ -1643,6 +1648,7 @@ impl FileRig {
                 language: String::new(),
                 text: Spoken(text.into()),
                 held: Vec::new(),
+                edited: false,
             })
         };
         let decode = |path: &std::path::Path| match lock(&self.decoded).take() {

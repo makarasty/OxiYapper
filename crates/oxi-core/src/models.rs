@@ -232,6 +232,39 @@ pub fn facts(id: &str) -> Facts {
     }
 }
 
+/// The offered models from the most accurate down (`tiny` aside): a language model first in its
+/// own language, a compact file just below its full one (q8 is near lossless, q5 less so).
+const ACCURACY: [&str; 9] = [
+    "podlodka",
+    "podlodka-compact",
+    "large-v3",
+    "large-v3-compact",
+    "turbo",
+    "distil-en",
+    "turbo-compact",
+    "small",
+    "base",
+];
+
+/// The offered models that hear `language`, the most accurate first: a model tuned for one
+/// language counts only for it (`auto` takes the multilingual ones).
+pub fn by_accuracy(language: Language) -> impl Iterator<Item = &'static str> {
+    ACCURACY
+        .into_iter()
+        .filter(move |id| facts(id).only.is_none_or(|only| only == language))
+}
+
+/// The model whose weights `id` carries: a compact file is its full model quantized, so the two
+/// hear almost word for word alike; any other id is its own family.
+pub fn family(id: &str) -> &str {
+    match id {
+        "turbo-compact" => "turbo",
+        "large-v3-compact" => "large-v3",
+        "podlodka-compact" => "podlodka",
+        other => other,
+    }
+}
+
 /// A graphics adapter as the OS lists it: its name and its own (dedicated) memory in bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Adapter {
@@ -565,6 +598,30 @@ mod tests {
         assert_eq!(facts("distil-en").only, Some(Language::EN));
         assert_eq!(facts("tiny").class, ModelClass::Small);
         assert_eq!(ModelClass::Small.index(), 3);
+    }
+
+    #[test]
+    fn every_offered_model_has_an_accuracy_place_and_language_models_count_in_their_language() {
+        for m in MODELS.iter().filter(|m| m.id != "tiny") {
+            assert!(ACCURACY.contains(&m.id), "{}: no accuracy place", m.id);
+        }
+        assert_eq!(by_accuracy(Language::RU).next(), Some("podlodka"));
+        assert_eq!(by_accuracy(Language::EN).next(), Some("large-v3"));
+        assert!(by_accuracy(Language::EN).any(|id| id == "distil-en"));
+        assert!(!by_accuracy(Language::AUTO).any(|id| facts(id).only.is_some()));
+    }
+
+    #[test]
+    fn a_compact_file_is_in_the_family_of_its_full_model() {
+        for m in MODELS {
+            let full = family(m.id);
+            assert!(find(full).is_some(), "{}: family {full} is no model", m.id);
+            assert_eq!(full != m.id, m.id.ends_with("-compact"), "{}", m.id);
+        }
+        assert_eq!(family("large-v3-compact"), "large-v3");
+        assert_eq!(family("podlodka-compact"), "podlodka");
+        assert_eq!(family("turbo-compact"), "turbo");
+        assert_eq!(family("custom"), "custom");
     }
 
     fn rec(machine: Machine, language: Language) -> Option<&'static str> {

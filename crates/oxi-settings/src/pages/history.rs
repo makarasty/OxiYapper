@@ -1629,7 +1629,7 @@ impl PageState {
         if new == text {
             return true;
         }
-        self.edit_text(id, new)
+        self.edit_text(id, new, false)
     }
 
     /// Add to the text: the held parts of the picked entry go to the end of its text.
@@ -1652,11 +1652,13 @@ impl PageState {
         } else {
             format!("{text} {held}")
         };
-        self.edit_text(item.id, new)
+        // The model's own words: the entry does not become the person's text.
+        self.edit_text(item.id, new, true)
     }
 
-    /// Sends `new` as the edited text of entry `id`; false when the daemon is not there.
-    fn edit_text(&self, id: HistoryId, new: String) -> bool {
+    /// Sends `new` as the edited text of entry `id` (`adds_held`: only held parts added back, not
+    /// typed); false when the daemon is not there.
+    fn edit_text(&self, id: HistoryId, new: String, adds_held: bool) -> bool {
         if !self.online() {
             self.toast(self.ctx.ipc.link().off_reason(EDIT_NEEDS_DAEMON));
             return false;
@@ -1664,6 +1666,7 @@ impl PageState {
         self.ctx.ipc.send(Request::HistoryEdit {
             id: id.clone(),
             text: Spoken(new.clone()),
+            adds_held,
         });
         *self.edit.borrow_mut() = Some((id, new));
         true
@@ -2237,6 +2240,7 @@ mod tests {
             language: String::new(),
             text: Spoken(text.into()),
             held: Vec::new(),
+            edited: false,
         }
     }
 
@@ -2869,7 +2873,9 @@ enabled = false
             [Request::HistoryEdit {
                 id: HistoryId::parse("2026-11-08/134501-123").unwrap(),
                 text: Spoken("call Anna at noon".into()),
-            }]
+                adds_held: true,
+            }],
+            "the model's own words, not typed: the entry is not marked edited"
         );
         s.set_selected(1);
         s.invoke_add_held();
@@ -3029,6 +3035,7 @@ enabled = false
             [Request::HistoryEdit {
                 id: HistoryId::parse("2026-11-08/134501-123").unwrap(),
                 text: Spoken("call Hanna at noon".into()),
+                adds_held: false,
             }]
         );
         assert_eq!(
@@ -3251,6 +3258,7 @@ enabled = false
                 language: String::new(),
                 settings: None,
                 newer: true,
+                edited: false,
             }),
             original: Some(history::Previous {
                 text: "dictated".into(),
@@ -3258,6 +3266,7 @@ enabled = false
                 language: String::new(),
                 settings: None,
                 newer: false,
+                edited: false,
             }),
             words: Vec::new(),
             timings: None,
@@ -3265,6 +3274,7 @@ enabled = false
             held: Vec::new(),
             delivered: None,
             levels: None,
+            edited: false,
         };
         fs::write(entry_path(&folder, id, "json"), meta.to_json().unwrap()).unwrap();
         s.invoke_shown();
@@ -3387,6 +3397,7 @@ enabled = false
             held: Vec::new(),
             delivered: None,
             levels: None,
+            edited: false,
         };
         fs::write(
             entry_path(&folder, ID, history::JSON),
@@ -4097,6 +4108,7 @@ enabled = false
                     held: Vec::new(),
                     delivered: None,
                     levels: None,
+                    edited: false,
                 };
                 fs::write(day.join("134501-123.json"), meta.to_json().unwrap()).unwrap();
             }
@@ -4430,6 +4442,7 @@ enabled = false
             held: Vec::new(),
             delivered: None,
             levels: None,
+            edited: false,
         };
         assert_eq!(
             exported(Format::Txt, SAID, None, &[]).as_deref(),

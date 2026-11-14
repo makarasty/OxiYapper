@@ -896,11 +896,11 @@ fn a_new_text_keeps_the_old_one_as_the_other_version_and_restore_swaps_them() {
         ("first", ctx().model.as_str())
     );
 
-    edit_text(&dir, id, "second fixed").unwrap();
+    edit_text(&dir, id, "second fixed", true).unwrap();
     let now = meta_of(&base);
     assert_eq!(now.model, "turbo", "an edit keeps the run");
     assert_eq!(now.previous.unwrap().text, "second");
-    edit_text(&dir, id, "second fixed").unwrap();
+    edit_text(&dir, id, "second fixed", true).unwrap();
     assert_eq!(
         meta_of(&base).previous.unwrap().text,
         "second",
@@ -930,7 +930,7 @@ fn a_new_text_keeps_the_old_one_as_the_other_version_and_restore_swaps_them() {
     assert_eq!(text(), "third", "Use new undoes it");
 
     let bad = &hid("2026-11-08/090000-001");
-    assert!(edit_text(&dir, bad, "x").is_err() && restore(&dir, bad, false).is_err());
+    assert!(edit_text(&dir, bad, "x", true).is_err() && restore(&dir, bad, false).is_err());
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -1145,7 +1145,7 @@ fn a_save_keeps_the_words_and_a_retranscribe_keeps_timed_ones() {
         (timed.clone(), Some(how.clone()))
     );
     // A text edit keeps them: they describe the audio.
-    edit_text(&dir, id, "hello there").unwrap();
+    edit_text(&dir, id, "hello there", true).unwrap();
     assert_eq!(read_words(&dir, id).unwrap().0, timed);
     // Transcribe again keeps the timed list and its timings: the audio is the same.
     set_text_with_words(&dir, id, "again", &ctx(), vec![word("again", 0.8, None)]).unwrap();
@@ -1230,7 +1230,7 @@ fn a_save_keeps_the_held_parts_and_how_it_was_delivered() {
     set_text(&dir, id, "again", &ctx()).unwrap();
     assert_eq!(meta_of(&base).held, held);
     assert_eq!(meta_of(&base).delivered, Some(history::Delivered::Filtered));
-    edit_text(&dir, id, "edited").unwrap();
+    edit_text(&dir, id, "edited", true).unwrap();
     restore(&dir, id, false).unwrap();
     assert_eq!(meta_of(&base).held, held);
     assert_eq!(meta_of(&base).delivered, Some(history::Delivered::Filtered));
@@ -1249,11 +1249,57 @@ fn a_recovered_recording_is_marked_raw_and_stays_so() {
     // A retranscribe and an edit rewrite the status, not the audio.
     set_text(&dir, id, "again", &ctx()).unwrap();
     assert!(meta_of(&base).raw && meta_of(&base).status == Status::Done);
-    edit_text(&dir, id, "edited").unwrap();
+    edit_text(&dir, id, "edited", true).unwrap();
     assert!(meta_of(&base).raw);
     // A dictation the app saved is processed audio.
     assert_eq!(handle(save_cmd(cfg(true)), &dir, clock(), &ctx), None);
     assert!(!meta_of(&dir.join("2026-11-08/130000-123")).raw);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The Test page grades on a text the person corrected: an edit marks the entry, a model's text
+/// (a new run, a restore) does not, and an entry from before the field reads as not edited.
+#[test]
+fn an_edit_by_hand_marks_the_entry_and_a_models_text_clears_it() {
+    let dir = owned_temp("edited-marker");
+    assert_eq!(handle(save_cmd(cfg(true)), &dir, clock(), &ctx), None);
+    let id = &hid("2026-11-08/130000-123");
+    let base = dir.join(id);
+    let json = || fs::read_to_string(base.with_extension(JSON)).unwrap();
+    assert!(!json().contains("edited"), "written as an older build did");
+    assert!(!meta_of(&base).edited, "and read as the model's text");
+    edit_text(&dir, id, "fixed by hand", true).unwrap();
+    assert!(meta_of(&base).edited);
+    assert!(json().contains("edited"));
+    restore(&dir, id, false).unwrap();
+    assert!(
+        !meta_of(&base).edited,
+        "Restore old: the model's text is back"
+    );
+    restore(&dir, id, false).unwrap();
+    assert!(
+        meta_of(&base).edited,
+        "Use new: the hand edit is back, still one"
+    );
+    restore(&dir, id, true).unwrap();
+    assert!(
+        !meta_of(&base).edited,
+        "Restore original: the dictation's own"
+    );
+    restore(&dir, id, false).unwrap();
+    assert!(meta_of(&base).edited, "Use new after it: the edit again");
+    edit_text(&dir, id, "fixed again", true).unwrap();
+    set_text(&dir, id, "again", &ctx()).unwrap();
+    assert!(!meta_of(&base).edited, "a new run is the model's text");
+    // Add to the text: the held parts are the model's words, nothing typed.
+    edit_text(&dir, id, "again and the held part", false).unwrap();
+    assert!(!meta_of(&base).edited, "added back, not typed");
+    edit_text(&dir, id, "again, fixed", true).unwrap();
+    edit_text(&dir, id, "again, fixed and the held part", false).unwrap();
+    assert!(
+        meta_of(&base).edited,
+        "an edit stays one when held parts join it"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -1370,7 +1416,7 @@ fn a_search_reads_each_text_once_and_then_only_what_changed() {
     fs::write(dir.join(new).with_extension(WAV), [0; 8]).unwrap();
     fs::write(dir.join(new).with_extension(TXT), "zz new").unwrap();
     let edited = &ids[10];
-    edit_text(&dir, edited, "zz").unwrap();
+    edit_text(&dir, edited, "zz", true).unwrap();
     let same = &ids[20];
     let txt = dir.join(same).with_extension(TXT);
     fs::write(&txt, "z").unwrap();
@@ -1451,7 +1497,7 @@ fn a_new_entry_is_found_and_an_edited_one_by_its_new_text_with_nothing_to_rebuil
     assert_eq!(found(&dir, "beta", &none, None), Vec::<String>::new());
     seeded(&dir, &[("2026-11-08/110000-000", "beta", 1000)]);
     assert_eq!(found(&dir, "beta", &none, None), ["2026-11-08/110000-000"]);
-    edit_text(&dir, &hid("2026-11-08/110000-000"), "gamma").unwrap();
+    edit_text(&dir, &hid("2026-11-08/110000-000"), "gamma", true).unwrap();
     assert_eq!(found(&dir, "beta", &none, None), Vec::<String>::new());
     assert_eq!(found(&dir, "gamma", &none, None).len(), 1);
 }

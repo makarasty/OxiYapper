@@ -217,6 +217,10 @@ pub struct Meta {
     /// in an entry from before this field and in one made from a file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub levels: Option<crate::audio::Levels>,
+    /// The text shown is the person's own correction (an edit on the History page), not a
+    /// model's output; `false` in an entry from before this field. The Test page grades on it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub edited: bool,
 }
 
 impl Meta {
@@ -240,6 +244,7 @@ impl Meta {
             held: Vec::new(),
             delivered: None,
             levels: None,
+            edited: false,
         }
     }
 }
@@ -285,6 +290,9 @@ pub struct Previous {
     /// The kept text is the newer version: the current one is an old text a Restore brought back.
     #[serde(default, skip_serializing_if = "is_false")]
     pub newer: bool,
+    /// The kept text is the person's own correction ([`Meta::edited`] of that version).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub edited: bool,
 }
 
 #[allow(
@@ -358,6 +366,7 @@ impl Meta {
             language: self.language.clone(),
             settings: self.settings.clone(),
             newer: false,
+            edited: self.edited,
         }
     }
 
@@ -376,6 +385,8 @@ impl Meta {
                 newer: !kept.newer,
                 ..self.as_previous(text)
             }),
+            // A hand edit stays one when Restore old or Use new brings it back.
+            edited: kept.edited,
             ..self.clone()
         };
         Some((meta, kept.text.clone()))
@@ -412,6 +423,8 @@ impl Meta {
             language: first.language.clone(),
             settings: first.settings.clone(),
             previous: Some(kept),
+            // The first text is the dictation's own.
+            edited: false,
             ..self.clone()
         };
         Some((meta, first.text.clone()))
@@ -1218,6 +1231,7 @@ mod tests {
             held: Vec::new(),
             delivered: None,
             levels: None,
+            edited: false,
         }
     }
 
@@ -1430,6 +1444,7 @@ mod tests {
                 language: "en".into(),
                 settings: None,
                 newer: false,
+                edited: false,
             }),
             ..meta(Status::Done)
         };
@@ -1452,6 +1467,35 @@ mod tests {
         let kept = again.previous.unwrap();
         assert_eq!(kept.text, "old text");
         assert!(!kept.newer, "the new text is shown again");
+    }
+
+    /// The Test page grades on a hand edit: Restore old and Use new keep the mark with the version
+    /// it belongs to, Restore original clears it (the dictation's own text).
+    #[test]
+    fn a_hand_edit_stays_marked_through_restore_old_and_use_new() {
+        let fixed = Meta {
+            edited: true,
+            original: Some(meta(Status::Done).as_previous("dictated")),
+            previous: Some(meta(Status::Done).as_previous("dictated")),
+            ..meta(Status::Done)
+        };
+        let (old, text) = fixed.swapped("fixed by hand").unwrap();
+        assert_eq!(text, "dictated");
+        assert!(!old.edited, "the model's text is shown");
+        assert!(
+            old.previous.as_ref().unwrap().edited,
+            "the edit is kept as one"
+        );
+        let (new, text) = old.swapped(&text).unwrap();
+        assert_eq!(text, "fixed by hand");
+        assert!(new.edited, "Use new brings the edit back as an edit");
+        assert!(!new.previous.unwrap().edited);
+        let (first, _) = fixed.back_to_original("fixed by hand").unwrap();
+        assert!(!first.edited, "the original is the dictation's own");
+        assert!(
+            first.previous.unwrap().edited,
+            "and Use new brings the edit back"
+        );
     }
 
     /// b01 review: the dictated text survives any number of replacements and restores, and an
