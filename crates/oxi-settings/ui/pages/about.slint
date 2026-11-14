@@ -2,7 +2,7 @@
 // tile opens the std "Made with Slint" badge (SPEC Settings UI, R2.3). The browser opens every link;
 // the app makes no request.
 import { AboutSlint } from "std-widgets.slint";
-import { Theme, Shell, Icons, Caption, CapText, Group, Card, CardFrame, ClickCard, Button } from "../theme/index.slint";
+import { Theme, Shell, Icons, Caption, CapText, Group, Card, CardFrame, Button, FocusRing, KeyFocus } from "../theme/index.slint";
 
 // `brand`: one of the `Theme.brand-*` inks (DS-19.3).
 // An empty `url`: the tile opens the Slint badge instead of a link.
@@ -15,7 +15,9 @@ struct Tech {
 }
 
 // A project the app is built with: a whole-card link. `short` drops the note where it would be cut.
-component TechCard inherits ClickCard {
+// ClickCard's look and keys on a bare frame: the card body's fixed 16/12 padding cannot put the
+// short tile's mark `space-2` from every edge, so the tile pads itself (no negative padding).
+component TechCard inherits CardFrame {
     in property <string> name;
     in property <string> note;
     in property <image> mark;
@@ -23,19 +25,42 @@ component TechCard inherits ClickCard {
     in property <bool> short;
     // The tile opens a link in the browser, not something inside the app.
     in property <bool> external: true;
+    callback clicked;
+    out property <bool> hover: touch.has-hover;
+    property <bool> key-focus;
+    background: touch.pressed ? Theme.bg-card-pressed : root.hover ? Theme.bg-control-hover : Theme.bg-card;
+    animate background { duration: Theme.motion-quick; easing: ease-out; }
+    accessible-role: button;
     accessible-label: root.name;
     accessible-description: root.note;
+    accessible-action-default => {
+        root.clicked();
+    }
     border-color: root.hover ? Theme.stroke-control : Theme.stroke-card;
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+    fs := FocusScope {
+        focus-on-click: false;
+        focus-gained(reason) => {
+            root.key-focus = KeyFocus.after(reason, root.key-focus);
+        }
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
     HorizontalLayout {
-        // The whole tile under its padding: the card body packs at the top, and the page sets the
-        // height so the mark box sits as far from the top and bottom as from the left.
-        height: root.height - 2 * Theme.card-padding-v;
-        // The short tile's mark sits `space-2` from every edge: the card body's padding is pulled back
-        // by the difference, the layout's height unchanged.
-        padding-left: root.short ? Theme.space-2 - Theme.card-padding-h : 0px;
+        // The page sets the height so the mark box sits as far from the top and bottom as from
+        // the left: `card-padding-h` round the tall tile's box, `space-2` round the short one's.
+        padding-left: root.short ? Theme.space-2 : Theme.card-padding-h;
         padding-right: self.padding-left;
-        padding-top: root.short ? Theme.space-2 - Theme.card-padding-v : 0px;
-        padding-bottom: self.padding-top;
         spacing: Theme.space-3;
         VerticalLayout {
             alignment: center;
@@ -89,6 +114,10 @@ component TechCard inherits ClickCard {
                 accessible-role: none;
             }
         }
+    }
+    FocusRing {
+        shown: root.key-focus && fs.has-focus;
+        radius: Theme.radius-card;
     }
 }
 
@@ -241,12 +270,16 @@ export component AboutPage inherits VerticalLayout {
     property <length> short-tile: 2 * Theme.space-2 + Theme.icon-size;
     // The page as drawn: two cards, the tile grid, two group titles and the gaps.
     property <length> drawn-height: 2 * root.card-height + root.rows * (root.notes-fit ? root.tall-tile : root.short-tile) + (root.rows - 1) * Theme.tile-gap + 2 * root.group-head + 2 * Theme.group-gap;
-    // Too low for that (UI rule 25): no group titles, short tiles.
+    // Too low for that (UI rule 25): the logos shrink and the tiles go short.
     property <bool> tight: root.free-height < root.drawn-height;
     property <bool> short: root.tight || !root.notes-fit;
     property <length> tile-height: root.short ? root.short-tile : root.tall-tile;
+    // Tight and still too low (a banner over 720 x 520): the group titles go and the blocks sit
+    // `space-4` apart, the page padding.
+    property <length> tight-height: 2 * (2 * Theme.card-padding-v + Theme.control-height) + root.rows * root.short-tile + (root.rows - 1) * Theme.tile-gap + 2 * root.group-head + 2 * Theme.group-gap;
+    property <bool> titled: !root.tight || root.free-height >= root.tight-height;
     alignment: start;
-    spacing: root.tight ? Theme.space-1 : Theme.group-gap;
+    spacing: root.titled ? Theme.group-gap : Theme.space-4;
     Card {
         HorizontalLayout {
             spacing: Theme.icon-gap;
@@ -310,7 +343,7 @@ export component AboutPage inherits VerticalLayout {
         }
     }
     Group {
-        title: root.tight ? "" : @tr("Built with");
+        title: !root.titled ? "" : @tr("Built with");
         Rectangle {
             height: root.rows * root.tile-height + (root.rows - 1) * Theme.tile-gap;
             for tech[i] in root.techs: TechCard {
@@ -362,7 +395,7 @@ export component AboutPage inherits VerticalLayout {
         }
     }
     Group {
-        title: root.tight ? "" : @tr("Author");
+        title: !root.titled ? "" : @tr("Author");
         AuthorCard {
             logo-size: root.logo-size;
             open(url) => {

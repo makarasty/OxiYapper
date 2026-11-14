@@ -1,25 +1,28 @@
 // Settings window (redesign spec sections 2 and 3): a nav rail with icons on the left (icons only
 // under 960 px), the page on the right in a scrolling column as wide as the window allows, banners above it.
 import { Palette } from "std-widgets.slint";
-import { Theme, Shell, AccentSet, Icons, KeyFocus, Tip, Button, Banner, Severity, HeaderRow, StatusChip, MonthLabel, PathText, ScrollView } from "theme/index.slint";
+import { Theme, Shell, AccentSet, Icons, KeyFocus, Tip, Button, Banner, Severity, HeaderRow, StatusChip, MonthLabel, PathText, ScrollView, IconLabel, Caption } from "theme/index.slint";
+import { SearchPopup } from "theme/components/search_popup.slint";
 import { KeyTipHost, Toast, ToastHost } from "theme/components/feedback.slint";
 import { Scrim } from "theme/components/scrim.slint";
 import { HomePage, HomeState } from "pages/home.slint";
 import { HotkeyPage, HotkeyState } from "pages/hotkey.slint";
 import { KeyCap } from "keyboard.slint";
 import { AudioPage, AudioState, AudioKey } from "pages/audio.slint";
-import { ModelPage, ModelState, ModelRow } from "pages/model.slint";
+import { ModelPage, ModelState, ModelRow, LanguageModel } from "pages/model.slint";
 import { TextPage, TextState, PasteRuleRow, FileState, FileInfo, TextFile } from "pages/text.slint";
+import { PastePage } from "pages/paste.slint";
 import { OverlayPage, OverlayState } from "pages/overlay.slint";
 import { SystemPage, ThemeChoice, SystemState } from "pages/system.slint";
 import { TestPage, TestState, TestRow } from "pages/test.slint";
-import { AboutPage } from "pages/about.slint";
 import { HistoryPage, HistoryState, HistoryRow } from "pages/history.slint";
 
 export { GalleryTile } from "theme/index.slint";
-export { Shell, Theme, AccentSet, Toast, PathText, ThemeChoice, HomeState, MonthLabel, HotkeyState, KeyCap, AudioState, AudioKey, ModelState, ModelRow, TextState, PasteRuleRow, FileState, FileInfo, TextFile, OverlayState, SystemState, TestState, TestRow, HistoryState, HistoryRow }
+export { Shell, Theme, AccentSet, Toast, PathText, ThemeChoice, HomeState, MonthLabel, HotkeyState, KeyCap, AudioState, AudioKey, ModelState, ModelRow, LanguageModel, TextState, PasteRuleRow, FileState, FileInfo, TextFile, OverlayState, SystemState, TestState, TestRow, HistoryState, HistoryRow }
 
-export enum Page { home, hotkey, audio, model, text, overlay, history, test, system, about }
+// `about` is no page of its own (ia-map 3.1): opening it shows System > About, so a deep link or
+// `real_window about` keeps working.
+export enum Page { home, hotkey, audio, model, text, paste, overlay, history, test, system, about }
 
 // The status chip right of the header row (`ipc::Level`); `hidden` when the window follows no daemon.
 export enum ChipLevel { hidden, ok, attention, down }
@@ -96,6 +99,64 @@ component NavItem inherits Rectangle {
     }
 }
 
+// Settings search, the rail's first entry above Home (ia-map 3.1, owner item 17): in the full rail
+// a field look with the magnifier, the placeholder and "Ctrl+F", its icon where the items' icons
+// are; in the icons-only rail an item like the others. Out of the rail's keys and Ctrl+Tab; a click
+// opens the search popup.
+component SearchSlot inherits Rectangle {
+    in property <bool> compact;
+    callback activated();
+    if root.compact: NavItem {
+        label: @tr("Search settings (Ctrl+F)");
+        icon: Icons.search;
+        icon-selected: Icons.search;
+        compact: true;
+        accessible-role: button;
+        activated => {
+            root.activated();
+        }
+    }
+    if !root.compact: Rectangle {
+        y: (parent.height - self.height) / 2;
+        height: Theme.control-height;
+        border-radius: Theme.radius-control;
+        background: touch.has-hover ? Theme.bg-control-hover : Theme.bg-control;
+        animate background { duration: Theme.motion-quick; easing: ease-out; }
+        // 1 px hairline: the field's stroke.
+        border-width: 1px;
+        border-color: Theme.stroke-control;
+        accessible-role: button;
+        accessible-label: @tr("Search settings");
+        accessible-action-default => {
+            root.activated();
+        }
+        HorizontalLayout {
+            // The magnifier sits where the rail items' icons sit (rail inset + item inset).
+            padding-left: Theme.space-3;
+            padding-right: Theme.space-3;
+            spacing: Theme.pair-gap;
+            IconLabel {
+                horizontal-stretch: 1;
+                icon: Icons.search;
+                text: @tr("Search settings");
+                ink: Theme.text-secondary;
+            }
+            Caption {
+                text: @tr("Ctrl+F");
+                color: Theme.text-secondary;
+                vertical-alignment: center;
+                accessible-role: none;
+            }
+        }
+        touch := TouchArea {
+            mouse-cursor: pointer;
+            clicked => {
+                root.activated();
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     in property <string> app-name;
     in property <string> version;
@@ -123,6 +184,21 @@ export component AppWindow inherits Window {
     in property <string> chip-tooltip;
     // Why the last daemon start failed; shown under the notice.
     in property <string> spawn-error;
+    // Settings search: the matches of the last `search` (titles) and where each is ("Page > Tab").
+    in property <[string]> search-items;
+    in property <[string]> search-notes;
+    // The page of each match, for the glyph the rail shows for it.
+    in property <[Page]> search-pages;
+    callback search(string);
+    // A match was taken: Rust opens its page and tab and sets `Shell.found`.
+    callback search-picked(int);
+    property <string> search-query;
+    // Opens the search popup with `query` in its field (Ctrl+F, the rail entry, shots).
+    public function open-search(query: string) {
+        root.search-query = query;
+        root.search(query);
+        search-popup.show();
+    }
     // How far the open page is scrolled (0 at the top, negative below).
     out property <length> scroll-y: scroll.viewport-y;
     // The display scale the window opens at, set once before the OS window exists. Slint gives
@@ -173,18 +249,61 @@ export component AppWindow inherits Window {
         { page: Page.hotkey, label: @tr("Hotkey"), icon: Icons.keyboard, filled: Icons.keyboard-filled, tabs: false },
         { page: Page.audio, label: @tr("Audio"), icon: Icons.mic, filled: Icons.mic-filled, tabs: true },
         { page: Page.text, label: @tr("Text"), icon: Icons.text-t, filled: Icons.text-t-filled, tabs: true },
+        { page: Page.paste, label: @tr("Paste"), icon: Icons.clipboard-paste-24, filled: Icons.clipboard-paste-24-filled, tabs: true },
         { page: Page.overlay, label: @tr("Overlay"), icon: Icons.slide-text, filled: Icons.slide-text-filled, tabs: false },
         { page: Page.history, label: @tr("History"), icon: Icons.history, filled: Icons.history-filled, tabs: false },
         { page: Page.test, label: @tr("Test"), icon: Icons.checkmark-circle, filled: Icons.checkmark-circle, tabs: true },
         { page: Page.system, label: @tr("System"), icon: Icons.settings, filled: Icons.settings-filled, tabs: true },
-        { page: Page.about, label: @tr("About"), icon: Icons.info, filled: Icons.info-filled, tabs: false },
     ];
     property <bool> tabbed: root.rail[root.index-of(root.page)].tabs;
     // The page's height under the header row (banners already taken off).
     property <length> free-height: scroll.visible-height - column.padding-top - column.padding-bottom - (root.tabbed ? 0 : Theme.header-row-height + column.spacing);
 
+    // Full rail: the popup's field lies over the rail's; icons-only: beside the rail.
+    search-popup := SearchPopup {
+        x: root.compact ? nav.width : 0px;
+        y: root.compact ? root.top : root.top + (root.rail-item - Theme.control-height) / 2 - Theme.space-2;
+        width: min(480px, root.width - self.x - Theme.space-2);
+        query: root.search-query;
+        items: root.search-items;
+        notes: root.search-notes;
+        detailed: true;
+        icon-of(i) => {
+            return root.rail[root.index-of(root.search-pages[i])].icon;
+        }
+        placeholder: @tr("Search settings");
+        empty-text: @tr("No setting matches");
+        search(text) => {
+            root.search-query = text;
+            root.search(text);
+        }
+        picked(i) => {
+            root.search-picked(i);
+        }
+    }
+    property <bool> search-open: search-popup.is-open;
+    changed search-open => {
+        Shell.modal(root.search-open);
+    }
+    // The picked row asks to be seen: scroll it to the middle when it is not in view.
+    property <int> reveal: Shell.reveal-serial;
+    changed reveal => {
+        let top = Shell.reveal-y - scroll.absolute-position.y;
+        if (top < 0 || top + Shell.reveal-h > scroll.height) {
+            scroll.viewport-y = max(min(0px, scroll.height - scroll.content-height), min(0px, scroll.viewport-y - top + (scroll.height - Shell.reveal-h) / 2));
+        }
+    }
+    // A row that is not on screen now (its state hides it) must not flash when it shows up later.
+    Timer {
+        interval: 1s;
+        running: Shell.found != "";
+        triggered => {
+            Shell.found = "";
+        }
+    }
+
     pure function index-of(p: Page) -> int {
-        return p == Page.home ? 0 : p == Page.model ? 1 : p == Page.hotkey ? 2 : p == Page.audio ? 3 : p == Page.text ? 4 : p == Page.overlay ? 5 : p == Page.history ? 6 : p == Page.test ? 7 : p == Page.system ? 8 : 9;
+        return p == Page.home ? 0 : p == Page.model ? 1 : p == Page.hotkey ? 2 : p == Page.audio ? 3 : p == Page.text ? 4 : p == Page.paste ? 5 : p == Page.overlay ? 6 : p == Page.history ? 7 : p == Page.test ? 8 : 9;
     }
 
     // System follows the OS: `unknown` makes the style read the OS scheme.
@@ -206,6 +325,10 @@ export component AppWindow inherits Window {
         Shell.page-width = root.page-width;
     }
     changed page => {
+        if (root.page == Page.about) {
+            SystemState.tab = 2;
+            root.page = Page.system;
+        }
         // The rail follows a page opened by Ctrl+Tab; the page opens at its top.
         nav.cursor = root.index-of(root.page);
         scroll.viewport-y = 0;
@@ -227,6 +350,15 @@ export component AppWindow inherits Window {
             if (event.modifiers.control && (event.text == Key.Tab || event.text == Key.Backtab)) {
                 let step = event.modifiers.shift || event.text == Key.Backtab ? root.rail.length - 1 : 1;
                 root.page = root.rail[Math.mod(root.index-of(root.page) + step, root.rail.length)].page;
+                return accept;
+            }
+            // Ctrl+F searches the settings; on History it searches the recordings, as people expect there.
+            if (event.modifiers.control && !event.modifiers.alt && (event.text == "f" || event.text == "F")) {
+                if (root.page == Page.history) {
+                    Shell.history-find += 1;
+                } else {
+                    root.open-search("");
+                }
                 return accept;
             }
             reject
@@ -259,9 +391,10 @@ export component AppWindow inherits Window {
                 }
                 reject
             }
-            // No logo or app name over the items: the title bar has both (R2.4).
+            // No logo or app name over the items: the title bar has both (R2.4). The search entry
+            // takes the first slot.
             VerticalLayout {
-                padding-top: root.top;
+                padding-top: root.top + root.rail-item + Theme.space-1;
                 padding-left: Theme.space-1;
                 padding-right: Theme.space-1;
                 padding-bottom: Theme.space-2;
@@ -272,7 +405,7 @@ export component AppWindow inherits Window {
                     label: item.label;
                     icon: item.icon;
                     icon-selected: item.filled;
-                    selected: root.page == item.page;
+                    selected: root.page == item.page || (root.page == Page.about && item.page == Page.system);
                     compact: root.compact;
                     focused: nav.has-focus && nav.key-focus && nav.cursor == i;
                     activated => {
@@ -368,8 +501,14 @@ export component AppWindow inherits Window {
                         if root.page == Page.audio: AudioPage {
                             free-height: root.free-height;
                         }
-                        if root.page == Page.model: ModelPage { }
+                        if root.page == Page.model: ModelPage {
+                            free-height: root.free-height;
+                        }
                         if root.page == Page.text: TextPage {
+                            window-width: root.width;
+                            free-height: root.free-height;
+                        }
+                        if root.page == Page.paste: PastePage {
                             window-width: root.width;
                             free-height: root.free-height;
                         }
@@ -378,20 +517,18 @@ export component AppWindow inherits Window {
                             free-height: root.free-height;
                         }
                         if root.page == Page.test: TestPage { }
-                        if root.page == Page.system: SystemPage {
+                        if root.page == Page.system || root.page == Page.about: SystemPage {
                             free-height: root.free-height;
+                            about: root.page == Page.about;
                             theme: root.theme;
-                            theme-picked(choice) => {
-                                root.theme = choice;
-                                root.theme-changed(choice);
-                            }
-                        }
-                        if root.page == Page.about: AboutPage {
-                            free-height: root.free-height;
                             app-name: root.app-name;
                             version: root.version;
                             licence: root.licence;
                             repository: root.repository;
+                            theme-picked(choice) => {
+                                root.theme = choice;
+                                root.theme-changed(choice);
+                            }
                         }
                     }
                 }
@@ -409,6 +546,17 @@ export component AppWindow inherits Window {
                         root.status-clicked();
                     }
                 }
+            }
+        }
+
+        SearchSlot {
+            x: Theme.space-1;
+            y: root.top;
+            width: nav.width - 2 * Theme.space-1;
+            height: root.rail-item;
+            compact: root.compact;
+            activated => {
+                root.open-search("");
             }
         }
 

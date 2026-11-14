@@ -18,7 +18,9 @@ use oxi_core::paths::Layout;
 use oxi_core::stats::{Date, Stats, Summary};
 use oxi_settings::constants::{DEFAULT, MIN};
 use oxi_settings::ipc::{Event, Link};
-use oxi_settings::{AppWindow, Ipc, Page, SystemState, ThemeChoice};
+use oxi_settings::{
+    AppWindow, AudioState, Ipc, ModelState, Page, SystemState, TextState, ThemeChoice,
+};
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
 };
@@ -29,15 +31,17 @@ use tiny_skia::{IntSize, Pixmap};
 const SIZES: [(f32, f32); 2] = [DEFAULT, MIN];
 const THEMES: [(&str, ThemeChoice); 2] =
     [("light", ThemeChoice::Light), ("dark", ThemeChoice::Dark)];
-const PAGES: [(&str, Page); 9] = [
+const PAGES: [(&str, Page); 10] = [
     ("home", Page::Home),
     ("hotkey", Page::Hotkey),
     ("audio", Page::Audio),
     ("model", Page::Model),
     ("text", Page::Text),
+    ("paste", Page::Paste),
     ("overlay", Page::Overlay),
     ("test", Page::Test),
     ("system", Page::System),
+    // System > About (ia-map 3.1): the old page value opens that tab.
     ("about", Page::About),
 ];
 
@@ -818,28 +822,55 @@ fn shot_model() {
     shot("model", Page::Model, None);
 }
 
+/// Opens the sub-tab `label` of the open page. Paste, Write to file and Per-app rules open the
+/// Paste page on it first (ia-map 3.2; the rail has an item named Paste too).
 fn model_tab(window: &AppWindow, label: &str) {
+    if let Some(tab) = ["Paste", "Write to file", "Per-app rules"]
+        .iter()
+        .position(|t| *t == label)
+    {
+        window.set_page(Page::Paste);
+        window
+            .global::<TextState>()
+            .set_paste_tab(i32::try_from(tab).unwrap());
+        return;
+    }
     common::with_role(window, label, AccessibleRole::Tab).invoke_accessible_default_action();
 }
 
 #[test]
-fn shot_model_settings() {
-    matrix("model-settings", |choice| {
-        let window = open("model-settings", None);
-        window.set_page(Page::Model);
-        window.set_theme(choice);
-        model_tab(&window, "Settings");
-        window
-    });
+fn shot_model_tabs() {
+    for (screen, tab) in [
+        ("model-languages", "Languages"),
+        ("model-speed", "Speed"),
+        ("model-accuracy", "Accuracy"),
+    ] {
+        matrix(screen, |choice| {
+            let window = open(screen, None);
+            window.set_page(Page::Model);
+            window.set_theme(choice);
+            model_tab(&window, tab);
+            window
+        });
+    }
 }
 
+/// Items 33, 36: Model > Languages with two language rows (one in use, one whose model is not on
+/// disk), at both sizes.
 #[test]
-fn shot_model_advanced() {
-    matrix("model-advanced", |choice| {
-        let window = open("model-advanced", None);
+fn shot_model_language_rows() {
+    let config = "version = 2
+[model]
+language = \"ru\"
+[model.by_language]
+en = \"turbo\"
+ru = \"large-v3\"
+";
+    matrix("model-language-rows", |choice| {
+        let window = open("model-language-rows", Some(config));
         window.set_page(Page::Model);
         window.set_theme(choice);
-        model_tab(&window, "Advanced");
+        model_tab(&window, "Languages");
         window
     });
 }
@@ -1165,7 +1196,6 @@ fn shot_text_worst_case() {
         let layout = common::layout("text-worst", Some(&config));
         let (ipc, _sent) = Ipc::fake();
         let window = oxi_settings::open_with(layout, ipc.clone()).unwrap();
-        window.set_page(Page::Text);
         window.set_theme(choice);
         window.show().unwrap();
         ipc.deliver(&Event::Link(Link::Offline));
@@ -1233,43 +1263,80 @@ fn shot_text_worst_case() {
     }
 }
 
-/// Every Text sub-tab at 720 x 520 under the offline daemon's banner, a 500-word dictionary behind
-/// it: the page does not scroll on any of them (UI rule 25).
+/// Every sub-tab of the pages ia-map 3.2 changed, at 720 x 520, a 500-word dictionary behind
+/// Text: with no banner the page does not scroll on any of them (UI rule 25); under the offline
+/// daemon's banner Text and Paste (but its five-row Paste tab) still fit (the shots of the rest
+/// are saved for review).
 #[test]
-fn shot_text_tabs_under_a_banner() {
+fn shot_every_tab_at_720x520() {
+    // (screen, page, sub-tab index)
+    let tabs: [(&str, Page, i32); 18] = [
+        ("model-models", Page::Model, 0),
+        ("model-languages", Page::Model, 1),
+        ("model-speed", Page::Model, 2),
+        ("model-accuracy", Page::Model, 3),
+        ("text-dictionary", Page::Text, 0),
+        ("text-replacements", Page::Text, 1),
+        ("text-words", Page::Text, 2),
+        ("text-formatting", Page::Text, 3),
+        ("text-commands", Page::Text, 4),
+        ("paste-paste", Page::Paste, 0),
+        ("paste-file", Page::Paste, 1),
+        ("paste-rules", Page::Paste, 2),
+        ("system-general", Page::System, 0),
+        ("system-files", Page::System, 1),
+        ("system-about", Page::System, 2),
+        ("audio-microphone", Page::Audio, 0),
+        ("audio-recording", Page::Audio, 1),
+        ("audio-sounds", Page::Audio, 2),
+    ];
     for (theme, choice) in THEMES {
-        for (name, tab) in [
-            ("dictionary", "Dictionary"),
-            ("replacements", "Replacements"),
-            ("paste", "Paste"),
-            ("rules", "Per-app rules"),
-        ] {
-            let _ = slint::platform::set_platform(Box::new(Shots));
-            let layout = common::layout("text-banner", None);
-            let words: Vec<String> = (0..500).map(|i| format!("synthword{i}")).collect();
-            fs::write(layout.dictionary_file(), words.join("\n")).unwrap();
-            let (ipc, _sent) = Ipc::fake();
-            let window = oxi_settings::open_with(layout, ipc.clone()).unwrap();
-            window.set_page(Page::Text);
-            window.set_theme(choice);
-            window.show().unwrap();
-            ipc.deliver(&Event::Link(Link::Offline));
-            model_tab(&window, tab);
-            let surface = LAST.with_borrow(Clone::clone).unwrap();
-            let pixmap = render(&window, MIN, 1.0);
-            save(&pixmap, &format!("text-banner-{name}-720-{theme}"));
-            // A wheel over the sub-tab bar moves the page only if the page is taller than its room.
-            let bar =
-                common::with_role(&window, "Dictionary", AccessibleRole::Tab).absolute_position();
-            surface.dispatch_event(WindowEvent::PointerScrolled {
-                position: slint::LogicalPosition::new(bar.x + 4.0, bar.y + 4.0),
-                delta_x: 0.0,
-                delta_y: -100_000.0,
-            });
-            slint::platform::update_timers_and_animations();
-            // The fit is measured in Segoe UI Variable Text, which only Windows has.
-            if cfg!(windows) {
-                assert_eq!(window.get_scroll_y(), 0.0, "{tab} scrolls at 720 x 520");
+        for banner in [false, true] {
+            for (name, page, tab) in tabs {
+                let _ = slint::platform::set_platform(Box::new(Shots));
+                SIZE.set(MIN);
+                let layout = common::layout("every-tab", None);
+                let words: Vec<String> = (0..500).map(|i| format!("synthword{i}")).collect();
+                fs::write(layout.dictionary_file(), words.join("\n")).unwrap();
+                let (ipc, _sent) = Ipc::fake();
+                let window = oxi_settings::open_with(layout, ipc.clone()).unwrap();
+                window.set_page(page);
+                match page {
+                    Page::Model => window.global::<ModelState>().set_tab(tab),
+                    Page::Text => window.global::<TextState>().set_tab(tab),
+                    Page::Paste => window.global::<TextState>().set_paste_tab(tab),
+                    Page::System => window.global::<SystemState>().set_tab(tab),
+                    _ => window.global::<AudioState>().set_view(tab),
+                }
+                window.set_theme(choice);
+                window.show().unwrap();
+                ipc.deliver(&Event::Link(if banner {
+                    Link::Offline
+                } else {
+                    Link::Online
+                }));
+                let surface = LAST.with_borrow(Clone::clone).unwrap();
+                let pixmap = render(&window, MIN, 1.0);
+                let under = if banner { "-banner" } else { "" };
+                save(&pixmap, &format!("tab-{name}{under}-720-{theme}"));
+                // A wheel over the page moves it only if it is taller than its room.
+                surface.dispatch_event(WindowEvent::PointerScrolled {
+                    position: slint::LogicalPosition::new(400.0, 30.0),
+                    delta_x: 0.0,
+                    delta_y: -100_000.0,
+                });
+                slint::platform::update_timers_and_animations();
+                let scrolled = window.get_scroll_y() != 0.0;
+                if scrolled {
+                    eprintln!("{name} scrolls at 720 x 520 (banner {banner})");
+                }
+                // The fit is measured in Segoe UI Variable Text, which only Windows has.
+                // Paste > Paste: five rows, 32 px left with no banner (ia-map 3.2), so a 72 px banner makes
+                // it scroll (ia-map RT R12, UI rule 1 (a)).
+                let held = page == Page::Text || (page == Page::Paste && tab > 0);
+                if cfg!(windows) && (!banner || held) {
+                    assert!(!scrolled, "{name} scrolls at 720 x 520 (banner {banner})");
+                }
             }
         }
     }
@@ -1495,5 +1562,377 @@ fn history_after_copy_stays_inside_the_window() {
             }
             save(&shot, &format!("history-copy-{}-{theme}", size.0));
         }
+    }
+}
+
+/// ia-map 3.5: "Add language" sorts the new row in at its place (Yoruba last of seven) and
+/// scrolls it into view at 720 x 520, in the real fonts (the testing backend's lay out taller).
+#[test]
+fn shot_model_language_added() {
+    let config = "version = 2
+[model.by_language]
+de = \"turbo\"
+en = \"turbo\"
+es = \"turbo\"
+fr = \"turbo\"
+it = \"turbo\"
+ru = \"turbo\"
+";
+    let window = open("model-language-added", Some(config));
+    window.set_page(Page::Model);
+    window.set_theme(ThemeChoice::Dark);
+    model_tab(&window, "Languages");
+    render(&window, MIN, 1.0);
+    let s = window.global::<ModelState>();
+    s.invoke_add_search("yoruba".into());
+    s.invoke_add_chosen(0);
+    save(&render(&window, MIN, 1.0), "model-language-added-720-dark");
+    let combo = ElementHandle::find_by_accessible_label(&window, "Model for Yoruba")
+        .find(|e| e.accessible_role() == Some(AccessibleRole::Combobox))
+        .expect("Yoruba's Combo in view");
+    let (y, h) = (combo.absolute_position().y, combo.size().height);
+    assert!(y >= 0.0 && y + h <= MIN.1, "Yoruba's Combo is cut: y {y}");
+    // The list scrolled: its first row, the default model's, is out of view.
+    assert!(
+        ElementHandle::find_by_accessible_label(&window, "Change the default model")
+            .next()
+            .is_none()
+    );
+}
+
+/// Owner item 17: a search pick opens Audio > Recording and flashes "Longest recording" in the
+/// accent; the flash is gone once it has run. Shot mid-flash at the minimum size, both themes.
+#[test]
+fn shot_search_flash() {
+    let ms = std::time::Duration::from_millis;
+    for (theme, choice) in THEMES {
+        SIZE.set(MIN);
+        let window = open("search-flash", None);
+        window.set_theme(choice);
+        render(&window, MIN, 1.0);
+        window.invoke_search("longest".into());
+        window.invoke_search_picked(0);
+        render(&window, MIN, 1.0);
+        // A frame for the layout, then the first pulse at full strength.
+        advance(ms(20));
+        slint::platform::update_timers_and_animations();
+        advance(ms(120));
+        let lit = render(&window, MIN, 1.0);
+        save(&lit, &format!("search-flash-{}-{theme}", MIN.0));
+        advance(ms(1000));
+        for _ in 0..8 {
+            advance(ms(160));
+            slint::platform::update_timers_and_animations();
+        }
+        let after = render(&window, MIN, 1.0);
+        assert_eq!(window.get_page(), Page::Audio);
+        assert_ne!(
+            lit.data(),
+            after.data(),
+            "{theme}: the flash shows, then goes"
+        );
+    }
+}
+
+/// The pixels of `pixmap` around `element` (6 px past each side, where a focus ring is drawn).
+fn around(pixmap: &Pixmap, element: &ElementHandle) -> Vec<u8> {
+    let (at, size) = (element.absolute_position(), element.size());
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // whole positive pixels
+    let (x0, y0, x1, y1) = (
+        (at.x as u32).saturating_sub(6),
+        (at.y as u32).saturating_sub(6),
+        ((at.x + size.width) as u32 + 6).min(pixmap.width()),
+        ((at.y + size.height) as u32 + 6).min(pixmap.height()),
+    );
+    let width = pixmap.width() as usize;
+    (y0..y1)
+        .flat_map(|y| {
+            let row = y as usize * width * 4;
+            pixmap.data()[row + x0 as usize * 4..row + x1 as usize * 4].to_vec()
+        })
+        .collect()
+}
+
+/// Owner item 17, ia-map 3.7: a search pick moves the keyboard focus to the row's control, with no
+/// focus ring (a pick is not a keyboard walk); the next Tab and back draws the ring there.
+#[test]
+fn search_pick_focuses_the_rows_control_and_draws_no_ring() {
+    use slint::platform::Key as K;
+    let ms = std::time::Duration::from_millis;
+    for (theme, choice) in THEMES {
+        SIZE.set(MIN);
+        let window = open("search-focus", None);
+        window.set_theme(choice);
+        render(&window, MIN, 1.0);
+        let surface = LAST.with_borrow(Clone::clone).unwrap();
+        let press = |text: slint::SharedString| {
+            surface.dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+            surface.dispatch_event(WindowEvent::KeyReleased { text });
+        };
+        window.invoke_search("log dictated".into());
+        window.invoke_search_picked(0);
+        render(&window, MIN, 1.0);
+        // A frame for the layout, then the row asks for the focus; let the flash run out.
+        advance(ms(20));
+        slint::platform::update_timers_and_animations();
+        advance(ms(1500));
+        slint::platform::update_timers_and_animations();
+        let switch = || common::with_role(&window, "Log dictated text", AccessibleRole::Switch);
+        let calm = render(&window, MIN, 1.0);
+        let at_pick = around(&calm, &switch());
+        assert_eq!(switch().accessible_checked(), Some(false), "{theme}");
+        // Space acts on the found setting: the focus is on its switch.
+        press(" ".into());
+        assert_eq!(
+            switch().accessible_checked(),
+            Some(true),
+            "{theme}: Space did not reach the picked row's switch"
+        );
+        press(" ".into());
+        let switch_back = render(&window, MIN, 1.0);
+        assert_eq!(
+            around(&switch_back, &switch()),
+            at_pick,
+            "{theme}: a ring was drawn on a pick"
+        );
+        // A real Tab away and Shift+Tab back is a keyboard walk: the ring shows.
+        press(K::Tab.into());
+        surface.dispatch_event(WindowEvent::KeyPressed {
+            text: K::Shift.into(),
+        });
+        press(K::Backtab.into());
+        surface.dispatch_event(WindowEvent::KeyReleased {
+            text: K::Shift.into(),
+        });
+        assert_ne!(
+            around(&render(&window, MIN, 1.0), &switch()),
+            at_pick,
+            "{theme}: Tab draws the ring, a pick does not"
+        );
+    }
+}
+
+/// A pick of a row whose controls are off keeps the focus on the row: Space and the arrows change
+/// nothing, here or on the next row, and the focus does not wrap to the page's first control
+/// (UI rule 17).
+#[test]
+fn search_pick_of_a_disabled_row_changes_no_setting() {
+    const BIG: (f32, f32) = (1280.0, 1600.0);
+    use slint::platform::Key as K;
+    let ms = std::time::Duration::from_millis;
+    let second_try_off = "version = 2
+[model.advanced]
+temperature_fallback = false
+";
+    for (query, config) in [
+        ("Second try when a phrase repeats", second_try_off),
+        (
+            "Certainty needed",
+            "version = 2
+",
+        ),
+    ] {
+        SIZE.set(BIG);
+        let window = open("search-disabled", Some(config));
+        render(&window, BIG, 1.0);
+        let surface = LAST.with_borrow(Clone::clone).unwrap();
+        window.invoke_search(query.into());
+        window.invoke_search_picked(0);
+        render(&window, BIG, 1.0);
+        advance(ms(20));
+        slint::platform::update_timers_and_animations();
+        advance(ms(1500));
+        slint::platform::update_timers_and_animations();
+        let calm = render(&window, BIG, 1.0);
+        // What the rows near the pick say of themselves: a popup is no part of the frame.
+        let snap = || -> Vec<String> {
+            [
+                "Second try when confidence is low",
+                "Second try when a phrase repeats",
+                "Silence cut-off",
+                "Skip non-speech sounds",
+                "Hold back unsure words",
+                "Certainty needed",
+            ]
+            .into_iter()
+            .flat_map(|label| ElementHandle::find_by_accessible_label(&window, label))
+            .map(|e| {
+                format!(
+                    "{:?} {:?} {:?} {:?} {:?}",
+                    e.accessible_label(),
+                    e.accessible_value(),
+                    e.accessible_checked(),
+                    e.accessible_expanded(),
+                    e.accessible_enabled()
+                )
+            })
+            .collect()
+        };
+        let rows = snap();
+        assert!(
+            rows.iter().any(|r| r.ends_with("Some(false)")),
+            "{query}: the row's control is off: {rows:?}"
+        );
+        let page = window.get_page();
+        for key in [
+            K::Space.into(),
+            K::DownArrow.into(),
+            K::RightArrow.into(),
+            " ".into(),
+        ] {
+            let key: slint::SharedString = key;
+            surface.dispatch_event(WindowEvent::KeyPressed { text: key.clone() });
+            surface.dispatch_event(WindowEvent::KeyReleased { text: key });
+        }
+        let after = render(&window, BIG, 1.0);
+        assert_eq!(window.get_page(), page, "{query}");
+        assert_eq!(snap(), rows, "{query}: a key changed a row near the pick");
+        assert!(
+            calm.data() == after.data(),
+            "{query}: a key changed the frame"
+        );
+    }
+}
+
+/// What each setting near the search picks holds: label and state. Not `enabled`: Remove filler
+/// words turns the filler field on by design.
+fn held(window: &AppWindow) -> Vec<(String, String)> {
+    [
+        "Remove filler words",
+        "Filler words",
+        "Phrase shortcuts",
+        "Second try when confidence is low",
+        "Second try when a phrase repeats",
+        "Silence cut-off",
+        "Skip non-speech sounds",
+    ]
+    .into_iter()
+    .flat_map(|label| {
+        ElementHandle::find_by_accessible_label(window, label).map(move |e| {
+            let state = format!(
+                "{:?} {:?} {:?}",
+                e.accessible_value(),
+                e.accessible_checked(),
+                e.accessible_expanded()
+            );
+            (label.to_owned(), state)
+        })
+    })
+    .collect()
+}
+
+/// The entries of `rows` for `label` (`keep`) or all the others.
+fn of(rows: &[(String, String)], label: &str, keep: bool) -> Vec<(String, String)> {
+    rows.iter()
+        .filter(|(l, _)| (l == label) == keep)
+        .cloned()
+        .collect()
+}
+
+/// After a pick the focus is on an enabled control of the found row or on the row itself, never past
+/// it: Space and typing change nothing outside the found row, and the next Tab reaches the stop right
+/// after the row (UI rule 17).
+#[test]
+fn search_pick_keeps_the_focus_in_the_found_row() {
+    use slint::platform::Key as K;
+    const BIG: (f32, f32) = (1280.0, 1600.0);
+    let ms = std::time::Duration::from_millis;
+    let second_try_off = "version = 2
+[model.advanced]
+temperature_fallback = false
+";
+    // The query, its config, the setting Space changes (the row's own control), the setting a walk
+    // from the row reaches and its Tabs (a row's "i" is a stop). Filler words are off by default.
+    let cases = [
+        // A row with an enabled control: Space toggles it, which turns the filler field on; then
+        // the Filler words "i" and field.
+        (
+            "Remove filler words",
+            None,
+            Some("Remove filler words"),
+            "Filler words",
+            2,
+        ),
+        // A text-only row whose field is off: past it, the Phrase shortcuts "i" and field.
+        ("Filler words", None, None, "Phrase shortcuts", 2),
+        // A text-only row followed by a live text field: the pick puts the focus in that field (the
+        // row's `take-pick`), so typing lands there and no Tab is needed.
+        (
+            "Phrase shortcuts",
+            None,
+            Some("Phrase shortcuts"),
+            "Phrase shortcuts",
+            0,
+        ),
+        // A disabled row with controls: the next row's "i" and control.
+        (
+            "Second try when a phrase repeats",
+            Some(second_try_off),
+            None,
+            "Silence cut-off",
+            2,
+        ),
+    ];
+    for (query, config, own, next, tabs) in cases {
+        SIZE.set(BIG);
+        let window = open("search-in-row", config);
+        render(&window, BIG, 1.0);
+        let surface = LAST.with_borrow(Clone::clone).unwrap();
+        let press = |text: slint::SharedString| {
+            surface.dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+            surface.dispatch_event(WindowEvent::KeyReleased { text });
+        };
+        window.invoke_search(query.into());
+        window.invoke_search_picked(0);
+        render(&window, BIG, 1.0);
+        advance(ms(20));
+        slint::platform::update_timers_and_animations();
+        advance(ms(1500));
+        slint::platform::update_timers_and_animations();
+        let calm = render(&window, BIG, 1.0);
+        let picked = held(&window);
+        let page = window.get_page();
+        press(" ".into());
+        press("x".into());
+        let typed = held(&window);
+        assert_eq!(window.get_page(), page, "{query}: a key left the page");
+        if let Some(label) = own {
+            assert_ne!(
+                of(&picked, label, true),
+                of(&typed, label, true),
+                "{query}: Space did not reach the row's own control"
+            );
+            assert_eq!(
+                of(&picked, label, false),
+                of(&typed, label, false),
+                "{query}: a key changed a setting outside the found row"
+            );
+        } else {
+            assert_eq!(
+                picked, typed,
+                "{query}: a key changed a setting outside the found row"
+            );
+            assert!(
+                calm.data() == render(&window, BIG, 1.0).data(),
+                "{query}: a key changed the frame"
+            );
+        }
+        // The focus was in the found row: the walk from there reaches the setting after it.
+        for _ in 0..tabs {
+            press(K::Tab.into());
+        }
+        press("y".into());
+        press(" ".into());
+        let moved = held(&window);
+        assert_ne!(
+            of(&typed, next, true),
+            of(&moved, next, true),
+            "{query}: {tabs} Tab after the pick did not reach {next}"
+        );
+        assert_eq!(
+            of(&typed, next, false),
+            of(&moved, next, false),
+            "{query}: {tabs} Tab after the pick reached another setting than {next}"
+        );
     }
 }

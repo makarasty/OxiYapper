@@ -1145,6 +1145,70 @@ fn immediate_unload_waits_for_the_job_to_end() {
     );
 }
 
+/// Hold item 41, candidate 10 ("Always ready"): with `preload_at_start` the model loads with no
+/// press at the first step, again after a new config (another model) or a resume, and never
+/// right after an idle unload or a suspend's unload.
+#[test]
+fn preload_at_start_loads_without_a_press_but_not_after_an_idle_unload() {
+    let ready = MachineConfig {
+        preload_at_start: true,
+        idle_unload: Millis(1000),
+        ..untailed()
+    };
+    let mut s = Sim(State::new(ready.clone()));
+    assert_eq!(
+        s.core(0, Event::Tick),
+        [Effect::Preload],
+        "the daemon's first step"
+    );
+    assert_eq!(s.core(10, Event::Tick), Effects::new(), "one load");
+    s.at(20, Event::ModelLoaded);
+    assert_eq!(
+        s.core(1020, Event::Tick),
+        [Effect::Unload],
+        "the idle unload still runs"
+    );
+    assert_eq!(
+        s.core(1030, Event::Tick),
+        Effects::new(),
+        "and is not undone"
+    );
+
+    // A save that changes nothing about the model never undoes the idle unload.
+    assert_eq!(
+        s.core(1500, Event::ConfigChanged(ready.clone())),
+        [Effect::ApplyConfig],
+        "an unrelated save does not reload"
+    );
+    assert_eq!(s.core(1510, Event::Tick), Effects::new());
+
+    // Another model: the new config loads it at once.
+    let other = MachineConfig {
+        model: oxi_core::machine::ModelIdentity {
+            file: "large-v3".into(),
+            gpu: DeviceChoice::Auto,
+        },
+        ..ready.clone()
+    };
+    assert_eq!(
+        s.core(2000, Event::ConfigChanged(other)),
+        [Effect::ApplyConfig, Effect::Preload]
+    );
+    s.at(2010, Event::ModelLoaded);
+
+    // Sleep unloads; waking loads again.
+    s.core(3000, Event::Suspend);
+    assert_eq!(s.core(3010, Event::Tick), Effects::new());
+    assert_eq!(
+        s.core(4000, Event::Resume),
+        [Effect::ReinstallHook, Effect::Preload]
+    );
+
+    // Off (the default): nothing loads before a press.
+    let mut off = Sim(State::new(untailed()));
+    assert_eq!(off.core(0, Event::Tick), Effects::new());
+}
+
 // ---- release tail (ARCHITECTURE 3: keeps the last syllable) ---------------------------------
 
 fn tailed(mode: Mode, tail: u64) -> Sim {

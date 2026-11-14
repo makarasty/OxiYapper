@@ -661,3 +661,67 @@ proptest! {
         prop_assert_eq!(p.raw.split_whitespace().count(), segs.len());
     }
 }
+
+#[test]
+fn voice_commands_use_the_configured_phrases_several_per_action_and_each_switch() {
+    let mut o = on(|o| o.voice_commands = true);
+    o.voice.new_line.phrases = vec![
+        "enter".into(),
+        "next line please".into(),
+        "next line".into(),
+    ];
+    assert_eq!(go("One. Enter. Two.", &o), text("One.\nTwo."));
+    // The longest phrase wins when one starts another.
+    assert_eq!(go("One. Next line please. Two.", &o), text("One.\nTwo."));
+    assert_eq!(go("One. Next line. Two.", &o), text("One.\nTwo."));
+    // The old phrase is gone for that action, and stays text.
+    assert_eq!(go("One. New line. Two.", &o), text("One. New line. Two."));
+    // Another action keeps its own.
+    assert_eq!(go("One. New paragraph. Two.", &o), text("One.\n\nTwo."));
+    o.voice.new_paragraph.on = false;
+    assert_eq!(
+        go("One. New paragraph. Two.", &o),
+        text("One. New paragraph. Two.")
+    );
+    o.voice.delete_last.phrases.clear();
+    assert_eq!(
+        go("One. Two. Delete that.", &o),
+        text("One. Two. Delete that.")
+    );
+}
+
+#[test]
+fn the_style_switches_drop_the_final_full_stop_and_lower_the_first_letter() {
+    let style = on(|o| {
+        o.no_final_period = true;
+        o.small_first_letter = true;
+    });
+    let text = |s: &str| match go_with(&[seg(s)], &style, "", &[], &[]).outcome {
+        Outcome::Text(t) => t,
+        Outcome::NothingHeard => String::new(),
+    };
+    assert_eq!(text("Привет, как дела."), "привет, как дела");
+    assert_eq!(
+        text("Hello there..."),
+        "hello there...",
+        "an ellipsis stays"
+    );
+    assert_eq!(text("Really?"), "really?");
+    assert_eq!(
+        text("USB is fine."),
+        "USB is fine",
+        "an abbreviation keeps its capitals"
+    );
+    assert_eq!(text("I think so."), "I think so", "a one-letter word stays");
+    assert_eq!(text("«Ok» then."), "«ok» then");
+    // Off by default: the same text is left as it was.
+    let plain = go_with(&[seg("Hello.")], &TextOptions::default(), "", &[], &[]).outcome;
+    assert_eq!(plain, Outcome::Text("Hello.".into()));
+    // A snippet's stored text is the person's own: never changed.
+    let snip = [Snippet {
+        trigger: "sign".into(),
+        text: "Best regards.".into(),
+    }];
+    let out = go_with(&[seg("sign")], &style, "", &[], &snip).outcome;
+    assert_eq!(out, Outcome::Text("Best regards.".into()));
+}

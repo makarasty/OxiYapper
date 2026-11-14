@@ -14,8 +14,7 @@ use slint::platform::{Key, PointerEventButton, WindowEvent};
 
 fn recordings(l: &oxi_core::paths::Layout) -> AppWindow {
     let window = open(l, Page::System);
-    with_role(&window, "Recordings and files", AccessibleRole::Tab)
-        .invoke_accessible_default_action();
+    with_role(&window, "History and files", AccessibleRole::Tab).invoke_accessible_default_action();
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
     window
 }
@@ -146,8 +145,7 @@ fn unsaved_folder_text_is_restored_on_any_focus_loss() {
     f.set_accessible_value(typed);
     with_role(&window, "General", AccessibleRole::Tab).invoke_accessible_default_action();
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
-    with_role(&window, "Recordings and files", AccessibleRole::Tab)
-        .invoke_accessible_default_action();
+    with_role(&window, "History and files", AccessibleRole::Tab).invoke_accessible_default_action();
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
     assert_eq!(
         field(&window).accessible_value().as_deref(),
@@ -193,7 +191,7 @@ fn a_switch_click_restores_the_saved_path() {
     let window = recordings(&l);
     let saved = l.history_dir().to_string_lossy().into_owned();
     let typed = l.data_dir.join("elsewhere").to_string_lossy().into_owned();
-    for name in ["Save recordings", "Log dictated text"] {
+    for name in ["Save dictations to History", "Log dictated text"] {
         let f = field(&window);
         f.mock_single_click(PointerEventButton::Left);
         f.set_accessible_value(typed.clone());
@@ -306,7 +304,11 @@ fn the_folder_field_fills_the_control_column() {
         window.window().set_size(slint::LogicalSize::new(w, h));
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
         let f = field(&window);
-        let switch = with_role(&window, "Save recordings", AccessibleRole::Switch);
+        let switch = with_role(
+            &window,
+            "Save dictations to History",
+            AccessibleRole::Switch,
+        );
         let open = with_role(&window, "Open recordings folder", AccessibleRole::Button);
         let log = with_role(&window, "Log dictated text", AccessibleRole::Switch);
         for (name, e) in [

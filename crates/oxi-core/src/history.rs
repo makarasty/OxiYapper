@@ -213,6 +213,10 @@ pub struct Meta {
     /// How the text reached the user; `None` when not recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered: Option<Delivered>,
+    /// Loudness numbers of the recording (numbers only), for the setting suggestions; `None`
+    /// in an entry from before this field and in one made from a file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub levels: Option<crate::audio::Levels>,
 }
 
 impl Meta {
@@ -235,6 +239,7 @@ impl Meta {
             raw: false,
             held: Vec::new(),
             delivered: None,
+            levels: None,
         }
     }
 }
@@ -1212,6 +1217,7 @@ mod tests {
             raw: false,
             held: Vec::new(),
             delivered: None,
+            levels: None,
         }
     }
 

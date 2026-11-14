@@ -1,13 +1,18 @@
 //! Config: load with migrations, unknown keys kept, newer version read-only
 //! (ARCHITECTURE section 6). The atomic file write is I/O and lives in the settings process.
 
+mod audio_sets;
 mod extra;
+mod memory;
 mod schema;
 
+pub use audio_sets::{DenoiseStrength, DeviceSet, EdgePreset, Noise};
 pub use extra::{
     Accent, Advanced, AudioChannel, AudioCtx, Auto, BadAccent, Decoding, FileFormat, FileMode,
-    LanguageKey, Output, PromptSource, Rgb, Snippet, Text, TypeSpeed, VadSensitivity,
+    LanguageKey, Output, PromptSource, Rgb, Snippet, Text, TypeSpeed, VadSensitivity, VoiceCommand,
+    VoiceCommands, VoiceConflict, phrase_words,
 };
+pub use memory::MemoryMode;
 pub use schema::{
     AppLanguage, Audio, Config, Debug, History, Hotkey, Model, OtherKey, Overlay, OverlayPosition,
     Paste, PasteMode, PasteRule, Sounds, System, Theme, Ui,
@@ -46,6 +51,28 @@ fn accent_warning(doc: &DocumentMut) -> Option<String> {
     text.parse::<Accent>()
         .is_err()
         .then(|| format!("ui.accent = {text:?} is neither \"default\" nor #RRGGBB, using default"))
+}
+
+/// `sounds.enabled` is gone (ia-map S80): a hidden switch must not silence sounds the page shows
+/// as picked. An old `false` becomes every sound Off (text ready: `done_enabled = false`, as the
+/// page does, so its sound comes back with the next pick); the key is dropped either way. Runs at
+/// every load, not as a versioned step: a file of any version may carry the key. True when the
+/// document changed.
+fn drop_sounds_master(doc: &mut DocumentMut) -> bool {
+    let Some(s) = doc.get_mut("sounds").and_then(Item::as_table_like_mut) else {
+        return false;
+    };
+    let Some(on) = s.get("enabled").and_then(Item::as_bool) else {
+        return false;
+    };
+    if !on {
+        for key in ["start", "stop", "cancel", "error"] {
+            put(s, key, &toml_edit::value(crate::sounds::OFF));
+        }
+        put(s, "done_enabled", &toml_edit::value(false));
+    }
+    s.remove("enabled");
+    true
 }
 
 fn history_enabled(doc: &DocumentMut) -> Option<bool> {
@@ -157,9 +184,10 @@ impl ConfigFile {
         }
         let history_turned_on =
             history_before == Some(false) && history_enabled(&raw) == Some(true);
+        let sounds_fixed = drop_sounds_master(&mut raw);
         // Typed values come from the migrated text, so error lines point into it; with no
         // migration that text is the file itself.
-        let migrated = if pending.is_empty() {
+        let migrated = if pending.is_empty() && !sounds_fixed {
             Cow::Borrowed(text)
         } else {
             Cow::Owned(raw.to_string())
@@ -236,7 +264,11 @@ fn typed_doc(config: &Config) -> Result<DocumentMut, ConfigError> {
 /// removed from the file. Any other table keeps the keys this build does not know.
 /// Each is `(parent table, map key)`: a map is pruned only under its own parent, never inside
 /// a rule that happens to carry an unknown key of the same name.
-const MAP_TABLES: [(&str, &str); 2] = [("ui", "app_names"), ("model", "by_language")];
+const MAP_TABLES: [(&str, &str); 3] = [
+    ("ui", "app_names"),
+    ("model", "by_language"),
+    ("audio", "device_sets"),
+];
 
 /// Writes every key of `src` into `dst`: tables merge key by key, arrays of tables merge
 /// element by element on `app`, values replace only when they differ and keep their decor.

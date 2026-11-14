@@ -4,7 +4,7 @@ import { Theme, Shell, Icons, Card, Row, Divider, ToggleRow, SliderRow, Combo, S
 import { Warnings } from "../theme/components/feedback.slint";
 
 // Which control changed; `value` of `AudioState.edited` carries its new value.
-export enum AudioKey { device, gain, sensitivity, normalize, trim, denoise, tail, max-minutes, volume, channel, vad }
+export enum AudioKey { device, gain, sensitivity, normalize, trim, noise, tail, max-minutes, volume, channel, vad, edges, rumble, per-device }
 
 // Filled and read by `pages::audio`.
 export global AudioState {
@@ -22,7 +22,17 @@ export global AudioState {
     in-out property <int> vad;
     in-out property <bool> normalize;
     in-out property <bool> trim;
-    in-out property <bool> denoise;
+    // Noise suppression: 0 off, 1 light, 2 medium, 3 strong, 4 auto (`Noise::ALL`).
+    in-out property <int> noise;
+    // "Don't cut my words": 0 normal, 1 careful, 2 tight, 3 custom (`EdgePreset::ALL`).
+    in-out property <int> edges;
+    in-out property <bool> cut-rumble;
+    in-out property <bool> per-device;
+    // Suggestions from the person's recordings (hold item 41): why, per row; empty: none.
+    in property <string> noise-tip;
+    in property <string> gain-tip;
+    in property <string> edges-tip;
+    in property <string> rumble-tip;
     in-out property <float> tail-ms;
     in-out property <float> max-minutes;
     // The defaults of `Config::default()`: a double click on a slider's thumb returns to them.
@@ -47,6 +57,9 @@ export global AudioState {
     in property <string> silence;
     // The Test button: true while it records and plays back (its steps are toasts).
     in property <bool> testing;
+    // What the last Record 3 s heard ("Quiet", "Good level", "Too loud"), drawn in the meter;
+    // empty until a test has run.
+    in property <string> mic-result;
     // Per sound (start, stop, text ready, cancel, error): its tiles, Off, `Builtin::ALL` in order
     // then the own file, and the tile picked (-1: none).
     in property <[[GalleryTile]]> role-tiles;
@@ -68,6 +81,11 @@ export global AudioState {
     callback shown();
     callback edited(AudioKey, float);
     callback test();
+    // A suggestion's Apply (true) or Not now (false), for the row of `AudioKey` noise, gain,
+    // edges or rumble.
+    callback suggestion(AudioKey, bool);
+    // A suggestion's "Check again": read the history's numbers anew.
+    callback recheck();
     callback sound-picked(int);
     callback choose-file();
     callback choose-folder();
@@ -109,13 +127,23 @@ export component AudioPage inherits VerticalLayout {
             }
         }
         Divider { }
+        ToggleRow {
+            flat: true;
+            title: @tr("Remember for this microphone");
+            info: @tr("Keeps the boost, noise and rumble settings, stereo side and speech sensitivity for each microphone, and brings them back when you pick it.");
+            checked <=> AudioState.per-device;
+            toggled(on) => {
+                AudioState.edited(AudioKey.per-device, on ? 1 : 0);
+            }
+        }
+        Divider { }
         // The Test button takes its width from the column: the meter shrinks, the right edge stays
         // the column's (DS-3.3).
         Row {
             title: @tr("Level");
             info: @tr("How loud your microphone is right now. Speak to see it move.");
             // The "!" carries the words of the clip line (DS-21.3).
-            warning: Warnings.both(AudioState.silence, AudioState.clipping ? @tr("Too loud: lower the gain.") : "");
+            warning: Warnings.both(AudioState.silence, AudioState.clipping ? @tr("Too loud: lower the microphone boost.") : "");
             fill-controls: true;
             Meter {
                 bars: AudioState.bars;
@@ -124,10 +152,11 @@ export component AudioPage inherits VerticalLayout {
                 overloaded: AudioState.clipping;
                 empty-text: AudioState.note;
                 idle-text: @tr("Listening");
+                result: AudioState.mic-result;
                 accessible-label: !AudioState.live ? AudioState.note : AudioState.clipping ? @tr("Level, clipping") : @tr("Level");
             }
             Button {
-                text: @tr("Test");
+                text: @tr("Record 3 s");
                 enabled: !AudioState.testing;
                 tooltip: @tr("A test is running");
                 clicked => {
@@ -137,8 +166,19 @@ export component AudioPage inherits VerticalLayout {
         }
         Divider { }
         SliderRow {
-            title: @tr("Gain");
-            info: @tr("Makes your voice louder or quieter in the recording Whisper hears.");
+            title: @tr("Microphone boost");
+            info: @tr("Makes your voice louder or quieter in the recording Whisper hears. Record 3 s checks the level.");
+            can-suggest: true;
+            suggestion: AudioState.gain-tip;
+            suggestion-accepted => {
+                AudioState.suggestion(AudioKey.gain, true);
+            }
+            suggestion-dismissed => {
+                AudioState.suggestion(AudioKey.gain, false);
+            }
+            suggestion-refresh => {
+                AudioState.recheck();
+            }
             minimum: -20;
             maximum: 20;
             bipolar: true;
@@ -152,7 +192,7 @@ export component AudioPage inherits VerticalLayout {
         }
         Divider { }
         SliderRow {
-            title: @tr("Meter sensitivity");
+            title: @tr("Level bar sensitivity");
             info: @tr("Only changes how far the Level bar moves; the recording stays as it is.");
             minimum: -20;
             maximum: 20;
@@ -167,15 +207,41 @@ export component AudioPage inherits VerticalLayout {
         }
         Divider { }
         Row {
-            title: @tr("Channel");
-            info: @tr("Which side of a stereo microphone is used. Mix averages both; pick one when the other is noisy or silent.");
+            title: @tr("Stereo side");
+            info: @tr("Which side of a stereo microphone is used. Both averages them; pick one when the other is noisy or silent.");
             fill-controls: true;
             Combo {
-                model: [@tr("Mix"), @tr("Left"), @tr("Right")];
+                model: [@tr("Both"), @tr("Left"), @tr("Right")];
                 current-index <=> AudioState.channel;
-                accessible-label: @tr("Channel");
+                accessible-label: @tr("Stereo side");
                 selected => {
                     AudioState.edited(AudioKey.channel, self.current-index);
+                }
+            }
+        }
+    }
+    if AudioState.view == 1: Card {
+        Row {
+            title: @tr("Don't cut my words");
+            info: @tr("Careful keeps quieter starts and ends and listens longer after you let go; Tight cuts closer. Custom: the two rows below set by hand.");
+            fill-controls: true;
+            can-suggest: true;
+            suggestion: AudioState.edges-tip;
+            suggestion-accepted => {
+                AudioState.suggestion(AudioKey.edges, true);
+            }
+            suggestion-dismissed => {
+                AudioState.suggestion(AudioKey.edges, false);
+            }
+            suggestion-refresh => {
+                AudioState.recheck();
+            }
+            Combo {
+                model: [@tr("Normal"), @tr("Careful"), @tr("Tight"), @tr("Custom")];
+                current-index <=> AudioState.edges;
+                accessible-label: @tr("Don't cut my words");
+                selected => {
+                    AudioState.edited(AudioKey.edges, self.current-index);
                 }
             }
         }
@@ -193,38 +259,10 @@ export component AudioPage inherits VerticalLayout {
                 }
             }
         }
-    }
-    if AudioState.view == 1: Card {
-        ToggleRow {
-            flat: true;
-            title: @tr("Normalise level");
-            checked <=> AudioState.normalize;
-            toggled(on) => {
-                AudioState.edited(AudioKey.normalize, on ? 1 : 0);
-            }
-        }
-        Divider { }
-        ToggleRow {
-            flat: true;
-            title: @tr("Trim silence");
-            checked <=> AudioState.trim;
-            toggled(on) => {
-                AudioState.edited(AudioKey.trim, on ? 1 : 0);
-            }
-        }
-        Divider { }
-        ToggleRow {
-            flat: true;
-            title: @tr("Noise suppression");
-            warning: AudioState.denoise ? @tr("Noise suppression can make Whisper worse.") : "";
-            checked <=> AudioState.denoise;
-            toggled(on) => {
-                AudioState.edited(AudioKey.denoise, on ? 1 : 0);
-            }
-        }
         Divider { }
         SliderRow {
-            title: @tr("Tail after release");
+            title: @tr("Keep recording after release");
+            info: @tr("Keeps listening this long after you let go, so the last word is not cut.");
             minimum: 0;
             maximum: 1000;
             step: 50;
@@ -236,8 +274,76 @@ export component AudioPage inherits VerticalLayout {
             }
         }
         Divider { }
+        ToggleRow {
+            flat: true;
+            title: @tr("Cut silence at the ends");
+            info: @tr("Removes the quiet before and after you speak: fewer made-up words, a faster result.");
+            checked <=> AudioState.trim;
+            toggled(on) => {
+                AudioState.edited(AudioKey.trim, on ? 1 : 0);
+            }
+        }
+        Divider { }
+        ToggleRow {
+            flat: true;
+            title: @tr("Even out loudness");
+            info: @tr("Makes quiet and loud recordings equally loud before Whisper hears them.");
+            checked <=> AudioState.normalize;
+            toggled(on) => {
+                AudioState.edited(AudioKey.normalize, on ? 1 : 0);
+            }
+        }
+        Divider { }
+        Row {
+            title: @tr("Reduce background noise");
+            info: @tr("Removes steady noise like a fan or hum. Light and Medium keep part of the original sound; Auto cleans only when the room is noisy.");
+            warning: AudioState.noise != 0 ? @tr("Reducing background noise can make Whisper worse.") : "";
+            fill-controls: true;
+            can-suggest: true;
+            suggestion: AudioState.noise-tip;
+            suggestion-accepted => {
+                AudioState.suggestion(AudioKey.noise, true);
+            }
+            suggestion-dismissed => {
+                AudioState.suggestion(AudioKey.noise, false);
+            }
+            suggestion-refresh => {
+                AudioState.recheck();
+            }
+            Combo {
+                model: [@tr("Off"), @tr("Light"), @tr("Medium"), @tr("Strong"), @tr("Auto: only when noisy")];
+                current-index <=> AudioState.noise;
+                accessible-label: @tr("Reduce background noise");
+                selected => {
+                    AudioState.edited(AudioKey.noise, self.current-index);
+                }
+            }
+        }
+        Divider { }
+        ToggleRow {
+            flat: true;
+            title: @tr("Cut low rumble");
+            info: @tr("Removes deep hum and thumps below the voice: fans, desk knocks, air conditioning. Speech stays as it is.");
+            can-suggest: true;
+            suggestion: AudioState.rumble-tip;
+            suggestion-accepted => {
+                AudioState.suggestion(AudioKey.rumble, true);
+            }
+            suggestion-dismissed => {
+                AudioState.suggestion(AudioKey.rumble, false);
+            }
+            suggestion-refresh => {
+                AudioState.recheck();
+            }
+            checked <=> AudioState.cut-rumble;
+            toggled(on) => {
+                AudioState.edited(AudioKey.rumble, on ? 1 : 0);
+            }
+        }
+        Divider { }
         SliderRow {
-            title: @tr("Max length");
+            title: @tr("Longest recording");
+            info: @tr("A recording stops at this length; the overlay warns 30 s before.");
             minimum: 1;
             maximum: 120;
             unit: "min";

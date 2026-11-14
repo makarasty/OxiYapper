@@ -1148,7 +1148,13 @@ export component HistoryPage inherits VerticalLayout {
         HorizontalLayout {
             height: Theme.control-height;
             spacing: Theme.control-gap;
-            SearchField {
+            // Ctrl+F on this page searches the recordings (the window counts it in `Shell.history-find`).
+            property <int> find: Shell.history-find;
+            changed find => {
+                query-field.focus();
+                query-field.select-all();
+            }
+            query-field := SearchField {
                 horizontal-stretch: 1;
                 min-width: 120px;
                 height: Theme.control-height;

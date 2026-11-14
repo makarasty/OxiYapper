@@ -170,6 +170,7 @@ fn handle_in(
             words,
             held,
             delivered,
+            levels,
             cfg,
             spool,
             carried,
@@ -178,6 +179,7 @@ fn handle_in(
                 words,
                 held,
                 delivered,
+                levels,
             };
             (cfg, Some((samples, text, heard, spool, carried)))
         }
@@ -327,6 +329,7 @@ struct Heard {
     words: Vec<history::Word>,
     held: Vec<history::HeldPart>,
     delivered: Option<history::Delivered>,
+    levels: Option<oxi_core::audio::Levels>,
 }
 
 /// [`save_with`] for a text with only words.
@@ -344,6 +347,7 @@ fn save(
         words: words.to_vec(),
         held: Vec::new(),
         delivered: None,
+        levels: None,
     };
     save_with(dir, samples, text, &heard, spool, now, ctx)
 }
@@ -394,6 +398,7 @@ fn save_with(
                     words: heard.words.clone(),
                     held: heard.held.clone(),
                     delivered: heard.delivered,
+                    levels: heard.levels,
                     ..meta(&id, duration_ms, status, ctx)
                 },
             )
@@ -775,6 +780,7 @@ pub fn save_transcribed(
         words: Vec::new(),
         held: Vec::new(),
         delivered: Some(history::Delivered::Unknown),
+        levels: None,
     };
     save_with(dir, samples, text, &heard, None, now, ctx)
 }

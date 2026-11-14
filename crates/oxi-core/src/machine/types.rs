@@ -22,6 +22,10 @@ pub enum Mode {
 
 /// The values the machine reads from the user config; `Default` is the SPEC set.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent settings, one per config key"
+)]
 pub struct MachineConfig {
     pub mode: Mode,
     /// Esc cancels a recording; off, Esc is an ordinary key (R2.1).
@@ -55,6 +59,10 @@ pub struct MachineConfig {
     pub hold_gap: Millis,
     /// `[history] enabled`: a recording with speech is kept when it is cancelled or fails.
     pub keep_history: bool,
+    /// `[model] preload_at_start`: the model loads with no press, when the app starts, when a new
+    /// config asks for it (turned on, another model) and after a resume (hold item 41, "Always
+    /// ready"). An idle unload is never followed by a load.
+    pub preload_at_start: bool,
 }
 
 /// The settings a model load depends on.
@@ -94,6 +102,7 @@ impl From<&Config> for MachineConfig {
             },
             hold_gap: Millis(cfg.hotkey.hold_gap_ms.into()),
             keep_history: cfg.history.enabled,
+            preload_at_start: cfg.model.preload_at_start,
         }
     }
 }

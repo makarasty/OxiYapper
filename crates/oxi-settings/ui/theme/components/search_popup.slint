@@ -15,11 +15,17 @@ export component SearchPopup inherits PopupWindow {
     in property <int> current: -1;
     in property <string> placeholder;
     in property <string> empty-text;
+    // The text the field opens with (the owner answers it with `items` itself).
+    in property <string> query;
+    // Settings search rows (ia-map 3.7): 48 px, `icon-of(i)` at the left, the title and its note
+    // under it, up to eight rows. Off: one line per row, the note at the right.
+    in property <bool> detailed;
+    pure callback icon-of(int) -> image;
     callback search(string);
     callback picked(int);
 
     property <int> active;
-    property <length> row-height: Theme.control-height;
+    property <length> row-height: root.detailed ? Theme.row-height : Theme.control-height;
 
     function choose(i: int) {
         if (i >= 0 && i < root.items.length) {
@@ -40,14 +46,15 @@ export component SearchPopup inherits PopupWindow {
 
     close-policy: close-on-click-outside;
     init => {
+        field.text = root.query;
         field.focus();
     }
     // The width of the control column a field sits in (DS-4.4): 360, 240 on a page under 720 px.
     width: Theme.control-column;
     // shortcut: the geometry is final in the first frame (DS-25.4) because it follows the column,
     // not the field; a field that is not a full column wide sets `width` from its owner.
-    // The field and seven rows.
-    height: Theme.control-height * 8 + Theme.space-2 * 3;
+    // The field and seven rows (eight when `detailed`).
+    height: Theme.control-height + root.row-height * (root.detailed ? 8 : 7) + Theme.space-2 * 3;
 
     CardFrame {
         background: Theme.bg-control;
@@ -116,14 +123,36 @@ export component SearchPopup inherits PopupWindow {
                                 padding-left: Theme.space-2;
                                 padding-right: Theme.space-2;
                                 spacing: Theme.space-2;
-                                Text {
-                                    text: item;
-                                    font-size: Theme.body-size;
-                                    color: Theme.text-primary;
-                                    vertical-alignment: center;
-                                    accessible-role: none;
+                                if root.detailed: VerticalLayout {
+                                    alignment: center;
+                                    Image {
+                                        source: root.icon-of(i);
+                                        width: Theme.icon-size;
+                                        height: Theme.icon-size;
+                                        colorize: Theme.text-primary;
+                                        accessible-role: none;
+                                    }
                                 }
-                                Caption {
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: root.detailed ? 1 : 0;
+                                    spacing: Theme.title-gap;
+                                    Text {
+                                        text: item;
+                                        font-size: Theme.body-size;
+                                        color: Theme.text-primary;
+                                        overflow: elide;
+                                        vertical-alignment: center;
+                                        accessible-role: none;
+                                    }
+                                    if root.detailed: Caption {
+                                        text: root.notes[i];
+                                        color: Theme.text-secondary;
+                                        overflow: elide;
+                                        accessible-role: none;
+                                    }
+                                }
+                                if !root.detailed: Caption {
                                     text: root.notes[i];
                                     color: Theme.text-secondary;
                                     horizontal-stretch: 1;

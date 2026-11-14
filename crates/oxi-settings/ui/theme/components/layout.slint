@@ -1,6 +1,7 @@
 // Page structure: header, groups, cards and the setting rows inside them (Windows 11 Settings
 // pattern: one card per setting, label and description left, control right).
 import { Theme, Shell } from "../tokens.slint";
+import { Icons } from "../icons.slint";
 import { FocusRing, KeyFocus, CardFrame, Caption, Tip, InfoTip, ScrollBox } from "base.slint";
 import { Switch } from "switch.slint";
 import { Slider, NumberField } from "slider.slint";
@@ -36,9 +37,53 @@ export component IconLabel inherits HorizontalLayout {
     }
 }
 
+// Settings search (owner item 17): the row or group title whose `key` is `Shell.found` scrolls into
+// view, then its background flashes `accent-tint` twice (150 ms on, 150 off); under reduced motion it
+// holds a steady tint for 600 ms (ia-map 3.7). The holder draws it first (under its content), a
+// little past its edges: x -space-2, y -space-1.
+component Flash inherits Rectangle {
+    in property <string> key;
+    // The row asks for the keyboard focus once, when its page is laid out (step 0).
+    callback ready();
+    out property <bool> waiting: root.step == 0;
+    property <int> serial: root.key != "" && root.key == Shell.found ? Shell.found-serial : 0;
+    // -1 idle; 0 waits a frame so the new page and tab are laid out; 1 to 4 the pulses.
+    property <int> step: -1;
+    function start() {
+        if (root.serial > 0) {
+            root.step = 0;
+        }
+    }
+    init => {
+        root.start();
+    }
+    changed serial => {
+        root.start();
+    }
+    border-radius: Theme.radius-control;
+    background: Theme.accent-tint;
+    opacity: root.step == 1 || root.step == 3 || (Shell.reduced-motion && root.step >= 1) ? 1 : 0;
+    animate opacity { duration: Theme.motion-quick; easing: ease-out; }
+    visible: root.step >= 0 || self.opacity > 0;
+    accessible-role: none;
+    Timer {
+        interval: root.step == 0 ? 16ms : 150ms;
+        running: root.step >= 0;
+        triggered => {
+            if (root.step == 0) {
+                Shell.reveal(root.absolute-position.y, root.height);
+                root.ready();
+            }
+            root.step = root.step >= 4 ? -1 : root.step + 1;
+        }
+    }
+}
+
 // An optional header 8 px above its cards; the cards (children) 4 px apart. No box of its own.
 export component Group inherits VerticalLayout {
     in property <string> title;
+    // What settings search flashes for this group's title (`Shell.found`); empty: never.
+    in property <string> search-key: root.title;
     in property <image> icon;
     // A hint about the group: the "i" `pair-gap` after the title, this text its tooltip (UI rule
     // 35). Empty shows none.
@@ -51,34 +96,46 @@ export component Group inherits VerticalLayout {
     in property <bool> action-enabled: true;
     callback action;
     spacing: Theme.card-gap;
-    if root.title != "": HorizontalLayout {
-        padding-bottom: Theme.header-gap - Theme.card-gap;
-        spacing: Theme.pair-gap;
-        alignment: stretch;
-        // The icon centred in the row (a trailing action button makes it taller than the icon), the
-        // title's capitals on the same line.
-        IconLabel {
-            icon: root.icon;
-            text: root.title;
-            font-weight: Theme.weight-strong;
+    if root.title != "": Rectangle {
+        min-height: head.min-height;
+        preferred-height: head.preferred-height;
+        min-width: head.min-width;
+        Flash {
+            x: -Theme.space-2;
+            y: -Theme.space-1;
+            width: parent.width + 2 * Theme.space-2;
+            height: parent.height + 2 * Theme.space-1;
+            key: root.search-key;
         }
-        if root.info != "": VerticalLayout {
-            alignment: center;
-            InfoTip {
-                text: root.info;
+        head := HorizontalLayout {
+            padding-bottom: Theme.header-gap - Theme.card-gap;
+            spacing: Theme.pair-gap;
+            alignment: stretch;
+            // The icon centred in the row (a trailing action button makes it taller than the icon), the
+            // title's capitals on the same line.
+            IconLabel {
+                icon: root.icon;
+                text: root.title;
+                font-weight: Theme.weight-strong;
             }
-        }
-        Rectangle {
-            horizontal-stretch: 1;
-        }
-        if root.action-text != "": Button {
-            kind: ButtonKind.soft;
-            text: root.action-text;
-            icon: root.action-icon;
-            tooltip: root.action-tip;
-            enabled: root.action-enabled;
-            clicked => {
-                root.action();
+            if root.info != "": VerticalLayout {
+                alignment: center;
+                InfoTip {
+                    text: root.info;
+                }
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+            if root.action-text != "": Button {
+                kind: ButtonKind.soft;
+                text: root.action-text;
+                icon: root.action-icon;
+                tooltip: root.action-tip;
+                enabled: root.action-enabled;
+                clicked => {
+                    root.action();
+                }
             }
         }
     }
@@ -157,11 +214,115 @@ export component ClickCard inherits CardFrame {
     }
 }
 
+// A suggestion from the person's own recordings (hold item 41, one look for all of them): a
+// lightbulb in the row's reserved slot; a click (or Enter) opens why, with Apply and Not now.
+// Nothing changes unasked. Empty `text`: nothing drawn, the slot keeps its width (UI rule 1).
+export component SuggestSlot {
+    in property <string> text;
+    callback accepted();
+    callback dismissed();
+    // "Check again": read the recordings anew (the page does it off the UI thread).
+    callback refresh();
+    property <bool> key-focus;
+    width: Theme.icon-size;
+    height: Theme.icon-size;
+    accessible-role: button;
+    accessible-label: root.text == "" ? "" : @tr("Suggestion: {}", root.text);
+    accessible-action-default => {
+        popup.show();
+    }
+    fs := FocusScope {
+        enabled: root.text != "";
+        focus-on-click: false;
+        focus-gained(reason) => {
+            root.key-focus = KeyFocus.after(reason, root.key-focus);
+        }
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                popup.show();
+                return accept;
+            }
+            reject
+        }
+        if root.text != "": Rectangle {
+            border-radius: Theme.radius-round;
+            background: touch.has-hover ? Theme.bg-subtle-hover : transparent;
+            animate background { duration: Theme.motion-quick; easing: ease-out; }
+            Image {
+                source: Icons.suggestion;
+                width: Theme.icon-size-small;
+                height: Theme.icon-size-small;
+                colorize: Theme.accent;
+                accessible-role: none;
+            }
+            touch := TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    popup.show();
+                }
+            }
+        }
+    }
+    FocusRing {
+        shown: root.key-focus && fs.has-focus;
+        radius: Theme.radius-round;
+    }
+    // Opens under the bulb, to its left: the controls it is about stay in view.
+    popup := PopupWindow {
+        x: root.width - self.width;
+        y: root.height + Theme.space-1;
+        width: 320px;
+        close-policy: close-on-click-outside;
+        Rectangle {
+            background: Theme.bg-control;
+            border-width: 1px;
+            border-color: Theme.stroke-control;
+            border-radius: Theme.radius-card;
+            VerticalLayout {
+                padding: Theme.space-3;
+                spacing: Theme.space-3;
+                Text {
+                    text: root.text;
+                    wrap: word-wrap;
+                    color: Theme.text-primary;
+                    font-size: Theme.body-size;
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: Theme.control-gap;
+                    Button {
+                        text: @tr("Check again");
+                        clicked => {
+                            popup.close();
+                            root.refresh();
+                        }
+                    }
+                    Button {
+                        text: @tr("Not now");
+                        clicked => {
+                            popup.close();
+                            root.dismissed();
+                        }
+                    }
+                    Button {
+                        text: @tr("Apply");
+                        kind: ButtonKind.primary;
+                        clicked => {
+                            popup.close();
+                            root.accepted();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // `[icon 20?] [title + description, both wrap] .... [!] [control column]` inside a Card. The control
 // column (children, right-aligned) is `control-column` wide: 360 px, 240 under a 720 px page (DS-3),
 // the same in every row of every page (the wrapping of the text on the left must not move it); the
 // "!" sits just left of the packed controls; an `info` hint is an "i" `pair-gap` after the title.
-export component Row inherits HorizontalLayout {
+export component Row inherits Rectangle {
     in property <image> icon;
     in property <string> title;
     // A hint about the setting: the "i" after the title, this text its tooltip (UI rule 35). Empty
@@ -183,122 +344,189 @@ export component Row inherits HorizontalLayout {
     in property <bool> text-only;
     // Why the controls are off while `enabled` is false: their tooltip (UI rule 31).
     in property <string> off-tip;
+    // A text area under a text-only row is this row's field: while `field-live` the search pick bumps
+    // `field-pick` and stops there; the area (its `pick` bound to this) focuses itself, nothing else.
+    in property <bool> field-live;
+    out property <int> field-pick;
     // Where the title's text starts (tests).
     out property <length> title-x: title.absolute-position.x;
-    spacing: Theme.icon-gap;
-    min-height: root.description == "" ? Theme.row-min-height : Theme.control-height;
-    if root.icon.width > 0: VerticalLayout {
-        alignment: center;
-        Image {
-            source: root.icon;
-            width: Theme.icon-size;
-            height: Theme.icon-size;
-            colorize: root.enabled ? Theme.text-primary : Theme.text-disabled;
-            accessible-role: none;
+    // What settings search flashes (`Shell.found`): the title unless set; empty: never (a row that
+    // exists twice on one page, or only in a state).
+    in property <string> search-key: root.title;
+    // A row that may get a suggestion (hold item 41) keeps a slot for it before the "!", so one
+    // appearing never moves the text or the controls; `suggestion` is its why, empty: none now.
+    in property <bool> can-suggest;
+    in property <string> suggestion;
+    callback suggestion-accepted();
+    callback suggestion-dismissed();
+    callback suggestion-refresh();
+    min-height: body.min-height;
+    preferred-height: body.preferred-height;
+    min-width: body.min-width;
+    preferred-width: body.preferred-width;
+    flash := Flash {
+        x: -Theme.space-2;
+        y: -Theme.space-1;
+        width: parent.width + 2 * Theme.space-2;
+        height: parent.height + 2 * Theme.space-1;
+        key: root.search-key;
+        ready => {
+            if (root.field-live) {
+                root.field-pick += 1;
+                return;
+            }
+            focus-anchor.focus();
+            Shell.found-ready();
         }
     }
-    VerticalLayout {
-        alignment: center;
-        spacing: Theme.title-gap;
-        horizontal-stretch: 1;
-        preferred-width: 0;
-        Rectangle {
-            min-height: title.min-height;
-            preferred-height: title.preferred-height;
-            title := CapText {
-                // Without an x Slint centres a narrowed child: the title would start half the "i" room in.
-                x: 0;
-                // The "i" keeps its room so a long title wraps before it, not under it.
-                width: parent.width - (root.info == "" ? 0 : Theme.pair-gap + Theme.icon-size);
-                height: 100%;
-                text: root.title;
-                ink: root.enabled ? Theme.text-primary : Theme.text-disabled;
-                wrap: root.elide ? TextWrap.no-wrap : TextWrap.word-wrap;
-                overflow: root.elide ? TextOverflow.elide : TextOverflow.clip;
+    body := HorizontalLayout {
+        spacing: Theme.icon-gap;
+        min-height: root.description == "" ? Theme.row-min-height : Theme.control-height;
+        if root.icon.width > 0: VerticalLayout {
+            alignment: center;
+            Image {
+                source: root.icon;
+                width: Theme.icon-size;
+                height: Theme.icon-size;
+                colorize: root.enabled ? Theme.text-primary : Theme.text-disabled;
+                accessible-role: none;
             }
-            if root.elide: TouchArea {
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: Theme.title-gap;
+            horizontal-stretch: 1;
+            preferred-width: 0;
+            Rectangle {
+                min-height: title.min-height;
+                preferred-height: title.preferred-height;
+                title := CapText {
+                    // Without an x Slint centres a narrowed child: the title would start half the "i" room in.
+                    x: 0;
+                    // The "i" keeps its room so a long title wraps before it, not under it.
+                    width: parent.width - (root.info == "" ? 0 : Theme.pair-gap + Theme.icon-size);
+                    height: 100%;
+                    text: root.title;
+                    ink: root.enabled ? Theme.text-primary : Theme.text-disabled;
+                    wrap: root.elide ? TextWrap.no-wrap : TextWrap.word-wrap;
+                    overflow: root.elide ? TextOverflow.elide : TextOverflow.clip;
+                }
+                if root.elide: TouchArea {
+                    Tip {
+                        text: title.text-width > title.width ? root.title : "";
+                        hovered: parent.has-hover;
+                        pressed: parent.pressed;
+                    }
+                }
+                // One line of the title's font: the "i" centres on the first line when the title wraps.
+                line := Text {
+                    visible: false;
+                    text: "X";
+                    font-size: Theme.body-size;
+                    accessible-role: none;
+                }
+                // Slint does not give where a wrapped line ends, so a wrapped title's "i" sits at the end
+                // of the first line's room (kept free above): never under the text, never on line two.
+                if root.info != "": InfoTip {
+                    x: min(title.text-width, title.width) + Theme.pair-gap;
+                    // The box is the text block's height (the layout gives it its preferred), so line one starts at 0.
+                    y: (line.preferred-height - self.height) / 2;
+                    text: root.info;
+                }
+            }
+            if root.description != "": Caption {
+                text: root.description;
+                color: root.enabled ? Theme.text-secondary : Theme.text-disabled;
+                wrap: word-wrap;
+            }
+        }
+        if root.can-suggest: VerticalLayout {
+            alignment: center;
+            SuggestSlot {
+                text: root.suggestion;
+                accepted => {
+                    root.suggestion-accepted();
+                }
+                dismissed => {
+                    root.suggestion-dismissed();
+                }
+                refresh => {
+                    root.suggestion-refresh();
+                }
+            }
+        }
+        // The "!" keeps this room so a warning never moves the text; it is drawn in the control column.
+        Rectangle {
+            width: Theme.icon-size;
+        }
+        Rectangle {
+            horizontal-stretch: 0;
+            preferred-width: root.text-only ? 0 : Theme.control-column;
+            min-width: self.preferred-width;
+            max-width: self.preferred-width;
+            min-height: controls.min-height;
+            preferred-height: controls.preferred-height;
+            // Next to the controls it warns about (a switch, a button), not alone at the column's start;
+            // never left of its kept room.
+            WarningSlot {
+                x: root.fill-controls ? -(Theme.icon-gap + Theme.icon-size) : max(-(Theme.icon-gap + Theme.icon-size), parent.width - controls.preferred-width - Theme.control-gap - Theme.icon-size);
+                y: 0;
+                height: parent.height;
+                text: root.warning;
+            }
+            // Under the controls: a locked control lets the pointer through and this says why (UI rule
+            // 31); a control that stays live (Open folder) keeps the pointer and its own tooltip.
+            // Over the controls only, so the "!" beside them keeps its own tooltip.
+            if Shell.locked || (!root.enabled && root.off-tip != ""): TouchArea {
+                x: root.fill-controls ? 0 : max(0, parent.width - controls.preferred-width);
+                width: parent.width - self.x;
                 Tip {
-                    text: title.text-width > title.width ? root.title : "";
+                    text: Shell.locked ? Shell.locked-tip : root.off-tip;
                     hovered: parent.has-hover;
                     pressed: parent.pressed;
                 }
             }
-            // One line of the title's font: the "i" centres on the first line when the title wraps.
-            line := Text {
+            // A parent TouchArea sees the hover and still hands the pointer to the controls.
+            hover := TouchArea {
+                enabled: root.full-text != "" && !Shell.locked;
+                // Settings search sends its Tab from here: the next stop is the row's first control, past
+                // the "i" and the "!". A stop only for the one frame the row is asked for.
+                focus-anchor := FocusScope {
+                    width: 0;
+                    height: 0;
+                    enabled: flash.waiting;
+                    focus-on-click: false;
+                }
+                // A row taller than its controls (title + description) centres them (DS-3.4).
+                VerticalLayout {
+                    alignment: center;
+                    controls := HorizontalLayout {
+                        alignment: root.fill-controls ? LayoutAlignment.stretch : LayoutAlignment.end;
+                        spacing: Theme.control-gap;
+                        @children
+                    }
+                }
+                // The Tab stop after the controls: the pick's Tab lands on an enabled control of this row or here,
+                // never past the row (a text-only row's field is a sibling, not the row's), so Space, arrows
+                // and typing never change a setting the user did not pick.
+                focus-tail := FocusScope {
+                    width: 0;
+                    height: 0;
+                    enabled: flash.waiting;
+                    focus-on-click: false;
+                }
+                Tip {
+                    text: measure.preferred-width > hover.width - Theme.control-height - Theme.space-3 ? root.full-text : "";
+                    hovered: hover.has-hover;
+                    pressed: hover.pressed;
+                }
+            }
+            measure := Text {
                 visible: false;
-                text: "X";
+                text: root.full-text;
                 font-size: Theme.body-size;
                 accessible-role: none;
             }
-            // Slint does not give where a wrapped line ends, so a wrapped title's "i" sits at the end
-            // of the first line's room (kept free above): never under the text, never on line two.
-            if root.info != "": InfoTip {
-                x: min(title.text-width, title.width) + Theme.pair-gap;
-                // The box is the text block's height (the layout gives it its preferred), so line one starts at 0.
-                y: (line.preferred-height - self.height) / 2;
-                text: root.info;
-            }
-        }
-        if root.description != "": Caption {
-            text: root.description;
-            color: root.enabled ? Theme.text-secondary : Theme.text-disabled;
-            wrap: word-wrap;
-        }
-    }
-    // The "!" keeps this room so a warning never moves the text; it is drawn in the control column.
-    Rectangle {
-        width: Theme.icon-size;
-    }
-    Rectangle {
-        horizontal-stretch: 0;
-        preferred-width: root.text-only ? 0 : Theme.control-column;
-        min-width: self.preferred-width;
-        max-width: self.preferred-width;
-        min-height: controls.min-height;
-        preferred-height: controls.preferred-height;
-        // Next to the controls it warns about (a switch, a button), not alone at the column's start;
-        // never left of its kept room.
-        WarningSlot {
-            x: root.fill-controls ? -(Theme.icon-gap + Theme.icon-size) : max(-(Theme.icon-gap + Theme.icon-size), parent.width - controls.preferred-width - Theme.control-gap - Theme.icon-size);
-            y: 0;
-            height: parent.height;
-            text: root.warning;
-        }
-        // Under the controls: a locked control lets the pointer through and this says why (UI rule
-        // 31); a control that stays live (Open folder) keeps the pointer and its own tooltip.
-        // Over the controls only, so the "!" beside them keeps its own tooltip.
-        if Shell.locked || (!root.enabled && root.off-tip != ""): TouchArea {
-            x: root.fill-controls ? 0 : max(0, parent.width - controls.preferred-width);
-            width: parent.width - self.x;
-            Tip {
-                text: Shell.locked ? Shell.locked-tip : root.off-tip;
-                hovered: parent.has-hover;
-                pressed: parent.pressed;
-            }
-        }
-        // A parent TouchArea sees the hover and still hands the pointer to the controls.
-        hover := TouchArea {
-            enabled: root.full-text != "" && !Shell.locked;
-            // A row taller than its controls (title + description) centres them (DS-3.4).
-            VerticalLayout {
-                alignment: center;
-                controls := HorizontalLayout {
-                    alignment: root.fill-controls ? LayoutAlignment.stretch : LayoutAlignment.end;
-                    spacing: Theme.control-gap;
-                    @children
-                }
-            }
-            Tip {
-                text: measure.preferred-width > hover.width - Theme.control-height - Theme.space-3 ? root.full-text : "";
-                hovered: hover.has-hover;
-                pressed: hover.pressed;
-            }
-        }
-        measure := Text {
-            visible: false;
-            text: root.full-text;
-            font-size: Theme.body-size;
-            accessible-role: none;
         }
     }
 }
@@ -322,6 +550,13 @@ export component ToggleRow inherits CardFrame {
     in property <string> info;
     in property <string> warning;
     in property <string> off-tip;
+    // See Row.
+    in property <string> search-key: root.title;
+    in property <bool> can-suggest;
+    in property <string> suggestion;
+    callback suggestion-accepted();
+    callback suggestion-dismissed();
+    callback suggestion-refresh();
     in-out property <bool> checked;
     in property <bool> enabled: true;
     in property <bool> locked: Shell.locked;
@@ -357,6 +592,18 @@ export component ToggleRow inherits CardFrame {
             warning: root.warning;
             off-tip: root.off-tip;
             enabled: root.live;
+            search-key: root.search-key;
+            can-suggest: root.can-suggest;
+            suggestion: root.suggestion;
+            suggestion-accepted => {
+                root.suggestion-accepted();
+            }
+            suggestion-dismissed => {
+                root.suggestion-dismissed();
+            }
+            suggestion-refresh => {
+                root.suggestion-refresh();
+            }
             switch := Switch {
                 checked <=> root.checked;
                 enabled: root.enabled;
@@ -430,6 +677,8 @@ export component ScrollView {
     out property <bool> overflows: box.overflows;
     // The content's height; the layout inside reports it.
     property <length> content-h: body.preferred-height;
+    // What scrolls: the content, at least the view's own height.
+    out property <length> content-height: max(root.height, root.content-h);
     min-height: 0;
     preferred-height: root.content-h;
     box := ScrollBox {

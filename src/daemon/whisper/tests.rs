@@ -1506,6 +1506,7 @@ fn history_record(r: &Rig, cfg: &Config) -> (PathBuf, &'static str) {
         raw: false,
         held: Vec::new(),
         delivered: None,
+        levels: None,
     };
     fs::write(base.with_extension("json"), meta.to_json().unwrap()).unwrap();
     (dir, id)

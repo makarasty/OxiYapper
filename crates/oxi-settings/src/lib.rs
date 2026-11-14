@@ -5,6 +5,7 @@ mod ctx;
 mod debounce;
 pub mod ipc;
 mod pages;
+mod search;
 #[cfg(test)]
 mod testing;
 
@@ -30,8 +31,8 @@ mod generated {
     slint::include_modules!();
 }
 pub use generated::{
-    AppWindow, AudioState, ChipLevel, HomeState, ModelState, Page, PathText, Shell, SystemState,
-    TestRow, TestState, TextState, Theme as Tokens, ThemeChoice, Toast,
+    AppWindow, AudioKey, AudioState, ChipLevel, HomeState, ModelState, Page, PathText, Shell,
+    SystemState, TestRow, TestState, TextState, Theme as Tokens, ThemeChoice, Toast,
 };
 pub use pages::test::{Finish, Mic, bind_with as bind_test_page};
 
@@ -553,6 +554,15 @@ fn open_inner(
             ipc.restart_daemon();
         }
     });
+    on_status_clicked(&window, &ctx);
+    search::bind(&window);
+    pages::test::bind(&window, &ctx);
+    bind(&window, &ctx);
+    Ok(window)
+}
+
+/// A click on an actionable status chip.
+fn on_status_clicked(window: &AppWindow, ctx: &Ctx) {
     window.on_status_clicked({
         let (weak, ipc) = (window.as_weak(), ctx.ipc.clone());
         move || {
@@ -561,10 +571,6 @@ fn open_inner(
             }
         }
     });
-
-    pages::test::bind(&window, &ctx);
-    bind(&window, &ctx);
-    Ok(window)
 }
 
 /// The window got the focus (or a test says so): look again, and tell the pages that follow a file
@@ -700,7 +706,7 @@ fn show_chip(window: &AppWindow, chip: &ipc::Chip) {
 /// button does. The normal state takes no click.
 fn status_clicked(window: &AppWindow, chip: &ipc::Chip) {
     match (chip.level, chip.target) {
-        (Level::Attention, Some(target)) => open_target(window, target),
+        (Level::Attention, Some(target)) => open_target(window, target, chip.model_tab),
         (Level::Down, _) if window.get_daemon_start() => window.invoke_start_daemon(),
         (Level::Down, _) if window.get_daemon_restart() => window.invoke_restart_daemon(),
         _ => {}
@@ -709,7 +715,7 @@ fn status_clicked(window: &AppWindow, chip: &ipc::Chip) {
 
 /// Opens the page and sub-tab that fix the chip's status; no tab means the page's first one, not
 /// the sub-tab the user left it on.
-fn open_target(window: &AppWindow, target: Target) {
+fn open_target(window: &AppWindow, target: Target, model_tab: i32) {
     // The Audio page's tabs, in `SettingsTab` order.
     let view = target.tab.map_or(0, |tab| match tab {
         SettingsTab::Microphone => 0,
@@ -720,7 +726,7 @@ fn open_target(window: &AppWindow, target: Target) {
     match target.page {
         SettingsPage::Model => {
             window.set_page(Page::Model);
-            window.global::<ModelState>().set_tab(0);
+            window.global::<ModelState>().set_tab(model_tab);
         }
         SettingsPage::Audio => {
             window.set_page(Page::Audio);
@@ -1023,10 +1029,10 @@ mod tests {
             (
                 Attention::CpuFallback { reason: "x".into() },
                 Page::Model,
-                None,
+                Some(2),
             ),
             (Attention::OutOfMemory { cpu: true }, Page::Model, None),
-            (Attention::OutOfMemory { cpu: false }, Page::Model, None),
+            (Attention::OutOfMemory { cpu: false }, Page::Model, Some(2)),
             (Attention::NoMicrophone, Page::Audio, Some(0)),
             (sound(false), Page::Audio, Some(2)),
             (sound(true), Page::Audio, Some(3)),
@@ -1048,14 +1054,15 @@ mod tests {
             );
             window.invoke_status_clicked();
             assert_eq!(window.get_page(), page, "{item:?}");
-            match view {
-                Some(view) => {
+            match (page, view) {
+                (Page::Audio, Some(view)) => {
                     assert_eq!(window.global::<AudioState>().get_view(), view, "{item:?}");
                 }
-                None => assert_eq!(
+                // ia-map 3.8: a GPU problem opens Speed (Run the model on), the rest Models.
+                (_, view) => assert_eq!(
                     window.global::<ModelState>().get_tab(),
-                    0,
-                    "{item:?}: the Models list"
+                    view.unwrap_or(0),
+                    "{item:?}: the Model tab that fixes it"
                 ),
             }
         }

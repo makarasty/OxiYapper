@@ -7,7 +7,9 @@
   Starts the `real_window` example (built first unless -NoBuild), which places the window off every
   screen, saves the runtime renderer's own snapshot of it to -Out once the window has settled and
   exits (no OS capture: PrintWindow of an off-screen window came back flat white in 4 runs of 10).
-  Only the process started here is closed. -Tab is passed on for pages that get sub-tabs. Fails
+  Only the process started here is closed. -Tab is passed on for pages that get sub-tabs
+  (model: models|languages|speed|accuracy; text: dictionary|replacements|words|formatting|commands;
+  paste: paste|file|rules; system: general|history (or recordings)|about; audio, test: see real_window.rs). Fails
   (non-zero) when the runtime renderer is not skia-software (-AllowSoftware accepts the software
   one) or when the shot window took the foreground. The Audio page opens the default microphone
   for its meter (in memory).

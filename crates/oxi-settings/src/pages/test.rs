@@ -1738,6 +1738,10 @@ impl PageState {
             file.config.audio.normalize = set.normalize;
             file.config.audio.denoise = set.denoise;
             file.config.audio.trim = set.trim;
+            // The Audio page's own edits do the same: else picking another mic and back loses it.
+            file.config
+                .audio
+                .remember_device(oxi_platform::capture::default_input_name().as_deref());
             file.config.model.id = set.model;
         }
         let saved = self.ctx.save();

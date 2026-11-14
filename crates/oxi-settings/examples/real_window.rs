@@ -14,6 +14,7 @@
 //!
 //! States a plain start cannot reach come from the environment (all synthetic, all optional):
 //! - `OXI_SHOT_BANNER=<text>`: the broken-config banner with that text.
+//! - `OXI_SHOT_LEARN`: synthetic hand-edited history entries, so the Text page shows its suggestions.
 //! - `OXI_SHOT_RULES=<n>`: `n` per-app rules in the config.
 //! - `OXI_SHOT_HISTORY=<n>`: `n` History records, every seventh a long one.
 //! - `OXI_SHOT_STATS=1`: about half a year of Home statistics.
@@ -23,6 +24,7 @@
 //!   with `h`, only the pointer moved there, one step per settle. Never aim one at Play or Listen
 //!   (the page plays through the real speakers), at a folder or file button, or at the daemon
 //!   banner's Start.
+//! - `OXI_SHOT_SEARCH=<text>`: the settings search popup open with `text` in its field.
 
 // No console: a console exe started by the script shares the caller's console and was killed
 // from outside in about 1 run of 40 (exit 0xC000013A, or 0xC0000142 while attaching to it). The
@@ -136,6 +138,7 @@ fn page(name: &str) -> Option<Page> {
         "audio" => Page::Audio,
         "model" => Page::Model,
         "text" => Page::Text,
+        "paste" => Page::Paste,
         "overlay" => Page::Overlay,
         "history" => Page::History,
         "test" => Page::Test,
@@ -149,17 +152,22 @@ fn open_tab(window: &AppWindow, page: Page, name: &str) -> Result<(), String> {
     let tabs: &[&str] = match page {
         Page::Test => &["record", "results"],
         Page::Audio => &["microphone", "recording", "start", "stop"],
-        Page::Model => &["models", "settings", "advanced"],
+        Page::Model => &["models", "languages", "speed", "accuracy"],
         Page::Text => &[
             "dictionary",
             "replacements",
-            "paste",
-            "rules",
-            "processing",
             "words",
+            "formatting",
+            "commands",
         ],
-        Page::System => &["general", "recordings"],
+        Page::Paste => &["paste", "file", "rules"],
+        Page::System => &["general", "history", "about"],
         _ => &[],
+    };
+    // The map's names for the System tabs (ia-map 3.8) work too.
+    let name = match (page, name) {
+        (Page::System, "recordings" | "history-and-files") => "history",
+        _ => name,
     };
     let Some(view) = tabs.iter().position(|t| *t == name) else {
         return Err(format!("no sub-tab \"{name}\" on this page: {tabs:?}"));
@@ -170,6 +178,7 @@ fn open_tab(window: &AppWindow, page: Page, name: &str) -> Result<(), String> {
         Page::Audio => window.global::<AudioState>().set_view(view),
         Page::Model => window.global::<ModelState>().set_tab(view),
         Page::Text => window.global::<TextState>().set_tab(view),
+        Page::Paste => window.global::<TextState>().set_paste_tab(view),
         Page::System => window.global::<SystemState>().set_tab(view),
         _ => {}
     }
@@ -217,6 +226,46 @@ fn seed(layout: &Layout) -> Result<Option<Summary>, Box<dyn std::error::Error>> 
             .collect();
         oxi_platform::wav::write_wav(&day.join("120000-000.wav"), &samples)
             .map_err(|_| "cannot write the synthetic recording")?;
+    }
+    if env::var_os("OXI_SHOT_LEARN").is_some() {
+        // Six synthetic hand edits (final full stop and "so" taken away), one doubted word and a
+        // repeated phrase: every Text page suggestion of item 41 has something to say.
+        let day = layout.history_dir().join("2026-11-11");
+        fs::create_dir_all(&day)?;
+        for i in 0..6 {
+            let stem = format!("1000{i:02}-000");
+            let meta = oxi_core::history::Meta {
+                original: Some(oxi_core::history::Previous {
+                    text: "So, synthetic note for the shot.".into(),
+                    model: "turbo".into(),
+                    language: "en".into(),
+                    settings: None,
+                    newer: false,
+                }),
+                words: vec![Word {
+                    w: " Zorblat".into(),
+                    p: 0.2,
+                    t0: None,
+                    t1: None,
+                }],
+                ..oxi_core::history::Meta::basic(
+                    &format!("2026-11-11/{stem}"),
+                    1000,
+                    Status::Done,
+                    "turbo",
+                    "en",
+                )
+            };
+            fs::write(
+                day.join(format!("{stem}.json")),
+                meta.to_json()
+                    .map_err(|_| "cannot write a synthetic entry")?,
+            )?;
+            fs::write(
+                day.join(format!("{stem}.txt")),
+                "Synthetic note for the shot",
+            )?;
+        }
     }
     if env::var_os("OXI_SHOT_STATS").is_none() {
         return Ok(None);
@@ -327,6 +376,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(window) = weak.upgrade() {
             oxi_settings::own_accent(&window);
             oxi_settings::caption_theme(&window, window.get_theme());
+            if let Ok(query) = env::var("OXI_SHOT_SEARCH") {
+                window.invoke_open_search(query.into());
+            }
         }
     })?;
     Timer::single_shot(idle.map_or(DEADLINE, Duration::from_secs), || {

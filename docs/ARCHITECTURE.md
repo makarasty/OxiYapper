@@ -156,6 +156,9 @@ device = ""                    # empty = system default
 gain_db = 0.0
 normalize = true
 denoise = false
+denoise_strength = "strong"     # light | medium | strong | auto (by the room noise of each dictation); used while denoise is on
+cut_rumble = false             # high-pass at 80 Hz: fan, desk knocks, hum
+per_device = false             # remember gain, noise, rumble, stereo side and speech sensitivity per microphone ([audio.device_sets])
 trim = true
 tail_ms = 100
 max_seconds = 3600             # 60 min cap (owner, 2026-11-11; was 10 min in SPEC round 4)
@@ -180,7 +183,6 @@ enabled = true
 position = "bottom-right"      # bottom-centre, top-left, ...
 hide_over_fullscreen = false
 [sounds]
-enabled = true
 volume = 0.5                  # 0 to 1
 start = "apa-hit-3"            # a built-in id (apa-hit-3, apa-hit-2, rx-25, cancel-soft, boop-3, ...) or the path of a .wav or .ogg file, or "off" (any sound); the old ids rise, fall, pop, tick, fault still load as the default of their sound
 stop = "apa-hit-2"
@@ -213,7 +215,7 @@ hold_gap_ms = 400              # push mode: a re-press this soon after a release
 channel = "mix"                # mix | left | right
 vad_sensitivity = "normal"     # low | normal | high: how quiet a sound still counts as voice for the trim
 [model]
-preload_at_start = false       # load the model when the daemon starts
+preload_at_start = false       # load the model when the daemon starts (also on turning it on, a model change, wake)
 [model.by_language]            # empty = off; an explicit dictation language picks its model
 # ru = "podlodka"
 [model.advanced]               # "auto" keeps the engine's own choice
@@ -244,10 +246,15 @@ pause_paragraph_ms = 0         # 0 = off, else 1000..10000
 filler_filter = false
 fillers = ["э", "ээ", "эм", "мм", "um", "uh", "erm"]
 voice_commands = false
+# [text.voice.new_line] | [text.voice.new_paragraph] | [text.voice.delete_last]: on = true, phrases = ["new line", ...]
+#   (defaults: "новая строка"+"new line", "новый абзац"+"new paragraph", "удали последнее"+"delete that"+"scratch that";
+#   a phrase is matched as whole words, case and punctuation ignored; a phrase two commands share is dropped from the later one at load)
 confidence_filter = false      # holds a segment back when its mean word confidence is under confidence_min, or is
                                # under 0.6 while its 30 s window got 0.6 or more for "no speech" (the model scores
                                # a window, not a segment, so the window alone never holds anything); held text stays in the history
 confidence_min = 0.35          # 0.05..0.95
+no_final_period = false        # drops one full stop at the end (not an ellipsis); never on a snippet's text
+small_first_letter = false     # first letter small, unless the first word is one letter or has another capital
 # [[text.snippets]] with trigger = "..." and text = "..."
 [output]
 file_mode = "off"              # off | also | only: append each dictation to a daily file
@@ -300,7 +307,7 @@ Order, and where each step can fail:
 
 Steps 3-7 are pure functions in `oxi-core::audio`, tested on synthetic signals. Defaults (normalise on, trim on, denoise off, tail 100 ms) are confirmed against the 8 reference phrases in M5 before they ship.
 
-History (on by default, R1.3): the audio is written to disk while recording (streaming, `<name>.wav.part` through hound), so a crash or power loss keeps what was recorded; at start the daemon recovers a leftover `.part`. On a normal stop the file is finalized (`finalize()`) and renamed. The coordinator hands the final text to the history thread (`src/daemon/history.rs`) once it is known; it writes the `.txt` and a `.json` meta file beside the `.wav` (a documented, stable wav + txt + json entry format, so other tools can read it; the settings History page offers Copy path), then applies `oxi-core::history::expired` (age, then size, oldest first) to the day folders. Everything lives in one app-owned folder: `OxiYapper history` inside `[history] folder`, or `history/` in the data dir when that is empty or relative. It is created with a `.oxiyapper-history` marker; a folder without the marker is never listed or changed, and a non-empty one of that name is refused. Inside it, only `YYYY-MM-DD/HHMMSS-mmm.wav|txt|json` names with a real date and time are ever listed or deleted, and at start (and on every config change) the leftovers of a killed write directly in a day folder are handled: a `HHMMSS-mmm.wav.part` with audio in it is recovered (finalized and renamed, the entry has no text), an empty one and any `HHMMSS-mmm.txt.tmp` are swept. The age limit sits out a pass with an entry dated after today, or with today more than 31 days past every earlier entry (a clock jump); the size limit always applies. A clean-up failure is logged per entry, the pass goes on, and it shows as its own "Old history not removed" warning. A write error becomes a status warning and never stops the paste; the text is never logged.
+History (on by default, R1.3): the audio is written to disk while recording (streaming, `<name>.wav.part` through hound), so a crash or power loss keeps what was recorded; at start the daemon recovers a leftover `.part`. On a normal stop the file is finalized (`finalize()`) and renamed. The coordinator hands the final text to the history thread (`src/daemon/history.rs`) once it is known; it writes the `.txt` and a `.json` meta file beside the `.wav` (a documented, stable wav + txt + json entry format, so other tools can read it; the settings History page offers Copy path), then applies `oxi-core::history::expired` (age, then size, oldest first) to the day folders. Everything lives in one app-owned folder: `OxiYapper history` inside `[history] folder`, or `history/` in the data dir when that is empty or relative. It is created with a `.oxiyapper-history` marker; a folder without the marker is never listed or changed, and a non-empty one of that name is refused. Inside it, only `YYYY-MM-DD/HHMMSS-mmm.wav|txt|json` names with a real date and time are ever listed or deleted, and at start (and on every config change) the leftovers of a killed write directly in a day folder are handled: a `HHMMSS-mmm.wav.part` with audio in it is recovered (finalized and renamed, the entry has no text), an empty one and any `HHMMSS-mmm.txt.tmp` are swept. The age limit sits out a pass with an entry dated after today, or with today more than 31 days past every earlier entry (a clock jump); the size limit always applies. A clean-up failure is logged per entry, the pass goes on, and it shows as its own "Old history not removed" warning. A write error becomes a status warning and never stops the paste; the text is never logged. The json also keeps `levels` (peak, speech, room floor and rumble in dB, the gaps from the edges to the voice; numbers only, measured after the boost and before denoise, trim and normalise by `oxi-core::audio::LevelStats` in the capture pipeline), which the Audio page reads for its suggestions (`oxi-core::suggest`, item 41). The Text page's suggestions (doubted words, hand-edit habits, repeated phrases, deleted fillers, held parts added back) count the existing `words`, `original`/`previous`, `held` and `.txt` of the newest 200 entries on a worker thread (`oxi-core::learn`, pure); only the words and counts it shows come back to the UI thread, nothing is stored or logged.
 
 File transcription: "Transcribe a file" decodes in a child process of the same exe (`OxiYapper --decode-child <path>`, no console window), because symphonia can panic or abort on a damaged file (one bad `.m4a` atom) and the release build aborts on panic. The child writes one reply to its stdout: 16 kHz mono f32 samples with their count, or the reason it refused the file. The daemon checks the count against the 120-minute cap before reserving memory, treats a crash, an abort, a non-zero exit or a malformed reply as "the file is damaged", and kills the child on Stop or when the settings window closes. File sample rates outside 4..384 kHz are refused. Every decoding child joins one kill-on-close Job object the daemon holds for its whole life, so a child never outlives the daemon, whether it quits or crashes; an orderly quit also kills the child at once.
 

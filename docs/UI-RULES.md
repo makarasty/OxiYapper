@@ -72,7 +72,7 @@ How to look:
 
 24. **Maximize is allowed and the window has no maximum size (owner 2026-11-10); the content adapts.** It resizes from the minimum (720x520) to full screen.
     Check: the maximize button works and dragging an edge never stops at a limit. Every page is checked at 720x520, 1280x860 and full screen. Controls and short cards keep their natural size; an empty area below short content is allowed.
-25. **No scroll on normal pages. A page that does not fit gets horizontal sub-tabs in the header row (rule 34).** The sidebar stays short and works icons-only. Page scrolling stays only as SPEC's fallback. Two one-view pages that cannot be split into meaningful sub-tabs, Home and Hotkey with the on-screen keyboard open, may use a tight layout at small window sizes under a token-defined height instead of sub-tabs: it hides captions, the legend, headings and instruction text and keeps actions in view (owner, 2026-11-10). System General's tight layout at low height (system.slint:49, token `system-tight-height` in tokens.slint) is also allowed.
+25. **No scroll on normal pages. A page that does not fit gets horizontal sub-tabs in the header row (rule 34).** The sidebar stays short (at most 11 entries with the search field, so it fits 520 px) and works icons-only. Page scrolling stays only as SPEC's fallback. Two one-view pages that cannot be split into meaningful sub-tabs, Home and Hotkey with the on-screen keyboard open, may use a tight layout at small window sizes under a token-defined height instead of sub-tabs: it hides captions, the legend, headings and instruction text and keeps actions in view (owner, 2026-11-10). System General's tight layout at low height (system.slint:49, token `system-tight-height` in tokens.slint) is also allowed.
     Check: a real shot of every page and sub-tab at 720x520 with default content shows no page scrollbar; at the same size the icons-only sidebar shows every section.
 26. **Lists and galleries stretch and scroll inside themselves.** In a larger window a list, a gallery or a grid (the Per-app grid, the model gallery, History) takes the free space and shows more rows or tiles; when it has more than fits, it scrolls by itself and the page around it does not. No scroll inside a scroll.
     Check: at 720x520, 1280x860 and full screen with a list over its height, wheel over the list moves only the list, and the larger window shows more of it.
@@ -93,12 +93,14 @@ How to look:
 | Model | nothing downloaded, no GPU | all states at once (ready, downloading, paused, failed), long model and GPU names |
 | Text: Dictionary | empty file | a very long file, over the token budget |
 | Text: Replacements | empty file | a very long file, invalid lines |
-| Per-app rules | no rules, scan finds nothing | over 100 apps, long app names |
+| Paste: Per-app rules | no rules, scan finds nothing | over 100 apps, long app names |
+| Model: Languages | only the first row | every whisper language listed, a deleted model |
+| Settings search | nothing matches | a word in 30 rows |
 | Overlay | overlay turned off | every position selected in turn |
 | Sounds gallery | built-in sounds only | own file with a long name |
 | Test | no recording, no result | every scenario in the table, a long phrase |
 | System | nothing to warn about | all warnings on, a long folder path |
-| About | no extra states | narrowest window: blocks stay whole |
+| System: About | no extra states | narrowest window: blocks stay whole |
 
 ## Content
 

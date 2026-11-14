@@ -303,6 +303,8 @@ export component Meter inherits Rectangle {
     in property <bool> live: true;
     in property <string> empty-text;
     in property <string> idle-text;
+    // A verdict on the last test, a tag at the left end of the track over the bars; empty: none.
+    in property <string> result;
     property <length> inset: Theme.space-1;
     property <length> pitch: Theme.meter-pitch;
     property <length> bar-width: Theme.meter-bar;
@@ -342,6 +344,21 @@ export component Meter inherits Rectangle {
         horizontal-alignment: center;
         vertical-alignment: center;
         accessible-role: none;
+    }
+    if root.result != "": Rectangle {
+        x: root.inset;
+        y: root.inset;
+        width: tag.preferred-width + 2 * Theme.space-2;
+        height: root.height - 2 * root.inset;
+        border-radius: Theme.radius-control;
+        background: Theme.bg-control;
+        accessible-role: none;
+        tag := Caption {
+            text: root.result;
+            color: Theme.text-primary;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
     }
 }
 

@@ -299,7 +299,7 @@ export component TextField {
     property <bool> key-focus;
     changed has-focus => {
         if (self.has-focus) {
-            self.key-focus = !hover-area.has-hover;
+            self.key-focus = !hover-area.has-hover && !Shell.quiet-focus;
         }
         self.focus-press = self.has-focus && hover-area.has-hover && !self.clear-hover;
     }
@@ -456,6 +456,8 @@ export component TextArea {
     in property <bool> force-editing;
     in property <bool> force-focus;
     out property <bool> has-focus: input.has-focus;
+    // The owning Row's `field-pick`: a search pick on that row puts the focus here, quietly.
+    in property <int> pick;
     callback edited(string);
 
     public function select-all() {
@@ -465,9 +467,14 @@ export component TextArea {
     property <bool> live: root.enabled && !root.locked;
     // shortcut: as TextField's `key-focus`.
     property <bool> key-focus;
+    changed pick => {
+        Shell.quiet-focus = true;
+        input.focus();
+        Shell.quiet-release += 1;
+    }
     changed has-focus => {
         if (self.has-focus) {
-            self.key-focus = !hover-area.has-hover;
+            self.key-focus = !hover-area.has-hover && !Shell.quiet-focus;
         }
     }
 

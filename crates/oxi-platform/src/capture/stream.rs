@@ -174,13 +174,15 @@ impl Capture for CpalCapture {
         // The device name, never audio: a later "it recorded the old mic" is read off this line.
         tracing::info!(device = %name, fell_back, "input device picked");
 
+        // The opened device's own switches when they are remembered per microphone.
+        let opts = opts.for_device(&name);
         let supported = dev.default_input_config()?;
         let (channels, rate, format) = (
             usize::from(supported.channels()),
             supported.sample_rate(),
             supported.sample_format(),
         );
-        let pipeline = Pipeline::new(rate, opts)?;
+        let pipeline = Pipeline::new(rate, &opts)?;
         let channel = opts.channel;
         let (tx, rx) = RingBuffer::new(rate as usize * channels * RING_SECONDS);
         let shared = Arc::new(Shared {

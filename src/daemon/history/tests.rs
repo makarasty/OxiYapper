@@ -58,6 +58,7 @@ fn save_spooled(cfg: History, spool: Option<PathBuf>) -> HistoryCmd {
         words: vec![word("hello", 0.3, None)],
         held: Vec::new(),
         delivered: None,
+        levels: None,
         cfg,
         spool,
         carried: Vec::new(),
@@ -420,6 +421,7 @@ fn a_kept_cancelled_recording_is_saved_with_no_text_and_says_so() {
         words: Vec::new(),
         held: Vec::new(),
         delivered: None,
+        levels: None,
         cfg: cfg(true),
         spool: None,
         carried: Vec::new(),
@@ -672,6 +674,7 @@ fn merged_save(spool: Option<PathBuf>, carried: &Path) -> HistoryCmd {
         words: Vec::new(),
         held: Vec::new(),
         delivered: None,
+        levels: None,
         cfg: cfg(true),
         spool,
         carried: vec![carried.to_owned()],
@@ -1169,6 +1172,16 @@ fn a_save_keeps_the_words_and_a_retranscribe_keeps_timed_ones() {
 #[test]
 fn a_save_keeps_the_held_parts_and_how_it_was_delivered() {
     let dir = owned_temp("held");
+    // The recording's loudness numbers go into the json too (hold item 41).
+    let levels = oxi_core::audio::Levels {
+        peak_db: -3,
+        speech_db: -24,
+        floor_db: -62,
+        rumble_db: -30,
+        start_gap_ms: Some(210),
+        end_gap_ms: Some(40),
+        gain_db: Some(0),
+    };
     let held = vec![history::HeldPart {
         text: "doubtful".into(),
         t0: 100,
@@ -1179,16 +1192,19 @@ fn a_save_keeps_the_held_parts_and_how_it_was_delivered() {
     if let HistoryCmd::Save {
         held: h,
         delivered: d,
+        levels: l,
         ..
     } = &mut cmd
     {
         h.clone_from(&held);
         *d = Some(history::Delivered::Filtered);
+        *l = Some(levels);
     }
     assert_eq!(handle(cmd, &dir, clock(), &ctx), None);
     let base = dir.join("2026-11-08/130000-123");
     let meta = meta_of(&base);
     assert_eq!(meta.held, held);
+    assert_eq!(meta.levels, Some(levels));
     assert_eq!(meta.delivered, Some(history::Delivered::Filtered));
     let json = fs::read_to_string(base.with_extension(JSON)).unwrap();
     assert!(json.contains("\"why\": \"no_speech\""), "{json}");
@@ -1203,7 +1219,12 @@ fn a_save_keeps_the_held_parts_and_how_it_was_delivered() {
         None
     );
     let plain = fs::read_to_string(dir.join("2026-11-08/130001-123.json")).unwrap();
-    assert!(!plain.contains("held") && !plain.contains("delivered") && !plain.contains("raw"));
+    assert!(
+        !plain.contains("held")
+            && !plain.contains("delivered")
+            && !plain.contains("raw")
+            && !plain.contains("levels")
+    );
     // Review d03 #11: Transcribe again, an edit and a restore keep the held parts.
     let id = &hid("2026-11-08/130000-123");
     set_text(&dir, id, "again", &ctx()).unwrap();

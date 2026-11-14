@@ -15,6 +15,8 @@ thread_local! {
     /// The system default input the fake reports, and the device `fake_default_mic` opens.
     static DEFAULT: RefCell<Option<String>> = const { RefCell::new(None) };
     static SILENT_CLIP: Cell<bool> = const { Cell::new(false) };
+    /// The level of the test clip's constant samples.
+    static CLIP_LEVEL: Cell<f32> = const { Cell::new(0.1) };
     static PLAYED: Cell<usize> = const { Cell::new(0) };
     static PICKED: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
     /// What the fake folder dialog answers.
@@ -66,7 +68,7 @@ impl Capture for Fake {
         if SILENT_CLIP.get() {
             Err(AudioError::MicSilence.into())
         } else {
-            Ok(vec![0.1; SAMPLE_RATE as usize])
+            Ok(vec![CLIP_LEVEL.get(); SAMPLE_RATE as usize])
         }
     }
 }
@@ -178,6 +180,7 @@ fn reset() {
     LIST_FAILS.set(false);
     DEFAULT.set(None);
     SILENT_CLIP.set(false);
+    CLIP_LEVEL.set(0.1);
     PLAYED.set(0);
     PICKED.set(None);
     PICK_START.set(None);
@@ -222,7 +225,7 @@ fn window_on(
 /// Open the Audio page; building it runs its `init`, which starts the meter.
 fn show_audio(window: &AppWindow) {
     window.set_page(Page::Audio);
-    assert!(ElementHandle::find_by_accessible_label(window, "Gain").count() > 0);
+    assert!(ElementHandle::find_by_accessible_label(window, "Microphone boost").count() > 0);
 }
 
 fn frame(ms: u64) {
@@ -384,12 +387,79 @@ fn test_button_records_then_plays_back_then_clears() {
         Some(false),
         "test clip must not be normalised"
     );
+    assert_eq!(
+        state.get_mic_result(),
+        "Good level",
+        "the verdict is in the meter"
+    );
     frame(1_000);
     assert!(state.get_testing(), "playback stays open for a tail");
     frame(PLAY_TAIL.0);
     assert!(!state.get_testing());
     frame(3_000);
     assert_eq!(toast(), "", "a toast leaves by itself");
+    assert_eq!(state.get_mic_result(), "Good level", "the verdict stays");
+    state.invoke_test();
+    assert_eq!(state.get_mic_result(), "", "a new test clears it");
+    window.set_page(Page::About);
+    frame(40);
+    assert_eq!(state.get_mic_result(), "");
+}
+
+/// "Not now" on the mic test's offer is for what the person saw: the recordings' boost suggestion
+/// under it is not dismissed (it was never shown), in this session or in the saved keys.
+#[test]
+fn not_now_on_the_mic_offer_keeps_the_hidden_recordings_suggestion() {
+    use oxi_core::audio::Levels;
+    let (window, page) = window_on("mic-offer-not-now", None, fake);
+    window.show().unwrap();
+    show_audio(&window);
+    let waited = Instant::now();
+    while page.reading.borrow().is_some() {
+        assert!(
+            waited.elapsed() < Duration::from_secs(5),
+            "no history answer"
+        );
+        thread::sleep(Duration::from_millis(1));
+        page.tick();
+    }
+    let loud_history = Levels {
+        peak_db: -36,
+        speech_db: -46,
+        floor_db: -70,
+        rumble_db: -40,
+        start_gap_ms: Some(300),
+        end_gap_ms: Some(300),
+        gain_db: Some(0),
+    };
+    *page.levels.borrow_mut() = Some(vec![loud_history; 12]);
+    page.after_edit();
+    let state = window.global::<AudioState>();
+    let recordings = "12 of your last 12 recordings were quiet. Raise the boost to +20 dB?";
+    assert_eq!(state.get_gain_tip().as_str(), recordings);
+
+    CLIP_LEVEL.set(0.002);
+    state.invoke_test();
+    frame(TEST_LENGTH.0);
+    assert!(
+        state.get_gain_tip().starts_with("The test sounded quiet."),
+        "the mic offer takes the row: {}",
+        state.get_gain_tip()
+    );
+    state.invoke_suggestion(AudioKey::Gain, false);
+    assert_eq!(state.get_gain_tip().as_str(), recordings, "it comes back");
+    assert!(
+        super::super::recent::dismissed(&page.ctx.layout.data_dir).is_empty(),
+        "an unseen suggestion was kept as dismissed"
+    );
+
+    // Not now on the one that is on show is still kept.
+    state.invoke_suggestion(AudioKey::Gain, false);
+    assert_eq!(state.get_gain_tip().as_str(), "");
+    assert_eq!(
+        super::super::recent::dismissed(&page.ctx.layout.data_dir).len(),
+        1
+    );
 }
 
 #[test]
@@ -861,25 +931,27 @@ fn typed_values_are_clamped_and_snapped_before_saving() {
     window.show().unwrap();
     show_audio(&window);
     let saved = || page.ctx.config.borrow().config.audio.clone();
-    field(&window, "Gain").set_accessible_value("-50");
+    field(&window, "Microphone boost").set_accessible_value("-50");
     assert!((saved().gain_db - -20.0).abs() < f64::EPSILON, "clamped");
-    field(&window, "Gain").set_accessible_value("12.6");
+    field(&window, "Microphone boost").set_accessible_value("12.6");
     assert!((saved().gain_db - 13.0).abs() < f64::EPSILON, "rounded");
     window.global::<AudioState>().set_view(1);
-    field(&window, "Tail after release").set_accessible_value("333");
+    field(&window, "Keep recording after release").set_accessible_value("333");
     assert_eq!(saved().tail_ms, 350, "snapped to the 50 ms step");
     window.global::<AudioState>().set_view(0);
     // Not a number: nothing changes.
-    field(&window, "Gain").set_accessible_value("loud");
+    field(&window, "Microphone boost").set_accessible_value("loud");
     assert!((saved().gain_db - 13.0).abs() < f64::EPSILON);
     // L1: a positive gain shows its sign.
     assert_eq!(
-        field(&window, "Gain").accessible_value().as_deref(),
+        field(&window, "Microphone boost")
+            .accessible_value()
+            .as_deref(),
         Some("+13")
     );
     // Real typing: click, go to the end, one more digit, Enter commits and clamps.
     window.global::<AudioState>().set_view(1);
-    field(&window, "Max length").mock_single_click(PointerEventButton::Left);
+    field(&window, "Longest recording").mock_single_click(PointerEventButton::Left);
     let w = window.window();
     for text in [SharedString::from(K::End), "5".into(), K::Return.into()] {
         w.dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
@@ -916,12 +988,12 @@ fn leaving_a_field_untouched_keeps_a_value_off_the_step() {
     window.global::<AudioState>().set_view(1);
     let tail = || page.ctx.config.borrow().config.audio.tail_ms;
     for leave in [K::Return, K::Tab] {
-        field(&window, "Tail after release").mock_single_click(PointerEventButton::Left);
+        field(&window, "Keep recording after release").mock_single_click(PointerEventButton::Left);
         press(&window, leave);
         assert_eq!(tail(), 125, "the 50 ms step snapped an unedited value");
     }
     assert_eq!(
-        field(&window, "Tail after release")
+        field(&window, "Keep recording after release")
             .accessible_value()
             .as_deref(),
         Some("125")
@@ -946,7 +1018,7 @@ fn nan_inf_and_empty_are_refused_and_the_old_value_stays() {
         }
         press(&window, K::Return);
     };
-    field(&window, "Max length").mock_single_click(PointerEventButton::Left);
+    field(&window, "Longest recording").mock_single_click(PointerEventButton::Left);
     // Selecting works, or the refusals below would prove nothing.
     type_over("25");
     assert_eq!(seconds(), 1500);
@@ -955,10 +1027,12 @@ fn nan_inf_and_empty_are_refused_and_the_old_value_stays() {
         assert_eq!(seconds(), 1500, "{text:?} was accepted");
     }
     assert_eq!(
-        field(&window, "Max length").accessible_value().as_deref(),
+        field(&window, "Longest recording")
+            .accessible_value()
+            .as_deref(),
         Some("25")
     );
-    field(&window, "Max length").set_accessible_value("nan");
+    field(&window, "Longest recording").set_accessible_value("nan");
     assert_eq!(seconds(), 1500, "set-value took nan");
 }
 
@@ -1415,4 +1489,33 @@ fn the_meter_stream_key_follows_the_device_and_the_channel() {
     opts.channel = AudioChannel::Right;
     assert_ne!(left, stream_key(&opts));
     assert_ne!(left, "USB Mic");
+}
+
+/// d04c (hold item 41, candidate 4): on "System default" with the switches remembered per
+/// microphone, a default Windows moves to brings its own set onto the page; the old default keeps
+/// its own. Rides the page's existing 2 s relist: no new timer.
+#[test]
+fn a_moved_default_brings_its_own_set() {
+    i_slint_backend_testing::init_no_event_loop();
+    let config = "version = 2\n[audio]\nper_device = true\ngain_db = 6.0\n\
+                  [audio.device_sets.Laptop]\ngain_db = -3.0\n";
+    let (window, page) = window_on("default-set", Some(config), fake);
+    window.show().unwrap();
+    DEFAULT.set(Some("Headset".into()));
+    show_audio(&window);
+    frame(40);
+    let gain = || page.ctx.config.borrow().config.audio.gain_db;
+    let state = window.global::<AudioState>();
+    assert_eq!(gain(), 6.0);
+    assert_eq!(
+        page.ctx.config.borrow().config.audio.device_sets["Headset"].gain_db,
+        6.0,
+        "the switches are saved for the default in use"
+    );
+    DEFAULT.set(Some("Laptop".into()));
+    frame(RELIST.0);
+    assert_eq!((gain(), state.get_gain_db()), (-3.0, -3.0));
+    DEFAULT.set(Some("Headset".into()));
+    frame(RELIST.0);
+    assert_eq!((gain(), state.get_gain_db()), (6.0, 6.0));
 }

@@ -107,6 +107,18 @@ pub struct Chip {
     pub tooltip: String,
     /// The page (and tab) that fixes it; `None` when nothing in the settings does.
     pub target: Option<Target>,
+    /// The Model sub-tab a Model target opens (ia-map 3.8): 2, Speed, whose "Run the model on"
+    /// fixes a GPU fallback or a graphics card out of memory; else 0, Models.
+    pub model_tab: i32,
+}
+
+/// The Model sub-tab that fixes `a`: the device row on Speed, else the gallery on Models.
+#[must_use]
+pub const fn model_tab(a: &Attention) -> i32 {
+    match a {
+        Attention::CpuFallback { .. } | Attention::OutOfMemory { cpu: false } => 2,
+        _ => 0,
+    }
 }
 
 /// The chip for `link` and the daemon's last `Attention` list. A daemon that does not answer
@@ -126,12 +138,14 @@ pub fn chip(link: Link, attention: &[Attention]) -> Chip {
             level: Level::Attention,
             tooltip: strings::attention_text(first),
             target: Some(first.target()),
+            model_tab: model_tab(first),
         },
         _ => Chip {
             text,
             level,
             tooltip: String::new(),
             target: None,
+            model_tab: 0,
         },
     }
 }

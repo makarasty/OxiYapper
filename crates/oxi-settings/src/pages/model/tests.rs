@@ -39,7 +39,7 @@ fn shows(window: &AppWindow, part: &str) -> bool {
 fn window(name: &str) -> (AppWindow, Ipc, Receiver<Cmd>, Layout) {
     let opened = linked("model", name, Page::Model);
     // Building the page runs its `init`, which asks the daemon.
-    assert!(has(&opened.0, "Use my own .bin"));
+    assert!(has(&opened.0, "Use my own model file"));
     opened
 }
 
@@ -297,7 +297,7 @@ fn partial_downloads_are_listed_and_deleted() {
     assert!(shows(&window, "Whisper large-v3: Not downloaded"));
     assert_eq!(
         window.global::<Toast>().get_text(),
-        "Deleted 0 MB of partial downloads"
+        "Deleted 0 MB of unfinished downloads"
     );
 }
 
@@ -340,7 +340,7 @@ fn cancelled_download_with_a_part_file_shows_paused() {
 #[test]
 fn relative_custom_path_is_refused_and_not_saved() {
     let (window, _ipc, _sent, layout) = window("relative");
-    view(&window, "Use my own .bin");
+    view(&window, "Use my own model file");
     let field = with_role(&window, "Model file", AccessibleRole::TextInput);
     field.set_accessible_value("mine.bin".to_owned());
     assert!(has(&window, RELATIVE));
@@ -350,7 +350,7 @@ fn relative_custom_path_is_refused_and_not_saved() {
 #[test]
 fn an_answer_for_an_older_edit_is_dropped() {
     let (window, _ipc, _sent, layout) = window("stale");
-    view(&window, "Use my own .bin");
+    view(&window, "Use my own model file");
     let good = layout.config_dir.join("good.bin");
     fs::write(&good, b"synthetic").unwrap();
     let field = with_role(&window, "Model file", AccessibleRole::TextInput);
@@ -369,43 +369,114 @@ fn saved_model(layout: &Layout) -> oxi_core::config::Model {
     ConfigFile::parse(&text).unwrap().config.model
 }
 
-/// Review d04 #9, arch-plan 9.3: the Model page edits `model.by_language`; a language with
-/// its own model moves to the top of the list, Default takes it out.
+/// Owner items 33, 36 (ia-map 3.5): Model > Languages edits `model.by_language` as rows
+/// "language -> model", sorted by name; one row is "Active now"; a gone model gets its "!";
+/// the last Combo item opens Models; Delete takes the row away.
 #[test]
-fn by_language_row_gives_a_language_its_model_and_default_takes_it_away() {
+fn language_rows_give_a_language_its_model_and_mark_the_one_in_use() {
     let (window, _ipc, _sent, layout) = window("bylang");
     let s = window.global::<ModelState>();
-    let names = || -> Vec<SharedString> { s.get_by_language_names().iter().collect() };
-    let offered = || -> Vec<SharedString> { s.get_by_language_models().iter().collect() };
-    // d04-fix 1: nothing downloaded and no own file: Default alone is offered.
-    assert_eq!(offered(), ["Default"]);
+    let rows = || -> Vec<LanguageModel> { s.get_lang_rows().iter().collect() };
+    assert!(rows().is_empty(), "only the first row");
+    assert!(s.get_default_active(), "Auto: the first row runs");
     let entry = models::find("turbo").unwrap();
     on_disk(&layout, entry.file_name, entry.size);
     s.invoke_shown();
-    assert_eq!(
-        offered(),
-        ["Default", entry.display_name],
-        "only what is on disk"
-    );
-    let turbo = 1;
-    assert_eq!(names().len(), languages::LANGUAGES.len());
-    let ru = names().iter().position(|n| n == "Russian").unwrap();
-    s.invoke_by_language_shown(int(ru));
-    assert_eq!(s.get_by_language_model(), 0, "no model of its own yet");
-    s.invoke_by_language_picked(int(ru), int(turbo));
+
+    // "Add language" offers neither Auto nor a language with a row, and adds the default model.
+    s.invoke_add_search("russ".into());
+    let offered: Vec<SharedString> = s.get_add_rows().iter().collect();
+    assert_eq!(offered, ["Russian"]);
+    s.invoke_add_chosen(0);
+    s.invoke_add_search("english".into());
+    s.invoke_add_chosen(0);
     let saved = saved_model(&layout).by_language;
+    let default = saved_model(&layout).id;
+    assert_eq!(saved.get(&LanguageKey(Language::RU)), Some(&default));
+    let names: Vec<SharedString> = rows().iter().map(|r| r.name.clone()).collect();
+    assert_eq!(names, ["English", "Russian"], "by name, not by code");
+    s.invoke_add_search("russ".into());
+    assert_eq!(s.get_add_rows().row_count(), 0, "Russian has its row");
+
+    // The row's Combo: the downloaded model, then "Download another model".
+    let ru = rows()[1].clone();
+    let items: Vec<SharedString> = ru.models.iter().collect();
     assert_eq!(
-        saved.get(&LanguageKey(Language::RU)).map(String::as_str),
+        items.last().map(SharedString::as_str),
+        Some(DOWNLOAD_ANOTHER)
+    );
+    let turbo = items
+        .iter()
+        .position(|i| i == entry.display_name)
+        .expect("turbo offered");
+    s.invoke_lang_model_picked(1, int(turbo));
+    assert_eq!(
+        saved_model(&layout)
+            .by_language
+            .get(&LanguageKey(Language::RU))
+            .map(String::as_str),
         Some("turbo")
     );
-    assert_eq!(names()[0], "Russian", "first, still shown with its model");
+    s.invoke_lang_model_picked(1, int(items.len() - 1));
+    assert_eq!(s.get_tab(), 0, "Download another model opens Models");
     assert_eq!(
-        (s.get_by_language(), s.get_by_language_model()),
-        (0, int(turbo))
+        saved_model(&layout)
+            .by_language
+            .get(&LanguageKey(Language::RU))
+            .map(String::as_str),
+        Some("turbo"),
+        "that item writes nothing"
     );
-    s.invoke_by_language_picked(0, 0);
-    assert!(saved_model(&layout).by_language.is_empty());
-    assert_eq!(names().len(), languages::LANGUAGES.len());
+
+    // Dictating in Russian: its row is the one in use, the first row is not.
+    s.invoke_language_search("russian".into());
+    s.invoke_language_chosen(0);
+    assert!(rows()[1].active && !rows()[0].active && !s.get_default_active());
+
+    // English keeps the default model, which is not on disk: its "!" says dictation fails.
+    if !default.is_empty() && default != "turbo" {
+        assert!(
+            rows()[0].warning.starts_with("Not downloaded"),
+            "{:?}",
+            rows()[0].warning
+        );
+    }
+
+    s.invoke_lang_removed(1);
+    assert!(
+        !saved_model(&layout)
+            .by_language
+            .contains_key(&LanguageKey(Language::RU))
+    );
+    assert!(s.get_default_active(), "no Russian row: the first row runs");
+}
+
+/// ia-map 3.2: each tab's "Reset to Auto" resets its own group; the hint is never reset.
+#[test]
+fn reset_to_auto_resets_its_own_group_and_keeps_the_hint() {
+    let (window, _ipc, _sent, layout) = window("resetgroup");
+    let s = window.global::<ModelState>();
+    s.invoke_adv_changed(1, 1, 0.0);
+    s.invoke_adv_changed(8, 1, 0.0);
+    s.invoke_adv_prompt_edited("synthetic hint".into());
+    s.invoke_adv_reset(0);
+    let a = saved_model(&layout).advanced;
+    assert_eq!(a.flash_attn, Advanced::default().flash_attn, "Speed reset");
+    assert_ne!(
+        a.suppress_non_speech,
+        Advanced::default().suppress_non_speech,
+        "Accuracy kept"
+    );
+    s.invoke_adv_reset(1);
+    let a = saved_model(&layout).advanced;
+    assert_eq!(
+        a.suppress_non_speech,
+        Advanced::default().suppress_non_speech
+    );
+    assert_eq!(
+        a.initial_prompt, "synthetic hint",
+        "the hint is the person's text"
+    );
 }
 
 #[test]
@@ -537,9 +608,9 @@ fn status_warning_shows_the_cpu_note() {
         warnings: vec![note.clone(), "sounds.start: empty, using rise".into()],
     };
     push(&ipc, status);
-    // On the Settings sub-tab, beside the GPU; a hidden sub-tab shows nothing.
+    // On the Speed sub-tab, beside the GPU; a hidden sub-tab shows nothing.
     assert!(!has(&window, &note));
-    with_role(&window, "Settings", AccessibleRole::Tab).invoke_accessible_default_action();
+    with_role(&window, "Speed", AccessibleRole::Tab).invoke_accessible_default_action();
     // The note alone (an exact label): the sound line is the Audio page's.
     assert!(has(&window, &note));
 }
@@ -635,7 +706,7 @@ fn custom_path_problems() {
 #[test]
 fn custom_path_answers_come_from_the_worker() {
     let (window, _ipc, _sent, layout) = window("worker");
-    view(&window, "Use my own .bin");
+    view(&window, "Use my own model file");
     let field = with_role(&window, "Model file", AccessibleRole::TextInput);
     let missing = layout.config_dir.join("gone.bin");
     field.set_accessible_value(missing.to_string_lossy().into_owned());
@@ -1224,7 +1295,7 @@ fn fractions() {
 }
 
 /// Review b04: "runs on" names where the loaded model is, the processor after a GPU failure too,
-/// and what "Run on" picks while nothing is loaded.
+/// and what "Run the model on" picks while nothing is loaded.
 #[test]
 fn runs_on_follows_the_loaded_device() {
     let dev = |name: &str, description: &str| Device {

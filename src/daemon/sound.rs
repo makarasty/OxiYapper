@@ -239,7 +239,8 @@ impl Player {
         self.done = get("done", &sounds.done, Sound::Done);
         self.cancel = get("cancel", &sounds.cancel, Sound::Cancel);
         self.error = get("error", &sounds.error, Sound::Error);
-        self.enabled = sounds.enabled;
+        // The first config turns the player on; each sound has its own Off (no master switch, S80).
+        self.enabled = true;
         self.done_enabled = sounds.done_enabled;
         self.volume = sounds.volume;
         self.ready = Default::default();
@@ -603,7 +604,7 @@ mod tests {
         player.configure(&sounds);
         player.play_sound(Sound::Done, Instant::now());
         assert_eq!(player.warnings(), [] as [SoundWarning; 0]);
-        sounds.enabled = false;
+        sounds.start = "off".into();
         player.configure(&sounds);
         player.play_sound(Sound::Start, Instant::now());
         assert_eq!(player.warnings(), [] as [SoundWarning; 0]);

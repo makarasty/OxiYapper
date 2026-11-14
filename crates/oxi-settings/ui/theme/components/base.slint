@@ -1,6 +1,6 @@
 // Small pieces every control shares: the focus visual, the hover tooltip, the card frame and the
 // caption text.
-import { Theme } from "../tokens.slint";
+import { Theme, Shell } from "../tokens.slint";
 import { Icons } from "../icons.slint";
 
 // The frame of every card-shaped surface (Card, ClickCard, ToggleRow, StatCard): fill, 1 px stroke,
@@ -45,7 +45,7 @@ export component FocusRing {
 // passes its own answer along (`take-focus(ring)`).
 export global KeyFocus {
     public pure function from-key(reason: FocusReason) -> bool {
-        return reason == FocusReason.tab-navigation;
+        return reason == FocusReason.tab-navigation && !Shell.quiet-focus;
     }
 
     // `from-key` for a control that kept its own answer (`was`): a popup it opened by key and

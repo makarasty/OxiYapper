@@ -7,6 +7,7 @@
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,14 +16,16 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use oxi_core::audio::{AudioError, Level, SAMPLE_RATE, db_to_linear};
-use oxi_core::config::{Audio, AudioChannel, Config, Sounds, VadSensitivity};
+use oxi_core::audio::{AudioError, Level, LevelStats, Levels, SAMPLE_RATE, db_to_linear};
+use oxi_core::config::{Audio, AudioChannel, Config, EdgePreset, Noise, Sounds, VadSensitivity};
 use oxi_core::constants::PLAY_TAIL;
+use oxi_core::history;
 use oxi_core::ipc::{Push, Request};
 use oxi_core::machine::Sound;
 use oxi_core::overlay::{METER_HZ, Meter};
 use oxi_core::sounds::{Builtin, Choice, FolderSound, OFF, is_plain_local_path, scan_folder};
 use oxi_core::strings::{self, NO_MIC};
+use oxi_core::suggest::{AudioAdvice, MicLevel, advise, mic_check};
 use oxi_core::types::Millis;
 use oxi_platform::capture::{
     Capture, CaptureError, CaptureEvent, CpalCapture, LevelMeter, default_input_name,
@@ -221,6 +224,12 @@ fn bind_with<C: Capture + 'static>(window: &AppWindow, ctx: &Ctx, io: &Io<C>) ->
         scanning: RefCell::new(None),
         folder: RefCell::new(Vec::new()),
         test: RefCell::new(None),
+        levels: RefCell::new(None),
+        levels_at: Cell::new(Millis(0)),
+        reading: RefCell::new(None),
+        advice: RefCell::new(AudioAdvice::default()),
+        mic_offer: Cell::new(None),
+        dismissed: RefCell::new(super::recent::dismissed(&ctx.layout.data_dir)),
     });
     state.set_can_browse(cfg!(windows));
     state.set_preview_off(ctx.ipc.link().off_reason(PREVIEW_NEEDS_DAEMON).into());
@@ -231,6 +240,10 @@ fn bind_with<C: Capture + 'static>(window: &AppWindow, ctx: &Ctx, io: &Io<C>) ->
     state.on_edited(move |key, value| p.edited(key, value));
     let p = Rc::clone(&page);
     state.on_test(move || p.start_test());
+    let p = Rc::clone(&page);
+    state.on_suggestion(move |key, apply| p.suggestion(key, apply));
+    let p = Rc::clone(&page);
+    state.on_recheck(move || p.read_levels());
     let p = Rc::clone(&page);
     state.on_sound_picked(move |tile| p.sound_picked(tile));
     let p = Rc::clone(&page);
@@ -273,6 +286,19 @@ struct PageState<C> {
     /// The usable files of `sounds.folder`, read when the page is shown or the folder is picked.
     folder: RefCell<Vec<FolderSound>>,
     test: RefCell<Option<MicTest<C>>>,
+    /// The loudness numbers of the newest history entries, read when the page opens (again once
+    /// a day old, or on "Check again"), for the suggestions (hold item 41).
+    levels: RefCell<Option<Vec<Levels>>>,
+    /// When that read started: one older than a day is done again when the page opens.
+    levels_at: Cell<Millis>,
+    /// That read, running on its thread; [`Self::tick`] takes the answer.
+    reading: RefCell<Option<Receiver<Vec<Levels>>>>,
+    /// What the numbers suggest for the settings as they are now.
+    advice: RefCell<AudioAdvice>,
+    /// The last mic test's offer for the boost: what it heard and the boost to set.
+    mic_offer: Cell<Option<(MicLevel, f64)>>,
+    /// Keys of the suggestions given "Not now"; kept in the data folder (`recent::DISMISSED_FILE`).
+    dismissed: RefCell<HashSet<String>>,
 }
 
 /// A folder scan under way; `picked`: the folder was just picked, so an empty answer is toasted.
@@ -301,9 +327,16 @@ impl<C: Capture + 'static> PageState<C> {
             return;
         };
         let state = window.global::<AudioState>();
+        let device = self.ctx.config.borrow().config.audio.device.clone();
+        self.relist(&state, &device);
+        // After the relist: a default that moved since may have brought its own set.
         let config = self.ctx.config.borrow().config.clone();
-        self.relist(&state, &config.audio.device);
         self.rescan(PathBuf::from(&config.sounds.folder), false);
+        if self.levels.borrow().is_none()
+            || super::recent::stale(self.levels_at.get().0, (self.now)().0)
+        {
+            self.read_levels();
+        }
         push_config(
             &state,
             &config,
@@ -323,6 +356,22 @@ impl<C: Capture + 'static> PageState<C> {
         );
     }
 
+    /// Read the newest history entries' numbers on a thread (a few hundred small files); `tick`
+    /// takes the answer. A read already running is not doubled.
+    fn read_levels(&self) {
+        if self.reading.borrow().is_some() {
+            return;
+        }
+        let config = self.ctx.config.borrow();
+        let dir = history::folder(&config.config.history, &self.ctx.layout.history_dir());
+        self.levels_at.set((self.now)());
+        let (tx, answer) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(suggest::recent_levels(&dir));
+        });
+        *self.reading.borrow_mut() = Some(answer);
+    }
+
     /// Read the device list and the system default; the picker is only rebuilt when the list
     /// changed (keeps an open popup). True when either changed. Also asks for the daemon's warnings: it does not push them, and a
     /// bad sound file is found on its worker thread after the preview request has returned.
@@ -334,6 +383,9 @@ impl<C: Capture + 'static> PageState<C> {
         state.set_list_error(error.into());
         let default = (self.default_input)();
         let moved = self.default.replace(default.clone()) != default;
+        if moved {
+            self.follow_default(state);
+        }
         let devices = Devices::new(listed.unwrap_or_default(), configured);
         if *self.devices.borrow() == devices {
             return moved;
@@ -344,6 +396,26 @@ impl<C: Capture + 'static> PageState<C> {
         true
     }
 
+    /// "System default" with the switches remembered per microphone: a default Windows moved to
+    /// brings its own set onto the page (a recording picks it at its open either way). Saved
+    /// only when something changed.
+    fn follow_default(&self, state: &AudioState<'_>) {
+        let mut file = self.ctx.config.borrow_mut();
+        let audio = &mut file.config.audio;
+        if !audio.per_device || !audio.device.is_empty() {
+            return;
+        }
+        let before = audio.clone();
+        audio.recall_device(self.default.borrow().as_deref());
+        if *audio == before {
+            return;
+        }
+        drop(file);
+        report(&self.window, self.ctx.save());
+        push_audio(state, &self.ctx.config.borrow().config.audio);
+        self.refresh_tips(state);
+    }
+
     /// One meter frame, or the close of the capture once the page is gone.
     fn tick(&self) {
         let Some(window) = self.window.upgrade() else {
@@ -351,6 +423,16 @@ impl<C: Capture + 'static> PageState<C> {
         };
         self.take_scan(&window);
         let state = window.global::<AudioState>();
+        let read = self.reading.borrow().as_ref().map(Receiver::try_recv);
+        match read {
+            Some(Ok(levels)) => {
+                *self.reading.borrow_mut() = None;
+                *self.levels.borrow_mut() = Some(levels);
+                self.refresh_tips(&state);
+            }
+            Some(Err(TryRecvError::Disconnected)) => *self.reading.borrow_mut() = None,
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
         let mut live = self.live.borrow_mut();
         if window.get_page() == Page::Audio && window.window().is_visible() {
             let opts = self.ctx.config.borrow().config.audio.clone();
@@ -390,6 +472,7 @@ impl<C: Capture + 'static> PageState<C> {
             state.set_silence(SharedString::new());
             *self.test.borrow_mut() = None;
             state.set_testing(false);
+            state.set_mic_result(SharedString::new());
         }
         state.set_live(live.is_open());
         // Leading silence is drawn as nothing, not a row of 2 px dots (audit M9); the Meter keeps
@@ -411,6 +494,7 @@ impl<C: Capture + 'static> PageState<C> {
         if self.test.borrow().is_some() {
             return;
         }
+        state.set_mic_result(SharedString::new());
         let opts = Audio {
             trim: false,
             normalize: false,
@@ -441,12 +525,23 @@ impl<C: Capture + 'static> PageState<C> {
                 name,
                 until,
             }) if now >= until => {
-                let played = capture
-                    .finish()
-                    .and_then(|clip| Ok(((self.play)(&clip, SAMPLE_RATE)?, clip.len())));
+                let played = capture.finish().and_then(|clip| {
+                    let mut measure = LevelStats::new(SAMPLE_RATE);
+                    measure.feed(&clip);
+                    Ok((
+                        (self.play)(&clip, SAMPLE_RATE)?,
+                        clip.len(),
+                        measure.levels(),
+                    ))
+                });
                 match played {
-                    Ok((sound, len)) => {
+                    Ok((sound, len, levels)) => {
                         let ms = len as u64 * 1000 / u64::from(SAMPLE_RATE);
+                        let gain = self.ctx.config.borrow().config.audio.gain_db;
+                        let (heard, offer) = mic_check(&levels, gain);
+                        self.mic_offer.set(offer.map(|to| (heard, to)));
+                        self.refresh_tips(&state);
+                        state.set_mic_result(suggest::verdict(heard).into());
                         *test = Some(MicTest::Playing {
                             _sound: sound,
                             until: now + Millis(ms) + PLAY_TAIL,
@@ -657,7 +752,10 @@ impl<C: Capture + 'static> PageState<C> {
         let config = &mut file.config;
         let audio = &mut config.audio;
         match key {
-            AudioKey::Device => audio.device = self.devices.borrow().name(whole(value)),
+            AudioKey::Device => {
+                audio.device = self.devices.borrow().name(whole(value));
+                audio.recall_device(self.default.borrow().as_deref());
+            }
             AudioKey::Gain => audio.gain_db = f64::from(value.round()),
             AudioKey::Sensitivity => {
                 let range = Audio::METER_SENSITIVITY_DB;
@@ -665,15 +763,104 @@ impl<C: Capture + 'static> PageState<C> {
             }
             AudioKey::Normalize => audio.normalize = value != 0.0,
             AudioKey::Trim => audio.trim = value != 0.0,
-            AudioKey::Denoise => audio.denoise = value != 0.0,
+            AudioKey::Noise => audio.set_noise(Noise::ALL[(whole(value) as usize).min(4)]),
+            AudioKey::Edges => audio.set_edges(EdgePreset::ALL[(whole(value) as usize).min(3)]),
+            AudioKey::Rumble => audio.cut_rumble = value != 0.0,
+            AudioKey::PerDevice => audio.per_device = value != 0.0,
             AudioKey::Tail => audio.tail_ms = whole(value),
             AudioKey::MaxMinutes => audio.max_seconds = whole(value).max(1) * 60,
             AudioKey::Volume => config.sounds.volume = f64::from(whole(value).min(100)) / 100.0,
             AudioKey::Channel => audio.channel = channel_of(whole(value)),
             AudioKey::Vad => audio.vad_sensitivity = vad_of(whole(value)),
         }
+        if key != AudioKey::Device {
+            audio.remember_device(self.default.borrow().as_deref());
+        }
         drop(file);
         report(&self.window, self.ctx.save());
+        self.after_edit();
+    }
+
+    /// The rows one edit can move (a device's saved set, a preset over two rows) and the
+    /// suggestions, which go once the settings they suggest are in.
+    fn after_edit(&self) {
+        if let Some(window) = self.window.upgrade() {
+            let state = window.global::<AudioState>();
+            push_audio(&state, &self.ctx.config.borrow().config.audio);
+            self.refresh_tips(&state);
+        }
+    }
+
+    fn refresh_tips(&self, state: &AudioState<'_>) {
+        let advice = self
+            .levels
+            .borrow()
+            .as_deref()
+            .map_or_else(AudioAdvice::default, |l| {
+                advise(l, &self.ctx.config.borrow().config.audio)
+            });
+        let advice = suggest::without(&advice, &self.dismissed.borrow());
+        let mut offer = self.mic_offer.get();
+        let gain = self.ctx.config.borrow().config.audio.gain_db;
+        if offer.is_some_and(|(_, to)| (to - gain).abs() < 0.5) {
+            offer = None;
+            self.mic_offer.set(None);
+        }
+        let t = suggest::tips(&advice, offer, gain);
+        state.set_noise_tip(t.noise.into());
+        state.set_gain_tip(t.gain.into());
+        state.set_edges_tip(t.edges.into());
+        state.set_rumble_tip(t.rumble.into());
+        *self.advice.borrow_mut() = advice;
+    }
+
+    /// A suggestion's Apply or Not now.
+    fn suggestion(&self, key: AudioKey, apply: bool) {
+        let slot = match key {
+            AudioKey::Noise => Slot::Noise,
+            AudioKey::Gain => Slot::Gain,
+            AudioKey::Edges => Slot::Edges,
+            AudioKey::Rumble => Slot::Rumble,
+            _ => return,
+        };
+        if !apply {
+            // The mic test's offer on show is not the recordings' suggestion under it: only
+            // what the person saw is kept as "not now".
+            let seen_offer = slot == Slot::Gain && self.mic_offer.take().is_some();
+            let key = suggest::key(slot, &self.advice.borrow()).filter(|_| !seen_offer);
+            if let Some(key) = key {
+                super::recent::add_dismissed(&self.ctx.layout.data_dir, &key);
+                self.dismissed.borrow_mut().insert(key);
+            }
+            self.after_edit();
+            return;
+        }
+        let advice = self.advice.borrow().clone();
+        let mut file = self.ctx.config.borrow_mut();
+        let audio = &mut file.config.audio;
+        match slot {
+            Slot::Noise => {
+                if let Some(a) = advice.noise {
+                    audio.set_noise(a.value);
+                }
+            }
+            Slot::Gain => {
+                let to = self.mic_offer.take().map(|(_, to)| to);
+                if let Some(to) = to.or(advice.gain_db.map(|a| a.value)) {
+                    audio.gain_db = to;
+                }
+            }
+            Slot::Edges => {
+                if let Some(a) = advice.edges {
+                    audio.set_edges(a.value);
+                }
+            }
+            Slot::Rumble => audio.cut_rumble = true,
+        }
+        audio.remember_device(self.default.borrow().as_deref());
+        drop(file);
+        report(&self.window, self.ctx.save());
+        self.after_edit();
     }
 }
 
@@ -727,30 +914,12 @@ fn push_config(state: &AudioState<'_>, config: &Config, devices: &Devices, folde
     let audio = &config.audio;
     state.set_devices(ModelRc::from(Rc::new(VecModel::from(devices.rows()))));
     state.set_device(devices.row_of(&audio.device));
-    #[expect(clippy::cast_possible_truncation, reason = "gain is a few dB")]
-    state.set_gain_db(audio.gain_db as f32);
+    push_audio(state, audio);
     state.set_sensitivity_db(audio.meter_sensitivity_db);
-    state.set_channel(match audio.channel {
-        AudioChannel::Mix => 0,
-        AudioChannel::Left => 1,
-        AudioChannel::Right => 2,
-    });
-    state.set_vad(match audio.vad_sensitivity {
-        VadSensitivity::Low => 0,
-        VadSensitivity::Normal => 1,
-        VadSensitivity::High => 2,
-    });
     state.set_normalize(audio.normalize);
     state.set_trim(audio.trim);
-    state.set_denoise(audio.denoise);
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "ms and s values are far below 2^24"
-    )]
-    {
-        state.set_tail_ms(audio.tail_ms as f32);
-        state.set_max_minutes(audio.max_seconds as f32 / 60.0);
-    }
+    #[expect(clippy::cast_precision_loss, reason = "s values are far below 2^24")]
+    state.set_max_minutes(audio.max_seconds as f32 / 60.0);
     push_sounds(state, &config.sounds, folder);
     let defaults = Config::default();
     #[expect(
@@ -768,6 +937,32 @@ fn push_config(state: &AudioState<'_>, config: &Config, devices: &Devices, folde
         state.set_default_max_minutes(defaults.audio.max_seconds as f32 / 60.0);
     }
     state.set_default_volume(f32::from(percent(defaults.sounds.volume)));
+}
+
+/// Push the audio values one edit can change together: a microphone's saved set (boost, noise,
+/// rumble, stereo side, speech sensitivity) and "Don't cut my words" over its two rows.
+fn push_audio(state: &AudioState<'_>, audio: &Audio) {
+    #[expect(clippy::cast_possible_truncation, reason = "gain is a few dB")]
+    state.set_gain_db(audio.gain_db as f32);
+    state.set_channel(match audio.channel {
+        AudioChannel::Mix => 0,
+        AudioChannel::Left => 1,
+        AudioChannel::Right => 2,
+    });
+    state.set_vad(match audio.vad_sensitivity {
+        VadSensitivity::Low => 0,
+        VadSensitivity::Normal => 1,
+        VadSensitivity::High => 2,
+    });
+    let index = |i: Option<usize>| i32::try_from(i.unwrap_or(0)).unwrap_or(0);
+    state.set_noise(index(Noise::ALL.iter().position(|&n| n == audio.noise())));
+    state.set_edges(index(
+        EdgePreset::ALL.iter().position(|&e| e == audio.edges()),
+    ));
+    state.set_cut_rumble(audio.cut_rumble);
+    state.set_per_device(audio.per_device);
+    #[expect(clippy::cast_precision_loss, reason = "ms values are far below 2^24")]
+    state.set_tail_ms(audio.tail_ms as f32);
 }
 
 /// Push the sound settings: each sound's tiles and pick, and the volume.
@@ -1156,6 +1351,9 @@ impl<C> Live<C> {
         self.meter = Meter::new(BARS, self.sensitivity);
     }
 }
+
+mod suggest;
+use suggest::Slot;
 
 #[cfg(test)]
 mod tests;

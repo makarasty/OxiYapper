@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use common::{assert_nothing_moved, config, has, layout, open, open_linked, spots, with_role};
 use i_slint_backend_testing::{AccessibleRole, ElementHandle, ElementQuery};
-use oxi_core::config::Config;
+use oxi_core::config::{Config, EdgePreset, Noise};
 use oxi_core::device::DeviceChoice;
 use oxi_core::ipc::{Push, Request};
 use oxi_core::machine::Phase;
@@ -63,27 +63,59 @@ fn every_control_writes_its_key() {
     let slider = |label: &str, value: &str| {
         with_role(&window, label, AccessibleRole::Spinbox).set_accessible_value(value);
     };
-    slider("Gain", "-6");
+    slider("Microphone boost", "-6");
     assert!((saved(&l).audio.gain_db - -6.0).abs() < f64::EPSILON);
-    slider("Meter sensitivity", "12");
+    slider("Level bar sensitivity", "12");
     assert!((saved(&l).audio.meter_sensitivity_db - 12.0).abs() < f32::EPSILON);
     tab(&window, "Recording");
-    slider("Tail after release", "300");
+    slider("Keep recording after release", "300");
     assert_eq!(saved(&l).audio.tail_ms, 300);
-    slider("Max length", "15");
+    slider("Longest recording", "15");
     assert_eq!(saved(&l).audio.max_seconds, 900);
 
     for (label, get) in [
         (
-            "Normalise level",
+            "Even out loudness",
             (|c: &Config| c.audio.normalize) as fn(&Config) -> bool,
         ),
-        ("Trim silence", |c: &Config| c.audio.trim),
-        ("Noise suppression", |c: &Config| c.audio.denoise),
+        ("Cut silence at the ends", |c: &Config| c.audio.trim),
+        ("Cut low rumble", |c: &Config| c.audio.cut_rumble),
     ] {
         with_role(&window, label, AccessibleRole::Switch).invoke_accessible_default_action();
         assert_eq!(get(&saved(&l)), !get(&defaults), "{label}");
     }
+    // The two named choices of hold item 41: one row each over the keys they set.
+    pick(&window, "Reduce background noise", 1);
+    assert_eq!(saved(&l).audio.noise(), Noise::Light);
+    pick(&window, "Reduce background noise", 4);
+    assert_eq!(saved(&l).audio.noise(), Noise::Auto);
+    pick(&window, "Don't cut my words", 1);
+    let audio = saved(&l).audio;
+    assert_eq!((audio.edges(), audio.tail_ms), (EdgePreset::Careful, 300));
+    let combo = with_role(&window, "Don't cut my words", AccessibleRole::Combobox);
+    slider("Keep recording after release", "250");
+    assert_eq!(
+        combo.accessible_value().as_deref(),
+        Some("Custom"),
+        "a hand-set tail"
+    );
+
+    tab(&window, "Microphone");
+    with_role(
+        &window,
+        "Remember for this microphone",
+        AccessibleRole::Switch,
+    )
+    .invoke_accessible_default_action();
+    let audio = saved(&l).audio;
+    assert!(audio.per_device);
+    // With "System default" the set is the default device's (its name; "" when none is known).
+    assert_eq!(audio.device_sets.len(), 1, "{:?}", audio.device_sets.keys());
+    assert_eq!(
+        audio.device_sets.values().next().unwrap().gain_db,
+        -6.0,
+        "saved for the mic in use now"
+    );
 
     let text = fs::read_to_string(l.config_file()).unwrap();
     assert!(text.contains("# mine"), "comment lost: {text}");
@@ -96,7 +128,7 @@ fn gain_and_sensitivity_have_info_tips() {
     let window = open(&l, Page::Audio);
     assert!(has(
         &window,
-        "Makes your voice louder or quieter in the recording Whisper hears."
+        "Makes your voice louder or quieter in the recording Whisper hears. Record 3 s checks the level."
     ));
     assert!(has(
         &window,
@@ -109,11 +141,41 @@ fn denoise_shows_the_whisper_note() {
     let l = layout("denoise", None);
     let window = open(&l, Page::Audio);
     tab(&window, "Recording");
-    let note = "Noise suppression can make Whisper worse.";
+    let note = "Reducing background noise can make Whisper worse.";
     assert!(!has(&window, note));
-    with_role(&window, "Noise suppression", AccessibleRole::Switch)
-        .invoke_accessible_default_action();
-    assert!(has(&window, note));
+    pick(&window, "Reduce background noise", 1);
+    assert!(has(&window, note), "every level but Off can make it worse");
+}
+
+/// An old `denoise = true` is Strong.
+#[test]
+fn old_denoise_on_shows_as_strong() {
+    let old = layout(
+        "denoise-old",
+        Some("version = 2\n[audio]\ndenoise = true\n"),
+    );
+    let window = open(&old, Page::Audio);
+    tab(&window, "Recording");
+    let combo = with_role(&window, "Reduce background noise", AccessibleRole::Combobox);
+    assert_eq!(combo.accessible_value().as_deref(), Some("Strong"));
+}
+
+/// Opens the combo `label` and commits its row `row` (keys: up to the first, then down).
+fn pick(window: &AppWindow, label: &str, row: usize) {
+    with_role(window, label, AccessibleRole::Combobox).mock_single_click(PointerEventButton::Left);
+    for _ in 0..8 {
+        window.window().dispatch_event(WindowEvent::KeyPressed {
+            text: Key::UpArrow.into(),
+        });
+    }
+    for _ in 0..row {
+        window.window().dispatch_event(WindowEvent::KeyPressed {
+            text: Key::DownArrow.into(),
+        });
+    }
+    window.window().dispatch_event(WindowEvent::KeyPressed {
+        text: Key::Return.into(),
+    });
 }
 
 #[test]
@@ -123,13 +185,16 @@ fn config_values_show_on_the_page() {
         Some("version = 2\n[audio]\ngain_db = 4.0\ntail_ms = 250\n[model]\nlanguage = \"en\"\n"),
     );
     let window = open(&l, Page::Audio);
-    let gain = with_role(&window, "Gain", AccessibleRole::Slider);
+    let gain = with_role(&window, "Microphone boost", AccessibleRole::Slider);
     assert_eq!(gain.accessible_value().as_deref(), Some("4"));
     let field = |label: &str| with_role(&window, label, AccessibleRole::Spinbox).accessible_value();
-    assert_eq!(field("Gain").as_deref(), Some("+4"));
+    assert_eq!(field("Microphone boost").as_deref(), Some("+4"));
     tab(&window, "Recording");
-    assert_eq!(field("Tail after release").as_deref(), Some("250"));
-    assert_eq!(field("Max length").as_deref(), Some("60"));
+    assert_eq!(
+        field("Keep recording after release").as_deref(),
+        Some("250")
+    );
+    assert_eq!(field("Longest recording").as_deref(), Some("60"));
 }
 
 /// UI rule 28: a device name too long for the Combo stands in full in a tooltip; a short one has
@@ -198,13 +263,13 @@ fn locked_config_disables_the_controls() {
         let e = with_role(&window, label, role);
         assert_eq!(e.accessible_enabled(), Some(false), "{label}");
     };
-    off("Gain", AccessibleRole::Slider);
+    off("Microphone boost", AccessibleRole::Slider);
     off("Device", AccessibleRole::Combobox);
     // Hovering a locked control says why (UI rule 31): the Device combo and the Gain slider.
     let tip = window.global::<oxi_settings::Shell>().get_locked_tip();
     for (label, role) in [
         ("Device", AccessibleRole::Combobox),
-        ("Gain", AccessibleRole::Slider),
+        ("Microphone boost", AccessibleRole::Slider),
     ] {
         let e = with_role(&window, label, role);
         let (at, size) = (e.absolute_position(), e.size());
@@ -221,7 +286,7 @@ fn locked_config_disables_the_controls() {
         assert!(!has(&window, &tip), "the {label} tooltip stayed");
     }
     tab(&window, "Recording");
-    off("Trim silence", AccessibleRole::Switch);
+    off("Cut silence at the ends", AccessibleRole::Switch);
     // The sub-tabs still work; only the settings are locked.
     tab(&window, "Sounds");
     let stop = with_role(&window, "Stop", AccessibleRole::RadioButton);
@@ -275,16 +340,16 @@ fn control_columns_start_at_one_x_at_the_minimum_width() {
         .set_size(slint::LogicalSize::new(720.0, 1600.0));
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(50));
     let x = |label: &str, role| with_role(&window, label, role).absolute_position().x;
-    let gain = x("Gain", AccessibleRole::Slider);
+    let gain = x("Microphone boost", AccessibleRole::Slider);
     let same = |label: &str, role| {
         let at = x(label, role);
         assert!((at - gain).abs() < 0.5, "{label}: {at}, Gain {gain}");
     };
     same("Device", AccessibleRole::Combobox);
-    same("Meter sensitivity", AccessibleRole::Slider);
+    same("Level bar sensitivity", AccessibleRole::Slider);
     tab(&window, "Recording");
-    same("Tail after release", AccessibleRole::Slider);
-    same("Max length", AccessibleRole::Slider);
+    same("Keep recording after release", AccessibleRole::Slider);
+    same("Longest recording", AccessibleRole::Slider);
     sounds(&window, 1);
     same("Volume", AccessibleRole::Slider);
 }
@@ -314,13 +379,17 @@ fn level_row_has_the_edges_of_the_device_select() {
                 .find_first()
                 .expect("no level meter"),
         );
-        let test = edges(&with_role(&window, "Test", AccessibleRole::Button));
-        let gain = edges(&with_role(&window, "Gain", AccessibleRole::Spinbox));
+        let test = edges(&with_role(&window, "Record 3 s", AccessibleRole::Button));
+        let gain = edges(&with_role(
+            &window,
+            "Microphone boost",
+            AccessibleRole::Spinbox,
+        ));
         assert!(
             (select.0 - track.0).abs() < 0.5,
             "{width}: select {select:?}, track {track:?}"
         );
-        for (name, right) in [("Test", test.1), ("Gain field", gain.1)] {
+        for (name, right) in [("Record 3 s", test.1), ("Gain field", gain.1)] {
             assert!(
                 (select.1 - right).abs() < 0.5,
                 "{width}: select {select:?}, {name} ends at {right}"
@@ -671,4 +740,107 @@ fn events_are_cards_and_off_and_own_file_are_the_first_row() {
     assert!(y("Off") > y("Start"), "below the event cards");
     assert!(y("Hit 2") > y("Off"), "the gallery is below the first row");
     assert_eq!(checked(&window, "Start"), Some(true));
+}
+
+/// Hold item 41: quiet recordings in the history make a boost suggestion on its row; Apply
+/// writes it and the suggestion goes. Nothing is written before Apply.
+#[test]
+fn a_suggestion_from_the_history_applies_only_on_apply() {
+    use oxi_core::audio::Levels;
+    use oxi_core::history::{Meta, Status};
+    use oxi_settings::AudioKey;
+    let l = layout("suggest", Some("version = 2\n"));
+    let day = l.history_dir().join("2026-11-13");
+    fs::create_dir_all(&day).unwrap();
+    for i in 0..12 {
+        let stem = format!("1000{i:02}-000");
+        let meta = Meta {
+            levels: Some(Levels {
+                peak_db: -36,
+                speech_db: -46,
+                floor_db: -70,
+                rumble_db: -40,
+                start_gap_ms: Some(300),
+                end_gap_ms: Some(300),
+                gain_db: Some(0),
+            }),
+            ..Meta::basic(
+                &format!("2026-11-13/{stem}"),
+                1000,
+                Status::Done,
+                "turbo",
+                "ru",
+            )
+        };
+        fs::write(day.join(format!("{stem}.json")), meta.to_json().unwrap()).unwrap();
+    }
+    let window = open(&l, Page::Audio);
+    let state = window.global::<AudioState>();
+    // The read runs on its own thread; the page's meter tick takes the answer.
+    for _ in 0..200 {
+        if !state.get_gain_tip().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(50));
+    }
+    assert_eq!(
+        state.get_gain_tip().as_str(),
+        "12 of your last 12 recordings were quiet. Raise the boost to +20 dB?"
+    );
+    assert_eq!(saved(&l).audio.gain_db, 0.0, "nothing changes unasked");
+    state.invoke_suggestion(AudioKey::Gain, true);
+    assert_eq!(saved(&l).audio.gain_db, 20.0);
+    assert_eq!(
+        state.get_gain_tip().as_str(),
+        "",
+        "applied: nothing left to suggest"
+    );
+    assert_eq!(
+        state.get_noise_tip().as_str(),
+        "",
+        "a quiet room: no noise change"
+    );
+
+    // The old numbers were heard at 0 dB: they say nothing about +20. New clipping ones at +20
+    // are seen only on "Check again".
+    for i in 0..12 {
+        let stem = format!("2000{i:02}-000");
+        let meta = Meta {
+            levels: Some(Levels {
+                peak_db: 0,
+                speech_db: -10,
+                floor_db: -70,
+                rumble_db: -40,
+                start_gap_ms: Some(300),
+                end_gap_ms: Some(300),
+                gain_db: Some(20),
+            }),
+            ..Meta::basic(
+                &format!("2026-11-13/{stem}"),
+                1000,
+                Status::Done,
+                "turbo",
+                "ru",
+            )
+        };
+        fs::write(day.join(format!("{stem}.json")), meta.to_json().unwrap()).unwrap();
+    }
+    assert_eq!(
+        state.get_gain_tip().as_str(),
+        "",
+        "not seen before it is asked"
+    );
+    state.invoke_recheck();
+    for _ in 0..200 {
+        if !state.get_gain_tip().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(50));
+    }
+    assert_eq!(
+        state.get_gain_tip().as_str(),
+        "12 of your last 12 recordings were too loud. Lower the boost to +14 dB?"
+    );
 }

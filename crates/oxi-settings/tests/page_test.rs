@@ -677,7 +677,15 @@ fn history_off_offers_to_turn_it_on() {
 #[expect(clippy::too_many_lines, reason = "one script of the whole flow")]
 #[test]
 fn the_flow_runs_every_set_over_every_recording_and_apply_writes_the_best() {
-    let f = Fixture::new("flow", None);
+    let f = Fixture::new(
+        "flow",
+        Some(
+            "version = 2
+[audio]
+per_device = true
+",
+        ),
+    );
     let s = f.state();
     f.record_and_stop();
     f.list_history(vec![item(HISTORY_ID, "раз два три")]);
@@ -789,6 +797,11 @@ fn the_flow_runs_every_set_over_every_recording_and_apply_writes_the_best() {
     let want = &sets()[1];
     let saved = config(&f.layout).config;
     assert!(saved.audio.denoise, "the best set is the denoise one");
+    // "System default": the set is keyed by the default device's name ("" when none is known).
+    assert!(
+        !saved.audio.device_sets.is_empty() && saved.audio.device_sets.values().all(|s| s.denoise),
+        "kept for this microphone too, or picking another mic and back loses it"
+    );
     assert_eq!(saved.audio.normalize, want.normalize);
     assert_eq!(saved.audio.trim, want.trim);
     assert_eq!(saved.model.id, want.model);

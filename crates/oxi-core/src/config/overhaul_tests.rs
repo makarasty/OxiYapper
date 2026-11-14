@@ -432,3 +432,57 @@ initial_prompt = \"Notes.\"
         Some(PromptSource::None)
     );
 }
+
+#[test]
+fn voice_commands_default_to_todays_seven_phrases_and_old_files_keep_them() {
+    let v = ConfigFile::parse(OLD).unwrap().config.text.voice;
+    assert_eq!(v, VoiceCommands::default());
+    let all: usize = (0..3).map(|i| v.slot(i).phrases.len()).sum();
+    assert_eq!(all, 7);
+    assert!((0..3).all(|i| v.slot(i).on));
+    // The master switch stays a bool, off as before.
+    assert!(!ConfigFile::parse(OLD).unwrap().config.text.voice_commands);
+}
+
+#[test]
+fn voice_commands_read_own_phrases_and_a_table_with_only_a_switch_keeps_the_defaults() {
+    let text = "version = 2
+[text]
+voice_commands = true
+[text.voice.new_line]
+phrases = [\"enter\", \"Next line!\", \"enter\"]
+[text.voice.delete_last]
+on = false
+";
+    let mut file = ConfigFile::parse(text).unwrap();
+    let v = &file.config.text.voice;
+    assert_eq!(v.new_line.phrases, ["enter", "Next line!"]);
+    assert_eq!(v.new_paragraph, VoiceCommands::default().new_paragraph);
+    assert!(!v.delete_last.on);
+    assert_eq!(v.delete_last.phrases.len(), 3);
+    assert_eq!(file.warnings.len(), 1, "{:?}", file.warnings);
+    // Saved and read back, and the file keeps what it had.
+    file.config
+        .text
+        .voice
+        .new_paragraph
+        .phrases
+        .push("big gap".into());
+    let back = ConfigFile::parse(&file.to_toml_string().unwrap()).unwrap();
+    assert_eq!(back.config.text.voice, file.config.text.voice);
+    assert!(back.warnings.is_empty(), "{:?}", back.warnings);
+}
+
+#[test]
+fn a_phrase_two_voice_commands_share_is_a_conflict_and_is_dropped_from_the_later_one() {
+    let mut v = VoiceCommands::default();
+    assert_eq!(v.conflict(), None);
+    v.delete_last.phrases.push("New  line.".into());
+    let c = v.conflict().unwrap();
+    assert_eq!((c.first, c.second, c.phrase.as_str()), (0, 2, "New  line."));
+    let file =
+        ConfigFile::parse("[text.voice.delete_last]\nphrases = [\"delete that\", \"NEW line\"]\n")
+            .unwrap();
+    assert_eq!(file.config.text.voice.delete_last.phrases, ["delete that"]);
+    assert_eq!(file.warnings.len(), 1, "{:?}", file.warnings);
+}

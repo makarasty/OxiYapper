@@ -56,6 +56,8 @@ pub enum Inbox {
         samples: Vec<f32>,
         spool: Option<PathBuf>,
         voiced_ms: u64,
+        /// The recording's loudness numbers, for its history entry.
+        levels: Option<oxi_core::audio::Levels>,
     },
     /// Audio worker: an event of the capture opened by `AudioCmd::Start { session }`. The
     /// coordinator drops it once a later capture started, so a stale `DeviceLost` cannot stop
@@ -273,6 +275,8 @@ pub enum HistoryCmd {
         held: Vec<oxi_core::history::HeldPart>,
         /// `Some(Filtered)` when `text` is only the held parts and nothing was inserted.
         delivered: Option<oxi_core::history::Delivered>,
+        /// The recording's loudness numbers (`Inbox::JobAudio`), kept in the entry's json.
+        levels: Option<oxi_core::audio::Levels>,
         cfg: History,
         spool: Option<PathBuf>,
         carried: Vec<PathBuf>,

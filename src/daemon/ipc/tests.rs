@@ -729,6 +729,7 @@ fn entry(
         raw: false,
         held: Vec::new(),
         delivered: None,
+        levels: None,
     };
     std::fs::write(dir.join(id).with_extension("json"), meta.to_json().unwrap()).unwrap();
     (dir, id)
@@ -798,6 +799,7 @@ fn only_done_and_cancelled_audio_counts_as_processed() {
             raw: false,
             held: Vec::new(),
             delivered: None,
+            levels: None,
         }
         .to_json()
         .unwrap()

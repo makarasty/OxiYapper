@@ -145,6 +145,7 @@ impl Rig {
         let job = self.record();
         self.c.handle(
             Inbox::JobAudio {
+                levels: None,
                 job,
                 samples: vec![0.5; 4],
                 spool: None,
@@ -199,6 +200,7 @@ fn the_overlay_bar_follows_the_phases_and_never_waits_for_whisper() {
     assert!(!rig.progress.active());
     rig.c.handle(
         Inbox::JobAudio {
+            levels: None,
             job,
             samples: vec![0.5; 4],
             spool: None,
@@ -287,6 +289,7 @@ fn a_job_queued_behind_another_gets_its_own_bar_and_teaches_no_speed() {
     let job = rig.record();
     rig.c.handle(
         Inbox::JobAudio {
+            levels: None,
             job,
             samples: vec![0.5; 4],
             spool: None,
@@ -436,6 +439,7 @@ fn job_audio_goes_to_whisper_and_text_transcribed() {
     let job = rig.record();
     rig.c.handle(
         Inbox::JobAudio {
+            levels: None,
             job,
             samples: vec![0.25, -0.5],
             spool: None,
@@ -559,6 +563,7 @@ fn history_gets_the_audio_and_text_only_when_on_and_only_for_a_heard_dictation()
         let samples = vec![0.1; 16_000];
         rig.c.handle(
             Inbox::JobAudio {
+                levels: None,
                 job,
                 samples,
                 spool: None,
@@ -625,6 +630,7 @@ fn held_parts_go_to_the_entry_and_an_all_held_dictation_is_filed_unpasted() {
         let job = rig.record();
         rig.c.handle(
             Inbox::JobAudio {
+                levels: None,
                 job,
                 samples: vec![0.1; 16_000],
                 spool: None,
@@ -721,6 +727,7 @@ fn an_all_held_part_carried_on_waits_for_the_merge() {
         rig.event(Event::ChordUp, 1000);
         rig.event(Event::Tick, 1100); // job 0, its gap lasts until 1400
         let audio = Inbox::JobAudio {
+            levels: None,
             job: JobId(0),
             samples: vec![0.1; 8000],
             spool: None,
@@ -748,6 +755,7 @@ fn an_all_held_part_carried_on_waits_for_the_merge() {
         rig.event(Event::ChordUp, 2000);
         rig.event(Event::Tick, 2100);
         let audio = Inbox::JobAudio {
+            levels: None,
             job: JobId(1),
             samples: vec![0.1; 4000],
             spool: None,
@@ -794,6 +802,7 @@ fn the_entry_says_how_the_text_arrived() {
     rig.event(Event::ModelLoaded, 0);
     let job = rig.record();
     let audio = Inbox::JobAudio {
+        levels: None,
         job,
         samples: vec![0.5; 4],
         spool: None,
@@ -832,6 +841,7 @@ fn a_dictation_with_history_off_still_sends_the_prune() {
     let samples = vec![0.1; 16_000];
     rig.c.handle(
         Inbox::JobAudio {
+            levels: None,
             job,
             samples,
             spool: None,
@@ -867,6 +877,7 @@ fn a_re_press_inside_the_hold_gap_makes_one_dictation_from_both_parts() {
     rig.event(Event::ChordUp, 1000);
     rig.event(Event::Tick, 1100); // the tail ends: job 0, its gap lasts until 1400
     let audio = |job, len| Inbox::JobAudio {
+        levels: None,
         job,
         samples: vec![0.1; len],
         spool: None,
@@ -934,6 +945,7 @@ fn no_text_for_a_carried_part_keeps_its_audio_for_the_merge() {
         rig.event(Event::ChordUp, 1000);
         rig.event(Event::Tick, 1100); // job 0, its gap lasts until 1400
         let audio = |job, len| Inbox::JobAudio {
+            levels: None,
             job,
             samples: vec![0.1; len],
             spool: None,
@@ -1006,6 +1018,7 @@ fn a_lock_during_a_continuation_keeps_both_parts_as_one_cancel() {
         rig.event(Event::ChordUp, 1000);
         rig.event(Event::Tick, 1100);
         let audio = |job, len| Inbox::JobAudio {
+            levels: None,
             job,
             samples: vec![0.1; len],
             spool: None,
@@ -1061,6 +1074,7 @@ fn a_failed_continuation_gives_the_first_part_back_to_paste_and_save() {
         rig.event(Event::ChordUp, 1000);
         rig.event(Event::Tick, 1100); // job 0, its gap lasts until 1400
         let audio = Inbox::JobAudio {
+            levels: None,
             job: JobId(0),
             samples: vec![0.1; 8000],
             spool: None,
@@ -1082,6 +1096,7 @@ fn a_failed_continuation_gives_the_first_part_back_to_paste_and_save() {
         rig.c.handle(fail, Millis(1500));
         // The failed part keeps its own audio as job 1, alone.
         let audio = Inbox::JobAudio {
+            levels: None,
             job: JobId(1),
             samples: vec![0.1; 4000],
             spool: None,
@@ -1138,6 +1153,7 @@ fn a_failure_before_the_first_parts_audio_leaks_nothing_and_loses_nothing() {
     };
     rig.c.handle(fail, Millis(1400));
     let audio = Inbox::JobAudio {
+        levels: None,
         job: JobId(0),
         samples: vec![0.1; 8000],
         spool: None,
@@ -1218,6 +1234,7 @@ fn an_invention_is_filed_when_history_was_turned_on_during_the_dictation() {
         }
         rig.c.handle(
             Inbox::JobAudio {
+                levels: None,
                 job,
                 samples: vec![0.5; 4],
                 spool: None,
@@ -1270,6 +1287,7 @@ fn history_turned_off_during_a_job_is_off_at_its_save() {
     let samples = vec![0.1; 16_000];
     rig.c.handle(
         Inbox::JobAudio {
+            levels: None,
             job,
             samples,
             spool: None,
@@ -1330,6 +1348,7 @@ fn a_finished_dictation_updates_the_stats_file_a_failed_one_does_not() {
         let samples = vec![0.1; 16_000]; // 1 s
         rig.c.handle(
             Inbox::JobAudio {
+                levels: None,
                 job,
                 samples,
                 spool: None,
@@ -1377,6 +1396,7 @@ fn a_dictation_without_a_voiced_time_is_stored_without_one() {
     let job = rig.record();
     let samples = vec![0.1; 16_000]; // 1 s
     let audio = Inbox::JobAudio {
+        levels: None,
         job,
         samples,
         spool: None,
@@ -1422,6 +1442,7 @@ fn empty_or_failed_transcription_pastes_nothing() {
         let job = rig.record();
         rig.c.handle(
             Inbox::JobAudio {
+                levels: None,
                 job,
                 samples: vec![0.0],
                 spool: None,
@@ -1563,6 +1584,7 @@ fn esc_after_speech_keeps_the_audio_in_the_history_and_never_transcribes() {
     let samples = vec![0.1; 8_000];
     rig.c.handle(
         Inbox::JobAudio {
+            levels: None,
             job,
             samples,
             spool: None,
@@ -1783,6 +1805,7 @@ fn a_failure_badge_clears_when_its_cause_is_gone() {
         let samples = vec![0.5; 4];
         rig.c.handle(
             Inbox::JobAudio {
+                levels: None,
                 job,
                 samples,
                 spool: None,
@@ -1885,6 +1908,7 @@ fn a_job_that_streamed_a_recording_is_saved_whatever_the_active_setting_says() {
     let spool = PathBuf::from("h/2026-11-10/120000-000.wav.part");
     let (samples, text) = (vec![0.5; 4], Some("hello".to_owned()));
     let audio = Inbox::JobAudio {
+        levels: None,
         job,
         samples,
         spool: Some(spool.clone()),
@@ -2104,6 +2128,7 @@ fn quit_during_transcription_keeps_the_text_on_the_clipboard_and_in_the_history(
     let job = rig.record();
     rig.c.handle(
         Inbox::JobAudio {
+            levels: None,
             job,
             samples: vec![0.5; 4],
             spool: None,
@@ -2150,6 +2175,7 @@ fn quit_cuts_a_transcription_that_outlives_the_grace() {
     let job = rig.record();
     rig.c.handle(
         Inbox::JobAudio {
+            levels: None,
             job,
             samples: vec![0.5; 4],
             spool: None,
@@ -2215,6 +2241,7 @@ fn quit_while_recording_keeps_the_heard_audio() {
     rig.drain_all();
     // The capture's answer to the quit's Stop, for the first job.
     let msgs = vec![Inbox::JobAudio {
+        levels: None,
         job: JobId(0),
         samples: vec![0.1; 800],
         spool: None,
@@ -2370,6 +2397,7 @@ fn carry_on(rig: &mut Rig, part: &Path) {
 
 fn spooled_audio(job: JobId, spool: Option<PathBuf>) -> Inbox {
     Inbox::JobAudio {
+        levels: None,
         job,
         samples: vec![0.1; 4000],
         spool,
@@ -2565,6 +2593,7 @@ fn a_continuation_with_nothing_heard_still_files_its_kept_recording() {
     rig.event(Event::Tick, 1100);
     rig.c.handle(
         Inbox::JobAudio {
+            levels: None,
             job: JobId(0),
             samples: vec![0.1; 8000],
             spool: None,
@@ -2648,6 +2677,7 @@ fn the_pill_says_held_back_and_saved_to_file() {
         rig.event(Event::ModelLoaded, 0);
         let job = rig.record();
         let audio = Inbox::JobAudio {
+            levels: None,
             job,
             samples: vec![0.5; 4],
             spool: None,
@@ -2721,6 +2751,7 @@ fn also_saved_waits_for_the_write_and_a_failed_write_says_nothing() {
     rig.event(Event::ModelLoaded, 0);
     let job = rig.record();
     let audio = Inbox::JobAudio {
+        levels: None,
         job,
         samples: vec![0.5; 4],
         spool: None,
@@ -2761,6 +2792,7 @@ fn a_held_back_cue_is_not_lost_to_the_next_queued_dictation() {
     rig.event(Event::ModelLoaded, 0);
     let first = rig.record();
     let audio = |job| Inbox::JobAudio {
+        levels: None,
         job,
         samples: vec![0.5; 4],
         spool: None,
@@ -2896,6 +2928,7 @@ fn a_busy_machine_keeps_its_model_for_the_next_recording() {
         let at = 5000 + 100 * i as u64;
         rig.c.handle(
             Inbox::JobAudio {
+                levels: None,
                 job: *job,
                 samples: vec![0.5; 4],
                 spool: None,
@@ -3012,6 +3045,7 @@ fn quit_writes_the_text_of_a_to_file_dictation_to_its_file() {
     let job = rig.record();
     rig.c.handle(
         Inbox::JobAudio {
+            levels: None,
             job,
             samples: vec![0.5; 4],
             spool: None,
@@ -3069,6 +3103,7 @@ fn a_file_answer_belongs_to_its_own_job_not_to_the_oldest_write() {
     let second = JobId(first.0 + 1);
     assert!(drain(&rig.audio).contains(&AudioCmd::Stop(second)));
     let audio = Inbox::JobAudio {
+        levels: None,
         job: second,
         samples: vec![0.5; 4],
         spool: None,
@@ -3127,6 +3162,7 @@ fn the_paste_carries_the_focus_of_the_record_start() {
     rig.event(Event::Tick, 2000);
     let job = JobId(0);
     let audio = Inbox::JobAudio {
+        levels: None,
         job,
         samples: vec![0.5; 4],
         spool: None,
@@ -3153,6 +3189,7 @@ fn a_continued_dictation_carries_the_focus_of_its_first_part() {
     rig.event(Event::ChordUp, 1000);
     rig.event(Event::Tick, 1100);
     let audio = |job| Inbox::JobAudio {
+        levels: None,
         job,
         samples: vec![0.1; 800],
         spool: None,
@@ -3187,6 +3224,7 @@ fn a_lock_or_a_sleep_takes_the_start_focus_away() {
         rig.event(Event::ModelLoaded, 0);
         let job = rig.record();
         let audio = Inbox::JobAudio {
+            levels: None,
             job,
             samples: vec![0.5; 4],
             spool: None,

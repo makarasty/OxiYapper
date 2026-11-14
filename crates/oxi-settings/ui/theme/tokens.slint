@@ -38,6 +38,33 @@ export global Shell {
     public function modal(open: bool) {
         self.modals = max(0, self.modals + (open ? 1 : -1));
     }
+    // Settings search (owner item 17): the row or group whose `search-key` is `found` scrolls into
+    // view and flashes; `found-serial` counts the picks, so the same row can flash again. The window
+    // clears `found` a moment later, so a row that only appears later does not flash then.
+    in-out property <string> found;
+    in-out property <int> found-serial;
+    // Where the flashing row is (window coordinates); the window scrolls it into view.
+    out property <length> reveal-y;
+    out property <length> reveal-h;
+    out property <int> reveal-serial;
+    public function reveal(y: length, h: length) {
+        self.reveal-y = y;
+        self.reveal-h = h;
+        self.reveal-serial += 1;
+    }
+    // A search pick moves the keyboard focus to the row's control (a row's `Flash` asks once the page
+    // is laid out; the window answers with a Tab key). `quiet-focus` holds the ring back for that one
+    // move: a pick is not a keyboard walk (UI rule 17).
+    callback found-ready();
+    in-out property <bool> quiet-focus;
+    // Rust bumps it right after the Tab: a `changed` handler queued after the controls' own
+    // `changed has-focus` (a text field reads `quiet-focus` there, later than the key event) ends the quiet.
+    in-out property <int> quiet-release;
+    changed quiet-release => {
+        self.quiet-focus = false;
+    }
+    // Ctrl+F on History: its own "Search recordings" field takes the caret (ia-map 3.7).
+    in-out property <int> history-find;
 }
 
 export global Theme {

@@ -176,6 +176,7 @@ fn end<C: Capture>(capture: Option<C>, job: Option<JobId>, inbox: &Sender<Inbox>
             samples,
             spool,
             voiced_ms: Stats::voiced_time(trim, &stats).0,
+            levels: Some(stats.levels),
         },
         Err(why) => Inbox::Event(Event::JobAudioEmpty { job, why }),
     };

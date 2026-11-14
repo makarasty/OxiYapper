@@ -3264,6 +3264,7 @@ enabled = false
             raw: false,
             held: Vec::new(),
             delivered: None,
+            levels: None,
         };
         fs::write(entry_path(&folder, id, "json"), meta.to_json().unwrap()).unwrap();
         s.invoke_shown();
@@ -3385,6 +3386,7 @@ enabled = false
             raw: false,
             held: Vec::new(),
             delivered: None,
+            levels: None,
         };
         fs::write(
             entry_path(&folder, ID, history::JSON),
@@ -4094,6 +4096,7 @@ enabled = false
                     raw: false,
                     held: Vec::new(),
                     delivered: None,
+                    levels: None,
                 };
                 fs::write(day.join("134501-123.json"), meta.to_json().unwrap()).unwrap();
             }
@@ -4426,6 +4429,7 @@ enabled = false
             raw: false,
             held: Vec::new(),
             delivered: None,
+            levels: None,
         };
         assert_eq!(
             exported(Format::Txt, SAID, None, &[]).as_deref(),

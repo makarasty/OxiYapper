@@ -9,6 +9,7 @@ mod hotkey;
 mod model;
 mod overlay;
 mod progress;
+mod recent;
 mod system;
 pub mod test;
 mod text;

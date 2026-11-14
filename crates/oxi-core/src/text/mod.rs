@@ -1,5 +1,6 @@
 //! Text pipeline: newline strip, trim, hallucination filter, confidence filter, pause
-//! punctuation, replace rules, filler filter, voice commands, snippets, trailing space
+//! punctuation, replace rules, filler filter, voice commands, snippets, final full stop, first
+//! letter, trailing space
 //! (ARCHITECTURE sections 10 and 11, items 30-34; arch-plan 9.1). Pure, no OS calls.
 //!
 //! Every optional stage is off by default: with the default [`TextOptions`] and no fillers or
@@ -18,7 +19,7 @@ pub use hallucination::HallucinationFilter;
 pub use replace::{ParsedRules, ReplaceRules};
 pub use snippets::{fillers_from_lines, fillers_to_lines, snippets_from_lines, snippets_to_lines};
 
-use crate::config::{Snippet, Text};
+use crate::config::{Snippet, Text, VoiceCommands};
 use crate::types::Millis;
 
 /// Result of the text pipeline.
@@ -74,8 +75,13 @@ pub struct TextOptions {
     pub pause_paragraph_ms: u32,
     pub filler_filter: bool,
     pub voice_commands: bool,
+    /// Which commands are on, and the phrases that trigger them.
+    pub voice: VoiceCommands,
     pub confidence_filter: bool,
     pub confidence_min: f32,
+    /// The two style switches (item 41, candidate 7); a snippet's stored text is never changed.
+    pub no_final_period: bool,
+    pub small_first_letter: bool,
     pub trailing_space: bool,
     /// False when the text is typed: a line break would send a message, so it becomes a space.
     pub newlines_allowed: bool,
@@ -108,8 +114,11 @@ impl TextOptions {
             pause_paragraph_ms: text.pause_paragraph_ms,
             filler_filter: text.filler_filter,
             voice_commands: text.voice_commands,
+            voice: text.voice.clone(),
             confidence_filter: text.confidence_filter,
             confidence_min: text.confidence_min,
+            no_final_period: text.no_final_period,
+            small_first_letter: text.small_first_letter,
             trailing_space,
             newlines_allowed: true,
             can_hold: false,
@@ -302,16 +311,20 @@ pub fn run(segments: &[Seg<'_>], opts: &TextOptions, lists: &Lists<'_>) -> Proce
     // 7: voice commands.
     let mut tail = 0;
     if opts.voice_commands {
-        (text, tail) = stages::voice_commands(&text);
+        (text, tail) = stages::voice_commands(&text, &opts.voice);
     }
     // 8: a snippet when it is the whole text.
-    if let Some(block) = stages::snippet(&text, lists.snippets) {
+    let snippet = stages::snippet(&text, lists.snippets);
+    if let Some(block) = snippet {
         text = block.to_owned();
     }
-    // 9: trim (a rule may delete a whole word and leave the edge blank), then the line breaks
-    // the commands left at the end, then the trailing space.
+    // 9: trim (a rule may delete a whole word), the style switches (never on a snippet's own
+    // text), then the line breaks the commands left at the end, then the trailing space.
     text.retain(|c| c != '\r');
     let mut text = text.trim().to_owned();
+    if snippet.is_none() {
+        stages::style(&mut text, opts.no_final_period, opts.small_first_letter);
+    }
     if !opts.newlines_allowed {
         text = flatten(&text);
         tail = 0;

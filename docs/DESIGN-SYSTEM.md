@@ -410,7 +410,7 @@ One glyph per meaning, on every screen. `Icons` gets one constant per row (name 
 | play / stop | `play` / `stop` | `play` / `stop` | one slot, swaps |
 | record | `record` | `record` | vendor |
 | edit | `edit` | `pencil-simple` | |
-| search | `search` | `magnifying-glass` | vendor. The SearchField's own glyph only (DS-8.5), never on a button |
+| search | `search` | `magnifying-glass` | vendor. The SearchField's own glyph (DS-8.5) and the settings-search entry of the rail (28.8), never on another button |
 | close a popup, clear a field | `close` | `x` | |
 | hint | `info` | `info` | InfoTip only |
 | warning, attention, overload | `warning` | `warning` | the triangle; `warning-text` (the `WarningSlot`'s "!") |
@@ -455,9 +455,11 @@ One model for every bar and percent: model download, transcription (History, Tes
 | Constant | Value | Meaning |
 |---|---|---|
 | kick | to 0.03 within 200 ms, ease-out | the bar moves in its first frames, whatever is known |
-| estimate curve | `e(t) = 0.90 * (1 - 2^(-t / (0.30 * est)))` | eased guess while no real fraction exists: 0.81 at t = est, never above 0.90 |
+| soft tail | `soft(p, from, cap)`: `p` up to the knee `from + 0.70 * (cap - from)`, then `cap - g^2 / (g + (p - knee))` with `g = cap - knee` | the bar runs at the plain pace to the knee, then slows on a tail with the same slope that approaches `cap` and never reaches it: a job that runs long slows the bar, never stops it |
+| estimate curve | `e(t) = soft(t / est, 0, 0.95)` | the guess while no real fraction exists: linear to 0.665 at 0.70 `est`, then the tail under 0.95 |
 | default `est` | 4000 ms | when the caller has no estimate |
-| real projection | `real + (real / t_real) * (t - t_real)`, at most `real + 0.10` | between two real updates the bar keeps the measured pace, at most 10 points ahead of the last real value |
+| real projection | `soft(from + pace * (t - t_real), from, 0.99)`; `from` = max(bar, last real), `pace` = (last real - first real) / (time between them), the estimate's pace (`1 / est`) until a second report | between real updates the bar keeps the measured pace and goes on from where it is, so it never goes back and never waits; one report alone is not trusted (a resumed download starts at 50 %); an equal report again is ignored. whisper reports once per 30 s window, so the old cap at last report + 0.10 froze a 60 s clip at about 60 % (b10) |
+| time left | `(1 - real) / pace - (t - t_real)`, blank once it runs out or the job ended | an honest blank rather than a number that sits there |
 | target | the projection when `real` >= 0.01, else `e(t)`; capped at 0.99 | |
 | chase | `shown += (target - shown) * (1 - exp(-dt / 200 ms))` | smooths a coarse update into a glide |
 | speed limit | at most 0.04 per 33 ms frame (1.2 per second) | a 0 to 67 jump takes at least 560 ms |
@@ -493,7 +495,7 @@ Check for all: read each page shot and name, for every row, the one job it does;
 
 What correct looks like, per screen. Geometry not given here comes from sections 1 to 27.
 
-### 28.1 Text, Per-app rules [M3, M4, M6]
+### 28.1 Paste, Per-app rules [M3, M4, M6]
 
 - One card. Top bar, 32 px: `[SearchField, stretch][8][Button secondary "Scan for apps" + `scan` glyph]`. The button opens the apps popup.
 - The SearchField ("Search or add an app") filters the rules list as the user types (name and exe, case-insensitive substring). Under it, a result list (Combo popup geometry, DS-8.6) offers installed apps that match and have no rule yet; clicking one, or Enter on the first, adds its rule and clears the field. Text ending in `.exe` that matches nothing offers "Add <text>".
@@ -505,7 +507,7 @@ What correct looks like, per screen. Geometry not given here comes from sections
 
 - Model tiles (`CardGrid`, `tile-height` 104): the 32 px class glyph top-left (`model-accurate`, `model-fast`, `model-language`, `model-small`, `model-own`), the state in the top-right slot as a 20 px mark with a tooltip (`CheckBadge` in use; `done` in `success-text` downloaded; `download` in `text-secondary` not downloaded; the percent, right-aligned in a "100 %" slot, while downloading), title, then one caption line of facts joined by " · ": size, speed class, languages ("1.6 GB · Fast · 99 languages"). The state is not repeated as words on the tile (UI rule 29). No two tiles of different classes share a glyph.
 - The action row under the grid belongs to the selected tile: `[class glyph 20][name, caption][WarningSlot][ProgressBar slot, 200 wide (80 in the 240 column), while downloading][8][button, model-action-column 112][8][Delete slot, 32]`: 200 + 8 + 112 + 8 + 32 = the 360 column (80 + 8 + 112 + 8 + 32 = 240). The bar's place is reserved when no download runs. Delete is a 32 px IconButton (`delete` glyph, tooltip and accessible label "Delete", destructive, DS-6.3), rightmost (DS-23.2); its slot is always there, empty when there is nothing to delete or a download runs, so no button moves (DS-23.5).
-- Advanced: every engine parameter is a Row with an InfoTip and a control whose first choice is "Auto"; the tip says what Auto picks now (DS-11.4 h). The group title's trailing slot holds a soft "Reset all to Auto" button.
+- Speed and Accuracy: every engine parameter is a Row with an InfoTip and a control whose first choice is "Auto"; the tip says what Auto picks now (DS-11.4 h). Each group title's trailing slot holds a soft "Reset to Auto" button that resets that group only (its tip names the rows); the hint text is never reset.
 
 ### 28.3 Hotkey [M14, M15, M16]
 
@@ -540,6 +542,13 @@ What correct looks like, per screen. Geometry not given here comes from sections
 - Test, Recordings: Scenario: Combo, full column. Test: `[Run primary, 88]` at the column's right. New recording: title + InfoTip (DS-11.4 i), `[Record, 88]`. From history: Combo, full column, picking adds (DS-27.2). Four rows, 49 px apart, no second line.
 - Take card: `[Play / Stop][wave, stretch][duration] ... [delete]`: Play leftmost, Delete rightmost (section 23).
 - Test records with the device, gain and processing set on Audio; there is no second set of microphone settings.
+
+### 28.8 Settings search (owner item 17, ia-map 3.7)
+
+- Rail entry 1, above Home, outside the rail's FocusScope (Up/Down and Ctrl+Tab skip it), one 40 px slot, so the rail holds at most 11 entries (UI rule 25). Full rail: a field look (`bg-control`, 1 px `stroke-control`, `radius-control`, `control-height`, centred in the slot): `[magnifier 20, where the rail items' icons are][pair-gap]["Search settings" in `text-secondary`, stretch]["Ctrl+F" Caption]`. Icons-only rail: a NavItem with the magnifier, tooltip "Search settings (Ctrl+F)". A click or Ctrl+F opens the popup; on History Ctrl+F focuses "Search recordings" instead.
+- Popup: `SearchPopup` (modal, scrim of DS-25.11), its field over the rail's in the full rail, beside the rail when icons-only; width min(480, window - x - 8); rows 48 px (`row-height`, `SearchPopup.detailed`), up to eight: `[the page's rail glyph 20][title, "Page > Tab" under it in `text-secondary`]`; Up/Down, Enter, Esc, click outside closes. An empty field lists the pages and tabs; nothing found: "No setting matches".
+- Index: one static table in `src/search.rs` (title, tip, old names and everyday words per row, group, tab and page), word-start match, case and accents ignored, ranked title > tab name and extra words > tip. A test reads every row and group title of `ui/pages/*.slint` and fails when the table misses one or its text differs; no index is built from the live window (a closed page does not exist).
+- Pick: the page and tab open, the row whose `search-key` (its title unless set; empty for rows that exist twice on a page or only in a state) matches scrolls to the middle when out of view, and its background flashes `accent-tint` twice: 150 ms on, 150 off, fades `motion-quick`, drawn under the row 8 px past its sides and 4 px past top and bottom. The keyboard focus then goes to the row's first control with no ring (a row's `Flash` asks once the page is laid out, an anchor `FocusScope` in front of its controls takes the focus, the window sends one Tab key with `Shell.quiet-focus` set, which `KeyFocus` and the text fields read); Space and Enter act on it at once, the next Tab draws the ring. A row with no control (the Level meter) or only a disabled one passes the focus to the next row's control. Reduced motion: a steady tint for 600 ms. A row that is not on screen (hidden by a state) does not flash later: the pick expires after 1 s.
 
 ## 29. Mission items to sections
 

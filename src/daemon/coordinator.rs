@@ -137,6 +137,8 @@ pub struct Coordinator<H> {
     words: HashMap<JobId, Vec<oxi_core::history::Word>>,
     /// Parts the confidence filter held back, until the history entry (never pasted, never lost).
     held: HashMap<JobId, Vec<oxi_core::history::HeldPart>>,
+    /// The loudness numbers of each job's recording, from its audio to its history save.
+    levels: HashMap<JobId, oxi_core::audio::Levels>,
     /// The held parts of a job with text, joined, until its paste: "Copy last text" gets them
     /// after the text, so they are not lost when the entry is not written (arch-plan 9.1).
     held_copy: HashMap<JobId, String>,
@@ -231,6 +233,7 @@ impl<H: ChordHook> Coordinator<H> {
             text: HashMap::new(),
             words: HashMap::new(),
             held: HashMap::new(),
+            levels: HashMap::new(),
             held_copy: HashMap::new(),
             merges: HashMap::new(),
             last_text: None,
@@ -254,6 +257,10 @@ impl<H: ChordHook> Coordinator<H> {
     /// The thread body: waits for the next message or the machine's next deadline (then a
     /// `Tick`), until `Shutdown` or every sender is gone. `now` is the clock.
     pub fn run(mut self, inbox: &Receiver<Inbox>, now: impl Fn() -> Millis) {
+        // "Always ready" (`preload_at_start`): the machine's first step loads the model.
+        if self.active.model.preload_at_start {
+            self.feed(Event::Tick, now());
+        }
         loop {
             let msg = match wait(self.state.next_deadline(), now()) {
                 Some(timeout) => inbox.recv_timeout(timeout),
@@ -361,7 +368,13 @@ impl<H: ChordHook> Coordinator<H> {
                 samples,
                 spool,
                 voiced_ms,
-            } => self.job_audio(job, samples, spool, Millis(voiced_ms), now),
+                levels,
+            } => {
+                if let Some(levels) = levels {
+                    self.levels.insert(job, levels);
+                }
+                self.job_audio(job, samples, spool, Millis(voiced_ms), now);
+            }
             // A job merged into a longer dictation: whatever whisper made of it is not used. Its
             // audio may still wait for the merge.
             Inbox::Transcribed { job, .. } if self.state.superseded(job).is_none() => {}
@@ -548,6 +561,7 @@ impl<H: ChordHook> Coordinator<H> {
         let text = self.text.get(&job).cloned();
         let words = self.words.remove(&job).unwrap_or_default();
         let held = self.held.remove(&job).unwrap_or_default();
+        let levels = self.levels.remove(&job);
         match (samples, text) {
             (Some(samples), Some(text)) if self.history_wanted.remove(&job) => {
                 let carried = self.carried_spools.remove(&job).unwrap_or_default();
@@ -559,6 +573,7 @@ impl<H: ChordHook> Coordinator<H> {
                         words,
                         held,
                         delivered,
+                        levels,
                         cfg,
                         spool,
                         carried,
@@ -592,6 +607,7 @@ impl<H: ChordHook> Coordinator<H> {
         // Nothing was inserted: "Copy last text" is where it can be had at once.
         self.keep_last_text(job);
         self.spoken.remove(&job);
+        self.levels.remove(&job);
     }
 
     /// `samples` is the audio of `job`; when a press inside the hold gap carried earlier jobs
@@ -620,6 +636,7 @@ impl<H: ChordHook> Coordinator<H> {
             self.text.remove(&j);
             self.words.remove(&j);
             self.held.remove(&j);
+            self.levels.remove(&j);
             self.held_copy.remove(&j);
             // Its profile too: it ends here, with no paste and no `no_text` (review d04 #3).
             self.profiles.remove(&j);
@@ -652,6 +669,7 @@ impl<H: ChordHook> Coordinator<H> {
                     words: Vec::new(),
                     held: Vec::new(),
                     delivered: None,
+                    levels: None,
                     cfg,
                     spool,
                     carried,
@@ -749,6 +767,7 @@ impl<H: ChordHook> Coordinator<H> {
         if self.state.superseded(job) != Some(true) {
             self.profiles.remove(&job);
             self.spoken.remove(&job);
+            self.levels.remove(&job);
             self.no_transcript(job);
         }
     }
@@ -983,6 +1002,7 @@ impl<H: ChordHook> Coordinator<H> {
             Some(held) if !held.is_empty() => self.file_filtered(job, words, held),
             _ => {
                 self.spoken.remove(&job);
+                self.levels.remove(&job);
                 self.no_transcript(job);
             }
         }
@@ -992,6 +1012,7 @@ impl<H: ChordHook> Coordinator<H> {
     fn keep_cancelled(&mut self, job: JobId) {
         self.profiles.remove(&job);
         self.spoken.remove(&job);
+        self.levels.remove(&job);
         if let Some(samples) = self.audio.remove(&job) {
             // Interim route until t10's history API has a cancelled entry: the audio is
             // saved as a dictation with no text, so "kept" is true while history is on.
@@ -1007,6 +1028,7 @@ impl<H: ChordHook> Coordinator<H> {
                     words: Vec::new(),
                     held: Vec::new(),
                     delivered: None,
+                    levels: self.levels.remove(&job),
                     cfg,
                     spool,
                     carried,
@@ -1139,6 +1161,7 @@ impl<H: ChordHook> Coordinator<H> {
         let Some(samples) = self.audio.remove(&job) else {
             // Cannot happen (the machine waits for JobAudioReady); fail the job, not the machine.
             self.spoken.remove(&job);
+            self.levels.remove(&job);
             return Some(Event::TranscriptionFailed(job));
         };
         self.transcribing = Some(job);

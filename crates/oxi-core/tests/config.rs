@@ -10,6 +10,16 @@ use toml_edit::{DocumentMut, Item};
 const FULL: &str = include_str!("fixtures/config/v1_full.toml");
 const UNKNOWN: &str = include_str!("fixtures/config/v1_unknown.toml");
 
+/// The v1 fixture as a save writes it back: version 2, and its `[sounds]` without the old
+/// `enabled = false` (ia-map S80), every sound Off instead, so it stays as silent as it was.
+fn full_saved() -> String {
+    let from = "[sounds]\nenabled = false\nvolume = 0.25\nstart = \"pop\"\nstop = 'C:\\Sounds\\stop.wav'\n";
+    let to = "[sounds]\nvolume = 0.25\nstart = \"off\"\nstop = \"off\"\ncancel = \"off\"\nerror = \"off\"\ndone_enabled = false\n";
+    assert!(FULL.contains(from), "the fixture's [sounds] changed");
+    FULL.replacen("version = 1", "version = 2", 1)
+        .replacen(from, to, 1)
+}
+
 #[test]
 fn version_matches_migration_count() {
     assert_eq!(
@@ -27,10 +37,7 @@ fn v1_fixture_round_trips_byte_identical() {
     assert_eq!(file.config.hotkey.mode, Mode::Toggle);
     assert_eq!(file.config.model.language, Language::AUTO);
     assert_eq!(file.config.paste.rules.len(), 2);
-    assert_eq!(
-        file.to_toml_string().unwrap(),
-        FULL.replacen("version = 1", "version = 2", 1)
-    );
+    assert_eq!(file.to_toml_string().unwrap(), full_saved());
 }
 
 #[test]
@@ -515,10 +522,11 @@ fn recent_languages_and_app_language_default_and_round_trip() {
     let c = Config::default();
     assert_eq!(c.model.recent_languages, [Language::RU, Language::EN]);
     assert_eq!(c.ui.language, AppLanguage::En);
-    // A v1 file without the new keys changes only its version line on a save.
+    // A v1 file without the new keys changes only its version line on a save (and its old
+    // sound switch, S80).
     assert_eq!(
         ConfigFile::parse(FULL).unwrap().to_toml_string().unwrap(),
-        FULL.replacen("version = 1", "version = 2", 1)
+        full_saved()
     );
 
     let mut file = ConfigFile::default();
@@ -659,9 +667,31 @@ fn sound_defaults_and_values_load() {
     );
     assert_eq!(s.volume.to_bits(), 0.5_f64.to_bits());
     let file = ConfigFile::parse(FULL).unwrap();
-    assert_eq!(file.config.sounds.start, "pop");
-    assert_eq!(file.config.sounds.stop, r"C:\Sounds\stop.wav");
     assert!(file.warnings.is_empty(), "{:?}", file.warnings);
+    // The fixture's sounds were silenced by the old `enabled = false`: still silent, now per
+    // sound, so the page shows what plays (S80).
+    let s = &file.config.sounds;
+    for (key, value) in [
+        ("start", &s.start),
+        ("stop", &s.stop),
+        ("cancel", &s.cancel),
+        ("error", &s.error),
+    ] {
+        assert_eq!(value, "off", "{key}");
+    }
+    assert!(!s.done_enabled);
+    // An old `enabled = true` changes nothing but goes from the file.
+    let on = ConfigFile::parse("version = 2\n[sounds]\nenabled = true\nstart = \"pop\"\n").unwrap();
+    assert_eq!(on.config.sounds.start, "pop");
+    assert_eq!(
+        on.to_toml_string().unwrap(),
+        "version = 2\n[sounds]\nstart = \"pop\"\n"
+    );
+    let again = ConfigFile::parse(&file.to_toml_string().unwrap()).unwrap();
+    assert_eq!(
+        again.config.sounds, file.config.sounds,
+        "a second load changes nothing"
+    );
 }
 
 #[test]

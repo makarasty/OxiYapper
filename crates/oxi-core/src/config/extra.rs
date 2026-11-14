@@ -300,6 +300,192 @@ fn saturate(v: i64) -> u8 {
     u8::try_from(v.clamp(0, i64::from(u8::MAX))).unwrap_or(u8::MAX)
 }
 
+/// The spoken words of a voice-command phrase: lowercase, no punctuation at a word's ends, so
+/// "New line!" and "new  line" are the same phrase. Empty when nothing speakable is left.
+pub fn phrase_words(phrase: &str) -> Vec<String> {
+    phrase
+        .split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// One voice command: its own switch and the phrases that trigger it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VoiceCommand {
+    pub on: bool,
+    pub phrases: Vec<String>,
+}
+
+impl VoiceCommand {
+    fn with(phrases: &[&str]) -> Self {
+        Self {
+            on: true,
+            phrases: phrases.iter().map(|p| (*p).to_owned()).collect(),
+        }
+    }
+
+    /// A table that sets only `on` keeps the default phrases; one that sets `phrases` replaces them.
+    fn read<'de, D: Deserializer<'de>>(d: D, default: &[&str]) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            on: Option<bool>,
+            phrases: Option<Vec<String>>,
+        }
+        let raw = Raw::deserialize(d)?;
+        let mut cmd = Self::with(default);
+        cmd.on = raw.on.unwrap_or(true);
+        if let Some(phrases) = raw.phrases {
+            cmd.phrases = phrases;
+        }
+        Ok(cmd)
+    }
+
+    /// Trims, and drops phrases with nothing to say and repeats of an earlier one; true when it
+    /// changed anything.
+    fn clean(&mut self) -> bool {
+        let mut seen: Vec<Vec<String>> = Vec::new();
+        let before = self.phrases.clone();
+        self.phrases.retain(|p| {
+            let words = phrase_words(p);
+            let keep = !words.is_empty() && !seen.contains(&words);
+            seen.push(words);
+            keep
+        });
+        for p in &mut self.phrases {
+            *p = p.trim().to_owned();
+        }
+        before != self.phrases
+    }
+}
+
+/// Two voice commands that share a phrase: the engine could not tell which one was meant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceConflict {
+    /// The phrase as the second command writes it.
+    pub phrase: String,
+    /// The slots (see [`VoiceCommands::slot`]) that both claim it.
+    pub first: usize,
+    pub second: usize,
+}
+
+/// `[text.voice]`: the three voice commands; the master switch is `text.voice_commands`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoiceCommands {
+    #[serde(deserialize_with = "VoiceCommands::de_line")]
+    pub new_line: VoiceCommand,
+    #[serde(deserialize_with = "VoiceCommands::de_paragraph")]
+    pub new_paragraph: VoiceCommand,
+    #[serde(deserialize_with = "VoiceCommands::de_delete")]
+    pub delete_last: VoiceCommand,
+}
+
+impl VoiceCommands {
+    const LINE: [&'static str; 2] = ["новая строка", "new line"];
+    const PARAGRAPH: [&'static str; 2] = ["новый абзац", "new paragraph"];
+    const DELETE: [&'static str; 3] = ["удали последнее", "delete that", "scratch that"];
+
+    fn de_line<'de, D: Deserializer<'de>>(d: D) -> Result<VoiceCommand, D::Error> {
+        VoiceCommand::read(d, &Self::LINE)
+    }
+
+    fn de_paragraph<'de, D: Deserializer<'de>>(d: D) -> Result<VoiceCommand, D::Error> {
+        VoiceCommand::read(d, &Self::PARAGRAPH)
+    }
+
+    fn de_delete<'de, D: Deserializer<'de>>(d: D) -> Result<VoiceCommand, D::Error> {
+        VoiceCommand::read(d, &Self::DELETE)
+    }
+
+    /// Slot 0 new line, 1 new paragraph, 2 delete the last sentence.
+    pub fn slot(&self, i: usize) -> &VoiceCommand {
+        match i {
+            0 => &self.new_line,
+            1 => &self.new_paragraph,
+            _ => &self.delete_last,
+        }
+    }
+
+    pub fn slot_mut(&mut self, i: usize) -> &mut VoiceCommand {
+        match i {
+            0 => &mut self.new_line,
+            1 => &mut self.new_paragraph,
+            _ => &mut self.delete_last,
+        }
+    }
+
+    /// The default phrases of slot `i`.
+    pub fn defaults(i: usize) -> Vec<String> {
+        let list: &[&str] = match i {
+            0 => &Self::LINE,
+            1 => &Self::PARAGRAPH,
+            _ => &Self::DELETE,
+        };
+        list.iter().map(|p| (*p).to_owned()).collect()
+    }
+
+    /// The first phrase two commands share (their switches do not matter: switching one on later
+    /// must not start a clash), or `None`.
+    pub fn conflict(&self) -> Option<VoiceConflict> {
+        for second in 1..3 {
+            for phrase in &self.slot(second).phrases {
+                let words = phrase_words(phrase);
+                let first = (0..second).find(|&f| {
+                    self.slot(f)
+                        .phrases
+                        .iter()
+                        .any(|p| phrase_words(p) == words)
+                });
+                if let Some(first) = first.filter(|_| !words.is_empty()) {
+                    return Some(VoiceConflict {
+                        phrase: phrase.clone(),
+                        first,
+                        second,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// Cleans the phrases; a phrase a later command repeats from an earlier one is dropped from
+    /// the later one. Says what it did.
+    fn normalise(&mut self) -> Vec<String> {
+        let mut said = Vec::new();
+        for i in 0..3 {
+            if self.slot_mut(i).clean() {
+                said.push(format!(
+                    "text.voice command {i}: empty or repeated phrases were dropped"
+                ));
+            }
+        }
+        while let Some(c) = self.conflict() {
+            let words = phrase_words(&c.phrase);
+            self.slot_mut(c.second)
+                .phrases
+                .retain(|p| phrase_words(p) != words);
+            said.push(
+                "text.voice: a phrase two commands share was dropped from the later one".into(),
+            );
+        }
+        said
+    }
+}
+
+impl Default for VoiceCommands {
+    fn default() -> Self {
+        Self {
+            new_line: VoiceCommand::with(&Self::LINE),
+            new_paragraph: VoiceCommand::with(&Self::PARAGRAPH),
+            delete_last: VoiceCommand::with(&Self::DELETE),
+        }
+    }
+}
+
 /// A trigger phrase that types a block of text (`[[text.snippets]]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snippet {
@@ -321,9 +507,14 @@ pub struct Text {
     /// Lowercase whole words.
     pub fillers: Vec<String>,
     pub voice_commands: bool,
+    pub voice: VoiceCommands,
     pub snippets: Vec<Snippet>,
     pub confidence_filter: bool,
     pub confidence_min: f32,
+    /// Drop the full stop at the end of the text (item 41, candidate 7).
+    pub no_final_period: bool,
+    /// Start the text with a small letter (item 41, candidate 7).
+    pub small_first_letter: bool,
 }
 
 impl Default for Text {
@@ -337,9 +528,12 @@ impl Default for Text {
                 .map(String::from)
                 .to_vec(),
             voice_commands: false,
+            voice: VoiceCommands::default(),
             snippets: Vec::new(),
             confidence_filter: false,
             confidence_min: 0.35,
+            no_final_period: false,
+            small_first_letter: false,
         }
     }
 }
@@ -385,6 +579,7 @@ impl Text {
             said.push("text.fillers must be lowercase, non-empty and unique, cleaned".into());
             self.fillers = fillers;
         }
+        said.extend(self.voice.normalise());
         let before = self.snippets.len();
         self.snippets.retain(|s| !s.trigger.trim().is_empty());
         if self.snippets.len() != before {

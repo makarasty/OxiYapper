@@ -124,6 +124,9 @@ pub struct State {
     cfg: MachineConfig,
     /// Config received while busy; swapped in when the machine is Idle (item 11).
     pending_cfg: Option<MachineConfig>,
+    /// A load with no press is due (`preload_at_start`): at start, after a new config or a resume.
+    /// Kept while a load is in flight, so a model the new config replaced is followed by its own.
+    want_ready: bool,
     rec: Option<Recording>,
     /// Oldest first. Whisper and paste take jobs strictly in this order.
     jobs: VecDeque<Job>,
@@ -166,6 +169,7 @@ impl Default for State {
 impl State {
     pub fn new(cfg: MachineConfig) -> Self {
         Self {
+            want_ready: cfg.preload_at_start,
             cfg,
             pending_cfg: None,
             rec: None,
@@ -365,7 +369,11 @@ impl State {
                 self.unload_when_idle = true;
             }
             Event::Lock => self.cancel_recording(now, CancelWhy::Lock, false, &mut fx),
-            Event::Resume | Event::Unlock => fx.push(Effect::ReinstallHook),
+            Event::Resume => {
+                self.want_ready = self.cfg.preload_at_start;
+                fx.push(Effect::ReinstallHook);
+            }
+            Event::Unlock => fx.push(Effect::ReinstallHook),
             Event::Tick => self.tick(now, &mut fx),
         }
         self.dispatch(now, &mut fx);
@@ -967,6 +975,10 @@ impl State {
     fn settle(&mut self, now: Millis, fx: &mut Effects) {
         if self.phase() == Phase::Idle {
             if let Some(cfg) = self.pending_cfg.take() {
+                // Only turning it on or another model loads: any other save after an idle unload
+                // must not undo the unload.
+                let loads = !self.cfg.preload_at_start || cfg.model != self.cfg.model;
+                self.want_ready = cfg.preload_at_start && (self.want_ready || loads);
                 self.cfg = cfg;
                 self.idle_unload_at = None;
                 self.model_fallback_noted.clear(); // the rule may be fixed, or another one broken
@@ -990,6 +1002,12 @@ impl State {
                 && self.idle_unload_at.is_none()
             {
                 self.idle_unload_at = Some(now + self.cfg.idle_unload);
+            }
+            if self.want_ready && self.model != ModelStatus::Loading && !self.unload_when_idle {
+                self.want_ready = false;
+                if self.cfg.preload_at_start && self.model == ModelStatus::Unloaded {
+                    self.preload(fx);
+                }
             }
         }
         if !self.unloadable() {

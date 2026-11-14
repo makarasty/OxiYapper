@@ -4,12 +4,14 @@
 
 mod denoise;
 mod device;
+mod levels;
 mod pipeline;
 mod resample;
 mod speech;
 mod trim;
 
 pub use device::{EndpointNote, InputDevice, InputPick, endpoint_lost, pick_input};
+pub use levels::{Biquad, LevelStats, Levels, RUMBLE_HZ};
 pub use pipeline::{EdgeStats, Finished, Pipeline, Trim, process};
 pub use speech::{DETECTOR_LATENCY, SpeechDetector};
 pub use trim::voiced_runs;

@@ -178,7 +178,7 @@ fn missing_custom_path_shows_an_error() {
 fn relative_custom_path_is_refused() {
     let l = layout("relative", None);
     let window = open(&l, Page::Model);
-    view(&window, "Use my own .bin");
+    view(&window, "Use my own model file");
     with_role(&window, "Model file", AccessibleRole::TextInput)
         .set_accessible_value("mine.bin".to_owned());
     assert!(has(
@@ -193,7 +193,7 @@ fn typing_a_good_path_picks_the_custom_model() {
     let l = layout("custom-pick", None);
     let window = open(&l, Page::Model);
     // Viewed, not in use: an empty path is no error yet, and Use waits for a file.
-    view(&window, "Use my own .bin");
+    view(&window, "Use my own model file");
     assert!(!has(&window, "Choose a .bin model file"));
     let use_it = button(&window, "Use the model file");
     assert_eq!(use_it.accessible_enabled(), Some(false));
@@ -223,8 +223,8 @@ fn gpu_picker_shows_the_configured_choice() {
     ] {
         let l = layout("gpu", Some(&format!("version = 2\n[model]\n{config}\n")));
         let window = open_again(&l, Page::Model);
-        sub_tab(&window, "Settings");
-        let picker = with_role(&window, "Run on", AccessibleRole::Combobox);
+        sub_tab(&window, "Speed");
+        let picker = with_role(&window, "Run the model on", AccessibleRole::Combobox);
         assert_eq!(
             picker.accessible_value().as_deref(),
             Some(shown),
@@ -258,8 +258,8 @@ unload_immediately = true",
             )),
         );
         let window = open_again(&l, Page::Model);
-        sub_tab(&window, "Settings");
-        let picker = with_role(&window, "Unload after idle", AccessibleRole::Combobox);
+        sub_tab(&window, "Speed");
+        let picker = with_role(&window, "Free memory after", AccessibleRole::Combobox);
         assert_eq!(
             picker.accessible_value().as_deref(),
             Some(shown),
@@ -275,13 +275,17 @@ fn sub_tabs_show_one_part_of_the_page() {
     let tab = |label| with_role(&window, label, AccessibleRole::Tab);
     assert_eq!(tab("Models").accessible_item_selected(), Some(true));
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
-    assert!(has(&window, "Use my own .bin") && !has(&window, "Run on"));
-    sub_tab(&window, "Settings");
-    assert_eq!(tab("Settings").accessible_item_selected(), Some(true));
-    assert!(has(&window, "Run on") && has(&window, "Unload after idle"));
-    assert!(!has(&window, "Use my own .bin"));
-    sub_tab(&window, "Advanced");
-    assert!(has(&window, "Processor use") && !has(&window, "Run on"));
+    assert!(has(&window, "Use my own model file") && !has(&window, "Run the model on"));
+    sub_tab(&window, "Languages");
+    assert_eq!(tab("Languages").accessible_item_selected(), Some(true));
+    assert!(has(&window, "Dictation language") && has(&window, "All other languages and Auto"));
+    assert!(!has(&window, "Use my own model file"));
+    sub_tab(&window, "Speed");
+    assert_eq!(tab("Speed").accessible_item_selected(), Some(true));
+    assert!(has(&window, "Run the model on") && has(&window, "Free memory after"));
+    assert!(has(&window, "Processor use") && !has(&window, "Careful mode"));
+    sub_tab(&window, "Accuracy");
+    assert!(has(&window, "Careful mode") && !has(&window, "Run the model on"));
 }
 
 #[test]
@@ -318,6 +322,7 @@ fn locked_config_disables_the_controls() {
     let original = "version = 99\n[model]\nid = \"large-v3\"\n";
     let l = layout("locked", Some(original));
     let window = open(&l, Page::Model);
+    sub_tab(&window, "Languages");
     let off = |label: &str, role| {
         let e = with_role(&window, label, role);
         assert_eq!(e.accessible_enabled(), Some(false), "{label}");
@@ -326,16 +331,18 @@ fn locked_config_disables_the_controls() {
     off("More languages", AccessibleRole::Button);
     more_languages(&window);
     assert!(!popup_open(&window), "a locked config opened the popup");
+    off("Add language", AccessibleRole::Button);
     // Viewing writes nothing, so the gallery stays on; what writes the config is off.
-    view(&window, "Use my own .bin");
+    sub_tab(&window, "Models");
+    view(&window, "Use my own model file");
     off("Model file", AccessibleRole::TextInput);
     off("Use the model file", AccessibleRole::Button);
     view(&window, "Whisper large-v3 turbo");
     assert!(shows(&window, "Whisper large-v3 turbo: Not downloaded"));
     // The sub-tabs only navigate: they stay on.
-    sub_tab(&window, "Settings");
-    off("Run on", AccessibleRole::Combobox);
-    off("Unload after idle", AccessibleRole::Combobox);
+    sub_tab(&window, "Speed");
+    off("Run the model on", AccessibleRole::Combobox);
+    off("Free memory after", AccessibleRole::Combobox);
     assert_eq!(fs::read_to_string(l.config_file()).unwrap(), original);
 }
 
@@ -376,6 +383,7 @@ fn popup_open(window: &AppWindow) -> bool {
 fn the_language_search_finds_by_code_and_by_alias() {
     let l = layout("search-code", None);
     let window = open(&l, Page::Model);
+    sub_tab(&window, "Languages");
     for (typed, first) in [("ua", "Ukrainian"), ("uk", "Ukrainian"), ("JP", "Japanese")] {
         more_languages(&window);
         search(&window, typed);
@@ -406,6 +414,7 @@ fn the_language_search_finds_by_code_and_by_alias() {
 fn language_is_on_the_first_tab_and_auto_keeps_working() {
     let l = layout("language", None);
     let window = open(&l, Page::Model);
+    sub_tab(&window, "Languages");
     assert_eq!(segment(&window, "Russian").accessible_checked(), Some(true));
     // "More" is a button with a glyph, not a fourth segment of typed dots (DS-17.1).
     button(&window, "More languages");
@@ -430,6 +439,7 @@ fn language_is_on_the_first_tab_and_auto_keeps_working() {
 fn a_rare_language_goes_to_the_model_and_the_last_used() {
     let l = layout("language-rare", None);
     let window = open(&l, Page::Model);
+    sub_tab(&window, "Languages");
     let haw: Language = "haw".parse().unwrap();
     assert!(!popup_open(&window));
     more_languages(&window);
@@ -452,6 +462,7 @@ fn a_rare_language_goes_to_the_model_and_the_last_used() {
 fn the_popup_searches_english_and_native_names() {
     let l = layout("language-search", None);
     let window = open(&l, Page::Model);
+    sub_tab(&window, "Languages");
     more_languages(&window);
     let rows = |window: &AppWindow| {
         ElementHandle::find_by_element_type_name(window, "Rectangle")
@@ -480,6 +491,7 @@ fn the_popup_searches_english_and_native_names() {
 fn the_last_used_languages_rotate_and_the_segments_hold_still() {
     let l = layout("language-rotate", None);
     let window = open(&l, Page::Model);
+    sub_tab(&window, "Languages");
     let at = |label: &str| segment(&window, label).absolute_position().x;
     let (ru, en) = (at("Russian"), at("English"));
     let zh: Language = "zh".parse().unwrap();
@@ -525,6 +537,7 @@ fn tab_to_the_segments(window: &AppWindow, lit: &str) {
 fn the_popup_works_from_the_keyboard() {
     let l = layout("language-keys", None);
     let window = open(&l, Page::Model);
+    sub_tab(&window, "Languages");
     tab_to_the_segments(&window, "Russian");
     // The "more" button is the next Tab stop: it opens the list, and getting there saves nothing.
     press(&window, Key::Tab);
@@ -555,6 +568,7 @@ fn the_popup_works_from_the_keyboard() {
 fn the_arrows_stop_at_auto() {
     let l = layout("language-arrows", None);
     let window = open(&l, Page::Model);
+    sub_tab(&window, "Languages");
     tab_to_the_segments(&window, "Russian");
     press(&window, Key::RightArrow);
     assert_eq!(saved(&l).language, Language::EN);
@@ -574,6 +588,7 @@ fn the_arrows_stop_at_auto() {
 fn typing_reaches_the_search_when_an_accessibility_action_opened_it() {
     let l = layout("language-a11y-open", None);
     let window = open(&l, Page::Model);
+    sub_tab(&window, "Languages");
     // Nothing is focused: no click, no Tab. The first tick lays the page out, as the event loop does.
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
     more_languages(&window);
@@ -595,6 +610,7 @@ fn a_language_in_a_segment_stays_there_when_the_one_in_use_leaves() {
         Some("version = 2\n[model]\nlanguage = \"zh\"\nrecent_languages = [\"ru\", \"en\"]\n"),
     );
     let window = open(&l, Page::Model);
+    sub_tab(&window, "Languages");
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
     let at = |label: &str| segment(&window, label).absolute_position().x;
     let (zh, ru) = (at("Chinese"), at("Russian"));
@@ -633,6 +649,7 @@ fn a_language_code_says_its_name_in_a_tooltip() {
             )),
         );
         let window = open_again(&l, Page::Model);
+        sub_tab(&window, "Languages");
         assert_eq!(
             copies(&window, name),
             1,
@@ -645,6 +662,7 @@ fn a_language_code_says_its_name_in_a_tooltip() {
 
         // On hover, after the delay.
         let window = open_again(&l, Page::Model);
+        sub_tab(&window, "Languages");
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
         let seg = segment(&window, name);
         let (at, size) = (seg.absolute_position(), seg.size());
@@ -689,8 +707,10 @@ fn the_models_tab_never_scrolls_and_the_gallery_takes_the_room() {
         .window()
         .set_size(slint::LogicalSize::new(720.0, 860.0));
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
-    assert!(has(&window, "Use my own .bin"), "the last tile shows");
-    let last = radio(&window, "Use my own .bin").absolute_position().y;
+    assert!(has(&window, "Use my own model file"), "the last tile shows");
+    let last = radio(&window, "Use my own model file")
+        .absolute_position()
+        .y;
     let first = radio(&window, "Whisper large-v3 turbo")
         .absolute_position()
         .y;
@@ -704,6 +724,7 @@ fn a_language_set_by_hand_is_shown() {
         Some("version = 2\n[model]\nlanguage = \"zh\"\n"),
     );
     let window = open(&l, Page::Model);
+    sub_tab(&window, "Languages");
     assert_eq!(segment(&window, "Chinese").accessible_checked(), Some(true));
     assert_eq!(
         segment(&window, "Russian").accessible_checked(),
@@ -720,7 +741,11 @@ fn part_of(l: &Layout, bytes: u64) -> std::path::PathBuf {
 }
 
 fn delete_button(window: &AppWindow) -> ElementHandle {
-    with_role(window, "Delete partial downloads", AccessibleRole::Button)
+    with_role(
+        window,
+        "Delete unfinished downloads",
+        AccessibleRole::Button,
+    )
 }
 
 #[test]
@@ -729,7 +754,7 @@ fn delete_partials_waits_while_the_daemon_may_be_writing() {
     let part = part_of(&l, 3_000_000);
     let (ipc, _sent) = Ipc::fake();
     let window = open_linked(&l, Page::Model, ipc.clone());
-    sub_tab(&window, "Settings");
+    sub_tab(&window, "Models");
     let link = |link| ipc.deliver(&Event::Link(link));
     assert_eq!(delete_button(&window).accessible_enabled(), Some(true));
     // A daemon that does not answer (or speaks another protocol) may still be writing.
@@ -770,12 +795,12 @@ fn a_small_part_is_sized_in_mb() {
     let part = part_of(&l, 3_000_000);
     let (ipc, _sent) = Ipc::fake();
     let window = open_linked(&l, Page::Model, ipc);
-    sub_tab(&window, "Settings");
+    sub_tab(&window, "Models");
     delete_button(&window).invoke_accessible_default_action();
     assert!(!part.exists());
     assert_eq!(
         window.global::<Toast>().get_text(),
-        "Deleted 3 MB of partial downloads"
+        "Deleted 3 MB of unfinished downloads"
     );
 }
 
@@ -847,7 +872,7 @@ fn the_gallery_shows_the_rows_that_fit_and_scrolls_the_rest_inside() {
         .iter()
         .filter(|m| m.id != "tiny")
         .map(|m| m.display_name)
-        .chain(["Use my own .bin"])
+        .chain(["Use my own model file"])
         .collect();
     assert_eq!(offered.len(), 10);
     let rows = |window: &AppWindow, names: &[&str]| {
@@ -948,7 +973,7 @@ fn files_rows_say_the_sizes() {
     let turbo = MODELS.iter().find(|m| m.id == "turbo").unwrap();
     common::fake_model(&l.models_dir().join(turbo.file_name), turbo.size);
     let window = open(&l, Page::Model);
-    sub_tab(&window, "Settings");
+    sub_tab(&window, "Models");
     let state = window.global::<ModelState>();
     measured(&window);
     let folder = state.get_folder_size();
@@ -970,7 +995,7 @@ fn an_unreadable_models_folder_shows_an_error() {
     fs::create_dir_all(l.models_dir().parent().unwrap()).unwrap();
     fs::write(l.models_dir(), b"not a folder").unwrap();
     let window = open(&l, Page::Model);
-    sub_tab(&window, "Settings");
+    sub_tab(&window, "Models");
     let state = window.global::<ModelState>();
     measured(&window);
     assert_eq!(state.get_folder_size(), "Can't read the folder");
@@ -1008,16 +1033,19 @@ fn row_titles_start_at_one_x_and_text_rows_use_the_width() {
             .absolute_position()
             .x
     };
+    sub_tab(&window, "Languages");
     let language = x("Dictation language");
+    sub_tab(&window, "Models");
     for (tab, title) in [
         (None, "Whisper large-v3 turbo: Not downloaded"),
-        (Some("Use my own .bin"), "Use my own .bin"),
-        (Some("Settings"), "Run on"),
-        (Some("Advanced"), "Processor use"),
+        (Some("Use my own model file"), "Use my own model file"),
+        (Some("Accuracy"), "Careful mode"),
+        (Some("Speed"), "Run the model on"),
+        (Some("Speed"), "Processor use"),
     ] {
         match tab {
             // Past the two rows shown at 720: picked as the arrows and Enter would.
-            Some("Use my own .bin") => window
+            Some("Use my own model file") => window
                 .global::<ModelState>()
                 .set_viewed(i32::try_from(MODELS.len() - 1).unwrap()),
             Some(tab) => sub_tab(&window, tab),
@@ -1039,7 +1067,7 @@ fn row_titles_start_at_one_x_and_text_rows_use_the_width() {
 
 /// The prompt is a select (your dictionary, none, custom); Custom swaps it for a text field of the
 /// same place and size, and the text is kept while another choice is on. The field is typed in, so
-/// its binding to the config ends: "Reset all to Auto" must still empty it.
+/// its binding to the config ends; "Reset to Auto" keeps it (the hint is the person's own text).
 #[test]
 fn the_prompt_select_swaps_for_a_field_of_the_same_size_and_keeps_the_text() {
     let l = layout("prompt-reset", None);
@@ -1047,7 +1075,7 @@ fn the_prompt_select_swaps_for_a_field_of_the_same_size_and_keeps_the_text() {
     window
         .window()
         .set_size(slint::LogicalSize::new(720.0, 520.0));
-    sub_tab(&window, "Advanced");
+    sub_tab(&window, "Accuracy");
     // Slint runs `changed` handlers on the next tick, as the running app does between two clicks.
     let tick = || i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
     tick();
@@ -1100,10 +1128,19 @@ fn the_prompt_select_swaps_for_a_field_of_the_same_size_and_keeps_the_text() {
             .as_deref(),
         Some("None")
     );
-    // Reset all while the select shows "None": the select follows the config back.
-    button(&window, "Reset all to Auto").invoke_accessible_default_action();
+    // ia-map 3.2, RT R19: Reset to Auto keeps the hint, the person's own choice and text.
+    button(&window, "Reset to Auto").invoke_accessible_default_action();
     tick();
-    assert_eq!(saved(&l).advanced.prompt_source, None);
+    assert_eq!(saved(&l).advanced.prompt_source, Some(PromptSource::None));
+    assert_eq!(
+        with_role(&window, "Hint for the model", AccessibleRole::Combobox)
+            .accessible_value()
+            .as_deref(),
+        Some("None")
+    );
+    // A source pushed from outside still reaches the select whose pick ended its binding.
+    state.invoke_adv_prompt_source_picked(0);
+    tick();
     assert_eq!(
         with_role(&window, "Hint for the model", AccessibleRole::Combobox)
             .accessible_value()
@@ -1112,22 +1149,16 @@ fn the_prompt_select_swaps_for_a_field_of_the_same_size_and_keeps_the_text() {
     );
     state.invoke_adv_prompt_source_picked(2);
     tick();
-    // Reset all cleared the text too; type it again, then Reset all from Custom.
     let field = with_role(&window, "Hint for the model", AccessibleRole::TextInput);
-    assert_eq!(field.accessible_value().as_deref(), Some(""));
-    field.set_accessible_value("Notes.".to_owned());
-    state.invoke_adv_prompt_edited("Notes.".into());
-    assert_eq!(saved(&l).advanced.initial_prompt, "Notes.");
-    button(&window, "Reset all to Auto").invoke_accessible_default_action();
-    assert_eq!(saved(&l).advanced.initial_prompt, "");
-    assert_eq!(saved(&l).advanced.prompt_source, None);
-    tick();
     assert_eq!(
-        with_role(&window, "Hint for the model", AccessibleRole::Combobox)
-            .accessible_value()
-            .as_deref(),
-        Some("Your dictionary (auto)")
+        field.accessible_value().as_deref(),
+        Some("Notes."),
+        "the text is kept"
     );
+    button(&window, "Reset to Auto").invoke_accessible_default_action();
+    tick();
+    assert_eq!(saved(&l).advanced.initial_prompt, "Notes.");
+    assert_eq!(saved(&l).advanced.prompt_source, Some(PromptSource::Custom));
 }
 
 /// A config from before the choice: a typed prompt opens as Custom with its text in the field.
@@ -1143,7 +1174,7 @@ initial_prompt = \"Notes.\"
         ),
     );
     let window = open(&l, Page::Model);
-    sub_tab(&window, "Advanced");
+    sub_tab(&window, "Accuracy");
     let field = with_role(&window, "Hint for the model", AccessibleRole::TextInput);
     assert_eq!(field.accessible_value().as_deref(), Some("Notes."));
 }
@@ -1163,7 +1194,7 @@ threads = 3
         ),
     );
     let window = open(&l, Page::Model);
-    sub_tab(&window, "Advanced");
+    sub_tab(&window, "Speed");
     let shown = |window: &AppWindow| {
         with_role(window, "Processor use", AccessibleRole::Combobox)
             .accessible_value()
@@ -1201,19 +1232,20 @@ threads = 3
 #[test]
 fn advanced_has_a_row_per_parameter_and_none_shares_a_glyph() {
     let window = open(&layout("adv-rows", None), Page::Model);
-    sub_tab(&window, "Advanced");
-    for title in ["Word variety", "Repeat check"] {
+    sub_tab(&window, "Accuracy");
+    for title in ["Word variety", "Second try when a phrase repeats"] {
         assert!(has(&window, title), "{title}");
     }
     assert!(!has(&window, "Audio window"), "a choice the engine ignores");
     let slint = include_str!("../ui/pages/model.slint");
-    let advanced = &slint[slint.find("ModelState.tab == 2").expect("the Advanced tab")..];
+    // Speed and Accuracy (ia-map 3.2), the former Advanced tab.
+    let advanced = &slint[slint.find("ModelState.tab == 2").expect("the Speed tab")..];
     let icons: Vec<&str> = advanced
         .split("icon: Icons.")
         .skip(1)
         .filter_map(|t| t.split(';').next())
         .collect();
-    assert!(icons.len() >= 10, "{icons:?}");
+    assert!(icons.len() >= 12, "{icons:?}");
     let mut seen = std::collections::HashSet::new();
     for icon in icons {
         assert!(seen.insert(icon), "{icon} is on two Advanced controls");
@@ -1274,12 +1306,12 @@ fn the_advanced_choices_leave_room_for_the_number_at_the_least_window() {
     window
         .window()
         .set_size(slint::LogicalSize::new(720.0, 520.0));
-    sub_tab(&window, "Advanced");
+    sub_tab(&window, "Accuracy");
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
     let combos = i_slint_backend_testing::ElementQuery::from_root(&window)
         .match_accessible_role(AccessibleRole::Combobox)
         .find_all();
-    assert!(combos.len() >= 6, "{} choices", combos.len());
+    assert!(combos.len() >= 7, "{} choices", combos.len());
     // The hint select is the whole column: it is swapped for a text field of that size.
     for c in combos
         .into_iter()
@@ -1311,7 +1343,7 @@ fn the_advanced_rows_draw_distinct_glyph_files() {
     for (title, want) in [
         ("Processor use", "threads"),
         ("Speed boost", "flash-attention"),
-        ("Retry doubtful segments", "retry-doubtful"),
+        ("Second try", "retry-doubtful"),
     ] {
         assert_eq!(icon_of(title), want, "{title}");
     }
@@ -1474,6 +1506,7 @@ fn a_downloaded_or_damaged_card_does_not_repeat_the_tile() {
 #[test]
 fn the_language_chevron_has_a_word_and_auto_is_not_a_disabled_box() {
     let window = open(&layout("e11-words", None), Page::Model);
+    sub_tab(&window, "Languages");
     window
         .window()
         .set_size(slint::LogicalSize::new(720.0, 520.0));
@@ -1482,7 +1515,7 @@ fn the_language_chevron_has_a_word_and_auto_is_not_a_disabled_box() {
         button(&window, "More languages").size().width > 48.0,
         "a bare chevron"
     );
-    sub_tab(&window, "Advanced");
+    sub_tab(&window, "Speed");
     assert!(has(&window, "4 now"), "Auto's value is a line of its own");
     assert!(
         !i_slint_backend_testing::ElementQuery::from_root(&window)
@@ -1620,8 +1653,9 @@ fn icon_file(name: &str) -> String {
 #[test]
 fn settings_rows_lead_with_distinct_glyphs() {
     let slint = include_str!("../ui/pages/model.slint");
-    let tab = &slint[slint.find("ModelState.tab == 1").expect("the Settings tab")
-        ..slint.find("ModelState.tab == 2").expect("the Advanced tab")];
+    // Models (with the Files rows), Languages and Speed (ia-map 3.2).
+    let tab = &slint[slint.find("ModelState.tab == 0").expect("the Models tab")
+        ..slint.find("ModelState.tab == 3").expect("the Accuracy tab")];
     let lines: Vec<&str> = tab.lines().collect();
     let leads: Vec<&str> = lines
         .windows(2)
@@ -1702,4 +1736,106 @@ fn a_file_picking_path_field_shows_the_file_glyph() {
         field.contains("picks-file: true;"),
         "the .bin Browse shows browse-folder"
     );
+}
+
+/// ia-map 3.5: the row "Add language" makes takes the caret on its Combo, once (its scroll
+/// into view is `shots::shot_model_language_added`, which lays out in the real fonts).
+#[test]
+fn an_added_language_row_takes_the_caret() {
+    let l = layout("lang-added", None);
+    let window = open(&l, Page::Model);
+    sub_tab(&window, "Languages");
+    let s = window.global::<ModelState>();
+    s.invoke_add_search("yoruba".into());
+    assert_eq!(s.get_add_rows().row_count(), 1);
+    s.invoke_add_chosen(0);
+    assert_eq!(s.get_lang_new(), 0, "Yoruba is the only row");
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    with_role(&window, "Model for Yoruba", AccessibleRole::Combobox);
+    assert_eq!(s.get_lang_new(), -1, "the new row took the caret once");
+    // Yoruba's Combo lists its model, then "Download another model", which opens Models: Down on
+    // the focused Combo picks it.
+    assert_eq!(s.get_tab(), 1);
+    window.window().dispatch_event(WindowEvent::KeyPressed {
+        text: Key::DownArrow.into(),
+    });
+    window.window().dispatch_event(WindowEvent::KeyReleased {
+        text: Key::DownArrow.into(),
+    });
+    assert_eq!(s.get_tab(), 0, "the caret is on Yoruba's Combo");
+}
+
+/// ia-map 3.5, ia-owner: the first row shows the default model as text and a soft "Change"
+/// that opens Models; it has no Delete.
+#[test]
+fn the_default_language_row_changes_the_model_on_models() {
+    let l = layout("lang-change", None);
+    let window = open(&l, Page::Model);
+    sub_tab(&window, "Languages");
+    let change = with_role(&window, "Change the default model", AccessibleRole::Button);
+    assert!(!has(&window, "Remove All other languages and Auto"));
+    change.invoke_accessible_default_action();
+    assert_eq!(window.global::<ModelState>().get_tab(), 0);
+}
+
+/// Hold item 41, candidate 10: the Home daily counts suggest the memory settings on "Free memory
+/// after" (ia-map 3.4); nothing changes until Apply, which sets both rows. "Not now" survives a
+/// reopen. "Load the model at start" is its own switch.
+#[test]
+fn daily_counts_suggest_the_memory_settings_only_on_apply() {
+    use oxi_core::stats::{Date, Day, Stats, Totals};
+    i_slint_backend_testing::init_no_event_loop();
+    let l = layout("memory", Some("version = 2\n"));
+    let stats = Stats {
+        days: (1..=10)
+            .map(|d| Day {
+                date: Date::from_ymd(2026, 11, d).unwrap(),
+                n: Totals {
+                    dictations: 40,
+                    ..Totals::default()
+                },
+            })
+            .collect(),
+        ..Stats::default()
+    };
+    fs::create_dir_all(&l.data_dir).unwrap();
+    fs::write(
+        l.data_dir.join(oxi_core::stats::FILE),
+        stats.to_json().unwrap(),
+    )
+    .unwrap();
+    {
+        let window = open_again(&l, Page::Model);
+        sub_tab(&window, "Speed");
+        let s = window.global::<ModelState>();
+        assert_eq!(
+            s.get_memory_tip().as_str(),
+            "On your last 10 days of use you dictated about 40 times a day. Load the model at start and never free it?"
+        );
+        assert!(!saved(&l).preload_at_start, "nothing changes unasked");
+        s.invoke_memory_suggestion(true);
+        let m = saved(&l);
+        assert!(m.preload_at_start && m.idle_unload_minutes == 0 && !m.unload_immediately);
+        assert_eq!(s.get_memory_tip().as_str(), "", "applied: gone");
+        assert!(s.get_load_at_start(), "the switch shows it");
+        let picker = with_role(&window, "Free memory after", AccessibleRole::Combobox);
+        assert_eq!(picker.accessible_value().as_deref(), Some("Never"));
+
+        // The switch alone: off makes it a hand-set mix, so the suggestion is back; Not now.
+        with_role(&window, "Load the model at start", AccessibleRole::Switch)
+            .invoke_accessible_default_action();
+        assert!(!saved(&l).preload_at_start);
+        assert_ne!(s.get_memory_tip().as_str(), "");
+        s.invoke_memory_suggestion(false);
+        assert_eq!(s.get_memory_tip().as_str(), "");
+    }
+    let window = open_again(&l, Page::Model);
+    sub_tab(&window, "Speed");
+    let s = window.global::<ModelState>();
+    assert_eq!(
+        s.get_memory_tip().as_str(),
+        "",
+        "Not now came back after a reopen"
+    );
+    assert!(!saved(&l).preload_at_start);
 }

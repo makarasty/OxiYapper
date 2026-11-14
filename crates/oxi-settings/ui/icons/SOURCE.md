@@ -74,7 +74,7 @@ entries out again.
 | dark-theme-24, -filled | circle-half bold, fill | theme System tile |
 | weather-sunny-24, -filled | sun bold, fill | theme Light tile |
 | weather-moon-24, -filled | moon bold, fill | theme Dark tile |
-| timer | timer bold | tail, max length, idle unload |
+| timer | timer bold | tail, max length, free memory after |
 | top-speed | gauge bold | speed stat card |
 | fire | fire bold | streak stat card |
 | text-word-count | article bold | words stat card |
@@ -82,7 +82,7 @@ entries out again.
 | desktop | desktop bold | GPU |
 | book-letter | book-open-text bold | dictionary |
 | app-generic | app-window bold | per-app rule |
-| code | code bold | Model > Advanced, Decoding row |
+| code | code bold | Model > Accuracy, Decoding row |
 | person-voice | user-sound bold | About whisper.cpp tile |
 | plug-connected | plugs-connected bold | About whisper-rs tile |
 | sound-wave-circle | waveform bold | About nnnoiseless tile |
@@ -115,17 +115,19 @@ elements checked, same licence):
 | model-language | translate bold | model class: tuned for one language |
 | model-small | feather bold | model class: small |
 | model-own | folder-user bold | own model file |
-| temperature | thermometer bold | Model Advanced, Temperature |
-| silence-threshold | waveform-slash bold | Model Advanced, Silence threshold |
-| confidence | target bold | Model Advanced, Confidence threshold |
-| repetition | repeat bold | Model Advanced, Repetition threshold |
-| non-speech | ear-slash bold | Model Advanced, Skip non-speech sounds |
-| threads | cpu bold | Model Advanced, Processor threads |
-| flash-attention | flashlight bold | Model Advanced, Flash attention |
-| retry-doubtful | seal-question bold | Model Advanced, Retry doubtful segments |
-| models-folder | hard-drives bold | Model Settings, Models folder row |
-| partial-downloads | file-dashed bold | Model Settings, Partial downloads row |
-| reset-auto | eraser bold | Model Advanced, Reset all to Auto |
+| temperature | thermometer bold | Model > Accuracy, Temperature |
+| silence-threshold | waveform-slash bold | Model > Accuracy, Silence threshold |
+| confidence | target bold | Model > Accuracy, Confidence threshold |
+| repetition | repeat bold | Model > Accuracy, Repetition threshold |
+| non-speech | ear-slash bold | Model > Accuracy, Skip non-speech sounds |
+| threads | cpu bold | Model > Speed, Processor use |
+| flash-attention | flashlight bold | Model > Speed, Speed boost |
+| suggestion | lightbulb bold | a setting suggestion from your recordings (Audio rows), DS suggestion slot |
+| memory | memory bold | "Keep the model ready": how long the model stays in memory (Model > Device and memory) |
+| retry-doubtful | seal-question bold | Model > Accuracy, Second try |
+| models-folder | hard-drives bold | Model > Models, Models folder row |
+| partial-downloads | file-dashed bold | Model > Models, Unfinished downloads row |
+| reset-auto | eraser bold | Model > Speed and Accuracy, Reset |
 | replace | swap bold | always replace (History selection) |
 
 The other constants of the table (`open-external`, `retry`, `edit`, `close`, `error`, `done`,

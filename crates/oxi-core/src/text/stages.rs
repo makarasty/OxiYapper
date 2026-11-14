@@ -2,7 +2,7 @@
 //! function over text; `mod.rs` decides which run. Text only, no logging.
 
 use super::{Seg, WordIn};
-use crate::config::Snippet;
+use crate::config::{Snippet, VoiceCommands, phrase_words};
 
 /// A word and the whitespace before it, so a stage can drop a word and keep a line break.
 #[derive(Clone)]
@@ -193,16 +193,6 @@ enum Cmd {
     DeleteLast,
 }
 
-const COMMANDS: [(&[&str], Cmd); 7] = [
-    (&["новая", "строка"], Cmd::Line),
-    (&["новый", "абзац"], Cmd::Paragraph),
-    (&["удали", "последнее"], Cmd::DeleteLast),
-    (&["new", "line"], Cmd::Line),
-    (&["new", "paragraph"], Cmd::Paragraph),
-    (&["delete", "that"], Cmd::DeleteLast),
-    (&["scratch", "that"], Cmd::DeleteLast),
-];
-
 /// The sentence before a `delete` command goes: tokens back to the one after a sentence mark or a
 /// line break.
 fn delete_last(out: &mut Vec<Tok>) {
@@ -215,16 +205,29 @@ fn delete_last(out: &mut Vec<Tok>) {
 
 /// Step 7: whole-phrase voice commands. Returns the text and how many line breaks the commands
 /// left at its very end (0, 1 or 2): the caller decides whether a break may be pasted.
-pub(super) fn voice_commands(text: &str) -> (String, usize) {
+pub(super) fn voice_commands(text: &str, voice: &VoiceCommands) -> (String, usize) {
+    let commands: Vec<(Vec<String>, Cmd)> = [Cmd::Line, Cmd::Paragraph, Cmd::DeleteLast]
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| voice.slot(*i).on)
+        .flat_map(|(i, cmd)| {
+            let words = voice.slot(i).phrases.iter().map(|p| phrase_words(p));
+            words.filter(|w| !w.is_empty()).map(move |w| (w, cmd))
+        })
+        .collect();
     let toks = tokens(text);
     let cores: Vec<String> = toks.iter().map(|t| core(&t.word)).collect();
     let mut out: Vec<Tok> = Vec::new();
     let (mut brk, mut cap_next) = (String::new(), false);
     let mut i = 0;
     while i < toks.len() {
-        let hit = COMMANDS.iter().find(|(words, _)| {
-            cores.len() - i >= words.len() && cores[i..].iter().zip(*words).all(|(a, b)| a == b)
-        });
+        // The longest phrase wins when one is the start of another.
+        let hit = commands
+            .iter()
+            .filter(|(words, _)| {
+                cores.len() - i >= words.len() && cores[i..].iter().zip(words).all(|(a, b)| a == b)
+            })
+            .max_by_key(|(words, _)| words.len());
         let Some((words, cmd)) = hit else {
             let mut t = toks[i].clone();
             if !brk.is_empty() {
@@ -279,4 +282,42 @@ pub(super) fn snippet<'a>(text: &str, snippets: &'a [Snippet]) -> Option<&'a str
         .iter()
         .find(|s| phrase_key(&s.trigger) == key)
         .map(|s| s.text.as_str())
+}
+
+/// The style switches (item 41, candidate 7), in this order.
+pub(super) fn style(text: &mut String, no_final_period: bool, small_first: bool) {
+    if no_final_period {
+        drop_final_period(text);
+    }
+    if small_first {
+        small_first_letter(text);
+    }
+}
+
+/// "No full stop at the end": one final `.` goes; an ellipsis (`...`, `…`), `!` and `?` stay.
+fn drop_final_period(text: &mut String) {
+    if text.ends_with('.') && !text.ends_with("..") {
+        text.pop();
+        text.truncate(text.trim_end().len());
+    }
+}
+
+/// "Small first letter": the first letter of the text in lower case, unless the first word is
+/// one letter ("I") or has another capital (an abbreviation like "USB").
+fn small_first_letter(text: &mut String) {
+    let Some((at, first)) = text.char_indices().find(|(_, c)| c.is_alphabetic()) else {
+        return;
+    };
+    let word: String = text[at..]
+        .chars()
+        .take_while(|c| c.is_alphanumeric())
+        .collect();
+    if !first.is_uppercase()
+        || word.chars().count() < 2
+        || word.chars().skip(1).any(char::is_uppercase)
+    {
+        return;
+    }
+    let lower: String = first.to_lowercase().collect();
+    text.replace_range(at..at + first.len_utf8(), &lower);
 }

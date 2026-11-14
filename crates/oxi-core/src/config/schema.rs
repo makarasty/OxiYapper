@@ -1,6 +1,7 @@
 //! Config schema v1 (ARCHITECTURE section 6). Every field has a default, so a partial
 //! or empty file loads. Unknown keys are not rejected here; `ConfigFile` keeps them.
 
+use super::audio_sets::{DenoiseStrength, DeviceSet};
 use super::extra::{
     Accent, Advanced, AudioChannel, FileMode, LanguageKey, Output, Text, TypeSpeed, VadSensitivity,
     clamp_int,
@@ -98,6 +99,16 @@ pub struct Audio {
     pub gain_db: f64,
     pub normalize: bool,
     pub denoise: bool,
+    /// How hard noise suppression works while `denoise` is on; the Audio page shows the two as
+    /// one choice ([`Audio::noise`]). A file without the key reads as Strong (the old "on").
+    pub denoise_strength: DenoiseStrength,
+    /// High-pass at 80 Hz before whisper: fan, desk knocks, hum. Off by default.
+    pub cut_rumble: bool,
+    /// Keep the switches of [`DeviceSet`] per microphone and bring them back when it is picked.
+    pub per_device: bool,
+    /// The saved switches per microphone (`device`; empty: the system default).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub device_sets: BTreeMap<String, DeviceSet>,
     pub trim: bool,
     pub tail_ms: u32,
     pub max_seconds: u32,
@@ -138,6 +149,10 @@ impl Default for Audio {
             gain_db: 0.0,
             normalize: true,
             denoise: false,
+            denoise_strength: DenoiseStrength::Strong,
+            cut_rumble: false,
+            per_device: false,
+            device_sets: BTreeMap::new(),
             trim: true,
             tail_ms: 100,
             max_seconds: 3600,
@@ -358,7 +373,6 @@ impl Default for Overlay {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Sounds {
-    pub enabled: bool,
     /// 0 to 1.
     pub volume: f64,
     /// A built-in id (`Builtin::id`), the path of a `.wav` or `.ogg` file, or `off`. Same for the
@@ -417,7 +431,6 @@ impl Sounds {
 impl Default for Sounds {
     fn default() -> Self {
         Self {
-            enabled: true,
             volume: 0.5,
             start: Builtin::ApaHit3.id().into(),
             stop: Builtin::ApaHit2.id().into(),

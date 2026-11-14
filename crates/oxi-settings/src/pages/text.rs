@@ -10,7 +10,10 @@ use std::sync::mpsc;
 use std::time::Duration;
 use std::{fs, io, thread};
 
-use oxi_core::config::{FileFormat, FileMode, Output, Paste, PasteMode, PasteRule, Text};
+use oxi_core::config::{
+    Config, FileFormat, FileMode, Output, Paste, PasteMode, PasteRule, Text, TypeSpeed,
+    VoiceCommands, phrase_words,
+};
 use oxi_core::dictionary::{BUDGET, build_prompt, token_count};
 use oxi_core::languages::LANGUAGES;
 use oxi_core::models::{self, MODELS, ModelStatus};
@@ -29,6 +32,8 @@ use slint::{
 use crate::debounce::SaveDebounce;
 use crate::generated::{FileInfo, FileState, GalleryTile, PasteRuleRow, TextFile, TextState};
 use crate::{AppWindow, Ctx, Error, report};
+
+mod learn;
 
 const FILES: [TextFile; 2] = [TextFile::Dictionary, TextFile::Replacements];
 
@@ -110,9 +115,11 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     s.set_budget(int(BUDGET));
     bind_paste(window, ctx);
     bind_processing(window, ctx);
+    bind_voice(window, ctx);
     for file in FILES {
         refresh(&s, &ctx.layout, file);
     }
+    learn::bind(window, ctx);
 
     let (w, l) = (window.as_weak(), ctx.layout.clone());
     s.on_shown(move || {
@@ -166,7 +173,7 @@ fn bind_processing(window: &AppWindow, ctx: &Ctx) {
     s.set_voice_commands(text.voice_commands);
     s.set_snippets(snippets_to_lines(&text.snippets).into());
     s.set_confidence_filter(text.confidence_filter);
-    s.set_confidence_min(text.confidence_min);
+    s.set_confidence_pct(text.confidence_min * 100.0);
     drop(file);
 
     let (w, c) = (window.as_weak(), ctx.clone());
@@ -222,6 +229,98 @@ fn bind_processing(window: &AppWindow, ctx: &Ctx) {
     });
 }
 
+const VOICE_NAMES: [&str; 3] = ["New line", "New paragraph", "Delete the last sentence"];
+
+/// The phrases as the one comma-separated line the field shows.
+fn phrases_to_line(phrases: &[String]) -> String {
+    phrases.join(", ")
+}
+
+/// The phrases of a field: split at commas, trimmed, nothing empty, a repeat of an earlier one
+/// (same words, whatever the case or marks) left out.
+fn phrases_from_line(line: &str) -> Vec<String> {
+    let mut seen: Vec<Vec<String>> = Vec::new();
+    let mut out = Vec::new();
+    for part in line.split(',') {
+        let words = phrase_words(part);
+        if !words.is_empty() && !seen.contains(&words) {
+            seen.push(words);
+            out.push(part.trim().to_owned());
+        }
+    }
+    out
+}
+
+fn show_voice(s: &TextState<'_>, v: &VoiceCommands) {
+    s.set_voice_line(v.new_line.on);
+    s.set_voice_paragraph(v.new_paragraph.on);
+    s.set_voice_delete(v.delete_last.on);
+    s.set_voice_line_phrases(phrases_to_line(&v.new_line.phrases).into());
+    s.set_voice_paragraph_phrases(phrases_to_line(&v.new_paragraph.phrases).into());
+    s.set_voice_delete_phrases(phrases_to_line(&v.delete_last.phrases).into());
+    s.set_voice_errors(shared(vec![String::new(); 3]));
+}
+
+/// Text > Voice commands: each command's switch and phrases (`[text.voice]`). A phrase another
+/// command already has is refused with the reason on its field and not saved; the field keeps what
+/// was typed, whatever else is edited, until it is fixed or Reset phrases brings the originals back.
+fn bind_voice(window: &AppWindow, ctx: &Ctx) {
+    let s = window.global::<TextState>();
+    show_voice(&s, &ctx.config.borrow().config.text.voice);
+    let (w, c) = (window.as_weak(), ctx.clone());
+    s.on_voice_toggled(move |i, on| {
+        let i = usize::try_from(i).unwrap_or(0);
+        apply_text(&w, &c, |t| t.voice.slot_mut(i).on = on);
+    });
+    // The refused fields' text by slot, kept so another field's edit cannot drop it.
+    let refused: Rc<std::cell::RefCell<[Option<String>; 3]>> = Rc::default();
+    let (w, c, r) = (window.as_weak(), ctx.clone(), refused.clone());
+    s.on_voice_reset(move || {
+        *r.borrow_mut() = Default::default();
+        apply_text(&w, &c, |t| {
+            for i in 0..3 {
+                t.voice.slot_mut(i).phrases = VoiceCommands::defaults(i);
+            }
+        });
+        with(&w, |s| show_voice(&s, &c.config.borrow().config.text.voice));
+    });
+    let (w, c) = (window.as_weak(), ctx.clone());
+    let save = SaveDebounce::new(w.clone(), c.clone());
+    s.on_voice_phrases_edited(move |slot, line| {
+        let slot = usize::try_from(slot).unwrap_or(0).min(2);
+        let mut refused = refused.borrow_mut();
+        refused[slot] = Some(line.to_string());
+        let mut voice = c.config.borrow().config.text.voice.clone();
+        let mut errors = vec![String::new(); 3];
+        // The edited field first, then the earlier refusals: what fits is saved, the rest stays.
+        for i in std::iter::once(slot).chain((0..3).filter(|&i| i != slot)) {
+            let Some(line) = refused[i].clone() else {
+                continue;
+            };
+            let mut trial = voice.clone();
+            trial.slot_mut(i).phrases = phrases_from_line(&line);
+            if let Some(clash) = trial.conflict() {
+                let other = if clash.second == i {
+                    clash.first
+                } else {
+                    clash.second
+                };
+                errors[i] = format!(
+                    "\"{}\" already belongs to {}",
+                    clash.phrase.trim(),
+                    VOICE_NAMES[other]
+                );
+            } else {
+                voice = trial;
+                refused[i] = None;
+            }
+        }
+        with(&w, |s| s.set_voice_errors(shared(errors)));
+        c.config.borrow_mut().config.text.voice = voice;
+        save.touch();
+    });
+}
+
 #[allow(
     clippy::cast_precision_loss,
     reason = "a delay in ms is far below 2^24"
@@ -247,6 +346,7 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
     s.set_trailing_space(paste.trailing_space);
     s.set_keep_history(paste.keep_in_clipboard_history);
     s.set_press_enter(paste.press_enter);
+    s.set_type_speed(i32::from(paste.type_speed == TypeSpeed::Safe));
     s.set_join_console_lines(paste.join_console_lines);
     #[allow(
         clippy::cast_precision_loss,
@@ -278,6 +378,15 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
     s.on_keep_history_toggled(move |on| apply(&w, &c, |p| p.keep_in_clipboard_history = on));
     let (w, c) = (window.as_weak(), ctx.clone());
     s.on_press_enter_toggled(move |on| apply(&w, &c, |p| p.press_enter = on));
+    let (w, c) = (window.as_weak(), ctx.clone());
+    s.on_type_speed_picked(move |i| {
+        let speed = if i == 1 {
+            TypeSpeed::Safe
+        } else {
+            TypeSpeed::Fast
+        };
+        apply(&w, &c, |p| p.type_speed = speed);
+    });
     let (w, c) = (window.as_weak(), ctx.clone());
     s.on_join_console_lines_toggled(move |on| apply(&w, &c, |p| p.join_console_lines = on));
     let (w, c) = (window.as_weak(), ctx.clone());
@@ -325,12 +434,13 @@ fn bind_paste(window: &AppWindow, ctx: &Ctx) {
 
 /// The profile editor of a rule and the to-file settings. Profile fields in the order of
 /// `TextState::profile_values`: language, model, to file, dictionary, replacements, voice
-/// commands, filler words, pause punctuation, join lines.
+/// commands, filler words, pause punctuation, join lines, typing speed.
 fn bind_profiles(window: &AppWindow, ctx: &Ctx) {
     let s = window.global::<TextState>();
     s.set_profile_rule(-1);
     s.set_language_names(shared(language_names()));
     show_output(&s, &ctx.config.borrow().config.output);
+    s.set_file_wanted(file_wanted(&ctx.config.borrow().config));
     // What each row of the model Combo writes, as the open profile listed them.
     let listed: Rc<std::cell::RefCell<Vec<Option<String>>>> = Rc::default();
 
@@ -346,13 +456,20 @@ fn bind_profiles(window: &AppWindow, ctx: &Ctx) {
         let dir = c.layout.models_dir();
         let ids = profile_models(&dir, &file.config.model.custom_path, rule.model.as_deref());
         let values = profile_values(rule, &ids);
-        let names = ids
+        let defaults = profile_defaults(&file.config, rule, &dir);
+        let mut names: Vec<String> = ids
             .iter()
             .map(|id| model_name(id.as_deref(), &dir))
             .collect();
+        // Each list's first item names the global value it follows (ia-map 3.2, RT R2).
+        names[0].clone_from(&defaults[1]);
+        let mut languages = language_names();
+        languages[0].clone_from(&defaults[0]);
         *shown.borrow_mut() = ids;
         with(&w, |s| {
             s.set_model_names(shared(names));
+            s.set_language_names(shared(languages));
+            s.set_profile_defaults(shared(defaults));
             if let Some(row) = s
                 .get_rules()
                 .row_data(usize::try_from(i).unwrap_or_default())
@@ -390,6 +507,9 @@ fn bind_profiles(window: &AppWindow, ctx: &Ctx) {
             2 => FileMode::Only,
             _ => FileMode::Off,
         };
+        with(&w, |s| {
+            s.set_file_wanted(file_wanted(&c.config.borrow().config));
+        });
         report(&w, c.save());
     });
     let (w, c) = (window.as_weak(), ctx.clone());
@@ -477,6 +597,50 @@ fn show_output(s: &TextState<'_>, out: &Output) {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     s.set_file_folder_name(name.into());
+}
+
+/// Writing to a file is on, globally or in any app rule: with no folder nothing is written, which
+/// the Folder row says (ia-map 3.2, c03 R4).
+fn file_wanted(config: &Config) -> bool {
+    let on = |m: FileMode| m != FileMode::Off;
+    on(config.output.file_mode) || config.paste.rules.iter().any(|r| r.to_file.is_some_and(on))
+}
+
+/// The first item of each profile Combo, in the order of `profile_values`: "Default (" and the
+/// global value it follows ")". Dictionary and replacements have no global switch: always on.
+/// Typing speed follows `oxi_core::paste::type_pace`: a rule that forces typing types at Safe.
+fn profile_defaults(config: &Config, rule: &PasteRule, dir: &Path) -> Vec<String> {
+    let on_off = |on: bool| if on { "On" } else { "Off" };
+    let language = match config.model.language {
+        Language::AUTO => "Auto".to_owned(),
+        l => l.info().map_or(l.as_str(), |i| i.english).to_owned(),
+    };
+    let to_file = match config.output.file_mode {
+        FileMode::Off => "Off",
+        FileMode::Also => "Paste and write",
+        FileMode::Only => "Write only",
+    };
+    let model = model_name(Some(config.model.id.as_str()), dir);
+    let text = &config.text;
+    [
+        language.as_str(),
+        model.as_str(),
+        to_file,
+        "On",
+        "On",
+        on_off(text.voice_commands),
+        on_off(text.filler_filter),
+        on_off(text.pause_punctuation),
+        on_off(config.paste.join_console_lines),
+        match config.paste.type_speed {
+            _ if rule.mode == Some(PasteMode::Type) => "Safe",
+            TypeSpeed::Fast => "Fast",
+            TypeSpeed::Safe => "Safe",
+        },
+    ]
+    .iter()
+    .map(|v| format!("Default ({v})"))
+    .collect()
 }
 
 fn shared(names: Vec<String>) -> ModelRc<SharedString> {
@@ -597,6 +761,11 @@ fn profile_values(r: &PasteRule, models: &[Option<String>]) -> Vec<i32> {
         tri(r.filler_filter),
         tri(r.pause_punctuation),
         tri(r.join_lines),
+        match r.type_speed {
+            None => 0,
+            Some(TypeSpeed::Fast) => 1,
+            Some(TypeSpeed::Safe) => 2,
+        },
     ]
 }
 
@@ -618,6 +787,13 @@ fn set_profile_field(r: &mut PasteRule, field: i32, i: i32, models: &[Option<Str
         6 => r.filler_filter = from_tri(i),
         7 => r.pause_punctuation = from_tri(i),
         8 => r.join_lines = from_tri(i),
+        9 => {
+            r.type_speed = match i {
+                1 => Some(TypeSpeed::Fast),
+                2 => Some(TypeSpeed::Safe),
+                _ => None,
+            }
+        }
         _ => {}
     }
 }
@@ -918,6 +1094,8 @@ fn change(weak: &Weak<AppWindow>, ctx: &Ctx, edit: impl FnOnce(&mut Paste)) {
     with(weak, |s| {
         let file = ctx.config.borrow();
         show_rules(&s, &file.config.paste.rules, &file.config.ui.app_names);
+        // A rule added, removed or edited can start or end writing to a file.
+        s.set_file_wanted(file_wanted(&file.config));
     });
 }
 
@@ -1411,7 +1589,7 @@ mod tests {
         }
         let window = crate::open(layout.clone()).unwrap();
         window.show().unwrap();
-        window.set_page(Page::Text);
+        window.set_page(Page::Paste);
         window.window().set_size(LogicalSize::new(720.0, 520.0));
         mock_elapsed_time(Duration::from_millis(1));
         with_role(&window, "Per-app rules", AccessibleRole::Tab).invoke_accessible_default_action();
@@ -1473,7 +1651,8 @@ mod tests {
     }
 
     fn page_scrolls(window: &AppWindow) -> bool {
-        let at = with_role(window, "Dictionary", AccessibleRole::Tab).absolute_position();
+        // The Paste page's first sub-tab that the rail does not share a name with.
+        let at = with_role(window, "Write to file", AccessibleRole::Tab).absolute_position();
         window
             .window()
             .dispatch_event(WindowEvent::PointerScrolled {
@@ -1494,7 +1673,7 @@ mod tests {
             .dispatch_event(WindowEvent::KeyReleased { text });
     }
 
-    /// Review d03 #9: "Hold doubtful words back" follows History saving switched after the page
+    /// Review d03 #9: "Hold back unsure words" follows History saving switched after the page
     /// was bound, without reopening the window.
     #[test]
     fn hold_back_follows_history_saving_switched_later() {
@@ -2028,10 +2207,10 @@ mode = \"type\"
             .unwrap();
     }
 
-    /// Review d08-fix #4: the Processing tab with "Press Enter after pasting" on in Clipboard mode
+    /// Review d08-fix #4: Paste > Paste with "Press Enter after pasting" on in Clipboard mode
     /// (its "!") and off, drawn by the software renderer at 720x520 and 1280x860 in both themes,
-    /// into `OXI_SHOTS_DIR` as `settings-text-<enter|words>-<on|off>-<w>-<theme>.png` (Processing,
-    /// then Words). Nothing runs without it.
+    /// into `OXI_SHOTS_DIR` as `settings-text-<enter|words>-<on|off>-<w>-<theme>.png` (Paste,
+    /// then Text > Words). Nothing runs without it.
     #[test]
     fn shots_press_enter() {
         let Some(dir) = std::env::var_os("OXI_SHOTS_DIR").map(PathBuf::from) else {
@@ -2074,13 +2253,14 @@ mode = \"type\"
                 let config = format!("version = 2\n[paste]\npress_enter = {on}\n");
                 fs::write(layout.config_file(), config).unwrap();
                 let window = crate::open(layout).unwrap();
-                window.set_page(Page::Text);
                 window.set_theme(choice);
                 window.show().unwrap();
                 let surface = LAST.with_borrow(Clone::clone).unwrap();
-                // 4: Processing, 5: Words (`real_window` has no name for the second).
-                for (tab, name) in [(4, "enter"), (5, "words")] {
-                    window.global::<TextState>().set_tab(tab);
+                // Paste > Paste holds the Enter row (item 14), Text tab 2 is Words.
+                for (page, name) in [(Page::Paste, "enter"), (Page::Text, "words")] {
+                    window.set_page(page);
+                    window.global::<TextState>().set_paste_tab(0);
+                    window.global::<TextState>().set_tab(2);
                     for (w, h) in [(720_u32, 520_u32), (1280, 860)] {
                         surface.set_size(slint::PhysicalSize::new(w, h));
                         slint::platform::update_timers_and_animations();
@@ -2158,7 +2338,7 @@ rules = []
                     fs::write(layout.config_file(), config).unwrap();
                 }
                 let window = crate::open(layout).unwrap();
-                window.set_page(Page::Text);
+                window.set_page(Page::Paste);
                 window.set_theme(choice);
                 window.show().unwrap();
                 let surface = LAST.with_borrow(Clone::clone).unwrap();
@@ -2246,12 +2426,19 @@ voice_commands = true
         s.invoke_profile_opened(0);
         // d04-fix 1: only what is on disk is offered.
         let names: Vec<SharedString> = s.get_model_names().iter().collect();
-        assert_eq!(names, ["Default", turbo.display_name]);
+        // ia-map 3.2, RT R2: the first item names the global value it follows.
+        let default = format!("Default ({})", turbo.display_name);
+        assert_eq!(names, [default.as_str(), turbo.display_name]);
         assert_eq!(s.get_profile_rule(), 0);
         assert_eq!(s.get_profile_app(), "a.exe");
+        // A rule that forces typing types at Safe, whatever the global speed.
+        assert_eq!(
+            s.get_profile_defaults().row_data(9).unwrap(),
+            "Default (Safe)"
+        );
         // The rule's own values show, the rest read Default.
         let values: Vec<i32> = s.get_profile_values().iter().collect();
-        assert_eq!(values, [0, 0, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(values, [0, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
         let ru = super::language_names()
             .iter()
             .position(|n| n == "Russian")
@@ -2262,6 +2449,7 @@ voice_commands = true
         s.invoke_profile_picked(3, 2);
         s.invoke_profile_picked(5, 0);
         s.invoke_profile_picked(8, 1);
+        s.invoke_profile_picked(9, 2);
         mock_elapsed_time(Duration::from_millis(350));
         let text = fs::read_to_string(layout.config_file()).unwrap();
         let rule = oxi_core::config::ConfigFile::parse(&text)
@@ -2276,6 +2464,7 @@ voice_commands = true
         assert_eq!(rule.dictionary, Some(false));
         assert_eq!(rule.voice_commands, None, "Default drops the key");
         assert_eq!(rule.join_lines, Some(true));
+        assert_eq!(rule.type_speed, Some(oxi_core::config::TypeSpeed::Safe));
         assert_eq!(
             rule.mode,
             Some(oxi_core::config::PasteMode::Type),

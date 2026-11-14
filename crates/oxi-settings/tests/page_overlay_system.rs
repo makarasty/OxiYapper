@@ -142,7 +142,7 @@ fn system_sub_tabs_fit_the_small_windows_without_scrolling() {
         window.window().set_size(slint::LogicalSize::new(w, h));
         for (tab, last) in [
             ("General", "Check for updates"),
-            ("Recordings and files", "Log dictated text"),
+            ("History and files", "Log dictated text"),
         ] {
             with_role(&window, tab, AccessibleRole::Tab).invoke_accessible_default_action();
             i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
@@ -481,10 +481,9 @@ fn after_the_check(window: &AppWindow, label: &str) -> bool {
     false
 }
 
-/// The Recordings and files sub-tab of the System page.
+/// The History and files sub-tab of the System page.
 fn show_recordings(window: &AppWindow) {
-    with_role(window, "Recordings and files", AccessibleRole::Tab)
-        .invoke_accessible_default_action();
+    with_role(window, "History and files", AccessibleRole::Tab).invoke_accessible_default_action();
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
 }
 
@@ -504,7 +503,7 @@ fn recordings_again(l: &Layout) -> AppWindow {
 fn saving_is_on_by_default_and_the_switch_writes_it() {
     let l = layout("history-switch", None);
     let window = open_recordings(&l);
-    let on = switch(&window, "Save recordings");
+    let on = switch(&window, "Save dictations to History");
     assert_eq!(on.accessible_checked(), Some(true));
     assert!(!l.config_file().exists(), "showing it writes nothing");
     on.invoke_accessible_default_action();
@@ -680,7 +679,7 @@ fn a_read_only_config_locks_the_recording_controls() {
     let l = layout("history-locked", Some(original));
     let window = open_recordings(&l);
     assert_eq!(
-        switch(&window, "Save recordings").accessible_enabled(),
+        switch(&window, "Save dictations to History").accessible_enabled(),
         Some(false)
     );
     assert_eq!(

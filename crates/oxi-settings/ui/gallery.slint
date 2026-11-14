@@ -862,11 +862,11 @@ component GallerySheet inherits VerticalLayout {
         note: "In the header row. The open tab: semibold, 3 px accent underline that fades in; the tab line spans the whole width. Left/Right/Home/End switch, Tab leaves the bar. Short of room, the side padding goes first; labels stay whole.";
         GridRow {
             label: "states";
-            for s[i] in ["rest, Model open", "hover Settings", "pressed Settings", "focused (keyboard)"]: Cell {
+            for s[i] in ["rest, Models open", "hover Languages", "pressed Speed", "focused (keyboard)"]: Cell {
                 width: 280px;
                 label: s;
                 SubTabs {
-                    items: ["Model", "Settings", "Advanced"];
+                    items: ["Models", "Languages", "Speed"];
                     selected: 0;
                     force-hover: i == 1 ? 1 : -1;
                     force-pressed: i == 2 ? 1 : -1;
@@ -1755,7 +1755,7 @@ component GallerySheet inherits VerticalLayout {
                         Card {
                             SliderRow {
                                 icon: Icons.timer;
-                                title: "Unload after idle";
+                                title: "Free memory after";
                                 description: "Frees GPU memory when you have not dictated for a while.";
                                 minimum: 0;
                                 maximum: 60;
@@ -1766,19 +1766,19 @@ component GallerySheet inherits VerticalLayout {
                         }
                     }
                     Group {
-                        title: "Processing";
+                        title: "Recording";
                         ToggleRow {
-                            title: "Normalise level";
+                            title: "Even out loudness";
                             description: "Evens out quiet and loud speech.";
                             checked: true;
                         }
                         ToggleRow {
-                            title: "Trim silence (hover)";
+                            title: "Cut silence at the ends (hover)";
                             description: "Cuts silence at the start and end.";
                             force-hover: true;
                         }
                         ToggleRow {
-                            title: "Noise suppression (focused)";
+                            title: "Reduce background noise (focused)";
                             description: "Can make Whisper worse; off by default.";
                             force-focus: true;
                         }

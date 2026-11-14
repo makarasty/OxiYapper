@@ -14,7 +14,9 @@ use i_slint_backend_testing::{
 use oxi_core::config::{ConfigFile, Theme};
 use oxi_core::ipc::Push;
 use oxi_settings::ipc::{Cmd, Event, Link};
-use oxi_settings::{AppWindow, ChipLevel, Ipc, Page, Shell, TestState, ThemeChoice, Toast, Tokens};
+use oxi_settings::{
+    AppWindow, ChipLevel, Ipc, Page, Shell, TestState, TextState, ThemeChoice, Toast, Tokens,
+};
 use slint::ComponentHandle;
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
@@ -35,13 +37,16 @@ fn rail_switches_pages() {
     let window = open_default(&l);
     assert_eq!(window.get_page(), Page::Home);
     assert!(!has(&window, "Version"));
-    tab(&window, "About").invoke_accessible_default_action();
-    assert_eq!(window.get_page(), Page::About);
-    assert!(has(&window, "Version"));
-    assert_eq!(tab(&window, "About").accessible_item_selected(), Some(true));
+    tab(&window, "Paste").invoke_accessible_default_action();
+    assert_eq!(window.get_page(), Page::Paste);
+    assert!(has(&window, "Paste mode"));
     tab(&window, "System").invoke_accessible_default_action();
     assert_eq!(window.get_page(), Page::System);
     assert!(!has(&window, "Version"));
+    // ia-map 3.1: About is System's third tab, no rail entry of its own.
+    tab(&window, "About").invoke_accessible_default_action();
+    assert_eq!(window.get_page(), Page::System);
+    assert!(has(&window, "Version"));
 }
 
 #[test]
@@ -139,8 +144,9 @@ fn about_slint_card_keeps_its_ring_when_esc_closes_its_badge() {
         .set_size(slint::PhysicalSize::new(1000, 700));
     let card = with_role(&window, "Slint", AccessibleRole::Button);
     assert!(!ring_on_top_edge(&card), "a ring before any key");
-    // The rail, Project page, MIT, Apache-2.0, Rust, then Slint.
-    for _ in 0..6 {
+    // The rail, System's sub-tabs (About is their third, ia-map 3.1), Project page, MIT,
+    // Apache-2.0, Rust, then Slint.
+    for _ in 0..7 {
         press(&window, Key::Tab);
     }
     assert!(
@@ -167,8 +173,8 @@ fn about_links_open_from_the_keyboard() {
             press(&window, Key::Tab);
         }
     };
-    // The rail, then Project page.
-    tab(2);
+    // The rail, System's sub-tabs, then Project page.
+    tab(3);
     press(&window, Key::Return);
     assert_eq!(opened(), env!("CARGO_PKG_REPOSITORY"));
     // MIT, Apache-2.0, then the tiles: Rust, Slint, whisper.cpp.
@@ -677,15 +683,15 @@ fn chord(window: &AppWindow, shift: bool, key: Key) {
 
 #[test]
 fn ctrl_tab_cycles_the_pages_both_ways() {
-    let window = open(&layout("ctrl-tab", None), Page::System);
+    let window = open(&layout("ctrl-tab", None), Page::Test);
     chord(&window, false, Key::Tab);
-    assert_eq!(window.get_page(), Page::About);
+    assert_eq!(window.get_page(), Page::System);
     chord(&window, false, Key::Tab);
     assert_eq!(window.get_page(), Page::Home, "wraps to the first page");
     chord(&window, true, Key::Tab);
-    assert_eq!(window.get_page(), Page::About, "Ctrl+Shift+Tab goes back");
+    assert_eq!(window.get_page(), Page::System, "Ctrl+Shift+Tab goes back");
     chord(&window, true, Key::Backtab);
-    assert_eq!(window.get_page(), Page::System);
+    assert_eq!(window.get_page(), Page::Test);
 }
 
 #[test]
@@ -694,7 +700,7 @@ fn ctrl_tab_keeps_working_after_the_focused_field_leaves_with_its_page() {
     // The rail, then the first field of the page.
     press(&window, Key::Tab);
     press(&window, Key::Tab);
-    for want in [Page::Audio, Page::Text, Page::Overlay] {
+    for want in [Page::Audio, Page::Text, Page::Paste, Page::Overlay] {
         chord(&window, false, Key::Tab);
         assert_eq!(window.get_page(), want);
     }
@@ -788,7 +794,7 @@ fn rail_turns_compact_under_960_px() {
 fn rail_starts_with_what_a_person_configures_first() {
     let window = open(&layout("rail-order", None), Page::Home);
     let labels = [
-        "Home", "Model", "Hotkey", "Audio", "Text", "Overlay", "Test", "System", "About",
+        "Home", "Model", "Hotkey", "Audio", "Text", "Paste", "Overlay", "Test", "System",
     ];
     let tops: Vec<f32> = labels
         .iter()
@@ -1085,14 +1091,19 @@ fn page_title_centres_on_the_first_rail_item() {
             Page::Hotkey,
             Page::Audio,
             Page::Text,
+            Page::Paste,
             Page::Overlay,
             Page::History,
             Page::Test,
             Page::System,
-            Page::About,
         ] {
             window.set_page(page);
-            let rail = centre(&tab(&window, "Home"));
+            // The rail's first entry is the search slot above Home (ia-map 3.1).
+            let rail = centre(
+                &ElementHandle::find_by_element_type_name(&window, "SearchSlot")
+                    .next()
+                    .expect("the search slot"),
+            );
             // The header row is the page name's HeaderRow or the page's own SubTabs; both are
             // centred on the first rail item.
             let (row, label) =
@@ -1132,7 +1143,7 @@ fn page_title_centres_on_the_first_rail_item() {
 fn headers_wear_the_underline_and_cover_the_badge() {
     let (window, _ipc, _rx) = linked("header-underline");
     let bottom = |e: &ElementHandle| e.absolute_position().y + e.size().height;
-    for page in [Page::Home, Page::Hotkey, Page::Overlay, Page::About] {
+    for page in [Page::Home, Page::Hotkey, Page::Overlay] {
         window.set_page(page);
         let row = ElementHandle::find_by_element_type_name(&window, "HeaderRow")
             .next()
@@ -1226,7 +1237,7 @@ fn sub_tab(window: &AppWindow, label: &str) {
 fn system_warnings_move_no_row() {
     let l = layout("still-system", None);
     let window = open(&l, Page::System);
-    system_tab(&window, "Recordings and files");
+    system_tab(&window, "History and files");
     tall(&window);
     let before = spots(&window);
 
@@ -1286,7 +1297,7 @@ fn update_confirm_takes_the_focus_and_gives_it_back() {
 fn a_hover_tip_does_not_take_the_keyboard_focus() {
     let l = layout("hover-tip-focus", None);
     let window = open(&l, Page::System);
-    system_tab(&window, "Recordings and files");
+    system_tab(&window, "History and files");
     tall(&window);
     // Four Tabs from the opened sub-tab reach the Save recordings switch (limits, then switch).
     for _ in 0..4 {
@@ -1319,7 +1330,7 @@ fn a_hover_tip_does_not_take_the_keyboard_focus() {
 fn the_warning_is_a_tab_stop_that_opens_its_tooltip() {
     let l = layout("slot-focus", None);
     let window = open(&l, Page::System);
-    system_tab(&window, "Recordings and files");
+    system_tab(&window, "History and files");
     tall(&window);
     let text = "Dictated text is written to the log files while this is on. Turn it off when you are done.";
     // The slot's own label, and the tooltip's text while that is open.
@@ -1351,10 +1362,10 @@ fn idle_never_and_the_engine_warning_move_no_row() {
     tall(&window);
 
     // Item 4: "Never" is inside the field, at the field's own place. The field is on the
-    // Settings tab; the tab switch is the one move this test allows, so measure after it.
-    tab(&window, "Settings").invoke_accessible_default_action();
+    // Speed tab; the tab switch is the one move this test allows, so measure after it.
+    tab(&window, "Speed").invoke_accessible_default_action();
     let before = spots(&window);
-    let unload = with_role(&window, "Unload after idle", AccessibleRole::Combobox);
+    let unload = with_role(&window, "Free memory after", AccessibleRole::Combobox);
     assert_eq!(unload.accessible_value().as_deref(), Some("After 5 min"));
     // A real click opens the list; the arrows walk it to the last choice, Enter takes it.
     unload.mock_single_click(PointerEventButton::Left);
@@ -1387,8 +1398,14 @@ fn denoise_warning_moves_no_row() {
     tall(&window);
     with_role(&window, "Recording", AccessibleRole::Tab).invoke_accessible_default_action();
     let before = spots(&window);
-    press_switch(&window, "Noise suppression");
-    assert!(has(&window, "Noise suppression can make Whisper worse."));
+    with_role(&window, "Reduce background noise", AccessibleRole::Combobox)
+        .mock_single_click(PointerEventButton::Left);
+    press(&window, Key::DownArrow);
+    press(&window, Key::Return);
+    assert!(has(
+        &window,
+        "Reducing background noise can make Whisper worse."
+    ));
     assert_nothing_moved(&before, &spots(&window));
 }
 
@@ -1442,8 +1459,10 @@ Over the limit"
     assert!(!has(&window, "All lines valid"));
     assert_nothing_moved(&before, &spots(&window));
 
-    // A refused duplicate rule flashes the existing one: no toast, nothing moves.
-    sub_tab(&window, "Per-app rules");
+    // A refused duplicate rule flashes the existing one: no toast, nothing moves. The rules are
+    // on the Paste page (ia-map 3.2).
+    window.set_page(Page::Paste);
+    window.global::<TextState>().set_paste_tab(2);
     one(&window, "New rule app").set_accessible_value("synth.exe");
     one(&window, "Add rule").invoke_accessible_default_action();
     let with_rule = spots(&window);
@@ -1778,4 +1797,86 @@ fn window_default_font_size_is_body_size() {
     let body = window.global::<Tokens>().get_body_size();
     assert!(body > 0.0);
     assert!((window.get_text_size() - body).abs() < 0.01);
+}
+
+fn ctrl_f(window: &AppWindow) {
+    let ctrl = || slint::SharedString::from(Key::Control);
+    window
+        .window()
+        .dispatch_event(WindowEvent::KeyPressed { text: ctrl() });
+    press(window, "f");
+    window
+        .window()
+        .dispatch_event(WindowEvent::KeyReleased { text: ctrl() });
+}
+
+/// Owner item 17, ia-map 3.7: Ctrl+F opens settings search; a pick opens the page and tab, the row
+/// asks to be scrolled into view and flashes; on History Ctrl+F stays the recordings search.
+#[test]
+fn settings_search_opens_the_tab_and_flashes_the_row() {
+    use slint::Model as _;
+    let elapse =
+        |ms| i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(ms));
+    let window = open(&layout("search", None), Page::Home);
+    let shell = window.global::<Shell>();
+    ctrl_f(&window);
+    elapse(1);
+    assert_eq!(
+        shell.get_modals(),
+        1,
+        "the popup is open and dims the window"
+    );
+    window.invoke_search("gain".into());
+    assert_eq!(
+        window.get_search_items().row_data(0).as_deref(),
+        Some("Microphone boost")
+    );
+    assert_eq!(
+        window.get_search_notes().row_data(0).as_deref(),
+        Some("Audio > Microphone")
+    );
+    press(&window, Key::Return);
+    elapse(1);
+    assert_eq!(
+        shell.get_modals(),
+        0,
+        "Enter takes the match and closes the popup"
+    );
+    assert_eq!(window.get_page(), Page::Audio);
+    assert_eq!(window.global::<oxi_settings::AudioState>().get_view(), 0);
+    assert_eq!(shell.get_found(), "Microphone boost");
+    let before = shell.get_reveal_serial();
+    elapse(20);
+    assert_eq!(
+        shell.get_reveal_serial(),
+        before + 1,
+        "the row asked to be seen once"
+    );
+    elapse(1000);
+    assert_eq!(shell.get_found(), "", "the pick expires");
+
+    // A tab on another page, by an old name; Esc closes without a pick.
+    ctrl_f(&window);
+    elapse(1);
+    window.invoke_search("advanced".into());
+    let items: Vec<String> = window.get_search_items().iter().map(Into::into).collect();
+    assert!(
+        items.contains(&"Speed".to_owned()) && items.contains(&"Accuracy".to_owned()),
+        "{items:?}"
+    );
+    press(&window, Key::Escape);
+    elapse(1);
+    assert_eq!((shell.get_modals(), window.get_page()), (0, Page::Audio));
+
+    window.set_page(Page::History);
+    elapse(1);
+    let find = shell.get_history_find();
+    ctrl_f(&window);
+    elapse(1);
+    assert_eq!(
+        shell.get_history_find(),
+        find + 1,
+        "History keeps Ctrl+F for its recordings"
+    );
+    assert_eq!(shell.get_modals(), 0);
 }

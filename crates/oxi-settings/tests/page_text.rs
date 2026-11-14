@@ -6,14 +6,14 @@ use std::fmt::Write as _;
 use std::fs;
 use std::time::Duration;
 
-use common::{config, has, layout, one, open, with_role};
+use common::{config, has, layout, one, open, open_again, with_role};
 use i_slint_backend_testing::AccessibleRole;
 use oxi_core::config::{FileFormat, FileMode, PasteMode};
-use oxi_core::dictionary::{BUDGET, build_prompt};
+use oxi_core::dictionary::build_prompt;
 use oxi_core::paths::Layout;
 use oxi_settings::{AppWindow, Page, TextState};
-use slint::ComponentHandle;
 use slint::platform::{Key, PointerEventButton, WindowEvent};
+use slint::{ComponentHandle, Model};
 
 /// The Text page in a window tall enough for all of it: the element search finds only what is in
 /// view.
@@ -25,8 +25,23 @@ fn open_tall(l: &Layout) -> AppWindow {
     window
 }
 
-/// Opens the sub-tab `label` (Dictionary is open at first).
+/// Opens the sub-tab `label` (Dictionary is open at first). Paste, Write to file and Per-app
+/// rules are the Paste page's (ia-map 3.2): it opens that page on them, and the Text page for the
+/// others.
 fn sub_tab(window: &AppWindow, label: &str) {
+    let paste = ["Paste", "Write to file", "Per-app rules"]
+        .iter()
+        .position(|t| *t == label);
+    if let Some(tab) = paste {
+        window.set_page(Page::Paste);
+        window
+            .global::<TextState>()
+            .set_paste_tab(i32::try_from(tab).unwrap());
+        return;
+    }
+    if window.get_page() != Page::Text {
+        window.set_page(Page::Text);
+    }
     with_role(window, label, AccessibleRole::Tab).invoke_accessible_default_action();
 }
 
@@ -59,22 +74,21 @@ fn over_budget_dictionary_marks_the_tail() {
     assert!(first_dropped > 1 && first_dropped < 300, "{first_dropped}");
     let over = format!("Over the limit: line {first_dropped} and after are not sent.");
     assert!(has(&window, &over), "{:?}", labels(&window, "Over"));
-    let count = labels(&window, "")
-        .into_iter()
-        .find(|l| l.ends_with(&format!(" / {BUDGET} tokens")))
-        .unwrap();
-    let tokens: usize = count.split(' ').next().unwrap().parse().unwrap();
-    assert!(tokens > BUDGET, "{count}");
+    // "{p} % full" (item 34): over the budget it is past 100.
+    let full = || -> usize {
+        let count = labels(&window, "")
+            .into_iter()
+            .find(|l| l.ends_with(" % full"))
+            .unwrap();
+        count.split(' ').next().unwrap().parse().unwrap()
+    };
+    assert!(full() > 100, "{}", full());
 
     // Down to the first ten words: everything fits, the mark goes.
     editor(&window, "Dictionary").set_accessible_value(words[..10].join("\n"));
     assert_eq!(labels(&window, "Over the limit"), Vec::<String>::new());
-    let count = labels(&window, "")
-        .into_iter()
-        .find(|l| l.ends_with(&format!(" / {BUDGET} tokens")))
-        .unwrap();
-    let small: usize = count.split(' ').next().unwrap().parse().unwrap();
-    assert!(small > 0 && small <= BUDGET, "{count}");
+    let small = full();
+    assert!(small > 0 && small <= 100, "{small}");
 }
 
 #[test]
@@ -270,9 +284,9 @@ fn fixed_file_is_read_again_when_the_page_is_shown_or_on_reload() {
         "replace.txt is not UTF-8 or UTF-16 text: fix it in a text editor."
     ));
 
-    window.set_page(Page::About);
-    // The query builds the About page, so the Text page is really left.
-    assert!(has(&window, "Version"));
+    window.set_page(Page::Overlay);
+    // The query builds the Overlay page, so the Text page is really left.
+    assert!(has(&window, "Show the overlay"));
     window.set_page(Page::Text);
     sub_tab(&window, "Dictionary");
     assert_eq!(
@@ -412,7 +426,11 @@ fn restore_delay_is_saved_once_the_slider_rests() {
     let l = layout("delay", None);
     let window = open_tall(&l);
     sub_tab(&window, "Paste");
-    let slider = with_role(&window, "Restore your copy after", AccessibleRole::Spinbox);
+    let slider = with_role(
+        &window,
+        "Give your copy back after",
+        AccessibleRole::Spinbox,
+    );
     slider.set_accessible_value("400");
     slider.set_accessible_value("500");
     assert_eq!(slider.accessible_value().as_deref(), Some("500"));
@@ -440,8 +458,12 @@ fn closing_within_the_debounce_still_saves_the_delay() {
     let l = layout("delay-close", None);
     let window = open_tall(&l);
     sub_tab(&window, "Paste");
-    with_role(&window, "Restore your copy after", AccessibleRole::Spinbox)
-        .set_accessible_value("700");
+    with_role(
+        &window,
+        "Give your copy back after",
+        AccessibleRole::Spinbox,
+    )
+    .set_accessible_value("700");
     assert!(!l.config_file().exists(), "saved during the drag");
     window.hide().unwrap();
     drop(window);
@@ -494,7 +516,7 @@ fn mode_thumb_and_rules_write_the_config() {
                 "Keep the last dictation in Win+V",
                 AccessibleRole::Switch,
             ),
-            with_role(&window, "Restore your copy after", AccessibleRole::Slider),
+            with_role(&window, "Give your copy back after", AccessibleRole::Slider),
         ]
         .map(|e| e.accessible_enabled())
     };
@@ -510,7 +532,12 @@ fn mode_thumb_and_rules_write_the_config() {
             .contains("# mine")
     );
 
-    with_role(&window, "Trailing space", AccessibleRole::Switch).invoke_accessible_default_action();
+    with_role(
+        &window,
+        "Add a space after the text",
+        AccessibleRole::Switch,
+    )
+    .invoke_accessible_default_action();
     assert!(!config(&l).config.paste.trailing_space);
 
     // The default rule is mstsc.exe; add one, refuse its case-insensitive twin, remove the first.
@@ -588,7 +615,8 @@ fn press_enter_is_off_until_switched_on_and_warns_in_clipboard_mode() {
     const WARN: &str = "With Clipboard mode, Enter only when the app confirms it took the text";
     let l = layout("press-enter", None);
     let window = open_tall(&l);
-    sub_tab(&window, "Processing");
+    // Owner item 14: the row sits with pasting, on Paste > Paste.
+    sub_tab(&window, "Paste");
     assert!(!config(&l).config.paste.press_enter);
     assert_eq!(
         labels(&window, WARN),
@@ -606,10 +634,8 @@ fn press_enter_is_off_until_switched_on_and_warns_in_clipboard_mode() {
         shown[0].contains("No confirmation, no Enter.") && !shown[0].contains("Win+V"),
         "{shown:?}"
     );
-    sub_tab(&window, "Paste");
     with_role(&window, "Type", AccessibleRole::RadioButton).invoke_accessible_default_action();
     assert_eq!(config(&l).config.paste.mode, PasteMode::Type);
-    sub_tab(&window, "Processing");
     assert_eq!(
         labels(&window, WARN),
         Vec::<String>::new(),
@@ -686,69 +712,61 @@ fn paste_tab_links_to_the_per_app_rules() {
     let l = layout("paste-link", None);
     let window = open_tall(&l);
     sub_tab(&window, "Paste");
-    let tab = |label| with_role(&window, label, AccessibleRole::Tab);
-    assert_eq!(tab("Paste").accessible_item_selected(), Some(true));
+    let state = window.global::<TextState>();
+    assert_eq!(state.get_paste_tab(), 0);
     with_role(&window, "Per-app rules", AccessibleRole::Button).invoke_accessible_default_action();
-    assert_eq!(tab("Per-app rules").accessible_item_selected(), Some(true));
-    assert_eq!(tab("Paste").accessible_item_selected(), Some(false));
+    assert_eq!(state.get_paste_tab(), 2);
+    let tab = with_role(&window, "Per-app rules", AccessibleRole::Tab);
+    assert_eq!(tab.accessible_item_selected(), Some(true));
     assert!(has(&window, "New rule app"), "the rules list is in view");
 }
 
-/// Owner item 15: the file rows sit on Per-app rules, between the line-join switch and the rule
-/// list. While no file is written the Folder row offers one button, "Turn on file writing", and
-/// has no greyed controls whose reason is hidden; choosing a mode in the Combo (what the owner
-/// did, and the state then stayed Off) or pressing the button makes the format and folder live,
-/// and both rows save the same `[output]` keys.
+/// Owner item 15 (ia-map 3.2): writing to a file has a tab of its own, Paste > Write to file. Its
+/// Folder and File type rows are live while writing is Off (choosing them writes nothing, so
+/// nothing is grey without a reason); with writing on and no folder the Folder row says so.
 #[test]
-fn file_rows_are_on_per_app_rules_and_say_what_to_turn_on() {
+fn write_to_file_tab_keeps_its_rows_live_and_says_when_no_folder_is_chosen() {
+    const NO_FOLDER: &str = "No folder chosen: nothing is written";
     let l = layout("folder-grey", None);
     let window = open_tall(&l);
-    sub_tab(&window, "Per-app rules");
-    let y = |label: &str| {
-        i_slint_backend_testing::ElementHandle::find_by_accessible_label(&window, label)
-            .next()
-            .unwrap_or_else(|| panic!("no {label}"))
-            .absolute_position()
-            .y
-    };
-    let file = y("Also write to a file");
-    assert!(y("Join lines in command prompts") < file && file < y("Scan for apps"));
+    sub_tab(&window, "Write to file");
     let state = window.global::<TextState>();
     assert_eq!(state.get_file_mode(), 0);
-    let live = || [has(&window, "File format"), has(&window, "Choose folder")];
-    assert_eq!(live(), [false, false], "Off: no controls to wonder about");
-    assert!(
-        has(&window, "Turn on file writing"),
-        "Off: the way to turn it on"
+    assert_eq!(one(&window, "File format").accessible_enabled(), Some(true));
+    assert!(has(&window, "Choose folder"));
+    assert!(!has(&window, NO_FOLDER), "Off: nothing to warn about");
+    // The Combo's own pick reaches the state and the file.
+    let combo = with_role(
+        &window,
+        "Write each dictation to a file",
+        AccessibleRole::Combobox,
     );
-    // The Combo's own pick reaches the state (it did not: the row stayed Off) and the file.
-    let combo = with_role(&window, "Also write to a file", AccessibleRole::Combobox);
     combo.mock_single_click(PointerEventButton::Left);
     window.window().dispatch_event(WindowEvent::KeyPressed {
         text: Key::DownArrow.into(),
     });
     assert_eq!(state.get_file_mode(), 1);
     assert_eq!(config(&l).config.output.file_mode, FileMode::Also);
-    assert_eq!(live(), [true, true], "Paste and write: live");
-    assert!(!has(&window, "Turn on file writing"));
-    assert_eq!(one(&window, "File format").accessible_enabled(), Some(true));
+    assert!(
+        has(&window, NO_FOLDER),
+        "on with no folder: the Folder row's \"!\""
+    );
     state.invoke_file_format_picked(1);
     let out = config(&l).config.output;
     assert_eq!(out.file_mode, FileMode::Also);
     assert_eq!(out.file_format, FileFormat::Txt);
 }
 
-/// Owner item 15: the button of the Off state turns writing on, as Paste and write.
+/// c03 R4: writing on in an app rule only, no folder: the Folder row warns too.
 #[test]
-fn the_turn_on_button_of_the_folder_row_turns_file_writing_on() {
-    let l = layout("folder-turn-on", None);
+fn an_app_rule_that_writes_without_a_folder_warns_on_the_folder_row() {
+    let l = layout(
+        "folder-rule",
+        Some("version = 2\n[[paste.rules]]\napp = \"synthapp.exe\"\nto_file = \"only\"\n"),
+    );
     let window = open_tall(&l);
-    sub_tab(&window, "Per-app rules");
-    one(&window, "Turn on file writing").invoke_accessible_default_action();
-    let state = window.global::<TextState>();
-    assert_eq!(state.get_file_mode(), 1);
-    assert_eq!(config(&l).config.output.file_mode, FileMode::Also);
-    assert!(has(&window, "Choose folder"));
+    sub_tab(&window, "Write to file");
+    assert!(has(&window, "No folder chosen: nothing is written"));
 }
 
 /// e12-fix, DS-15.1: the Paste mode tiles carry their captions, at the tile's own height (no
@@ -811,7 +829,14 @@ fn whole_in_view(window: &AppWindow, label: &str) -> bool {
 /// Whether the page itself scrolls: a wheel over the sub-tab bar moves it only if its content is
 /// taller than the room it has (the list and the editors keep the wheel over themselves).
 fn page_scrolls(window: &AppWindow) -> bool {
-    let at = with_role(window, "Dictionary", AccessibleRole::Tab).absolute_position();
+    // The first sub-tab of the open page: Dictionary on Text, Write to file on Paste (the rail
+    // has an item named Paste too).
+    let first = if window.get_page() == Page::Paste {
+        "Write to file"
+    } else {
+        "Dictionary"
+    };
+    let at = with_role(window, first, AccessibleRole::Tab).absolute_position();
     window
         .window()
         .dispatch_event(WindowEvent::PointerScrolled {
@@ -838,7 +863,7 @@ app = \"SynthApp.exe\"
     // The name is the title; the exe stands under it as its caption (DS-28.1), never as the title.
     assert!(has(&window, "SynthApp.exe"), "the exe is the caption");
     assert!(has(&window, "Remove SynthApp.exe"));
-    let window = common::open_again(&layout("rule-names-default", None), Page::Text);
+    let window = open_again(&layout("rule-names-default", None), Page::Text);
     sub_tab(&window, "Per-app rules");
     assert!(has(&window, "Remote Desktop Connection"));
 }
@@ -863,7 +888,7 @@ fn long_app_name_keeps_its_rule_row_one_line() {
 
 /// UI rule 25, worst case: a 500-word dictionary, a long replace.txt and 150 rules, and every
 /// sub-tab has its last control in view at 720 x 520 and the page cannot scroll, with no banner,
-/// the offline daemon's and a broken config's.
+/// the offline daemon's and a broken config's (Paste > Paste with no banner only).
 #[test]
 #[cfg_attr(
     not(windows),
@@ -889,22 +914,31 @@ fn every_tab_fits_the_minimum_size_with_long_lists() {
         for (tab, last) in [
             ("Dictionary", "Save dictionary.txt"),
             ("Replacements", "Save replace.txt"),
-            ("Paste", "Restore your copy after"),
+            ("Paste", "Give your copy back after"),
+            ("Write to file", "File type"),
             ("Per-app rules", "Scan for apps"),
-            ("Per-app rules", "Turn on file writing"),
             ("Per-app rules", "Join lines in command prompts"),
-            ("Processing", "Doubt level"),
-            ("Words", "Snippets"),
+            ("Formatting", "Certainty needed"),
+            ("Voice commands", "Delete the last sentence"),
+            ("Words", "Phrase shortcuts"),
         ] {
             sub_tab(&window, tab);
             i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+            // Paste > Paste has five rows (ia-map 3.2: 412 of 444 px, 32 left): a 72 px banner
+            // pushes it past the window, and the page scrolls (ia-map RT R12, UI rule 1 (a)).
+            // Formatting has seven rows since the two style switches (ia-map 3.4: 429 of 444 px):
+            // the same.
+            if (tab == "Paste" || tab == "Formatting") && !(banner.is_empty() && daemon.is_empty())
+            {
+                continue;
+            }
             assert!(
                 whole_in_view(&window, last),
                 "{last} is cut on {tab} (banner {banner:?}, daemon {daemon:?})"
             );
             if tab == "Words" {
                 // The label also names the row above the editor: the editor itself must be whole.
-                let e = editor(&window, "Snippets");
+                let e = editor(&window, "Phrase shortcuts");
                 let bottom = e.absolute_position().y + e.size().height;
                 assert!(
                     bottom <= 520.0,
@@ -932,14 +966,14 @@ fn opening_a_profile_keeps_the_card_size() {
         let card = || {
             let card = i_slint_backend_testing::ElementHandle::find_by_element_id(
                 &window,
-                "TextPage::card",
+                "PastePage::card",
             )
             .next()
             .expect("the rules card");
             (card.absolute_position(), card.size())
         };
         let list = card();
-        one(&window, "Profile of synthapp0.exe").invoke_accessible_default_action();
+        one(&window, "Settings for synthapp0.exe").invoke_accessible_default_action();
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
         assert!(has(&window, "Close the profile"), "the profile is open");
         assert_eq!(card(), list, "the card moved or changed size at {w}x{h}");
@@ -1084,5 +1118,347 @@ fn apps_popup_dims_the_window_while_open() {
         shell.get_modals(),
         0,
         "the dim stays after the popup closed"
+    );
+}
+
+/// RT R2, ia-owner: a rule that follows the Paste tab's mode names that mode in its Combo, and
+/// follows a change of it.
+#[test]
+fn a_rule_mode_names_the_paste_mode_it_follows() {
+    let l = layout(
+        "rule-default",
+        Some(
+            "version = 2
+[[paste.rules]]
+app = \"synthapp.exe\"
+",
+        ),
+    );
+    let window = open_tall(&l);
+    sub_tab(&window, "Per-app rules");
+    let mode = || {
+        with_role(&window, "Mode for synthapp.exe", AccessibleRole::Combobox)
+            .accessible_value()
+            .map(|v| v.to_string())
+    };
+    assert_eq!(mode().as_deref(), Some("Default (Clipboard)"));
+    window.global::<TextState>().invoke_paste_mode_picked(1);
+    window.global::<TextState>().set_paste_mode(1);
+    assert_eq!(mode().as_deref(), Some("Default (Type)"));
+}
+
+/// d01 review: the Folder row's "!" goes with the last rule that wrote to a file, at once (no
+/// reload), whether the rule is removed in the list or unticked in the scan popup.
+#[test]
+fn the_folder_warning_goes_with_the_last_rule_that_writes() {
+    const NO_FOLDER: &str = "No folder chosen: nothing is written";
+    let l = layout(
+        "folder-rule-gone",
+        Some(
+            "version = 2
+[[paste.rules]]
+app = \"synthapp.exe\"
+to_file = \"only\"
+",
+        ),
+    );
+    let window = open_tall(&l);
+    sub_tab(&window, "Write to file");
+    assert!(has(&window, NO_FOLDER));
+    sub_tab(&window, "Per-app rules");
+    one(&window, "Remove synthapp.exe").invoke_accessible_default_action();
+    sub_tab(&window, "Write to file");
+    assert!(!has(&window, NO_FOLDER), "no rule writes: no \"!\"");
+}
+
+/// ia-map S41, SPEC:39: the bar shows the share, the editor's "i" the count of word pieces.
+#[test]
+fn the_dictionary_tip_says_the_word_piece_count() {
+    let l = layout("token-tip", None);
+    fs::write(
+        l.dictionary_file(),
+        "synthone
+synthtwo
+",
+    )
+    .unwrap();
+    let window = open_tall(&l);
+    let s = window.global::<TextState>();
+    assert!(s.get_tokens() > 0);
+    let tip = format!("Now {} of {} word pieces.", s.get_tokens(), s.get_budget());
+    let found = labels(
+        &window,
+        "Names and rare words Whisper should know, one per line. A",
+    );
+    assert!(found.iter().any(|l| l.ends_with(&tip)), "{found:?}");
+}
+
+/// d01 review: "Certainty needed" follows the config after a drag (a two-way binding): a value
+/// changed in the file outside reaches the slider on the next look at the files.
+#[test]
+fn certainty_needed_follows_the_file_after_a_drag() {
+    let l = layout(
+        "certainty",
+        Some(
+            "version = 2
+[text]
+confidence_filter = true
+",
+        ),
+    );
+    let window = open_tall(&l);
+    sub_tab(&window, "Formatting");
+    let slider = || with_role(&window, "Certainty needed", AccessibleRole::Slider);
+    let value = || -> f32 { slider().accessible_value().unwrap().parse().unwrap() };
+    assert!((value() - 35.0).abs() < 0.5, "{}", value());
+    slider().invoke_accessible_increment_action();
+    assert!((value() - 40.0).abs() < 0.5, "{}", value());
+    // The drag's save rests first, so the edit below is the file's last word.
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_secs(5));
+    assert!((config(&l).config.text.confidence_min - 0.40).abs() < 0.001);
+    fs::write(
+        l.config_file(),
+        "version = 2
+[text]
+confidence_filter = true
+confidence_min = 0.6
+",
+    )
+    .unwrap();
+    window.invoke_files_check();
+    assert!((value() - 60.0).abs() < 0.5, "{}", value());
+}
+
+#[test]
+fn voice_phrases_are_saved_and_a_phrase_of_another_command_is_refused() {
+    let l = layout("voice", None);
+    let window = open_tall(&l);
+    let s = window.global::<TextState>();
+    let err = || -> Vec<String> {
+        Model::iter(&s.get_voice_errors())
+            .map(|e| e.to_string())
+            .collect()
+    };
+    assert_eq!(s.get_voice_line_phrases(), "новая строка, new line");
+    // Several phrases for one command; a repeat inside the field is left out.
+    s.invoke_voice_phrases_edited(0, "enter, Next line, enter!".into());
+    assert_eq!(err(), ["", "", ""]);
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(350));
+    let voice = config(&l).config.text.voice;
+    assert_eq!(voice.new_line.phrases, ["enter", "Next line"]);
+    // "new paragraph" belongs to New paragraph: the field says why, nothing is saved.
+    s.set_voice_line_phrases("enter, New  Paragraph".into()); // what typing does
+    s.invoke_voice_phrases_edited(0, "enter, New  Paragraph".into());
+    assert!(err()[0].contains("New paragraph"));
+    assert_eq!(s.get_voice_line_phrases(), "enter, New  Paragraph");
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(350));
+    assert_eq!(
+        config(&l).config.text.voice.new_line.phrases,
+        voice.new_line.phrases
+    );
+    // Editing another field does not drop the refused text: it stays, with its error, unsaved.
+    s.invoke_voice_phrases_edited(2, "delete that".into());
+    assert!(err()[0].contains("New paragraph"), "{:?}", err());
+    assert_eq!(s.get_voice_line_phrases(), "enter, New  Paragraph");
+    // Removing the clash from the other command lets the kept text through.
+    s.invoke_voice_phrases_edited(1, "new para".into());
+    assert_eq!(err(), ["", "", ""]);
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(350));
+    let saved = config(&l).config.text.voice;
+    assert_eq!(saved.new_line.phrases, ["enter", "New  Paragraph"]);
+    assert_eq!(saved.new_paragraph.phrases, ["new para"]);
+    // A fixed edit clears it; a switch is saved at once; Reset brings the phrases back.
+    s.invoke_voice_phrases_edited(0, "enter".into());
+    assert_eq!(err(), ["", "", ""]);
+    s.invoke_voice_toggled(2, false);
+    assert!(!config(&l).config.text.voice.delete_last.on);
+    s.invoke_voice_reset();
+    assert_eq!(s.get_voice_line_phrases(), "новая строка, new line");
+    let voice = config(&l).config.text.voice;
+    assert_eq!(voice.new_line.phrases, ["новая строка", "new line"]);
+    assert!(!voice.delete_last.on, "Reset keeps the switches");
+}
+
+/// Six edited synthetic dictations, each with the word "Zorblat" doubted and the full stop taken
+/// away by hand, in the history of `l`.
+fn write_doubted_history(l: &Layout) {
+    use oxi_core::history::{Meta, Previous, Status, Word};
+    let day = l.history_dir().join("2026-11-13");
+    fs::create_dir_all(&day).unwrap();
+    for i in 0..6 {
+        let stem = format!("1000{i:02}-000");
+        let meta = Meta {
+            original: Some(Previous {
+                text: "Synthetic note.".into(),
+                model: "turbo".into(),
+                language: "en".into(),
+                settings: None,
+                newer: false,
+            }),
+            words: vec![Word {
+                w: " Zorblat".into(),
+                p: 0.2,
+                t0: None,
+                t1: None,
+            }],
+            ..Meta::basic(
+                &format!("2026-11-13/{stem}"),
+                1000,
+                Status::Done,
+                "turbo",
+                "en",
+            )
+        };
+        fs::write(day.join(format!("{stem}.json")), meta.to_json().unwrap()).unwrap();
+        fs::write(day.join(format!("{stem}.txt")), "Synthetic note").unwrap();
+    }
+}
+
+/// Waits (mock time) for the history read of the open Text page to come back.
+fn wait_for_suggestions(s: &TextState<'_>) {
+    for _ in 0..200 {
+        if !s.get_period_tip().is_empty() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(60));
+    }
+}
+
+/// Hold item 41, candidates 6 and 7: edits that took the final full stop away and words the model
+/// doubted, in a synthetic history, make a suggestion on the "No full stop at the end" row and a
+/// word in the Dictionary's list. Nothing is written before Apply or Add.
+#[test]
+fn suggestions_from_the_history_change_nothing_until_apply_or_add() {
+    let l = layout("learn", Some("version = 2\n"));
+    write_doubted_history(&l);
+    let window = open(&l, Page::Text);
+    let s = window.global::<TextState>();
+    // The read runs on its own thread; a timer takes the answer.
+    for _ in 0..200 {
+        if !s.get_period_tip().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(60));
+    }
+    assert_eq!(
+        s.get_period_tip().as_str(),
+        "You took away the full stop at the end in 6 of your last 6 edits. Turn this on?"
+    );
+    assert_eq!(s.get_doubted_count(), 1);
+    assert!(
+        !config(&l).config.text.no_final_period,
+        "nothing changes unasked"
+    );
+    assert!(!l.dictionary_file().exists(), "nothing added unasked");
+
+    s.invoke_suggestion(0, true);
+    assert!(config(&l).config.text.no_final_period);
+    assert!(s.get_no_final_period());
+    assert_eq!(
+        s.get_period_tip().as_str(),
+        "",
+        "applied: nothing left to suggest"
+    );
+
+    s.invoke_doubt_added(0);
+    assert_eq!(fs::read_to_string(l.dictionary_file()).unwrap(), "Zorblat");
+    assert_eq!(s.get_doubted_count(), 0, "in the dictionary now");
+}
+
+/// Review fix: "Not this one" and "Not now" stay after the window is opened again, the list says
+/// what a word costs of the word-piece limit before Add, and a dictionary at the limit says so.
+#[test]
+fn dismissed_suggestions_stay_dismissed_and_the_list_shows_the_cost() {
+    use oxi_core::history::{Meta, Status, Word};
+    let l = layout(
+        "learn-dismiss",
+        Some(
+            "version = 2
+",
+        ),
+    );
+    write_doubted_history(&l);
+    // A second doubted word that is not dismissed: once it is listed again after the reopen, the
+    // history read has answered, so what is missing then was kept dismissed (not read late).
+    let day = l.history_dir().join("2026-11-12");
+    fs::create_dir_all(&day).unwrap();
+    for i in 0..3 {
+        let stem = format!("1000{i:02}-000");
+        let meta = Meta {
+            words: vec![Word {
+                w: " Quaxle".into(),
+                p: 0.2,
+                t0: None,
+                t1: None,
+            }],
+            ..Meta::basic(
+                &format!("2026-11-12/{stem}"),
+                1000,
+                Status::Done,
+                "turbo",
+                "en",
+            )
+        };
+        fs::write(day.join(format!("{stem}.json")), meta.to_json().unwrap()).unwrap();
+        fs::write(day.join(format!("{stem}.txt")), "Quaxle").unwrap();
+    }
+    let word = |s: &TextState<'_>, i| s.get_doubted().row_data(i).unwrap().word.to_string();
+    {
+        let window = open(&l, Page::Text);
+        let s = window.global::<TextState>();
+        wait_for_suggestions(&s);
+        assert_eq!(s.get_doubted_count(), 2);
+        let row = s.get_doubted().row_data(0).unwrap();
+        assert!(
+            row.cost.starts_with("Adds ") && row.cost.contains("of 223") && !row.over,
+            "{}",
+            row.cost
+        );
+        let zorblat = (0..2).find(|&i| word(&s, i) == "Zorblat").unwrap();
+        s.invoke_suggestion(0, false);
+        s.invoke_doubt_skipped(i32::try_from(zorblat).unwrap());
+        assert_eq!(s.get_period_tip().as_str(), "");
+        assert_eq!(s.get_doubted_count(), 1);
+    }
+    let window = open_again(&l, Page::Text);
+    let s = window.global::<TextState>();
+    for _ in 0..200 {
+        if s.get_doubted_count() > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(60));
+    }
+    assert_eq!(s.get_doubted_count(), 1, "the read answered");
+    assert_eq!(word(&s, 0), "Quaxle", "Not this one came back");
+    assert_eq!(s.get_period_tip().as_str(), "", "Not now came back");
+    assert!(
+        fs::read_to_string(l.data_dir.join("learn-dismissed.txt"))
+            .unwrap()
+            .lines()
+            .all(|k| k.len() == 16 && k.chars().all(|c| c.is_ascii_hexdigit())),
+        "only hashed keys are kept"
+    );
+}
+
+#[test]
+fn a_full_dictionary_says_a_doubted_word_is_over_the_limit() {
+    let l = layout("learn-full", Some("version = 2\n"));
+    write_doubted_history(&l);
+    fs::write(
+        l.dictionary_file(),
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu\n".repeat(30),
+    )
+    .unwrap();
+    let window = open(&l, Page::Text);
+    let s = window.global::<TextState>();
+    wait_for_suggestions(&s);
+    let row = s.get_doubted().row_data(0).unwrap();
+    assert!(
+        row.over && row.cost.contains("over the limit"),
+        "{}",
+        row.cost
     );
 }
