@@ -11,12 +11,14 @@ mod run;
 mod sound;
 mod stats;
 mod ui;
+mod update;
 mod watch;
 mod whisper;
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-pub use run::run;
+pub use run::{Launch, run};
+pub use update::{AFTER_UPDATE_ARG, OPEN_SETTINGS_ARG, wait_for_parent};
 
 /// A mutex guard even when another thread panicked holding it: the daemon's shared state stays
 /// usable, and the panic itself is logged by the hook.

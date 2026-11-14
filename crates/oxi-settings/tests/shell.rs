@@ -56,7 +56,7 @@ fn about_shows_name_version_and_licence() {
     window.set_page(Page::About);
     for text in [
         oxi_core::APP_NAME,
-        env!("CARGO_PKG_VERSION"),
+        oxi_core::VERSION,
         env!("CARGO_PKG_LICENSE"),
         "MIT licence",
         "Apache-2.0 licence",
@@ -1256,7 +1256,7 @@ fn system_warnings_move_no_row() {
     press_switch(&window, "Log dictated text");
 
     // The update confirm takes the row's own title and switch.
-    system_tab(&window, "General");
+    system_tab(&window, "Updates");
     let before = spots(&window);
     press_switch(&window, "Check for updates");
     assert!(has(&window, "Update checks tell you when a fix is out."));
@@ -1268,6 +1268,7 @@ fn system_warnings_move_no_row() {
 fn update_confirm_takes_the_focus_and_gives_it_back() {
     let l = layout("swap-focus", None);
     let window = open(&l, Page::System);
+    window.global::<oxi_settings::SystemState>().set_tab(2);
     tall(&window);
     let space = || {
         for event in [
@@ -1277,10 +1278,8 @@ fn update_confirm_takes_the_focus_and_gives_it_back() {
             window.window().dispatch_event(event);
         }
     };
-    // The rail, the sub-tabs, the theme tiles, the "i" and the box of App language, Start at
-    // sign-in, the swatch strip and the hex field of the Accent row (DS-20.7), the "i" of Check for
-    // updates and its switch.
-    for _ in 0..10 {
+    // The rail, the sub-tabs, the "i" of Check for updates and its switch.
+    for _ in 0..4 {
         press(&window, Key::Tab);
     }
     space();

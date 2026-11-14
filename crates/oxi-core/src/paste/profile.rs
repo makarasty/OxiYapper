@@ -134,6 +134,7 @@ mod tests {
         c.model
             .by_language
             .insert(LanguageKey(Language::RU), "podlodka".into());
+        c.model.language = Language::RU;
         assert_eq!(profile(&c, "a.exe").model, "tiny");
         c.paste.rules.push(PasteRule {
             language: Some(Language::EN),

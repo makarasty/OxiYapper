@@ -1,5 +1,5 @@
-//! I/O worker: model download (ARCHITECTURE section 8). History writes and the update check join
-//! it later.
+//! I/O worker: model download (ARCHITECTURE section 8). It hands "Check now" and each new window
+//! to the update thread (`update.rs`).
 //!
 //! The worker thread only routes [`IoCmd`]s. Each download runs on its own thread, so a
 //! `CancelDownload` is heard while the transfer runs. Progress and the end go to the settings
@@ -23,6 +23,7 @@ use oxi_core::paths::part_path;
 use super::cmd::{Inbox, IoCmd};
 use super::ipc::Pushes;
 use super::lock;
+use super::update::UpdateCmd;
 use crate::net::{self, DownloadError, Downloaded};
 
 /// Shortest gap between two progress pushes (10 a second).
@@ -49,8 +50,10 @@ pub fn spawn(
     inbox: Sender<Inbox>,
     pushes: Pushes,
     models_dir: PathBuf,
+    update: Sender<UpdateCmd>,
 ) -> std::io::Result<JoinHandle<()>> {
-    let worker = Worker::new(Arc::new(net::download), inbox, pushes, models_dir);
+    let mut worker = Worker::new(Arc::new(net::download), inbox, pushes, models_dir);
+    worker.update = Some(update);
     thread::Builder::new().name("io".into()).spawn(move || {
         for cmd in rx {
             worker.handle(cmd);
@@ -66,6 +69,8 @@ struct Worker {
     models_dir: PathBuf,
     /// Every running download, by model id.
     active: Arc<Mutex<HashMap<String, Arc<Running>>>>,
+    /// The update thread; `None` in the tests.
+    update: Option<Sender<UpdateCmd>>,
 }
 
 /// One running download: its cancel flag and the last progress it reported.
@@ -91,6 +96,7 @@ impl Worker {
             pushes,
             models_dir,
             active: Arc::default(),
+            update: None,
         }
     }
 
@@ -102,7 +108,18 @@ impl Worker {
                     run.cancel.store(true, Ordering::Relaxed);
                 }
             }
-            IoCmd::Subscribed => self.replay(),
+            IoCmd::Subscribed => {
+                self.replay();
+                self.to_update(UpdateCmd::Subscribed);
+            }
+            IoCmd::CheckUpdate => self.to_update(UpdateCmd::Check),
+        }
+    }
+
+    fn to_update(&self, cmd: UpdateCmd) {
+        if let Some(tx) = &self.update {
+            // Err: the update thread failed to start; nothing answers then.
+            let _ = tx.send(cmd);
         }
     }
 

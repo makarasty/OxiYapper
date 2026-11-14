@@ -75,6 +75,8 @@ export global ModelState {
     in property <int> selected;
     // The tile under the check, whose card is below the gallery; the model in use on opening.
     in-out property <int> viewed;
+    // The row `models::recommend` picked for this PC, -1 for none (the setup wizard opens on it).
+    in property <int> recommended: -1;
     in-out property <string> custom-path;
     in property <string> custom-error;
     // The native file dialog exists on this OS.
@@ -258,7 +260,7 @@ component AdvControl inherits HorizontalLayout {
 // needs), its state and where it runs (or the download's bar), its "!", and two action slots, get
 // (Download, Resume, Cancel, Use) and remove (Delete), each one width. Delete asks first, in place
 // of the line.
-component ModelCard inherits VerticalLayout {
+export component ModelCard inherits VerticalLayout {
     in property <ModelRow> data;
     in property <int> index;
     property <bool> in-use: ModelState.selected == root.index;
@@ -511,7 +513,7 @@ component ModelCard inherits VerticalLayout {
 
 // "Use my own .bin" under the gallery's check: the path on a line of its own, wide enough for a
 // real one at the least window width.
-component CustomCard inherits VerticalLayout {
+export component CustomCard inherits VerticalLayout {
     property <bool> in-use: ModelState.selected == ModelState.rows.length;
     Card {
         HorizontalLayout {
@@ -717,9 +719,7 @@ export component ModelPage inherits VerticalLayout {
                         property <length> room: Shell.window-height - root.gallery-chrome;
                         // Less the gap after the last row: the next row must not peek in under the grid.
                         height: min(self.full-height, max(2, floor(self.room / self.row-room)) * self.row-room) - Theme.tile-gap;
-                        // Wider than the token's least cell, so a name and its facts fit beside
-                        // the badge: four to a row at 1280, three at the least window.
-                        min-cell: 200px;
+                        min-cell: Theme.model-tile-min-width;
                         accessible-label: @tr("Models");
                         tiles: ModelState.tiles;
                         selected: ModelState.viewed;

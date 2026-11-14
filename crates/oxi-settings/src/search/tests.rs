@@ -4,7 +4,7 @@ use std::path::Path;
 use super::{ENTRIES, Entry, Kind, find, fold, place, rank};
 use crate::Page;
 
-/// The page files that hold settings, and the page each belongs to (About is System's third tab).
+/// The page files that hold settings, and the page each belongs to (About is System's fourth tab).
 /// Home, History and Test hold no settings (ia-map 1: "Not settings").
 const FILES: [(&str, Page, Option<i32>); 8] = [
     ("audio", Page::Audio, None),
@@ -14,7 +14,7 @@ const FILES: [(&str, Page, Option<i32>); 8] = [
     ("paste", Page::Paste, None),
     ("system", Page::System, None),
     ("text", Page::Text, None),
-    ("about", Page::System, Some(2)),
+    ("about", Page::System, Some(3)),
 ];
 
 /// Titles on those pages that are no setting: the confirm line under "Check for updates".

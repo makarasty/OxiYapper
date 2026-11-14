@@ -93,6 +93,51 @@ export global AudioState {
     callback preview();
 }
 
+// The microphone pick; also the setup wizard's microphone step.
+export component MicDeviceRow inherits Row {
+    title: @tr("Device");
+    warning: Warnings.both(AudioState.list-error, AudioState.fallback);
+    fill-controls: true;
+    full-text: AudioState.devices[AudioState.device];
+    Combo {
+        model: AudioState.devices;
+        current-index <=> AudioState.device;
+        accessible-label: @tr("Device");
+        selected => {
+            AudioState.edited(AudioKey.device, self.current-index);
+        }
+    }
+}
+
+// The live meter and Record 3 s; also the setup wizard's microphone step.
+// The Test button takes its width from the column: the meter shrinks, the right edge stays
+// the column's (DS-3.3).
+export component MicLevelRow inherits Row {
+    title: @tr("Level");
+    info: @tr("How loud your microphone is right now. Speak to see it move.");
+    // The "!" carries the words of the clip line (DS-21.3).
+    warning: Warnings.both(AudioState.silence, AudioState.clipping ? @tr("Too loud: lower the microphone boost.") : "");
+    fill-controls: true;
+    Meter {
+        bars: AudioState.bars;
+        live: AudioState.live;
+        clipped: AudioState.clipped;
+        overloaded: AudioState.clipping;
+        empty-text: AudioState.note;
+        idle-text: @tr("Listening");
+        result: AudioState.mic-result;
+        accessible-label: !AudioState.live ? AudioState.note : AudioState.clipping ? @tr("Level, clipping") : @tr("Level");
+    }
+    Button {
+        text: @tr("Record 3 s");
+        enabled: !AudioState.testing;
+        tooltip: @tr("A test is running");
+        clicked => {
+            AudioState.test();
+        }
+    }
+}
+
 export component AudioPage inherits VerticalLayout {
     // The shell's room under the header row: the sound gallery takes what the sub-tabs and the
     // card above it leave, so the Sounds tab fits without the page scrolling (UI rule 25).
@@ -112,20 +157,7 @@ export component AudioPage inherits VerticalLayout {
         }
     }
     if AudioState.view == 0: Card {
-        Row {
-            title: @tr("Device");
-            warning: Warnings.both(AudioState.list-error, AudioState.fallback);
-            fill-controls: true;
-            full-text: AudioState.devices[AudioState.device];
-            Combo {
-                model: AudioState.devices;
-                current-index <=> AudioState.device;
-                accessible-label: @tr("Device");
-                selected => {
-                    AudioState.edited(AudioKey.device, self.current-index);
-                }
-            }
-        }
+        MicDeviceRow { }
         Divider { }
         ToggleRow {
             flat: true;
@@ -137,33 +169,7 @@ export component AudioPage inherits VerticalLayout {
             }
         }
         Divider { }
-        // The Test button takes its width from the column: the meter shrinks, the right edge stays
-        // the column's (DS-3.3).
-        Row {
-            title: @tr("Level");
-            info: @tr("How loud your microphone is right now. Speak to see it move.");
-            // The "!" carries the words of the clip line (DS-21.3).
-            warning: Warnings.both(AudioState.silence, AudioState.clipping ? @tr("Too loud: lower the microphone boost.") : "");
-            fill-controls: true;
-            Meter {
-                bars: AudioState.bars;
-                live: AudioState.live;
-                clipped: AudioState.clipped;
-                overloaded: AudioState.clipping;
-                empty-text: AudioState.note;
-                idle-text: @tr("Listening");
-                result: AudioState.mic-result;
-                accessible-label: !AudioState.live ? AudioState.note : AudioState.clipping ? @tr("Level, clipping") : @tr("Level");
-            }
-            Button {
-                text: @tr("Record 3 s");
-                enabled: !AudioState.testing;
-                tooltip: @tr("A test is running");
-                clicked => {
-                    AudioState.test();
-                }
-            }
-        }
+        MicLevelRow { }
         Divider { }
         SliderRow {
             title: @tr("Microphone boost");

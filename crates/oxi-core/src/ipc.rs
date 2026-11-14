@@ -28,8 +28,8 @@ use crate::types::Language;
 /// `TestProgress`. 6: the daemon pushes `HistoryAdded`, `HistoryRemoved`, `FileChanged` and `Woke`
 /// and sends `Stats`, `Status` and `Attention` unasked. `HistoryWords`, `HistoryWordsCancel`,
 /// `HistoryRunWords` and the words of `HistorySetText` came with 6 (the daemon and the window are
-/// one build).
-pub const PROTO: u32 = 6;
+/// one build). 7: `CheckUpdate` and `Update`.
+pub const PROTO: u32 = 7;
 
 /// Longest accepted line, newline excluded.
 pub const MAX_LINE: usize = 1024 * 1024;
@@ -175,6 +175,9 @@ pub enum Request {
     DeleteModel {
         id: String,
     },
+    /// The System page's "Check now": check for an update at once. The state comes as
+    /// [`Push::Update`].
+    CheckUpdate,
     Shutdown,
 }
 
@@ -653,6 +656,10 @@ pub enum Push {
     },
     /// The machine woke from sleep or the session was unlocked: what the window drew may be stale.
     Woke,
+    /// Where the updater is. Sent when it changes and to a window that connects.
+    Update {
+        status: crate::update::Status,
+    },
 }
 
 /// Windows named pipe for one user: `\\.\pipe\OxiYapper-<SID>`.

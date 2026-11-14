@@ -106,7 +106,16 @@ impl Fixture {
         hardware: Option<Hardware>,
     ) -> Self {
         SAMPLES.set(MIC_SAMPLES);
-        let layout = layout(name, config);
+        // Written for a Russian setup (the ready phrases): a config saved with Russian.
+        let layout = layout(
+            name,
+            config.or(Some(
+                "version = 2
+[model]
+language = \"ru\"
+",
+            )),
+        );
         fake(&layout, "turbo");
         let (ipc, sent) = Ipc::fake();
         let window = open_linked(&layout, Page::Test, ipc.clone());
@@ -707,6 +716,8 @@ fn the_flow_runs_every_set_over_every_recording_and_apply_writes_the_best() {
             "version = 2
 [audio]
 per_device = true
+[model]
+language = \"ru\"
 ",
         ),
     );

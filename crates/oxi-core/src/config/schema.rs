@@ -26,6 +26,8 @@ pub struct Config {
     pub history: History,
     pub system: System,
     pub debug: Debug,
+    /// A file with no `[ui]` was written before the setup wizard: it counts as set up.
+    #[serde(default = "Ui::set_up")]
     pub ui: Ui,
     pub text: Text,
     pub output: Output,
@@ -191,7 +193,8 @@ impl Default for Model {
             id: "turbo".into(),
             custom_path: String::new(),
             gpu: DeviceChoice::Auto,
-            language: Language::RU,
+            // A new config detects the language; a saved one keeps its own.
+            language: Language::AUTO,
             recent_languages: [Language::RU, Language::EN],
             idle_unload_minutes: 5,
             unload_immediately: false,
@@ -476,6 +479,9 @@ impl Default for History {
 pub struct System {
     pub autostart: bool,
     pub update_check: bool,
+    /// A newer release found by the check installs itself and restarts the app once no dictation
+    /// runs; off, the System page offers its download page instead.
+    pub auto_update: bool,
 }
 
 impl Default for System {
@@ -483,6 +489,7 @@ impl Default for System {
         Self {
             autostart: true,
             update_check: true,
+            auto_update: true,
         }
     }
 }
@@ -523,6 +530,24 @@ pub struct Ui {
     /// for a rule picked from a scan, so the name outlives the window (UI rule 30). Display only.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub app_names: BTreeMap<String, String>,
+    /// The first-run setup wizard was finished or skipped. False in a new config; a file from
+    /// before the wizard has no key and counts as set up, so an update never shows it.
+    #[serde(default = "set_up")]
+    pub first_run_done: bool,
+}
+
+const fn set_up() -> bool {
+    true
+}
+
+impl Ui {
+    /// What a file with no `[ui]` reads as.
+    pub(crate) fn set_up() -> Self {
+        Self {
+            first_run_done: true,
+            ..Self::default()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -603,5 +628,48 @@ mod tests {
         let mut want = PasteRule::KEYS.to_vec();
         want.sort_unstable();
         assert_eq!(keys, want);
+    }
+
+    /// A new config detects the language and shows the setup wizard; a saved file keeps its
+    /// language, and a file from before the wizard (no key, or no `[ui]` at all) never shows it.
+    #[test]
+    fn a_new_config_is_auto_and_not_set_up_and_a_saved_one_keeps_its_values() {
+        use crate::config::ConfigFile;
+        let fresh = Config::default();
+        assert_eq!(fresh.model.language, Language::AUTO);
+        assert!(!fresh.ui.first_run_done);
+        let written = ConfigFile::default().to_toml_string().unwrap();
+        let again = ConfigFile::parse(&written).unwrap().config;
+        assert_eq!(again.model.language, Language::AUTO);
+        assert!(!again.ui.first_run_done, "a new file shows the wizard");
+
+        let old = ConfigFile::parse(
+            "version = 2
+[model]
+language = \"ru\"
+[ui]
+theme = \"dark\"
+",
+        )
+        .unwrap();
+        assert_eq!(old.config.model.language, Language::RU);
+        assert!(old.config.ui.first_run_done, "an old file is set up");
+        let no_ui = ConfigFile::parse(
+            "version = 2
+[model]
+language = \"ru\"
+",
+        )
+        .unwrap();
+        assert!(no_ui.config.ui.first_run_done);
+        // Saved again, both values stay.
+        let back = ConfigFile::parse(&old.to_toml_string().unwrap()).unwrap();
+        assert_eq!(back.config.model.language, Language::RU);
+        assert!(back.config.ui.first_run_done);
+
+        let mut done = ConfigFile::parse(&written).unwrap();
+        done.config.ui.first_run_done = true;
+        let saved = done.to_toml_string().unwrap();
+        assert!(ConfigFile::parse(&saved).unwrap().config.ui.first_run_done);
     }
 }

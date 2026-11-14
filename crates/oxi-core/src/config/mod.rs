@@ -227,7 +227,8 @@ impl ConfigFile {
 
     /// The raw document with the typed settings written into its existing items, so an
     /// unchanged file comes back byte-identical (BOM and CRLF included) and a changed value
-    /// changes only its text. A key the file lacks is added only when it is not the default.
+    /// changes only its text. A key the file lacks is added only when it differs from what its
+    /// absence reads as.
     /// Errors with `ReadOnly` for a file from a newer version.
     pub fn to_toml_string(&self) -> Result<String, ConfigError> {
         if self.read_only {
@@ -235,7 +236,12 @@ impl ConfigFile {
         }
         let mut typed = typed_doc(&self.config)?;
         unplace(typed.as_table_mut());
-        let default = typed_doc(&Config::default())?;
+        // What a missing key reads as: an old file with no `first_run_done` is set up, so the
+        // key is not added to it.
+        let default = typed_doc(&Config {
+            ui: Ui::set_up(),
+            ..Config::default()
+        })?;
         let mut out = self.raw.clone();
         merge(
             out.as_table_mut(),

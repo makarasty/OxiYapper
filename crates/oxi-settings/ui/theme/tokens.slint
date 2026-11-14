@@ -199,6 +199,9 @@ export global Theme {
     // Card grid (DS-15): the narrowest column.
     out property <length> tile-min-width: 160px;
     out property <length> tile-max-width: 320px;
+    // The model gallery's narrowest column: a name and its facts fit beside the badge, four to a
+    // row at 1280, three at the least window (Model page, setup wizard).
+    out property <length> model-tile-min-width: 200px;
     // Home heatmap and trend defaults (the page passes its own).
     out property <length> heat-cell-default: 12px;
     out property <length> heat-gap: 3px;

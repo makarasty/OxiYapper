@@ -11,6 +11,7 @@
 //! `--idle <seconds>` (anywhere in the arguments, `out.png` is then unused) takes no shot: the window
 //! stays open that long, untouched, for the idle-CPU measurement of UI rule 23, then exits.
 //! `tab` opens a sub-tab by name; a name it does not know is an error, never a shot of another tab.
+//! Page `setup` is the first-run wizard; its `tab` is the step: welcome, model, hotkey, microphone, try.
 //!
 //! States a plain start cannot reach come from the environment (all synthetic, all optional):
 //! - `OXI_SHOT_BANNER=<text>`: the broken-config banner with that text.
@@ -43,7 +44,8 @@ use oxi_core::stats::{HEAT_WEEKS, Stats, Summary};
 use oxi_core::types::Millis;
 use oxi_settings::ipc::{Cmd, Event};
 use oxi_settings::{
-    AppWindow, AudioState, Ipc, ModelState, Page, SystemState, TestState, TextState, ThemeChoice,
+    AppWindow, AudioState, Ipc, ModelState, Page, SetupState, SystemState, TestState, TextState,
+    ThemeChoice,
 };
 use slint::platform::{PointerEventButton, WindowEvent};
 use slint::{ComponentHandle, LogicalPosition, LogicalSize, PhysicalPosition, Timer, TimerMode};
@@ -147,6 +149,22 @@ fn page(name: &str) -> Option<Page> {
         "about" => Page::About,
         _ => return None,
     })
+}
+
+/// The setup wizard on step `name` (its first without one).
+fn open_setup(window: &AppWindow, name: Option<&str>) -> Result<(), String> {
+    let steps = ["welcome", "model", "hotkey", "microphone", "try"];
+    let step = match name {
+        None => 0,
+        Some(name) => steps
+            .iter()
+            .position(|s| *s == name)
+            .ok_or_else(|| format!("no setup step \"{name}\": {steps:?}"))?,
+    };
+    let state = window.global::<SetupState>();
+    state.invoke_start();
+    state.invoke_go(i32::try_from(step).map_err(|e| e.to_string())?);
+    Ok(())
 }
 
 fn open_tab(window: &AppWindow, page: Page, name: &str) -> Result<(), String> {
@@ -317,7 +335,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ) else {
         return Err(usage.into());
     };
-    let (Some(page), Ok(w), Ok(h)) = (page(&name), w.parse::<f32>(), h.parse::<f32>()) else {
+    let setup = name == "setup";
+    let page_name = if setup { "home" } else { name.as_str() };
+    let (Some(page), Ok(w), Ok(h)) = (page(page_name), w.parse::<f32>(), h.parse::<f32>()) else {
         return Err(usage.into());
     };
     let theme = match theme.as_str() {
@@ -357,7 +377,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         window.set_banner_text(text.into());
         window.set_banner_fixable(true);
     }
-    if let Some(tab) = &tab
+    if setup {
+        open_setup(&window, tab.as_deref())?;
+    } else if let Some(tab) = &tab
         && let Err(e) = open_tab(&window, page, tab)
     {
         return Err(e.into());

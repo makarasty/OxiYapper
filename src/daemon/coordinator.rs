@@ -174,6 +174,8 @@ pub struct Coordinator<H> {
     /// The model the newest recording runs with: a recording that starts while jobs still wait
     /// for whisper keeps it (arch-plan 9.2, no switch mid-queue).
     model: String,
+    /// The update's swap, held until no dictation runs (`Inbox::UpdateReady`).
+    update: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl<H: ChordHook> Coordinator<H> {
@@ -248,6 +250,7 @@ impl<H: ChordHook> Coordinator<H> {
             file_writes: HashMap::new(),
             stale_file_writes: HashSet::new(),
             model: String::new(),
+            update: None,
         };
         c.send_config();
         c.sync_warnings();
@@ -331,6 +334,14 @@ impl<H: ChordHook> Coordinator<H> {
             self.pushed = None;
         }
         self.dispatch(msg, now);
+        if self.update.is_some()
+            && !self.quitting
+            && self.state.phase() == Phase::Idle
+            && !self.state.busy()
+            && let Some(swap) = self.update.take()
+        {
+            swap();
+        }
         self.sync_warnings();
         self.sync_badge();
         if up && let Some(report) = self.changed_status() {
@@ -460,6 +471,7 @@ impl<H: ChordHook> Coordinator<H> {
                     );
                 }
             }
+            Inbox::UpdateReady(swap) => self.update = Some(swap),
             Inbox::Shutdown => {} // `run` ends the loop before it gets here
         }
     }

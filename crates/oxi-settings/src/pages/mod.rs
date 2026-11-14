@@ -10,6 +10,7 @@ mod model;
 mod overlay;
 mod progress;
 mod recent;
+pub(crate) mod setup;
 mod system;
 pub mod test;
 mod text;
@@ -48,4 +49,5 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     overlay::bind(window, ctx);
     about::bind(window, ctx);
     system::bind(window, ctx);
+    setup::bind(window, ctx);
 }

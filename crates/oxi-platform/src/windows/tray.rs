@@ -310,9 +310,14 @@ impl MainLoop {
 
     /// A balloon (a toast on Windows 10 and later) with the full text of `notice`.
     pub fn notify(&self, notice: Notice) -> io::Result<()> {
+        self.notify_text(strings::notice(notice))
+    }
+
+    /// A balloon with `text` (cut at the 255 characters Windows keeps).
+    pub fn notify_text(&self, text: &str) -> io::Result<()> {
         let mut data = self.data(NIF_INFO);
         copy_wide(&mut data.szInfoTitle, APP_NAME);
-        copy_wide(&mut data.szInfo, strings::notice(notice));
+        copy_wide(&mut data.szInfo, text);
         // The daemon plays its own sounds.
         data.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
         shell(NIM_MODIFY, &data)

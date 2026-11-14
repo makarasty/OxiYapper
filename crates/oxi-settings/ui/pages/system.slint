@@ -3,11 +3,12 @@
 import { Theme, Shell, Icons, Group, Card, Row, Divider, ToggleRow, TilePicker, Combo, Button, ButtonKind, NumberField, PathField, SubTabs, TextField, FocusRing, KeyFocus, Tip } from "../theme/index.slint";
 import { HomeState } from "home.slint";
 import { AboutPage } from "about.slint";
+import { SetupState } from "setup.slint";
 
 export enum ThemeChoice { system, dark, light }
 
 export global SystemState {
-    // The sub-tab: 0 General, 1 History and files (UI rule 25: the page did not fit), 2 About.
+    // The sub-tab: 0 General, 1 History and files, 2 Updates (UI rule 25: the page did not fit), 3 About.
     in-out property <int> tab;
     in-out property <bool> autostart;
     in-out property <bool> update-check;
@@ -36,6 +37,15 @@ export global SystemState {
     callback autostart-toggled(bool);
     // Off fires only after the note is confirmed.
     callback update-check-toggled(bool);
+    in-out property <bool> auto-update;
+    callback auto-update-toggled(bool);
+    // The updater's line ("Up to date · 0.1.0"), made in Rust from the daemon's `Update` push.
+    in property <string> update-status;
+    // A newer release that does not install itself: its page, which Download opens.
+    in property <string> update-page;
+    // The daemon answers, so "Check now" reaches it.
+    in property <bool> update-live;
+    callback check-update();
     callback log-text-toggled(bool);
     callback open-settings-folder();
     callback open-logs-folder();
@@ -201,7 +211,7 @@ export component SystemPage inherits VerticalLayout {
     // Opened as the old About page (`Page.about`): the About tab shows at once, before the shell
     // turns the page into System with tab 2.
     in property <bool> about;
-    property <int> tab: root.about ? 2 : SystemState.tab;
+    property <int> tab: root.about ? 3 : SystemState.tab;
     property <bool> tight: root.free-height < Theme.system-tight-height;
     // The update switch was turned off: it stays on until the note is confirmed (SPEC Settings UI).
     // The note and its buttons take the row's title and switch, so the row keeps its height.
@@ -227,7 +237,7 @@ export component SystemPage inherits VerticalLayout {
         SystemState.history-check();
     }
     tabs := SubTabs {
-        items: [@tr("General"), @tr("History and files"), @tr("About")];
+        items: [@tr("General"), @tr("History and files"), @tr("Updates"), @tr("About")];
         selected: root.tab;
         picked(i) => {
             // The field goes with its tab, so its focus loss is never seen.
@@ -287,7 +297,7 @@ export component SystemPage inherits VerticalLayout {
         }
     }
     Group {
-        title: @tr("Startup and updates");
+        title: @tr("Startup");
         Card {
             ToggleRow {
                 flat: true;
@@ -298,51 +308,15 @@ export component SystemPage inherits VerticalLayout {
                 }
             }
             Divider { }
-            Rectangle {
-                min-height: update-row.min-height;
-                preferred-height: update-row.preferred-height;
-                update-row := ToggleRow {
-                    visible: !root.confirm-update-off;
-                    flat: true;
-                    title: @tr("Check for updates");
-                    info: @tr("Once a day OxiYapper asks GitHub for the latest version. Nothing installs on its own.");
-                    checked <=> SystemState.update-check;
-                    toggled(on) => {
-                        if (on) {
-                            root.confirm-update-off = false;
-                            SystemState.update-check-toggled(true);
-                        } else {
-                            self.checked = true;
-                            root.confirm-by-key = self.key-focused;
-                            root.confirm-update-off = true;
-                        }
-                    }
-                }
-                if root.confirm-update-off: Row {
-                    init => {
-                        keep.take-focus(root.confirm-by-key);
-                    }
-                    title: @tr("Update checks tell you when a fix is out.");
-                    Button {
-                        text: @tr("Turn off");
-                        kind: ButtonKind.soft;
-                        // The risky choice the confirmation guards turns red under the pointer (UI rule 16).
-                        destructive: true;
-                        accessible-label: @tr("Turn off update checks");
-                        clicked => {
-                            root.confirm-update-off = false;
-                            update-row.take-focus(self.key-focused);
-                            SystemState.update-check = false;
-                            SystemState.update-check-toggled(false);
-                        }
-                    }
-                    keep := Button {
-                        text: @tr("Keep checking");
-                        kind: ButtonKind.primary;
-                        clicked => {
-                            root.confirm-update-off = false;
-                            update-row.take-focus(self.key-focused);
-                        }
+            Row {
+                title: @tr("Setup");
+                info: @tr("The short tour of the first start: model, hotkey, microphone, a try.");
+                // Writes nothing until Finish or Skip, so a locked config keeps it.
+                Button {
+                    text: @tr("Run setup again");
+                    kind: ButtonKind.soft;
+                    clicked => {
+                        SetupState.start();
                     }
                 }
             }
@@ -508,7 +482,91 @@ export component SystemPage inherits VerticalLayout {
                 }
             }
     }
-    if root.tab == 2: AboutPage {
+    // Its own tab: with the install switch and the status row, General did not fit 720x520 (UI rule 25).
+    if root.tab == 2: Card {
+        Rectangle {
+            min-height: update-row.min-height;
+            preferred-height: update-row.preferred-height;
+            update-row := ToggleRow {
+                visible: !root.confirm-update-off;
+                flat: true;
+                title: @tr("Check for updates");
+                info: @tr("Once a day OxiYapper asks GitHub whether a newer version is out.");
+                checked <=> SystemState.update-check;
+                toggled(on) => {
+                    if (on) {
+                        root.confirm-update-off = false;
+                        SystemState.update-check-toggled(true);
+                    } else {
+                        self.checked = true;
+                        root.confirm-by-key = self.key-focused;
+                        root.confirm-update-off = true;
+                    }
+                }
+            }
+            if root.confirm-update-off: Row {
+                init => {
+                    keep.take-focus(root.confirm-by-key);
+                }
+                title: @tr("Update checks tell you when a fix is out.");
+                Button {
+                    text: @tr("Turn off");
+                    kind: ButtonKind.soft;
+                    // The risky choice the confirmation guards turns red under the pointer (UI rule 16).
+                    destructive: true;
+                    accessible-label: @tr("Turn off update checks");
+                    clicked => {
+                        root.confirm-update-off = false;
+                        update-row.take-focus(self.key-focused);
+                        SystemState.update-check = false;
+                        SystemState.update-check-toggled(false);
+                    }
+                }
+                keep := Button {
+                    text: @tr("Keep checking");
+                    kind: ButtonKind.primary;
+                    clicked => {
+                        root.confirm-update-off = false;
+                        update-row.take-focus(self.key-focused);
+                    }
+                }
+            }
+        }
+        Divider { }
+        ToggleRow {
+            flat: true;
+            title: @tr("Install updates automatically");
+            info: @tr("A newer version downloads in the background, is checked against its SHA256 and replaces this one when you are not dictating. OxiYapper then restarts.");
+            enabled: SystemState.update-check;
+            checked <=> SystemState.auto-update;
+            toggled(on) => {
+                SystemState.auto-update-toggled(on);
+            }
+        }
+        Divider { }
+        // The title is the updater's state (no search entry: the search finds Check for updates).
+        Row {
+            title: SystemState.update-status;
+            if SystemState.update-page != "": Button {
+                text: @tr("Download");
+                kind: ButtonKind.soft;
+                accessible-label: @tr("Open the download page");
+                clicked => {
+                    Platform.open-url(SystemState.update-page);
+                }
+            }
+            Button {
+                text: @tr("Check now");
+                kind: ButtonKind.soft;
+                accessible-label: @tr("Check for updates now");
+                enabled: SystemState.update-live;
+                clicked => {
+                    SystemState.check-update();
+                }
+            }
+        }
+    }
+    if root.tab == 3: AboutPage {
         free-height: root.free-height - tabs.preferred-height - Theme.header-bottom;
         app-name: root.app-name;
         version: root.version;

@@ -3262,3 +3262,40 @@ fn a_lock_or_a_sleep_takes_the_start_focus_away() {
     let next = rig.c.next_profile.as_ref().unwrap().focus_at_start;
     assert_eq!(next, Some(at(1)));
 }
+
+#[test]
+fn an_update_swap_runs_only_once_no_dictation_runs() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let ran = Arc::new(AtomicUsize::new(0));
+    let swap = |ran: &Arc<AtomicUsize>| {
+        let ran = Arc::clone(ran);
+        Inbox::UpdateReady(Box::new(move || {
+            ran.fetch_add(1, Ordering::SeqCst);
+        }))
+    };
+
+    let mut rig = Rig::new();
+    rig.c.handle(swap(&ran), Millis(0));
+    assert_eq!(ran.load(Ordering::SeqCst), 1, "idle: at once");
+
+    let mut rig = Rig::new();
+    let job = rig.transcribed("hello");
+    rig.c.handle(swap(&ran), Millis(2000));
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "not while the text waits for its paste"
+    );
+    rig.drain_all();
+    rig.event(
+        Event::PasteDone {
+            job,
+            outcome: PasteOutcome::Pasted,
+        },
+        3000,
+    );
+    assert_eq!(ran.load(Ordering::SeqCst), 2, "once the paste is done");
+    rig.c.handle(Inbox::CopyLastText, Millis(3100));
+    assert_eq!(ran.load(Ordering::SeqCst), 2, "only once");
+}

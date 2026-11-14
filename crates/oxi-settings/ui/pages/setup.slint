@@ -1,0 +1,221 @@
+// First-run setup wizard (SPEC Settings UI, ROADMAP M10): welcome, model, hotkey, microphone,
+// try it. It covers the whole window. Each step reuses its page's own parts, and Rust moves the
+// window's page with the step (`pages::setup`), so the live meter and the hotkey capture run as
+// they do on their pages. Skip setup and Finish close it for good; System > General reopens it.
+import { Theme, Icons, Group, Card, Row, Divider, SubTabs, Button, ButtonKind, CardGrid, KeycapRow, TextArea } from "../theme/index.slint";
+import { ModelState, ModelCard, CustomCard } from "model.slint";
+import { HotkeyState, HotkeyKeys } from "hotkey.slint";
+import { AudioState, MicDeviceRow, MicLevelRow } from "audio.slint";
+
+// Filled and read by `pages::setup`.
+export global SetupState {
+    // The wizard covers the window.
+    in property <bool> open;
+    // 0 welcome, 1 model, 2 hotkey, 3 microphone, 4 try it.
+    in property <int> step;
+    // The config says it was finished or skipped (a locked config counts as done: it could not
+    // remember a finish).
+    in property <bool> done: true;
+    // Opens it on its first step: the first start, System's "Run setup again".
+    callback start();
+    // Shows a step; the window's page moves with it.
+    callback go(int);
+    // Finish or Skip setup.
+    callback finish();
+}
+
+// The model step: the Model page's gallery with the recommended model under the check, and its
+// card (Download with its bar, Use).
+component ModelStep inherits VerticalLayout {
+    // The step's height.
+    in property <length> room;
+    // A tile was picked here: a recommendation that comes later moves the check no more.
+    property <bool> picked;
+    property <int> recommended: ModelState.recommended;
+    // The card under the gallery at its tallest: two text lines in the card's padding.
+    property <length> card-room: Theme.body-line + Theme.title-gap + Theme.caption-line + 2 * Theme.card-padding-v;
+    property <length> grid-room: root.room - Theme.control-height - Theme.header-gap - 2 * Theme.card-gap - root.card-room;
+    init => {
+        ModelState.shown();
+        if ModelState.recommended >= 0 {
+            ModelState.viewed = ModelState.recommended;
+        }
+    }
+    changed recommended => {
+        if !root.picked && root.recommended >= 0 {
+            ModelState.viewed = root.recommended;
+        }
+    }
+    alignment: start;
+    Group {
+        title: @tr("Pick a model");
+        info: @tr("The Recommended one suits this PC. Download it, then Use it. The Model page can change it later.");
+        CardGrid {
+            property <length> row-room: Theme.tile-height + Theme.tile-gap;
+            // Whole rows only, at least one; the rest scroll inside the gallery (UI rule 26).
+            height: min(self.full-height, max(1, floor((root.grid-room + Theme.tile-gap) / self.row-room)) * self.row-room) - Theme.tile-gap;
+            min-cell: Theme.model-tile-min-width;
+            accessible-label: @tr("Models");
+            tiles: ModelState.tiles;
+            selected: ModelState.viewed;
+            fallback-icon: Icons.brain-circuit;
+            // Picking only shows a model below; its card's Use puts it in use.
+            locked: false;
+            picked(i) => {
+                root.picked = true;
+                ModelState.viewed = i;
+            }
+        }
+        if ModelState.viewed >= 0 && ModelState.viewed < ModelState.rows.length: ModelCard {
+            data: ModelState.rows[ModelState.viewed];
+            index: ModelState.viewed;
+        }
+        if ModelState.viewed == ModelState.rows.length: CustomCard { }
+    }
+}
+
+export component SetupPage inherits Rectangle {
+    in property <string> app-name;
+    // The shell's page padding and top, so the step tabs sit where a page's tabs do.
+    in property <length> pad;
+    in property <length> top;
+    property <int> last: 4;
+    background: Theme.bg-page;
+    // Nothing under the wizard takes a click.
+    TouchArea { }
+    VerticalLayout {
+        padding-left: root.pad;
+        padding-right: root.pad;
+        padding-top: root.top;
+        padding-bottom: root.pad;
+        spacing: Theme.header-bottom;
+        SubTabs {
+            items: [@tr("Welcome"), @tr("Model"), @tr("Hotkey"), @tr("Microphone"), @tr("Try it")];
+            selected: SetupState.step;
+            picked(i) => {
+                SetupState.go(i);
+            }
+        }
+        body := Rectangle {
+            vertical-stretch: 1;
+            if SetupState.step == 0: VerticalLayout {
+                alignment: start;
+                Group {
+                    title: @tr("Welcome to {}", root.app-name);
+                    Card {
+                        Row {
+                            icon: Icons.keyboard;
+                            title: @tr("Hold a key and speak");
+                            description: @tr("Your words are typed where the cursor is, in any app.");
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.desktop;
+                            title: @tr("Runs on this PC");
+                            description: @tr("No account, and your voice is never sent online.");
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.checkmark-circle;
+                            title: @tr("A minute to set up");
+                            description: @tr("Pick a model, check the hotkey and the microphone, then try it.");
+                        }
+                    }
+                }
+            }
+            if SetupState.step == 1: ModelStep {
+                room: body.height;
+            }
+            if SetupState.step == 2: VerticalLayout {
+                alignment: start;
+                init => {
+                    HotkeyState.shown();
+                }
+                HotkeyKeys {
+                    free-height: body.height;
+                }
+            }
+            if SetupState.step == 3: VerticalLayout {
+                alignment: start;
+                init => {
+                    AudioState.shown();
+                }
+                Group {
+                    title: @tr("Microphone");
+                    info: @tr("Speak and watch the level move. Record 3 s plays back what it heard.");
+                    Card {
+                        MicDeviceRow { }
+                        Divider { }
+                        MicLevelRow { }
+                    }
+                }
+            }
+            if SetupState.step == 4: VerticalLayout {
+                alignment: start;
+                Group {
+                    title: @tr("Try it");
+                    info: @tr("The text goes where the cursor is, here as in any other app.");
+                    Card {
+                        Row {
+                            icon: Icons.mic;
+                            title: HotkeyState.mode == 0 ? @tr("Click the box, hold the keys and speak") : @tr("Click the box, press the keys, speak, press them again");
+                            // Why nothing can be dictated now: OxiYapper is not running.
+                            warning: HotkeyState.note;
+                            KeycapRow {
+                                keys: HotkeyState.chord-keys;
+                                label: HotkeyState.chord;
+                                pack-end: true;
+                            }
+                        }
+                        Divider { }
+                        TextArea {
+                            height: 3 * Theme.control-height;
+                            placeholder-text: @tr("Your words appear here");
+                            // A scratch box, never saved: a locked config does not lock it.
+                            locked: false;
+                            accessible-label: @tr("Try dictation here");
+                        }
+                    }
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.control-gap;
+            Button {
+                text: @tr("Skip setup");
+                kind: ButtonKind.soft;
+                clicked => {
+                    SetupState.finish();
+                }
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+            // Its slot stays on the first step, so Next never moves.
+            Rectangle {
+                min-width: back.min-width;
+                preferred-width: back.preferred-width;
+                back := Button {
+                    visible: SetupState.step > 0;
+                    enabled: SetupState.step > 0;
+                    text: @tr("Back");
+                    clicked => {
+                        SetupState.go(SetupState.step - 1);
+                    }
+                }
+            }
+            Button {
+                min-width: Theme.button-min-width + Theme.space-4;
+                text: SetupState.step < root.last ? @tr("Next") : @tr("Finish");
+                kind: ButtonKind.primary;
+                clicked => {
+                    if SetupState.step < root.last {
+                        SetupState.go(SetupState.step + 1);
+                    } else {
+                        SetupState.finish();
+                    }
+                }
+            }
+        }
+    }
+}

@@ -166,7 +166,7 @@ fn second_launch_forwards_status_answers_shutdown_exits_cleanly() {
     conn.set_read_timeout(Some(READ)).unwrap();
     conn.send(&Request::Hello {
         proto: PROTO,
-        version: env!("CARGO_PKG_VERSION").into(),
+        version: oxi_core::VERSION.into(),
     })
     .unwrap();
     next(&mut conn, |p| {

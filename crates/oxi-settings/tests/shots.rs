@@ -266,6 +266,7 @@ fn update_confirm_rings_keep_checking_for_the_keyboard_only() {
 
     let window = open("swap-key", None);
     window.set_page(Page::System);
+    window.global::<SystemState>().set_tab(2);
     let _ = render(&window, TALL, 1.0);
     // Tab to the Check for updates switch: the stops before it (the rail, the sub-tabs, the theme
     // tiles, the "i" tips) are not counted, its own ring says it has the focus.
@@ -298,6 +299,7 @@ fn update_confirm_rings_keep_checking_for_the_keyboard_only() {
 
     let window = open("swap-mouse", None);
     window.set_page(Page::System);
+    window.global::<SystemState>().set_tab(2);
     let _ = render(&window, TALL, 1.0);
     let switch = common::with_role(&window, "Check for updates", AccessibleRole::Switch);
     let (at, size) = (switch.absolute_position(), switch.size());
@@ -319,6 +321,7 @@ fn update_confirm_turn_off_turns_red_on_hover() {
     SIZE.set(TALL);
     let window = open("turn-off-red", None);
     window.set_page(Page::System);
+    window.global::<SystemState>().set_tab(2);
     let _ = render(&window, TALL, 1.0);
     common::with_role(&window, "Check for updates", AccessibleRole::Switch)
         .invoke_accessible_default_action();
@@ -1270,7 +1273,7 @@ fn shot_text_worst_case() {
 #[test]
 fn shot_every_tab_at_720x520() {
     // (screen, page, sub-tab index)
-    let tabs: [(&str, Page, i32); 18] = [
+    let tabs: [(&str, Page, i32); 19] = [
         ("model-models", Page::Model, 0),
         ("model-languages", Page::Model, 1),
         ("model-speed", Page::Model, 2),
@@ -1285,7 +1288,8 @@ fn shot_every_tab_at_720x520() {
         ("paste-rules", Page::Paste, 2),
         ("system-general", Page::System, 0),
         ("system-files", Page::System, 1),
-        ("system-about", Page::System, 2),
+        ("system-updates", Page::System, 2),
+        ("system-about", Page::System, 3),
         ("audio-microphone", Page::Audio, 0),
         ("audio-recording", Page::Audio, 1),
         ("audio-sounds", Page::Audio, 2),
@@ -1414,6 +1418,7 @@ fn shot_system_update_off() {
     matrix("system-update-off", |choice| {
         let window = open("system-update-off", None);
         window.set_page(Page::System);
+        window.global::<SystemState>().set_tab(2);
         window.set_theme(choice);
         window.show().unwrap();
         ElementHandle::find_by_accessible_label(&window, "Check for updates")

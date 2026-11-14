@@ -434,7 +434,7 @@ fn open(name: &str) -> Result<(Client, u32), Error> {
     conn.set_read_timeout(Some(REPLY_WAIT))?;
     conn.send(&Request::Hello {
         proto: PROTO,
-        version: env!("CARGO_PKG_VERSION").into(),
+        version: oxi_core::VERSION.into(),
     })?;
     let Some(Push::HelloAck { proto, .. }) = conn.recv()? else {
         return Err(io::Error::from(io::ErrorKind::InvalidData).into());

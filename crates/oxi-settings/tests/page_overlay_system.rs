@@ -83,6 +83,7 @@ fn overlay_switches_write_the_config() {
 fn update_check_off_writes_false_only_after_the_confirm() {
     let l = layout("update-off", None);
     let window = open(&l, Page::System);
+    with_role(&window, "Updates", AccessibleRole::Tab).invoke_accessible_default_action();
     let note = "Turn off update checks";
     assert!(!has(&window, note));
 
@@ -141,8 +142,9 @@ fn system_sub_tabs_fit_the_small_windows_without_scrolling() {
     for (w, h) in [(720.0_f32, 520.0_f32), (1000.0, 700.0)] {
         window.window().set_size(slint::LogicalSize::new(w, h));
         for (tab, last) in [
-            ("General", "Check for updates"),
+            ("General", "Start at sign-in"),
             ("History and files", "Log dictated text"),
+            ("Updates", "Install updates automatically"),
         ] {
             with_role(&window, tab, AccessibleRole::Tab).invoke_accessible_default_action();
             i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
@@ -151,7 +153,7 @@ fn system_sub_tabs_fit_the_small_windows_without_scrolling() {
             // The last row's lowest text: the card must not be cut.
             if let Some(text) = ElementHandle::find_by_accessible_label(
                 &window,
-                "Once a day OxiYapper asks GitHub for the latest version. Nothing installs on its own.",
+                "A newer version downloads in the background, is checked against its SHA256 and replaces this one when you are not dictating. OxiYapper then restarts.",
             )
             .next()
             {
@@ -234,6 +236,7 @@ fn locked_config_keeps_both_pages_unwritten() {
     card(&window, "Top left").invoke_accessible_default_action();
     assert_eq!(card(&window, "Top left").accessible_checked(), Some(false));
     window.set_page(Page::System);
+    with_role(&window, "Updates", AccessibleRole::Tab).invoke_accessible_default_action();
     assert_eq!(
         switch(&window, "Check for updates").accessible_enabled(),
         Some(false)
@@ -713,4 +716,36 @@ fn system_row_titles_start_at_one_x() {
     };
     let (language, sign_in) = (x("App language"), x("Start at sign-in"));
     assert!((language - sign_in).abs() < 0.5, "{language} vs {sign_in}");
+}
+
+/// General and the Updates tab fit the smallest window (UI rule 25), the install switch writes its
+/// key, and with no daemon the status line shows this build's version and "Check now" is off.
+#[test]
+fn update_rows_fit_the_smallest_window_and_install_writes() {
+    let l = layout("auto-update", None);
+    let window = open(&l, Page::System);
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(720.0, 520.0));
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    let e = with_role(&window, "Run setup again", AccessibleRole::Button);
+    assert!(
+        e.absolute_position().y + e.size().height <= 520.0,
+        "General is cut"
+    );
+    with_role(&window, "Updates", AccessibleRole::Tab).invoke_accessible_default_action();
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    let check = with_role(&window, "Check for updates now", AccessibleRole::Button);
+    let bottom = check.absolute_position().y + check.size().height;
+    assert!(
+        bottom <= 520.0,
+        "Check now ends at {bottom}, under the window"
+    );
+    assert_eq!(check.accessible_enabled(), Some(false), "no daemon");
+    assert!(has(&window, &format!("Version {}", oxi_core::VERSION)));
+
+    switch(&window, "Install updates automatically").invoke_accessible_default_action();
+    assert!(!config(&l).config.system.auto_update);
+    switch(&window, "Install updates automatically").invoke_accessible_default_action();
+    assert!(config(&l).config.system.auto_update);
 }

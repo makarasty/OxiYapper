@@ -40,10 +40,15 @@ fn requests() -> Vec<Request> {
             set: SettingsSet::defaults(),
             language: Language::RU,
         },
+        Request::CheckUpdate,
         Request::Shutdown,
     ]
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one list of every push, for the snapshot"
+)]
 fn pushes() -> Vec<Push> {
     vec![
         Push::HelloAck {
@@ -144,6 +149,12 @@ fn pushes() -> Vec<Push> {
             file: WatchedFile::Replace,
         },
         Push::Woke,
+        Push::Update {
+            status: oxi_core::update::Status::Downloading {
+                version: "0.1.0-pre.13".into(),
+                percent: 40,
+            },
+        },
     ]
 }
 

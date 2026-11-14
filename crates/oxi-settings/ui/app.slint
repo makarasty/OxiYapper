@@ -16,9 +16,10 @@ import { OverlayPage, OverlayState } from "pages/overlay.slint";
 import { SystemPage, ThemeChoice, SystemState } from "pages/system.slint";
 import { TestPage, TestState, TestRow } from "pages/test.slint";
 import { HistoryPage, HistoryState, HistoryRow } from "pages/history.slint";
+import { SetupPage, SetupState } from "pages/setup.slint";
 
 export { GalleryTile } from "theme/index.slint";
-export { Shell, Theme, AccentSet, Toast, PathText, ThemeChoice, HomeState, MonthLabel, HotkeyState, KeyCap, AudioState, AudioKey, ModelState, ModelRow, LanguageModel, TextState, PasteRuleRow, FileState, FileInfo, TextFile, OverlayState, SystemState, TestState, TestRow, HistoryState, HistoryRow }
+export { Shell, Theme, AccentSet, Toast, PathText, ThemeChoice, HomeState, MonthLabel, HotkeyState, KeyCap, AudioState, AudioKey, ModelState, ModelRow, LanguageModel, TextState, PasteRuleRow, FileState, FileInfo, TextFile, OverlayState, SystemState, TestState, TestRow, HistoryState, HistoryRow, SetupState }
 
 // `about` is no page of its own (ia-map 3.1): opening it shows System > About, so a deep link or
 // `real_window about` keeps working.
@@ -256,6 +257,9 @@ export component AppWindow inherits Window {
         { page: Page.system, label: @tr("System"), icon: Icons.settings, filled: Icons.settings-filled, tabs: true },
     ];
     property <bool> tabbed: root.rail[root.index-of(root.page)].tabs;
+    // The page the column shows: none under the setup wizard, whose steps show the page's parts
+    // themselves (`about` is never a page of the column).
+    property <Page> page-shown: SetupState.open ? Page.about : root.page;
     // The page's height under the header row (banners already taken off).
     property <length> free-height: scroll.visible-height - column.padding-top - column.padding-bottom - (root.tabbed ? 0 : Theme.header-row-height + column.spacing);
 
@@ -326,7 +330,7 @@ export component AppWindow inherits Window {
     }
     changed page => {
         if (root.page == Page.about) {
-            SystemState.tab = 2;
+            SystemState.tab = 3;
             root.page = Page.system;
         }
         // The rail follows a page opened by Ctrl+Tab; the page opens at its top.
@@ -347,6 +351,10 @@ export component AppWindow inherits Window {
         focus-on-click: false;
         focus-on-tab-navigation: false;
         capture-key-pressed(event) => {
+            // The setup wizard owns the window: no page switch or search under it.
+            if (SetupState.open) {
+                return reject;
+            }
             if (event.modifiers.control && (event.text == Key.Tab || event.text == Key.Backtab)) {
                 let step = event.modifiers.shift || event.text == Key.Backtab ? root.rail.length - 1 : 1;
                 root.page = root.rail[Math.mod(root.index-of(root.page) + step, root.rail.length)].page;
@@ -371,6 +379,8 @@ export component AppWindow inherits Window {
             y: 0;
             width: root.compact ? Theme.rail-width-compact : Theme.rail-width;
             height: parent.height;
+            // Under the setup wizard the rail takes no focus or key.
+            enabled: !SetupState.open;
             accessible-role: tab-list;
             property <int> cursor;
             property <bool> key-focus;
@@ -490,34 +500,34 @@ export component AppWindow inherits Window {
                         if !root.tabbed: HeaderRow {
                             title: root.rail[root.index-of(root.page)].label;
                         }
-                        if root.page == Page.home: HomePage {
+                        if root.page-shown == Page.home: HomePage {
                             window-width: root.width;
                             content-width: root.page-width;
                             free-height: root.free-height;
                         }
-                        if root.page == Page.hotkey: HotkeyPage {
+                        if root.page-shown == Page.hotkey: HotkeyPage {
                             free-height: root.free-height;
                         }
-                        if root.page == Page.audio: AudioPage {
+                        if root.page-shown == Page.audio: AudioPage {
                             free-height: root.free-height;
                         }
-                        if root.page == Page.model: ModelPage {
+                        if root.page-shown == Page.model: ModelPage {
                             free-height: root.free-height;
                         }
-                        if root.page == Page.text: TextPage {
+                        if root.page-shown == Page.text: TextPage {
                             window-width: root.width;
                             free-height: root.free-height;
                         }
-                        if root.page == Page.paste: PastePage {
+                        if root.page-shown == Page.paste: PastePage {
                             window-width: root.width;
                             free-height: root.free-height;
                         }
-                        if root.page == Page.overlay: OverlayPage { }
-                        if root.page == Page.history: HistoryPage {
+                        if root.page-shown == Page.overlay: OverlayPage { }
+                        if root.page-shown == Page.history: HistoryPage {
                             free-height: root.free-height;
                         }
-                        if root.page == Page.test: TestPage { }
-                        if root.page == Page.system || root.page == Page.about: SystemPage {
+                        if root.page-shown == Page.test: TestPage { }
+                        if !SetupState.open && (root.page == Page.system || root.page == Page.about): SystemPage {
                             free-height: root.free-height;
                             about: root.page == Page.about;
                             theme: root.theme;
@@ -558,6 +568,17 @@ export component AppWindow inherits Window {
             activated => {
                 root.open-search("");
             }
+        }
+
+        // Over the rail and the page, under the popups and the toasts.
+        if SetupState.open: SetupPage {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            app-name: root.app-name;
+            pad: root.pad;
+            top: root.top;
         }
 
         // Over the page and the rail, under the popups and the toasts.

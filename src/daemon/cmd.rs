@@ -108,6 +108,9 @@ pub enum Inbox {
     Ipc(IpcAsk),
     /// Tray menu "Copy last text".
     CopyLastText,
+    /// Update thread: a checked new exe waits beside the running one. The coordinator runs this
+    /// swap once no dictation runs; it quits the daemon when the swap worked.
+    UpdateReady(Box<dyn FnOnce() + Send>),
     /// IPC `Shutdown` or tray Quit: the coordinator loop ends and drops every worker sender.
     Shutdown,
 }
@@ -292,6 +295,8 @@ pub enum IoCmd {
     CancelDownload { id: String },
     /// A settings window connected: push the progress of every running download to it.
     Subscribed,
+    /// The System page's "Check now", for the update thread.
+    CheckUpdate,
 }
 
 /// Commands for the main (UI) thread.
@@ -305,6 +310,8 @@ pub enum UiCmd {
     Badge(TrayBadge),
     /// OS notification (tray balloon).
     Notify(Notice),
+    /// OS notification with its own text ("Updated to 0.2.0").
+    NotifyText(String),
     /// Show the pill at this position for 2 s (settings preview).
     PreviewOverlay(OverlayPosition),
     /// The active config parts the overlay and the tray read: the overlay options, the meter

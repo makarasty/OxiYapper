@@ -624,6 +624,7 @@ impl Ctx {
             Request::Stats => conn.send(&self.host.stats()).is_ok(),
             Request::DownloadModel { id } => self.io.send(IoCmd::Download { id }).is_ok(),
             Request::CancelDownload { id } => self.io.send(IoCmd::CancelDownload { id }).is_ok(),
+            Request::CheckUpdate => self.io.send(IoCmd::CheckUpdate).is_ok(),
             Request::CaptureHotkey { on } => {
                 self.capture(on, session);
                 true

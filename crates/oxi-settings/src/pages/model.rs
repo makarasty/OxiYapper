@@ -1144,6 +1144,8 @@ impl PageState {
                 r.info = info.into();
             });
         }
+        let picked = pick.and_then(|p| self.index_of(p.id));
+        self.state(|s| s.set_recommended(picked.map_or(-1, int)));
     }
 
     fn checked(&self, answer: &Checked) {

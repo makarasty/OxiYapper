@@ -412,8 +412,17 @@ fn the_language_search_finds_by_code_and_by_alias() {
 
 #[test]
 fn language_is_on_the_first_tab_and_auto_keeps_working() {
-    let l = layout("language", None);
-    let window = open(&l, Page::Model);
+    // A new config detects the language; this one was saved with Russian and keeps it.
+    let fresh = layout("language-new", None);
+    let new_window = open(&fresh, Page::Model);
+    sub_tab(&new_window, "Languages");
+    assert_eq!(
+        segment(&new_window, "Auto").accessible_checked(),
+        Some(true)
+    );
+    drop(new_window);
+    let l = layout("language", Some(RUSSIAN));
+    let window = open_again(&l, Page::Model);
     sub_tab(&window, "Languages");
     assert_eq!(segment(&window, "Russian").accessible_checked(), Some(true));
     // "More" is a button with a glyph, not a fourth segment of typed dots (DS-17.1).
@@ -535,22 +544,34 @@ fn tab_to_the_segments(window: &AppWindow, lit: &str) {
 
 #[test]
 fn the_popup_works_from_the_keyboard() {
-    let l = layout("language-keys", None);
+    let l = layout("language-keys", Some(RUSSIAN));
     let window = open(&l, Page::Model);
     sub_tab(&window, "Languages");
     tab_to_the_segments(&window, "Russian");
     // The "more" button is the next Tab stop: it opens the list, and getting there saves nothing.
     press(&window, Key::Tab);
     assert!(!popup_open(&window));
-    assert!(!l.config_file().exists(), "Tab onto the more button saved");
+    assert_eq!(
+        fs::read_to_string(l.config_file()).unwrap(),
+        RUSSIAN,
+        "Tab onto the more button saved"
+    );
     press(&window, " ");
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(350));
     assert!(popup_open(&window));
-    assert!(!l.config_file().exists(), "opening the list saved");
+    assert_eq!(
+        fs::read_to_string(l.config_file()).unwrap(),
+        RUSSIAN,
+        "opening the list saved"
+    );
     // Esc closes it and the focus is back on the more button, where Enter opens it again.
     press(&window, Key::Escape);
     assert!(!popup_open(&window));
-    assert!(!l.config_file().exists(), "closing the list saved");
+    assert_eq!(
+        fs::read_to_string(l.config_file()).unwrap(),
+        RUSSIAN,
+        "closing the list saved"
+    );
     assert_eq!(segment(&window, "Russian").accessible_checked(), Some(true));
     press(&window, Key::Return);
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(350));
@@ -566,7 +587,7 @@ fn the_popup_works_from_the_keyboard() {
 
 #[test]
 fn the_arrows_stop_at_auto() {
-    let l = layout("language-arrows", None);
+    let l = layout("language-arrows", Some(RUSSIAN));
     let window = open(&l, Page::Model);
     sub_tab(&window, "Languages");
     tab_to_the_segments(&window, "Russian");
@@ -1374,6 +1395,12 @@ fn the_advanced_rows_draw_distinct_glyph_files() {
         );
     }
 }
+
+/// A config saved while Russian was the default language.
+const RUSSIAN: &str = "version = 2
+[model]
+language = \"ru\"
+";
 
 const NOT_ON_DISK: &str = "Dictation will not start until this is downloaded.";
 const SLOW: &str =

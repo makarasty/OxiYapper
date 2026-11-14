@@ -1,14 +1,32 @@
 # Releasing
 
-A release is a `vX.Y.Z` tag pushed to GitHub. `.github/workflows/release.yml` does the rest.
+## Assets and tags
 
-## 1. Prepare
+The update checker relies on everything in this section; change it only together with the checker.
+
+- Exactly one release exists at a time. Every commit on `main` that passes `ci` becomes a pre-release, and every other release and its tag are then deleted (`.github/workflows/prerelease.yml`).
+- Tags:
+  - `v<version>-pre.<n>`: automatic pre-release. `<version>` is the `Cargo.toml` workspace version at that commit, `<n>` the run number of `prerelease.yml` (grows by one per run). Marked pre-release.
+  - `vX.Y.Z`: a release pushed by hand (section "Tag" below), `.github/workflows/release.yml`.
+  - `vX.Y.Z-<suffix>` (`-rc.1`, `-beta.2`): a hand-pushed test tag, marked pre-release.
+  - `release.yml` fails when the tag without its `-<suffix>` differs from the `Cargo.toml` version.
+- Assets, `<version>` being the tag without its leading `v` (`0.2.0`, `0.2.0-pre.57`):
+  - `OxiYapper-<version>-windows-x64.exe`: the whole app in one file. Windows x64, Vulkan build; with no Vulkan driver it runs on the CPU. Needs a CPU with AVX2. Needs the Microsoft Visual C++ runtime (x64) installed; on a clean Windows use the zip.
+  - `OxiYapper-<version>-windows-x64.zip`: the portable build, one folder `OxiYapper-<version>-windows-x64/` with `OxiYapper.exe`, an empty `portable` marker (data in `data\` beside the exe, `docs/ARCHITECTURE.md` section 7), `README.txt`, `LICENSE-MIT`, `LICENSE-APACHE`, and the MSVC runtime DLLs next to the exe (`msvcp140.dll`, `vcruntime140.dll`, `vcruntime140_1.dll`: app-local deployment, allowed by Microsoft's redistribution terms), so it starts on a clean Windows with nothing installed.
+  - `SHA256SUMS`: `sha256sum` lines (`<hex>  <file name>`) for both files above.
+  - A build provenance attestation for each of the three.
+- How the checker finds the newest build (`crates/oxi-core/src/update.rs`, `src/daemon/update.rs`): `GET https://api.github.com/repos/makarasty/OxiYapper/releases?per_page=10` (pre-releases included; `/releases/latest` skips pre-releases, so do not use it), drafts and tags that are no `vX.Y.Z[-<pre>]` left out, the highest version by semver (`pre.10` after `pre.9`, a release after its pre-releases), its asset `OxiYapper-<version>-windows-x64.exe`, checked against its line in `SHA256SUMS` of the same release.
+- The version a build reports (`--version`, the updater, About) is the tag without `v`: `build-windows.yml` passes it to `cargo build` as `OXI_VERSION`. A local build reports the `Cargo.toml` version, which is newer than its own pre-releases, so it never updates itself.
+
+Linux and macOS are not shipped for now; `ci.yml` still builds them.
+
+## 1. Prepare a release
 
 1. Start from an up-to-date `main` with `ci-ok` green on its last commit.
 2. Run the manual QA checklist (`docs/ARCHITECTURE.md` section 13) on Windows and keep the results in the release PR.
 3. Bump the version in the root `Cargo.toml` (`[workspace.package] version = "X.Y.Z"`; every crate takes it from there), then run `cargo check` so `Cargo.lock` follows.
 4. In `CHANGELOG.md`: rename `## [Unreleased]` content into a new `## [X.Y.Z] - YYYY-MM-DD` section with today's date, leave an empty `## [Unreleased]` above it, and update the compare links at the bottom.
-5. Commit (`chore: release vX.Y.Z`), open a PR, merge it when `ci-ok` is green.
+5. Commit (`chore: release vX.Y.Z`), open a PR, merge it when `ci-ok` is green. The merge makes a pre-release `vX.Y.Z-pre.<n>` by itself.
 
 ## 2. Tag
 
@@ -19,36 +37,44 @@ git tag -a vX.Y.Z -m "OxiYapper vX.Y.Z"
 git push origin vX.Y.Z
 ```
 
-The tag must match the `Cargo.toml` version: the workflow does not check it, and `OxiYapper --version` prints the `Cargo.toml` one. The workflow builds any `v*` tag, `vX.Y.Z-rc.1` included, and publishes it as a normal release: mark a test tag as a pre-release on GitHub by hand.
+The next automatic pre-release deletes this release and its tag (one release at a time), so tag right after the merge and before the next commit on `main`.
 
-## 3. What release.yml does
+## 3. What the workflows do
 
-1. `build`, one job per target, `cargo build --release --features <feature>`, then `OxiYapper --version` as a smoke test:
-
-   | Target | Runner | Feature | Archive |
-   |---|---|---|---|
-   | `windows-x86_64-vulkan` | windows-latest | `vulkan` | `OxiYapper-vX.Y.Z-windows-x86_64-vulkan.zip` |
-   | `windows-x86_64-cuda` | windows-latest | `cuda` (CUDA 13.3.1) | `OxiYapper-vX.Y.Z-windows-x86_64-cuda.zip` |
-   | `linux-x86_64-vulkan` | ubuntu-24.04 | `vulkan` | `OxiYapper-vX.Y.Z-linux-x86_64-vulkan.tar.gz` |
-   | `macos-aarch64-metal` | macos-latest | `metal` | `OxiYapper-vX.Y.Z-macos-aarch64-metal.tar.gz` |
-
-   Each archive holds one folder `OxiYapper-vX.Y.Z-<target>/` with the executable, `README.md`, `LICENSE-MIT` and `LICENSE-APACHE`. `fail-fast` is off, so one failing target does not cancel the others, but `publish` needs all four.
-2. `publish` downloads the four archives, writes `SHA256SUMS` (`sha256sum OxiYapper-*`), adds a build provenance attestation for every file, and creates the GitHub release with the archives and `SHA256SUMS`. The release notes are generated by GitHub from the merged PRs; paste the `CHANGELOG.md` section on top by hand.
+- `build-windows.yml` (called by both): `cargo build --locked --release --features vulkan` with `GGML_NATIVE=OFF` and `OXI_VERSION=<version>` on windows-latest, `OxiYapper --version` as a smoke test that must print `OxiYapper <version>`, a check that `vulkan-1.dll` is a delay-load import (not a static one: the exe must start without a Vulkan driver), then the `.zip` (the `*140*.dll` files the exe imports, found with `dumpbin`, are copied from the runner's `VC\Redist\MSVC\<version>\x64\Microsoft.VC*.CRT` folder found with `vswhere`; the job fails if one is missing) and the `.exe`, and a last step that unzips the zip into a fresh folder and runs `OxiYapper.exe --version` from there.
+- `release.yml` on a `v*` tag push: the version check, the build, then `publish` writes `SHA256SUMS`, attests every file and creates the release with `gh release create` (notes generated by GitHub from the merged PRs; paste the `CHANGELOG.md` section on top by hand).
+- `prerelease.yml` on a successful `ci` run of a push to `main` in this repository (not a fork, not a PR): builds that run's commit, creates the pre-release at that commit, then deletes every other release with its tag. Runs queue (`concurrency: prerelease`), so two never delete at once.
 
 ## 4. Check the release
 
-1. On the release page: four archives plus `SHA256SUMS`.
-2. Download the Windows Vulkan zip and check it:
+1. On the release page: the `.exe`, the `.zip` and `SHA256SUMS`.
+2. Download the exe and check it:
 
    ```
    sha256sum -c SHA256SUMS --ignore-missing
-   gh attestation verify OxiYapper-vX.Y.Z-windows-x86_64-vulkan.zip --repo makarasty/OxiYapper
+   gh attestation verify OxiYapper-X.Y.Z-windows-x64.exe --repo makarasty/OxiYapper
    ```
 
-   On Windows without `sha256sum`: `certutil -hashfile <zip> SHA256` and compare with the line in `SHA256SUMS`.
-3. Unzip on a clean Windows user, run `OxiYapper.exe --version` from a terminal, start it, download a model, dictate into Notepad.
+   On Windows without `sha256sum`: `certutil -hashfile <file> SHA256` and compare with the line in `SHA256SUMS`.
+3. On a clean Windows user: run `OxiYapper-X.Y.Z-windows-x64.exe --version` from a terminal, start it, download a model, dictate into Notepad.
+
+## 5. Check the self-update
+
+After a pre-release is out, on Windows with an older build or none:
+
+1. Download the newest `OxiYapper-<version>-windows-x64.zip`, unpack it to a writable folder (not `Program Files`).
+2. Start it with the hidden test hook, so it takes itself for an old build:
+
+   ```
+   set OXI_UPDATE_FAKE_VERSION=0.0.1
+   OxiYapper.exe
+   ```
+
+   The first check runs 5 s after the start (a minute without the hook). The hook also lets a debug build install, so never set it on a build in a cargo target folder you want to keep.
+3. Within a minute: System > Updates shows "Downloading ..." then the app quits and starts again, the tray says "Updated to <version>", the folder holds the release's exe and no `OxiYapper.old.exe` after the next start, and the log (`data\logs`) has `update installed, restarting` and `daemon started ... updated=true`. The restarted daemon does not inherit the hook, so it does not update again.
+4. Fallback: make the folder read-only (or turn "Install updates automatically" off) and press Check now: the status says "Update available" with a Download button that opens the release page; the exe is unchanged.
 
 ## If something fails
 
-- A build job failed: fix on `main`, delete the tag (`git push origin :refs/tags/vX.Y.Z` and `git tag -d vX.Y.Z`), and tag again. No release is created until every build passes.
-- A release went out broken: never replace its files. Publish the next patch version with the fix and mark the broken one as a pre-release or delete it.
+- A build job failed: fix on `main`, delete the tag (`git push origin :refs/tags/vX.Y.Z` and `git tag -d vX.Y.Z`), and tag again. No release is created until the build passes.
+- A release went out broken: never replace its files. Merge the fix; its pre-release replaces the broken one.

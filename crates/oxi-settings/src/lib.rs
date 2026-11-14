@@ -31,8 +31,8 @@ mod generated {
     slint::include_modules!();
 }
 pub use generated::{
-    AppWindow, AudioKey, AudioState, ChipLevel, HomeState, ModelState, Page, PathText, Shell,
-    SystemState, TestRow, TestState, TextState, Theme as Tokens, ThemeChoice, Toast,
+    AppWindow, AudioKey, AudioState, ChipLevel, HomeState, ModelState, Page, PathText, SetupState,
+    Shell, SystemState, TestRow, TestState, TextState, Theme as Tokens, ThemeChoice, Toast,
 };
 pub use pages::test::{Finish, Mic, bind_with as bind_test_page};
 
@@ -70,6 +70,8 @@ fn show(layout: Layout) -> Result<(), Error> {
         options.spawn = watch_spawn(options.spawn, window.as_weak());
         Ok(Some(Ipc::connect(options)?))
     })?;
+    // The first start of a new config opens on the setup wizard; tests and shots open it by hand.
+    pages::setup::open_if_new(&window);
     #[cfg(windows)]
     {
         let size = if let Ok((area, scale)) = oxi_platform::os::display::work_area() {
@@ -955,12 +957,13 @@ mod tests {
     #[test]
     fn resets_leave_one_subscriber_per_page() {
         let (window, ipc, _sent, _) = crate::testing::linked("lib", "resets", super::Page::Hotkey);
-        // The banner, Home, Hotkey, Audio, Model, History and Test (Overlay stopped subscribing in b04).
-        assert_eq!(ipc.subscribers(), 7);
+        // The banner, Home, Hotkey, Audio, Model, History, Test and System (the updater's line;
+        // Overlay stopped subscribing in b04).
+        assert_eq!(ipc.subscribers(), 8);
         for _ in 0..3 {
             window.invoke_reset_config();
         }
-        assert_eq!(ipc.subscribers(), 7);
+        assert_eq!(ipc.subscribers(), 8);
     }
 
     #[cfg(windows)]

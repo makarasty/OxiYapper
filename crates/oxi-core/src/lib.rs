@@ -5,6 +5,13 @@
 /// The product name: executable, per-user directories, IPC names and usage text all use it.
 pub const APP_NAME: &str = "OxiYapper";
 
+/// The version of this build: the release tag CI builds from (`OXI_VERSION`, `0.2.0-pre.57`), else
+/// the crate version. The update check compares it with the releases (`update`).
+pub const VERSION: &str = match option_env!("OXI_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 pub mod audio;
 pub mod autostart;
 pub mod cli;
@@ -30,5 +37,6 @@ pub mod text;
 pub mod tray;
 pub mod tuning;
 pub mod types;
+pub mod update;
 
 pub use cli::{Command, parse_command};

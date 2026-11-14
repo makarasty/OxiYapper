@@ -135,6 +135,11 @@ impl Ui {
                     tracing::warn!(?notice, "tray balloon not shown: {e}");
                 }
             }
+            UiCmd::NotifyText(text) => {
+                if let Err(e) = tray.notify_text(&text) {
+                    tracing::warn!("tray balloon not shown: {e}");
+                }
+            }
             UiCmd::PreviewOverlay(position) => {
                 let mut cfg = self.cfg.clone();
                 cfg.overlay.position = position;

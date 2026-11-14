@@ -1,4 +1,5 @@
-//! System page: `[system]` (autostart, update check), `[history]` and `debug.log_text`. The theme
+//! System page: `[system]` (autostart, update check and install), `[history]` and `debug.log_text`,
+//! and the updater's state from the daemon (`Push::Update`, "Check now"). The theme
 //! picker on the same page belongs to the shell. `ui.language` is the app language, not the
 //! dictation one. The daemon registers autostart with the OS when the config changes.
 
@@ -10,13 +11,16 @@ use std::{fs, thread};
 
 use oxi_core::config::{Accent, AppLanguage, Config, Rgb};
 use oxi_core::history;
+use oxi_core::ipc::{Push, Request};
 use oxi_core::overlay::{
     AccentTheme, PRESETS, close_to_error, derive, hex, parse_seed, preset_index, seed,
 };
+use oxi_core::update::{self, Status};
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, Weak};
 
 use crate::constants::FOLDER_POLL;
 use crate::generated::SystemState;
+use crate::ipc::{Event, Link};
 use crate::{AccentColors, AppWindow, Ctx, Error, report, set_accent};
 
 /// The languages of the app's own text: config value and the name in that language. A new
@@ -103,6 +107,7 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     show_accent(window, seed(file.config.ui.accent));
     s.set_autostart(file.config.system.autostart);
     s.set_update_check(file.config.system.update_check);
+    s.set_auto_update(file.config.system.auto_update);
     s.set_log_text(file.config.debug.log_text);
     s.set_app_languages(ModelRc::from(
         APP_LANGUAGES.map(|(_, name)| SharedString::from(name)),
@@ -123,6 +128,9 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     s.on_autostart_toggled(move |on| apply(&w, &c, |cfg| cfg.system.autostart = on));
     let (w, c) = (window.as_weak(), ctx.clone());
     s.on_update_check_toggled(move |on| apply(&w, &c, |cfg| cfg.system.update_check = on));
+    let (w, c) = (window.as_weak(), ctx.clone());
+    s.on_auto_update_toggled(move |on| apply(&w, &c, |cfg| cfg.system.auto_update = on));
+    bind_update(window, ctx);
     let (w, c) = (window.as_weak(), ctx.clone());
     s.on_log_text_toggled(move |on| apply(&w, &c, |cfg| cfg.debug.log_text = on));
     let (w, c) = (window.as_weak(), ctx.clone());
@@ -177,6 +185,46 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     s.on_history_browse(move |path| browse(&w, &c, &t, &path));
     let (w, c) = (window.as_weak(), ctx.clone());
     s.on_history_folder_typed(move |text| typed(&w, &c, &check, &text));
+}
+
+/// The updater's line and buttons follow the daemon's `Update` pushes; it sends the state to a
+/// window that connects. With no daemon the line shows this build's version.
+fn bind_update(window: &AppWindow, ctx: &Ctx) {
+    let s = window.global::<SystemState>();
+    show_update(&s, &Status::Unknown);
+    s.set_update_live(ctx.ipc.link() == Link::Online);
+    let w = window.as_weak();
+    let events = ctx.ipc.subscribe(move |event| {
+        let Some(window) = w.upgrade() else {
+            return;
+        };
+        let s = window.global::<SystemState>();
+        match event {
+            Event::Link(link) => {
+                s.set_update_live(*link == Link::Online);
+                if *link != Link::Online {
+                    show_update(&s, &Status::Unknown);
+                }
+            }
+            Event::Push(Push::Update { status }) => show_update(&s, status),
+            Event::Push(_) => {}
+        }
+    });
+    let ipc = ctx.ipc.clone();
+    s.on_check_update(move || {
+        // Held by this callback: a rebind replaces it and so stops the old one.
+        let _ = &events;
+        ipc.send(Request::CheckUpdate);
+    });
+}
+
+fn show_update(s: &SystemState<'_>, status: &Status) {
+    s.set_update_status(update::status_line(status, oxi_core::VERSION).into());
+    let page = match status {
+        Status::Available { page, .. } => page.as_str(),
+        _ => "",
+    };
+    s.set_update_page(page.into());
 }
 
 /// The "!" of a size limit the GB field can only show rounded up: the daemon trims to the stored
@@ -470,5 +518,51 @@ mod accent_tests {
         assert_eq!(colors(&derive(red, true)), AccentColors::RED_DARK);
         assert_eq!(colors(&derive(red, false)), AccentColors::RED_LIGHT);
         assert_eq!(preset_index(red), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+    use crate::Page;
+    use crate::ipc::Cmd;
+
+    #[test]
+    fn the_updater_line_follows_the_daemon_and_check_now_asks_it() {
+        let (window, ipc, sent, _) = crate::testing::linked("system", "update", Page::System);
+        let s = window.global::<SystemState>();
+        assert!(s.get_update_live(), "the fake link is up");
+        assert_eq!(
+            s.get_update_status(),
+            format!("Version {}", oxi_core::VERSION)
+        );
+
+        s.invoke_check_update();
+        assert_eq!(
+            sent.try_iter().last(),
+            Some(Cmd::Send(Request::CheckUpdate))
+        );
+
+        let page = "https://github.com/makarasty/OxiYapper/releases/tag/v9.0.0";
+        ipc.deliver(&Event::Push(Push::Update {
+            status: Status::Available {
+                version: "9.0.0".into(),
+                page: page.into(),
+            },
+        }));
+        assert_eq!(s.get_update_status(), "Update available · 9.0.0");
+        assert_eq!(s.get_update_page(), page);
+
+        ipc.deliver(&Event::Push(Push::Update {
+            status: Status::UpToDate,
+        }));
+        assert_eq!(s.get_update_page(), "");
+
+        ipc.deliver(&Event::Link(Link::Offline));
+        assert!(!s.get_update_live());
+        assert_eq!(
+            s.get_update_status(),
+            format!("Version {}", oxi_core::VERSION)
+        );
     }
 }

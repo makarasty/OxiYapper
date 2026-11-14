@@ -4,6 +4,10 @@ All notable changes to OxiYapper are listed here. The format follows [Keep a Cha
 
 ## [Unreleased]
 
+### Added
+
+- Self-update: once a day (and on Check now in System > Updates) OxiYapper looks for a newer release on GitHub, pre-releases included; with "Install updates automatically" on (default) it downloads the exe, checks it against `SHA256SUMS`, swaps it in when you are not dictating and restarts. A read-only folder or the switch off offers the download page instead.
+
 ## [0.1.0] - not released yet
 
 First public version. Windows 10 and 11 only; macOS and Linux builds compile but do not dictate yet.

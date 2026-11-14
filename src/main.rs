@@ -12,10 +12,12 @@ mod daemon;
 mod log;
 mod net;
 mod pipeline;
+#[cfg(all(windows, target_env = "msvc"))]
+mod vulkan_loader;
 
 use oxi_core::Command;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+use oxi_core::VERSION;
 
 #[cfg(windows)]
 use console::attach;
@@ -24,8 +26,8 @@ use console::attach;
 fn attach() {}
 
 #[cfg(windows)]
-fn run_daemon() {
-    if let Err(e) = daemon::run() {
+fn run_daemon(launch: Launch) {
+    if let Err(e) = daemon::run(launch) {
         attach();
         eprintln!("error: {e:#}");
         // Started by Explorer or the Run key the release exe has no console: without the box
@@ -38,8 +40,14 @@ fn run_daemon() {
     }
 }
 
+/// How the daemon was started; nothing to say off Windows.
+#[cfg(windows)]
+use daemon::Launch;
 #[cfg(not(windows))]
-fn run_daemon() {
+type Launch = ();
+
+#[cfg(not(windows))]
+fn run_daemon(_: Launch) {
     println!(
         "{} {VERSION}: not supported on this OS yet",
         oxi_core::APP_NAME
@@ -57,8 +65,18 @@ fn main() {
             oxi_core::audio::SAMPLE_RATE,
         ));
     }
+    // A daemon the previous one started after installing an update: it takes the pipe once the
+    // old process has ended.
+    #[cfg(windows)]
+    if args.first().map(String::as_str) == Some(daemon::AFTER_UPDATE_ARG) {
+        daemon::wait_for_parent();
+        return run_daemon(Launch {
+            updated: true,
+            open_settings: args.iter().any(|a| a == daemon::OPEN_SETTINGS_ARG),
+        });
+    }
     match oxi_core::parse_command(&args) {
-        Ok(Command::Daemon) => run_daemon(),
+        Ok(Command::Daemon) => run_daemon(Launch::default()),
         Ok(Command::Settings) => {
             if let Err(e) = oxi_settings::run() {
                 attach();

@@ -52,7 +52,7 @@ fn defaults_round_trip() {
 fn default_values_match_the_spec() {
     let c = Config::default();
     assert_eq!(c.audio.max_seconds, 3600);
-    assert_eq!(c.model.language, Language::RU);
+    assert_eq!(c.model.language, Language::AUTO);
     assert_eq!(c.model.id, "turbo");
     assert_eq!(c.hotkey.chord, ["Ctrl", "Win"]);
     assert!(c.history.enabled);
@@ -61,7 +61,10 @@ fn default_values_match_the_spec() {
 #[test]
 fn empty_file_gives_defaults() {
     let file = ConfigFile::parse("").unwrap();
-    assert_eq!(file.config, Config::default());
+    // A file with no `[ui]` predates the setup wizard: it counts as set up.
+    let mut want = Config::default();
+    want.ui.first_run_done = true;
+    assert_eq!(file.config, want);
     assert!(file.to_toml_string().unwrap().starts_with("version = 2\n"));
 }
 

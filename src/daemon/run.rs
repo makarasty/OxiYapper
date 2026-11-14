@@ -25,7 +25,7 @@ use super::cmd::{ChordHook, Inbox, UiCmd, Workers};
 use super::coordinator::Coordinator;
 use super::ipc::{Pushes, Start, SystemHost};
 use super::ui::Ui;
-use super::{audio, history, io, ipc, paste, sound, watch, whisper};
+use super::{audio, history, io, ipc, paste, sound, update, watch, whisper};
 use crate::log;
 
 /// How long the exit waits for the whisper worker. A model load cannot be cut and a run stops at
@@ -39,16 +39,27 @@ const _: () = assert!(END_SESSION_WAIT.as_millis() <= 3500 && WHISPER_EXIT.as_mi
 /// The ids of our Win+V entries, for the next session's first paste (`paste::spawn`).
 const PASTE_ENTRIES_FILE: &str = "clipboard-entries.txt";
 
-pub fn run() -> anyhow::Result<()> {
+/// How this daemon was started.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Launch {
+    /// By the previous daemon after it installed an update (`update::relaunch`).
+    pub updated: bool,
+    /// A settings window was open before that restart: open it again.
+    pub open_settings: bool,
+}
+
+pub fn run(launch: Launch) -> anyhow::Result<()> {
     let layout = oxi_platform::dirs::layout().context("no data directory")?;
     oxi_platform::dirs::ensure(&layout).context("cannot create the data directories")?;
     let _log = log::init(&layout.logs_dir);
     // An error is a refusal to start; main prints it to stderr and exits non-zero. A GUI exe
     // started at logon has no stderr: the log file is where the reason stays (t11 finding 3).
-    let done = serve(&layout);
+    let done = serve(&layout, launch);
     if let Err(e) = &done {
         tracing::error!("daemon stopped by an error: {e:#}");
     }
+    // An installed update starts the new exe now, with the log still open.
+    update::relaunch();
     done
 }
 
@@ -56,14 +67,21 @@ pub fn run() -> anyhow::Result<()> {
     clippy::too_many_lines,
     reason = "start-up wiring reads top to bottom, one thread after another"
 )]
-fn serve(layout: &oxi_core::paths::Layout) -> anyhow::Result<()> {
+fn serve(layout: &oxi_core::paths::Layout, launch: Launch) -> anyhow::Result<()> {
     let server = match ipc::bind()? {
         Start::Serve(server) => server,
         Start::Forwarded => return Ok(()),
     };
-    tracing::info!(version = env!("CARGO_PKG_VERSION"), "daemon started");
+    tracing::info!(
+        version = oxi_core::VERSION,
+        updated = launch.updated,
+        "daemon started"
+    );
+    update::remove_leftovers();
     watch::ensure_config(layout).context("cannot write the default config.toml")?;
     let (config, warnings, config_error, history_on) = load_config(&layout.config_file());
+    // First run (ROADMAP M10): a new config opens the settings window on the setup wizard.
+    let first_run = config_error.is_none() && !config.ui.first_run_done;
     // A config that does not parse is no answer: autostart stays as it is until it is fixed.
     if config_error.is_none() {
         sync_autostart(config.system.autostart);
@@ -86,6 +104,13 @@ fn serve(layout: &oxi_core::paths::Layout) -> anyhow::Result<()> {
     }
     if history_on {
         notify(Notice::HistoryOn);
+    }
+    if launch.updated {
+        let _ = ui_tx.send(UiCmd::NotifyText(format!(
+            "Updated to {}",
+            oxi_core::VERSION
+        )));
+        let _ = waker.wake();
     }
 
     let phase = PhaseCell::default();
@@ -129,9 +154,25 @@ fn serve(layout: &oxi_core::paths::Layout) -> anyhow::Result<()> {
     let pushes = Pushes::default();
     // Before any download can resume: a model `.part` untouched for 7 days is dropped.
     sweep_partials(&layout.models_dir());
+    let (update_tx, update_rx) = mpsc::channel();
     // Never joined: the IPC threads hold its sender until the process ends.
-    io::spawn(io_rx, inbox.clone(), pushes.clone(), layout.models_dir())?;
+    io::spawn(
+        io_rx,
+        inbox.clone(),
+        pushes.clone(),
+        layout.models_dir(),
+        update_tx,
+    )?;
     let host = Arc::new(SystemHost::new(Arc::clone(&hook)));
+    // Never joined either: the io worker holds its sender.
+    update::spawn(
+        update_rx,
+        inbox.clone(),
+        pushes.clone(),
+        Arc::clone(&host),
+        layout.config_file(),
+        launch.updated,
+    )?;
     let quit_host = Arc::clone(&host);
 
     let (watch_tx, watch_rx) = mpsc::channel();
@@ -196,6 +237,11 @@ fn serve(layout: &oxi_core::paths::Layout) -> anyhow::Result<()> {
         let _ = inbox.send(Inbox::Shutdown);
         exit.wait(WORKERS_DONE);
         return Err(e.into());
+    }
+    // Through the listener just started, as a tray click does; the window opens on the wizard, or
+    // again after an update closed it.
+    if first_run || launch.open_settings {
+        open_settings();
     }
     {
         // Shutdown, restart or logoff: the same quit as the tray's, finished before Windows ends

@@ -26,7 +26,8 @@ The daemon runs these threads. Each owns its data; they talk only through channe
 | audio | cpal stream (callback runs on the OS audio thread) plus a drain loop | Callback copies samples into a preallocated `rtrb` ring and updates the level atomic. No allocation, no lock in the callback. The drain loop downmixes and resamples in 20 ms chunks while recording. |
 | whisper | `WhisperContext`, the loaded model | Takes one job at a time. Loads on `Preload`, unloads on `Unload`. |
 | paste | clipboard and synthetic input | Waits for modifiers, snapshots and restores the clipboard. Kept off the coordinator because it sleeps (restore delay). |
-| io | model download, update check | One worker with a job channel; downloads report progress over IPC. |
+| io | model download | One worker with a job channel; downloads report progress over IPC. It hands "Check now" and each new settings window to the update thread. |
+| update | update check and self-update (`src/daemon/update.rs`, section 12) | Wakes once a day and on `CheckUpdate`; the swap itself runs on the coordinator once no dictation runs. |
 | history | history writes and retention (`src/daemon/history.rs`) | One worker with a job channel; a failed write comes back as a status warning. |
 | ipc | local socket server | One connection at a time is the settings window; other connections only send `OpenSettings`. |
 
@@ -127,12 +128,13 @@ Framing: one JSON object per line (`serde_json`), max 1 MiB per line, tagged enu
 | `TestTranscribe { id, set, language }` | `TestResult { id, outcome }`: `Heard { text, ms }` or `Failed { why }` for one settings set on the held recording, preceded by `TestProgress { id, percent, est_ms }` (0 to 100 while whisper runs; the first carries `est_ms`, the estimated length of the run, so the bar moves before whisper reports; optional, serde default); one run in flight per connection, the rest and any run a dictation overtakes answer `Busy`. A model only a test loaded is dropped after 60 s with no test request |
 | `HistoryWords { run, id }` | `HistoryWords { run, id, ... }`: the words of record `id` with their times, at once when the record has them, else made by the whisper worker in the slot of a test run (one at a time, a dictation first) with `TestProgress` carrying `run` meanwhile |
 | `HistoryWordsCancel { run }` | the run `run` ends and answers `HistoryWords` `Busy`; nothing when it is not the one out |
+| `CheckUpdate` (System > Updates, "Check now") | `Update { status }`: the updater's state (`oxi_core::update::Status`), also pushed unasked on every change and to a window that connects |
 | `Shutdown` | daemon exits |
 | | `ConfigError { file, line, message }` pushed on a bad reload |
 
 Versioning: `proto` is an integer, starting at 1. Adding an optional field (serde default) does not bump it; renaming or removing a field or changing meaning does, and so does a new request (an older daemon drops a connection that sends one). Proto 2 added `Stats`. Proto 3 added `PreviewSound`. Proto 4 added `TestAudio` and `TestTranscribe`. `Hello`, `HelloAck` and `Shutdown` never change shape. On a mismatch (exe updated while the old daemon runs) settings shows "Restart OxiYapper to finish the update" and a button that sends `Shutdown` and relaunches the daemon.
 
-Live updates (planned, run 2026-11-11, task c04; proto 6): the daemon pushes what changed, and the settings window does not poll. Pushed unasked while a settings connection exists: `HistoryAdded { item }`, `HistoryChanged { item }`, `HistoryRemoved { ids }` from the history worker after the files are on disk; `Stats` after each rewrite of `stats.json`; `Status` and `Attention` when the phase, the model load state, the backend or the warnings change; `FileChanged { file }` (config, dictionary, replace) from the config watcher; `Woke` on resume and unlock. With no connection a push is dropped at no cost. The 1 s timer of the window (file stats, redraw) goes away: file checks follow `FileChanged`, and the whole-frame redraw that repairs pixels the OS dropped follows window focus, un-occlusion, resize, theme change, pointer entry and `Woke`. Devices are listed again when their page is shown. `HistoryList` pages come from an in-memory id list built by one directory listing; only the files of the page are read. Proto 5 added `Attention`, the history requests, `DeleteModel` and `TestProgress`.
+Live updates (planned, run 2026-11-11, task c04; proto 6): the daemon pushes what changed, and the settings window does not poll. Pushed unasked while a settings connection exists: `HistoryAdded { item }`, `HistoryChanged { item }`, `HistoryRemoved { ids }` from the history worker after the files are on disk; `Stats` after each rewrite of `stats.json`; `Status` and `Attention` when the phase, the model load state, the backend or the warnings change; `FileChanged { file }` (config, dictionary, replace) from the config watcher; `Woke` on resume and unlock. With no connection a push is dropped at no cost. The 1 s timer of the window (file stats, redraw) goes away: file checks follow `FileChanged`, and the whole-frame redraw that repairs pixels the OS dropped follows window focus, un-occlusion, resize, theme change, pointer entry and `Woke`. Devices are listed again when their page is shown. `HistoryList` pages come from an in-memory id list built by one directory listing; only the files of the page are read. Proto 5 added `Attention`, the history requests, `DeleteModel` and `TestProgress`. Proto 7 added `CheckUpdate` and `Update`.
 
 Live meter: the settings Audio page does not read `LEVEL` over IPC. While the page is shown, settings opens its own capture (`CpalCapture`) and polls its `LevelMeter` at 30 Hz; the capture closes when the page goes away. The daemon's mic is still opened only on key-down. Settings reopens the stream every 60 s to bound the memory the capture keeps.
 
@@ -167,7 +169,7 @@ meter_sensitivity_db = 0.0     # level meter display only (overlay, settings); -
 id = "turbo"                   # registry id, or "custom"
 custom_path = ""
 gpu = "auto"                   # auto | cpu | device name (names survive index changes)
-language = "ru"                # any whisper language code, or auto
+language = "auto"              # any whisper language code, or auto (a file that has "ru" keeps it)
 idle_unload_minutes = 5        # 0 = never unload
 unload_immediately = false    # unload as soon as a dictation ends; wins over idle_unload_minutes
 [paste]
@@ -197,11 +199,13 @@ max_days = 30                  # keep the last N days, today included; 0 = no ag
 folder = ""                    # absolute path, may be another drive, gets an "OxiYapper history" subfolder; empty = history/ in the data dir
 [system]
 autostart = true
-update_check = true
+update_check = true             # once a day against GitHub Releases (section 12)
+auto_update = true             # a newer release installs itself and restarts the app when no dictation runs
 [debug]
 log_text = false               # dictated text in logs only when true
 [ui]
 theme = "system"               # system | dark | light
+first_run_done = false         # the setup wizard was finished or skipped; a file without the key counts as done
 ```
 
 `audio.meter_sensitivity_db` scales only the meter that is drawn, never the audio whisper gets. A value outside -20..+20 is clamped (NaN becomes 0.0) and the load adds a message to `ConfigFile.warnings`. `[ui] theme` is the colour scheme of the settings window: `system` follows the OS light/dark setting. Both keys are optional, and an older file without them loads with the defaults.
@@ -404,7 +408,7 @@ System
 50. Config from a newer build (downgrade): read-only, never written.
 51. Crash during a wav write: a non-empty `.wav.part` is kept and recovered as "interrupted" at next start (see 52), never deleted; the text was already pasted.
 52. History over its cap: oldest entries removed after each dictation and at start, saving on or off, in the current folder only (a former folder is never touched; a `.txt.tmp` leftover is swept and a non-empty `.wav.part` is recovered as "interrupted" on the same pass, never deleted); age is strict by date, entries dated after today are kept; only files matching the history naming inside the app-owned folder that holds the marker are ever deleted.
-53. Update check offline or rate-limited: silent, try again the next day. Asset for this build variant missing: the badge opens the release page instead of Install.
+53. Update check offline or rate-limited: silent (the status line says GitHub was not reached), try again the next day. Release without the exe or its `SHA256SUMS` line, exe folder not writable, automatic install off, or any install failure: the running exe stays and System > Updates offers Download (the release page).
 54. Autostart path moved (portable zip moved): each daemon start and config reload re-registers autostart (`HKCU\...\Run\OxiYapper`, quoted exe path) if it points elsewhere, and removes it when off and it is this exe; a test daemon (`OXI_PIPE_SUFFIX` set) never touches it.
 55. Installer and portable copy both present: same per-user socket, the second opens the first one's settings.
 56. Two users logged in on one machine: socket name and data are per user; hooks are per session.
@@ -415,8 +419,14 @@ System
 
 ## 12. Security and privacy
 
-- Network: only the model download (huggingface.co and its CDN) and the update check (api.github.com, github.com release assets). Both go through one `net` module with a host allowlist; both are visible in settings; the update check can be turned off. No telemetry, no crash upload.
-- Downloads: models by SHA256 pinned in code; updates by the SHA256 from `SHA256SUMS` of the same release (integrity, not authenticity, until code signing; build provenance attestations let a user verify with `gh attestation verify`). Never self-replace: Install runs the per-user installer the user can see.
+- Network: only the model download (huggingface.co and its CDN) and the update check (api.github.com; release assets on github.com, which redirects to objects.githubusercontent.com or release-assets.githubusercontent.com). Both go through one `net` module with a host allowlist that every redirect hop passes; both are visible in settings; the update check can be turned off. Requests carry only the user agent `OxiYapper/<version>`; no token, no id. No telemetry, no crash upload.
+- Downloads: models by SHA256 pinned in code; updates by the SHA256 from `SHA256SUMS` of the same release (integrity, not authenticity, until code signing; build provenance attestations let a user verify with `gh attestation verify`).
+- Updates (owner 2026-11-15: the app ships as the portable exe and zip of GitHub Releases, no installer). The running version is `oxi_core::VERSION`: the tag CI builds from (`OXI_VERSION`, set by `build-windows.yml`), else the crate version, so a local build (`0.1.0`) is newer than every `0.1.0-pre.N` and never updates itself. The update thread (`src/daemon/update.rs`) checks a minute after the start, then every 24 hours, and on "Check now", while `[system] update_check` is on; a test daemon (`OXI_PIPE_SUFFIX` set) never goes online. It reads `GET https://api.github.com/repos/makarasty/OxiYapper/releases?per_page=10` and takes the newest non-draft release by semver, pre-releases included (`oxi_core::update`: `0.1.0-pre.9 < 0.1.0-pre.10 < 0.1.0-rc.1 < 0.1.0`). Newer than the running version, with `[system] auto_update` on (default) and a release build:
+  1. `OxiYapper-<version>-windows-x64.exe` is downloaded to `<exe>.new.part` beside the running exe, checked against its line in the release's `SHA256SUMS` (length and digest), renamed `<exe>.new`, and run once with `--version` (it must answer `OxiYapper ...` and exit 0, else it is deleted).
+  2. The coordinator runs the swap once no dictation runs (Idle, nothing queued): `<exe>` is renamed `<stem>.old.exe` (Windows allows renaming a running exe), `<exe>.new` takes its name; if the second rename fails the first is undone. Then the settings window this daemon opened closes and the daemon quits as on tray Quit.
+  3. After the quit the daemon starts `<exe> --after-update [--open-settings]` with a pipe as its stdin and keeps the write end until its own exit: the new daemon reads its stdin to the end (the old process gone) before it binds the IPC pipe, at most 30 s. If the new exe cannot be started, the old one is renamed back and started instead.
+  4. The new daemon shows "Updated to <version>" in a tray balloon, reopens the settings window when one was open, and deletes `<stem>.old.exe` and any leftover `<exe>.new` or `.new.part` at its start.
+  Only those three names are ever written; the portable marker, `data\`, DLLs and other files beside the exe are never touched. A folder that cannot be written fails at the `.part` and, like a missing asset, automatic install off or any failure above, leaves the running exe and offers Download (the release page, built from the tag, never taken from the API answer). The hidden test hook `OXI_UPDATE_FAKE_VERSION=<version>` (docs/RELEASING.md) replaces the running version for the check and lets a debug build install; the relaunched daemon does not inherit it.
 - Dictated text never goes to logs; logs hold lengths, timings and errors. `debug.log_text = true` adds text and settings shows a warning while it is on.
 - History is on by default (R1.3), can be turned off, and is a plain local folder in the user's data directory, removable from settings.
 - IPC is owner-only (section 5), because hotkey capture forwards keystrokes.

@@ -65,6 +65,8 @@ fn config_old_file_loads_with_new_defaults_and_writes_back_identical() {
     assert!(file.warnings.is_empty(), "{:?}", file.warnings);
     let mut want = Config::default();
     want.ui.theme = Theme::Dark;
+    // A file from before the setup wizard counts as set up.
+    want.ui.first_run_done = true;
     want.paste.rules = vec![PasteRule {
         app: "x.exe".into(),
         mode: Some(PasteMode::Type),
