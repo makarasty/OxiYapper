@@ -6,7 +6,7 @@ Each milestone fits one agent session and ends with checks anyone can run. Windo
 
 Owner data rule for every milestone: the 8 reference phrases, the owner's dictionary and replacements live in a private folder outside the repo, passed by path (`OXI_BENCH_DIR`). Nothing from it is ever committed, pasted into a test, or used as a fixture.
 
-## M0 - Workspace and gates (this change)
+## M0 - Workspace and gates
 
 Workspace (`oxi-core`, `oxi-whisper`, app at the root), lints, `deny.toml`, `_typos.toml`, `rustfmt.toml`, nextest config, CI gates, CONTRIBUTING, AGENTS.
 
