@@ -571,8 +571,11 @@ fn pick_audio() -> Option<PathBuf> {
 
 /// The save dialog for an export named `name`.
 #[cfg_attr(
-    test,
-    allow(unused_variables, reason = "the test dialog ignores the name")
+    any(test, not(windows)),
+    allow(
+        unused_variables,
+        reason = "the test dialog and the non-Windows stub ignore the name and extension"
+    )
 )]
 fn save_as(name: &str, ext: &str) -> Option<PathBuf> {
     #[cfg(test)]

@@ -744,10 +744,15 @@ fn a_page_opens_at_its_top() {
             delta_x: 0.0,
             delta_y: -400.0,
         });
-    assert!(
-        window.get_scroll_y() < 0.0,
-        "Home with banners scrolls at 720 x 520"
-    );
+    // Whether Home scrolls at the least window depends on the font (Segoe UI Variable Text, Windows
+    // only): another font's shorter lines can fit it, so the page that "still scrolls" is checked
+    // only where the font is.
+    if cfg!(windows) {
+        assert!(
+            window.get_scroll_y() < 0.0,
+            "Home with banners scrolls at 720 x 520"
+        );
+    }
     window.set_page(Page::About);
     // The event loop runs the change handlers; the testing backend has none.
     slint::platform::update_timers_and_animations();

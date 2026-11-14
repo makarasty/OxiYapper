@@ -231,12 +231,18 @@ fn info_sits_on_the_first_line_of_a_wrapped_title() {
     let p = probe(720.0, 520.0);
     let line = p.get_line_h();
     let (top, h) = (p.get_long_y(), p.get_long_h());
+    // Two lines in Segoe UI Variable Text; another font (Linux) is wider and may need a third.
+    let lines = if cfg!(windows) {
+        2.0
+    } else {
+        (h / line).round()
+    };
     assert!(
-        h > 1.5 * line && h < 2.5 * line,
+        h > 1.5 * line && h < (lines + 0.5) * line,
         "the long title is {h} px high, not two {line} px lines"
     );
-    // The middle of the first of the two lines.
-    let first = top + h / 2.0 - line / 2.0;
+    // The middle of the first line of the block, which the row centres.
+    let first = top + h / 2.0 - lines * line / 2.0 + line / 2.0;
     // Walk the first line rightwards until the "i" opens its tooltip.
     let end = p.get_long_switch_x();
     let mut x = p.get_long_x();

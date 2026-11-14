@@ -579,9 +579,15 @@ fn every_sound_can_be_switched_off() {
 /// An own file from the config stands on its tile with its name; the whole path is the tooltip.
 #[test]
 fn own_file_shows_on_its_tile() {
+    // A path of this OS: a backslash is no separator on Linux, so a Windows path would not split.
+    let path = if cfg!(windows) {
+        r"C:\Sounds\my start.wav"
+    } else {
+        "/Sounds/my start.wav"
+    };
     let l = layout(
         "own",
-        Some("version = 2\n[sounds]\nstart = 'C:\\Sounds\\my start.wav'\n"),
+        Some(&format!("version = 2\n[sounds]\nstart = '{path}'\n")),
     );
     let window = open(&l, Page::Audio);
     sounds(&window, 0);
@@ -593,10 +599,7 @@ fn own_file_shows_on_its_tile() {
         .unwrap();
     assert_eq!(own.row_data(1).unwrap().caption, "my start.wav");
     let tile = with_role(&window, "Own file", AccessibleRole::RadioButton);
-    assert_eq!(
-        tile.accessible_description().as_deref(),
-        Some(r"C:\Sounds\my start.wav")
-    );
+    assert_eq!(tile.accessible_description().as_deref(), Some(path));
     sounds(&window, 1);
     assert_eq!(
         checked(&window, "Own file"),

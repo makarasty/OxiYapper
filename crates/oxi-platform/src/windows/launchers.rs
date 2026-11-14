@@ -77,7 +77,7 @@ pub struct Places {
 /// Entries read below one game's folder when its exe is looked for, and when its size is added up.
 const MAX_EXE_ENTRIES: usize = 2000;
 const MAX_SIZE_ENTRIES: usize = 20_000;
-/// A UE game keeps its real exe at `Game\Binaries\Win64\`, three folders down.
+/// An Unreal Engine game keeps its real exe at `Game\Binaries\Win64\`, three folders down.
 const EXE_DEPTH: usize = 3;
 /// Files below this are not read whole: a manifest is a few KB, `product.db` some tens of KB.
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;

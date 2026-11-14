@@ -816,7 +816,10 @@ mod tests {
             if [(1280, 540), (1280, 520)].contains(&size) {
                 // The heatmap is 20 (months) + 7 x (cell + 3) + 12 + 16 (legend) high.
                 let spare = height - bottom;
-                assert!((0.0..8.0).contains(&spare), "{size:?}: {spare} px spare");
+                // The chrome tokens are tuned for Segoe UI Variable Text (Windows only): another
+                // font's shorter lines leave a few px more, so elsewhere only a loose bound holds.
+                let most = if cfg!(windows) { 8.0 } else { 24.0 };
+                assert!((0.0..most).contains(&spare), "{size:?}: {spare} px spare");
             }
         }
         // 899x520 is width-limited (cell == cell-wide): 200 px more height leaves the cells as

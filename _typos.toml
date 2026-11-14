@@ -9,11 +9,15 @@ extend-exclude = ["Cargo.lock", "LICENSE-*", "*.svg"]
 [default.extend-words]
 hel = "hel"
 whis = "whis"
+# "wisper => Whisper" is the sample replacement rule in the learning tests and a slint hint.
+wisper = "wisper"
 
-# Win32 NIN_* tray notification constants, "PNGs" in slint comments, and the
+# Win32 NIN_* tray notification constants, "PNGs" in slint comments, Windows
+# structured exception handling (SEH) in vulkan_loader.rs, and the
 # deliberate misspelling "teh" used as replacement-rule test input in pipeline.rs.
 teh = "teh"
 NIN = "NIN"
+SEH = "SEH"
 PN = "PN"
 
 # Whisper language codes (Faroese, Bashkir) in languages.rs and German/Spanish

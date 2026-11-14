@@ -411,6 +411,7 @@ fn test_button_records_then_plays_back_then_clears() {
 #[test]
 fn not_now_on_the_mic_offer_keeps_the_hidden_recordings_suggestion() {
     use oxi_core::audio::Levels;
+    i_slint_backend_testing::init_no_event_loop();
     let (window, page) = window_on("mic-offer-not-now", None, fake);
     window.show().unwrap();
     show_audio(&window);
