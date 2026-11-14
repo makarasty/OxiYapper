@@ -6,7 +6,16 @@ All notable changes to OxiYapper are listed here. The format follows [Keep a Cha
 
 ### Added
 
+- First-run setup wizard: Welcome, Model, Hotkey, Microphone, Try it; skip at any time, open again with System > General > Run setup again.
+- Packaging: the Windows zip now holds the C++ runtime DLLs next to the exe and starts on a clean Windows; a bare `OxiYapper-<version>-windows-x64.exe` is released too, with `SHA256SUMS` and build provenance. Every green commit on `main` becomes an automatic pre-release, and only the newest release is kept.
+- Vulkan is loaded on demand: without a Vulkan driver the exe still starts and runs the model on the CPU. A CPU with AVX2 is required.
 - Self-update: once a day (and on Check now in System > Updates) OxiYapper looks for a newer release on GitHub, pre-releases included; with "Install updates automatically" on (default) it downloads the exe, checks it against `SHA256SUMS`, swaps it in when you are not dictating and restarts. A read-only folder or the switch off offers the download page instead.
+
+### Changed
+
+- The dictation language is Auto by default; the Recommended mark in the model gallery follows it.
+- Windows 10 and 11 (64-bit) only. Linux and macOS archives are no longer released and the CUDA build is dropped; they may return once there is a way to test them.
+- The README covers the wizard, Auto, updates, the two network uses (model download and update check) and the new download files.
 
 ## [0.1.0] - not released yet
 
@@ -25,7 +34,7 @@ First public version. Windows 10 and 11 only; macOS and Linux builds compile but
 - Test page: a three-step wizard that compares models and settings on your own recordings and offers the best one.
 - Settings window: Home stats (dictations, words, speaking time and speed), light and dark theme, accent colours, search across every setting (Ctrl+F), tray icon with state colours, autostart at sign-in, portable mode.
 - Write each dictation to a daily text or Markdown file.
-- Release workflow building Windows Vulkan, Windows CUDA, Linux Vulkan and macOS Metal archives with SHA256SUMS and build provenance.
+- Release workflow with SHA256SUMS and build provenance (see Unreleased for what it builds now).
 
 [Unreleased]: https://github.com/makarasty/OxiYapper/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/makarasty/OxiYapper/releases/tag/v0.1.0

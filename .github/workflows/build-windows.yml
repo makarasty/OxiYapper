@@ -109,7 +109,10 @@ jobs:
             "Start OxiYapper.exe. Settings, models and history stay in the data folder next to it" \
             "(the empty file 'portable' turns that on), so the whole folder can be moved or deleted." \
             "" \
-            "Guide: https://github.com/makarasty/OxiYapper#readme" \
+            "Keep the .dll files (the Microsoft C++ runtime) next to OxiYapper.exe: without them it" \
+            "does not start on a Windows that has no runtime installed." \
+            "" \
+            "Guide: https://github.com/makarasty/OxiYapper#readme (install, first run, updates, privacy)" \
             "Licence: MIT or Apache-2.0 (LICENSE-MIT, LICENSE-APACHE)." > "dist/$NAME/README.txt"
           (cd dist && 7z a -tzip "$NAME.zip" "$NAME" > /dev/null)
           rm -rf "dist/$NAME"
