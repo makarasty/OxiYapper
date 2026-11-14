@@ -451,6 +451,23 @@ fn language_rows_give_a_language_its_model_and_mark_the_one_in_use() {
     assert!(s.get_default_active(), "no Russian row: the first row runs");
 }
 
+/// Owner item 33: the first row ("All other languages and Auto") shows the same "!" as the other
+/// rows while the model it runs is not on disk, and loses it when the file is there.
+#[test]
+fn the_first_language_row_warns_while_its_model_is_not_on_disk() {
+    let (window, _ipc, _sent, layout) = window("bylang-default");
+    let s = window.global::<ModelState>();
+    assert!(
+        s.get_default_warning().starts_with("Not downloaded"),
+        "{:?}",
+        s.get_default_warning()
+    );
+    let default = &MODELS[usize::try_from(s.get_selected()).unwrap()];
+    on_disk(&layout, default.file_name, default.size);
+    s.invoke_shown();
+    assert_eq!(s.get_default_warning(), "", "the default model is on disk");
+}
+
 /// ia-map 3.2: each tab's "Reset to Auto" resets its own group; the hint is never reset.
 #[test]
 fn reset_to_auto_resets_its_own_group_and_keeps_the_hint() {

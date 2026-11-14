@@ -106,6 +106,9 @@ export global ModelState {
     // The first row, "All other languages and Auto": the model in use, and whether it runs now.
     in property <string> default-model;
     in property <bool> default-active;
+    // The "!" of that row, as on the language rows: its model is not on disk (`selected` is the
+    // model id in use; -1 is an id the gallery does not know, `rows.length` is the own file).
+    out property <string> default-warning: self.rows.length > 0 && self.selected < self.rows.length && (self.selected < 0 || !self.rows[self.selected].ready) ? @tr("Not downloaded: dictation in this language fails until you download it or pick another") : "";
     // The row "Add language" just made: it scrolls into view and takes the caret once, then -1.
     in-out property <int> lang-new: -1;
     // The "Add language" popup: the languages with no row yet that match its search.
@@ -863,6 +866,7 @@ export component ModelPage inherits VerticalLayout {
                                     LanguageLine {
                                         name: @tr("All other languages and Auto");
                                         active: ModelState.default-active;
+                                        warning: ModelState.default-warning;
                                         // The model as text and a soft Change that opens Models (ia-map 3.5).
                                         HorizontalLayout {
                                             spacing: Theme.control-gap;

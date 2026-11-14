@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::{fs, thread};
 
@@ -170,7 +171,6 @@ pub fn bind(window: &AppWindow, ctx: &Ctx) {
     });
 
     let check = Rc::new(Timer::default());
-    show_folder(&window.as_weak(), ctx, &check);
     let (w, c, t) = (window.as_weak(), ctx.clone(), check.clone());
     s.on_history_check(move || show_folder(&w, &c, &t));
     let (w, c, t) = (window.as_weak(), ctx.clone(), check.clone());
@@ -371,8 +371,11 @@ fn folder_problem(chosen: &Path) -> &'static str {
 }
 
 /// Empty when a file can be made in `dir` (and is removed again), else [`FOLDER_READ_ONLY`].
+/// The name is unique per call: two checks at once must not delete each other's file.
 fn writable(dir: &Path) -> &'static str {
-    let probe = dir.join(format!(".oxiyapper-write-test-{}", std::process::id()));
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    let probe = dir.join(format!(".oxiyapper-write-test-{}-{n}", std::process::id()));
     if fs::write(&probe, b"").is_err() {
         return FOLDER_READ_ONLY;
     }
@@ -403,6 +406,27 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
+
+    /// Two folder checks at once (the page used to start two per visit) shared one probe name and
+    /// one deleted the other's file: a `PermissionDenied` shown as "read-only".
+    #[test]
+    fn folder_checks_at_once_never_see_a_read_only_folder() {
+        let root = crate::testing::scratch_dir(&format!("oxi-probe-{}", std::process::id()));
+        let racers: Vec<_> = (0..4)
+            .map(|_| {
+                let root = root.clone();
+                thread::spawn(move || (0..300).all(|_| writable(&root).is_empty()))
+            })
+            .collect();
+        for racer in racers {
+            assert!(racer.join().unwrap(), "a probe collided with another");
+        }
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            0,
+            "probes are removed"
+        );
+    }
 
     #[test]
     fn the_owned_folder_stands_for_its_parent_and_bad_names_are_refused() {

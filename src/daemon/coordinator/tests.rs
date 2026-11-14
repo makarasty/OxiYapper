@@ -241,8 +241,10 @@ fn the_overlay_bar_follows_the_phases_and_never_waits_for_whisper() {
         rig.progress.finishing_left().is_some(),
         "the transcription bar runs to its end"
     );
-    let scale = rig.c.speed.values().next().copied().unwrap_or(1.0);
-    assert!(scale > 0.0, "the run was timed");
+    // The run started with the estimate at 2100 and ended at 2500: 0 ms of audio took 400 ms.
+    let first = overlay::learn_first(0, 400);
+    assert_eq!(rig.c.speed.len(), 1);
+    assert_eq!(rig.c.speed.values().next().copied(), Some(first));
     // A clipboard paste only reports that the text landed: no bar, and the Pasting pill
     // shows none (review c04 #4: not the finished transcription's 100).
     rig.c
@@ -277,6 +279,20 @@ fn the_overlay_bar_follows_the_phases_and_never_waits_for_whisper() {
     rig.c
         .handle(Inbox::Progress { job, percent: 90 }, Millis(2700));
     assert_eq!(rig.c.bar, Bar::None);
+    // A second run of the same model on the same device averages into the first scale.
+    rig.c.bar = Bar::Transcribing(job);
+    rig.c.run = Some(Run {
+        job,
+        audio_ms: 1000,
+        started: Some(Millis(rig.c.clock.0 - 900)),
+        queued: false,
+    });
+    rig.c.overlay_progress(OverlayState::Pasting);
+    assert_eq!(rig.c.speed.len(), 1);
+    assert_eq!(
+        rig.c.speed.values().next().copied(),
+        Some(overlay::learn(first, 1000, 900))
+    );
 }
 
 /// Review c04 #6: a job sent to whisper while an earlier one is still in it gets its own
