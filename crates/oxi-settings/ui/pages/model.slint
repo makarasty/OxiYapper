@@ -343,11 +343,6 @@ component ModelCard inherits VerticalLayout {
                             overflow: elide;
                         }
                     }
-                    // UI rule 2: the warning is the "!" of the row, its words in the tooltip and
-                    // the accessible label, never a line under the row.
-                    WarningSlot {
-                        text: root.notice;
-                    }
                     // DS-28.2: the bar's slot, kept so nothing moves when a download starts. With the
                     // two action slots it fills the control column (200 wide, 80 in the 240 column).
                     Rectangle {
@@ -361,6 +356,12 @@ component ModelCard inherits VerticalLayout {
                             accessible-label: @tr("{} download", root.data.name);
                             accessible-value: root.data.progress;
                         }
+                    }
+                    // UI rule 2: the warning is the "!" of the row, its words in the tooltip and
+                    // the accessible label, never a line under the row. Next to the action it
+                    // warns about (Download), not floating in the middle of the row (hold 24).
+                    WarningSlot {
+                        text: root.notice;
                     }
                     Rectangle {
                         width: Theme.model-action-column;

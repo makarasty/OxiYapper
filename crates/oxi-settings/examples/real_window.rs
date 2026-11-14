@@ -35,6 +35,7 @@ use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::{env, fs, path::PathBuf, process, time::Duration};
 
+use oxi_core::device::Device;
 use oxi_core::history::{HistoryId, Status, Word};
 use oxi_core::ipc::{HistoryItem, Push, Request, Spoken, Words, WordsResult};
 use oxi_core::paths::Layout;
@@ -393,6 +394,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ipc.deliver(&Event::Push(Push::History {
                         items: sample_history(records),
                         more: false,
+                    }));
+                }
+                // The daemon's GPU list: the biggest adapter this PC has, by the name the page
+                // matches it with; the Model page's "Recommended" badge needs it.
+                Cmd::Send(Request::ListDevices) => {
+                    let gpus = oxi_platform::sysinfo::adapters()
+                        .into_iter()
+                        .max_by_key(|a| a.vram)
+                        .map(|a| Device {
+                            name: "Vulkan0".into(),
+                            description: a.name,
+                            // shortcut: ggml says integrated for the daemon; DXGI has no kind, so
+                            // under 1 GiB of own memory counts as shared (UHD shows 128 MB).
+                            uma: a.vram < 1 << 30,
+                        })
+                        .into_iter()
+                        .collect();
+                    ipc.deliver(&Event::Push(Push::Devices {
+                        mics: Vec::new(),
+                        gpus,
                     }));
                 }
                 Cmd::Send(Request::Stats) => {

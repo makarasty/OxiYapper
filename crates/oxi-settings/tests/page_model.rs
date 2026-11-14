@@ -1400,6 +1400,17 @@ fn a_model_not_on_disk_is_named_once_and_warns_in_its_slot() {
         "the warning is a {} px line, not the slot",
         slot.size().width
     );
+    // Hold 24: the "!" sits beside the action it warns about, not floating mid-row.
+    let download = with_role(
+        &window,
+        "Download Whisper large-v3 turbo",
+        AccessibleRole::Button,
+    );
+    let gap = download.absolute_position().x - (slot.absolute_position().x + slot.size().width);
+    assert!(
+        (0.0..=8.5).contains(&gap),
+        "the \"!\" is {gap} px from Download"
+    );
 }
 
 /// DS-25, UI rule 1: the card of a heavy (slow) model in use keeps its height in every state at
@@ -1838,4 +1849,157 @@ fn daily_counts_suggest_the_memory_settings_only_on_apply() {
         "Not now came back after a reopen"
     );
     assert!(!saved(&l).preload_at_start);
+}
+
+/// The daemon lists one integrated GPU: this PC's memory judges the models (Windows only; no
+/// hardware is read elsewhere).
+fn list_an_integrated_gpu(ipc: &Ipc) {
+    ipc.deliver(&Event::Push(Push::Devices {
+        mics: vec![],
+        gpus: vec![Device {
+            name: "Vulkan0".into(),
+            description: "Integrated".into(),
+            uma: true,
+        }],
+    }));
+}
+
+/// Hold 24: the recommended tile wears its "Recommended" badge in every state of its model (not on
+/// disk, on disk, in use), and no other tile has one.
+#[test]
+fn the_recommended_tile_keeps_its_badge_in_every_state() {
+    if !cfg!(windows) {
+        return;
+    }
+    let l = layout("badge-states", None);
+    let (ipc, _sent) = Ipc::fake();
+    let window = open_linked(&l, Page::Model, ipc.clone());
+    list_an_integrated_gpu(&ipc);
+    let state = window.global::<ModelState>();
+    measured(&window);
+    let badged = || -> Vec<String> {
+        state
+            .get_tiles()
+            .iter()
+            .filter(|t| t.badge == "Recommended")
+            .map(|t| t.title.to_string())
+            .collect()
+    };
+    // The Badge itself is drawn: an element labelled exactly "Recommended" (the InfoTip's longer
+    // "...Recommended for this PC..." text must not count).
+    let drawn = || {
+        assert!(
+            i_slint_backend_testing::ElementQuery::from_root(&window)
+                .find_all()
+                .into_iter()
+                .any(|e| e.accessible_label().is_some_and(|l| l == "Recommended")),
+            "the Recommended badge is not drawn"
+        );
+    };
+    assert_eq!(badged(), ["Whisper turbo compact"], "not on disk");
+    drawn();
+
+    let entry = MODELS.iter().find(|m| m.id == "turbo-compact").unwrap();
+    fs::create_dir_all(l.models_dir()).unwrap();
+    common::fake_model(&l.models_dir().join(entry.file_name), entry.size);
+    list_an_integrated_gpu(&ipc);
+    assert_eq!(badged(), ["Whisper turbo compact"], "on disk");
+    drawn();
+
+    view(&window, "Whisper turbo compact");
+    button(&window, "Use Whisper turbo compact").invoke_accessible_default_action();
+    assert_eq!(saved(&l).id, "turbo-compact");
+    list_an_integrated_gpu(&ipc);
+    assert_eq!(badged(), ["Whisper turbo compact"], "in use");
+    drawn();
+}
+
+/// ia-map 3.5 (RT R5): a model Combo item of a one-language model carries its language, a pick
+/// that does not match the row's language shows the "!" with the reason, and the last item
+/// downloads another model.
+#[test]
+fn a_language_row_names_single_language_models_and_warns_on_a_mismatch() {
+    let l = layout(
+        "lang-only",
+        Some(
+            "version = 2
+[model]
+id = \"podlodka\"
+[model.by_language]
+en = \"podlodka\"
+ru = \"podlodka\"
+",
+        ),
+    );
+    let russian = MODELS.iter().find(|m| m.id == "podlodka").unwrap();
+    fs::create_dir_all(l.models_dir()).unwrap();
+    common::fake_model(&l.models_dir().join(russian.file_name), russian.size);
+    let window = open(&l, Page::Model);
+    let state = window.global::<ModelState>();
+    state.invoke_shown();
+    let rows: Vec<_> = state.get_lang_rows().iter().collect();
+    let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["English", "Russian"]);
+    let items: Vec<String> = rows[0].models.iter().map(|m| m.to_string()).collect();
+    assert!(
+        items.contains(&"Whisper large-v3 Russian · Russian only".to_owned()),
+        "{items:?}"
+    );
+    assert_eq!(
+        items.last().map(String::as_str),
+        Some("Download another model…")
+    );
+    assert_eq!(
+        rows[0].warning, "This model hears only Russian",
+        "a Russian-only model on the English row"
+    );
+    assert_eq!(
+        rows[1].warning, "",
+        "the same model on the Russian row is fine"
+    );
+}
+
+/// ia-map 3.5 (RT "model deleted while rows use it"): Delete's question names the languages that
+/// run the model, and says nothing of the kind for a model no row uses.
+#[test]
+fn the_delete_question_names_the_languages_that_use_the_model() {
+    let l = layout(
+        "delete-names",
+        Some(
+            "version = 2
+[model.by_language]
+en = \"large-v3\"
+ru = \"large-v3\"
+",
+        ),
+    );
+    let (ipc, _sent) = Ipc::fake();
+    let window = open_linked(&l, Page::Model, ipc.clone());
+    ipc.deliver(&Event::Link(Link::Online));
+    for id in ["large-v3", "small"] {
+        let entry = MODELS.iter().find(|m| m.id == id).unwrap();
+        fs::create_dir_all(l.models_dir()).unwrap();
+        common::fake_model(&l.models_dir().join(entry.file_name), entry.size);
+    }
+    window.global::<ModelState>().invoke_shown();
+    view(&window, "Whisper large-v3");
+    button(&window, "Delete Whisper large-v3").invoke_accessible_default_action();
+    assert!(
+        shows(&window, "Used for English, Russian."),
+        "names the rows"
+    );
+    view(&window, "Whisper small");
+    button(&window, "Delete Whisper small").invoke_accessible_default_action();
+    assert!(!shows(&window, "Used for"), "no row uses Whisper small");
+}
+
+/// ia-map 3.5 (c03 R9): the Languages "i" says an app rule's own model beats the language rows.
+#[test]
+fn the_languages_tip_says_an_app_rules_model_overrides_the_rows() {
+    let window = open(&layout("lang-tip", None), Page::Model);
+    sub_tab(&window, "Languages");
+    assert!(shows(
+        &window,
+        "An app rule with its own model uses that model"
+    ));
 }

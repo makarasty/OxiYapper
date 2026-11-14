@@ -1462,3 +1462,25 @@ fn a_full_dictionary_says_a_doubted_word_is_over_the_limit() {
         row.cost
     );
 }
+
+/// ia-map 3.8 (RT R8): the unsure-word rows, grey while History saving is off, say where that
+/// switch is, and the place they name exists.
+#[test]
+fn the_unsure_word_rows_name_where_history_saving_is() {
+    let slint = include_str!("../ui/pages/text.slint");
+    let group = &slint[slint
+        .find("title: @tr(\"Unsure words\")")
+        .expect("the group")..];
+    let group = &group[..group.find("title: @tr(\"Certainty needed\")").unwrap() + 600];
+    let named = group
+        .matches("Turn on System > History and files > Save dictations to History")
+        .count();
+    assert_eq!(named, 2, "both rows name the switch: {named}");
+    let window = open(&layout("unsure-off-tip", None), Page::System);
+    with_role(&window, "History and files", AccessibleRole::Tab).invoke_accessible_default_action();
+    with_role(
+        &window,
+        "Save dictations to History",
+        AccessibleRole::Switch,
+    );
+}
