@@ -54,7 +54,7 @@ Hold a hotkey, speak, let go: your words appear in whatever field has focus. Spe
 
 ## Download and install
 
-Go to [Releases](https://github.com/makarasty/OxiYapper/releases). Every change on `main` is published as a pre-release that replaces the previous one; a stable release, once there is one, stays beside it until the next. So there is at most one of each, and the pre-release is the newer. Pick a file:
+Go to [Releases](https://github.com/makarasty/OxiYapper/releases). Changes on `main` that pass CI are published as a pre-release that replaces the previous one (right after a stable release, until the version number is bumped, none is published); a stable release, once there is one, stays beside it until the next. So there is at most one of each, and the pre-release is the newer. Pick a file:
 
 | File | Pick it if |
 |---|---|

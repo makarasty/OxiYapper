@@ -478,7 +478,13 @@ pub fn relaunch() {
     match unswap(&r.exe, &r.new, &r.old) {
         // shortcut: the old exe says "Updated" too, rare (its own exe did not start); add an
         // argument if it is ever seen.
-        Ok(()) => drop(start(&r.exe, r.settings, Stdio::piped())),
+        // Forgotten, not dropped: its stdin must stay open until this process ends, or it takes
+        // the pipe while this daemon still holds it and exits as already running.
+        Ok(()) => {
+            if let Ok(child) = start(&r.exe, r.settings, Stdio::piped()) {
+                std::mem::forget(child);
+            }
+        }
         Err(e) => tracing::error!("the old exe could not be put back: {e}"),
     }
 }
