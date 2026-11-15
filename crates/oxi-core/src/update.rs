@@ -47,9 +47,14 @@ impl Version {
             None => (text, None),
         };
         let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-        let mut nums = core
-            .split('.')
-            .map(|n| digits(n).then(|| n.parse().ok()).flatten());
+        // Semver: no leading zero. `rc.01` would print as `rc.1`, a tag and an asset that do not
+        // exist; release.yml refuses such a tag too (scripts/release.sh).
+        let number = |s: &str| {
+            (digits(s) && (s.len() == 1 || !s.starts_with('0')))
+                .then(|| s.parse().ok())
+                .flatten()
+        };
+        let mut nums = core.split('.').map(number);
         let core = [nums.next()??, nums.next()??, nums.next()??];
         if nums.next().is_some() {
             return None;
@@ -60,7 +65,7 @@ impl Version {
                 .split('.')
                 .map(|id| {
                     if digits(id) {
-                        id.parse().ok().map(Ident::Num)
+                        number(id).map(Ident::Num)
                     } else if !id.is_empty()
                         && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
                     {
@@ -298,9 +303,17 @@ mod tests {
             "1.2.3-p_re",
             "latest",
             " -1.2.3",
+            // Leading zeros (semver 2): release.yml refuses these tags as well.
+            "01.2.3",
+            "1.02.3",
+            "1.2.03",
+            "0.2.0-rc.01",
+            "0.2.0-00",
         ] {
             assert_eq!(Version::parse(bad), None, "{bad:?}");
         }
+        // A lone zero and a word that starts with one are fine.
+        assert_eq!(v("0.0.0-0.rc.0a").to_string(), "0.0.0-0.rc.0a");
     }
 
     #[test]

@@ -65,6 +65,11 @@ fn main() {
             oxi_core::audio::SAMPLE_RATE,
         ));
     }
+    // The watchdog of an update, started by the daemon that installed it from the replaced exe.
+    #[cfg(windows)]
+    if args.first().map(String::as_str) == Some(daemon::WATCH_ARG) {
+        return daemon::watch_update(&args[1..]);
+    }
     // A daemon the previous one started after installing an update: it takes the pipe once the
     // old process has ended.
     #[cfg(windows)]

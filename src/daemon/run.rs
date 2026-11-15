@@ -77,7 +77,6 @@ fn serve(layout: &oxi_core::paths::Layout, launch: Launch) -> anyhow::Result<()>
         updated = launch.updated,
         "daemon started"
     );
-    update::remove_leftovers();
     watch::ensure_config(layout).context("cannot write the default config.toml")?;
     let (config, warnings, config_error, history_on) = load_config(&layout.config_file());
     // First run (ROADMAP M10): a new config opens the settings window on the setup wizard.
@@ -237,6 +236,10 @@ fn serve(layout: &oxi_core::paths::Layout, launch: Launch) -> anyhow::Result<()>
         let _ = inbox.send(Inbox::Shutdown);
         exit.wait(WORKERS_DONE);
         return Err(e.into());
+    }
+    // The pipe is served: the update watchdog (`update::watch`) keeps this exe.
+    if launch.updated {
+        update::signal_ready();
     }
     // Through the listener just started, as a tray click does; the window opens on the wizard, or
     // again after an update closed it.

@@ -1,7 +1,8 @@
 name: release
 
-# A `vX.Y.Z` tag makes a release; a tag with a suffix (`vX.Y.Z-rc.1`) makes a pre-release.
-# Automatic pre-releases from main are prerelease.yml. Contract: docs/RELEASING.md.
+# A `vX.Y.Z` tag makes a release and then deletes every other release; a tag with a suffix
+# (`vX.Y.Z-rc.1`) makes a pre-release and deletes every other pre-release. Automatic pre-releases
+# from main are prerelease.yml. Contract: docs/RELEASING.md.
 on:
   push:
     tags: ['v*']
@@ -27,14 +28,12 @@ jobs:
         id: check
         env:
           TAG: ${{ github.ref_name }}
+        # Semver with no leading zeros (`-rc.01` fails), as the updater parses it.
+        shell: bash
         run: |
-          version="${TAG#v}"
-          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] \
-            || { echo "::error::tag $TAG is not vX.Y.Z or vX.Y.Z-suffix"; exit 1; }
           cargo_version=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "oxi-yapper") | .version')
-          [ "${version%%-*}" = "$cargo_version" ] \
-            || { echo "::error::tag $TAG does not match the Cargo.toml version $cargo_version"; exit 1; }
+          version=$(bash scripts/release.sh tag-version "$TAG" "$cargo_version")
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
   build:
@@ -56,6 +55,9 @@ jobs:
       GH_REPO: ${{ github.repository }}
       TAG: ${{ github.ref_name }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: windows-x64
@@ -71,3 +73,10 @@ jobs:
           flags=()
           [[ "$TAG" == *-* ]] && flags+=(--prerelease)
           gh release create "$TAG" dist/* --verify-tag --title "OxiYapper $TAG" --generate-notes "${flags[@]}"
+      # After the create: at most one stable release and one pre-release (docs/RELEASING.md).
+      - name: Delete the releases this one replaces
+        shell: bash
+        run: |
+          gh release list --limit 1000 --json tagName,isPrerelease --jq '.[] | "\(.tagName) \(.isPrerelease)"' \
+            | bash scripts/release.sh prune "$TAG" \
+            | while read -r tag; do gh release delete "$tag" --cleanup-tag --yes; done

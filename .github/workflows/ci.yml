@@ -41,6 +41,8 @@ jobs:
       - run: typos
       - run: cargo machete
       - run: cargo deny --locked check
+      - name: Release workflow rules (scripts/release.sh)
+        run: bash scripts/release-test.sh
 
   clippy:
     name: clippy (${{ matrix.os }})

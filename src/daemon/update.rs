@@ -5,16 +5,18 @@
 //! `auto_update` on is downloaded next to the exe as `<exe>.new`: SHA256 from the release's
 //! `SHA256SUMS`, then one `--version` run to see that it starts. The swap waits until no dictation
 //! runs ([`Inbox::UpdateReady`], run by the coordinator): `<exe>` is renamed `<stem>.old.exe`
-//! (Windows lets a running exe be renamed), `.new` takes its name, the daemon quits and a new one
-//! starts from the same path ([`relaunch`]); the next start deletes the `.old`. A folder that cannot
-//! be written, a release without the files, or any failure leaves the running exe in place and
-//! offers the release page instead. Files beside the exe (the portable marker, `data\`, DLLs) are
-//! never touched.
+//! (Windows lets a running exe be renamed), `.new` takes its name, and the daemon quits. A watchdog
+//! run from the `.old` ([`relaunch`], [`watch_update`]) then starts the new daemon and waits for
+//! it to serve the pipe; if it does not within [`READY_LIMIT`], the watchdog kills it, puts the old
+//! exe back, starts it, and records the version so it is only offered from then on. The first
+//! check of the next daemon deletes the `.old`. A folder that cannot be written, a release without
+//! the files, or any failure leaves the running exe in place and offers the release page instead.
+//! Files beside the exe (the portable marker, `data\`, DLLs) are never touched.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -36,6 +38,9 @@ use crate::net::{self, DownloadError};
 pub const AFTER_UPDATE_ARG: &str = "--after-update";
 /// With [`AFTER_UPDATE_ARG`]: a settings window was open, open it again.
 pub const OPEN_SETTINGS_ARG: &str = "--open-settings";
+/// The first argument of the watchdog [`relaunch`] starts: `--update-watch <exe> <version>
+/// [--open-settings]`.
+pub const WATCH_ARG: &str = "--update-watch";
 
 const FIRST_CHECK: Duration = Duration::from_secs(60);
 /// With the test hook set, the end-to-end check should not wait a minute.
@@ -48,6 +53,11 @@ const MAX_EXE: u64 = 512 << 20;
 const PROBE_LIMIT: Duration = Duration::from_secs(20);
 /// How long a relaunched daemon waits for the old one to end (its quit grace is 2 s).
 const PARENT_LIMIT: Duration = Duration::from_secs(30);
+/// How long the watchdog gives the new daemon to serve the pipe. A good start takes a second or
+/// two; a failed one shows its error box until the watchdog kills it.
+const READY_LIMIT: Duration = Duration::from_secs(30);
+/// How often the watchdog looks for the ready marker and the new daemon's end.
+const READY_POLL: Duration = Duration::from_millis(100);
 
 /// What the update thread hears, through the io worker.
 pub enum UpdateCmd {
@@ -141,6 +151,7 @@ pub fn spawn(
     };
     thread::Builder::new().name("update".into()).spawn(move || {
         let mut next = Instant::now() + first;
+        let mut leftovers = true;
         loop {
             let manual = match rx.recv_timeout(next.saturating_duration_since(Instant::now())) {
                 Ok(UpdateCmd::Subscribed) => {
@@ -154,6 +165,11 @@ pub fn spawn(
                 }
                 Err(RecvTimeoutError::Disconnected) => return,
             };
+            // Not at the start: the watchdog of the update that started this daemon runs the
+            // `.old` until the daemon is ready.
+            if std::mem::take(&mut leftovers) {
+                remove_leftovers();
+            }
             if !online {
                 continue;
             }
@@ -241,7 +257,13 @@ impl Updater {
         };
         let version = release.version.to_string();
         tracing::info!(%version, running = %current, "update available");
-        if !(system.auto_update && self.may_install) {
+        // A version whose daemon did not start here ([`watch_update`]) is never installed again.
+        let failed =
+            fs::read_to_string(failed_marker(&self.exe)).is_ok_and(|v| v.trim() == version);
+        if failed {
+            tracing::warn!(%version, "this version did not start here before, offered only");
+        }
+        if failed || !(system.auto_update && self.may_install) {
             self.offer(&release);
             return None;
         }
@@ -312,10 +334,24 @@ fn staged(exe: &Path) -> PathBuf {
     exe.with_file_name(name)
 }
 
-/// `<stem>.old.exe`: the replaced exe, deleted at the next start.
+/// `<stem>.old.exe`: the replaced exe, deleted by the next daemon's first check.
 fn retired(exe: &Path) -> PathBuf {
+    beside(exe, ".old.exe")
+}
+
+/// `<stem>.update-ready`: made by the new daemon once it serves, taken by the watchdog.
+fn ready_marker(exe: &Path) -> PathBuf {
+    beside(exe, ".update-ready")
+}
+
+/// `<stem>.update-failed`: the version whose daemon did not start, written by the watchdog.
+fn failed_marker(exe: &Path) -> PathBuf {
+    beside(exe, ".update-failed")
+}
+
+fn beside(exe: &Path, suffix: &str) -> PathBuf {
     let mut name = exe.file_stem().unwrap_or_default().to_os_string();
-    name.push(".old.exe");
+    name.push(suffix);
     exe.with_file_name(name)
 }
 
@@ -381,6 +417,7 @@ struct Relaunch {
     exe: PathBuf,
     new: PathBuf,
     old: PathBuf,
+    version: String,
     settings: bool,
 }
 
@@ -413,6 +450,7 @@ fn apply(
             exe,
             new,
             old,
+            version,
             settings: report.pushes.connected(),
         });
         host.close_settings();
@@ -420,39 +458,126 @@ fn apply(
     }
 }
 
-/// After the daemon's quit: starts the swapped-in exe. If it cannot start, the old exe is put
-/// back and started instead. The new process waits for this one to end before it takes the pipe.
+/// After the daemon's quit: starts the watchdog ([`watch_update`]) from the replaced exe, which ran
+/// as a daemon until now; the new one never has. If it cannot start, the old exe is put back and
+/// started instead.
 pub fn relaunch() {
     let Some(r) = lock(&RELAUNCH).take() else {
         return;
     };
-    if start(&r.exe, r.settings).is_ok() {
-        return;
+    let mut cmd = Command::new(&r.old);
+    cmd.arg(WATCH_ARG).arg(&r.exe).arg(&r.version);
+    if r.settings {
+        cmd.arg(OPEN_SETTINGS_ARG);
     }
-    tracing::error!("the updated exe did not start, putting the old one back");
+    // Its stdin closes when this process ends: then the pipe is free for the new daemon.
+    match without_hook(&mut cmd).stdin(Stdio::piped()).spawn() {
+        Ok(child) => return std::mem::forget(child),
+        Err(e) => tracing::error!("update watchdog not started, putting the old exe back: {e}"),
+    }
     match unswap(&r.exe, &r.new, &r.old) {
-        // shortcut: the old exe says "Updated" too, rare (the new one passed its probe); add an
+        // shortcut: the old exe says "Updated" too, rare (its own exe did not start); add an
         // argument if it is ever seen.
-        Ok(()) => drop(start(&r.exe, r.settings)),
+        Ok(()) => drop(start(&r.exe, r.settings, Stdio::piped())),
         Err(e) => tracing::error!("the old exe could not be put back: {e}"),
     }
 }
 
-fn start(exe: &Path, settings: bool) -> io::Result<()> {
+/// The watchdog, in a process of the replaced exe: `args` follow [`WATCH_ARG`]. Once the old
+/// daemon has ended (the pipe is free) it starts the new one and waits up to [`READY_LIMIT`] for
+/// its ready marker ([`signal_ready`]). Without it the new daemon is killed, the old exe put back
+/// and started, and the version written to the failed marker, so it is only offered from then on.
+pub fn watch_update(args: &[String]) {
+    let [exe, version, rest @ ..] = args else {
+        return;
+    };
+    let _log = oxi_platform::dirs::layout()
+        .ok()
+        .map(|layout| crate::log::init(&layout.logs_dir));
+    let exe = PathBuf::from(exe);
+    let ready = ready_marker(&exe);
+    let _ = fs::remove_file(&ready);
+    wait_for_parent();
+    let settings = rest.iter().any(|a| a == OPEN_SETTINGS_ARG);
+    let kept = match start(&exe, settings, Stdio::null()) {
+        Ok(mut child) => supervise(&mut child, &ready, READY_LIMIT),
+        Err(_) => false,
+    };
+    if kept {
+        tracing::info!(%version, "the updated daemon is ready");
+        return;
+    }
+    tracing::error!(%version, "the updated daemon did not get ready, putting the old exe back");
+    match roll_back(&exe, version) {
+        Ok(()) => {
+            if let Err(e) = without_hook(&mut Command::new(&exe))
+                .stdin(Stdio::null())
+                .spawn()
+            {
+                tracing::error!("the old exe did not start: {e}");
+            }
+        }
+        Err(e) => tracing::error!("the old exe could not be put back: {e}"),
+    }
+}
+
+/// Waits until `ready` appears (taken then) or `child` ends; `true` keeps the new daemon. An end
+/// with success is a hand-over to a daemon a launch in the gap started; a failure, or no marker
+/// within `limit`, is no start, and a child still running is killed.
+fn supervise(child: &mut Child, ready: &Path, limit: Duration) -> bool {
+    let end = Instant::now() + limit;
+    loop {
+        if fs::remove_file(ready).is_ok() {
+            return true;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < end => thread::sleep(READY_POLL),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// Puts the old exe back after a failed update and records `version` as failed.
+fn roll_back(exe: &Path, version: &str) -> io::Result<()> {
+    unswap(exe, &staged(exe), &retired(exe))?;
+    if let Err(e) = fs::write(failed_marker(exe), version) {
+        tracing::warn!("failed update not recorded, it may be installed again: {e}");
+    }
+    Ok(())
+}
+
+/// In a daemon started with [`AFTER_UPDATE_ARG`], once it serves the pipe: tells the watchdog the
+/// update works. The file's existence is the signal, so one create is atomic.
+pub fn signal_ready() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    if let Err(e) = fs::write(ready_marker(&exe), b"") {
+        tracing::warn!("update ready marker not written: {e}");
+    }
+}
+
+/// Starts `exe` as a daemon after an update. With `stdin` piped it waits for this process to end;
+/// with null it takes the pipe at once.
+fn start(exe: &Path, settings: bool, stdin: Stdio) -> io::Result<Child> {
     let mut cmd = Command::new(exe);
-    cmd.arg(AFTER_UPDATE_ARG)
-        .stdin(Stdio::piped())
-        // The test hook would make the new daemon update itself again, in a loop.
-        .env_remove(update::FAKE_VERSION_ENV);
+    cmd.arg(AFTER_UPDATE_ARG).stdin(stdin);
     if settings {
         cmd.arg(OPEN_SETTINGS_ARG);
     }
-    let child = cmd
+    without_hook(&mut cmd)
         .spawn()
-        .inspect_err(|e| tracing::error!("new daemon not started: {e}"))?;
-    // Its stdin closes when this process ends: that is what the new daemon waits for.
-    std::mem::forget(child);
-    Ok(())
+        .inspect_err(|e| tracing::error!("new daemon not started: {e}"))
+}
+
+/// The test hook would make the next daemon update itself again, in a loop.
+fn without_hook(cmd: &mut Command) -> &mut Command {
+    cmd.env_remove(update::FAKE_VERSION_ENV)
 }
 
 /// In a daemon started by [`relaunch`]: returns once the old daemon ended (its end closes our
@@ -470,14 +595,14 @@ pub fn wait_for_parent() {
     }
 }
 
-/// At the start: the `.old` of the last update and a `.new` never swapped in are deleted (a
-/// `.new` is downloaded again by the next check).
-pub fn remove_leftovers() {
+/// Before the first check: the `.old` of the last update, a `.new` never swapped in (downloaded
+/// again by the check) and a ready marker no watchdog took are deleted.
+fn remove_leftovers() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
     let new = staged(&exe);
-    for path in [retired(&exe), part_path(&new), new] {
+    for path in [retired(&exe), part_path(&new), new, ready_marker(&exe)] {
         match fs::remove_file(&path) {
             Ok(()) => tracing::info!(file = ?path.file_name(), "update leftover removed"),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -511,6 +636,102 @@ mod tests {
             retired(single),
             Path::new(r"C:\d\OxiYapper-0.1.0-pre.12-windows-x64.old.exe")
         );
+        assert_eq!(
+            ready_marker(exe),
+            Path::new(r"C:\apps\OxiYapper\OxiYapper.update-ready")
+        );
+        assert_eq!(
+            failed_marker(exe),
+            Path::new(r"C:\apps\OxiYapper\OxiYapper.update-failed")
+        );
+    }
+
+    /// A stand-in for the new daemon: `cmd /C <script>`, its stdin held open by the test.
+    fn fake_daemon(script: &str) -> Child {
+        Command::new("cmd")
+            .args(["/C", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn the_watchdog_keeps_a_ready_daemon_and_kills_a_silent_one() {
+        let d = dir("ready");
+        let exe = d.join("OxiYapper.exe");
+        let ready = ready_marker(&exe);
+
+        // `pause` waits for its stdin, like a daemon that runs on.
+        let mut serving = fake_daemon("pause");
+        fs::write(&ready, b"").unwrap();
+        assert!(supervise(&mut serving, &ready, Duration::from_secs(20)));
+        assert!(!ready.exists(), "the marker is taken");
+        assert!(
+            serving.try_wait().unwrap().is_none(),
+            "a ready daemon runs on"
+        );
+        let _ = serving.kill();
+        let _ = serving.wait();
+
+        let mut silent = fake_daemon("pause");
+        let start = Instant::now();
+        assert!(!supervise(&mut silent, &ready, Duration::from_millis(300)));
+        assert!(start.elapsed() >= Duration::from_millis(300));
+        assert!(silent.try_wait().unwrap().is_some(), "killed");
+
+        // A start that fails is seen at once, not after the limit.
+        let start = Instant::now();
+        assert!(!supervise(
+            &mut fake_daemon("exit 3"),
+            &ready,
+            Duration::from_secs(20)
+        ));
+        assert!(start.elapsed() < Duration::from_secs(10));
+        // A clean end handed over to a daemon already running: kept.
+        assert!(supervise(
+            &mut fake_daemon("exit 0"),
+            &ready,
+            Duration::from_secs(20)
+        ));
+    }
+
+    #[test]
+    fn a_rollback_puts_the_old_exe_back_and_records_the_version() {
+        let (d, exe, new, old) = folder("rollback-ready");
+        fs::write(&new, b"new exe").unwrap();
+        swap(&exe, &new, &old).unwrap();
+        roll_back(&exe, "0.2.0").unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), b"old exe");
+        assert_eq!(fs::read(&new).unwrap(), b"new exe");
+        assert!(!old.exists());
+        assert_eq!(fs::read_to_string(failed_marker(&exe)).unwrap(), "0.2.0");
+        assert_eq!(fs::read(d.join("vcruntime140.dll")).unwrap(), b"dll");
+        // Nothing to put back: an error, and the exe stays.
+        assert!(roll_back(&exe, "0.2.0").is_err());
+        assert_eq!(fs::read(&exe).unwrap(), b"old exe");
+    }
+
+    #[test]
+    fn a_version_that_did_not_start_is_offered_not_installed() {
+        let mut r = rig(
+            "failed",
+            "0.1.0-pre.12",
+            releases("0.1.0-pre.13"),
+            sums("0.1.0-pre.13"),
+            good_file(),
+        );
+        fs::write(failed_marker(&r.updater.exe), "0.1.0-pre.13").unwrap();
+        assert!(r.updater.check(false).is_none());
+        assert!(matches!(
+            statuses(&r.pushes).last(),
+            Some(Status::Available { .. })
+        ));
+        assert!(!staged(&r.updater.exe).exists());
+        // Another version installs.
+        fs::write(failed_marker(&r.updater.exe), "0.1.0-pre.11").unwrap();
+        assert!(r.updater.check(false).is_some());
     }
 
     /// The exe folder of the portable zip, with KB-sized fakes.
