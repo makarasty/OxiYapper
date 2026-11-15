@@ -169,8 +169,8 @@ fn open_setup(window: &AppWindow, name: Option<&str>) -> Result<(), String> {
 
 fn open_tab(window: &AppWindow, page: Page, name: &str) -> Result<(), String> {
     let tabs: &[&str] = match page {
-        Page::Test => &["record", "results"],
-        Page::Audio => &["microphone", "recording", "start", "stop"],
+        Page::Test => &["record", "recordings", "results"],
+        Page::Audio => &["microphone", "recording", "sounds"],
         Page::Model => &["models", "languages", "speed", "accuracy"],
         Page::Text => &[
             "dictionary",
@@ -180,7 +180,7 @@ fn open_tab(window: &AppWindow, page: Page, name: &str) -> Result<(), String> {
             "commands",
         ],
         Page::Paste => &["paste", "file", "rules"],
-        Page::System => &["general", "history", "about"],
+        Page::System => &["general", "history", "updates", "about"],
         _ => &[],
     };
     // The map's names for the System tabs (ia-map 3.8) work too.
