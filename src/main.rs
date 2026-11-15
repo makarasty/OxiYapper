@@ -44,7 +44,8 @@ fn run_daemon(launch: Launch) {
 #[cfg(windows)]
 use daemon::Launch;
 #[cfg(not(windows))]
-type Launch = ();
+#[derive(Default)]
+struct Launch;
 
 #[cfg(not(windows))]
 fn run_daemon(_: Launch) {

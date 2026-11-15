@@ -289,8 +289,8 @@ fn get_text_with(policy: &Policy, url: &str, max: u64) -> Result<String, Downloa
 /// `sha256` (lowercase hex), renamed to `dest` only then. On any failure the `.part` is removed
 /// and `dest` is untouched. No resume: the file is small (the app exe).
 #[cfg_attr(
-    not(any(test, windows)),
-    expect(dead_code, reason = "only the Windows daemon updates itself for now")
+    not(windows),
+    allow(dead_code, reason = "only the Windows daemon updates itself for now")
 )]
 pub fn download_file(
     url: &str,
