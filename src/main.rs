@@ -45,7 +45,10 @@ fn run_daemon(launch: Launch) {
 use daemon::Launch;
 #[cfg(not(windows))]
 #[derive(Default)]
-struct Launch;
+struct Launch {
+    // A field, not a unit struct: `Launch::default()` at the call site is shared with Windows.
+    _off_windows: (),
+}
 
 #[cfg(not(windows))]
 fn run_daemon(_: Launch) {
