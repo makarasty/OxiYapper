@@ -1,0 +1,168 @@
+// Buttons (DS-5 to DS-7). Our own, because std `Button { primary }` paints the system accent. Every
+// button has a fill at rest (DS-7.5): `secondary` and `danger` are framed, `soft` and the icon
+// button sit on the soft surface.
+import { Theme } from "../tokens.slint";
+import { FocusRing, KeyFocus, Tip } from "base.slint";
+
+// `soft` is the low-weight button with a rest fill.
+export enum ButtonKind { primary, secondary, danger, icon, soft }
+
+// Height 32, radius 4, padding 12, min width 88 so action rows align. Icon and label are one group
+// centred at whole pixels, 8 px apart (DS-7.1, crisp text [22]). `icon` buttons are 32x32 with
+// only the glyph (prefer `IconButton`); their `text` is the accessible label and the tooltip. A
+// disabled button needs a reason: put it in `tooltip` (or in the row description).
+export component Button {
+    in property <string> text;
+    in property <image> icon;
+    in property <ButtonKind> kind: ButtonKind.secondary;
+    in property <bool> enabled: true;
+    in property <string> tooltip;
+    // A Remove that is an `icon` button turns red under the pointer as `danger` does (UI rule 16).
+    in property <bool> destructive;
+    // A toggled icon button (the Hotkey pencil while its panel is open): tint fill, accent glyph (DS-6.5).
+    in property <bool> toggled;
+    // A kept draft behind the button (the Hotkey pencil, DS-28.3): a 6 px accent dot in the top-right corner of its box.
+    in property <bool> kept-dot;
+    // Static shots have no mouse: the gallery forces the states.
+    in property <bool> force-hover;
+    in property <bool> force-pressed;
+    in property <bool> force-focus;
+    callback clicked;
+
+    // For a control that replaces the focused one: `ring` says if the keyboard did it (UI rule 17).
+    public function take-focus(ring: bool) {
+        fs.focus();
+        root.key-focus = ring;
+    }
+
+    property <bool> framed: root.kind == ButtonKind.secondary || root.kind == ButtonKind.danger;
+    property <bool> is-icon: root.kind == ButtonKind.icon;
+    property <bool> hover: root.enabled && (touch.has-hover || root.force-hover);
+    property <bool> down: root.enabled && (touch.pressed || root.force-pressed);
+    // `danger` (Cancel, Remove, Stop) rests as a secondary button and turns red under the pointer.
+    out property <bool> red: (root.kind == ButtonKind.danger || root.destructive) && (root.hover || root.down);
+    property <bool> key-focus;
+    out property <bool> key-focused: root.key-focus && fs.has-focus;
+    property <color> ink: !root.enabled && root.kind == ButtonKind.primary ? Theme.bg-card : !root.enabled ? Theme.text-disabled : root.kind == ButtonKind.primary ? Theme.on-accent : root.red ? Theme.error-text : root.toggled ? Theme.accent-text : Theme.text-primary;
+    property <bool> has-icon: root.icon.width > 0;
+    property <bool> has-label: !root.is-icon && root.text != "";
+    // The icon+label group, laid out by hand so both land on whole pixels.
+    property <length> icon-w: root.has-icon ? Theme.icon-size-small : 0;
+    property <length> gap: root.has-icon && root.has-label ? Theme.pair-gap : 0;
+    property <length> label-w: root.has-label ? Theme.whole(words.preferred-width) : 0;
+    property <length> group-w: root.icon-w + root.gap + root.label-w;
+    property <length> group-x: Theme.whole((root.width - root.group-w) / 2);
+    // Exposed for the gallery's geometry readout (DS-6.2, DS-7.1, DS-7.2).
+    out property <length> icon-x: root.group-x;
+    out property <length> icon-y: Theme.whole((root.height - Theme.icon-size-small) / 2);
+    out property <length> label-x: root.group-x + root.icon-w + root.gap;
+    // Where the label's capitals are centred, from the top of the button (tests): the icon's centre line.
+    out property <length> label-mid: words.y + words.height / 2 + Theme.cap-lift;
+
+    forward-focus: fs;
+    height: Theme.control-height;
+    min-width: root.is-icon ? Theme.control-height : max(Theme.button-min-width, root.group-w + 2 * Theme.space-3);
+    // No limit but its row's for a labelled button (100000 px stands for none).
+    max-width: root.is-icon ? Theme.control-height : 100000px;
+    horizontal-stretch: 0;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-description: root.enabled ? "" : root.tooltip;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        if (root.enabled) {
+            root.clicked();
+        }
+    }
+
+    face := Rectangle {
+        border-radius: Theme.radius-control;
+        background: root.kind == ButtonKind.primary ? (!root.enabled ? Theme.text-disabled : root.down ? Theme.accent-pressed : root.hover ? Theme.accent-hover : Theme.accent) : root.red ? (root.down ? Theme.error-fill-pressed : Theme.error-fill) : root.toggled ? Theme.accent-tint : root.framed ? (!root.enabled ? Theme.bg-control.transparentize(0.5) : root.down ? Theme.bg-control-pressed : root.hover ? Theme.bg-control-hover : Theme.bg-control) : (root.down ? Theme.bg-soft-pressed : root.hover ? Theme.bg-soft-hover : Theme.bg-soft);
+        // 1 px hairline: the framed button's stroke.
+        border-width: root.framed ? 1px : 0;
+        border-color: root.red ? Theme.error-text.transparentize(0.7) : Theme.stroke-control;
+        animate background, border-color { duration: Theme.motion-quick; easing: ease-out; }
+        // Fluent's darker bottom edge on framed controls (1 px hairline).
+        Rectangle {
+            visible: root.framed;
+            x: Theme.radius-control;
+            y: parent.height - 1px;
+            width: parent.width - 2 * Theme.radius-control;
+            height: 1px;
+            background: root.red ? Theme.error-text.transparentize(0.5) : Theme.stroke-control-bottom;
+        }
+    }
+    if root.has-icon: Image {
+        x: root.icon-x;
+        y: root.icon-y;
+        source: root.icon;
+        width: Theme.icon-size-small;
+        height: Theme.icon-size-small;
+        colorize: root.ink;
+        accessible-role: none;
+        animate colorize { duration: Theme.motion-quick; easing: ease-out; }
+    }
+    words := Text {
+        visible: root.has-label;
+        x: root.label-x;
+        // Raised so the capitals, not the line box, are centred with the icon (DS-16.1).
+        y: -Theme.cap-lift;
+        height: root.height;
+        width: root.label-w;
+        text: root.text;
+        font-size: Theme.body-size;
+        color: root.ink;
+        vertical-alignment: center;
+        accessible-role: none;
+        animate color { duration: Theme.motion-quick; easing: ease-out; }
+    }
+    if root.kept-dot: Rectangle {
+        x: root.width - self.width - Theme.space-1;
+        y: Theme.space-1;
+        width: Theme.draft-dot-size;
+        height: Theme.draft-dot-size;
+        border-radius: Theme.radius-round;
+        background: Theme.accent;
+        accessible-role: none;
+    }
+    // Enabled even on a disabled button: its tooltip says why.
+    touch := TouchArea {
+        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+        clicked => {
+            if (root.enabled) {
+                root.clicked();
+            }
+        }
+    }
+    fs := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: false;
+        focus-gained(reason) => {
+            root.key-focus = KeyFocus.after(reason, root.key-focus);
+        }
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+    FocusRing {
+        shown: root.force-focus || root.key-focused;
+    }
+    Tip {
+        text: root.is-icon && root.enabled ? root.text : root.enabled ? "" : root.tooltip;
+        hovered: touch.has-hover;
+        pressed: touch.pressed;
+    }
+}
+
+// The one icon-only button (DS-6): a 32x32 box that takes hover and click everywhere, the soft
+// surface (visible at rest, so the hit area is seen), the 16 px glyph at (8, 8). `label` is its tooltip and accessible name; `destructive`
+// turns it red under the pointer. Replaces `ButtonKind.icon` and every page-local icon button.
+export component IconButton inherits Button {
+    in property <string> label;
+    kind: ButtonKind.icon;
+    text: root.label;
+}

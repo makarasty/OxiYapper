@@ -7,10 +7,10 @@
 mod state;
 mod types;
 
-pub use state::State;
+pub use state::{BOUNCE, State};
 pub use types::{
-    Effect, Effects, Event, JobId, MachineConfig, Mode, ModelFailure, Notice, OverlayState, Phase,
-    PhaseCell, Sound,
+    CancelWhy, Effect, Effects, EmptyAudio, EngineWarning, Event, JobId, MachineConfig, Mode,
+    ModelFailure, ModelIdentity, Note, Notice, OverlayState, Phase, PhaseCell, Sound,
 };
 
 use crate::types::Millis;
@@ -19,3 +19,6 @@ use crate::types::Millis;
 pub fn step(state: &mut State, event: Event, now: Millis) -> Effects {
     state.handle(event, now)
 }
+
+#[cfg(test)]
+mod edge_tests;

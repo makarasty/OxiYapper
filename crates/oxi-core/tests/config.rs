@@ -1,6 +1,6 @@
 use oxi_core::config::{
-    CURRENT_VERSION, Config, ConfigError, ConfigFile, MIGRATIONS, Migration, OverlayPosition,
-    PasteMode, PasteRule, Theme,
+    AppLanguage, CURRENT_VERSION, Config, ConfigError, ConfigFile, MIGRATIONS, Migration,
+    OverlayPosition, PasteMode, PasteRule, Theme,
 };
 use oxi_core::machine::Mode;
 use oxi_core::types::Language;
@@ -9,6 +9,16 @@ use toml_edit::{DocumentMut, Item};
 
 const FULL: &str = include_str!("fixtures/config/v1_full.toml");
 const UNKNOWN: &str = include_str!("fixtures/config/v1_unknown.toml");
+
+/// The v1 fixture as a save writes it back: version 2, and its `[sounds]` without the old
+/// `enabled = false` (ia-map S80), every sound Off instead, so it stays as silent as it was.
+fn full_saved() -> String {
+    let from = "[sounds]\nenabled = false\nvolume = 0.25\nstart = \"pop\"\nstop = 'C:\\Sounds\\stop.wav'\n";
+    let to = "[sounds]\nvolume = 0.25\nstart = \"off\"\nstop = \"off\"\ncancel = \"off\"\nerror = \"off\"\ndone_enabled = false\n";
+    assert!(FULL.contains(from), "the fixture's [sounds] changed");
+    FULL.replacen("version = 1", "version = 2", 1)
+        .replacen(from, to, 1)
+}
 
 #[test]
 fn version_matches_migration_count() {
@@ -25,9 +35,9 @@ fn v1_fixture_round_trips_byte_identical() {
     // The fixture differs from the defaults everywhere, so the typed values were really read.
     assert_ne!(file.config, Config::default());
     assert_eq!(file.config.hotkey.mode, Mode::Toggle);
-    assert_eq!(file.config.model.language, Language::Auto);
+    assert_eq!(file.config.model.language, Language::AUTO);
     assert_eq!(file.config.paste.rules.len(), 2);
-    assert_eq!(file.to_toml_string().unwrap(), FULL);
+    assert_eq!(file.to_toml_string().unwrap(), full_saved());
 }
 
 #[test]
@@ -41,18 +51,21 @@ fn defaults_round_trip() {
 #[test]
 fn default_values_match_the_spec() {
     let c = Config::default();
-    assert_eq!(c.audio.max_seconds, 600);
-    assert_eq!(c.model.language, Language::Ru);
+    assert_eq!(c.audio.max_seconds, 3600);
+    assert_eq!(c.model.language, Language::AUTO);
     assert_eq!(c.model.id, "turbo");
     assert_eq!(c.hotkey.chord, ["Ctrl", "Win"]);
-    assert!(!c.history.enabled);
+    assert!(c.history.enabled);
 }
 
 #[test]
 fn empty_file_gives_defaults() {
     let file = ConfigFile::parse("").unwrap();
-    assert_eq!(file.config, Config::default());
-    assert!(file.to_toml_string().unwrap().starts_with("version = 1\n"));
+    // A file with no `[ui]` predates the setup wizard: it counts as set up.
+    let mut want = Config::default();
+    want.ui.first_run_done = true;
+    assert_eq!(file.config, want);
+    assert!(file.to_toml_string().unwrap().starts_with("version = 2\n"));
 }
 
 #[test]
@@ -202,13 +215,13 @@ fn one_changed_value_changes_only_its_text() {
 
 #[test]
 fn hand_edited_comments_and_order_survive() {
-    let text = "# my mic\nversion = 1\n[audio]\ngain_db = 1.0 # loud\n";
+    let text = "# my mic\nversion = 2\n[audio]\ngain_db = 1.0 # loud\n";
     let mut file = ConfigFile::parse(text).unwrap();
     assert!(file.to_toml_string().unwrap().starts_with(text));
     file.config.audio.gain_db = 2.0;
     let out = file.to_toml_string().unwrap();
     assert!(
-        out.starts_with("# my mic\nversion = 1\n[audio]\ngain_db = 2.0 # loud\n"),
+        out.starts_with("# my mic\nversion = 2\n[audio]\ngain_db = 2.0 # loud\n"),
         "{out}"
     );
     assert_eq!(ConfigFile::parse(&out).unwrap().config, file.config);
@@ -248,6 +261,7 @@ fn rules_merge_by_app_not_by_index() {
         mode: Some(PasteMode::Type),
         chord: None,
         restore_delay_ms: Some(10),
+        ..PasteRule::default()
     });
     let out = file.to_toml_string().unwrap();
     let again = ConfigFile::parse(&out).unwrap();
@@ -291,7 +305,7 @@ fn overlay_position_values() {
 
 #[test]
 fn unknown_overlay_position_reports_its_line() {
-    let text = "version = 1\n[overlay]\nenabled = true\nposition = \"middle\"\n";
+    let text = "version = 2\n[overlay]\nenabled = true\nposition = \"middle\"\n";
     match ConfigFile::parse(text).unwrap_err() {
         ConfigError::Syntax { line, .. } => assert_eq!(line, 4),
         other => panic!("expected Syntax, got {other:?}"),
@@ -307,6 +321,7 @@ fn default_paste_rule_types_into_remote_desktop() {
             mode: Some(PasteMode::Type),
             chord: None,
             restore_delay_ms: None,
+            ..PasteRule::default()
         }]
     );
 }
@@ -337,7 +352,7 @@ fn deleting_every_rule_survives_a_reload() {
 
 #[test]
 fn minimal_file_stays_minimal() {
-    let text = "version = 1\n[audio]\ngain_db = 1.0\n";
+    let text = "version = 2\n[audio]\ngain_db = 1.0\n";
     assert_eq!(
         ConfigFile::parse(text).unwrap().to_toml_string().unwrap(),
         text
@@ -355,7 +370,7 @@ fn minimal_file_stays_minimal() {
 #[test]
 fn new_file_has_every_default() {
     let out = ConfigFile::default().to_toml_string().unwrap();
-    assert!(out.contains("max_seconds = 600"), "{out}");
+    assert!(out.contains("max_seconds = 3600"), "{out}");
     assert!(out.contains("app = \"mstsc.exe\""), "{out}");
 }
 
@@ -381,7 +396,7 @@ fn crlf_and_bom_survive_a_save() {
         );
     }
     // Lines this build adds to a CRLF file use CRLF too.
-    let mut file = ConfigFile::parse("version = 1\r\n[audio]\r\ngain_db = 1.0\r\n").unwrap();
+    let mut file = ConfigFile::parse("version = 2\r\n[audio]\r\ngain_db = 1.0\r\n").unwrap();
     file.config.model.id = "base".into();
     file.config.audio.tail_ms = 5;
     let out = file.to_toml_string().unwrap();
@@ -394,22 +409,22 @@ fn mixed_line_endings_normalise_to_the_dominant_one() {
     for (text, want) in [
         // Three CRLF lines, one LF line: CRLF wins.
         (
-            "version = 1\r\n# c\r\n[audio]\ngain_db = 1.0\r\n",
-            "version = 1\r\n# c\r\n[audio]\r\ngain_db = 1.0\r\n",
+            "version = 2\r\n# c\r\n[audio]\ngain_db = 1.0\r\n",
+            "version = 2\r\n# c\r\n[audio]\r\ngain_db = 1.0\r\n",
         ),
         // One CRLF line, three LF lines: LF wins.
         (
-            "version = 1\r\n# c\n[audio]\ngain_db = 1.0\n",
-            "version = 1\n# c\n[audio]\ngain_db = 1.0\n",
+            "version = 2\r\n# c\n[audio]\ngain_db = 1.0\n",
+            "version = 2\n# c\n[audio]\ngain_db = 1.0\n",
         ),
         // A tie goes to LF, or to CRLF in a BOM file.
         (
-            "version = 1\r\n[audio]\ngain_db = 1.0\r\n# c\n",
-            "version = 1\n[audio]\ngain_db = 1.0\n# c\n",
+            "version = 2\r\n[audio]\ngain_db = 1.0\r\n# c\n",
+            "version = 2\n[audio]\ngain_db = 1.0\n# c\n",
         ),
         (
-            "\u{feff}version = 1\r\n[audio]\ngain_db = 1.0\r\n# c\n",
-            "\u{feff}version = 1\r\n[audio]\r\ngain_db = 1.0\r\n# c\r\n",
+            "\u{feff}version = 2\r\n[audio]\ngain_db = 1.0\r\n# c\n",
+            "\u{feff}version = 2\r\n[audio]\r\ngain_db = 1.0\r\n# c\r\n",
         ),
     ] {
         let file = ConfigFile::parse(text).unwrap();
@@ -427,7 +442,7 @@ fn theme_round_trips_and_is_written_only_when_set() {
     ] {
         let file = ConfigFile::parse(&format!("[ui]\ntheme = \"{text}\"\n")).unwrap();
         assert_eq!(file.config.ui.theme, theme);
-        let mut minimal = ConfigFile::parse("version = 1\n").unwrap();
+        let mut minimal = ConfigFile::parse("version = 2\n").unwrap();
         minimal.config.ui.theme = theme;
         let out = minimal.to_toml_string().unwrap();
         assert_eq!(out.contains("[ui]"), theme != Theme::System, "{out}");
@@ -457,16 +472,328 @@ fn meter_sensitivity_is_clamped_on_load() {
 #[test]
 fn meter_sensitivity_survives_a_save() {
     // 1.1 has no exact f32: the save must not rewrite it as the widened f64.
-    let text = "version = 1\n[audio]\nmeter_sensitivity_db = 1.1\n";
+    let text = "version = 2\n[audio]\nmeter_sensitivity_db = 1.1\n";
     assert_eq!(
         ConfigFile::parse(text).unwrap().to_toml_string().unwrap(),
         text
     );
-    let mut minimal = ConfigFile::parse("version = 1\n").unwrap();
+    let mut minimal = ConfigFile::parse("version = 2\n").unwrap();
     minimal.config.audio.meter_sensitivity_db = -3.5;
     let out = minimal.to_toml_string().unwrap();
     assert!(
         out.contains("[audio]\nmeter_sensitivity_db = -3.5\n"),
         "{out}"
     );
+}
+
+#[test]
+fn language_values_load_and_unknown_code_is_a_config_error() {
+    let lang = |v: &str| ConfigFile::parse(&format!("[model]\nlanguage = \"{v}\"\n"));
+    for (text, want) in [
+        ("auto", Language::AUTO),
+        ("ru", Language::RU),
+        ("en", Language::EN),
+        ("zh", "zh".parse().unwrap()),
+        ("haw", "haw".parse().unwrap()),
+    ] {
+        assert_eq!(lang(text).unwrap().config.model.language, want, "{text}");
+    }
+    for bad in ["xx", "RU", "", "russian"] {
+        match lang(bad).unwrap_err() {
+            ConfigError::Syntax { line, message, .. } => {
+                assert_eq!(line, 2, "{bad}");
+                assert!(message.contains("unknown language code"), "{message}");
+            }
+            other => panic!("expected Syntax, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn any_whisper_language_round_trips() {
+    let mut file = ConfigFile::parse(FULL).unwrap();
+    file.config.model.language = "zh".parse().unwrap();
+    let text = file.to_toml_string().unwrap();
+    assert!(text.contains("language = \"zh\""));
+    let again = ConfigFile::parse(&text).unwrap();
+    assert_eq!(again.config.model.language.as_str(), "zh");
+    assert_eq!(again.to_toml_string().unwrap(), text);
+}
+
+#[test]
+fn recent_languages_and_app_language_default_and_round_trip() {
+    let c = Config::default();
+    assert_eq!(c.model.recent_languages, [Language::RU, Language::EN]);
+    assert_eq!(c.ui.language, AppLanguage::En);
+    // A v1 file without the new keys changes only its version line on a save (and its old
+    // sound switch, S80).
+    assert_eq!(
+        ConfigFile::parse(FULL).unwrap().to_toml_string().unwrap(),
+        full_saved()
+    );
+
+    let mut file = ConfigFile::default();
+    let zh = "zh".parse().unwrap();
+    file.config.model.use_language(zh);
+    assert_eq!(file.config.model.recent_languages, [zh, Language::RU]);
+    let again = ConfigFile::parse(&file.to_toml_string().unwrap()).unwrap();
+    assert_eq!(again.config, file.config);
+}
+
+#[test]
+fn use_language_keeps_the_last_two_distinct() {
+    let mut m = Config::default().model;
+    let de = "de".parse().unwrap();
+    m.use_language(Language::EN);
+    assert_eq!(m.recent_languages, [Language::EN, Language::RU]);
+    m.use_language(de);
+    assert_eq!(m.recent_languages, [de, Language::EN]);
+    m.use_language(de);
+    assert_eq!(m.recent_languages, [de, Language::EN]);
+    m.use_language(Language::AUTO);
+    assert_eq!(
+        (m.language, m.recent_languages),
+        (Language::AUTO, [de, Language::EN])
+    );
+}
+
+#[test]
+fn recent_languages_are_two_different_real_languages_on_load() {
+    let de: Language = "de".parse().unwrap();
+    let (ru, en, auto) = (Language::RU, Language::EN, Language::AUTO);
+    // (list in the file, list loaded, warned)
+    let table = [
+        ("\"ru\", \"en\"", [ru, en], false),
+        ("\"de\", \"ru\"", [de, ru], false),
+        ("\"auto\", \"ru\"", [ru, en], true),
+        ("\"ru\", \"ru\"", [ru, en], true),
+        ("\"auto\", \"auto\"", [ru, en], true),
+        ("\"en\", \"auto\"", [en, ru], true),
+        ("\"de\", \"de\"", [de, ru], true),
+    ];
+    for (list, want, warned) in table {
+        let file = ConfigFile::parse(&format!(
+            "[model]
+recent_languages = [{list}]
+"
+        ))
+        .unwrap();
+        assert_eq!(file.config.model.recent_languages, want, "{list}");
+        assert_eq!(file.warnings.len(), usize::from(warned), "{list}");
+        assert!(!want.contains(&auto));
+    }
+}
+
+#[test]
+fn keep_in_clipboard_history_defaults_on_for_files_without_the_key() {
+    // Older files have no such key: no migration needed, the default applies and nothing is added.
+    let file = ConfigFile::parse(FULL).unwrap();
+    assert!(file.config.paste.keep_in_clipboard_history);
+    assert!(
+        !file
+            .to_toml_string()
+            .unwrap()
+            .contains("keep_in_clipboard_history")
+    );
+    assert!(Config::default().paste.keep_in_clipboard_history);
+}
+
+#[test]
+fn press_enter_defaults_off_without_the_key_and_on_survives_a_save() {
+    let file = ConfigFile::parse(FULL).unwrap();
+    assert!(!file.config.paste.press_enter);
+    assert!(!file.to_toml_string().unwrap().contains("press_enter"));
+    let mut file = ConfigFile::parse(
+        "version = 2
+",
+    )
+    .unwrap();
+    file.config.paste.press_enter = true;
+    let out = file.to_toml_string().unwrap();
+    assert!(out.contains("press_enter = true"), "{out}");
+    assert!(ConfigFile::parse(&out).unwrap().config.paste.press_enter);
+}
+
+/// e08, owner 2026-11-12: on without the key; off and a rule's override survive a save.
+#[test]
+fn join_console_lines_defaults_on_and_off_or_a_rule_survives_a_save() {
+    let mut file = ConfigFile::parse("version = 2\n").unwrap();
+    assert!(file.config.paste.join_console_lines);
+    assert!(!file.to_toml_string().unwrap().contains("join"));
+    file.config.paste.join_console_lines = false;
+    file.config.paste.rules[0].join_lines = Some(true);
+    let out = file.to_toml_string().unwrap();
+    assert!(out.contains("join_console_lines = false"), "{out}");
+    let back = ConfigFile::parse(&out).unwrap().config.paste;
+    assert!(!back.join_console_lines);
+    assert_eq!(back.rules[0].join_lines, Some(true));
+}
+
+#[test]
+fn keep_in_clipboard_history_off_survives_a_save() {
+    let mut file = ConfigFile::parse(
+        "version = 2
+",
+    )
+    .unwrap();
+    file.config.paste.keep_in_clipboard_history = false;
+    let out = file.to_toml_string().unwrap();
+    assert!(out.contains("keep_in_clipboard_history = false"), "{out}");
+    let again = ConfigFile::parse(&out).unwrap();
+    assert!(!again.config.paste.keep_in_clipboard_history);
+}
+
+#[test]
+fn v1_idle_unload_zero_stays_never_and_immediately_is_explicit() {
+    let model = |body: &str| {
+        ConfigFile::parse(&format!("version = 1\n[model]\n{body}"))
+            .unwrap()
+            .config
+            .model
+    };
+    let old = model("idle_unload_minutes = 0\n");
+    assert_eq!(
+        (old.idle_unload_minutes, old.unload_immediately),
+        (0, false)
+    );
+    let now = model("unload_immediately = true\n");
+    assert!(now.unload_immediately);
+    assert!(!Config::default().model.unload_immediately);
+}
+
+#[test]
+fn sound_defaults_and_values_load() {
+    let s = Config::default().sounds;
+    assert_eq!(
+        (s.start.as_str(), s.stop.as_str()),
+        ("apa-hit-3", "apa-hit-2")
+    );
+    assert_eq!(s.volume.to_bits(), 0.5_f64.to_bits());
+    let file = ConfigFile::parse(FULL).unwrap();
+    assert!(file.warnings.is_empty(), "{:?}", file.warnings);
+    // The fixture's sounds were silenced by the old `enabled = false`: still silent, now per
+    // sound, so the page shows what plays (S80).
+    let s = &file.config.sounds;
+    for (key, value) in [
+        ("start", &s.start),
+        ("stop", &s.stop),
+        ("cancel", &s.cancel),
+        ("error", &s.error),
+    ] {
+        assert_eq!(value, "off", "{key}");
+    }
+    assert!(!s.done_enabled);
+    // An old `enabled = true` changes nothing but goes from the file.
+    let on = ConfigFile::parse("version = 2\n[sounds]\nenabled = true\nstart = \"pop\"\n").unwrap();
+    assert_eq!(on.config.sounds.start, "pop");
+    assert_eq!(
+        on.to_toml_string().unwrap(),
+        "version = 2\n[sounds]\nstart = \"pop\"\n"
+    );
+    let again = ConfigFile::parse(&file.to_toml_string().unwrap()).unwrap();
+    assert_eq!(
+        again.config.sounds, file.config.sounds,
+        "a second load changes nothing"
+    );
+}
+
+#[test]
+fn unknown_sound_ids_and_bad_volume_fall_back_with_a_warning() {
+    let file =
+        ConfigFile::parse("[sounds]\nstart = \"nope\"\nstop = \"pop\"\nvolume = 3.0\n").unwrap();
+    let s = &file.config.sounds;
+    assert_eq!((s.start.as_str(), s.stop.as_str()), ("apa-hit-3", "pop"));
+    assert_eq!(s.volume.to_bits(), 1.0_f64.to_bits());
+    assert_eq!(file.warnings.len(), 2, "{:?}", file.warnings);
+    assert!(
+        file.warnings[1].contains("sounds.start"),
+        "{:?}",
+        file.warnings
+    );
+    // A wrong type is a config error, not a silent default.
+    assert!(ConfigFile::parse("[sounds]\nstart = 3\n").is_err());
+    let nan = ConfigFile::parse("[sounds]\nvolume = nan\n").unwrap();
+    assert_eq!(nan.config.sounds.volume.to_bits(), 0.5_f64.to_bits());
+}
+
+#[test]
+fn a_custom_wav_path_is_kept_and_survives_a_save() {
+    let text = "version = 2\n[sounds]\nstart = 'D:\\a\\b.wav'\n";
+    let file = ConfigFile::parse(text).unwrap();
+    assert_eq!(file.warnings, [] as [String; 0]);
+    assert_eq!(file.config.sounds.start, r"D:\a\b.wav");
+    assert_eq!(file.to_toml_string().unwrap(), text);
+    let mut changed = file.clone();
+    changed.config.sounds.start = r"E:\x y\c.wav".into();
+    let again = ConfigFile::parse(&changed.to_toml_string().unwrap()).unwrap();
+    assert_eq!(again.config.sounds.start, r"E:\x y\c.wav");
+}
+
+#[test]
+fn history_defaults_and_values_load() {
+    let h = Config::default().history;
+    assert_eq!(
+        (h.enabled, h.max_bytes, h.max_days, h.folder.as_str()),
+        (true, 2_147_483_648, 30, "")
+    );
+    // A file from before the age limit and the folder keeps the defaults for them.
+    let old = ConfigFile::parse("[history]\nenabled = true\nmax_bytes = 5\n").unwrap();
+    assert_eq!(
+        (
+            old.config.history.max_days,
+            old.config.history.folder.as_str()
+        ),
+        (30, "")
+    );
+    let file = ConfigFile::parse(FULL).unwrap();
+    let h = &file.config.history;
+    assert_eq!(
+        (h.enabled, h.max_bytes, h.max_days, h.folder.as_str()),
+        (true, 1_048_576, 7, r"D:\Dictations")
+    );
+}
+
+#[test]
+fn v1_history_off_becomes_on_and_is_reported() {
+    let file =
+        ConfigFile::parse("version = 1\n[history]\nenabled = false # old\nmax_days = 7\n").unwrap();
+    assert!(file.config.history.enabled);
+    assert!(file.history_turned_on);
+    let out = file.to_toml_string().unwrap();
+    assert_eq!(
+        out,
+        "version = 2\n[history]\nenabled = true # old\nmax_days = 7\n"
+    );
+    // The saved file is v2: loading it again reports nothing.
+    let back = ConfigFile::parse(&out).unwrap();
+    assert!(back.config.history.enabled && !back.history_turned_on);
+}
+
+#[test]
+fn v1_file_without_an_explicit_off_reports_nothing() {
+    for text in [
+        "",
+        "version = 1\n",
+        "version = 1\n[history]\nenabled = true\n",
+    ] {
+        let file = ConfigFile::parse(text).unwrap();
+        assert!(
+            file.config.history.enabled && !file.history_turned_on,
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn v2_history_off_stays_off_and_round_trips() {
+    let text = "version = 2\n[history]\nenabled = false\n";
+    let file = ConfigFile::parse(text).unwrap();
+    assert!(!file.config.history.enabled && !file.history_turned_on);
+    assert_eq!(file.to_toml_string().unwrap(), text);
+}
+
+#[test]
+fn a_newer_file_with_history_off_is_not_migrated() {
+    let file = ConfigFile::parse("version = 99\n[history]\nenabled = false\n").unwrap();
+    assert!(file.read_only && !file.config.history.enabled && !file.history_turned_on);
 }

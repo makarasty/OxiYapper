@@ -1,12 +1,15 @@
 # cargo-deny: licences, advisories, bans, sources. Run: cargo deny check
 [graph]
 all-features = false
-# iOS-only i-slint-renderer-skia (GPL option) is not in these targets, so it is not checked.
+# i-slint-renderer-skia (Windows settings window) has the Slint licence exception below.
 targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "x86_64-apple-darwin", "aarch64-apple-darwin"]
 
 [advisories]
 # RustSec advisories fail the check; an ignore needs an id and a reason here.
 ignore = []
+# "Unmaintained" fails only for our direct dependencies: transitive ones (pin-utils, ttf-parser, zbus_names,
+# zvariant via slint, 2026-11) are not ours to replace. Vulnerabilities still fail for the whole tree.
+unmaintained = "workspace"
 
 [licenses]
 confidence-threshold = 0.9
@@ -39,8 +42,18 @@ exceptions = [
     { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "i-slint-compiler" },
     { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "i-slint-core" },
     { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "i-slint-core-macros" },
+    { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "i-slint-renderer-skia" },
     { allow = ["LicenseRef-Slint-Royalty-free-2.0"], crate = "i-slint-renderer-software" },
     { allow = ["MPL-2.0"], crate = "option-ext" }, # directories -> dirs-sys; file-level copyleft, unmodified
+# Symphonia (History: transcribe a file) is MPL-2.0 too; these crates only, no other exception.
+    { allow = ["MPL-2.0"], crate = "symphonia" }, # file-level copyleft, unmodified
+    { allow = ["MPL-2.0"], crate = "symphonia-bundle-flac" }, # file-level copyleft, unmodified
+    { allow = ["MPL-2.0"], crate = "symphonia-bundle-mp3" }, # file-level copyleft, unmodified
+    { allow = ["MPL-2.0"], crate = "symphonia-codec-aac" }, # file-level copyleft, unmodified
+    { allow = ["MPL-2.0"], crate = "symphonia-core" }, # file-level copyleft, unmodified
+    { allow = ["MPL-2.0"], crate = "symphonia-format-isomp4" }, # file-level copyleft, unmodified
+    { allow = ["MPL-2.0"], crate = "symphonia-metadata" }, # file-level copyleft, unmodified
+    { allow = ["MPL-2.0"], crate = "symphonia-utils-xiph" }, # file-level copyleft, unmodified
 ]
 
 [bans]

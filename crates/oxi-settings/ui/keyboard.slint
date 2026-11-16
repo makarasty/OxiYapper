@@ -1,0 +1,61 @@
+// The full visual keyboard of the hotkey picker: bright caps, crisp 1 px stroke, a solid fill when
+// picked. `pages::keyboard_layout` places the keys; this file scales them with the window.
+import { Theme, Keycap } from "theme/index.slint";
+
+export struct KeyCap {
+    // `Key::as_str` ("LCtrl"), sent back on a click.
+    name: string,
+    // The text on the cap: `label` from a key unit of `full-from` px, `short` below it.
+    label: string,
+    short: string,
+    full-from: float,
+    // The accessible label, `keyboard_layout::spoken` ("Left Ctrl"): unique on the board.
+    spoken: string,
+    // Position and size in key units.
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    // Physically down now (hotkey capture).
+    held: bool,
+    // In the pending chord.
+    picked: bool,
+    // In the pending chord but not allowed there (Esc).
+    invalid: bool,
+}
+
+export component Keyboard inherits Rectangle {
+    in property <[KeyCap]> caps;
+    // Board size in key units.
+    in property <float> columns: 1;
+    in property <float> rows: 1;
+    // The height the board may take; the unit shrinks to it, down to the 28 px floor.
+    in property <length> room: 1000px;
+    callback clicked(string);
+    // Spec 5.1: 28..52 px. The first and last caps line up with the heading and the buttons (the
+    // 3 px are the half gaps outside them); the 28 px board of the smallest window takes the card's
+    // padding, and the board is centred when it stops growing at 52.
+    property <length> unit: clamp((root.width + 3px) / root.columns, 28px, max(28px, min(52px, root.room / root.rows)));
+    property <length> gap: Theme.keycap-gap-for(root.unit);
+    property <length> left: (root.width - root.unit * root.columns) / 2;
+    height: root.unit * root.rows;
+    for cap in root.caps: Keycap {
+        x: root.left + cap.x * root.unit + root.gap / 2;
+        y: cap.y * root.unit + root.gap / 2;
+        width: cap.w * root.unit - root.gap;
+        height: cap.h * root.unit - root.gap;
+        unit: root.unit;
+        label: root.unit >= cap.full-from * 1px ? cap.label : cap.short;
+        // Keycap draws picked and held over invalid; Esc must stay red while pressed.
+        picked: cap.picked && !cap.invalid;
+        held: cap.held && !cap.invalid;
+        invalid: cap.invalid;
+        spoken: cap.spoken;
+        accessible-label: cap.spoken;
+        accessible-checked: cap.picked;
+        accessible-description: cap.held ? "held" : "";
+        clicked => {
+            root.clicked(cap.name);
+        }
+    }
+}

@@ -1,0 +1,26 @@
+---
+source: crates/oxi-core/tests/stats.rs
+expression: "String::from_utf8(json).unwrap()"
+---
+{
+  "version": 1,
+  "before": {
+    "dictations": 0,
+    "words": 0,
+    "speech_ms": 0
+  },
+  "days": [
+    {
+      "date": "2026-11-06",
+      "dictations": 1,
+      "words": 12,
+      "speech_ms": 4500
+    },
+    {
+      "date": "2026-11-07",
+      "dictations": 1,
+      "words": 3,
+      "speech_ms": 900
+    }
+  ]
+}

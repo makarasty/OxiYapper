@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// One GPU that whisper.cpp can run on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Device {
     /// ggml device name, e.g. `Vulkan0`. Stable key for the config.
     pub name: String,
@@ -12,6 +12,18 @@ pub struct Device {
     pub description: String,
     /// Integrated GPU sharing system memory.
     pub uma: bool,
+}
+
+impl Device {
+    /// What the UI shows: the marketing name; `name` is the config key and stays out of sight
+    /// unless the driver gave no description.
+    pub fn display_name(&self) -> &str {
+        if self.description.is_empty() {
+            &self.name
+        } else {
+            &self.description
+        }
+    }
 }
 
 /// What the user picked: `[model] gpu = "auto" | "cpu" | "<device name>"`, or `--gpu`.
@@ -49,8 +61,8 @@ impl From<DeviceChoice> for String {
 pub struct Picked {
     /// Index in the device list, `None` = CPU.
     pub index: Option<usize>,
-    /// Set when a named device was not found and `Auto` was used instead.
-    pub warning: Option<String>,
+    /// A named device was not found and `Auto` was used instead.
+    pub missing: bool,
 }
 
 /// Auto: first discrete GPU, then first integrated one, then CPU.
@@ -66,20 +78,20 @@ pub fn pick(devices: &[Device], choice: &DeviceChoice) -> Picked {
     match choice {
         DeviceChoice::Auto => Picked {
             index: pick_auto(devices),
-            warning: None,
+            missing: false,
         },
         DeviceChoice::Cpu => Picked {
             index: None,
-            warning: None,
+            missing: false,
         },
         DeviceChoice::Named(name) => match devices.iter().position(|d| &d.name == name) {
             Some(i) => Picked {
                 index: Some(i),
-                warning: None,
+                missing: false,
             },
             None => Picked {
                 index: pick_auto(devices),
-                warning: Some(format!("GPU {name:?} not found, using auto")),
+                missing: true,
             },
         },
     }
@@ -127,8 +139,17 @@ mod tests {
         for (devices, choice, index, warns) in cases {
             let got = pick(&devices, &choice);
             assert_eq!(got.index, index, "{devices:?} {choice:?}");
-            assert_eq!(got.warning.is_some(), warns, "{devices:?} {choice:?}");
+            assert_eq!(got.missing, warns, "{devices:?} {choice:?}");
         }
+    }
+
+    #[test]
+    fn display_name_prefers_the_description() {
+        let mut d = dev("Vulkan0", false);
+        assert_eq!(d.display_name(), "Vulkan0");
+        d.description = "NVIDIA GeForce RTX 4070 SUPER".into();
+        assert_eq!(d.display_name(), "NVIDIA GeForce RTX 4070 SUPER");
+        assert_eq!(d.name, "Vulkan0");
     }
 
     #[test]

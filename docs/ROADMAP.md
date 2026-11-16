@@ -6,7 +6,7 @@ Each milestone fits one agent session and ends with checks anyone can run. Windo
 
 Owner data rule for every milestone: the 8 reference phrases, the owner's dictionary and replacements live in a private folder outside the repo, passed by path (`OXI_BENCH_DIR`). Nothing from it is ever committed, pasted into a test, or used as a fixture.
 
-## M0 - Workspace and gates (this change)
+## M0 - Workspace and gates
 
 Workspace (`oxi-core`, `oxi-whisper`, app at the root), lints, `deny.toml`, `_typos.toml`, `rustfmt.toml`, nextest config, CI gates, CONTRIBUTING, AGENTS.
 
@@ -43,7 +43,7 @@ Needs M3 and M4. On the owner's machine, through `bench` on the private phrases:
 - Audio defaults: normalise, trim, denoise, tail length, A/B on the same phrases.
 - Results go into `docs/research/bench-<date>.md` as numbers only (no phrase text, no audio).
 
-Done when: the document states keep or drop CUDA with the numbers; the CI CUDA job becomes blocking or is removed; defaults in `oxi-core::config` match the measured winners; **all 8 reference phrases give the same text as the owner's bench**.
+Done when: the document states keep or drop CUDA with the numbers; the CI CUDA job becomes blocking or is removed; defaults in `oxi-core::config` match the measured winners; **word edits against the owner's reference texts are not worse than the owner's bench** (owner decision 2026-11-06: defaults trim+normalise on; 25 vs 24 edits measured).
 
 ## M6 - Windows hotkey, tray, daemon wiring
 
@@ -53,9 +53,9 @@ Done when: on the owner's PC, holding Ctrl+Win, speaking and releasing pastes te
 
 ## M7 - Windows paste, all edge cases
 
-Needs M6. Modifier wait, UIPI check, clipboard snapshot/restore with sequence number, history and cloud exclusion, type mode, per-app rules, "Copy last text" tray item.
+Needs M6. Modifier wait, UIPI check, clipboard snapshot/restore with sequence number, cloud exclusion always and Win+V history exclusion by setting (default: kept in history), type mode only when chosen or the clipboard is locked, per-app rules, "Copy last text" tray item.
 
-Done when: QA checklist paste rows pass on Windows (Notepad, browser, Windows Terminal, RDP, an elevated Notepad, a game chat in type mode); Win+V history shows neither the dictation nor the restored item; platform smoke test for clipboard round trip runs in CI on Windows.
+Done when: QA checklist paste rows pass on Windows (Notepad, browser, Windows Terminal, RDP, an elevated Notepad, a game chat in type mode); by default Win+V history shows the dictation (on top for now; "second, under the earlier copy" is deferred, see the Win+V probe in the deferred list below) while Ctrl+V returns the earlier copy (an earlier copy excluded from history stays excluded), and neither when the setting is off; the cloud clipboard never gets the text; platform smoke test for clipboard round trip runs in CI on Windows.
 
 ## M8 - Windows overlay
 
@@ -65,7 +65,7 @@ Done when: the fullscreen game case passes (open chat, dictate, Enter sends the 
 
 ## M9 - Settings UI, IPC, config watch
 
-Needs M1; parallel with M6-M8. `oxi-settings` crate (Slint, software renderer), IPC messages, config writer (temp + rename), daemon watcher, hotkey picker with visual keyboard and capture mode, mic picker with live meter, model page with download progress, dictionary token counter, replacements editor, overlay position pickers, About with the "Made with Slint" badge. Add the Slint licence exception to `deny.toml`.
+Needs M1; parallel with M6-M8. `oxi-settings` crate (Slint), IPC messages, config writer (temp + rename), daemon watcher, hotkey picker with visual keyboard and capture mode, mic picker with live meter, model page with download progress, dictionary token counter, replacements editor, overlay position pickers, About with the "Made with Slint" badge. Add the Slint licence exception to `deny.toml`.
 
 Done when: Slint UI tests pass headless; changing the hotkey in settings takes effect in the daemon without restart; killing settings during hotkey capture restores the hotkey; a broken hand-edited config shows its line number.
 
@@ -104,3 +104,16 @@ Done when: dictation pastes on GNOME Wayland and KDE Wayland, or the unsupported
 Needs M11-M14. Full QA checklist on all three OSes, README with install and permissions per OS, CHANGELOG, SECURITY contact verified, release notes, tag `v1.0.0`.
 
 Done when: every QA row passes on Windows, macOS and Linux X11; CI `ci-ok` is green on the tag; the release has artifacts, SHA256SUMS and attestations for every target.
+
+## Deferred from the UI-polish run (2026-11-10)
+
+- Win+V "user copy on top" via `SetHistoryItemAsContent`: needs a probe on a separate Windows account or VM, never the owner's machine (live clipboard tests evict real Win+V entries).
+- Known limitation, `crates/oxi-core/src/paste/mod.rs` ~:676/:735: the user copies Y, then a files or password entry, then dictates while Y is still registering under a stalled history service; Y can be missing from Win+V. Verify with the same probe. Same probe for the 3-4 s dictation when a WinRT history call times out (safe fallback).
+- Test page wording: purpose and "sets" text; the shots had no history data (the "Run off" reason exists, `test.slint:399-400`).
+- `sound.rs:249-253` opens an audio stream per sound; the log now carries "sound played open_ms". Read a day of logs, then keep one warm stream if open is slow.
+- `history_list` rescans the folder per page (`src/daemon/ipc.rs:905-908`); fix: list ids once, read meta per page. Perf only.
+- `regen_icons` (`draw.rs:465-470`) does not write the window logo PNGs; the current PNGs match, risk only on the next mark change.
+- `SpeechHeard` is a level gate (`src/daemon/audio.rs:36-43`), not the earshot VAD; a design change outside UI polish.
+- Own Lock sound role is missing (`state.rs:514` replays Start).
+- Settings slider: 10 px start offset and the reserved Delete slot at 1920 wide; needs a pixel pass.
+- Test page Record/Stop has no glyph on purpose (`test.slint:420` keeps one width); a Phosphor copy glyph is not vendored.

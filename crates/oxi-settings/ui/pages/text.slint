@@ -1,0 +1,849 @@
+// Text page (SPEC Text, ia-map 3.2), in sub-tabs: dictionary.txt with how full its prompt budget
+// is, replace.txt with the lines it ignores, the filler words and phrase shortcuts, the
+// formatting (pause punctuation, unsure words) and the voice commands. How text is delivered is
+// the Paste page (paste.slint), which shares `TextState`.
+import { Theme, Shell, Icons, CapText, Group, Card, CardFrame, Caption, Row, Divider, ToggleRow, SliderRow, Combo, Segmented, TextField, SearchField, TextArea, TilePicker, Button, ButtonKind, IconButton, InfoTip, Tip, ProgressBar, Note, Severity, SubTabs, SubTabPane, GalleryTile, CardGrid, EmptyState, ScrollBox } from "../theme/index.slint";
+import { WarningSlot, Warnings } from "../theme/components/feedback.slint";
+import { SystemState } from "system.slint";
+
+export enum TextFile { dictionary, replacements }
+
+// How a text file was read. `converted`: UTF-16 or a BOM, Save writes plain UTF-8.
+// `not-text` and `unreadable` (an io error, its kind in `FileInfo.error`): the editor stays
+// empty and Save is off, so the file is never wiped.
+export enum FileState { ok, converted, not-text, unreadable }
+
+export struct FileInfo {
+    state: FileState,
+    error: string,
+    // What was on disk when the editor last matched it ("missing", or length and hash). Kept
+    // here so a rebind after Reset still knows it; Save writes only while the disk still has it.
+    base: string,
+    // Edited since the last load or save.
+    dirty: bool,
+    // Save or a re-check found the file changed on disk while the editor was dirty; `error`
+    // then names the read error if the file cannot be read now.
+    conflict: bool,
+}
+
+// One per-app paste rule. `mode`: 0 the global mode, 1 clipboard, 2 type. `name`: the app's name
+// from the last scan, empty when the scan did not find it. `icon`: its icon from the scan (none
+// before one ran). `hidden`: the search field filters it out; the row keeps its place in the model so
+// `rule-mode-picked` and `rule-removed` still count from the config's first rule.
+export struct PasteRuleRow {
+    app: string,
+    name: string,
+    mode: int,
+    icon: image,
+    hidden: bool,
+}
+
+// A word the model doubted in several dictations (hold item 41, candidate 6): the word as last
+// written, how often ("in 4 dictations") and what adding it costs of the dictionary's word-piece
+// limit; `over` is true when it would not fit.
+export struct DoubtRow {
+    word: string,
+    note: string,
+    cost: string,
+    over: bool,
+}
+
+// Filled and read by `pages::text`.
+export global TextState {
+    // The open sub-tab of Text: 0 Dictionary, 1 Replacements, 2 Words, 3 Formatting, 4 Voice commands.
+    in-out property <int> tab;
+    // The open sub-tab of Paste: 0 Paste, 1 Write to file, 2 Per-app rules.
+    in-out property <int> paste-tab;
+    in-out property <string> dictionary;
+    in property <FileInfo> dictionary-info;
+    // Tokens (word pieces) of the whole dictionary, and the most whisper keeps.
+    in property <int> tokens;
+    in property <int> budget;
+    // 1-based first line left out of the prompt (it and every line after it); 0 when all fit.
+    in property <int> dropped-from;
+    in-out property <string> replacements;
+    in property <FileInfo> replacements-info;
+    // Which lines have no "=>" and are ignored; empty when every line parses.
+    in property <string> bad-lines;
+    // 0 clipboard, 1 type.
+    in-out property <int> paste-mode;
+    in-out property <bool> trailing-space;
+    // The dictation stays in Win+V history (`paste.keep_in_clipboard_history`).
+    in-out property <bool> keep-history;
+    // One Enter after the whole text landed (`paste.press_enter`).
+    in-out property <bool> press-enter;
+    // Type mode's speed (`paste.type_speed`): 0 fast, 1 safe.
+    in-out property <int> type-speed;
+    // Line breaks become spaces in a classic cmd.exe console (`paste.join_console_lines`).
+    in-out property <bool> join-console-lines;
+    in-out property <float> restore-delay-ms;
+    in property <float> default-restore-delay-ms;
+    // Processing (`[text]`): every switch is off until the person turns it on.
+    in-out property <bool> pause-punctuation;
+    in-out property <float> pause-sentence-ms;
+    // 0 is off.
+    in-out property <float> pause-paragraph-ms;
+    in-out property <bool> filler-filter;
+    // One word per line.
+    in-out property <string> fillers;
+    in-out property <bool> voice-commands;
+    in-out property <bool> voice-line;
+    in-out property <bool> voice-paragraph;
+    in-out property <bool> voice-delete;
+    // The phrases of each command as one line, separated by commas.
+    in-out property <string> voice-line-phrases;
+    in-out property <string> voice-paragraph-phrases;
+    in-out property <string> voice-delete-phrases;
+    // Why each command's field is refused (a phrase another command has), by slot; empty: fine.
+    in property <[string]> voice-errors;
+    // One `trigger => text` per line; a backslash and n in the text is a line break.
+    in-out property <string> snippets;
+    in-out property <bool> confidence-filter;
+    // "Certainty needed" in percent (0.35 is 35): the slider binds both ways, so a reload reaches it.
+    in-out property <float> confidence-pct;
+    // The two style switches (`text.no_final_period`, `text.small_first_letter`; hold item 41,
+    // candidate 7): off until the person turns them on.
+    in-out property <bool> no-final-period;
+    in-out property <bool> small-first-letter;
+    // Suggestions from the person's own dictations (hold item 41, candidates 6-9): the why of each
+    // row's lightbulb, empty when none. Nothing changes until Apply.
+    in property <string> period-tip;
+    in property <string> small-tip;
+    in property <string> filler-tip;
+    in property <string> phrase-tip;
+    in property <string> certainty-tip;
+    // Words the model doubted in several dictations, the first few (the Dictionary's suggestion
+    // list), and how many there are in all.
+    in property <[DoubtRow]> doubted;
+    in property <int> doubted-count;
+    // History saving is on: a held part has a place to be kept, so the confidence filter can run.
+    // Follows the System page's switch, so a change made anywhere shows at once.
+    out property <bool> history-on: SystemState.history-on;
+    in property <[PasteRuleRow]> rules;
+    // To-file mode (`[output]`): 0 off, 1 also, 2 only; the format 0 md, 1 txt; the folder's name
+    // (empty while none is chosen, the whole path is its tip).
+    in-out property <int> file-mode;
+    in-out property <int> file-format;
+    in property <string> file-folder-name;
+    in property <string> file-folder;
+    // Writing is on, globally or in any app rule: with no folder the Folder row shows its "!".
+    in property <bool> file-wanted;
+    // Why the last dictation did not reach its file (the daemon's status warning); empty when it did.
+    in property <string> file-warning;
+    // The rule whose profile is open in the Per-app card, -1 for the list.
+    in-out property <int> profile-rule: -1;
+    in property <string> profile-name;
+    in property <string> profile-app;
+    in property <image> profile-icon;
+    // The choices of the profile's two long lists, "Default" first.
+    in property <[string]> language-names;
+    in property <[string]> model-names;
+    // The profile's values as indexes into those lists and the three-way ones (0 default, 1 on, 2
+    // off); the order is the fields of `profile-picked`.
+    in property <[int]> profile-values;
+    // The first item of each profile Combo, naming the global value: "Default (On)",
+    // "Default (Russian)"; in the order of `profile-values`.
+    in property <[string]> profile-defaults;
+    // How many rules the search field leaves visible.
+    in property <int> rule-matches;
+    // The search field of the rules list: filters the rules, offers the installed apps and a typed exe.
+    in-out property <string> query;
+    // What the field offers under it: installed apps with no rule yet (name as title, exe as caption,
+    // icon as picture), then one row for the typed exe: `hint` "add" to add it, "dup" when it already
+    // has a rule (`caption` says so).
+    in property <[GalleryTile]> suggestions;
+    // What the last Scan found: the shortcut's name as title, the exe as caption, its icon as
+    // picture; `checked` when the app has a rule.
+    in property <[GalleryTile]> found;
+    // `found` filtered by `popup-query`, the apps popup's grid.
+    in property <[GalleryTile]> grid;
+    in-out property <string> popup-query;
+    // The popup's filters beside its search, applied by `pages::text`: the kind (0 all, 1 apps, 2
+    // games), the source (an index into `source-names`, 0 all) and the order (0 by name, 1 biggest first).
+    in-out property <int> popup-type;
+    in-out property <int> popup-source;
+    in-out property <int> popup-sort;
+    // "All sources", then every source the last scan found something from.
+    in property <[string]> source-names;
+    // The glyph of the popup's first tile, which opens the file dialog for an .exe.
+    out property <image> browse-icon: Icons.browse-file;
+    // The rule a duplicate pick points at, for 600 ms: its row shows the accent tint and scrolls into view.
+    in property <string> flash-app;
+    // A scan runs on a worker; `scanned` once one has finished in this window.
+    in property <bool> scanning;
+    in property <bool> scanned;
+    // Paste > Per-app rules came into view: the first time, the apps are scanned for their icons and names.
+    callback per-app-shown();
+    // The page came into view: files with no unsaved edits are read again.
+    callback shown();
+    callback edited(TextFile, string);
+    callback save(TextFile);
+    callback open(TextFile);
+    callback reload(TextFile);
+    callback overwrite(TextFile);
+    callback paste-mode-picked(int);
+    callback trailing-space-toggled(bool);
+    callback keep-history-toggled(bool);
+    callback press-enter-toggled(bool);
+    callback type-speed-picked(int);
+    callback join-console-lines-toggled(bool);
+    callback restore-delay-changed(float);
+    callback pause-punctuation-toggled(bool);
+    callback pause-sentence-changed(float);
+    callback pause-paragraph-changed(float);
+    callback filler-filter-toggled(bool);
+    callback fillers-edited(string);
+    callback voice-commands-toggled(bool);
+    callback voice-toggled(int, bool);
+    callback voice-phrases-edited(int, string);
+    callback voice-reset();
+    callback snippets-edited(string);
+    callback confidence-filter-toggled(bool);
+    callback confidence-min-changed(float);
+    callback no-final-period-toggled(bool);
+    callback small-first-letter-toggled(bool);
+    // The Text page came into view: the history is read for the suggestions (the first time, and
+    // again once that read is a day old).
+    callback learn-shown();
+    // A suggestion's Apply (true) or Not now (false): 0 no full stop, 1 small first letter,
+    // 2 filler words, 3 phrase shortcut, 4 certainty needed.
+    callback suggestion(int, bool);
+    // A suggestion's "Check again": read the history anew.
+    callback recheck();
+    // A row of the doubted words: Add puts it in the dictionary, Not this one hides it.
+    callback doubt-added(int);
+    callback doubt-skipped(int);
+    callback rule-mode-picked(int, int);
+    // 0 language, 1 model, 2 to file, 3 dictionary, 4 replacements, 5 voice commands, 6 filler
+    // words, 7 pause punctuation, 8 join lines; the index into that field's list.
+    callback profile-picked(int, int);
+    callback profile-opened(int);
+    callback file-mode-picked(int);
+    callback file-format-picked(int);
+    callback file-folder-choose();
+    callback rule-removed(int);
+    // A row of the field's list: add the rule for this exe (a duplicate is refused: its rule flashes).
+    callback rule-picked(string);
+    callback query-edited(string);
+    callback popup-search(string);
+    // A tile of the popup: its app gets a rule, or loses it. The exe, not the index: the grid is filtered.
+    callback found-toggled(string);
+    callback scan();
+    // An .exe picked in a file dialog gets a rule.
+    callback browse-exe();
+}
+
+// An editor for one text file on its card: the text and one status line that never grows: an "i"
+// with what the file is for, the children (Reload and Overwrite take their place when the file
+// needs them), a "!" with how the file was read, Open file and Save.
+component FileEditor inherits Card {
+    in property <TextFile> file;
+    in property <string> name;
+    in property <string> label;
+    in property <string> description;
+    // The format, shown inside an empty editor.
+    in property <string> hint;
+    in property <FileInfo> info;
+    // What is wrong with the text itself; the file's own trouble comes first in the "!".
+    in property <string> warning;
+    // The height under the sub-tabs for this card; the editor takes what the status line leaves, at least its least (no most: a cap leaves an empty band at large sizes).
+    in property <length> room;
+    in-out property <string> text;
+    property <length> chrome: 2 * Theme.card-padding-v + Theme.space-2 + max(bar.preferred-height, bar.min-height);
+    property <length> editor-height: max(root.room - root.chrome, Theme.editor-min-height);
+    property <bool> readable: root.info.state != FileState.not-text && root.info.state != FileState.unreadable;
+    // A converted file has no edit yet, but Save is what rewrites it as UTF-8.
+    property <bool> can-save: root.readable && (root.info.dirty || root.info.state == FileState.converted);
+    property <bool> trouble: root.info.conflict || !root.readable;
+    property <string> file-alert: root.info.conflict ? (root.info.error != "" ? @tr("Could not read {} on disk: {}.", root.name, root.info.error) : @tr("{} changed on disk since it was loaded.", root.name))
+        : root.info.state == FileState.unreadable ? @tr("Could not read {}: {}.", root.name, root.info.error)
+        : root.info.state == FileState.not-text ? @tr("{} is not UTF-8 or UTF-16 text: fix it in a text editor.", root.name)
+        : "";
+    // A converted file reads fine: its note comes after what is wrong with the text.
+    property <string> warnings: Warnings.both(Warnings.both(root.file-alert, root.warning), root.info.state == FileState.converted ? @tr("Saved as UTF-16 or with a BOM: Save rewrites it as UTF-8.") : "");
+    property <string> alert: root.warnings != "" ? root.warnings : root.info.dirty ? @tr("Unsaved changes") : "";
+    FocusScope {
+        height: root.editor-height;
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
+        capture-key-pressed(event) => {
+            // Ctrl+S on an English, a Russian or a Ukrainian layout.
+            if (event.modifiers.control && (event.text == "s" || event.text == "S" || event.text == "ы" || event.text == "Ы" || event.text == "і" || event.text == "І")) {
+                if (root.can-save) {
+                    TextState.save(root.file);
+                }
+                return accept;
+            }
+            reject
+        }
+        TextArea {
+            width: 100%;
+            height: 100%;
+            text <=> root.text;
+            // A read-only config locks the config only: this file is written on its own.
+            locked: false;
+            enabled: root.readable;
+            // An unreadable file must not look like an empty one: say why inside the editor.
+            placeholder-text: root.readable ? root.hint : root.file-alert;
+            accessible-label: root.label;
+            edited(text) => {
+                TextState.edited(root.file, text);
+            }
+        }
+    }
+    bar := HorizontalLayout {
+        spacing: Theme.control-gap;
+        VerticalLayout {
+            alignment: center;
+            InfoTip {
+                text: root.description;
+            }
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+            min-width: status.min-width;
+            min-height: status.min-height;
+            Rectangle {
+                visible: !root.trouble;
+                status := VerticalLayout {
+                    alignment: center;
+                    @children
+                }
+            }
+            if root.trouble: HorizontalLayout {
+                alignment: start;
+                spacing: Theme.control-gap;
+                Button {
+                    text: @tr("Reload");
+                    accessible-label: @tr("Reload {}", root.name);
+                    clicked => {
+                        TextState.reload(root.file);
+                    }
+                }
+                if root.info.conflict: Button {
+                    text: @tr("Overwrite");
+                    kind: ButtonKind.danger;
+                    accessible-label: @tr("Overwrite {}", root.name);
+                    clicked => {
+                        TextState.overwrite(root.file);
+                    }
+                }
+            }
+        }
+        WarningSlot {
+            text: root.alert;
+        }
+        VerticalLayout {
+            alignment: center;
+            Button {
+                text: @tr("Open file");
+                icon: Icons.open-external;
+                kind: ButtonKind.soft;
+                accessible-label: @tr("Open {}", root.name);
+                clicked => {
+                    TextState.open(root.file);
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Button {
+                text: @tr("Save");
+                kind: root.info.dirty ? ButtonKind.primary : ButtonKind.secondary;
+                enabled: root.can-save;
+                tooltip: root.readable ? @tr("No changes to save") : @tr("The file could not be read");
+                accessible-label: @tr("Save {}", root.name);
+                clicked => {
+                    TextState.save(root.file);
+                }
+            }
+        }
+    }
+}
+
+// One tab in view, so the page needs no scroll at the minimum size (UI rule 25); the editors
+// scroll inside their own area (rule 26).
+export component TextPage inherits VerticalLayout {
+    // The shell's room under the page title, banners already taken off: what the editors share
+    // out so a tab fits without the page scrolling.
+    in property <length> free-height;
+    // The command rows while "Use voice commands" is off: still editable, shown quieter (they run nothing).
+    property <float> voice-dim: TextState.voice-commands ? 1 : 0.6;
+    property <length> room: root.free-height - tabs.preferred-height - Theme.space-4;
+    // Words: the two editors share what the room leaves after both cards' padding, the
+    // toggle and the two headers, so the tab never scrolls as a page; each keeps three rows.
+    property <length> words-min: 3 * Theme.control-height;
+    property <length> words-height: max(root.words-min, (root.room - Theme.card-gap - 4 * Theme.card-padding-v - 3 * Theme.row-height - 3 * Theme.space-2) / 2);
+    // The window's width, from the shell (kept for the shell's call).
+    in property <length> window-width;
+    alignment: start;
+    spacing: Theme.space-4;
+    init => {
+        TextState.shown();
+        TextState.learn-shown();
+    }
+    tabs := SubTabs {
+        items: [@tr("Dictionary"), @tr("Replacements"), @tr("Words"), @tr("Formatting"), @tr("Voice commands")];
+        selected: TextState.tab;
+        picked(i) => {
+            TextState.tab = i;
+        }
+    }
+    Rectangle {
+        // No group titles: the sub-tab says it (UI rule 29).
+        SubTabPane {
+            shown: TextState.tab == 0;
+            VerticalLayout {
+                alignment: start;
+                // The purpose is in the empty editor and the "i", not a loose line (UI rule 35).
+                FileEditor {
+                    file: TextFile.dictionary;
+                    name: "dictionary.txt";
+                    label: @tr("Dictionary");
+                    // The count is here, the bar shows the share (ia-map S41, SPEC:39).
+                    description: @tr("Names and rare words Whisper should know, one per line. A word it always mishears? Fix it in Replacements. Now {} of {} word pieces.", TextState.tokens, TextState.budget);
+                    hint: @tr("Names and rare words Whisper should know, one per line");
+                    info: TextState.dictionary-info;
+                    warning: TextState.dropped-from > 0 ? @tr("Over the limit: line {} and after are not sent.", TextState.dropped-from) : "";
+                    room: root.room;
+                    text <=> TextState.dictionary;
+                    HorizontalLayout {
+                        spacing: Theme.control-gap;
+                        ProgressBar {
+                            horizontal-stretch: 1;
+                            value: TextState.tokens / max(TextState.budget, 1);
+                            error: TextState.dropped-from > 0;
+                            label: @tr("{} % full", Math.round(100 * TextState.tokens / max(TextState.budget, 1)));
+                            accessible-label: self.label;
+                            accessible-description: @tr("{} of {} word pieces", TextState.tokens, TextState.budget);
+                        }
+                        // Words Whisper doubted in your dictations (hold item 41, candidate 6). The
+                        // button keeps the width of its longest label, so a count never moves the bar.
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: max(wide.min-width, doubts.min-width);
+                                height: Theme.control-height;
+                                wide := Button {
+                                    visible: false;
+                                    text: @tr("No suggestions");
+                                    icon: Icons.suggestion;
+                                    kind: ButtonKind.soft;
+                                }
+                                doubts := Button {
+                                    width: parent.width;
+                                    text: TextState.doubted-count == 0 ? @tr("No suggestions") : TextState.doubted-count == 1 ? @tr("1 suggestion") : @tr("{} suggestions", TextState.doubted-count);
+                                    icon: Icons.suggestion;
+                                    kind: ButtonKind.soft;
+                                    enabled: TextState.doubted-count > 0;
+                                    tooltip: @tr("Words Whisper doubted in 3 or more of your dictations show up here");
+                                    clicked => {
+                                        doubt-list.show();
+                                    }
+                                }
+                                // Opens above the button, to its left: the footer is at the card's bottom.
+                                doubt-list := PopupWindow {
+                                    x: parent.width - self.width;
+                                    y: -self.height - Theme.space-1;
+                                    width: 360px;
+                                    close-policy: close-on-click-outside;
+                                    Rectangle {
+                                        background: Theme.bg-control;
+                                        border-width: 1px;
+                                        border-color: Theme.stroke-control;
+                                        border-radius: Theme.radius-card;
+                                        VerticalLayout {
+                                            padding: Theme.space-3;
+                                            spacing: Theme.space-2;
+                                            for d[i] in TextState.doubted: HorizontalLayout {
+                                                spacing: Theme.control-gap;
+                                                VerticalLayout {
+                                                    alignment: center;
+                                                    horizontal-stretch: 1;
+                                                    Text {
+                                                        text: d.word;
+                                                        color: Theme.text-primary;
+                                                        font-size: Theme.body-size;
+                                                        overflow: elide;
+                                                    }
+                                                    Caption {
+                                                        text: d.note;
+                                                    }
+                                                    Caption {
+                                                        text: d.cost;
+                                                        wrap: word-wrap;
+                                                        color: d.over ? Theme.warning-text : Theme.text-secondary;
+                                                    }
+                                                }
+                                                VerticalLayout {
+                                                    alignment: center;
+                                                    Button {
+                                                        text: @tr("Not this one");
+                                                        accessible-label: @tr("Not this one: {}", d.word);
+                                                        clicked => {
+                                                            TextState.doubt-skipped(i);
+                                                            if (TextState.doubted.length == 0) {
+                                                                doubt-list.close();
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                VerticalLayout {
+                                                    alignment: center;
+                                                    Button {
+                                                        text: @tr("Add");
+                                                        kind: ButtonKind.primary;
+                                                        accessible-label: @tr("Add {} to the dictionary", d.word);
+                                                        clicked => {
+                                                            TextState.doubt-added(i);
+                                                            if (TextState.doubted.length == 0) {
+                                                                doubt-list.close();
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        SubTabPane {
+            shown: TextState.tab == 1;
+            VerticalLayout {
+                alignment: start;
+                FileEditor {
+                    file: TextFile.replacements;
+                    name: "replace.txt";
+                    label: @tr("Replacements");
+                    description: @tr("Fixes a word Whisper always gets wrong: heard => wanted, one per line. Applied after transcription.");
+                    hint: @tr("heard => wanted, like wisper => Whisper: fixes a word it always gets wrong");
+                    info: TextState.replacements-info;
+                    warning: TextState.bad-lines;
+                    room: root.room;
+                    text <=> TextState.replacements;
+                    if TextState.bad-lines == "": Note {
+                        text: @tr("All lines valid");
+                        severity: Severity.success;
+                    }
+                }
+            }
+        }
+        SubTabPane {
+            shown: TextState.tab == 2;
+            VerticalLayout {
+                alignment: start;
+                Group {
+                    Card {
+                        ToggleRow {
+                            flat: true;
+                            title: @tr("Remove filler words");
+                            info: @tr("Removes the words below, with their comma: \"Ну, э, привет\" becomes \"Ну, привет\"; \"Um, hello\" becomes \"Hello\".");
+                            checked <=> TextState.filler-filter;
+                            toggled(on) => {
+                                TextState.filler-filter-toggled(on);
+                            }
+                        }
+                        fillers-row := Row {
+                            title: @tr("Filler words");
+                            info: @tr("Filler words to drop, like um or ну: one per line, any case, whole words only.");
+                            can-suggest: true;
+                            suggestion: TextState.filler-tip;
+                            suggestion-accepted => {
+                                TextState.suggestion(2, true);
+                            }
+                            suggestion-dismissed => {
+                                TextState.suggestion(2, false);
+                            }
+                            suggestion-refresh => {
+                                TextState.recheck();
+                            }
+                            text-only: true;
+                            field-live: TextState.filler-filter;
+                        }
+                        fillers-area := TextArea {
+                            width: 100%;
+                            preferred-height: root.words-height;
+                            min-height: root.words-min;
+                            enabled: TextState.filler-filter;
+                            pick: fillers-row.field-pick;
+                            text <=> TextState.fillers;
+                            placeholder-text: @tr("Filler words to drop, one per line: um, ну");
+                            accessible-label: @tr("Filler words");
+                            edited(text) => {
+                                TextState.fillers-edited(text);
+                            }
+                        }
+                    }
+                    Card {
+                        snippets-row := Row {
+                            title: @tr("Phrase shortcuts");
+                            info: @tr("When you say only the trigger, the text takes its place: \"мой адрес => ул. Ленина, 1\" or \"my email => me@example.com\". The trigger must be the whole dictation: inside a longer sentence it does nothing (a replacement fixes a word anywhere). Write a backslash and n for a line break in the text.");
+                            can-suggest: true;
+                            suggestion: TextState.phrase-tip;
+                            suggestion-accepted => {
+                                TextState.suggestion(3, true);
+                            }
+                            suggestion-dismissed => {
+                                TextState.suggestion(3, false);
+                            }
+                            suggestion-refresh => {
+                                TextState.recheck();
+                            }
+                            text-only: true;
+                            field-live: true;
+                        }
+                        snippets-area := TextArea {
+                            width: 100%;
+                            preferred-height: root.words-height;
+                            min-height: root.words-min;
+                            pick: snippets-row.field-pick;
+                            text <=> TextState.snippets;
+                            placeholder-text: @tr("trigger => text: a short phrase that turns into a full text");
+                            accessible-label: @tr("Phrase shortcuts");
+                            edited(text) => {
+                                TextState.snippets-edited(text);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        SubTabPane {
+            shown: TextState.tab == 3;
+            VerticalLayout {
+                alignment: start;
+                spacing: Theme.group-gap;
+                Group {
+                    title: @tr("Punctuation");
+                    Card {
+                        ToggleRow {
+                            flat: true;
+                            title: @tr("Punctuation from pauses");
+                            info: @tr("A long pause ends the sentence: a full stop and a capital letter. \"привет  как дела\" with a pause becomes \"привет. Как дела\"; \"hello  how are you\" becomes \"hello. How are you\".");
+                            checked <=> TextState.pause-punctuation;
+                            toggled(on) => {
+                                TextState.pause-punctuation-toggled(on);
+                            }
+                        }
+                        Divider { }
+                        SliderRow {
+                            title: @tr("Sentence pause");
+                            info: @tr("A pause at least this long ends a sentence.");
+                            enabled: TextState.pause-punctuation;
+                            minimum: 300;
+                            maximum: 3000;
+                            step: 100;
+                            unit: "ms";
+                            default-value: 800;
+                            value <=> TextState.pause-sentence-ms;
+                            changed(v) => {
+                                TextState.pause-sentence-changed(v);
+                            }
+                        }
+                        Divider { }
+                        SliderRow {
+                            title: @tr("Paragraph pause");
+                            info: @tr("A pause at least this long also leaves a blank line. Typed text gets a space instead: a line break would send the message.");
+                            enabled: TextState.pause-punctuation;
+                            minimum: 0;
+                            maximum: 10000;
+                            step: 1000;
+                            unit: "ms";
+                            zero-text: @tr("Off");
+                            default-value: 0;
+                            value <=> TextState.pause-paragraph-ms;
+                            changed(v) => {
+                                TextState.pause-paragraph-changed(v);
+                            }
+                        }
+                        Divider { }
+                        ToggleRow {
+                            flat: true;
+                            title: @tr("No full stop at the end");
+                            info: @tr("Drops the full stop at the very end of a dictation: \"See you.\" becomes \"See you\". An ellipsis, ! and ? stay; a phrase shortcut's text is never changed.");
+                            can-suggest: true;
+                            suggestion: TextState.no-final-period ? "" : TextState.period-tip;
+                            suggestion-accepted => {
+                                TextState.suggestion(0, true);
+                            }
+                            suggestion-dismissed => {
+                                TextState.suggestion(0, false);
+                            }
+                            suggestion-refresh => {
+                                TextState.recheck();
+                            }
+                            checked <=> TextState.no-final-period;
+                            toggled(on) => {
+                                TextState.no-final-period-toggled(on);
+                            }
+                        }
+                        Divider { }
+                        ToggleRow {
+                            flat: true;
+                            title: @tr("Small first letter");
+                            info: @tr("Starts a dictation with a small letter: \"Hello there\" becomes \"hello there\". A one-letter word (I) and a word with more capitals (USB) stay as they are.");
+                            can-suggest: true;
+                            suggestion: TextState.small-first-letter ? "" : TextState.small-tip;
+                            suggestion-accepted => {
+                                TextState.suggestion(1, true);
+                            }
+                            suggestion-dismissed => {
+                                TextState.suggestion(1, false);
+                            }
+                            suggestion-refresh => {
+                                TextState.recheck();
+                            }
+                            checked <=> TextState.small-first-letter;
+                            toggled(on) => {
+                                TextState.small-first-letter-toggled(on);
+                            }
+                        }
+                    }
+                }
+                Group {
+                    title: @tr("Unsure words");
+                    Card {
+                        ToggleRow {
+                            flat: true;
+                            title: @tr("Hold back unsure words");
+                            info: @tr("A part Whisper was unsure of is not pasted; its text stays in the History record. Needs History saving.");
+                            enabled: TextState.history-on;
+                            off-tip: @tr("Turn on System > History and files > Save dictations to History: a held part is kept there");
+                            checked <=> TextState.confidence-filter;
+                            toggled(on) => {
+                                TextState.confidence-filter-toggled(on);
+                            }
+                        }
+                        Divider { }
+                        // Shown in percent (0.35 is 35 %): a share as a decimal is jargon (item 34).
+                        SliderRow {
+                            title: @tr("Certainty needed");
+                            info: @tr("A part is held back when Whisper is less sure of it than this.");
+                            enabled: TextState.history-on && TextState.confidence-filter;
+                            off-tip: TextState.history-on ? @tr("Turn on Hold back unsure words first") : @tr("Turn on System > History and files > Save dictations to History: a held part is kept there");
+                            minimum: 5;
+                            maximum: 95;
+                            step: 5;
+                            unit: "%";
+                            default-value: 35;
+                            can-suggest: true;
+                            suggestion: TextState.confidence-filter ? TextState.certainty-tip : "";
+                            suggestion-accepted => {
+                                TextState.suggestion(4, true);
+                            }
+                            suggestion-dismissed => {
+                                TextState.suggestion(4, false);
+                            }
+                            suggestion-refresh => {
+                                TextState.recheck();
+                            }
+                            value <=> TextState.confidence-pct;
+                            changed(v) => {
+                                TextState.confidence-min-changed(v / 100);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        SubTabPane {
+            shown: TextState.tab == 4;
+            VerticalLayout {
+                alignment: start;
+                Group {
+                    title: @tr("Voice commands");
+                    info: @tr("Say a phrase on its own between two sentences and it does its job instead of being typed: \"Hello. New line. World.\" becomes two lines. Each command has its own switch and as many phrases as you like, separated by commas, in any language. A phrase cannot belong to two commands. Text already pasted is never touched. Typed text gets a space instead of a line break.");
+                    action-text: @tr("Reset phrases");
+                    action-icon: Icons.revert;
+                    action-tip: @tr("Brings back the original phrases of all three commands. The switches stay as they are.");
+                    action-enabled: !Shell.locked;
+                    action => {
+                        TextState.voice-reset();
+                    }
+                    Card {
+                        ToggleRow {
+                            flat: true;
+                            title: @tr("Use voice commands");
+                            info: @tr("The switch for every app: off, none of the commands below works. An app rule on the Paste page can turn it on or off for one app.");
+                            checked <=> TextState.voice-commands;
+                            toggled(on) => {
+                                TextState.voice-commands-toggled(on);
+                            }
+                        }
+                        Divider { }
+                        ToggleRow {
+                            flat: true;
+                            title: @tr("New line");
+                            opacity: root.voice-dim;
+                            info: @tr("Ends the line. \"Hello. New line. World.\" becomes Hello. and World. on two lines.");
+                            checked <=> TextState.voice-line;
+                            toggled(on) => {
+                                TextState.voice-toggled(0, on);
+                            }
+                        }
+                        TextField {
+                            opacity: root.voice-dim;
+                            text <=> TextState.voice-line-phrases;
+                            placeholder-text: @tr("Phrases, separated by commas");
+                            accessible-label: @tr("New line phrases");
+                            invalid: TextState.voice-errors[0] != "";
+                            invalid-tip: TextState.voice-errors[0];
+                            edited(t) => {
+                                TextState.voice-phrases-edited(0, t);
+                            }
+                        }
+                        Divider { }
+                        ToggleRow {
+                            flat: true;
+                            title: @tr("New paragraph");
+                            opacity: root.voice-dim;
+                            info: @tr("Leaves a blank line and starts the next sentence with a capital letter.");
+                            checked <=> TextState.voice-paragraph;
+                            toggled(on) => {
+                                TextState.voice-toggled(1, on);
+                            }
+                        }
+                        TextField {
+                            opacity: root.voice-dim;
+                            text <=> TextState.voice-paragraph-phrases;
+                            placeholder-text: @tr("Phrases, separated by commas");
+                            accessible-label: @tr("New paragraph phrases");
+                            invalid: TextState.voice-errors[1] != "";
+                            invalid-tip: TextState.voice-errors[1];
+                            edited(t) => {
+                                TextState.voice-phrases-edited(1, t);
+                            }
+                        }
+                        Divider { }
+                        ToggleRow {
+                            flat: true;
+                            title: @tr("Delete the last sentence");
+                            opacity: root.voice-dim;
+                            info: @tr("Removes the sentence you said just before it, in this dictation only. \"Keep. Drop this one. Delete that. More.\" becomes Keep. More.");
+                            checked <=> TextState.voice-delete;
+                            toggled(on) => {
+                                TextState.voice-toggled(2, on);
+                            }
+                        }
+                        TextField {
+                            opacity: root.voice-dim;
+                            text <=> TextState.voice-delete-phrases;
+                            placeholder-text: @tr("Phrases, separated by commas");
+                            accessible-label: @tr("Delete the last sentence phrases");
+                            invalid: TextState.voice-errors[2] != "";
+                            invalid-tip: TextState.voice-errors[2];
+                            edited(t) => {
+                                TextState.voice-phrases-edited(2, t);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

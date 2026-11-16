@@ -1,0 +1,441 @@
+// Design tokens of the settings window (redesign spec section 1). Components read only
+// `Theme.*`: never `Palette.*` and never a literal colour. `Palette` appears here once, for the
+// colour scheme the window maps system/dark/light onto.
+import { Palette } from "std-widgets.slint";
+
+// The colours one seed gives in one theme (DESIGN-SYSTEM section 20). The settings window sets the
+// derived values from Rust (`set_accent`); nothing in `ui/` computes a colour.
+export struct AccentSet {
+    accent: color,
+    hover: color,
+    pressed: color,
+    on-accent: color,
+    text: color,
+    tint: color,
+    heat-1: color,
+    heat-2: color,
+    heat-3: color,
+    heat-4: color,
+}
+
+// Window-wide state every control reads.
+export global Shell {
+    // The config cannot be written (newer version, or a parse error until Reset): controls go grey.
+    in-out property <bool> locked;
+    // Width of the page column (cards included), set by the window: a Row sizes its control
+    // column from it, not from its own text, so controls start at one x in every card.
+    in-out property <length> page-width: 880px;
+    // Height of the window, set by it: a popup flips above its field when there is no room below.
+    in-out property <length> window-height: 860px;
+    // The one tooltip of a control that is off because of `locked`.
+    out property <string> locked-tip: @tr("The config is read-only");
+    // Windows "Animation effects" is off (SPI_GETCLIENTAREAANIMATION): every `Theme.motion-*`
+    // duration reads 0 and lists, popups and knobs appear in place. The window keeps it current.
+    in-out property <bool> reduced-motion;
+    // How many modal popups are open; the window's scrim shows while it is above 0. Each popup
+    // reports its own `is-open` through `modal` (no popup has a `closed` callback).
+    in-out property <int> modals;
+    public function modal(open: bool) {
+        self.modals = max(0, self.modals + (open ? 1 : -1));
+    }
+    // Settings search (owner item 17): the row or group whose `search-key` is `found` scrolls into
+    // view and flashes; `found-serial` counts the picks, so the same row can flash again. The window
+    // clears `found` a moment later, so a row that only appears later does not flash then.
+    in-out property <string> found;
+    in-out property <int> found-serial;
+    // Where the flashing row is (window coordinates); the window scrolls it into view.
+    out property <length> reveal-y;
+    out property <length> reveal-h;
+    out property <int> reveal-serial;
+    public function reveal(y: length, h: length) {
+        self.reveal-y = y;
+        self.reveal-h = h;
+        self.reveal-serial += 1;
+    }
+    // A search pick moves the keyboard focus to the row's control (a row's `Flash` asks once the page
+    // is laid out; the window answers with a Tab key). `quiet-focus` holds the ring back for that one
+    // move: a pick is not a keyboard walk (UI rule 17).
+    callback found-ready();
+    in-out property <bool> quiet-focus;
+    // Rust bumps it right after the Tab: a `changed` handler queued after the controls' own
+    // `changed has-focus` (a text field reads `quiet-focus` there, later than the key event) ends the quiet.
+    in-out property <int> quiet-release;
+    changed quiet-release => {
+        self.quiet-focus = false;
+    }
+    // Ctrl+F on History: its own "Search recordings" field takes the caret (ia-map 3.7).
+    in-out property <int> history-find;
+}
+
+export global Theme {
+    // The style's own result, not `Palette.color-scheme`: for System that holds the `unknown` the
+    // window wrote, and only the style resolves it against the OS scheme (and its changes).
+    out property <bool> dark: Palette.background == #1C1C1C;
+
+    // 1.1 Spacing, 4 px base. Which step goes where (UI rule 7; pages hold no px):
+    //   title-gap (2): title to caption
+    //   space-1 (4): inside a control (text to icon in a badge, keycap gap), tooltip padding down
+    //   space-2 (8): between siblings in one row (icon to text, button to button, segments),
+    //                tooltip padding across
+    //   space-3 (12): card padding on the vertical, control to its note
+    //   space-4 (16): card padding on the horizontal, icon to the row text, page padding
+    //   space-6 (24): between groups, between unrelated blocks in one card
+    //   space-8 (32): large empty-state and gallery breathing room
+    // The fixed uses below name those steps for one job each; a page reads the named one.
+    out property <length> space-1: 4px;
+    out property <length> space-2: 8px;
+    out property <length> space-3: 12px;
+    out property <length> space-4: 16px;
+    out property <length> space-6: 24px;
+    out property <length> space-8: 32px;
+    // Fixed uses; no other gaps.
+    out property <length> page-padding: 16px;
+    out property <length> page-padding-narrow: 12px;
+    // The page title goes away with R2.4 (HeaderRow); app.slint reads these until its task lands.
+    out property <length> title-top: 28px;
+    out property <length> title-bottom: 24px;
+    out property <length> group-gap: 24px;
+    // The header row (DS-14): as high as a rail item, 12 px from its tab line to the first card.
+    out property <length> header-row-height: self.rail-item-height;
+    out property <length> header-bottom: 12px;
+    // Icon to its label in any icon+label pair: buttons, stat titles, chips, the status dot.
+    out property <length> pair-gap: 8px;
+    out property <length> header-gap: 8px;
+    out property <length> card-gap: 4px;
+    out property <length> card-padding-h: 16px;
+    out property <length> card-padding-v: 12px;
+    out property <length> icon-gap: 16px;
+    out property <length> title-gap: 2px;
+    out property <length> control-gap: 8px;
+    out property <length> tile-gap: 8px;
+    out property <length> keycap-gap: 4px;
+    out property <length> control-height: 32px;
+    // The right column of every row (DS-3): two steps, never fluid. `control-column-min/-max` are the
+    // old names, kept so pages compile; read `control-column`.
+    out property <length> control-column: Shell.page-width >= 720px ? 360px : 240px;
+    out property <length> control-column-min: 240px;
+    out property <length> control-column-max: 360px;
+    // The narrow slot beside a main control (NumberField, Test, Browse) and the rest of the column.
+    out property <length> control-side: 88px;
+    out property <length> control-main: self.control-column - self.control-gap - self.control-side;
+    // A settings row: a control plus 8 above and below; with a description line (DS-1.5).
+    out property <length> row-height: 48px;
+    out property <length> row-height-tall: 56px;
+    out property <length> card-padding-rows: 4px;
+    // Icon boxes: the 20 px master (rows, banners, rail), the 16 px one (buttons, fields, tips)
+    // and the 32 px one (tiles, empty states).
+    out property <length> icon-size: 20px;
+    out property <length> icon-size-small: 16px;
+    out property <length> icon-size-large: 32px;
+    // 1.1b Component geometry (DS-6 to DS-18): one job each, so components hold no px.
+    out property <length> button-min-width: self.control-side;
+    out property <length> number-field-width: self.control-side;
+    // A field's own clear "x" or chevron: its square hover box.
+    out property <length> adornment-size: 24px;
+    out property <length> switch-track-width: 40px;
+    out property <length> switch-track-height: 20px;
+    // Switch knob: one size in every state (no scale, DS-5.4); hover and pressed change colour.
+    out property <length> switch-knob: 12px;
+    out property <length> switch-knob-inset: 4px;
+    // The "On"/"Off" caption keeps this width, so the track does not move when it flips.
+    out property <length> switch-caption-width: 24px;
+    out property <length> status-dot-size: 8px;
+    out property <length> badge-height: 20px;
+    // Radio dot and its selected centre (one size in every state).
+    out property <length> radio-size: 16px;
+    out property <length> radio-dot: 6px;
+    // The check badge of a selected tile and its glyph.
+    out property <length> check-badge-size: 20px;
+    out property <length> check-glyph-size: 12px;
+    // Slider: thumb and its dot (one size in every state), the rail.
+    out property <length> slider-thumb: 20px;
+    out property <length> slider-dot: 12px;
+    out property <length> rail-height: 4px;
+    out property <length> slider-min-width: 120px;
+    // Segmented: the inset around and between segments, and a segment's least width.
+    out property <length> segment-inset: 2px;
+    out property <length> segment-min-width: 44px;
+    // Sub-tabs: the label's padding above and below (with the 1 px tab line, the bar is
+    // `header-row-height`), the count gap, the underline.
+    out property <length> tab-padding-top: 8px;
+    out property <length> tab-padding-bottom: 12px;
+    out property <length> tab-count-gap: 6px;
+    out property <length> tab-underline: 2px;
+    // Label to label in a tab bar (DS-14).
+    out property <length> tab-gap: 24px;
+    // Meter: track height, bar width and pitch, the least width.
+    out property <length> meter-height: self.control-height;
+    // The Meter's overload line across its top edge (DS-21.3).
+    out property <length> meter-clip-line: 2px;
+    // The kept-draft dot on an icon button (DS-28.3).
+    out property <length> draft-dot-size: 6px;
+    out property <length> meter-bar: 3px;
+    out property <length> meter-pitch: 5px;
+    out property <length> meter-min-width: 120px;
+    out property <length> progress-min-width: 80px;
+    // Progress (DS-26): the slot that holds "100 %", the indeterminate segment (share of the rail)
+    // and one sweep of it.
+    out property <length> progress-label-width: 40px;
+    out property <float> progress-sweep: 0.3;
+    out property <duration> progress-sweep-time: 1200ms;
+    // The widest a tooltip line runs before it wraps.
+    out property <length> tooltip-max-width: 320px;
+    // Banner: least width, and the width under which its text goes above the buttons.
+    out property <length> banner-min-width: 280px;
+    out property <length> banner-narrow: 560px;
+    // A row's least height without and with a description.
+    out property <length> row-min-height: self.control-height;
+    out property <length> keycap-width: 44px;
+    // The fallback min width of a Combo outside a Row (the Per-app mode column sets its own).
+    out property <length> combo-min-width: 160px;
+    // How many rows an open Combo shows before it scrolls.
+    out property <int> combo-visible-rows: 6;
+    // Scrollbar (DS-18): thumb width and the gutter content leaves while it overflows.
+    out property <length> scrollbar-width: 6px;
+    // `thin`: inside a control (Combo list, SearchPopup, TextArea).
+    out property <length> scrollbar-width-thin: 4px;
+    out property <length> scrollbar-gutter: 12px;
+    out property <length> scrollbar-min-thumb: 24px;
+    // Card grid (DS-15): the narrowest column.
+    out property <length> tile-min-width: 160px;
+    out property <length> tile-max-width: 320px;
+    // The model gallery's narrowest column: a name and its facts fit beside the badge, four to a
+    // row at 1280, three at the least window (Model page, setup wizard).
+    out property <length> model-tile-min-width: 200px;
+    // Home heatmap and trend defaults (the page passes its own).
+    out property <length> heat-cell-default: 12px;
+    out property <length> heat-gap: 3px;
+    out property <length> heat-label-width: 32px;
+    out property <length> heat-top: 20px;
+    out property <length> trend-max-pitch: 21px;
+    // A body line's box (Slint 1.18 has no line height): the stat card label lines.
+    out property <length> body-line: 20px;
+    // Sizes and breakpoints with one job each (UI rule 7).
+    out property <length> narrow-window: 900px;
+    // The shell (app.slint): the window's least, first and largest size (SPEC Settings UI), the
+    // width under which the rail shows icons only, the rail in both widths and one rail item, the
+    // selected item's accent pill and its keyboard ring.
+    out property <length> window-min-width: 720px;
+    out property <length> window-min-height: 520px;
+    out property <length> window-first-width: 1280px;
+    out property <length> window-first-height: 800px;
+    out property <length> compact-window: 960px;
+    out property <length> rail-width: 220px;
+    out property <length> rail-width-compact: 56px;
+    out property <length> rail-item-height: 40px;
+    out property <length> rail-pill-width: 3px;
+    out property <length> rail-pill-height: 16px;
+    out property <length> focus-ring-width: 2px;
+    // The ring's gap outside the control (DS-4.1); the ring's outer radius is radius + offset + width.
+    out property <length> focus-ring-offset: 2px;
+    out property <length> stat-card-one-line: 172px;
+    // A picker tile's height, and System's General tab in a low window (UI rule 25).
+    out property <length> tile-height: 104px;
+    out property <length> tile-height-short: 76px;
+    out property <length> system-tight-height: 480px;
+    // The Overlay position tiles (DS-28.4): 112 x 32 in the 360 column, 12 apart across, `tile-gap` down.
+    out property <length> position-tile-width: 112px;
+    out property <length> position-tile-height: self.control-height;
+    out property <length> position-tile-gap: self.space-3;
+    // The Overlay position row (DS-1.5, DS-28.4): the 72 px grid of two 32 px rows plus 8, and 16.
+    out property <length> position-row-height: 88px;
+    // A model card's fixed columns: the widest badge ("Not downloaded") and button ("Download").
+    out property <length> model-badge-column: 108px;
+    out property <length> model-action-column: 112px;
+    // The narrowest Home stat card: four fit across a 720 px window.
+    out property <length> stat-card-min: 140px;
+    // Home: the height under which a narrow window keeps one row of cards (two rows need this to
+    // leave the grid its room), and what the page spends outside the heatmap grid: with one row of
+    // cards and one-line labels, for two-line labels, and for the second row (measured by
+    // `the_page_never_needs_a_scrollbar_in_a_low_window`).
+    out property <length> home-full-height: 566px;
+    out property <length> home-chrome: 186px;
+    out property <length> home-chrome-labels: 36px;
+    out property <length> home-chrome-row: 122px;
+    // Hotkey page with the keyboard open: the room that shows it all (Recording mode too), the room
+    // under which it goes tight, and what each layout spends beside the board.
+    out property <length> hotkey-full-height: 914px;
+    out property <length> hotkey-tight-height: 480px;
+    out property <length> hotkey-open-chrome: 300px;
+    out property <length> hotkey-tight-chrome: 190px;
+    // Home heatmap cells: the cap for a history shorter than a year. A full
+    // year (`heat-year-weeks`, oxi-core's HEAT_WEEKS) has no cap: it fills the card at any width.
+    out property <length> heat-cell-max: 36px;
+    out property <int> heat-year-weeks: 53;
+    // The least cell that keeps the legend (its swatches are 16 px high), and the least at all.
+    out property <length> heat-cell-legend: 16px;
+    out property <length> heat-cell-floor: 8px;
+    out property <length> capture-keycap-height: 40px;
+    out property <length> editor-min-height: 120px;
+    out property <length> editor-max-height: 360px;
+    out property <length> rule-mode-width: 160px;
+    out property <length> about-logo-size: 48px;
+    out property <length> about-slint-width: 206px;
+    out property <length> about-slint-height: 90px;
+    // A length rounded to whole pixels, so a 1 px stroke at it stays crisp (UI rule 20).
+    public pure function whole(l: length) -> length {
+        return round(l / 1px) * 1px;
+    }
+    // The Home heatmap's cell in whole pixels: fills `room`, up to `heat-cell-max` short of a year.
+    public pure function heat-cell(room: length, weeks: int, gap: length) -> length {
+        return weeks >= self.heat-year-weeks ? floor(room / weeks / 1px - gap / 1px) * 1px : min(self.heat-cell-max, floor(room / weeks / 1px - gap / 1px) * 1px);
+    }
+
+    // 1.2 Radii (UI rules 12 to 14): low, from here only; no square corner but window edges,
+    // full-bleed panels and 1 px dividers.
+    //   radius-small (2): cells under 16 px (heatmap cells, legend swatches)
+    //   radius-control (4): controls, badges, chips, tooltips, inline tiles
+    //   radius-card (8): cards, banners, tiles, the screen diagram
+    //   radius-round: circles and pills (switch, radio, slider thumb and rail, progress rail,
+    //   meter bars, check badge);
+    //   both renderers cap it at half the shorter side, so one value fits every size.
+    out property <length> radius-small: 2px;
+    out property <length> radius-control: 4px;
+    out property <length> radius-card: 8px;
+    out property <length> radius-round: 999px;
+    public pure function radius-keycap(unit: length) -> length {
+        return max(4px, unit * 0.12);
+    }
+    public pure function keycap-gap-for(unit: length) -> length {
+        return max(3px, unit * 0.08);
+    }
+    public pure function keycap-label-size(unit: length) -> length {
+        return clamp(unit * 0.30, 12px, 15px);
+    }
+
+    // 1.3 Type: Fluent ramp, Regular 400 (the default weight, no token) and Semibold 600 only.
+    // Slint 1.18 has no line height: `caption-line` is for fixed text boxes.
+    out property <string> font-family: "Segoe UI Variable Text";
+    out property <length> caption-size: 12px;
+    out property <length> caption-line: 16px;
+    out property <length> body-size: 14px;
+    out property <length> subtitle-size: 20px;
+    out property <length> title-size: 28px;
+    out property <int> weight-strong: 600;
+    // A line box centres its text on the middle of ascent + descent, which puts the capitals about
+    // 1 px under it at 14 px (measured on the shots). Text beside an icon or a dot is raised by this,
+    // so the capitals' centre and the icon's centre are one line (DS-16.1).
+    out property <length> cap-lift: 1px;
+
+    // 1.4 Neutrals and roles: concept C "white minimal" (owner's pick, 2026-11-10, DESIGN-SYSTEM
+    // section 19): ink on paper, neutral steps only. Colour lives here alone, so a later colour
+    // theme replaces these values and touches no page or component (DS-19.3).
+    // The dim behind a modal popup (DS-38): Slint has no backdrop blur, so a black veil; lighter on
+    // the light theme, where the same alpha would read as dirt.
+    out property <color> scrim: dark ? #00000073 : #1C1B1940;
+    out property <color> bg-page: dark ? #161616 : #F7F5F0;
+    out property <color> bg-card: dark ? #1F1F1F : #FCFBF8;
+    out property <color> bg-control: dark ? #262626 : #FFFEFB;
+    out property <color> bg-control-hover: dark ? #2C2C2C : #F8F6F2;
+    out property <color> bg-control-pressed: dark ? #222222 : #F1EEE8;
+    // Pressed fill for whole-card buttons: a step under the card in both themes.
+    out property <color> bg-card-pressed: dark ? #1A1A1A : #F1EEE8;
+    out property <color> bg-subtle-hover: dark ? #FFFFFF0F : #1C1B190A;
+    out property <color> bg-subtle-selected: dark ? #FFFFFF14 : #1C1B190F;
+    out property <color> bg-inset: dark ? #FFFFFF1A : #1C1B1914;
+    out property <color> stroke-card: dark ? #2F2F2F : #E6E2DA;
+    out property <color> stroke-control: dark ? #383838 : #D3CEC4;
+    out property <color> stroke-control-bottom: dark ? #444444 : #B5AFA4;
+    out property <color> stroke-keycap: dark ? #5A5A5A : #8A857C;
+    out property <color> divider: dark ? #2A2A2A : #EAE7E0;
+    out property <color> text-primary: dark ? #F4F2EE : #1C1B19;
+    out property <color> text-secondary: dark ? #B5B1AA : #5C5850;
+    out property <color> text-disabled: dark ? #75726D : #A39F97;
+    // The soft surface (DS-5): the rest fill of a soft Button and an IconButton, so the hit area
+    // is seen. Pressed is a step under rest.
+    out property <color> bg-soft: dark ? #FFFFFF14 : #1C1B190F;
+    out property <color> bg-soft-hover: dark ? #FFFFFF1F : #1C1B191A;
+    out property <color> bg-soft-pressed: dark ? #FFFFFF0F : #1C1B1907;
+
+    // 1.4b The accent (DS-20): the user's seed, derived per theme in Rust and set here at run time
+    // (`set_accent` in lib.rs). The defaults are the brand Red (seed #D93A3F) and the first test
+    // vectors of DS-20; an invalid or missing config value lands on them. Never `Palette.accent`
+    // (UI rule 15: that name is the Windows accent).
+    in-out property <AccentSet> accent-dark: {
+        accent: #D93A3F, hover: #C33439, pressed: #AE2E32, on-accent: #FFFFFF, text: #E47175, tint: #3D2324,
+        heat-1: #4E2627, heat-2: #732B2D, heat-3: #A13235, heat-4: #D93A3F,
+    };
+    in-out property <AccentSet> accent-light: {
+        accent: #D93A3F, hover: #C33439, pressed: #AE2E32, on-accent: #FFFFFF, text: #BF3337, tint: #F8E4E2,
+        heat-1: #F3CBCA, heat-2: #ECA4A5, heat-3: #E47477, heat-4: #D93A3F,
+    };
+    out property <color> accent: dark ? accent-dark.accent : accent-light.accent;
+    out property <color> accent-hover: dark ? accent-dark.hover : accent-light.hover;
+    out property <color> accent-pressed: dark ? accent-dark.pressed : accent-light.pressed;
+    out property <color> on-accent: dark ? accent-dark.on-accent : accent-light.on-accent;
+    out property <color> accent-text: dark ? accent-dark.text : accent-light.text;
+    // Selected fills: the tint, opaque, so `accent-text` and the primary inks keep 4.5:1 on it.
+    out property <color> accent-tint: dark ? accent-dark.tint : accent-light.tint;
+    out property <color> accent-badge: self.accent-tint;
+    // The heat scale of Home: level 0 is `bg-inset`, levels 1 to 4 the accent mixes.
+    out property <color> heat-1: dark ? accent-dark.heat-1 : accent-light.heat-1;
+    out property <color> heat-2: dark ? accent-dark.heat-2 : accent-light.heat-2;
+    out property <color> heat-3: dark ? accent-dark.heat-3 : accent-light.heat-3;
+    out property <color> heat-4: dark ? accent-dark.heat-4 : accent-light.heat-4;
+    // The one keyboard-focus ring (DS-4): the accent, 3:1 or more on every surface. `focus-outer` is
+    // the old name; `focus-inner` draws nothing. Both go when no page reads them.
+    out property <color> focus-ring: self.accent;
+    out property <color> focus-outer: self.focus-ring;
+    out property <color> focus-inner: transparent;
+
+    // Status.
+    out property <color> error-text: dark ? #FF99A4 : #B9291A;
+    out property <color> error-fill: dark ? #442726 : #FBEAE6;
+    // Pressed danger button: paler than hover, so error-text keeps AA on it.
+    out property <color> error-fill-pressed: dark ? #352020 : #FCF3EF;
+    out property <color> warning-text: dark ? #FCE100 : #8A5200;
+    out property <color> warning-fill: dark ? #433519 : #FAEFD5;
+    out property <color> success-text: dark ? #6CCB5F : #0F7B0F;
+    out property <color> success-tint: dark ? #2F3F2F : #EAF2E5;
+    out property <color> info-fill: dark ? #292929 : #F2F0EB;
+
+    // Brand inks of the About "Built with" marks: the project's own colour where it has one (Rust,
+    // Slint, Claude), else a hue of its own. The same in both themes, each 3:1 or more on its 10 %
+    // tinted box in both.
+    out property <color> brand-rust: #CE422B;
+    out property <color> brand-slint: #2379F4;
+    out property <color> brand-whisper-cpp: #E0457B;
+    out property <color> brand-whisper-rs: #27894F;
+    out property <color> brand-nnnoiseless: #0C8693;
+    out property <color> brand-cpal: #A06E00;
+    out property <color> brand-phosphor: #6A8501;
+    out property <color> brand-claude: #C15F3C;
+    out property <color> brand-tiny-skia: #5468D4;
+    out property <color> brand-symphonia: #9560D6;
+    out property <color> brand-rubato: #2B8DB8;
+    out property <color> brand-earshot: #CC5A52;
+    out property <color> brand-windows-rs: #2C7FD0;
+    out property <color> brand-rfd: #A8721F;
+    out property <color> brand-ureq: #BC4F9F;
+
+    // 1.5 Motion (UI rules 21 to 23): short and calm, never waited for, 0 under
+    // `Shell.reduced-motion`. `motion-quick` is a state change inside a control (knob, thumb,
+    // hover fill); `motion-open` is a list or popup appearing. Every `animate` reads one of them,
+    // with `easing: ease-out` (Slint 1.18 cannot expose an easing property, so it stays inline).
+    out property <duration> motion-quick: Shell.reduced-motion ? 0ms : 100ms;
+    out property <duration> motion-open: Shell.reduced-motion ? 0ms : 160ms;
+}
+
+// WCAG 2 contrast, so the gallery labels and the test read numbers computed from the tokens.
+export global Contrast {
+    pure function channel(c: float) -> float {
+        if (c / 255 <= 0.04045) {
+            return c / 255 / 12.92;
+        }
+        return pow((c / 255 + 0.055) / 1.055, 2.4);
+    }
+    // `fg` (maybe translucent) composited over the opaque `bg`.
+    public pure function over(fg: color, bg: color) -> color {
+        return rgb(
+            fg.red * fg.alpha / 255 + bg.red * (255 - fg.alpha) / 255,
+            fg.green * fg.alpha / 255 + bg.green * (255 - fg.alpha) / 255,
+            fg.blue * fg.alpha / 255 + bg.blue * (255 - fg.alpha) / 255);
+    }
+    public pure function luminance(c: color) -> float {
+        return 0.2126 * channel(c.red) + 0.7152 * channel(c.green) + 0.0722 * channel(c.blue);
+    }
+    // `fg` on the opaque `bg`; a translucent `bg` (a tint) goes through `over` first.
+    public pure function ratio(fg: color, bg: color) -> float {
+        return (max(luminance(over(fg, bg)), luminance(bg)) + 0.05) / (min(luminance(over(fg, bg)), luminance(bg)) + 0.05);
+    }
+}

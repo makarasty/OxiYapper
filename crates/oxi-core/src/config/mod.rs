@@ -1,11 +1,21 @@
 //! Config: load with migrations, unknown keys kept, newer version read-only
 //! (ARCHITECTURE section 6). The atomic file write is I/O and lives in the settings process.
 
+mod audio_sets;
+mod extra;
+mod memory;
 mod schema;
 
+pub use audio_sets::{DenoiseStrength, DeviceSet, EdgePreset, Noise};
+pub use extra::{
+    Accent, Advanced, AudioChannel, AudioCtx, Auto, BadAccent, Decoding, FileFormat, FileMode,
+    LanguageKey, Output, PromptSource, Rgb, Snippet, Text, TypeSpeed, VadSensitivity, VoiceCommand,
+    VoiceCommands, VoiceConflict, phrase_words,
+};
+pub use memory::MemoryMode;
 pub use schema::{
-    Audio, Config, Debug, History, Hotkey, Model, Overlay, OverlayPosition, Paste, PasteMode,
-    PasteRule, Sounds, System, Theme, Ui,
+    AppLanguage, Audio, Config, Debug, History, Hotkey, Model, OtherKey, Overlay, OverlayPosition,
+    Paste, PasteMode, PasteRule, Sounds, System, Theme, Ui,
 };
 
 use crate::paths::CONFIG_FILE;
@@ -16,13 +26,61 @@ use toml_edit::{
 };
 
 /// Schema version this build writes. Equals `MIGRATIONS.len() + 1` (checked by a test).
-pub const CURRENT_VERSION: i64 = 1;
+pub const CURRENT_VERSION: i64 = 2;
 
 /// A pure step `vN -> vN+1` on the raw document. It does not touch `version`; `parse_with` does.
 pub type Migration = fn(&mut DocumentMut);
 
-/// `MIGRATIONS[i]` turns version `i + 1` into `i + 2`. Empty while v1 is the only schema.
-pub const MIGRATIONS: &[Migration] = &[];
+/// `MIGRATIONS[i]` turns version `i + 1` into `i + 2`.
+pub const MIGRATIONS: &[Migration] = &[history_on];
+
+/// v1 -> v2 (R1.3): history was off by default in v1, so no v1 file can have chosen "off"
+/// on purpose; an explicit `false` becomes `true`. A later `false` (v2) is left alone.
+fn history_on(doc: &mut DocumentMut) {
+    if let Some(h) = doc.get_mut("history").and_then(Item::as_table_like_mut)
+        && h.get("enabled").and_then(Item::as_bool) == Some(false)
+    {
+        put(h, "enabled", &toml_edit::value(true));
+    }
+}
+
+/// `ui.accent` loads leniently (a bad string is `default`); this is where the file's text is
+/// checked, so the bad value is reported.
+fn accent_warning(doc: &DocumentMut) -> Option<String> {
+    let text = doc.get("ui")?.as_table_like()?.get("accent")?.as_str()?;
+    text.parse::<Accent>()
+        .is_err()
+        .then(|| format!("ui.accent = {text:?} is neither \"default\" nor #RRGGBB, using default"))
+}
+
+/// `sounds.enabled` is gone (ia-map S80): a hidden switch must not silence sounds the page shows
+/// as picked. An old `false` becomes every sound Off (text ready: `done_enabled = false`, as the
+/// page does, so its sound comes back with the next pick); the key is dropped either way. Runs at
+/// every load, not as a versioned step: a file of any version may carry the key. True when the
+/// document changed.
+fn drop_sounds_master(doc: &mut DocumentMut) -> bool {
+    let Some(s) = doc.get_mut("sounds").and_then(Item::as_table_like_mut) else {
+        return false;
+    };
+    let Some(on) = s.get("enabled").and_then(Item::as_bool) else {
+        return false;
+    };
+    if !on {
+        for key in ["start", "stop", "cancel", "error"] {
+            put(s, key, &toml_edit::value(crate::sounds::OFF));
+        }
+        put(s, "done_enabled", &toml_edit::value(false));
+    }
+    s.remove("enabled");
+    true
+}
+
+fn history_enabled(doc: &DocumentMut) -> Option<bool> {
+    doc.get("history")?
+        .as_table_like()?
+        .get("enabled")?
+        .as_bool()
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -42,12 +100,16 @@ pub enum ConfigError {
 /// A loaded `config.toml`: typed settings plus the raw document, so comments, key order and
 /// keys this build does not know survive a write.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools, reason = "independent load flags")]
 pub struct ConfigFile {
     pub config: Config,
     /// True when the file's `version` is newer than this build: never write it back.
     pub read_only: bool,
     /// Values the load had to correct, for the tray and settings to show.
     pub warnings: Vec<String>,
+    /// True when this load migrated `history.enabled` from an explicit `false` to `true`, so
+    /// the daemon can show a one-time notice.
+    pub history_turned_on: bool,
     raw: DocumentMut,
     /// The file started with a UTF-8 byte order mark; written back with it.
     bom: bool,
@@ -65,6 +127,7 @@ impl Default for ConfigFile {
             config: Config::default(),
             read_only: false,
             warnings: Vec::new(),
+            history_turned_on: false,
             raw,
             bom: false,
             crlf: false,
@@ -115,19 +178,39 @@ impl ConfigFile {
         } else {
             &migrations[done..]
         };
+        let history_before = history_enabled(&raw);
         for migration in pending {
             migration(&mut raw);
         }
+        let history_turned_on =
+            history_before == Some(false) && history_enabled(&raw) == Some(true);
+        let sounds_fixed = drop_sounds_master(&mut raw);
         // Typed values come from the migrated text, so error lines point into it; with no
         // migration that text is the file itself.
-        let migrated = if pending.is_empty() {
+        let migrated = if pending.is_empty() && !sounds_fixed {
             Cow::Borrowed(text)
         } else {
             Cow::Owned(raw.to_string())
         };
-        let mut config = toml::from_str::<Config>(&migrated)
-            .map_err(|e| located(&migrated, e.span(), e.message()))?;
-        let warnings = config.audio.clamp_meter_sensitivity().into_iter().collect();
+        let mut config = toml::from_str::<Config>(&migrated).map_err(|e| {
+            located(
+                &migrated,
+                e.span(),
+                &keyed(&migrated, e.span(), e.message()),
+            )
+        })?;
+        let warnings = config
+            .audio
+            .clamp_meter_sensitivity()
+            .into_iter()
+            .chain(config.model.normalise_recent_languages())
+            .chain(config.sounds.normalise())
+            .chain(config.hotkey.clamp_hold_gap())
+            .chain(config.model.advanced.normalise())
+            .chain(config.text.normalise())
+            .chain(config.output.warning())
+            .chain(accent_warning(&raw))
+            .collect();
         if !read_only {
             put(raw.as_table_mut(), "version", &toml_edit::value(current));
         }
@@ -135,6 +218,7 @@ impl ConfigFile {
             config,
             read_only,
             warnings,
+            history_turned_on,
             raw,
             bom,
             crlf,
@@ -143,7 +227,8 @@ impl ConfigFile {
 
     /// The raw document with the typed settings written into its existing items, so an
     /// unchanged file comes back byte-identical (BOM and CRLF included) and a changed value
-    /// changes only its text. A key the file lacks is added only when it is not the default.
+    /// changes only its text. A key the file lacks is added only when it differs from what its
+    /// absence reads as.
     /// Errors with `ReadOnly` for a file from a newer version.
     pub fn to_toml_string(&self) -> Result<String, ConfigError> {
         if self.read_only {
@@ -151,7 +236,12 @@ impl ConfigFile {
         }
         let mut typed = typed_doc(&self.config)?;
         unplace(typed.as_table_mut());
-        let default = typed_doc(&Config::default())?;
+        // What a missing key reads as: an old file with no `first_run_done` is set up, so the
+        // key is not added to it.
+        let default = typed_doc(&Config {
+            ui: Ui::set_up(),
+            ..Config::default()
+        })?;
         let mut out = self.raw.clone();
         merge(
             out.as_table_mut(),
@@ -176,6 +266,16 @@ fn typed_doc(config: &Config) -> Result<DocumentMut, ConfigError> {
         .map_err(|e: toml_edit::TomlError| ConfigError::Invalid(e.to_string()))
 }
 
+/// Tables whose keys are user data (a map), not a fixed set: a key the typed config lacks is
+/// removed from the file. Any other table keeps the keys this build does not know.
+/// Each is `(parent table, map key)`: a map is pruned only under its own parent, never inside
+/// a rule that happens to carry an unknown key of the same name.
+const MAP_TABLES: [(&str, &str); 3] = [
+    ("ui", "app_names"),
+    ("model", "by_language"),
+    ("audio", "device_sets"),
+];
+
 /// Writes every key of `src` into `dst`: tables merge key by key, arrays of tables merge
 /// element by element on `app`, values replace only when they differ and keep their decor.
 /// `default` is the same place in the default config (`None` inside a rule).
@@ -197,6 +297,22 @@ fn merge(dst: &mut dyn TableLike, src: &dyn TableLike, default: Option<&dyn Tabl
             }
         } else if let (Some(o), Some(n)) = (old.as_table_like_mut(), new.as_table_like()) {
             merge(o, n, fallback.and_then(Item::as_table_like));
+            // An empty map is not serialised, so its table is missing from `n`: drop the file's copy.
+            for &(parent, map) in &MAP_TABLES {
+                if key == parent && !n.contains_key(map) {
+                    o.remove(map);
+                }
+            }
+            if MAP_TABLES.iter().any(|&(_, map)| map == key) {
+                let gone: Vec<String> = o
+                    .iter()
+                    .map(|(k, _)| k.to_owned())
+                    .filter(|k| !n.contains_key(k))
+                    .collect();
+                for k in gone {
+                    o.remove(&k);
+                }
+            }
         } else {
             put(dst, key, new);
         }
@@ -364,6 +480,18 @@ fn unplace(t: &mut Table) {
     }
 }
 
+/// `message` led by the key on the span's line (`threads: ...`): a typed error names the bad
+/// value but not the key.
+fn keyed(text: &str, span: Option<Range<usize>>, message: &str) -> String {
+    let at = span.map_or(0, |s| s.start).min(text.len());
+    let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+    let line = text[start..].lines().next().unwrap_or_default();
+    match line.split_once('=') {
+        Some((key, _)) if !key.trim().is_empty() => format!("{}: {message}", key.trim()),
+        _ => message.to_owned(),
+    }
+}
+
 fn located(text: &str, span: Option<Range<usize>>, message: &str) -> ConfigError {
     let at = span.map_or(0, |s| s.start).min(text.len());
     let before = text.get(..at).unwrap_or_default();
@@ -375,3 +503,49 @@ fn located(text: &str, span: Option<Range<usize>>, message: &str) -> ConfigError
         message: message.to_owned(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_removed_app_name_leaves_the_file_and_other_keys_and_comments_stay() {
+        let text = "version = 1
+# keep me
+future = 1
+[ui]
+theme = \"dark\" # mine
+unknown = 2
+
+[ui.app_names]
+\"a.exe\" = \"Aaa\" # note
+\"b.exe\" = \"Bbb\"
+";
+        let mut file = ConfigFile::parse(text).unwrap();
+        assert_eq!(file.config.ui.app_names.len(), 2);
+        file.config.ui.app_names.remove("a.exe");
+        let out = file.to_toml_string().unwrap();
+        assert!(!out.contains("a.exe") && !out.contains("Aaa"), "{out}");
+        for kept in [
+            "# keep me",
+            "future = 1",
+            "theme = \"dark\" # mine",
+            "unknown = 2",
+            "\"b.exe\" = \"Bbb\"",
+        ] {
+            assert!(
+                out.contains(kept),
+                "{kept} lost:
+{out}"
+            );
+        }
+        let back = ConfigFile::parse(&out).unwrap();
+        assert_eq!(
+            back.config.ui.app_names.keys().collect::<Vec<_>>(),
+            ["b.exe"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod overhaul_tests;

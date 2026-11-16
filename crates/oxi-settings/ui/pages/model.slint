@@ -1,0 +1,1240 @@
+// Model page (SPEC Models, ARCHITECTURE section 8, ia-map 3.2), in four sub-tabs. Models: the
+// models as a gallery (DS-15) with the tile under the check in a card below it: its state on disk
+// and what can be done now (download, resume, cancel, use, delete), or the path of "use my own
+// model file"; then the models folder and its unfinished downloads. Languages: the dictation
+// language and the model of each language. Speed: the device, the memory and the engine's speed
+// parameters. Accuracy: the engine's accuracy parameters and the hint.
+import { Theme, Shell, Icons, CapText, Group, Card, Row, ToggleRow, Divider, Caption, IconLabel, Combo, Segmented, TextField, NumberField, Button, ButtonKind, IconButton, InfoTip, PathField, ProgressBar, WarningSlot, SubTabs, SubTabPane, CardGrid, GalleryTile, Badge, BadgeKind, ScrollBox } from "../theme/index.slint";
+import { SearchPopup } from "../theme/components/search_popup.slint";
+
+export struct ModelRow {
+    id: string,
+    name: string,
+    // Under the status, what the tile does not say: paused "0.4 of 3.1 GB · kept 7 more days",
+    // damaged "download it again"; empty when there is nothing to add.
+    detail: string,
+    // The facts alone, a tile's caption and tooltip.
+    facts: string,
+    // The index of the model's glyph in `ModelState.class-icons`.
+    class: int,
+    // In place of `detail` while downloading: "0.7 of 1.6 GB".
+    progress-text: string,
+    // "Ready", "Not downloaded", "Paused", "Downloading".
+    badge: string,
+    // On disk and usable.
+    ready: bool,
+    can-download: bool,
+    // A `.part` is there: the download resumes from it.
+    paused: bool,
+    downloading: bool,
+    // 0..1 while downloading.
+    progress: float,
+    // Why the last download or delete failed; empty otherwise.
+    error: string,
+    // Likely slow on the GPU picked (`models::too_heavy`); a warning, never a block.
+    heavy: bool,
+    // A file of it is on disk (the model, a damaged one or a `.part`): Delete is offered.
+    can-delete: bool,
+    // What a delete frees: "3.1 GB".
+    frees: string,
+    // The card's "i": what the model is for, the memory it needs, why it is recommended.
+    info: string,
+    // Why Download is off on a drive too full for the model (also the card's "!"); empty when it fits.
+    disk-off: string,
+    // `models::recommend` picked it for this PC and language: the tile's caption says so.
+    recommended: bool,
+    // The languages of Model > Languages that run it: "Used for English, Russian"; empty for none.
+    used-for: string,
+}
+
+// One row of Model > Languages (ia-map 3.5): a language with a model of its own.
+export struct LanguageModel {
+    name: string,
+    // The native name under it, empty when it is the English one.
+    native: string,
+    // The row's Combo: the downloaded models, the own file, its own model when that is gone,
+    // then "Download another model".
+    models: [string],
+    model: int,
+    // Its model is not on disk, or hears only another language; empty when fine.
+    warning: string,
+    // It runs for the dictation language now (exactly one row of the tab, the first included).
+    active: bool,
+}
+
+// Filled and read by `pages::model`.
+export global ModelState {
+    // The open sub-tab: 0 Models, 1 Languages, 2 Speed, 3 Accuracy.
+    in-out property <int> tab;
+    in property <[ModelRow]> rows;
+    // One glyph per model class (accurate, fast, language, small), then "use my own .bin".
+    out property <[image]> class-icons: [Icons.model-accurate, Icons.model-fast, Icons.model-language, Icons.model-small, Icons.model-own];
+    // The gallery: a tile per row, then "use my own .bin".
+    in property <[GalleryTile]> tiles;
+    // The model in use: an index in `rows`; `rows.length` is "use my own .bin", -1 is none.
+    in property <int> selected;
+    // The tile under the check, whose card is below the gallery; the model in use on opening.
+    in-out property <int> viewed;
+    // The row `models::recommend` picked for this PC, -1 for none (the setup wizard opens on it).
+    in property <int> recommended: -1;
+    in-out property <string> custom-path;
+    in property <string> custom-error;
+    // The native file dialog exists on this OS.
+    in property <bool> can-browse;
+    // Why "Delete partial downloads" is off; empty while it is on.
+    in property <string> partials-off;
+    // The Partial downloads row's caption: "120 MB in 2 files", "None".
+    in property <string> partials;
+    // The models folder's line, on the Files row and the Models tab header: "4.7 GB in 2 models ·
+    // 120.3 GB free", "Measuring" until the worker answers, a short error if it cannot read it.
+    in property <string> folder-size;
+    // Why the models folder cannot be read, the Files row's "!"; empty while it can.
+    in property <string> folder-error;
+    // Where the models run, for the card's status line: "runs on <graphics card>"; empty until
+    // the daemon lists its GPUs.
+    in property <string> runs-on;
+    // "Auto (best available)", "Processor (CPU)", then the graphics cards the daemon lists.
+    in property <[string]> gpus;
+    in-out property <int> gpu;
+    // "Right away", the minutes, "Never".
+    in property <[string]> unload-options;
+    in-out property <int> unload;
+    // `model.preload_at_start` (hold item 41, candidate 10): loaded when the app starts.
+    in-out property <bool> load-at-start;
+    // The memory suggestion from the daily counts, on "Free memory after"; empty: none now.
+    in property <string> memory-tip;
+    // Model > Languages (`model.by_language`): a row per language with its own model, by name.
+    in property <[LanguageModel]> lang-rows;
+    // The first row, "All other languages and Auto": the model in use, and whether it runs now.
+    in property <string> default-model;
+    in property <bool> default-active;
+    // The "!" of that row, as on the language rows: its model is not on disk (`selected` is the
+    // model id in use; -1 is an id the gallery does not know, `rows.length` is the own file).
+    out property <string> default-warning: self.rows.length > 0 && self.selected < self.rows.length && (self.selected < 0 || !self.rows[self.selected].ready) ? @tr("Not downloaded: dictation in this language fails until you download it or pick another") : "";
+    // The row "Add language" just made: it scrolls into view and takes the caret once, then -1.
+    in-out property <int> lang-new: -1;
+    // The "Add language" popup: the languages with no row yet that match its search.
+    in property <[string]> add-rows;
+    in property <[string]> add-native;
+    // The daemon's Status warnings ("running on CPU: ..."); empty hides the "!" of the GPU row.
+    in property <string> warning;
+    // Why Download is off; empty while the daemon is online.
+    in property <string> download-off;
+    // Why Delete is off; empty while the daemon is online (it may hold the file open).
+    in property <string> delete-off;
+    // The two last used dictation languages: "RU", and "Russian" for a screen reader.
+    in property <[string]> language-codes;
+    in property <[string]> language-names;
+    // 0 and 1 those two, 2 Auto.
+    in property <int> language;
+    // The rows of the "more languages" popup: what the search matches, the native names beside them.
+    in property <[string]> language-rows;
+    in property <[string]> language-native;
+    // The row of the language in use, -1 when the search hides it or it is Auto.
+    in property <int> language-row;
+    callback language-picked(int);
+    callback language-search(string);
+    callback language-chosen(int);
+    callback shown();
+    // The models folder measure answered (the worker wakes the event loop with it).
+    callback measured();
+    // Use: the model of `rows` (or `rows.length`, the own file) becomes the one in use.
+    callback picked(int);
+    callback download(int);
+    callback cancel(int);
+    // Deletes the model's files; its card asked first. False: refused at once, nothing was sent.
+    callback delete(int) -> bool;
+    callback custom-edited(string);
+    // The dialog starts at the folder of this path (DS-13.4).
+    callback browse(string);
+    callback open-folder();
+    callback delete-partials();
+    callback gpu-picked(int);
+    callback unload-picked(int);
+    callback load-at-start-toggled(bool);
+    // The memory suggestion's Apply (true) or Not now (false), and its "Check again".
+    callback memory-suggestion(bool);
+    callback memory-recheck();
+    // (row, item) of a language row's Combo; the last item opens Models instead.
+    callback lang-model-picked(int, int);
+    callback lang-removed(int);
+    callback add-search(string);
+    // A row of the "Add language" popup: the language gets a row with the default model.
+    callback add-chosen(int);
+    // Advanced: per parameter (0 threads, 1 flash attention, 2 decoding, 3 temperature, 4 retry,
+    // 5 silence, 6 confidence, 7 repetition, 8 non-speech) its choice (0 is Auto; a number's
+    // choices then name values, Custom last) and its number (what the choice gives).
+    in property <[int]> adv-mode;
+    in property <[float]> adv-value;
+    in property <string> adv-prompt;
+    // The prompt select: 0 your dictionary, 1 none, 2 your own text (`adv-prompt`).
+    in property <int> adv-prompt-source;
+    // The device `Auto` is judged for: a GPU is loaded (or would be picked), not the processor.
+    in property <bool> adv-gpu;
+    // (parameter, choice, number); parameter 9 is the number beside Decoding.
+    callback adv-changed(int, int, float);
+    callback adv-prompt-edited(string);
+    callback adv-prompt-source-picked(int);
+    // "Reset to Auto" of one tab's tuning group: 0 Speed, 1 Accuracy (the hint is kept).
+    callback adv-reset(int);
+}
+
+// One engine parameter's control: a choice whose first entry is Auto, and for a number the field
+// beside it: a quiet inset showing what the choice gives (Auto or a named value), an editable
+// field on Custom. The page pushes the values; what the person picks is sent up and pushed back.
+component AdvControl inherits HorizontalLayout {
+    in property <int> index;
+    in property <[string]> choices;
+    in property <string> label;
+    // A number beside the choice; `number-index` is the parameter it reports as.
+    in property <bool> number;
+    // The first choice whose number is typed: Custom, the last choice (Decoding: from Fast on).
+    in property <int> editable-from: root.choices.length - 1;
+    in property <int> number-index: root.index;
+    in property <float> minimum;
+    in property <float> maximum: 1;
+    in property <float> step: 1;
+    in property <int> decimals;
+    // Off while the switch it hangs on is off (the Second try thresholds).
+    in property <bool> enabled: true;
+    property <int> mode: ModelState.adv-mode[root.index];
+    property <float> val: ModelState.adv-value[root.index];
+    // The two-way copies the controls edit: a push from the page moves them (Reset all, a save).
+    in-out property <int> shown-mode: root.mode;
+    in-out property <float> shown-value: root.val;
+    changed mode => {
+        root.shown-mode = root.mode;
+    }
+    changed val => {
+        root.shown-value = root.val;
+    }
+    spacing: Theme.control-gap;
+    Combo {
+        horizontal-stretch: 1;
+        // Shrinks to the room left of the number in the 240 column (the default is the whole column).
+        min-width: 0;
+        enabled: root.enabled;
+        model: root.choices;
+        current-index <=> root.shown-mode;
+        accessible-label: root.label;
+        selected => {
+            ModelState.adv-changed(root.index, self.current-index, root.shown-value);
+        }
+    }
+    // Every row's choice is as wide as the others' (DS-3.2): the number's room stays when there is none.
+    if !root.number: Rectangle {
+        width: Theme.control-side;
+    }
+    // Auto is not a broken box: what the choice gives now, in a quiet inset instead of a greyed field.
+    if root.number && root.shown-mode < root.editable-from: Rectangle {
+        width: Theme.control-side;
+        height: Theme.control-height;
+        y: (parent.height - self.height) / 2;
+        background: Theme.bg-inset;
+        border-radius: Theme.radius-control;
+        accessible-role: text;
+        accessible-label: @tr("{} now", root.shown-value.to-fixed(root.decimals));
+        Text {
+            text: root.shown-value.to-fixed(root.decimals);
+            font-size: Theme.body-size;
+            color: Theme.text-secondary;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    if root.number && root.shown-mode >= root.editable-from: NumberField {
+        value <=> root.shown-value;
+        width: Theme.control-side;
+        minimum: root.minimum;
+        maximum: root.maximum;
+        step: root.step;
+        decimals: root.decimals;
+        enabled: root.enabled;
+        changed(v) => {
+            ModelState.adv-changed(root.number-index, root.shown-mode, v);
+        }
+    }
+}
+
+// The curated model under the gallery's check: its name with an "i" (what it is for, the memory it
+// needs), its state and where it runs (or the download's bar), its "!", and two action slots, get
+// (Download, Resume, Cancel, Use) and remove (Delete), each one width. Delete asks first, in place
+// of the line.
+export component ModelCard inherits VerticalLayout {
+    in property <ModelRow> data;
+    in property <int> index;
+    property <bool> in-use: ModelState.selected == root.index;
+    property <string> missing: root.in-use && root.data.can-download && !root.data.downloading ? @tr("Dictation will not start until this is downloaded.") : "";
+    property <string> slow: root.data.heavy ? @tr("Likely slow without a dedicated graphics card. Whisper large-v3 turbo is faster.") : "";
+    property <string> disk: root.data.can-download && !root.data.downloading ? root.data.disk-off : "";
+    property <string> first: root.data.error != "" && root.missing != "" ? root.data.error + "\n" + root.missing : root.data.error + root.missing;
+    property <string> second: root.disk != "" && root.slow != "" ? root.disk + "\n" + root.slow : root.disk + root.slow;
+    property <string> notice: root.first != "" && root.second != "" ? root.first + "\n" + root.second : root.first + root.second;
+    // The state, what the tile does not say (paused: how much is there; damaged: what to do) and
+    // where it runs, on one caption line.
+    property <string> state-line: root.data.badge + (root.data.detail != "" ? " · " + root.data.detail : "") + (ModelState.runs-on != "" ? " · " + ModelState.runs-on : "");
+    // The model a dictation loads is not deleted from under it: another one is put in use first.
+    property <string> delete-tip: ModelState.delete-off != "" ? ModelState.delete-off : root.in-use && root.data.ready ? @tr("In use. Use another model first to delete this one.") : "";
+    property <bool> confirming;
+    property <bool> confirm-by-key;
+    // The question's buttons go with it: the focus goes back to Delete, not to the window top.
+    property <bool> refocus;
+    // A confirmed Delete: once the files are gone, the get slot's Download takes the focus.
+    property <bool> deleting;
+    changed index => {
+        root.confirming = false;
+        root.refocus = false;
+        root.deleting = false;
+    }
+    // A delete that fails (the daemon's refusal lands as the card's "!") ends the wait for the files.
+    property <string> failure: root.data.error;
+    changed failure => {
+        if root.failure != "" {
+            root.deleting = false;
+        }
+    }
+    Card {
+        Rectangle {
+            min-height: line.min-height;
+            preferred-height: line.preferred-height;
+            line := HorizontalLayout {
+                visible: !root.confirming;
+                spacing: Theme.icon-gap;
+                // The icon column of a `Row`: the name starts where row titles do (UI rule 9).
+                VerticalLayout {
+                    alignment: center;
+                    Image {
+                        source: ModelState.class-icons[root.data.class];
+                        width: Theme.icon-size;
+                        height: Theme.icon-size;
+                        colorize: Theme.text-primary;
+                        accessible-role: none;
+                    }
+                }
+                HorizontalLayout {
+                    spacing: Theme.control-gap;
+                    horizontal-stretch: 1;
+                    // The status and its caption line are kept in every state, so the card keeps its
+                    // height (DS-25); a status alone sits in the middle of them.
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        min-height: Theme.body-line + Theme.title-gap + Theme.caption-line;
+                        alignment: center;
+                        spacing: Theme.title-gap;
+                        // The name again (hold 35: "Ready" alone said little); the facts stay on
+                        // the tile, the card says what it is for, where it stands and runs.
+                        HorizontalLayout {
+                            alignment: start;
+                            spacing: Theme.pair-gap;
+                            CapText {
+                                text: root.data.name;
+                                overflow: elide;
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                InfoTip {
+                                    text: root.data.info;
+                                }
+                            }
+                        }
+                        CapText {
+                            text: root.state-line;
+                            spoken: @tr("{}: {}", root.data.name, root.state-line);
+                            font-size: Theme.caption-size;
+                            ink: Theme.text-secondary;
+                            overflow: elide;
+                        }
+                    }
+                    // DS-28.2: the bar's slot, kept so nothing moves when a download starts. With the
+                    // two action slots it fills the control column (200 wide, 80 in the 240 column).
+                    Rectangle {
+                        width: Theme.control-column - 2 * Theme.control-gap - Theme.model-action-column - Theme.control-height;
+                        if root.data.downloading: ProgressBar {
+                            y: (parent.height - self.height) / 2;
+                            width: parent.width;
+                            height: self.preferred-height;
+                            value: root.data.progress;
+                            label: root.data.progress-text;
+                            accessible-label: @tr("{} download", root.data.name);
+                            accessible-value: root.data.progress;
+                        }
+                    }
+                    // UI rule 2: the warning is the "!" of the row, its words in the tooltip and
+                    // the accessible label, never a line under the row. Next to the action it
+                    // warns about (Download), not floating in the middle of the row (hold 24).
+                    WarningSlot {
+                        text: root.notice;
+                    }
+                    Rectangle {
+                        width: Theme.model-action-column;
+                        // Downloading writes no config, so it stays on while the config is locked.
+                        if root.data.can-download && !root.data.downloading: VerticalLayout {
+                            property <bool> back: root.deleting && !root.data.can-delete;
+                            // A ready model's Download is new; a paused one's Resume was there.
+                            init => {
+                                if self.back {
+                                    root.deleting = false;
+                                    get.take-focus(root.confirm-by-key);
+                                }
+                            }
+                            changed back => {
+                                if self.back {
+                                    root.deleting = false;
+                                    get.take-focus(root.confirm-by-key);
+                                }
+                            }
+                            width: parent.width;
+                            alignment: center;
+                            get := Button {
+                                text: root.data.paused ? @tr("Resume") : @tr("Download");
+                                icon: Icons.download;
+                                enabled: ModelState.download-off == "" && root.data.disk-off == "";
+                                tooltip: ModelState.download-off != "" ? ModelState.download-off : root.data.disk-off;
+                                accessible-label: root.data.paused ? @tr("Resume {}", root.data.name) : @tr("Download {}", root.data.name);
+                                clicked => {
+                                    ModelState.download(root.index);
+                                }
+                            }
+                        }
+                        if root.data.downloading: VerticalLayout {
+                            width: parent.width;
+                            alignment: center;
+                            Button {
+                                text: @tr("Cancel");
+                                kind: ButtonKind.danger;
+                                accessible-label: @tr("Cancel {}", root.data.name);
+                                clicked => {
+                                    ModelState.cancel(root.index);
+                                }
+                            }
+                        }
+                        if root.data.ready: VerticalLayout {
+                            width: parent.width;
+                            alignment: center;
+                            Button {
+                                text: root.in-use ? @tr("In use") : @tr("Use");
+                                kind: root.in-use ? ButtonKind.secondary : ButtonKind.primary;
+                                enabled: !root.in-use && !Shell.locked;
+                                tooltip: Shell.locked ? Shell.locked-tip : "";
+                                accessible-label: root.in-use ? @tr("{} in use", root.data.name) : @tr("Use {}", root.data.name);
+                                clicked => {
+                                    ModelState.picked(root.index);
+                                }
+                            }
+                        }
+                    }
+                    // Delete's slot is always there (DS-23.5, DS-7.3), empty when there is nothing to
+                    // delete or a download runs, so no button moves; Delete is rightmost. Files, not
+                    // the config: a locked config keeps it.
+                    Rectangle {
+                        width: Theme.control-height;
+                        if root.data.can-delete && !root.data.downloading: VerticalLayout {
+                            property <bool> back: root.refocus;
+                            changed back => {
+                                if self.back {
+                                    root.refocus = false;
+                                    remove.take-focus(root.confirm-by-key);
+                                }
+                            }
+                            width: parent.width;
+                            alignment: center;
+                            remove := IconButton {
+                                icon: Icons.delete;
+                                label: @tr("Delete");
+                                destructive: true;
+                                enabled: root.delete-tip == "";
+                                tooltip: root.delete-tip;
+                                accessible-label: @tr("Delete {}", root.data.name);
+                                clicked => {
+                                    root.confirm-by-key = self.key-focused;
+                                    root.confirming = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if root.confirming: HorizontalLayout {
+                spacing: Theme.icon-gap;
+                init => {
+                    keep.take-focus(root.confirm-by-key);
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Image {
+                        source: Icons.warning;
+                        width: Theme.icon-size;
+                        height: Theme.icon-size;
+                        colorize: Theme.text-primary;
+                        accessible-role: none;
+                    }
+                }
+                HorizontalLayout {
+                    spacing: Theme.control-gap;
+                    CapText {
+                        text: root.data.paused && !root.data.ready ? @tr("Delete the partial download of {}? Frees {}.", root.data.name, root.data.frees) : root.data.used-for != "" ? @tr("Delete {}? Frees {}. {}", root.data.name, root.data.frees, root.data.used-for) : @tr("Delete {}? Frees {}.", root.data.name, root.data.frees);
+                        wrap: word-wrap;
+                    }
+                    VerticalLayout {
+                        width: Theme.model-action-column;
+                        alignment: center;
+                        Button {
+                            text: @tr("Delete");
+                            icon: Icons.delete;
+                            kind: ButtonKind.danger;
+                            accessible-label: @tr("Confirm: delete {}", root.data.name);
+                            clicked => {
+                                root.refocus = true;
+                                // A refusal may repeat the last "!" word for word, so `failure`
+                                // would not change: the wait starts only for a sent request.
+                                root.deleting = ModelState.delete(root.index);
+                                root.confirming = false;
+                            }
+                        }
+                    }
+                    VerticalLayout {
+                        width: Theme.model-action-column;
+                        alignment: center;
+                        keep := Button {
+                            text: @tr("Keep");
+                            kind: ButtonKind.primary;
+                            accessible-label: @tr("Keep {}", root.data.name);
+                            clicked => {
+                                root.refocus = true;
+                                root.confirming = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// "Use my own .bin" under the gallery's check: the path on a line of its own, wide enough for a
+// real one at the least window width.
+export component CustomCard inherits VerticalLayout {
+    property <bool> in-use: ModelState.selected == ModelState.rows.length;
+    Card {
+        HorizontalLayout {
+            spacing: Theme.icon-gap;
+            VerticalLayout {
+                alignment: start;
+                Rectangle {
+                    width: Theme.icon-size;
+                    // The first line's height: the glyph sits beside the title, not the field.
+                    height: Theme.control-height;
+                    Image {
+                        source: Icons.model-own;
+                        width: Theme.icon-size;
+                        height: Theme.icon-size;
+                        colorize: Theme.text-primary;
+                        accessible-role: none;
+                    }
+                }
+            }
+            VerticalLayout {
+                spacing: Theme.space-2;
+                horizontal-stretch: 1;
+                HorizontalLayout {
+                    spacing: Theme.control-gap;
+                    HorizontalLayout {
+                        horizontal-stretch: 1;
+                        alignment: start;
+                        spacing: Theme.pair-gap;
+                        CapText {
+                            text: @tr("Use my own model file");
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            InfoTip {
+                                text: @tr("A .bin file you have, loaded as is, without a hash check.");
+                            }
+                        }
+                    }
+                    WarningSlot {
+                        text: ModelState.custom-error;
+                    }
+                    VerticalLayout {
+                        width: Theme.model-action-column;
+                        alignment: center;
+                        Button {
+                            text: root.in-use ? @tr("In use") : @tr("Use");
+                            kind: root.in-use ? ButtonKind.secondary : ButtonKind.primary;
+                            enabled: !root.in-use && !Shell.locked && ModelState.custom-path != "" && ModelState.custom-error == "";
+                            tooltip: Shell.locked ? Shell.locked-tip : ModelState.custom-path == "" ? @tr("Choose a .bin model file") : "";
+                            accessible-label: root.in-use ? @tr("Own model file in use") : @tr("Use the model file");
+                            clicked => {
+                                ModelState.picked(ModelState.rows.length);
+                            }
+                        }
+                    }
+                }
+                PathField {
+                    path <=> ModelState.custom-path;
+                    placeholder-text: @tr("Path to a .bin file");
+                    browse-text: ModelState.can-browse ? @tr("Browse") : "";
+                    picks-file: true;
+                    // The field inside takes the label; the frame itself is no element of its own.
+                    accessible-role: none;
+                    accessible-label: @tr("Model file");
+                    edited(text) => {
+                        ModelState.custom-edited(text);
+                    }
+                    browse(path) => {
+                        ModelState.browse(path);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// One line of Model > Languages (ia-map 3.5): the language with its native name under it, the
+// arrow, its model (the children), the "!", the "Active now" slot and Delete rightmost (empty on
+// the first row, DS-23.5). Every slot keeps its width when empty, so the columns line up row to row.
+component LanguageLine inherits HorizontalLayout {
+    in property <string> name;
+    in property <string> native;
+    in property <string> warning;
+    in property <bool> active;
+    in property <bool> removable;
+    callback removed();
+    height: Theme.row-height;
+    spacing: Theme.control-gap;
+    Rectangle {
+        horizontal-stretch: 1;
+        min-width: 0;
+        // No width of its own: the name's length must not move the arrow and model columns.
+        preferred-width: 0;
+        VerticalLayout {
+            alignment: center;
+            CapText {
+                text: root.name;
+                overflow: elide;
+            }
+            if root.native != "": CapText {
+                text: root.native;
+                font-size: Theme.caption-size;
+                ink: Theme.text-secondary;
+                overflow: elide;
+            }
+        }
+    }
+    VerticalLayout {
+        alignment: center;
+        Image {
+            source: Icons.becomes;
+            width: Theme.icon-size-small;
+            height: Theme.icon-size-small;
+            colorize: Theme.text-secondary;
+            accessible-role: none;
+        }
+    }
+    // The model takes the column's width where there is room; at the least window it shares
+    // what the language name leaves (a model name is longer than a language's).
+    HorizontalLayout {
+        min-width: Theme.control-main;
+        preferred-width: Theme.control-column;
+        // The first row's text and the others' Combo end in the same column (DS-3).
+        max-width: Theme.control-column;
+        horizontal-stretch: 1;
+        alignment: stretch;
+        @children
+    }
+    WarningSlot {
+        text: root.warning;
+    }
+    Rectangle {
+        width: Theme.whole(probe.preferred-width) + 2 * Theme.space-2;
+        probe := Text {
+            text: @tr("Active now");
+            font-size: Theme.caption-size;
+            visible: false;
+            accessible-role: none;
+        }
+        if root.active: Badge {
+            width: parent.width;
+            text: @tr("Active now");
+            kind: BadgeKind.accent;
+        }
+    }
+    Rectangle {
+        width: Theme.control-height;
+        if root.removable: Button {
+            kind: ButtonKind.icon;
+            destructive: true;
+            icon: Icons.delete-16;
+            text: @tr("Remove {}", root.name);
+            enabled: !Shell.locked;
+            tooltip: Shell.locked-tip;
+            clicked => {
+                root.removed();
+            }
+        }
+    }
+}
+
+export component ModelPage inherits VerticalLayout {
+    // The shell's room under the header row, banners already taken off.
+    in property <length> free-height;
+    alignment: start;
+    // DS-1.3: the first card sits `header-bottom` under the tab line.
+    spacing: Theme.header-bottom;
+    // The popups report their own `is-open` only to the component that holds them; open, they dim the window.
+    property <bool> languages-open: all-languages.is-open || add-language.is-open;
+    // What the Models tab spends outside the gallery at most (the window's top, the tabs, the group
+    // title, the taller own-file card, the Files card, the bottom margin), measured by
+    // `the_models_tab_never_scrolls_and_the_gallery_takes_the_room`.
+    property <length> gallery-chrome: 329px;
+    // Languages: the list card takes what the room leaves under the language card and the
+    // group title with its button (UI rule 26); its rows scroll inside it.
+    property <length> list-room: root.free-height - tabs.preferred-height - Theme.header-bottom - language-card.preferred-height - Theme.group-gap - Theme.control-height - Theme.header-gap - 2 * Theme.card-padding-v;
+    property <length> list-height: min((ModelState.lang-rows.length + 1) * Theme.row-height, max(3 * Theme.row-height, root.list-room));
+    changed languages-open => {
+        Shell.modal(root.languages-open);
+    }
+    init => {
+        ModelState.shown();
+    }
+    tabs := SubTabs {
+        items: [@tr("Models"), @tr("Languages"), @tr("Speed"), @tr("Accuracy")];
+        selected: ModelState.tab;
+        picked(i) => {
+            ModelState.tab = i;
+        }
+    }
+    Rectangle {
+        SubTabPane {
+            shown: ModelState.tab == 0;
+            VerticalLayout {
+                alignment: start;
+                Group {
+                    title: @tr("Models");
+                    // On the page, not in a card: a tile is a card (UI rule 10). It shows the rows
+                    // the window has room for under the rest of the page, at least two, and
+                    // scrolls the others inside itself, so the page does not (UI rules 25, 26).
+                    CardGrid {
+                        property <length> row-room: Theme.tile-height + Theme.tile-gap;
+                        property <length> room: Shell.window-height - root.gallery-chrome;
+                        // Less the gap after the last row: the next row must not peek in under the grid.
+                        height: min(self.full-height, max(2, floor(self.room / self.row-room)) * self.row-room) - Theme.tile-gap;
+                        min-cell: Theme.model-tile-min-width;
+                        accessible-label: @tr("Models");
+                        tiles: ModelState.tiles;
+                        selected: ModelState.viewed;
+                        fallback-icon: Icons.brain-circuit;
+                        // Picking only shows a model below, it writes no config: a locked config
+                        // keeps it. Its card's Use puts it in use.
+                        locked: false;
+                        picked(i) => {
+                            ModelState.viewed = i;
+                        }
+                    }
+                    if ModelState.viewed >= 0 && ModelState.viewed < ModelState.rows.length: ModelCard {
+                        data: ModelState.rows[ModelState.viewed];
+                        index: ModelState.viewed;
+                    }
+                    if ModelState.viewed == ModelState.rows.length: CustomCard { }
+                    // They change files, not the config, so a locked config keeps them.
+                    Card {
+                        Row {
+                            icon: Icons.models-folder;
+                            title: @tr("Models folder");
+                            info: @tr("Where the downloaded models are kept. The size counts the finished models; the free space is that of its drive.");
+                            description: ModelState.folder-size;
+                            warning: ModelState.folder-error;
+                            // The look of every open-folder button (System, Home): subtle, folder glyph.
+                            Button {
+                                text: @tr("Open");
+                                kind: ButtonKind.soft;
+                                icon: Icons.folder-open;
+                                accessible-label: @tr("Open models folder");
+                                clicked => {
+                                    ModelState.open-folder();
+                                }
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.partial-downloads;
+                            title: @tr("Unfinished downloads");
+                            info: @tr("Downloads that stopped before the end. They are kept so the download goes on from there.");
+                            description: ModelState.partials;
+                            Button {
+                                text: @tr("Delete");
+                                icon: Icons.delete;
+                                accessible-label: @tr("Delete unfinished downloads");
+                                kind: ButtonKind.danger;
+                                enabled: ModelState.partials-off == "";
+                                tooltip: ModelState.partials-off;
+                                clicked => {
+                                    ModelState.delete-partials();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        SubTabPane {
+            shown: ModelState.tab == 1;
+            VerticalLayout {
+                alignment: start;
+                spacing: Theme.group-gap;
+                // No group title: the row names it.
+                language-card := Card {
+                    Row {
+                        icon: Icons.mic;
+                        title: @tr("Dictation language");
+                        // The column's least width at every size: three short segments stretched
+                        // over a wide column read as one bar (UI rule 24).
+                        Rectangle {
+                            width: Theme.control-column-min;
+                            min-height: language-line.min-height;
+                            preferred-height: language-line.preferred-height;
+                            language-line := HorizontalLayout {
+                                spacing: Theme.control-gap;
+                                Segmented {
+                                    horizontal-stretch: 1;
+                                    accessible-label: @tr("Dictation language");
+                                    items: [ModelState.language-codes[0], ModelState.language-codes[1], @tr("Auto")];
+                                    spoken: [ModelState.language-names[0], ModelState.language-names[1], @tr("Auto")];
+                                    // The code ("HAW", "JW") says little: the English name on hover and keyboard focus.
+                                    tips: [ModelState.language-names[0], ModelState.language-names[1], @tr("Detects the language on its own")];
+                                    selected: ModelState.language;
+                                    picked(i) => {
+                                        ModelState.language-picked(i);
+                                    }
+                                }
+                                // A glyph, not typed dots (DS-17.1), with a word: the chevron alone said nothing.
+                                Button {
+                                    text: @tr("More");
+                                    accessible-label: @tr("More languages");
+                                    icon: Icons.caret-down;
+                                    enabled: !Shell.locked;
+                                    clicked => {
+                                        ModelState.language-search("");
+                                        all-languages.show();
+                                    }
+                                }
+                            }
+                            all-languages := SearchPopup {
+                                // The field is the column's least width, not the column: the list is as wide.
+                                width: parent.width;
+                                x: 0;
+                                y: parent.height + Theme.space-1;
+                                items: ModelState.language-rows;
+                                notes: ModelState.language-native;
+                                current: ModelState.language-row;
+                                placeholder: @tr("Search languages");
+                                empty-text: @tr("No language matches");
+                                search(text) => {
+                                    ModelState.language-search(text);
+                                }
+                                picked(i) => {
+                                    ModelState.language-chosen(i);
+                                }
+                            }
+                        }
+                    }
+                }
+                Group {
+                    title: @tr("Model for each language");
+                    info: @tr("When you dictate in a language listed here, its model runs. With Auto the model of the first row runs. An app rule with its own model uses that model; an app rule with its own language uses that language's row.");
+                    action-text: @tr("Add language");
+                    action-icon: Icons.add;
+                    action-tip: Shell.locked ? Shell.locked-tip : @tr("A language that gets a model of its own");
+                    action-enabled: !Shell.locked;
+                    action => {
+                        ModelState.add-search("");
+                        add-language.show();
+                    }
+                    Card {
+                        Rectangle {
+                            height: root.list-height;
+                            lang-box := ScrollBox {
+                                // Without an x a sized child is centred: pinned, so the overhang is all on the right.
+                                x: 0;
+                                width: parent.width + Theme.scrollbar-gutter;
+                                height: parent.height;
+                                reserve-gutter: true;
+                                content-height: (ModelState.lang-rows.length + 1) * Theme.row-height;
+                                VerticalLayout {
+                                    alignment: start;
+                                    width: lang-box.content-width;
+                                    // The default model: edited in one place only, the gallery's Use (ia-map 3.5).
+                                    LanguageLine {
+                                        name: @tr("All other languages and Auto");
+                                        active: ModelState.default-active;
+                                        warning: ModelState.default-warning;
+                                        // The model as text and a soft Change that opens Models (ia-map 3.5).
+                                        HorizontalLayout {
+                                            spacing: Theme.control-gap;
+                                            VerticalLayout {
+                                                horizontal-stretch: 1;
+                                                min-width: 0;
+                                                alignment: center;
+                                                CapText {
+                                                    text: ModelState.default-model;
+                                                    overflow: elide;
+                                                }
+                                            }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                Button {
+                                                    kind: ButtonKind.soft;
+                                                    text: @tr("Change");
+                                                    accessible-label: @tr("Change the default model");
+                                                    tooltip: @tr("Change it in the gallery on Models");
+                                                    clicked => {
+                                                        ModelState.tab = 0;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    for lang[i] in ModelState.lang-rows: LanguageLine {
+                                        name: lang.name;
+                                        native: lang.native;
+                                        warning: lang.warning;
+                                        active: lang.active;
+                                        removable: true;
+                                        removed => {
+                                            ModelState.lang-removed(i);
+                                        }
+                                        // A row just added sorts in at its place: show it and put the caret on its Combo (ia-map 3.5).
+                                        init => {
+                                            if (ModelState.lang-new == i) {
+                                                ModelState.lang-new = -1;
+                                                let top = (i + 1) * Theme.row-height;
+                                                if (top + Theme.row-height > -lang-box.viewport-y + lang-box.height) {
+                                                    lang-box.viewport-y = lang-box.height - top - Theme.row-height;
+                                                }
+                                                if (top < -lang-box.viewport-y) {
+                                                    lang-box.viewport-y = -top;
+                                                }
+                                                combo.focus();
+                                            }
+                                        }
+                                        VerticalLayout {
+                                            alignment: center;
+                                            combo := Combo {
+                                                min-width: 0;
+                                                model: lang.models;
+                                                current-index: lang.model;
+                                                enabled: !Shell.locked;
+                                                accessible-label: @tr("Model for {}", lang.name);
+                                                selected => {
+                                                    ModelState.lang-model-picked(i, self.current-index);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            add-language := SearchPopup {
+                                width: min(parent.width, Theme.control-column);
+                                x: parent.width - self.width;
+                                y: 0;
+                                items: ModelState.add-rows;
+                                notes: ModelState.add-native;
+                                placeholder: @tr("Search languages");
+                                empty-text: @tr("No language matches");
+                                search(text) => {
+                                    ModelState.add-search(text);
+                                }
+                                picked(i) => {
+                                    ModelState.add-chosen(i);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        SubTabPane {
+            shown: ModelState.tab == 2;
+            VerticalLayout {
+                alignment: start;
+                spacing: Theme.group-gap;
+                Group {
+                    title: @tr("Device and memory");
+                    Card {
+                        Row {
+                            icon: Icons.desktop;
+                            title: @tr("Run the model on");
+                            info: @tr("Where the model does its work. Auto picks the graphics card when there is one, else the processor. A graphics card is much faster; the processor works everywhere.");
+                            warning: ModelState.warning;
+                            fill-controls: true;
+                            full-text: ModelState.gpus[ModelState.gpu];
+                            Combo {
+                                model: ModelState.gpus;
+                                current-index <=> ModelState.gpu;
+                                accessible-label: @tr("Run the model on");
+                                selected => {
+                                    ModelState.gpu-picked(self.current-index);
+                                }
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.timer;
+                            title: @tr("Free memory after");
+                            info: @tr("Takes the model out of memory when you have not dictated for this long. The next dictation then starts a little slower.");
+                            fill-controls: true;
+                            can-suggest: true;
+                            suggestion: ModelState.memory-tip;
+                            suggestion-accepted => {
+                                ModelState.memory-suggestion(true);
+                            }
+                            suggestion-dismissed => {
+                                ModelState.memory-suggestion(false);
+                            }
+                            suggestion-refresh => {
+                                ModelState.memory-recheck();
+                            }
+                            Combo {
+                                model: ModelState.unload-options;
+                                current-index <=> ModelState.unload;
+                                accessible-label: @tr("Free memory after");
+                                selected => {
+                                    ModelState.unload-picked(self.current-index);
+                                }
+                            }
+                        }
+                        Divider { }
+                        ToggleRow {
+                            flat: true;
+                            icon: Icons.memory;
+                            title: @tr("Load the model at start");
+                            info: @tr("Loads the model when the app starts, so even the first dictation starts at once. Off: it loads when you first dictate.");
+                            checked <=> ModelState.load-at-start;
+                            toggled(on) => {
+                                ModelState.load-at-start-toggled(on);
+                            }
+                        }
+                    }
+                }
+                Group {
+                    title: @tr("Speed tuning");
+                    info: @tr("For experts. Auto means the app decides: the grey value is what it uses now.");
+                    action-text: @tr("Reset to Auto");
+                    action-tip: @tr("Resets Processor use and Speed boost.");
+                    action-enabled: !Shell.locked;
+                    action => {
+                        ModelState.adv-reset(0);
+                    }
+                    Card {
+                        Row {
+                            icon: Icons.threads;
+                            title: @tr("Processor use");
+                            info: ModelState.adv-gpu ? @tr("How many processor threads transcription may use. Auto: 4 now, a graphics card does the heavy work. Max: all of them, the fastest, other programs may slow down. Half: half of them.") : @tr("How many processor threads transcription may use. Auto: half of them, at most 8, now. Max: all of them, the fastest, other programs may slow down. Half: half of them.");
+                            fill-controls: true;
+                            AdvControl {
+                                index: 0;
+                                label: @tr("Processor use");
+                                choices: [@tr("Auto"), @tr("Max"), @tr("Half"), @tr("Custom")];
+                                number: true;
+                                minimum: 1;
+                                maximum: 32;
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.flash-attention;
+                            title: @tr("Speed boost");
+                            info: ModelState.adv-gpu ? @tr("A quicker way to compute (flash attention). Auto: on now, a graphics card is in use. Changing it loads the model again for the next dictation.") : @tr("A quicker way to compute (flash attention). Auto: off now, the processor is in use. On with a graphics card that supports it. Changing it loads the model again for the next dictation.");
+                            fill-controls: true;
+                            AdvControl {
+                                index: 1;
+                                label: @tr("Speed boost");
+                                choices: [@tr("Auto"), @tr("On"), @tr("Off")];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        SubTabPane {
+            shown: ModelState.tab == 3;
+            VerticalLayout {
+                alignment: start;
+                Group {
+                    title: @tr("Accuracy tuning");
+                    info: @tr("For experts. Auto means the app decides: the grey value is what it uses now.");
+                    action-text: @tr("Reset to Auto");
+                    action-tip: @tr("Resets every row here but the hint for the model, which is your own text.");
+                    action-enabled: !Shell.locked;
+                    action => {
+                        ModelState.adv-reset(1);
+                    }
+                    Card {
+                        Row {
+                            icon: Icons.code;
+                            title: @tr("Careful mode");
+                            info: @tr("Auto: Off, the quickest. On is slower and can be more exact. The number is how many wordings are compared before one is picked.");
+                            fill-controls: true;
+                            AdvControl {
+                                index: 2;
+                                label: @tr("Careful mode");
+                                choices: [@tr("Auto"), @tr("Off (faster)"), @tr("On (more exact)")];
+                                number: true;
+                                editable-from: 1;
+                                number-index: 9;
+                                minimum: 1;
+                                maximum: 8;
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.temperature;
+                            title: @tr("Word variety");
+                            info: @tr("Auto: 0, the most predictable words. Varied and Very varied let Whisper try less likely words.");
+                            fill-controls: true;
+                            AdvControl {
+                                index: 3;
+                                label: @tr("Word variety");
+                                choices: [@tr("Auto"), @tr("Varied"), @tr("Very varied"), @tr("Custom")];
+                                number: true;
+                                maximum: 1;
+                                step: 0.1;
+                                decimals: 1;
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.retry-doubtful;
+                            title: @tr("Second try");
+                            info: @tr("Auto: on. A phrase Whisper is not sure of is tried again with a little more variety. The next two rows say when.");
+                            fill-controls: true;
+                            AdvControl {
+                                index: 4;
+                                label: @tr("Second try");
+                                choices: [@tr("Auto"), @tr("On"), @tr("Off")];
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.confidence;
+                            title: @tr("Second try when confidence is low");
+                            info: @tr("Auto: -1.0. A phrase Whisper is less sure of than this is tried again. Stricter retries more phrases, Looser fewer.");
+                            enabled: ModelState.adv-mode[4] != 2;
+                            off-tip: @tr("Turn on Second try first");
+                            fill-controls: true;
+                            AdvControl {
+                                index: 6;
+                                label: @tr("Second try when confidence is low");
+                                enabled: ModelState.adv-mode[4] != 2;
+                                choices: [@tr("Auto"), @tr("Stricter"), @tr("Looser"), @tr("Custom")];
+                                number: true;
+                                minimum: -5;
+                                maximum: 0;
+                                step: 0.1;
+                                decimals: 1;
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.repetition;
+                            title: @tr("Second try when a phrase repeats");
+                            info: @tr("Auto: 2.4. A phrase that repeats itself more than this is tried again. Stricter retries sooner, Looser later.");
+                            enabled: ModelState.adv-mode[4] != 2;
+                            off-tip: @tr("Turn on Second try first");
+                            fill-controls: true;
+                            AdvControl {
+                                index: 7;
+                                label: @tr("Second try when a phrase repeats");
+                                enabled: ModelState.adv-mode[4] != 2;
+                                choices: [@tr("Auto"), @tr("Stricter"), @tr("Looser"), @tr("Custom")];
+                                number: true;
+                                maximum: 10;
+                                step: 0.1;
+                                decimals: 1;
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.silence-threshold;
+                            title: @tr("Silence cut-off");
+                            info: @tr("Auto: 0.6. A phrase more likely to be silence than this is dropped. Keep more drops only near-certain silence, Cut more drops doubtful quiet too.");
+                            fill-controls: true;
+                            AdvControl {
+                                index: 5;
+                                label: @tr("Silence cut-off");
+                                choices: [@tr("Auto"), @tr("Keep more"), @tr("Cut more"), @tr("Custom")];
+                                number: true;
+                                maximum: 1;
+                                step: 0.05;
+                                decimals: 2;
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.non-speech;
+                            title: @tr("Skip non-speech sounds");
+                            info: @tr("Auto: off. On drops sounds written as [MUSIC] or (laughs).");
+                            fill-controls: true;
+                            AdvControl {
+                                index: 8;
+                                label: @tr("Skip non-speech sounds");
+                                choices: [@tr("Auto"), @tr("On"), @tr("Off")];
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            icon: Icons.book-letter;
+                            title: @tr("Hint for the model");
+                            info: @tr("Words or a sentence Whisper reads before it listens, to set the style or the spelling. Your dictionary: its words alone. Custom: your text, then your dictionary. Reset to Auto keeps it.");
+                            fill-controls: true;
+                            // The select and the text field take the same place and size, so
+                            // nothing around them moves; the arrow goes back to the select.
+                            if ModelState.adv-prompt-source != 2: Combo {
+                                model: [@tr("Your dictionary (auto)"), @tr("None"), @tr("Custom")];
+                                current-index: ModelState.adv-prompt-source;
+                                accessible-label: @tr("Hint for the model");
+                                // A pick ends the binding above: a source pushed from outside still reaches the select.
+                                property <int> pushed: ModelState.adv-prompt-source;
+                                changed pushed => {
+                                    self.current-index = self.pushed;
+                                }
+                                selected => {
+                                    ModelState.adv-prompt-source-picked(self.current-index);
+                                }
+                            }
+                            if ModelState.adv-prompt-source == 2: HorizontalLayout {
+                                spacing: Theme.control-gap;
+                                TextField {
+                                    text: ModelState.adv-prompt;
+                                    placeholder-text: @tr("Your own text");
+                                    accessible-label: @tr("Hint for the model");
+                                    // Typing ends the binding: a prompt pushed from outside still reaches the field.
+                                    property <string> pushed: ModelState.adv-prompt;
+                                    changed pushed => {
+                                        self.text = self.pushed;
+                                    }
+                                    // Saved when the person is done, not on every key.
+                                    accepted(text) => {
+                                        ModelState.adv-prompt-edited(text);
+                                    }
+                                    changed has-focus => {
+                                        if !self.has-focus {
+                                            ModelState.adv-prompt-edited(self.text);
+                                        }
+                                    }
+                                }
+                                IconButton {
+                                    icon: Icons.revert;
+                                    label: @tr("Choose from the list");
+                                    clicked => {
+                                        ModelState.adv-prompt-source-picked(0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

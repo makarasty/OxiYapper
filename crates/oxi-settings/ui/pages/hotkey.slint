@@ -1,0 +1,277 @@
+// Hotkey page (SPEC Recording, Settings UI): the chord as keycaps and a pencil, which toggles the
+// full keyboard (click keys or press them, held keys light up); while it is open the same row reads
+// "current -> new". Closing the keyboard with keys picked keeps them as a draft (a dot on the
+// pencil) until the page is left. Then the mode.
+import { Theme, Shell, Icons, Group, Card, Row, Divider, ToggleRow, SliderRow, Combo, KeycapRow, TilePicker, Button, ButtonKind } from "../theme/index.slint";
+import { WarningSlot } from "../theme/components/feedback.slint";
+import { Keyboard, KeyCap } from "../keyboard.slint";
+
+// Filled and read by `pages::hotkey`.
+export global HotkeyState {
+    // The saved chord in words, "Ctrl + Numpad 1", and the caps of its keys one by one.
+    in property <string> chord;
+    in property <[string]> chord-keys;
+    // 0 push-to-talk, 1 toggle.
+    in property <int> mode;
+    // `hotkey.other_key`: 0 auto, 1 never cancel, 2 always cancel.
+    in-out property <int> other-key;
+    // `hotkey.esc_cancels`.
+    in-out property <bool> esc-cancels;
+    in property <bool> keyboard-open;
+    // The keyboard is hidden but its pending keys are kept (the dot on the pencil).
+    in property <bool> draft;
+    // `hotkey.hold_gap_ms` as the slider shows it: 0 is off, else 100 to 1500.
+    in-out property <float> hold-gap;
+    // The daemon link is up: without it no key is captured and Apply is off.
+    in property <bool> online;
+    // Why Apply is off on this link (empty while online): its tooltip.
+    in property <string> note;
+    in property <[KeyCap]> caps;
+    in property <float> columns;
+    in property <float> rows;
+    // The pending chord in words, the keys `pending-keys` shows; empty while it has no keys.
+    in property <string> pending;
+    // The pending keys one by one (also while the chord is refused, to show what was pressed).
+    in property <[string]> pending-keys;
+    // Why the pending chord cannot be saved; empty when it can.
+    in property <string> error;
+    // The page came into view.
+    callback shown();
+    callback change();
+    callback key-clicked(string);
+    // The keyboard gained (true) or lost (false) the keyboard focus (the window going to the back
+    // takes it): hotkey capture follows it, so it runs the whole time the keyboard is open.
+    callback focused(bool);
+    callback apply();
+    callback cancel();
+    callback mode-picked(int);
+    callback other-key-picked(int);
+    callback esc-cancels-toggled(bool);
+    callback hold-gap-changed(float);
+}
+
+// The Shortcut group: the chord as keycaps, Change, and the keyboard it opens. Also the setup
+// wizard's hotkey step.
+export component HotkeyKeys inherits Group {
+    // The room the keyboard may take (the page's, or the wizard step's).
+    in property <length> free-height;
+    // The room of the chords, from the Change button's left: the control column, and while the
+    // keyboard is open also the free part of the title column (the chords reach back over it).
+    // What the title ("Keys", its "i" and some air) keeps of its column.
+    property <length> title-reserve: 96px;
+    property <length> closed-room: Theme.control-column - change.preferred-width - Theme.control-gap;
+    property <length> cluster-width: HotkeyState.keyboard-open ? max(root.closed-room, keys-row.width - Theme.icon-size - Theme.icon-gap - root.title-reserve - change.preferred-width - Theme.control-gap) : root.closed-room;
+    // What the old chord may take: the rest keeps one cap for the new chord, so a chord gives way
+    // to the new keys only when the cluster is short (a "+N" cap on real overflow).
+    property <length> chord-room: root.cluster-width - Theme.icon-size-small - Theme.icon-size - 3 * Theme.control-gap - Theme.keycap-width;
+    title: @tr("Shortcut");
+    Card {
+        keys-row := Row {
+            icon: Icons.keyboard;
+            title: @tr("Keys");
+            info: @tr("Click keys or press them. Left and right modifiers both count.");
+            // The saved chord, the arrow and the new chord: a display and no control (the labelled
+            // Change button is the one way in). Hangs on a zero-width anchor at the button's left
+            // and reaches left over the title column's free part, so it never folds while there
+            // is room (DS-28.3: a "+N" cap only on real overflow).
+            Rectangle {
+                preferred-width: 0;
+                max-width: 0;
+                min-height: Theme.control-height;
+                HorizontalLayout {
+                    x: -self.width;
+                    width: root.cluster-width;
+                    height: parent.height;
+                    alignment: end;
+                    spacing: Theme.control-gap;
+                    // The saved chord reads as the old value in secondary ink while editing.
+                    Rectangle {
+                        preferred-width: chord.preferred-width;
+                        min-width: HotkeyState.keyboard-open ? min(chord.preferred-width, max(Theme.keycap-width, root.chord-room)) : 0px;
+                        chord := KeycapRow {
+                            width: parent.width;
+                            pack-end: true;
+                            keys: HotkeyState.chord-keys;
+                            label: HotkeyState.chord;
+                            muted: HotkeyState.keyboard-open;
+                        }
+                    }
+                    if HotkeyState.keyboard-open: VerticalLayout {
+                        alignment: center;
+                        Image {
+                            source: Icons.becomes;
+                            width: Theme.icon-size-small;
+                            height: Theme.icon-size-small;
+                            colorize: Theme.text-secondary;
+                            accessible-role: none;
+                        }
+                    }
+                    // A slot of four caps at least, so the old chord and the arrow do not move while the first keys
+                    // are typed; a longer chord takes the width it needs (a "+N" cap only on real overflow).
+                    if HotkeyState.keyboard-open: Rectangle {
+                        preferred-width: max(4 * Theme.keycap-width + 3 * Theme.keycap-gap, pending.preferred-width);
+                        min-width: Theme.keycap-width;
+                        pending := KeycapRow {
+                            width: parent.width;
+                            keys: HotkeyState.pending-keys;
+                            fresh: true;
+                            warning: HotkeyState.error != "";
+                            empty-text: @tr("Press keys");
+                            label: HotkeyState.pending != "" ? @tr("New hotkey: {}", HotkeyState.pending) : @tr("No keys yet");
+                        }
+                    }
+                    // The "!" of the new chord (UI rule 2): why it cannot be saved, its tooltip.
+                    if HotkeyState.keyboard-open: WarningSlot {
+                        text: HotkeyState.error;
+                    }
+                }
+            }
+            // Centre the button on the keycaps (DS-3.4).
+            VerticalLayout {
+                alignment: center;
+                change := Button {
+                    text: @tr("Change");
+                    icon: Icons.edit;
+                    accessible-label: @tr("Change hotkey");
+                    enabled: !Shell.locked;
+                    toggled: HotkeyState.keyboard-open;
+                    kept-dot: HotkeyState.draft && !HotkeyState.keyboard-open;
+                    tooltip: Shell.locked ? Shell.locked-tip : HotkeyState.keyboard-open ? @tr("Hide the keyboard, keep the keys") : HotkeyState.draft ? @tr("Continue the unsaved hotkey") : "";
+                    clicked => {
+                        HotkeyState.change();
+                    }
+                }
+            }
+        }
+    }
+    // Keys pressed while it has the focus come from the daemon's hook (CaptureHotkey), which
+    // swallows every key, Tab and Esc too, for as long as the keyboard is open: Esc alone and
+    // Enter alone are handled by `pages::hotkey`; Cancel and Apply are the mouse's.
+    if HotkeyState.keyboard-open: board := FocusScope {
+        accessible-role: groupbox;
+        accessible-label: @tr("Hotkey keyboard");
+        init => {
+            self.focus();
+        }
+        focus-gained => {
+            HotkeyState.focused(true);
+        }
+        focus-lost => {
+            HotkeyState.focused(false);
+        }
+        // A FocusScope does not take its child's height: the panel would end above the buttons.
+        min-height: panel.min-height;
+        preferred-height: panel.preferred-height;
+        panel := Card {
+            Keyboard {
+                caps: HotkeyState.caps;
+                columns: HotkeyState.columns;
+                rows: HotkeyState.rows;
+                // The chrome counted a row of buttons under the board: they sit on its last row now.
+                room: root.free-height - (Theme.hotkey-tight-chrome - Theme.control-height - Theme.space-2);
+                clicked(name) => {
+                    board.focus();
+                    HotkeyState.key-clicked(name);
+                }
+                // In the free end of the F13-F24 row (right of F24), centred on that row.
+                HorizontalLayout {
+                    width: self.preferred-width;
+                    height: Theme.control-height;
+                    x: parent.width - self.width;
+                    y: parent.height - (parent.height / HotkeyState.rows + self.height) / 2;
+                    spacing: Theme.control-gap;
+                    cancel := Button {
+                        text: @tr("Cancel");
+                        accessible-label: @tr("Cancel hotkey change");
+                        clicked => {
+                            HotkeyState.cancel();
+                        }
+                    }
+                    apply := Button {
+                        text: @tr("Apply");
+                        accessible-label: @tr("Apply hotkey");
+                        kind: ButtonKind.primary;
+                        enabled: !Shell.locked && HotkeyState.online && HotkeyState.error == "";
+                        // The reason sits on the button; the banner already says OxiYapper is off.
+                        tooltip: Shell.locked ? Shell.locked-tip : HotkeyState.note;
+                        clicked => {
+                            HotkeyState.apply();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component HotkeyPage inherits VerticalLayout {
+    // The room of the page in the window (without the title and the banners).
+    in property <length> free-height;
+    // With the keyboard open the page must not scroll (UI rule 25): the board is capped by height
+    // and Recording mode gives way.
+    property <bool> mode-hidden: HotkeyState.keyboard-open && root.free-height < Theme.hotkey-full-height;
+    init => {
+        HotkeyState.shown();
+    }
+    alignment: start;
+    spacing: Theme.group-gap;
+    HotkeyKeys {
+        free-height: root.free-height;
+    }
+    if !root.mode-hidden: Group {
+        title: @tr("Recording mode");
+        TilePicker {
+            accessible-label: @tr("Recording mode");
+            columns: 2;
+            tiles: [
+                { icon: Icons.hand-left-24, icon-selected: Icons.hand-left-24-filled, title: @tr("Push to talk"), caption: @tr("Hold the keys while you speak. Double-tap to lock.") },
+                { icon: Icons.toggle-right-24, icon-selected: Icons.toggle-right-24-filled, title: @tr("Toggle"), caption: @tr("Press once to start, again to stop.") },
+            ];
+            selected: HotkeyState.mode;
+            picked(i) => {
+                HotkeyState.mode-picked(i);
+            }
+        }
+        // Gives way to the open keyboard like the tiles: the page must not scroll (UI rule 25).
+        if !HotkeyState.keyboard-open: Card {
+            Row {
+                title: @tr("Cancel on another key");
+                info: @tr("The key always reaches the app. Auto cancels only if you have not spoken yet.");
+                fill-controls: true;
+                Combo {
+                    model: [@tr("Auto"), @tr("Never cancel"), @tr("Always cancel")];
+                    current-index <=> HotkeyState.other-key;
+                    accessible-label: @tr("Cancel on another key");
+                    selected => {
+                        HotkeyState.other-key-picked(self.current-index);
+                    }
+                }
+            }
+            Divider { }
+            ToggleRow {
+                flat: true;
+                title: @tr("Esc cancels a recording");
+                checked <=> HotkeyState.esc-cancels;
+                toggled(on) => {
+                    HotkeyState.esc-cancels-toggled(on);
+                }
+            }
+            // Only a held key can be let go and pressed again by accident.
+            if HotkeyState.mode == 0: Divider { }
+            if HotkeyState.mode == 0: SliderRow {
+                title: @tr("Continue if pressed again within");
+                info: @tr("Let go of the keys and press them again within this time, and the same dictation goes on. Off starts a new one.");
+                minimum: 0;
+                maximum: 1500;
+                step: 100;
+                default-value: 400;
+                unit: "ms";
+                zero-text: @tr("Off");
+                value <=> HotkeyState.hold-gap;
+                changed(v) => {
+                    HotkeyState.hold-gap-changed(v);
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,338 @@
+// The card grid (DS-15) shared by the Per-app apps, the model gallery and the sounds: the grid
+// scrolls inside itself with the design-system bar, so the page around it stays still (UI rules 25,
+// 26). Give it a height from the page; put it on the page, not in a `Card`, a tile is already a
+// card (rule 10). Empty and full fill the same box. One anatomy: glyph or picture top-left, title
+// (one line, cut, whole in the tooltip), caption, the top-right slot for the check badge.
+import { Theme, Shell } from "../tokens.slint";
+import { Icons } from "../icons.slint";
+import { CardFrame, Caption, KeyFocus, Tip, ScrollBox } from "base.slint";
+import { Tile } from "tiles.slint";
+import { EmptyState, Badge, BadgeKind } from "feedback.slint";
+
+export struct GalleryTile {
+    // Monochrome glyph, tinted like a `TileItem`; `icon-selected` (filled) is drawn while picked.
+    icon: image,
+    icon-selected: image,
+    // Full-colour picture (an app's icon), drawn untinted; wins over `icon`.
+    picture: image,
+    title: string,
+    caption: string,
+    // The tooltip; on a disabled tile it says why (rule 31).
+    hint: string,
+    disabled: bool,
+    // Ticked on its own (the check badge and the tint), whatever `selected` says: a grid that toggles
+    // many tiles (the Per-app apps popup) keeps the flag in its rows.
+    checked: bool,
+    // The state mark in the top-right slot, drawn only while the tile is not ticked or picked (the
+    // check badge is its mark then): 0 none, 1 done (a success-tinted check), 2 to get (a download
+    // glyph). Its words are `hint`; never repeat them in the caption (rule 29).
+    mark: int,
+    // A percent drawn in that slot, right-aligned, while the tile's file downloads.
+    mark-text: string,
+    // An accent `Badge` beside the glyph ("Recommended"); empty shows none. Said before `hint`.
+    badge: string,
+}
+
+// One-way like `TilePicker`: `picked` fires, the owner updates `selected` (-1: none). The arrows
+// move a cursor (focus ring), Enter or Space picks, so walking 100 tiles fires nothing and a
+// disabled tile cannot trap the keyboard. Give it an `accessible-label` (the group title).
+export component CardGrid {
+    in property <[GalleryTile]> tiles;
+    in property <int> selected: -1;
+    // A window onto `tiles`: the `count` tiles from `first` (-1: all the rest), so two grids can
+    // share one list (the Off and Own file row above the sounds). `selected` and `picked` keep
+    // counting from the list's start.
+    in property <int> first: 0;
+    in property <int> count: -1;
+    // Cells as wide as those of a fuller grid beside it (the Off and Own file row above the
+    // gallery): `pack` keeps the columns it has room for even when there are fewer tiles, and
+    // `reserve-gutter` leaves the other grid's scrollbar gutter.
+    in property <bool> pack: false;
+    in property <bool> reserve-gutter: false;
+    // Centred in the box when `tiles` is empty, as an `EmptyState` (DS-12); the glyph is optional.
+    in property <string> empty-text;
+    in property <image> empty-icon;
+    // Drawn for a tile with neither picture nor icon (a found app whose shortcut gave none).
+    in property <image> fallback-icon;
+    in property <bool> locked: Shell.locked;
+    in property <int> force-hover: -1;
+    in property <bool> force-focus;
+    callback picked(int);
+
+    // Read by `tests/gallery.rs`.
+    out property <int> cursor: clamp(root.raw-cursor, 0, max(0, root.total - 1));
+    out property <int> columns: root.cols;
+    out property <length> scrolled: -list.viewport-y;
+    // The height at which no tile row scrolls, whatever the height given.
+    out property <length> full-height: ceil(root.total / root.fit(root.width)) * root.row-height;
+    // The height that holds the empty state: a page may give an empty gallery just this.
+    out property <length> empty-height: empty-measure.preferred-height;
+
+    // The widest column that still fits, so a wider window gets more tiles, not stretched ones
+    // (until every tile has its own column). Settable for a short list of one-line cards (the
+    // sound events): narrower and shorter.
+    in property <length> min-cell: Theme.tile-min-width;
+    in property <length> tile-height: Theme.tile-height;
+    property <length> gap: Theme.tile-gap;
+    // Half a gap around every tile inside the scroller: the focus ring must not be clipped.
+    property <length> edge: root.gap / 2;
+    property <length> row-height: root.tile-height + root.gap;
+    // The tiles step aside for the bar's gutter only when there is one (DS-18.2), by the scroller's
+    // own rule and width: rows at full width that overflow it still overflow once narrowed.
+    out property <bool> overflows: list.overflow-for(ceil(root.total / root.fit(root.width)) * root.row-height);
+    property <length> usable: root.width - (root.overflows || root.reserve-gutter ? Theme.scrollbar-gutter : 0);
+    // Never more columns than tiles, so a short gallery has no empty columns that cut every title
+    // (t21b); the cells share the width up to `tile-max-width`, then pack left (DS-15.2).
+    property <int> cols: root.pack ? root.fit(root.usable) : min(root.fit(root.usable), max(1, root.total));
+    property <length> cell: min(Theme.tile-max-width, (root.usable - (root.cols - 1) * root.gap) / root.cols);
+    property <int> rows: ceil(root.total / root.cols);
+    property <int> total: root.count < 0 ? max(0, root.tiles.length - root.first) : min(root.count, max(0, root.tiles.length - root.first));
+    // `selected` in this window's own count, -1 outside it.
+    property <int> sel: root.selected >= root.first && root.selected < root.first + root.total ? root.selected - root.first : -1;
+    property <int> raw-cursor;
+    property <bool> key-focus;
+
+    pure function fit(w: length) -> int {
+        return max(1, floor((w + root.gap) / (root.min-cell + root.gap)));
+    }
+
+    // The cursor takes the keyboard (the arrows walk the tiles): a search field above hands over here.
+    public function focus-grid() {
+        fs.focus();
+        root.key-focus = true;
+        root.reveal(root.cursor);
+    }
+
+    function pick(i: int) {
+        if (!root.locked && i >= 0 && i < root.total && !root.tiles[root.first + i].disabled && i != root.sel) {
+            root.picked(root.first + i);
+        }
+    }
+
+    function reveal(i: int) {
+        // Before the first layout there is no box to scroll in; `changed height` comes back.
+        if (root.height <= 0) {
+            return;
+        }
+        let top = floor(i / root.cols) * root.row-height;
+        if (top < -list.viewport-y) {
+            list.viewport-y = -top;
+        } else if (top + root.row-height > -list.viewport-y + list.height) {
+            // Whole rows, so the view never stops on a cut row.
+            let whole = ceil((top + root.row-height - list.height) / root.row-height) * root.row-height;
+            list.viewport-y = -min(whole, max(0, root.rows * root.row-height - list.height));
+        }
+    }
+
+    function move-to(i: int) {
+        if (i >= 0 && i < root.total) {
+            root.raw-cursor = i;
+            root.key-focus = true;
+            root.reveal(i);
+        }
+    }
+
+    function follow-selection() {
+        if (root.sel >= 0) {
+            root.raw-cursor = root.sel;
+            root.reveal(root.sel);
+        }
+    }
+
+    changed selected => {
+        root.follow-selection();
+    }
+    // Opening on a tile: now when the box is sized at creation (a fixed height never fires
+    // `changed`), else on its first layout.
+    init => {
+        root.follow-selection();
+    }
+    changed height => {
+        root.follow-selection();
+    }
+
+    preferred-width: 100%;
+    preferred-height: 100%;
+    horizontal-stretch: 1;
+    min-height: root.tile-height;
+    vertical-stretch: 1;
+    accessible-role: radio-group;
+
+    fs := FocusScope {
+        enabled: !root.locked && root.total > 0;
+        focus-on-click: false;
+        focus-gained(reason) => {
+            root.key-focus = KeyFocus.after(reason, root.key-focus);
+            root.reveal(root.cursor);
+        }
+        key-pressed(event) => {
+            if (event.text == Key.LeftArrow) {
+                root.move-to(root.cursor - 1);
+                return accept;
+            }
+            if (event.text == Key.RightArrow) {
+                root.move-to(root.cursor + 1);
+                return accept;
+            }
+            if (event.text == Key.UpArrow) {
+                root.move-to(root.cursor - root.cols);
+                return accept;
+            }
+            if (event.text == Key.DownArrow) {
+                // From above a short last row, Down lands on its last tile.
+                if (floor(root.cursor / root.cols) + 1 < root.rows) {
+                    root.move-to(min(root.cursor + root.cols, root.total - 1));
+                }
+                return accept;
+            }
+            if (event.text == Key.Return || event.text == " ") {
+                root.pick(root.cursor);
+                return accept;
+            }
+            reject
+        }
+    }
+
+    empty-measure := EmptyState {
+        visible: false;
+        width: root.width;
+        text: root.empty-text;
+        icon: root.empty-icon;
+        accessible-role: none;
+    }
+
+    if root.total == 0: CardFrame {
+        EmptyState {
+            text: root.empty-text;
+            icon: root.empty-icon;
+        }
+    }
+
+    list := ScrollBox {
+        x: -root.edge;
+        y: -root.edge;
+        width: root.width + 2 * root.edge;
+        height: root.height + 2 * root.edge;
+        // The thumb centred in the grid's gutter: the scroller overhangs the grid by `edge`.
+        bar-inset: root.edge + (Theme.scrollbar-gutter - Theme.scrollbar-width) / 2;
+        visible: root.total > 0;
+        content-height: root.rows * root.row-height;
+        for row in root.rows: Rectangle {
+            y: row * root.row-height;
+            height: root.row-height;
+            // shortcut: an empty `Tile` draws frame, fill, badge and ring, and the content goes on top, because
+            // `Tile` wraps and always tints; move elide and `picture` into `Tile` when tiles.slint is in scope.
+            for col in min(root.cols, root.total - row * root.cols): tile := Tile {
+                property <int> i: row * root.cols + col;
+                property <GalleryTile> data: root.tiles[root.first + self.i];
+                property <bool> cut: title.preferred-width > title.width;
+                // Holds "100 %" at the caption size.
+                property <length> percent-slot: 40px;
+                x: root.edge + col * (root.cell + root.gap);
+                y: root.edge;
+                width: root.cell;
+                height: root.tile-height;
+                selected: self.i == root.sel || self.data.checked;
+                hover: touch.has-hover || root.force-hover == self.i;
+                pressed: touch.pressed;
+                read-only: root.locked || self.data.disabled;
+                focused: self.i == root.cursor && (root.force-focus || (root.key-focus && fs.has-focus));
+                accessible-role: radio-button;
+                accessible-label: self.data.title;
+                accessible-description: self.data.badge == "" ? self.data.hint : self.data.hint == "" ? self.data.badge : self.data.badge + ". " + self.data.hint;
+                accessible-checkable: true;
+                accessible-checked: self.selected;
+                accessible-enabled: !self.read-only;
+                accessible-action-default => {
+                    root.pick(self.i);
+                }
+                VerticalLayout {
+                    padding: Theme.space-3;
+                    // Keeps the title clear of the top-right check badge.
+                    padding-right: Theme.space-3 + (tile.data.mark-text != "" ? tile.percent-slot + (tile.selected ? Theme.check-badge-size + Theme.space-1 : 0px) : Theme.check-badge-size);
+                    spacing: Theme.space-1;
+                    alignment: start;
+                    HorizontalLayout {
+                        alignment: start;
+                        spacing: Theme.space-2;
+                        Image {
+                            source: tile.data.picture.width > 0 ? tile.data.picture : tile.selected && tile.data.icon-selected.width > 0 ? tile.data.icon-selected : tile.data.icon.width > 0 ? tile.data.icon : root.fallback-icon;
+                            width: Theme.icon-size-large;
+                            height: Theme.icon-size-large;
+                            image-fit: contain;
+                            colorize: tile.data.picture.width > 0 ? transparent : tile.ink;
+                            // A full-colour picture has no ink to grey: it fades instead (an image, no text).
+                            opacity: tile.read-only && tile.data.picture.width > 0 ? 0.4 : 1;
+                            accessible-role: none;
+                        }
+                        // Not beside a download's percent: in the least cell the two would meet.
+                        // The glyph keeps the row's height, so nothing moves when it goes.
+                        if tile.data.badge != "" && tile.data.mark-text == "": VerticalLayout {
+                            alignment: center;
+                            Badge {
+                                text: tile.data.badge;
+                                kind: BadgeKind.accent;
+                                accessible-role: none;
+                            }
+                        }
+                    }
+                    title := Text {
+                        text: tile.data.title;
+                        font-size: Theme.body-size;
+                        font-weight: Theme.weight-strong;
+                        color: tile.ink;
+                        overflow: elide;
+                        accessible-role: none;
+                    }
+                    if tile.data.caption != "": Caption {
+                        text: tile.data.caption;
+                        color: tile.caption-ink;
+                        overflow: elide;
+                        accessible-role: none;
+                    }
+                }
+                if tile.data.mark > 0 && !tile.selected: Image {
+                    source: tile.data.mark == 1 ? Icons.done : Icons.download;
+                    x: tile.width - self.width - Theme.space-2;
+                    y: Theme.space-2;
+                    width: Theme.check-badge-size;
+                    height: Theme.check-badge-size;
+                    colorize: tile.data.mark == 1 ? Theme.success-text : Theme.text-secondary;
+                    opacity: tile.read-only ? 0.4 : 1;
+                    accessible-role: none;
+                }
+                if tile.data.mark-text != "": Caption {
+                    x: tile.width - self.width - Theme.space-2 - (tile.selected ? Theme.check-badge-size + Theme.space-1 : 0px);
+                    y: Theme.space-2;
+                    width: tile.percent-slot;
+                    height: Theme.check-badge-size;
+                    text: tile.data.mark-text;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                    accessible-role: none;
+                }
+                // Enabled on a disabled tile too: its tooltip says why (rule 31); `pick` refuses it.
+                touch := TouchArea {
+                    mouse-cursor: root.locked || tile.data.disabled ? MouseCursor.default : MouseCursor.pointer;
+                    clicked => {
+                        if (!root.locked) {
+                            fs.focus();
+                            root.key-focus = false;
+                            root.raw-cursor = tile.i;
+                            root.pick(tile.i);
+                        }
+                    }
+                }
+                Tip {
+                    // A cut title stands in full here (rule 28).
+                    text: !tile.cut ? tile.data.hint : tile.data.hint == "" ? tile.data.title : tile.data.title + "\n" + tile.data.hint;
+                    hovered: touch.has-hover;
+                    pressed: touch.pressed;
+                }
+            }
+        }
+    }
+}
+
+// The earlier name, kept while the pages move to `CardGrid` (t22-t32).
+export component TileGallery inherits CardGrid { }

@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
+use crate::config::{Config, OtherKey};
+use crate::device::DeviceChoice;
 use crate::paste::PasteOutcome;
 use crate::types::Millis;
 
@@ -20,9 +21,17 @@ pub enum Mode {
 }
 
 /// The values the machine reads from the user config; `Default` is the SPEC set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent settings, one per config key"
+)]
 pub struct MachineConfig {
     pub mode: Mode,
+    /// Esc cancels a recording; off, Esc is an ordinary key (R2.1).
+    pub esc_cancels: bool,
+    /// Whether a key outside the chord cancels the recording while the chord is held (R2.1).
+    pub other_key: OtherKey,
     /// A press shorter than this can be half of a double tap.
     pub double_tap_max_press: Millis,
     /// Largest gap between the two presses of a double tap.
@@ -37,10 +46,32 @@ pub struct MachineConfig {
     pub watchdog_period: Millis,
     /// Idle time before the model is unloaded; zero means never.
     pub idle_unload: Millis,
+    /// Unload the model the moment the machine is idle again; wins over `idle_unload`.
+    pub unload_immediately: bool,
     /// How long a transient overlay text (cancelled, nothing heard) stays up.
     pub overlay_hide: Millis,
     /// Capture keeps running this long after the stopping key, so the last syllable is kept.
     pub release_tail: Millis,
+    /// What a load depends on: a change unloads the loaded model, the next use loads the new one.
+    pub model: ModelIdentity,
+    /// A press this soon after releasing the held chord carries the dictation on instead of
+    /// starting a new one; zero is off. Push mode only.
+    pub hold_gap: Millis,
+    /// `[history] enabled`: a recording with speech is kept when it is cancelled or fails.
+    pub keep_history: bool,
+    /// `[model] preload_at_start`: the model loads with no press, when the app starts, when a new
+    /// config asks for it (turned on, another model) and after a resume (hold item 41, "Always
+    /// ready"). An idle unload is never followed by a load.
+    pub preload_at_start: bool,
+}
+
+/// The settings a model load depends on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelIdentity {
+    /// `[model] id`, or the file path for a custom model.
+    pub file: String,
+    /// `[model] gpu`: the device the model is loaded onto.
+    pub gpu: DeviceChoice,
 }
 
 impl From<&Config> for MachineConfig {
@@ -49,6 +80,8 @@ impl From<&Config> for MachineConfig {
     fn from(cfg: &Config) -> Self {
         Self {
             mode: cfg.hotkey.mode,
+            esc_cancels: cfg.hotkey.esc_cancels,
+            other_key: cfg.hotkey.other_key,
             double_tap_max_press: Millis(250),
             double_tap_gap: Millis(300),
             tap_max: Millis(300),
@@ -56,8 +89,20 @@ impl From<&Config> for MachineConfig {
             warn_before: Millis::from_secs(30),
             watchdog_period: Millis(100),
             idle_unload: Millis::from_secs(u64::from(cfg.model.idle_unload_minutes) * 60),
+            unload_immediately: cfg.model.unload_immediately,
             overlay_hide: Millis(1500),
             release_tail: Millis(cfg.audio.tail_ms.into()),
+            model: ModelIdentity {
+                file: if cfg.model.id == "custom" {
+                    cfg.model.custom_path.clone()
+                } else {
+                    cfg.model.id.clone()
+                },
+                gpu: cfg.model.gpu.clone(),
+            },
+            hold_gap: Millis(cfg.hotkey.hold_gap_ms.into()),
+            keep_history: cfg.history.enabled,
+            preload_at_start: cfg.model.preload_at_start,
         }
     }
 }
@@ -80,10 +125,34 @@ pub enum ModelFailure {
     Missing,
     /// Hash check or whisper init failed (item 23).
     Bad,
+    /// The load ran out of memory, also on the CPU.
+    OutOfMemory,
+}
+
+/// Why a stopped job has no audio for whisper (ARCHITECTURE 9 step 6, 11 item 17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyAudio {
+    /// Too little speech after the trim.
+    NothingHeard,
+    /// Every sample was zero: hardware mute or a privacy switch.
+    MicSilence,
+    /// The capture broke or was never open.
+    Failed,
+}
+
+/// Why whisper runs elsewhere than the config asked (ARCHITECTURE 8); the tray and `Status`
+/// show it through [`crate::strings::engine_warning`]. Never carries dictated text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineWarning {
+    /// The GPU failed (init, out of memory, lost mid-job); whisper runs on CPU. `reason` is
+    /// the error's own one-line `Display`.
+    CpuFallback { reason: String },
+    /// The configured GPU is not in the device list; the automatic choice runs instead.
+    GpuNotFound { name: String },
 }
 
 /// Everything that happens, as the coordinator sees it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// The hook saw the whole chord become held.
     ChordDown,
@@ -93,16 +162,27 @@ pub enum Event {
     ChordPolled {
         held: bool,
     },
-    /// Esc went down (the hook swallows it only while the phase is Recording).
+    /// Esc went down while recording (the hook swallows it only when `esc_cancels` is on).
     Esc,
-    /// Another key went down while the chord was held.
+    /// Another key went down while the chord was held. The key always reaches the system; the
+    /// machine decides from `other_key` and [`Event::SpeechHeard`] whether it cancels.
     OtherKey,
+    /// The audio side heard speech in the recording in progress (level over the threshold for
+    /// long enough). Sent once per recording; later ones are ignored.
+    SpeechHeard,
     /// Capture ended on its own (microphone unplugged); the audio so far is kept.
     DeviceLost,
     /// Capture could not run (no permission, device error); nothing is kept.
     CaptureFailed,
+    /// Capture could not run because there is no input device at all.
+    NoMicrophone,
     /// The audio of a job is trimmed and ready for whisper.
     JobAudioReady(JobId),
+    /// The job has no audio for whisper; it ends here, without a whisper call.
+    JobAudioEmpty {
+        job: JobId,
+        why: EmptyAudio,
+    },
     /// Whisper finished; `empty` is true when nothing is left to paste.
     TranscriptionDone {
         job: JobId,
@@ -116,6 +196,9 @@ pub enum Event {
     },
     /// The configured microphone is missing; capture opened the system default (item 15).
     MicFellBack,
+    /// The model an app rule or the language picks (its id) could not be used; the configured
+    /// model transcribed the job instead.
+    ModelFellBack(String),
     ModelLoaded,
     ModelFailed(ModelFailure),
     /// New settings; applied when the machine is Idle (item 11).
@@ -180,6 +263,8 @@ impl PhaseCell {
 pub enum Sound {
     Start,
     Stop,
+    /// The text is pasted (`sounds.done`); apart from `Stop`, which ends the recording.
+    Done,
     Cancel,
     Error,
 }
@@ -188,11 +273,14 @@ pub enum Sound {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Notice {
     Cancelled,
+    /// Cancelled after speech: the audio went to the history (R2.1).
+    CancelledKept,
     NothingHeard,
     NoModel,
     ModelBad,
     DeviceLost,
     CaptureFailed,
+    NoMicrophone,
     TranscriptionFailed,
     /// Modifiers stayed held: the text is on the clipboard, the user presses Ctrl+V (item 35).
     PressPaste,
@@ -202,8 +290,27 @@ pub enum Notice {
     RestoreSkipped,
     /// The paste worker could not deliver the text; "Copy last text" still has it (item 42).
     PasteFailed,
+    /// To-file only: the file write failed; "Copy last text" still has the text.
+    FileFailed,
+    /// The model an app rule or the language picks is not usable; the main model was used.
+    ModelFellBack,
     /// The configured microphone is missing; the system default records (item 15).
     MicFallback,
+    /// The config file has an error; the last good config stays in use. Line and message go
+    /// through IPC and the tray tooltip, not here.
+    ConfigInvalid,
+    /// The config file loaded with warnings (a value was clamped or replaced).
+    ConfigAdjusted,
+    /// Every sample was zero: hardware mute or a privacy switch (item 17).
+    MicSilence,
+    /// The model did not fit in memory, even on the CPU.
+    OutOfMemory,
+    /// The config migration turned history on; shown once, when the migrated file is written.
+    HistoryOn,
+    /// A mic or model failure ended a recording with speech: its audio is in the history.
+    FailedKept,
+    /// The start found recordings a crash left behind and put them in the history.
+    Recovered,
 }
 
 /// What the overlay shows; emitted only when it changes.
@@ -219,18 +326,93 @@ pub enum OverlayState {
     Transcribing,
     Pasting,
     Text(Notice),
+    /// The confidence filter held text back (d03 review #5). `all`: nothing was pasted, the
+    /// text is in the History; else the rest was pasted. The coordinator asks for it, the
+    /// machine does not know of it.
+    HeldBack {
+        all: bool,
+    },
+    /// To-file mode saved the text. `also`: it was pasted as well; else the file is all.
+    SavedToFile {
+        also: bool,
+    },
+}
+
+impl OverlayState {
+    /// A cue shown by the coordinator after a dictation, which ends by itself after a moment.
+    #[must_use]
+    pub const fn is_cue(self) -> bool {
+        matches!(self, Self::HeldBack { .. } | Self::SavedToFile { .. })
+    }
+}
+
+/// Why a recording was cancelled (the log line `recording cancelled why=...`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelWhy {
+    /// A key outside the chord with no speech after it: the chord was part of a shortcut.
+    Shortcut,
+    Esc,
+    /// Another key, with `other_key = always`.
+    OtherKey,
+    Lock,
+    Suspend,
+}
+
+impl std::fmt::Display for CancelWhy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl CancelWhy {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shortcut => "shortcut",
+            Self::Esc => "esc",
+            Self::OtherKey => "other_key",
+            Self::Lock => "lock",
+            Self::Suspend => "suspend",
+        }
+    }
+}
+
+/// A fact for the log that no effect carries: read with `State::take_notes`. Never holds
+/// dictated text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Note {
+    /// A recording was cancelled; `speech`: its audio was kept.
+    Cancelled { why: CancelWhy, speech: bool },
+    /// A key-down was refused: too many jobs wait.
+    RefusedQueueFull,
 }
 
 /// A command for a worker or the UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     StartCapture,
-    /// Stop capture, flush, and answer with [`Event::JobAudioReady`] for this job.
+    /// Stop capture, flush, and answer with [`Event::JobAudioReady`] or
+    /// [`Event::JobAudioEmpty`] for this job.
     StopCapture(JobId),
     /// Stop capture and throw the audio away.
     DiscardCapture,
+    /// A recording cancelled after speech: its audio (a stopped job, answered with
+    /// [`Event::JobAudioReady`] or [`Event::JobAudioEmpty`] as usual) is not transcribed. This
+    /// effect comes once the audio is ready; the coordinator routes it to the history as a
+    /// cancelled recording.
+    KeepCancelled(JobId),
     /// Free the audio of a job that will never be transcribed.
     DropJob(JobId),
+    /// A new press carries this job on: its text is not pasted unless the carrying recording
+    /// fails (then `resume` pastes it); its audio waits for the [`Effect::Merge`] that names it.
+    Supersede(JobId),
+    /// The recording that carried the jobs `from` on (oldest first) became job `into`: the audio
+    /// of `from` goes in front of the audio of `into`, which is transcribed as one dictation.
+    /// Comes right after [`Effect::StopCapture`] of `into`.
+    Merge {
+        from: Vec<JobId>,
+        into: JobId,
+    },
     Preload,
     Unload,
     /// Send the job to whisper.

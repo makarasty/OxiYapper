@@ -1,0 +1,16 @@
+// The dim behind a modal popup (DS-38): one full-window layer in the app window, under the popups
+// (a popup is drawn above everything) and under the toasts. It takes no pointer: a click outside the
+// popup closes it as before. A popup's `is-open` can be read only by the component that holds it, so
+// that component counts it in: `property <bool> x-open: popup.is-open; changed x-open => {
+// Shell.modal(root.x-open); }`. A dropdown list is a menu and does not.
+import { Theme, Shell } from "../tokens.slint";
+
+export component Scrim inherits Rectangle {
+    background: Theme.scrim;
+    // Fades in and out as a list opens (<= 200 ms), in place under reduced motion; no scale.
+    opacity: Shell.modals > 0 ? 1 : 0;
+    animate opacity { duration: Theme.motion-open; easing: ease-out; }
+    // Nothing is drawn while it is clear.
+    visible: self.opacity > 0;
+    accessible-role: none;
+}

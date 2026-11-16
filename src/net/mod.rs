@@ -1,16 +1,18 @@
 //! The only module allowed to touch the network (ARCHITECTURE 12).
 //!
 //! Model download: `<file>.part` with `Range` resume, SHA256 while streaming, rename on
-//! match, `.part` removed on mismatch. Every URL, redirects included, passes the host
-//! allowlist before a request is made.
+//! match, `.part` removed on mismatch. The update check: a small text GET ([`get_text`]) and
+//! the same verified download without resume ([`download_file`]). Every URL, redirects
+//! included, passes the host allowlist before a request is made. Requests carry only a generic
+//! `OxiYapper/<version>` user agent.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
-use oxi_core::models::{ModelEntry, Stamp, hash_file, hex, sha256_file, stamp_file_name};
+use oxi_core::models::{ModelEntry, hash_file, hex, sha256_file, stamp_file_name, write_stamp};
 use oxi_core::paths::part_path;
 use sha2::{Digest, Sha256};
 use ureq::Agent;
@@ -134,11 +136,8 @@ fn content_range_start(header: Option<&str>) -> Option<u64> {
 /// A verified model in place.
 #[derive(Debug)]
 #[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into the daemon in M3; only tests read it for now"
-    )
+    not(any(test, windows)),
+    expect(dead_code, reason = "only the Windows daemon downloads for now")
 )]
 pub struct Downloaded {
     pub path: PathBuf,
@@ -150,11 +149,8 @@ pub struct Downloaded {
 /// Download `entry` into `dest_dir` and return the verified file. `progress` gets
 /// `(done, total)` bytes; `cancel` stops the transfer and keeps `.part` for a later resume.
 #[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into the daemon in M3; only tests call it for now"
-    )
+    not(any(test, windows)),
+    expect(dead_code, reason = "only the Windows daemon downloads for now")
 )]
 pub fn download(
     entry: &ModelEntry,
@@ -175,17 +171,7 @@ fn download_with(
     fs::create_dir_all(dest_dir)?;
     let dest = dest_dir.join(entry.file_name);
     let part = part_path(&dest);
-    let agent = Agent::new_with_config(
-        Agent::config_builder()
-            .max_redirects(0)
-            .max_redirects_will_error(false)
-            .http_status_as_error(false)
-            .https_only(policy.https_only)
-            .timeout_connect(Some(Duration::from_secs(30)))
-            .timeout_recv_response(Some(Duration::from_secs(60)))
-            .timeout_per_read(Some(policy.read_timeout))
-            .build(),
-    );
+    let agent = agent(policy);
 
     let mut have = fs::metadata(&part).map_or(0, |m| m.len());
     if have > entry.size {
@@ -252,6 +238,139 @@ fn download_with(
     }
 }
 
+/// Redirects are followed by hand ([`fetch`]), so each hop passes the policy.
+fn agent(policy: &Policy) -> Agent {
+    Agent::new_with_config(
+        Agent::config_builder()
+            .user_agent(format!("{}/{}", oxi_core::APP_NAME, oxi_core::VERSION))
+            .max_redirects(0)
+            .max_redirects_will_error(false)
+            .http_status_as_error(false)
+            .https_only(policy.https_only)
+            .timeout_connect(Some(Duration::from_secs(30)))
+            .timeout_recv_response(Some(Duration::from_secs(60)))
+            .timeout_per_read(Some(policy.read_timeout))
+            .build(),
+    )
+}
+
+/// The body of a `200` answer to a GET of `url` as text, at most `max` bytes (the release list,
+/// `SHA256SUMS`). Any other status is [`DownloadError::Http`] (403 and 429: rate-limited).
+#[cfg_attr(
+    not(any(test, windows)),
+    expect(
+        dead_code,
+        reason = "only the Windows daemon checks for updates for now"
+    )
+)]
+pub fn get_text(url: &str, max: u64) -> Result<String, DownloadError> {
+    get_text_with(&Policy::PRODUCTION, url, max)
+}
+
+fn get_text_with(policy: &Policy, url: &str, max: u64) -> Result<String, DownloadError> {
+    let mut resp = fetch(&agent(policy), policy, url, 0)?;
+    match resp.status().as_u16() {
+        200 => {}
+        s => return Err(DownloadError::Http(s)),
+    }
+    let mut body = Vec::new();
+    resp.body_mut()
+        .as_reader()
+        .take(max + 1)
+        .read_to_end(&mut body)
+        .map_err(DownloadError::Network)?;
+    if body.len() as u64 > max {
+        return Err(DownloadError::TooLarge);
+    }
+    String::from_utf8(body).map_err(|_| network("answer is not text"))
+}
+
+/// Downloads `url` to `dest` through `<dest>.part`: exactly `size` bytes whose SHA256 is
+/// `sha256` (lowercase hex), renamed to `dest` only then. On any failure the `.part` is removed
+/// and `dest` is untouched. No resume: the file is small (the app exe).
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only the Windows daemon updates itself for now")
+)]
+pub fn download_file(
+    url: &str,
+    dest: &Path,
+    size: u64,
+    sha256: &str,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<(), DownloadError> {
+    download_file_with(&Policy::PRODUCTION, url, dest, size, sha256, progress)
+}
+
+fn download_file_with(
+    policy: &Policy,
+    url: &str,
+    dest: &Path,
+    size: u64,
+    sha256: &str,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<(), DownloadError> {
+    let mut resp = fetch(&agent(policy), policy, url, 0)?;
+    match resp.status().as_u16() {
+        200 => {}
+        s => return Err(DownloadError::Http(s)),
+    }
+    let part = part_path(dest);
+    let written = write_verified(
+        &mut resp.body_mut().as_reader(),
+        &part,
+        size,
+        sha256,
+        progress,
+    )
+    .and_then(|()| fs::rename(&part, dest).map_err(DownloadError::Io));
+    if written.is_err() {
+        let _ = fs::remove_file(&part);
+    }
+    written
+}
+
+/// Streams `reader` into a new `part`, checking the length and the digest; the caller removes
+/// `part` on an error.
+fn write_verified(
+    reader: &mut dyn Read,
+    part: &Path,
+    size: u64,
+    sha256: &str,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<(), DownloadError> {
+    let mut file = File::create(part)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; CHUNK];
+    let mut done = 0u64;
+    loop {
+        let n = reader.read(&mut buf).map_err(DownloadError::Network)?;
+        if n == 0 {
+            break;
+        }
+        done += n as u64;
+        if done > size {
+            return Err(DownloadError::TooLarge);
+        }
+        file.write_all(&buf[..n])?;
+        hasher.update(&buf[..n]);
+        progress(done, size);
+    }
+    if done < size {
+        return Err(network("connection closed early"));
+    }
+    file.sync_all()?;
+    let actual = hex(&hasher.finalize());
+    if actual == sha256 {
+        Ok(())
+    } else {
+        Err(DownloadError::Hash {
+            expected: sha256.to_owned(),
+            actual,
+        })
+    }
+}
+
 /// Compare the hex digest with the registry: rename and stamp on match, delete `.part` on
 /// mismatch.
 fn finish(
@@ -265,7 +384,7 @@ fn finish(
         let name = dest.file_name().unwrap_or_default().to_string_lossy();
         let stamp = dest.with_file_name(stamp_file_name(&name));
         // Best effort: failing here after the rename would make a retry download it again.
-        let stamp_error = write_stamp(dest, &stamp).err();
+        let stamp_error = write_stamp(dest).err();
         if stamp_error.is_some() {
             let _ = fs::remove_file(&stamp);
         }
@@ -280,20 +399,6 @@ fn finish(
             actual,
         })
     }
-}
-
-/// `<file>.ok` next to the verified file (ARCHITECTURE 8).
-fn write_stamp(file: &Path, stamp_path: &Path) -> io::Result<()> {
-    let meta = fs::metadata(file)?;
-    let since_epoch = meta
-        .modified()?
-        .duration_since(UNIX_EPOCH)
-        .map_err(io::Error::other)?;
-    let stamp = Stamp {
-        size: meta.len(),
-        mtime_ms: u64::try_from(since_epoch.as_millis()).map_err(io::Error::other)?,
-    };
-    fs::write(stamp_path, stamp.to_line())
 }
 
 /// GET with `Range: bytes=<have>-` (when `have > 0`), following redirects by hand so each
@@ -351,6 +456,8 @@ fn resolve(base: &Uri, location: &str) -> Result<Uri, DownloadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log::scratch::scratch_dir;
+    use oxi_core::models::Stamp;
     use std::io::BufRead;
     use std::net::TcpListener;
     use std::sync::Arc;
@@ -492,10 +599,7 @@ mod tests {
     }
 
     fn tempdir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("oxi-net-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        scratch_dir(&format!("oxi-net-{}-{name}", std::process::id()))
     }
 
     #[test]
@@ -730,6 +834,59 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, DownloadError::Network(_)), "{err}");
         assert!(dir.join("model.bin.part").exists());
+    }
+
+    #[test]
+    fn a_verified_file_lands_and_a_wrong_digest_leaves_nothing() {
+        let data = payload();
+        let sha = hex(&Sha256::digest(&data));
+        let (port, _) = serve(vec![ok_handler(data.clone()), ok_handler(data.clone())]);
+        let dir = tempdir("file");
+        let dest = dir.join("OxiYapper.exe.new");
+        let url = format!("http://127.0.0.1:{port}/app.exe");
+        let size = data.len() as u64;
+        let mut last = 0;
+        download_file_with(&LOCAL, &url, &dest, size, &sha, &mut |d, _| last = d).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), data);
+        assert_eq!(last, size);
+        assert!(!part_path(&dest).exists());
+
+        fs::remove_file(&dest).unwrap();
+        let wrong = "0".repeat(64);
+        let err =
+            download_file_with(&LOCAL, &url, &dest, size, &wrong, &mut |_, _| {}).unwrap_err();
+        assert!(matches!(err, DownloadError::Hash { .. }), "{err}");
+        assert!(!dest.exists() && !part_path(&dest).exists());
+    }
+
+    #[test]
+    fn a_file_longer_than_announced_is_refused() {
+        let data = payload();
+        let (port, _) = serve(vec![ok_handler(data.clone())]);
+        let dir = tempdir("filebig");
+        let dest = dir.join("app.new");
+        let url = format!("http://127.0.0.1:{port}/app.exe");
+        let sha = hex(&Sha256::digest(&data));
+        let err = download_file_with(&LOCAL, &url, &dest, 10, &sha, &mut |_, _| {}).unwrap_err();
+        assert!(matches!(err, DownloadError::TooLarge), "{err}");
+        assert!(!dest.exists() && !part_path(&dest).exists());
+    }
+
+    #[test]
+    fn text_get_returns_the_body_and_refuses_other_answers() {
+        let (port, _) = serve(vec![
+            Box::new(|_| response("200 OK", "", b"[]")),
+            Box::new(|_| response("403 Forbidden", "", b"rate limit")),
+            Box::new(|_| response("200 OK", "", &[b'x'; 100])),
+        ]);
+        let url = format!("http://127.0.0.1:{port}/releases");
+        assert_eq!(get_text_with(&LOCAL, &url, 1000).unwrap(), "[]");
+        let err = get_text_with(&LOCAL, &url, 1000).unwrap_err();
+        assert!(matches!(err, DownloadError::Http(403)), "{err}");
+        let err = get_text_with(&LOCAL, &url, 10).unwrap_err();
+        assert!(matches!(err, DownloadError::TooLarge), "{err}");
+        // Production refuses loopback before a request.
+        assert!(matches!(get_text(&url, 10), Err(DownloadError::Refused(_))));
     }
 
     #[test]

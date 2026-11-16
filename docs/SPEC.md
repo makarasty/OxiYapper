@@ -7,7 +7,7 @@ Status: decisions from the owner interview (2026-11-06). Open items are marked O
 ## Processes
 
 - **Daemon** (default mode, autostart): tray, global hotkey hook, mic capture, whisper, paste, overlay. No GUI toolkit beyond what the overlay needs.
-- **Settings** (`OxiYapper settings`): separate process, Slint with the software renderer, spawned from the tray, exits on close. Costs zero RAM when closed.
+- **Settings** (`OxiYapper settings`): separate process, Slint (software or Skia renderer, picked by the text-quality spike), spawned from the tray, exits on close. Costs zero RAM when closed.
 - One exe, one bundle id on macOS (one permission entry). Config is a TOML file; the settings process writes it (temp file + atomic rename), the daemon watches and reloads. While the settings window captures a hotkey it tells the daemon over IPC to pause the hook.
 - Single instance: a second launch asks the running daemon to open settings and exits.
 
@@ -15,56 +15,72 @@ Status: decisions from the owner interview (2026-11-06). Open items are marked O
 
 - Modes, chosen in settings: push-to-talk (hold, release = stop) and toggle (press = start, press = stop). In push-to-talk a double tap locks recording on until the next press.
 - Default hotkey: Ctrl+Win (Ctrl+Cmd on macOS), modifier-only chord. Win release must not open Start (inject VK 0xE8).
-- Esc cancels a recording: nothing is pasted.
-- Microphone picked from a list (default: system device). Language: ru, en, auto.
+- Esc cancels a recording only if the setting "Esc cancels" is on; it is off by default, because Esc may be pressed by accident or meant for another app (owner 2026-11-10). A cancelled recording is never pasted.
+- A key outside the chord pressed during a recording always reaches the system. Whether it also cancels is decided by voice activity (VAD) and the setting "Other key": auto (default), never cancel, always cancel. Auto: no speech heard yet means a shortcut (Ctrl+Win+D works) and a quiet cancel; speech already heard means the recording goes on, so a very short phrase is not lost. Any cancel after speech saves the audio to history and shows the notice "cancelled, can be restored" (owner 2026-11-10).
+- Microphone picked from a list (default: system device). Dictation language: auto or any language whisper supports (owner 2026-11-08). The picker shows the 2 last used languages (start: ru, en), Auto, and a "More" popup with every whisper language and a search field that finds a language by its name, its ISO 639-1 code (`uk`) or the code people type for it (`ua`), showing the code beside the name (owner 2026-11-13). The app (UI) language is a separate picker, independent of the dictation language.
 
 ## Audio before whisper
 
 All measured against the 8 owner reference phrases before becoming defaults.
 - Auto level normalisation (on).
 - Manual gain slider plus level-meter sensitivity, with a live meter in settings.
-- Noise suppression, RNNoise (`nnnoiseless`), off by default: Whisper can get worse on denoised audio.
+- Noise suppression, RNNoise (`nnnoiseless`), off by default: Whisper can get worse on denoised audio. One choice Off / Light / Medium / Strong / Auto (owner 2026-11-13, item 41): Light and Medium blend the cleaned and the original sound (35 % / 65 % cleaned, lined up for RNNoise's 10 ms delay), Strong is the old "on" (an old `denoise = true` loads as Strong), Auto picks Off, Light or Medium per dictation from the room noise of its first 300 ms.
+- Cut low rumble: a high-pass at 80 Hz before whisper (fan, desk knocks, hum), off by default.
+- "Don't cut my words": Normal / Careful / Tight name a pair of speech sensitivity and tail (Normal = the defaults, Careful = high and 300 ms, Tight = low and 50 ms); any other pair shows as Custom.
+- Remember for this microphone (off by default): boost, noise, rumble, stereo side and speech sensitivity are kept per microphone and come back when it is picked. With "System default" they are kept for the device that is the default then, and a default Windows moves to brings its own: each recording uses the set of the device it opened (item 41, d04c).
+- Suggestions from my recordings (item 41): each history entry keeps a few loudness numbers (peak, speech, room noise, rumble, the gaps to the edges; numbers only, never the audio or text). The Audio page reads the newest 50 off the UI thread when it opens (again once that read is a day old, or on "Check again"; no polling) and offers a change on the row it concerns (a lightbulb: why, Apply, Not now); the "Record 3 s" check says Quiet / Good / Too loud and offers a boost the same way. Nothing changes until Apply. No suggestion from fewer than 10 recordings. "Not now" is kept like the Text page's (hashed keys in `learn-dismissed.txt`): a dismissed value does not return after a restart, another value is offered again.
 - Trim silence at both ends (cuts hallucinations on silence and latency).
 
 ## Feedback
 
-- Start and stop sounds.
-- Tray icon colour by state: idle, recording, transcribing.
+- Start and stop sounds, a "text ready and pasted" sound (on by default), and a selectable sound for cancel and for error. A sound that fails to play is shown in the status, never silent (owner 2026-11-10).
+- Tray icon: monochrome shapes for idle and transcribing; colour only for recording. After a self-update the tray shows a short "Updated to X" note (owner 2026-11-15).
 - Overlay pill with a live volume meter. Position chosen in settings (bottom-right default, bottom-centre, other corners), never at the mouse cursor. Can be turned off.
 - Overlay must never take focus or flicker: no-activate, click-through, topmost, no taskbar entry. Case to hold: a player in a fullscreen game opens chat, dictates, presses Enter. Option to hide the overlay over fullscreen apps.
 
 ## Text
 
-- `dictionary.txt` words go into the whisper prompt. whisper.cpp keeps only the last ~224 tokens: show the token count and warn past the limit.
+- `dictionary.txt` words go into the whisper prompt. whisper.cpp keeps only the last ~224 tokens: show how full the dictionary is (the token count in its tip) and warn past the limit.
 - `replace.txt` lines `heard => wanted`, whole word, case-insensitive, applied after transcription, never in the prompt.
+- Two style switches, off by default (owner rule, round 5): "No full stop at the end" (one final `.` goes; an ellipsis, `!`, `?` stay) and "Small first letter" (not a one-letter word, not a word with more capitals); never applied to a phrase shortcut's text (item 41).
+- Suggestions from my dictations and edits (item 41): the Text page reads the newest 200 history entries off the UI thread when it opens (again once a day old, or on "Check again"), in memory, and keeps no text. It offers: words Whisper doubted in 3 or more dictations, not yet in the dictionary or replacements (Dictionary footer, "N suggestions": Add / Not this one); a style switch when one kind of hand edit (final full stop taken away, first letter made small) is at least 5 edits and 70 % of them; a phrase of 3-8 words said in 4 or more dictations as a phrase shortcut (trigger: its first two words); short words deleted by hand in 3 or more edits for the filler list; a lower "Certainty needed" when 30 % or more of at least 10 held-back parts were added back (the median certainty of those parts). Each is a lightbulb on its row (why, Apply, Not now) or the list's Add (which first shows what the word adds to the word-piece limit); nothing changes unasked. "Not now" and "Not this one" are kept as hashed keys in a small file in the data folder (`learn-dismissed.txt`), so a dismissed suggestion does not return after a restart; a changed suggestion is offered again.
 - Strip `\n` from whisper output without adding spaces (it wraps mid-word).
-- Paste: save clipboard, set text, synthetic Ctrl/Cmd+V, restore clipboard after a delay; exclude from Windows clipboard history. Elevated target window (UIPI): say "press Ctrl+V" instead of failing silently.
+- Paste: save clipboard, set text, synthetic Ctrl/Cmd+V, restore clipboard after a delay. Paste always pastes, except in Type mode; there is no automatic typing of short texts (owner 2026-11-08). The user's copy is never lost (owner 2026-11-10): when the clipboard cannot be saved whole (too big, slow or hung owner) or is locked by another program, the text is typed instead and the clipboard is left alone. One exception (owner 2026-11-13, item 21): a copy holding a virtual file Windows cannot hand out (`FileContents`: a Win+V screenshot item, an Outlook attachment) next to text or an image is still pasted through the clipboard; the copy comes back as its text and image without the file (pasting it as a file in Explorer no longer works for that copy), and the log names the dropped formats, never content. A virtual file alone is typed as above.
+- Windows clipboard history (Win+V): setting "keep dictation in Win+V history", default on (owner 2026-11-08). Ctrl+V returns the previous clipboard. Order in Win+V (owner 2026-11-10): the target is that the user's own copy stays on top and the dictation is second; until the probe in ROADMAP's deferred list is done, Win+V shows the dictation on top, Ctrl+V still returns the user's copy, and the previous dictation of ours is removed from the history. The dictated text is never uploaded to the cloud clipboard, whatever the setting. Elevated target window (UIPI): say "press Ctrl+V" instead of failing silently.
 
 ## Models
 
-- Short curated list (podlodka for Russian, large-v3, turbo) downloaded from Hugging Face with SHA256 check, plus "use my own .bin".
-- Load in the background on key-down, unload after idle (default 5 min, configurable).
-- GPU: Vulkan build first. CUDA build kept only if a measurement on an RTX 4070 SUPER shows a clear win. Pick the GPU explicitly (machines have an iGPU too).
+- A small gallery of curated models for different needs and machines (owner 2026-11-13, hold 24; was a short list of podlodka, large-v3, turbo): turbo, large-v3 and podlodka (Russian), their compact (quantized) files for little graphics memory, Distil-Whisper English, Whisper small and base for a PC without a graphics card; each downloaded from Hugging Face with SHA256 check, plus "use my own .bin". A "Recommended" mark picks one from the graphics card's memory, the system memory, the free disk space and the dictation language; with the hardware unknown there is no mark. A model bigger than the free disk space cannot be downloaded and says why. The card under the gallery names the model and says its state and where it runs; the Files rows say what the models folder and the partial downloads take.
+- Load in the background on key-down, unload after idle (default 5 min, configurable, with an "immediately" option; "never" stays; owner 2026-11-08).
+- Load the model at start (off by default, `preload_at_start`; item 41, candidate 10): the model also loads with no key press when the app starts, when the setting is turned on or the model changes, and after waking from sleep; an idle unload is never followed by a load. "Free memory after" gets a suggestion from the Home daily counts (the newest 14 days of use, at least 7): over 30 dictations a day on average, load at start and never free; under 3, free right after each dictation. Nothing changes until Apply; "Not now" is kept as above.
+- Partial downloads (`.part`) are kept 7 days from the last write, then removed at start (owner 2026-11-08). The model card shows the size and when it will be removed; buttons "Delete partial downloads" and "Open models folder".
+- GPU: Vulkan build is the default for everyone; the CUDA build stays and is the default on the owner's machine (owner decision 2026-11-06; M5 flash attention on: p50 -20..-41 % Vulkan, -14..-34 % CUDA). Releases ship the Vulkan build only (owner 2026-11-15); CUDA stays a build-from-source option. Without a Vulkan driver the app starts and runs on the CPU (vulkan-1.dll is delay-loaded). Where the model runs is picked explicitly in "Run on": Auto (best available), Processor (CPU), or a listed graphics card (machines have an iGPU too) (owner 2026-11-13: not called "GPU", which offered "CPU").
 
 ## History
 
-- Each dictation saves wav + text to a folder. On for the owner; off by default for other users (privacy).
+- Recording storage is a setting, on by default (30 days / 2 GB; owner 2026-11-10, replaces the off-by-default rule of 2026-11-08) and can be turned off. Each dictation saves wav + text + json meta to a folder the person chooses, with retention limits by size and by age (see History in round 3). The audio is written to disk while recording, so a crash or power loss keeps it. The entry format (wav + txt + json) is stable and documented, so other tools can read it.
+- Usage stats for the Home page (owner request 2026-11-07), always on: per local day only the number of dictations, their word count, audio length and the length of the voiced part of that audio (for the speech rate and the share of pauses on Home, owner 2026-11-11). Never the text, app names or a time finer than the day; nothing of it goes to logs or the network.
 
 ## Settings UI
 
-- English only for now (strings kept in one place for later languages).
-- Look modelled on XClicker: one compact panel.
-- Visual pickers instead of long lists: small SVG previews (like theme pickers) for overlay position, mode and the like.
+- Look modelled on Windows 11 Settings: opens large; resizable from a minimum (720x520) with no maximum size; maximize is allowed (owner 2026-11-10); lists and galleries stretch and scroll inside themselves; content adapts to the size, and the hotkey keyboard no longer changes the content width in a jarring way: the content adapts (owner 2026-11-08). Page scrolling is a fallback only: normal pages fit without it. Brand "white minimal" (owner pick 2026-11-10, concept C): ink on paper, the accent is the ink of the theme (#1C1B19 light, #F4F2EE dark), never the Windows accent; red (#E5484D) only for "recording now". Palette in `docs/DESIGN-SYSTEM.md` section 19.
+- Look modelled on XClicker: compact, with few controls per screen. No single-panel layout, except Home and Hotkey (with the on-screen keyboard open), which are one-view pages with a tight layout (owner, 2026-11-10): pages have horizontal sub-tabs in the header row, no separate page title (owner 2026-11-08, R2.4): Model has Models / Languages / Speed / Accuracy; Text has Dictionary / Replacements / Words / Formatting / Voice commands; Paste is its own page with Paste / Write to file / Per-app rules; System has General / History and files / Updates / About (owner 2026-11-13, items 14, 36; Updates 2026-11-15). The sidebar stays short and keeps working in icons-only mode.
+- Settings search: a field above Home in the sidebar (a magnifier in the icons-only sidebar) and Ctrl+F; it searches row names, their tips and tab names, and finds a setting by its old name too ("Advanced" finds Speed and Accuracy); on History, Ctrl+F stays the search of the recordings. Picking a result opens the tab, scrolls to the row and flashes it twice in the accent (owner 2026-11-13, item 17).
+- A Test tab (owner 2026-11-08), a three-step wizard (owner 2026-11-13, replaces the scenario profiles): the goal as cards (best model, best settings, a quiet microphone), the models to compare (quick picks Downloaded / Recommended / All over a list to tick; a model not on disk is skipped with its reason), and one Run button. While it runs: the percent, the time left and the average time per recording, and Cancel. Then a table with error percent per set (normalisation, noise suppression, trim, model), an "Apply best" button, and offers to download the recommended model the run skipped (the Model page's own Download, never on its own) and to delete the models that lost (with their size, after a question; never the one in use). The recordings come from History by themselves (a few recent ones of different lengths). Each is scored against an honest reference (owner 2026-11-15): the person's own corrected text where they edited it (on the Recordings view or on History), otherwise a fresh transcription by the most accurate downloaded model, the judge, which with its compact twin is never a candidate. Best settings and the quiet-microphone check tune only the model in use and never switch it; with no fair reference a recording is left out and the reason shown; the quiet-microphone check hears the same recordings 6, 12 and 18 dB quieter, so it needs no new recording. By hand, on its Recordings view: ready phrases in the person's language or their own phrase, and recordings from History (owner 2026-11-10). No AI. Recordings made for a test stay in memory and are deleted on close.
+- Rows never change height (owner 2026-11-08). A persistent state shows a "!" icon in a reserved slot of the row with the text in a hover tooltip. Short events (for example the mic test recording) are toasts at the bottom of the window.
+- Visual pickers instead of long lists: Phosphor icons in tiles and a drawn screen picker for overlay position, mode and the like.
 - Hotkey picker: a minimal field plus a button that opens a full visual keyboard; click keys or press them, held keys light up.
 - Confirmations only for important actions (example: turning off update checks shows a short note why it is recommended to keep it).
-- First-run wizard: microphone, model, hotkey; on macOS also the permissions.
+- First-run wizard (built 2026-11-15): Welcome, Model (the gallery with the Recommended model and Download), Hotkey, Microphone, Try it; Skip on every step; shown once for a new config, never for an existing one; "Run setup again" in System > General. On macOS later also the permissions.
+- Default dictation language for a new config: Auto (owner 2026-11-15); a saved language is kept.
 - About screen carries the "Made with Slint" badge (Slint royalty-free licence).
-- Icon: minimal, based on an open icon set (licence must allow it).
+- Icon: own logo mark, an ink "o" ring with a red record dot on a paper tile (own drawing, no licence issue), the same mark in the exe icon, window, sidebar and tray; UI icons from Phosphor, Bold weight (`@phosphor-icons/core@2.1.1`, MIT), pinned to that version (owner pick 2026-11-10).
 
 ## System
 
 - Autostart on by default, toggle in settings.
-- Update check: once a day against GitHub Releases, badge on the tray icon plus an "Install" button; never installs on its own; verifies SHA256; can be turned off.
+- Tray menu is the native menu, dark with our icons (owner 2026-11-08); if the OS call is unavailable it stays light. No custom window.
+- Update check and self-update (owner 2026-11-15, replaces "never installs on its own"): once a day and on "Check now" (System > Updates) against GitHub Releases, prereleases included; the new exe is downloaded, verified against SHA256SUMS and installed automatically when the app is idle (setting "Install updates automatically", default on; off = only offered). A watchdog keeps the old exe and restores it if the new one does not start; that version is then only offered. Both switches can be turned off.
 
 ## Build and CI
 
@@ -73,17 +89,35 @@ All measured against the 8 owner reference phrases before becoming defaults.
 
 ## Decided in round 3
 
-- Paste: restore the previous clipboard; add a trailing space; a "type character by character" mode for fields where Ctrl+V does not work (games, terminals, remote desktop). No auto-Enter.
-- Cancel key is Esc, fixed. No "paste last again" hotkey, no second-language hotkey.
-- History: size cap, configurable (default 2 GB), oldest removed first. A history view in settings: play, copy, add to replacements.
-- Distribution: free only. Windows per-user installer (no admin) plus portable zip; macOS .dmg; Linux AppImage and .deb. Package managers and code signing later.
+- Paste: restore the previous clipboard (see Text); add a trailing space; a "type character by character" mode for fields where Ctrl+V does not work (games, terminals, remote desktop). No auto-Enter, except the opt-in setting `paste.press_enter` (default off), which presses Enter once after a whole, verified delivery into the unchanged, unedited field; fail closed (owner 2026-11-12).
+- Multi-line text into a console (owner 2026-11-12, «Убирать \n для консолей»): line breaks become spaces where a pasted one runs a command, by default only a classic console window with nothing but cmd.exe running in it; Windows Terminal, PowerShell and TUIs such as Claude Code keep them. A setting (default on) and a per-app override (Default / On / Off).
+- Cancel by Esc is a setting, off by default (see Recording). No "paste last again" hotkey, no second-language hotkey.
+- History (recording storage, see History): retention by size cap and by age, both configurable (default 2 GB and the last 30 days; whichever limit is hit first removes the oldest entries). The age limit is strict by date; only entries dated after today (clock set back) are spared. Both limits apply to the folder in use also while saving is off; a former folder is never touched (owner 2026-11-10). A history view in settings (owner 2026-11-10): play, copy, Transcribe again, add to replacements, delete, Copy path. The Test page can run on several recordings from the history, each with its own editable reference text.
+- Distribution (owner 2026-11-15): free only. Windows 10/11 x64 only for now: a portable zip (exe plus the C++ runtime DLLs next to it, runs on a clean Windows) and the bare exe, from GitHub Releases. Every commit on main that passes CI becomes a prerelease that replaces the previous one; a stable tag makes a release. macOS and Linux are not shipped until there is a way to test them. No installer, no code signing for now.
 
 ## Decided in round 4
 
-- Theme follows the OS, with a visual picker (system, dark, light).
+- Theme follows the OS, with a visual picker (System, Light, Dark; Windows order).
 - Sounds: a set of 3-4 own synthesised sounds (no third-party rights), volume slider, preview in settings, custom wav allowed.
-- Recording cap: 10 minutes, configurable; the overlay warns 30 s before; long audio is transcribed in chunks.
+- Recording cap: 60 minutes by default (owner decision #50, `max_seconds = 3600`), configurable up to 120 minutes in settings; the overlay warns 30 s before; long audio is transcribed in chunks.
 - Moving from the previous tool (owner's machine, never in the repo): copy the 59-word `C:\Users\mky\Desktop\dictionary.txt` into the local config; reuse the podlodka model already on disk (SHA256 checked, no 3 GB re-download); import its history (transcriptions.db + audio) as an app feature or a one-off script.
+
+## Decided in round 5 (2026-11-11)
+
+- Owner rule: anything that changes the dictated text, or that people may disagree about, is a setting and is off by default.
+- Accent colour: a set of presets plus a custom hex, with one brand accent as the default. It colours the settings window and the overlay; red is only for errors and overload. This replaces "the accent is the ink of the theme" and "red only for recording now" in Settings UI above.
+- Hold mode, re-press gap: a release followed by a new press within the gap continues the same dictation. On by default, 400 ms, adjustable 100-1500 ms, can be turned off.
+- Model > Speed and Model > Accuracy (the former Advanced tab, split so each fits 720x520): the engine parameters (threads, flash attention, decoding, temperature, prompt, audio context, thresholds) can be changed; each has Auto, and each tab has "Reset to Auto" for its own parameters; the typed hint is never reset. Auto is the behaviour before this round. Besides Auto each has named choices a non-expert understands, with an "i" saying what each does (owner 2026-11-13): threads Max (all logical threads) / Half / Custom number; decoding "Careful mode" Off (faster, greedy) / On (more exact, beam); the numbers (variety, silence cut-off, doubt check, repeat check) a pair of named values then Custom; flash attention and the on/off ones On / Off. The config still stores the plain number or flag, so an old file loads (a number that is not a named value shows as Custom). The prompt is a select: your dictionary (auto, today), None, or Custom, which swaps the select for a text field of the same size; the text is kept while another choice is on (config `prompt_source`, absent in an old file: a typed prompt opens as Custom).
+- Microphone: input channel and voice-detection sensitivity are settings. The Test page records with the same microphone settings as dictation.
+- Sounds: a folder of sound files can be added.
+- Text, all off by default: punctuation and paragraphs from pauses, a filler-word filter with an editable list, voice commands (new line, new paragraph, delete the last sentence: each has its own switch and its own spoken phrases, several per command, Russian and English by default; a phrase cannot belong to two commands; own sub-tab Text > Voice commands, owner 2026-11-13, item 13), snippets (a whole phrase that inserts a stored text), a confidence filter (it holds back a part the model is unsure of, or a doubtful part from a stretch the model hears as probably no speech; the stretch alone never holds anything; every part it holds back stays in the history, so it works only while recording storage is on).
+- Per-app rules can also set the language, the model and the text switches for an app. A model per language is set on Model > Languages as rows "language -> model"; the row that runs now is marked (owner 2026-11-13, item 33). Both do nothing until filled in.
+- To-file mode: dictations are also, or only, appended to a daily file in a chosen folder. Off by default.
+- Typing speed: fast or safe (the pace before this round), global and per app. An app with a rule that forces typing, and remote desktop, keep the safe pace unless a rule sets the speed.
+- Transcribe a file: wav, ogg, mp3, m4a/mp4 (AAC) and flac (owner 2026-11-11; the new decoder must pass the licence check). The result is a history entry.
+- History player: long pauses can be skipped during playback. Off by default; the recording itself is never changed.
+- The model can be loaded at start. Off by default.
+- Home shows the speech rate (see History).
 
 ## OPEN
 

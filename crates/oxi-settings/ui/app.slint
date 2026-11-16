@@ -1,5 +1,606 @@
-// Settings window skeleton (ARCHITECTURE section 4); M9 fills it.
+// Settings window (redesign spec sections 2 and 3): a nav rail with icons on the left (icons only
+// under 960 px), the page on the right in a scrolling column as wide as the window allows, banners above it.
+import { Palette } from "std-widgets.slint";
+import { Theme, Shell, AccentSet, Icons, KeyFocus, Tip, Button, Banner, Severity, HeaderRow, StatusChip, MonthLabel, PathText, ScrollView, IconLabel, Caption } from "theme/index.slint";
+import { SearchPopup } from "theme/components/search_popup.slint";
+import { KeyTipHost, Toast, ToastHost } from "theme/components/feedback.slint";
+import { Scrim } from "theme/components/scrim.slint";
+import { HomePage, HomeState } from "pages/home.slint";
+import { HotkeyPage, HotkeyState } from "pages/hotkey.slint";
+import { KeyCap } from "keyboard.slint";
+import { AudioPage, AudioState, AudioKey } from "pages/audio.slint";
+import { ModelPage, ModelState, ModelRow, LanguageModel } from "pages/model.slint";
+import { TextPage, TextState, PasteRuleRow, FileState, FileInfo, TextFile } from "pages/text.slint";
+import { PastePage } from "pages/paste.slint";
+import { OverlayPage, OverlayState } from "pages/overlay.slint";
+import { SystemPage, ThemeChoice, SystemState } from "pages/system.slint";
+import { TestPage, TestState, TestRow } from "pages/test.slint";
+import { HistoryPage, HistoryState, HistoryRow } from "pages/history.slint";
+import { SetupPage, SetupState } from "pages/setup.slint";
+
+export { GalleryTile } from "theme/index.slint";
+export { Shell, Theme, AccentSet, Toast, PathText, ThemeChoice, HomeState, MonthLabel, HotkeyState, KeyCap, AudioState, AudioKey, ModelState, ModelRow, LanguageModel, TextState, PasteRuleRow, FileState, FileInfo, TextFile, OverlayState, SystemState, TestState, TestRow, HistoryState, HistoryRow, SetupState }
+
+// `about` is no page of its own (ia-map 3.1): opening it shows System > About, so a deep link or
+// `real_window about` keeps working.
+export enum Page { home, hotkey, audio, model, text, paste, overlay, history, test, system, about }
+
+// The status chip right of the header row (`ipc::Level`); `hidden` when the window follows no daemon.
+export enum ChipLevel { hidden, ok, attention, down }
+
+// One page of the rail. Selected: `accent-tint` fill, 3x16 accent pill, filled icon in `accent-text`;
+// the label keeps its weight so nothing moves. The rail owns focus; `focused` draws the ring inside.
+component NavItem inherits Rectangle {
+    in property <string> label;
+    in property <image> icon;
+    in property <image> icon-selected;
+    in property <bool> selected;
+    in property <bool> compact;
+    in property <bool> focused;
+    callback activated();
+    // The label starts past the icon: the rail inset, the icon, one sibling gap.
+    property <length> text-x: Theme.space-3 + Theme.icon-size + Theme.space-2;
+    border-radius: Theme.radius-control;
+    background: root.selected ? Theme.accent-tint : touch.has-hover ? Theme.bg-subtle-hover : transparent;
+    animate background { duration: Theme.motion-quick; easing: ease-out; }
+    accessible-role: tab;
+    accessible-label: root.label;
+    accessible-item-selectable: true;
+    accessible-item-selected: root.selected;
+    accessible-action-default => {
+        root.activated();
+    }
+    Rectangle {
+        x: 0;
+        y: (root.height - Theme.rail-pill-height) / 2;
+        width: Theme.rail-pill-width;
+        height: Theme.rail-pill-height;
+        border-radius: Theme.radius-round;
+        background: Theme.accent;
+        visible: root.selected;
+    }
+    Image {
+        x: root.compact ? (root.width - Theme.icon-size) / 2 : Theme.space-3;
+        y: (root.height - Theme.icon-size) / 2;
+        width: Theme.icon-size;
+        height: Theme.icon-size;
+        source: root.selected ? root.icon-selected : root.icon;
+        colorize: root.selected ? Theme.accent-text : Theme.text-primary;
+        accessible-role: none;
+    }
+    if !root.compact: Text {
+        x: root.text-x;
+        // Raised so the capitals, not the line box, are centred with the icon (DS-16.1).
+        y: -Theme.cap-lift;
+        height: root.height;
+        width: root.width - root.text-x - Theme.space-2;
+        text: root.label;
+        font-size: Theme.body-size;
+        color: Theme.text-primary;
+        vertical-alignment: center;
+        overflow: elide;
+        accessible-role: none;
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.activated();
+        }
+    }
+    Tip {
+        text: root.compact ? root.label : "";
+        hovered: touch.has-hover;
+        pressed: touch.pressed;
+    }
+    Rectangle {
+        visible: root.focused;
+        border-width: Theme.focus-ring-width;
+        border-color: Theme.focus-ring;
+        border-radius: Theme.radius-control;
+    }
+}
+
+// Settings search, the rail's first entry above Home (ia-map 3.1, owner item 17): in the full rail
+// a field look with the magnifier, the placeholder and "Ctrl+F", its icon where the items' icons
+// are; in the icons-only rail an item like the others. Out of the rail's keys and Ctrl+Tab; a click
+// opens the search popup.
+component SearchSlot inherits Rectangle {
+    in property <bool> compact;
+    callback activated();
+    if root.compact: NavItem {
+        label: @tr("Search settings (Ctrl+F)");
+        icon: Icons.search;
+        icon-selected: Icons.search;
+        compact: true;
+        accessible-role: button;
+        activated => {
+            root.activated();
+        }
+    }
+    if !root.compact: Rectangle {
+        y: (parent.height - self.height) / 2;
+        height: Theme.control-height;
+        border-radius: Theme.radius-control;
+        background: touch.has-hover ? Theme.bg-control-hover : Theme.bg-control;
+        animate background { duration: Theme.motion-quick; easing: ease-out; }
+        // 1 px hairline: the field's stroke.
+        border-width: 1px;
+        border-color: Theme.stroke-control;
+        accessible-role: button;
+        accessible-label: @tr("Search settings");
+        accessible-action-default => {
+            root.activated();
+        }
+        HorizontalLayout {
+            // The magnifier sits where the rail items' icons sit (rail inset + item inset).
+            padding-left: Theme.space-3;
+            padding-right: Theme.space-3;
+            spacing: Theme.pair-gap;
+            IconLabel {
+                horizontal-stretch: 1;
+                icon: Icons.search;
+                text: @tr("Search settings");
+                ink: Theme.text-secondary;
+            }
+            Caption {
+                text: @tr("Ctrl+F");
+                color: Theme.text-secondary;
+                vertical-alignment: center;
+                accessible-role: none;
+            }
+        }
+        touch := TouchArea {
+            mouse-cursor: pointer;
+            clicked => {
+                root.activated();
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
-    title: "OxiYapper";
-    Text { text: "OxiYapper settings"; }
+    in property <string> app-name;
+    in property <string> version;
+    in property <string> licence;
+    in property <string> repository;
+    in-out property <Page> page: Page.home;
+    in-out property <ThemeChoice> theme;
+    // Empty hides the banner.
+    in property <string> banner-text;
+    // The banner is for a broken file: offer "Reset to defaults" too (a newer file only gets "Open file").
+    in property <bool> banner-fixable;
+    // The last failed save or file action; empty hides it. Shown under the config banner.
+    in property <string> action-error;
+    // The daemon link's notice (not running, restart to update, a daemon-side config error);
+    // empty hides it. Start and Restart are the buttons it may carry.
+    in property <string> daemon-text;
+    // `daemon-text` is the daemon's report of the config file this window reads too.
+    in property <bool> daemon-config-error;
+    in property <bool> daemon-start;
+    in property <bool> daemon-restart;
+    // The status chip: its text and level; a click goes to `status-clicked`.
+    in property <string> chip-text;
+    in property <ChipLevel> chip-level;
+    // Hover text with the reason and the fix (`ipc::Chip::tooltip`); empty shows none.
+    in property <string> chip-tooltip;
+    // Why the last daemon start failed; shown under the notice.
+    in property <string> spawn-error;
+    // Settings search: the matches of the last `search` (titles) and where each is ("Page > Tab").
+    in property <[string]> search-items;
+    in property <[string]> search-notes;
+    // The page of each match, for the glyph the rail shows for it.
+    in property <[Page]> search-pages;
+    callback search(string);
+    // A match was taken: Rust opens its page and tab and sets `Shell.found`.
+    callback search-picked(int);
+    property <string> search-query;
+    // Opens the search popup with `query` in its field (Ctrl+F, the rail entry, shots).
+    public function open-search(query: string) {
+        root.search-query = query;
+        root.search(query);
+        search-popup.show();
+    }
+    // How far the open page is scrolled (0 at the top, negative below).
+    out property <length> scroll-y: scroll.viewport-y;
+    // The display scale the window opens at, set once before the OS window exists. Slint gives
+    // every later icon change to the taskbar too, as ICON_BIG, in place of the exe's oxi.ico; so a
+    // window moved to another display keeps this size.
+    in property <float> icon-scale: 1;
+    callback theme-changed(ThemeChoice);
+    callback start-daemon();
+    callback restart-daemon();
+    callback open-file();
+    callback reset-config();
+    callback status-clicked();
+    // The window looks at its files again: it got the focus, the OS theme changed, or a test says so.
+    callback files-check();
+    // The title-bar icon. The accent colours the record dot, so Rust builds it again when the accent
+    // changes; the PNGs (the default red) show until then.
+    in property <image> window-icon: Icons.window-logo(root.icon-scale);
+
+    title: @tr("{} settings", root.app-name);
+    icon: root.window-icon;
+    default-font-family: Theme.font-family;
+    // Text that sets no size (the std ComboBox and its list) reads body size, as every control does.
+    default-font-size: Theme.body-size;
+    // Test surface: `tests/shell.rs` reads the size the std widgets fall back to.
+    out property <length> text-size: root.default-font-size;
+    preferred-width: Theme.window-first-width;
+    preferred-height: Theme.window-first-height;
+    // No maximum: the window maximizes and the pages adapt (UI rule 24, R1.2).
+    min-width: Theme.window-min-width;
+    min-height: Theme.window-min-height;
+    background: Theme.bg-page;
+    forward-focus: keys;
+
+    // A broken config is said once: the window's own banner has the buttons to fix it.
+    property <bool> daemon-shown: root.daemon-text != "" && !(root.daemon-config-error && root.banner-text != "");
+    property <bool> compact: root.width < Theme.compact-window;
+    property <length> rail-item: Theme.rail-item-height;
+    // The first rail item and the header row start at this y, so they share one centre (UI rule 8).
+    property <length> top: Theme.space-2;
+    property <length> pad: root.width < Theme.narrow-window ? Theme.page-padding-narrow : Theme.page-padding;
+    // One rule for every page and state (UI rule 6); the window's maximum is the only cap.
+    property <length> page-width: root.width - nav.width - 2 * root.pad;
+    // `tabs`: the page opens with its own SubTabs, which are its header row; the others get the
+    // page name there.
+    property <[{page: Page, label: string, icon: image, filled: image, tabs: bool}]> rail: [
+        { page: Page.home, label: @tr("Home"), icon: Icons.home, filled: Icons.home-filled, tabs: false },
+        { page: Page.model, label: @tr("Model"), icon: Icons.brain-circuit, filled: Icons.brain-circuit-filled, tabs: true },
+        { page: Page.hotkey, label: @tr("Hotkey"), icon: Icons.keyboard, filled: Icons.keyboard-filled, tabs: false },
+        { page: Page.audio, label: @tr("Audio"), icon: Icons.mic, filled: Icons.mic-filled, tabs: true },
+        { page: Page.text, label: @tr("Text"), icon: Icons.text-t, filled: Icons.text-t-filled, tabs: true },
+        { page: Page.paste, label: @tr("Paste"), icon: Icons.clipboard-paste-24, filled: Icons.clipboard-paste-24-filled, tabs: true },
+        { page: Page.overlay, label: @tr("Overlay"), icon: Icons.slide-text, filled: Icons.slide-text-filled, tabs: false },
+        { page: Page.history, label: @tr("History"), icon: Icons.history, filled: Icons.history-filled, tabs: false },
+        { page: Page.test, label: @tr("Test"), icon: Icons.checkmark-circle, filled: Icons.checkmark-circle, tabs: true },
+        { page: Page.system, label: @tr("System"), icon: Icons.settings, filled: Icons.settings-filled, tabs: true },
+    ];
+    property <bool> tabbed: root.rail[root.index-of(root.page)].tabs;
+    // The page the column shows: none under the setup wizard, whose steps show the page's parts
+    // themselves (`about` is never a page of the column).
+    property <Page> page-shown: SetupState.open ? Page.about : root.page;
+    // The page's height under the header row (banners already taken off).
+    property <length> free-height: scroll.visible-height - column.padding-top - column.padding-bottom - (root.tabbed ? 0 : Theme.header-row-height + column.spacing);
+
+    // Full rail: the popup's field lies over the rail's; icons-only: beside the rail.
+    search-popup := SearchPopup {
+        x: root.compact ? nav.width : 0px;
+        y: root.compact ? root.top : root.top + (root.rail-item - Theme.control-height) / 2 - Theme.space-2;
+        width: min(480px, root.width - self.x - Theme.space-2);
+        query: root.search-query;
+        items: root.search-items;
+        notes: root.search-notes;
+        detailed: true;
+        icon-of(i) => {
+            return root.rail[root.index-of(root.search-pages[i])].icon;
+        }
+        placeholder: @tr("Search settings");
+        empty-text: @tr("No setting matches");
+        search(text) => {
+            root.search-query = text;
+            root.search(text);
+        }
+        picked(i) => {
+            root.search-picked(i);
+        }
+    }
+    property <bool> search-open: search-popup.is-open;
+    changed search-open => {
+        Shell.modal(root.search-open);
+    }
+    // The picked row asks to be seen: scroll it to the middle when it is not in view.
+    property <int> reveal: Shell.reveal-serial;
+    changed reveal => {
+        let top = Shell.reveal-y - scroll.absolute-position.y;
+        if (top < 0 || top + Shell.reveal-h > scroll.height) {
+            scroll.viewport-y = max(min(0px, scroll.height - scroll.content-height), min(0px, scroll.viewport-y - top + (scroll.height - Shell.reveal-h) / 2));
+        }
+    }
+    // A row that is not on screen now (its state hides it) must not flash when it shows up later.
+    Timer {
+        interval: 1s;
+        running: Shell.found != "";
+        triggered => {
+            Shell.found = "";
+        }
+    }
+
+    pure function index-of(p: Page) -> int {
+        return p == Page.home ? 0 : p == Page.model ? 1 : p == Page.hotkey ? 2 : p == Page.audio ? 3 : p == Page.text ? 4 : p == Page.paste ? 5 : p == Page.overlay ? 6 : p == Page.history ? 7 : p == Page.test ? 8 : 9;
+    }
+
+    // System follows the OS: `unknown` makes the style read the OS scheme.
+    function apply-theme() {
+        Palette.color-scheme = root.theme == ThemeChoice.dark ? ColorScheme.dark : root.theme == ThemeChoice.light ? ColorScheme.light : ColorScheme.unknown;
+    }
+    init => {
+        root.apply-theme();
+        Shell.page-width = root.page-width;
+        Shell.window-height = root.height;
+    }
+    changed height => {
+        Shell.window-height = root.height;
+    }
+    changed theme => {
+        root.apply-theme();
+    }
+    changed page-width => {
+        Shell.page-width = root.page-width;
+    }
+    changed page => {
+        if (root.page == Page.about) {
+            SystemState.tab = 3;
+            root.page = Page.system;
+        }
+        // The rail follows a page opened by Ctrl+Tab; the page opens at its top.
+        nav.cursor = root.index-of(root.page);
+        scroll.viewport-y = 0;
+        if (root.page == Page.home) {
+            HomeState.shown();
+        }
+        // The focused field may have left with the old page, and Ctrl+Tab needs a focus to reach
+        // `keys`. The rail keeps its own focus.
+        if (!nav.has-focus) {
+            keys.focus();
+        }
+    }
+
+    // Ctrl+Tab and Ctrl+Shift+Tab cycle the pages from anywhere, before a focused field sees them.
+    keys := FocusScope {
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
+        capture-key-pressed(event) => {
+            // The setup wizard owns the window: no page switch or search under it.
+            if (SetupState.open) {
+                return reject;
+            }
+            if (event.modifiers.control && (event.text == Key.Tab || event.text == Key.Backtab)) {
+                let step = event.modifiers.shift || event.text == Key.Backtab ? root.rail.length - 1 : 1;
+                root.page = root.rail[Math.mod(root.index-of(root.page) + step, root.rail.length)].page;
+                return accept;
+            }
+            // Ctrl+F searches the settings; on History it searches the recordings, as people expect there.
+            if (event.modifiers.control && !event.modifiers.alt && (event.text == "f" || event.text == "F")) {
+                if (root.page == Page.history) {
+                    Shell.history-find += 1;
+                } else {
+                    root.open-search("");
+                }
+                return accept;
+            }
+            reject
+        }
+
+        // Placed by hand, not in a layout: the rail width follows the window width, which a layout
+        // would feed back into the window's minimum size.
+        nav := FocusScope {
+            x: 0;
+            y: 0;
+            width: root.compact ? Theme.rail-width-compact : Theme.rail-width;
+            height: parent.height;
+            // Under the setup wizard the rail takes no focus or key.
+            enabled: !SetupState.open;
+            accessible-role: tab-list;
+            property <int> cursor;
+            property <bool> key-focus;
+            focus-gained(reason) => {
+                self.cursor = root.index-of(root.page);
+                self.key-focus = KeyFocus.after(reason, self.key-focus);
+            }
+            // Up and Down move the focus between pages; Enter or Space opens one.
+            key-pressed(event) => {
+                if (event.text == Key.UpArrow || event.text == Key.DownArrow) {
+                    self.cursor = clamp(self.cursor + (event.text == Key.UpArrow ? -1 : 1), 0, root.rail.length - 1);
+                    self.key-focus = true;
+                    return accept;
+                }
+                if (event.text == Key.Return || event.text == " ") {
+                    root.page = root.rail[self.cursor].page;
+                    return accept;
+                }
+                reject
+            }
+            // No logo or app name over the items: the title bar has both (R2.4). The search entry
+            // takes the first slot.
+            VerticalLayout {
+                padding-top: root.top + root.rail-item + Theme.space-1;
+                padding-left: Theme.space-1;
+                padding-right: Theme.space-1;
+                padding-bottom: Theme.space-2;
+                spacing: Theme.space-1;
+                alignment: start;
+                for item[i] in root.rail: NavItem {
+                    height: root.rail-item;
+                    label: item.label;
+                    icon: item.icon;
+                    icon-selected: item.filled;
+                    selected: root.page == item.page || (root.page == Page.about && item.page == Page.system);
+                    compact: root.compact;
+                    focused: nav.has-focus && nav.key-focus && nav.cursor == i;
+                    activated => {
+                        nav.cursor = i;
+                        root.page = item.page;
+                    }
+                }
+            }
+        }
+
+        VerticalLayout {
+            x: nav.width;
+            y: 0;
+            width: parent.width - nav.width;
+            height: parent.height;
+            if root.banner-text != "" || root.daemon-shown || root.action-error != "": HorizontalLayout {
+                padding-left: root.pad;
+                padding-top: Theme.space-4;
+                alignment: start;
+                VerticalLayout {
+                    width: parent.width - 2 * root.pad;
+                    spacing: Theme.space-2;
+                    if root.banner-text != "": Banner {
+                        text: root.banner-text;
+                        severity: root.banner-fixable ? Severity.error : Severity.warning;
+                        Button {
+                            text: @tr("Open file");
+                            clicked => {
+                                root.open-file();
+                            }
+                        }
+                        if root.banner-fixable: Button {
+                            text: @tr("Reset to defaults");
+                            clicked => {
+                                root.reset-config();
+                            }
+                        }
+                    }
+                    if root.daemon-shown: Banner {
+                        text: root.spawn-error == "" ? root.daemon-text : root.daemon-text + " " + root.spawn-error;
+                        severity: root.spawn-error != "" ? Severity.error : Severity.warning;
+                        if root.daemon-start: Button {
+                            text: @tr("Start");
+                            clicked => {
+                                root.start-daemon();
+                            }
+                        }
+                        if root.daemon-restart: Button {
+                            text: @tr("Restart");
+                            clicked => {
+                                root.restart-daemon();
+                            }
+                        }
+                    }
+                    if root.action-error != "": Banner {
+                        text: root.action-error;
+                        severity: Severity.error;
+                    }
+                }
+            }
+
+            // One scroll area for the open page (back at the top on a page change); the scrollbar sits at the window edge, right of the cards.
+            Rectangle {
+                vertical-stretch: 1;
+                clip: true;
+                scroll := ScrollView {
+                    x: 0;
+                    y: 0;
+                    width: parent.width;
+                    height: parent.height;
+                    // The page gets the full height left under the header row, so its lists can
+                    // stretch (UI rule 26); a page taller than that scrolls as a whole.
+                    column := VerticalLayout {
+                        min-height: scroll.visible-height;
+                        // The bar takes its gutter from the content; the page padding gives it
+                        // back, so the cards keep their width whether or not the bar shows.
+                        padding-left: root.pad;
+                        padding-right: scroll.overflows ? max(0px, root.pad - Theme.scrollbar-gutter) : root.pad;
+                        padding-top: root.top;
+                        padding-bottom: root.pad;
+                        spacing: Theme.header-bottom;
+                        if !root.tabbed: HeaderRow {
+                            title: root.rail[root.index-of(root.page)].label;
+                        }
+                        if root.page-shown == Page.home: HomePage {
+                            window-width: root.width;
+                            content-width: root.page-width;
+                            free-height: root.free-height;
+                        }
+                        if root.page-shown == Page.hotkey: HotkeyPage {
+                            free-height: root.free-height;
+                        }
+                        if root.page-shown == Page.audio: AudioPage {
+                            free-height: root.free-height;
+                        }
+                        if root.page-shown == Page.model: ModelPage {
+                            free-height: root.free-height;
+                        }
+                        if root.page-shown == Page.text: TextPage {
+                            window-width: root.width;
+                            free-height: root.free-height;
+                        }
+                        if root.page-shown == Page.paste: PastePage {
+                            window-width: root.width;
+                            free-height: root.free-height;
+                        }
+                        if root.page-shown == Page.overlay: OverlayPage { }
+                        if root.page-shown == Page.history: HistoryPage {
+                            free-height: root.free-height;
+                        }
+                        if root.page-shown == Page.test: TestPage { }
+                        if !SetupState.open && (root.page == Page.system || root.page == Page.about): SystemPage {
+                            free-height: root.free-height;
+                            about: root.page == Page.about;
+                            theme: root.theme;
+                            app-name: root.app-name;
+                            version: root.version;
+                            licence: root.licence;
+                            repository: root.repository;
+                            theme-picked(choice) => {
+                                root.theme = choice;
+                                root.theme-changed(choice);
+                            }
+                        }
+                    }
+                }
+                // Right of the header row, over a page's own SubTabs too; it scrolls with them.
+                if root.chip-level != ChipLevel.hidden: StatusChip {
+                    x: scroll.width - root.pad - self.width;
+                    // Its centre is the header row's: title or tabs, both centred at y 20 (DS-14).
+                    y: scroll.viewport-y + column.padding-top + floor(((Theme.header-row-height - self.height) / 2) / 1px) * 1px;
+                    width: self.preferred-width;
+                    text: root.chip-text;
+                    tooltip: root.chip-tooltip;
+                    dot: root.chip-level == ChipLevel.ok ? Theme.success-text : root.chip-level == ChipLevel.attention ? Theme.warning-text : Theme.error-text;
+                    actionable: root.chip-level == ChipLevel.attention || (root.chip-level == ChipLevel.down && (root.daemon-start || root.daemon-restart));
+                    clicked => {
+                        root.status-clicked();
+                    }
+                }
+            }
+        }
+
+        SearchSlot {
+            x: Theme.space-1;
+            y: root.top;
+            width: nav.width - 2 * Theme.space-1;
+            height: root.rail-item;
+            compact: root.compact;
+            activated => {
+                root.open-search("");
+            }
+        }
+
+        // Over the rail and the page, under the popups and the toasts.
+        if SetupState.open: SetupPage {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            app-name: root.app-name;
+            pad: root.pad;
+            top: root.top;
+        }
+
+        // Over the page and the rail, under the popups and the toasts.
+        Scrim {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+        }
+
+        ToastHost {
+            x: nav.width;
+            y: 0;
+            width: parent.width - nav.width;
+            height: parent.height;
+        }
+
+        KeyTipHost {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+        }
+    }
 }

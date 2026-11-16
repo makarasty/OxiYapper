@@ -1,0 +1,4 @@
+// Resources of OxiYapper.exe: the app icon (Explorer, taskbar, window) and the manifest.
+1 ICON "oxi.ico"
+// CREATEPROCESS_MANIFEST_RESOURCE_ID, RT_MANIFEST
+1 24 "oxi.manifest"

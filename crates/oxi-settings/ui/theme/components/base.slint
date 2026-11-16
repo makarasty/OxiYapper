@@ -1,0 +1,335 @@
+// Small pieces every control shares: the focus visual, the hover tooltip, the card frame and the
+// caption text.
+import { Theme, Shell } from "../tokens.slint";
+import { Icons } from "../icons.slint";
+
+// The frame of every card-shaped surface (Card, ClickCard, ToggleRow, StatCard): fill, 1 px stroke,
+// radius 8. The shell sets its own height from the layout inside it.
+export component CardFrame inherits Rectangle {
+    background: Theme.bg-card;
+    border-color: Theme.stroke-card;
+    border-width: 1px;
+    border-radius: Theme.radius-card;
+}
+
+// 12 px secondary text: descriptions, captions, status lines.
+export component Caption inherits Text {
+    font-size: Theme.caption-size;
+    color: Theme.text-secondary;
+}
+
+// The one focus visual (DS-4.1): a 2 px `focus-ring` stroke 2 px outside the parent, its outer
+// radius the control's plus offset and width. Fills its parent; shown only on keyboard focus
+// (see `KeyFocus`) and never while the control's popup is open (the owner folds that into `shown`).
+export component FocusRing {
+    in property <bool> shown;
+    in property <length> radius: Theme.radius-control;
+    property <length> out: Theme.focus-ring-offset + Theme.focus-ring-width;
+    width: 100%;
+    height: 100%;
+    Rectangle {
+        visible: root.shown;
+        x: -root.out;
+        y: -root.out;
+        width: root.width + 2 * root.out;
+        height: root.height + 2 * root.out;
+        border-width: Theme.focus-ring-width;
+        border-color: Theme.focus-ring;
+        border-radius: root.radius + root.out;
+    }
+}
+
+// Whether focus came from the keyboard, so a click does not draw the ring. Nor do a window
+// coming back to the front (Alt+Tab), a popup closing and `.focus()` in code: none is a key press
+// (DS-4.2). A `FocusScope` forwards its `focus-gained` reason here; a control that hands focus on
+// passes its own answer along (`take-focus(ring)`).
+export global KeyFocus {
+    public pure function from-key(reason: FocusReason) -> bool {
+        return reason == FocusReason.tab-navigation && !Shell.quiet-focus;
+    }
+
+    // `from-key` for a control that kept its own answer (`was`): a popup it opened by key and
+    // closed by Esc hands the focus back with `popup-activation`, and the ring must stay.
+    public pure function after(reason: FocusReason, was: bool) -> bool {
+        return reason == FocusReason.popup-activation ? was : KeyFocus.from-key(reason);
+    }
+}
+
+// The tooltip bubble: caption text on a control-coloured card (the toast sets body text).
+export component Tooltip inherits Rectangle {
+    in property <string> text;
+    in property <length> font-size: Theme.caption-size;
+    background: Theme.bg-control;
+    border-color: Theme.stroke-control;
+    border-width: 1px;
+    border-radius: Theme.radius-control;
+    accessible-role: none;
+    HorizontalLayout {
+        padding-left: Theme.space-2;
+        padding-right: Theme.space-2;
+        padding-top: Theme.space-1;
+        padding-bottom: Theme.space-1;
+        Text {
+            max-width: Theme.tooltip-max-width;
+            text: root.text;
+            font-size: root.font-size;
+            color: Theme.text-primary;
+            wrap: word-wrap;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// The tooltip of `Tip`, fading in over `Theme.motion-open` from the moment it is built.
+export component TipBubble inherits Tooltip {
+    property <bool> shown;
+    opacity: self.shown ? 1 : 0;
+    animate opacity { duration: Theme.motion-open; easing: ease-out; }
+    init => {
+        // An animated binding only animates a change it has seen: read it at 0 before the flip.
+        let start = self.opacity;
+        self.shown = start >= 0;
+    }
+}
+
+// A tooltip that opens after 600 ms of hover (at once on a left press) and closes when the pointer leaves (Slint 1.18 has
+// no tooltip widget). Place it inside the hovered element; it fills it and takes no input. The
+// bubble (in `KeyTipHost`, as a popup would take the focus) is built on each show, so it fades in.
+// What an open hover `Tip` says and where, for `KeyTipHost`. Not a PopupWindow: that takes the focus
+// from the control under the pointer, and the next Tab starts over at the sidebar. `beat` counts
+// while the Tip lives: a Tip removed under the pointer stops it, and the host drops the bubble.
+export global HoverTip {
+    in-out property <string> text;
+    in-out property <length> x;
+    in-out property <length> y;
+    in-out property <int> beat;
+}
+
+export component Tip {
+    in property <string> text;
+    in property <bool> hovered;
+    // The host's left button is down: a press on the hovered host opens the tip at once; a press
+    // on an open tip does nothing. Bound from the host's own `TouchArea` (a Tip takes no input).
+    in property <bool> pressed;
+    property <bool> open;
+    function show() {
+        if (root.open || root.text == "") {
+            return;
+        }
+        root.open = true;
+        HoverTip.text = root.text;
+        HoverTip.x = root.absolute-position.x;
+        HoverTip.y = root.absolute-position.y + root.height + Theme.space-1;
+    }
+    Timer {
+        interval: 600ms;
+        running: root.hovered && root.text != "" && !root.open;
+        triggered => {
+            root.show();
+        }
+    }
+    changed pressed => {
+        if (self.pressed && self.hovered) {
+            root.show();
+        }
+    }
+    Timer {
+        interval: 150ms;
+        running: root.open;
+        triggered => {
+            HoverTip.beat += 1;
+        }
+    }
+    changed hovered => {
+        if (!self.hovered && self.open) {
+            self.open = false;
+            HoverTip.text = "";
+        }
+    }
+    changed text => {
+        if (self.open) {
+            HoverTip.text = self.text;
+            // A moved host (the heatmap's one Tip hopping cells) must take the bubble along.
+            HoverTip.x = root.absolute-position.x;
+            HoverTip.y = root.absolute-position.y + root.height + Theme.space-1;
+        }
+    }
+}
+
+// The "i" that holds a hint instead of loose text (DS-11, UI rule 35): a 16 px `info` glyph in a
+// 20 px round hover box, the text in a `Tip`. It opens on hover, on keyboard focus, and Enter or
+// Space toggles it. Put it `pair-gap` after the title or control it explains.
+export component InfoTip {
+    in property <string> text;
+    // Gallery: the hovered and the focused look.
+    in property <bool> force-hover;
+    in property <bool> force-focus;
+    property <bool> hover: touch.has-hover || root.force-hover;
+    property <bool> key-focus;
+    property <bool> key-open;
+    out property <bool> key-focused: root.key-focus && fs.has-focus;
+    width: Theme.icon-size;
+    height: Theme.icon-size;
+    accessible-role: AccessibleRole.text;
+    accessible-label: root.text;
+    face := Rectangle {
+        border-radius: Theme.radius-round;
+        background: root.hover ? Theme.bg-subtle-hover : transparent;
+        animate background { duration: Theme.motion-quick; easing: ease-out; }
+        Image {
+            source: Icons.info;
+            width: Theme.icon-size-small;
+            height: Theme.icon-size-small;
+            colorize: root.hover || root.key-focused ? Theme.text-primary : Theme.text-secondary;
+            accessible-role: none;
+            animate colorize { duration: Theme.motion-quick; easing: ease-out; }
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+    }
+    fs := FocusScope {
+        focus-on-click: false;
+        focus-gained(reason) => {
+            root.key-focus = KeyFocus.after(reason, root.key-focus);
+            root.key-open = root.key-focus;
+            root.show-key-tip();
+        }
+        focus-lost => {
+            root.key-open = false;
+            root.show-key-tip();
+        }
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                root.key-open = !root.key-open;
+                root.show-key-tip();
+                return accept;
+            }
+            reject
+        }
+    }
+    function show-key-tip() {
+        HoverTip.text = root.key-open ? root.text : "";
+        HoverTip.x = root.absolute-position.x;
+        HoverTip.y = root.absolute-position.y + root.height + Theme.space-1;
+    }
+    // The key-opened bubble lives while focused: keep its heartbeat (see `HoverTip.beat`).
+    Timer {
+        interval: 150ms;
+        running: root.key-open;
+        triggered => {
+            HoverTip.beat += 1;
+        }
+    }
+    FocusRing {
+        shown: root.force-focus || root.key-focused;
+        radius: Theme.radius-round;
+    }
+    tip := Tip {
+        text: root.text;
+        hovered: touch.has-hover;
+        pressed: touch.pressed;
+    }
+}
+
+// The thumb of a vertical scroller; drag it, or click the track to page. The track is the Bar's own
+// height (a `ScrollBox` insets it, DS-18.4); `page` is the visible height of what it scrolls.
+export component Bar {
+    in property <length> total;
+    in property <length> page: root.height;
+    in property <bool> thin;
+    in-out property <length> position;
+    property <length> travel: max(0, root.total - root.page);
+    property <length> thumb-h: min(root.height, max(Theme.scrollbar-min-thumb, root.height * root.page / max(root.total, 1px)));
+    property <length> thumb-y: root.travel <= 0 ? 0 : (root.height - root.thumb-h) * (-root.position / root.travel);
+    property <length> grab-y;
+    property <length> grab-pos;
+    accessible-role: none;
+    thumb := Rectangle {
+        // The same rect in every state (DS-18.1): only the colour changes.
+        width: 100%;
+        y: root.thumb-y;
+        height: root.thumb-h;
+        border-radius: Theme.radius-small;
+        background: touch.has-hover || touch.pressed ? Theme.text-secondary : Theme.text-disabled;
+        animate background { duration: Theme.motion-quick; easing: ease-out; }
+    }
+    touch := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                if (self.mouse-y < root.thumb-y || self.mouse-y > root.thumb-y + root.thumb-h) {
+                    // A click on the track pages toward it.
+                    root.position = clamp(root.position + (self.mouse-y < root.thumb-y ? root.page : -root.page), -root.travel, 0);
+                }
+                root.grab-y = self.mouse-y;
+                root.grab-pos = root.position;
+            }
+        }
+        moved => {
+            if (self.pressed && root.height > root.thumb-h) {
+                root.position = clamp(root.grab-pos - (self.mouse-y - root.grab-y) * root.travel / (root.height - root.thumb-h), -root.travel, 0);
+            }
+        }
+    }
+}
+
+// The one scroller of the app (DS-18): scrolls its children vertically with the design-system bar.
+// While the content overflows (or always, with `reserve-gutter`) it leaves exactly `scrollbar-gutter`
+// on the right and draws the thumb centred in that gutter, `text-disabled` at rest and
+// `text-secondary` on hover or drag, same rect in every state. `thin` (4 px) is for a bar inside a
+// control. `inset` is the container's own padding: the bar's track starts and ends that far inside
+// the box, so the thumb never touches the container's edge when the content does not. The owner sets
+// `content-height`; the children take `content-width`.
+export component ScrollBox {
+    in-out property <length> viewport-y <=> fl.content-y;
+    in property <length> content-height;
+    // Control-inside scrollers (Combo list, SearchPopup, TextArea): the 4 px bar.
+    in property <bool> thin;
+    // Lists whose length changes while shown keep the gutter with and without the bar (DS-18.6).
+    in property <bool> reserve-gutter;
+    // The container's padding (4 in a list, 8 in a popup, 12 in a card, 0 for a page).
+    in property <length> inset;
+    // Where the thumb sits from the right edge; the default centres it in the gutter.
+    in property <length> bar-inset: (Theme.scrollbar-gutter - (root.thin ? Theme.scrollbar-width-thin : Theme.scrollbar-width)) / 2;
+    out property <length> content-width: fl.width;
+    // Set from `changed`, not bound: the content's height depends on the width the gutter leaves,
+    // so a binding would loop. Stable both ways: narrower content is never shorter.
+    out property <bool> overflows;
+    // The one overflow rule: an owner that lays out for the gutter ahead (`CardGrid`) asks this.
+    public pure function overflow-for(content: length) -> bool {
+        return content > root.height + 0.5px;
+    }
+    function measure() {
+        self.overflows = root.overflow-for(root.content-height);
+    }
+    init => {
+        self.measure();
+    }
+    changed content-height => {
+        self.measure();
+    }
+    changed height => {
+        self.measure();
+    }
+    fl := Flickable {
+        // A sized child without `x` is centred: pinned left, so the content does not shift half the
+        // gutter when the bar comes.
+        x: 0;
+        width: root.width - (root.overflows || root.reserve-gutter ? Theme.scrollbar-gutter : 0);
+        height: root.height;
+        content-width: self.width;
+        content-height: root.content-height;
+        @children
+    }
+    if root.overflows: Bar {
+        width: root.thin ? Theme.scrollbar-width-thin : Theme.scrollbar-width;
+        x: root.width - self.width - root.bar-inset;
+        y: root.inset;
+        height: root.height - 2 * root.inset;
+        thin: root.thin;
+        total: root.content-height;
+        page: root.height;
+        position <=> fl.content-y;
+    }
+}

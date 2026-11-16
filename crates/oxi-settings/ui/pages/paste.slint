@@ -1,0 +1,876 @@
+// Paste page (SPEC Text, ia-map 3.2): how the text reaches the app. Paste: the mode, a space
+// after it, Enter, typing speed, Win+V and when your copy comes back. Write to file: the daily
+// file and its folder. Per-app rules: the apps with their own way, and their settings.
+// Its state is `TextState`, shared with the Text page.
+import { Theme, Shell, Icons, CapText, Group, Card, CardFrame, Caption, Row, Divider, ToggleRow, SliderRow, Combo, Segmented, TextField, SearchField, TextArea, TilePicker, Button, ButtonKind, IconButton, InfoTip, Tip, ProgressBar, Note, Severity, SubTabs, SubTabPane, GalleryTile, CardGrid, EmptyState, ScrollBox } from "../theme/index.slint";
+import { WarningSlot, Warnings } from "../theme/components/feedback.slint";
+import { TextState } from "text.slint";
+
+// The apps found by a scan, in a popup: search, close, one tile per app that ticks or unticks its rule
+// (the mode is chosen in the rules list). The grid never resizes: nothing appears below it.
+component AppsPopup inherits PopupWindow {
+    close-policy: close-on-click-outside;
+    init => {
+        // The caret is in the search field at once, the ring never (DS-4.6).
+        field.focus();
+    }
+    CardFrame {
+        background: Theme.bg-control;
+        border-color: Theme.stroke-control;
+        FocusScope {
+            focus-on-click: false;
+            capture-key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    root.close();
+                    return accept;
+                }
+                reject
+            }
+            VerticalLayout {
+                padding: Theme.space-4;
+                spacing: Theme.space-3;
+                HorizontalLayout {
+                    spacing: Theme.control-gap;
+                    FocusScope {
+                        horizontal-stretch: 1;
+                        focus-on-click: false;
+                        capture-key-pressed(event) => {
+                            if (event.text == Key.DownArrow && grid.tiles.length > 0) {
+                                grid.focus-grid();
+                                return accept;
+                            }
+                            reject
+                        }
+                        field := SearchField {
+                            width: 100%;
+                            height: 100%;
+                            no-ring: true;
+                            text <=> TextState.popup-query;
+                            placeholder-text: @tr("Search apps");
+                            accessible-label: @tr("Search apps");
+                        }
+                    }
+                    // The filters: what kind, from where, in which order. Each change draws the grid again.
+                    Segmented {
+                        horizontal-stretch: 0;
+                        accessible-label: @tr("Show");
+                        items: [@tr("All"), @tr("Apps"), @tr("Games")];
+                        tips: [@tr("Apps and games"), @tr("Apps, no games"), @tr("Games from Steam, Battle.net, Epic, GOG and game folders")];
+                        selected: TextState.popup-type;
+                        picked(i) => {
+                            TextState.popup-type = i;
+                            TextState.popup-search(TextState.popup-query);
+                        }
+                    }
+                    Combo {
+                        min-width: Theme.rule-mode-width;
+                        max-width: Theme.rule-mode-width;
+                        horizontal-stretch: 0;
+                        model: TextState.source-names;
+                        current-index: TextState.popup-source;
+                        accessible-label: @tr("Source");
+                        selected => {
+                            TextState.popup-source = self.current-index;
+                            TextState.popup-search(TextState.popup-query);
+                        }
+                    }
+                    Segmented {
+                        horizontal-stretch: 0;
+                        accessible-label: @tr("Order");
+                        items: [@tr("Name"), @tr("Size")];
+                        tips: [@tr("Sort by name"), @tr("Biggest on disk first; apps whose size is not known come last")];
+                        selected: TextState.popup-sort;
+                        picked(i) => {
+                            TextState.popup-sort = i;
+                            TextState.popup-search(TextState.popup-query);
+                        }
+                    }
+                    IconButton {
+                        icon: Icons.close;
+                        label: @tr("Close");
+                        tooltip: @tr("Close");
+                        clicked => {
+                            root.close();
+                        }
+                    }
+                }
+                // The scan's bar has its place from the start, so the grid does not move when a scan begins.
+                Rectangle {
+                    height: Theme.rail-height;
+                    if TextState.scanning: ProgressBar {
+                        width: 100%;
+                        indeterminate: true;
+                        accessible-label: @tr("Looking for apps");
+                    }
+                }
+                Rectangle {
+                    vertical-stretch: 1;
+                    grid := CardGrid {
+                        visible: TextState.grid.length > 0;
+                        width: parent.width;
+                        height: parent.height;
+                        accessible-label: @tr("Installed apps");
+                        tiles: TextState.grid;
+                        fallback-icon: Icons.app-generic;
+                        picked(i) => {
+                            // The first tile, the one with no exe, opens the file dialog.
+                            if (TextState.grid[i].caption == "") {
+                                TextState.browse-exe();
+                            } else {
+                                TextState.found-toggled(TextState.grid[i].caption);
+                            }
+                        }
+                    }
+                    if TextState.grid.length == 0: EmptyState {
+                        icon: Icons.app-generic;
+                        text: TextState.scanning && TextState.found.length == 0 ? @tr("Looking for apps") : TextState.found.length > 0 ? @tr("No app matches") : @tr("No apps found");
+                        if !TextState.scanning && TextState.found.length == 0: Button {
+                            text: @tr("Scan again");
+                            icon: Icons.scan;
+                            enabled: !Shell.locked;
+                            clicked => {
+                                TextState.scan();
+                            }
+                        }
+                        // With no tile to hold it, the file dialog is a button here.
+                        Button {
+                            text: @tr("Choose an .exe file");
+                            icon: Icons.browse-file;
+                            enabled: !Shell.locked;
+                            clicked => {
+                                TextState.browse-exe();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// One tab in view, so the page needs no scroll at the minimum size (UI rule 25); the rule list
+// scrolls inside its own area (rule 26).
+export component PastePage inherits VerticalLayout {
+    // The shell's room under the page title, banners already taken off: what the editors and the
+    // rule list share out so a tab fits without the page scrolling.
+    in property <length> free-height;
+    property <length> room: root.free-height - tabs.preferred-height - Theme.space-4;
+    // Per-app rules: one card, the search bar over the list. The list takes its rows, between three
+    // rows (the empty states) and what the room leaves.
+    property <length> bar-block: Theme.control-height + Theme.space-3;
+    // Per-app rules: the line-join switch's card first; the rules card gets the room under it.
+    property <length> rules-room: root.room - join-card.preferred-height - Theme.card-gap;
+    property <length> list-room: max(root.rules-room - 2 * Theme.card-padding-v - root.bar-block, 3 * Theme.row-height);
+    // The profile editor of a rule: its header, then nine rows; it takes what the room leaves, so a short
+    // window scrolls inside it (rule 26).
+    property <length> profile-height: min(root.rules-room, 2 * Theme.card-padding-v + Theme.control-height + 2 * Theme.space-3 + 9 * Theme.control-height + 8 * Theme.space-3 + Theme.space-2);
+    property <length> list-height: min(root.list-room, max(TextState.rule-matches * Theme.row-height, 3 * Theme.row-height));
+    // The card is as tall with a profile open as with the list, the taller of the two, so opening one
+    // moves nothing (UI rule 1); the list keeps its rows at the top.
+    property <length> rules-card: max(2 * Theme.card-padding-v + root.bar-block + root.list-height, root.profile-height);
+    // The row of the field's list under the arrows.
+    property <int> active;
+    // The window's width, from the shell: the page's own width is short of it by the rail and
+    // paddings, and by the scrollbar gutter when the page scrolls as a whole.
+    in property <length> window-width;
+    // Open while there is text and rows for it, until the caret leaves the field; typing, or the
+    // caret coming back, opens it again.
+    property <bool> dismissed;
+    property <bool> suggest-open: TextState.query != "" && TextState.suggestions.length > 0 && !root.dismissed;
+    property <bool> field-focus: search.has-focus;
+    property <string> query: TextState.query;
+    property <string> popup-query: TextState.popup-query;
+    property <int> shown-tab: TextState.paste-tab;
+    changed field-focus => {
+        root.dismissed = !self.field-focus;
+    }
+    changed query => {
+        root.dismissed = false;
+        root.active = 0;
+        TextState.query-edited(self.query);
+    }
+    changed popup-query => {
+        TextState.popup-search(self.popup-query);
+    }
+    changed shown-tab => {
+        if (self.shown-tab == 2) {
+            TextState.per-app-shown();
+        }
+    }
+    function pick-suggestion(i: int) {
+        if (!Shell.locked && i >= 0 && i < TextState.suggestions.length) {
+            TextState.rule-picked(TextState.suggestions[i].caption);
+        }
+    }
+    // The popup reports its own `is-open` only to the component that holds it.
+    property <bool> apps-open: apps.is-open;
+    changed apps-open => {
+        Shell.modal(root.apps-open);
+    }
+    function open-apps() {
+        TextState.popup-query = "";
+        TextState.popup-type = 0;
+        TextState.popup-source = 0;
+        TextState.popup-sort = 0;
+        TextState.popup-search("");
+        apps.show();
+    }
+    alignment: start;
+    spacing: Theme.space-4;
+    init => {
+        TextState.shown();
+        if (TextState.paste-tab == 2) {
+            TextState.per-app-shown();
+        }
+    }
+    tabs := SubTabs {
+        items: [@tr("Paste"), @tr("Write to file"), @tr("Per-app rules")];
+        counts: [-1, -1, TextState.rules.length];
+        selected: TextState.paste-tab;
+        picked(i) => {
+            TextState.paste-tab = i;
+        }
+    }
+    Rectangle {
+        SubTabPane {
+            shown: TextState.paste-tab == 0;
+            VerticalLayout {
+                alignment: start;
+                // The link to Per-app rules is the group's trailing action (Home's History folder, DS-28.6).
+                Group {
+                    title: @tr("Paste mode");
+                    info: @tr("Clipboard puts your own copy back after the paste. Type also works where Ctrl+V does not, like remote desktops.");
+                    action-text: @tr("Per-app rules");
+                    action-tip: @tr("Different for one app or a command prompt? Set it in Per-app rules.");
+                    action => {
+                        TextState.paste-tab = 2;
+                    }
+                    TilePicker {
+                        accessible-label: @tr("Paste mode");
+                        columns: 2;
+                        tile-height: Theme.tile-height-short;
+                        tiles: [
+                            { icon: Icons.clipboard-paste-24, icon-selected: Icons.clipboard-paste-24-filled, title: @tr("Clipboard"), caption: @tr("Pastes with Ctrl+V") },
+                            { icon: Icons.keyboard-24, icon-selected: Icons.keyboard-24-filled, title: @tr("Type"), caption: @tr("Types key by key, for games") },
+                        ];
+                        selected: TextState.paste-mode;
+                        picked(i) => {
+                            TextState.paste-mode = i;
+                            TextState.paste-mode-picked(i);
+                        }
+                    }
+                    Card {
+                        ToggleRow {
+                            flat: true;
+                            title: @tr("Add a space after the text");
+                            info: @tr("Adds a space after the pasted text.");
+                            checked <=> TextState.trailing-space;
+                            toggled(on) => {
+                                TextState.trailing-space-toggled(on);
+                            }
+                        }
+                        Divider { }
+                        ToggleRow {
+                            flat: true;
+                            title: @tr("Press Enter after pasting");
+                            info: @tr("One Enter once the whole text is in. Not sent if, since you started speaking, the window or the field changed, you pressed a key, or the PC was locked or asleep.");
+                            // Owner 2026-11-12: after Ctrl+V the Enter needs the app's own read.
+                            warning: TextState.press-enter && TextState.paste-mode == 0 ? @tr("With Clipboard mode, Enter only when the app confirms it took the text from the clipboard. No confirmation, no Enter. Type mode always gets the Enter.") : "";
+                            checked <=> TextState.press-enter;
+                            toggled(on) => {
+                                TextState.press-enter-toggled(on);
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            title: @tr("Typing speed");
+                            info: @tr("How fast Type mode types. Safe waits a little between keys, for apps and games that drop fast keys. An app's rule can change it.");
+                            Segmented {
+                                accessible-label: @tr("Typing speed");
+                                items: [@tr("Fast"), @tr("Safe")];
+                                selected: TextState.type-speed;
+                                enabled: !Shell.locked;
+                                picked(i) => {
+                                    TextState.type-speed = i;
+                                    TextState.type-speed-picked(i);
+                                }
+                            }
+                        }
+                        Divider { }
+                        ToggleRow {
+                            flat: true;
+                            title: @tr("Keep the last dictation in Win+V");
+                            info: @tr("A new dictation replaces the one before.");
+                            checked <=> TextState.keep-history;
+                            toggled(on) => {
+                                TextState.keep-history-toggled(on);
+                            }
+                        }
+                        Divider { }
+                        SliderRow {
+                            title: @tr("Give your copy back after");
+                            info: @tr("How long the dictation stays on Ctrl+V after it is pasted.");
+                            minimum: 0;
+                            maximum: 1000;
+                            step: 25;
+                            unit: "ms";
+                            default-value: TextState.default-restore-delay-ms;
+                            value <=> TextState.restore-delay-ms;
+                            changed(v) => {
+                                TextState.restore-delay-changed(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        SubTabPane {
+            shown: TextState.paste-tab == 1;
+            VerticalLayout {
+                alignment: start;
+                Card {
+                        Row {
+                            title: @tr("Write each dictation to a file");
+                            warning: TextState.file-warning;
+                            info: @tr("Each dictation is added to a file of the day, YYYY-MM-DD, in the folder. With Write only nothing is pasted. Without a folder nothing is written.");
+                            Combo {
+                                model: [@tr("Off"), @tr("Paste and write"), @tr("Write only")];
+                                current-index <=> TextState.file-mode;
+                                accessible-label: @tr("Write each dictation to a file");
+                                selected => {
+                                    TextState.file-mode-picked(self.current-index);
+                                }
+                            }
+                        }
+                        Divider { }
+                        // Folder and file type stay enabled while writing is Off: choosing them writes
+                        // nothing, so nothing is grey without a reason (item 15).
+                        Row {
+                            title: @tr("Folder");
+                            info: TextState.file-folder == "" ? @tr("Choose the folder the files go to.") : TextState.file-folder;
+                            warning: TextState.file-folder == "" && TextState.file-wanted ? @tr("No folder chosen: nothing is written") : "";
+                            Button {
+                                text: TextState.file-folder-name == "" ? @tr("Choose folder") : TextState.file-folder-name;
+                                icon: Icons.browse-folder;
+                                enabled: !Shell.locked;
+                                tooltip: Shell.locked-tip;
+                                clicked => {
+                                    TextState.file-folder-choose();
+                                }
+                            }
+                        }
+                        Divider { }
+                        Row {
+                            title: @tr("File type");
+                            info: @tr("Markdown adds a list line, - 09:05 text; Text adds 09:05  text.");
+                            Segmented {
+                                accessible-label: @tr("File format");
+                                items: [".md", ".txt"];
+                                spoken: [@tr("Markdown"), @tr("Text")];
+                                tips: [@tr("Markdown: a list line, - 09:05 text"), @tr("Text: 09:05  text")];
+                                selected: TextState.file-format;
+                                enabled: !Shell.locked;
+                                picked(i) => {
+                                    TextState.file-format-picked(i);
+                                }
+                            }
+                        }
+                }
+            }
+        }
+        SubTabPane {
+            shown: TextState.paste-tab == 2;
+            VerticalLayout {
+                alignment: start;
+                // The default the rules below override per app (ia-map 3.2).
+                VerticalLayout {
+                    padding-bottom: Theme.card-gap;
+                    join-card := Card {
+                        ToggleRow {
+                            flat: true;
+                            title: @tr("Join lines in command prompts");
+                            info: @tr("Only a classic console window with nothing but cmd.exe running in it, where a line break runs the line as a command: there the lines are joined with spaces. Claude Code, PowerShell or any other program started in it, Windows Terminal and every other app get them as dictated. An app's profile can turn it on or off for that app.");
+                            checked <=> TextState.join-console-lines;
+                            toggled(on) => {
+                                TextState.join-console-lines-toggled(on);
+                            }
+                        }
+                    }
+                }
+                card := CardFrame {
+                    height: root.rules-card;
+                    // Search, add and scan in one field: it filters the rules below, lists the installed
+                    // apps that match, and takes a typed exe for an app with no shortcut.
+                    HorizontalLayout {
+                        visible: TextState.profile-rule < 0;
+                        x: Theme.card-padding-h;
+                        y: Theme.card-padding-v;
+                        width: parent.width - 2 * Theme.card-padding-h;
+                        height: Theme.control-height;
+                        spacing: Theme.control-gap;
+                        FocusScope {
+                            horizontal-stretch: 1;
+                            focus-on-click: false;
+                            capture-key-pressed(event) => {
+                                if (!root.suggest-open) {
+                                    return reject;
+                                }
+                                if (event.text == Key.DownArrow) {
+                                    root.active = min(root.active + 1, TextState.suggestions.length - 1);
+                                    return accept;
+                                }
+                                if (event.text == Key.UpArrow) {
+                                    root.active = max(root.active - 1, 0);
+                                    return accept;
+                                }
+                                if (event.text == Key.Return) {
+                                    root.pick-suggestion(root.active);
+                                    return accept;
+                                }
+                                reject
+                            }
+                            search := SearchField {
+                                width: 100%;
+                                height: 100%;
+                                text <=> TextState.query;
+                                placeholder-text: @tr("Search or add an app");
+                                enabled: !Shell.locked;
+                                accessible-label: @tr("New rule app");
+                                // At once for a typed letter; `changed query` takes the clear button, Esc and a pick.
+                                edited(text) => {
+                                    root.dismissed = false;
+                                    root.active = 0;
+                                    TextState.query-edited(text);
+                                }
+                            }
+                        }
+                        Button {
+                            text: @tr("Scan for apps");
+                            icon: Icons.scan;
+                            tooltip: Shell.locked ? Shell.locked-tip : @tr("Choose the apps that get their own rule");
+                            enabled: !Shell.locked;
+                            clicked => {
+                                root.open-apps();
+                            }
+                        }
+                        // An app on a stick or in a folder no scan reaches: pick its .exe yourself.
+                        IconButton {
+                            icon: Icons.browse-file;
+                            label: @tr("Choose an .exe file");
+                            tooltip: Shell.locked ? Shell.locked-tip : @tr("Choose an .exe file");
+                            enabled: !Shell.locked;
+                            clicked => {
+                                TextState.browse-exe();
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            InfoTip {
+                                text: @tr("These apps get text their own way; every other app follows Paste > Paste.");
+                            }
+                        }
+                    }
+                    // The list overhangs the card's padding by the bar's gutter, so the buttons end where
+                    // the search bar does and the thumb sits in the padding.
+                    Rectangle {
+                        visible: TextState.profile-rule < 0;
+                        x: Theme.card-padding-h;
+                        y: Theme.card-padding-v + root.bar-block;
+                        width: parent.width - 2 * Theme.card-padding-h;
+                        height: root.rules-card - 2 * Theme.card-padding-v - root.bar-block;
+                        rules-box := ScrollBox {
+                            // Without an x a sized child is centred: pinned, so the overhang is all on the right.
+                            x: 0;
+                            width: parent.width + Theme.scrollbar-gutter;
+                            height: parent.height;
+                            reserve-gutter: true;
+                            content-height: TextState.rule-matches * Theme.row-height;
+                            VerticalLayout {
+                                alignment: start;
+                                width: rules-box.content-width;
+                                for rule[i] in TextState.rules: Rectangle {
+                                    // A pick sets the Combo's index, which ends its binding: a mode changed
+                                    // from outside (Reset) still reaches it through this.
+                                    property <int> mode: rule.mode;
+                                    changed mode => {
+                                        mode-combo.current-index = self.mode;
+                                    }
+                                    // A duplicate pick: the tint for 600 ms (set and cleared by `pages::text`), and the row scrolls into view.
+                                    property <bool> flash: TextState.flash-app != "" && rule.app == TextState.flash-app;
+                                    changed flash => {
+                                        if (self.flash) {
+                                            if (self.y + self.height > -rules-box.viewport-y + rules-box.height) {
+                                                rules-box.viewport-y = rules-box.height - self.y - self.height;
+                                            }
+                                            if (self.y < -rules-box.viewport-y) {
+                                                rules-box.viewport-y = -self.y;
+                                            }
+                                        }
+                                    }
+                                    visible: !rule.hidden;
+                                    height: rule.hidden ? 0px : Theme.row-height;
+                                    background: self.flash ? Theme.accent-tint : transparent;
+                                    border-radius: Theme.radius-control;
+                                    HorizontalLayout {
+                                        spacing: Theme.icon-gap;
+                                        VerticalLayout {
+                                            alignment: center;
+                                            Image {
+                                                source: rule.icon.width > 0 ? rule.icon : Icons.app-generic;
+                                                width: Theme.icon-size;
+                                                height: Theme.icon-size;
+                                                image-fit: contain;
+                                                colorize: rule.icon.width > 0 ? transparent : Theme.text-secondary;
+                                                accessible-role: none;
+                                            }
+                                        }
+                                        Rectangle {
+                                            horizontal-stretch: 1;
+                                            min-width: 0;
+                                            VerticalLayout {
+                                                alignment: center;
+                                                CapText {
+                                                    text: rule.name != "" ? rule.name : rule.app;
+                                                    overflow: elide;
+                                                }
+                                                if rule.name != "": CapText {
+                                                    text: rule.app;
+                                                    font-size: Theme.caption-size;
+                                                    ink: Theme.text-secondary;
+                                                    overflow: elide;
+                                                }
+                                            }
+                                            name-area := TouchArea { }
+                                            Tip {
+                                                text: rule.name != "" ? rule.name + "\n" + rule.app : rule.app;
+                                                hovered: name-area.has-hover;
+                                                pressed: name-area.pressed;
+                                            }
+                                        }
+                                        // The mode and Delete are one group, 8 apart (DS-28.1); Delete is rightmost.
+                                        HorizontalLayout {
+                                            spacing: Theme.space-2;
+                                            VerticalLayout {
+                                                alignment: center;
+                                                mode-combo := Combo {
+                                                    min-width: Theme.rule-mode-width;
+                                                    max-width: Theme.rule-mode-width;
+                                                    // The first item names the Paste tab's mode it follows (ia-map 3.2, RT R2).
+                                                    model: [TextState.paste-mode == 1 ? @tr("Default (Type)") : @tr("Default (Clipboard)"), @tr("Clipboard"), @tr("Type")];
+                                                    current-index: rule.mode;
+                                                    accessible-label: @tr("Mode for {}", rule.app);
+                                                    selected => {
+                                                        TextState.rule-mode-picked(i, self.current-index);
+                                                    }
+                                                }
+                                            }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                Button {
+                                                    kind: ButtonKind.icon;
+                                                    icon: Icons.edit-16;
+                                                    text: @tr("Settings for {}", rule.app);
+                                                    tooltip: @tr("Language, model and text options for this app");
+                                                    clicked => {
+                                                        TextState.profile-opened(i);
+                                                    }
+                                                }
+                                            }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                Button {
+                                                    kind: ButtonKind.icon;
+                                                    destructive: true;
+                                                    icon: Icons.delete-16;
+                                                    text: @tr("Remove {}", rule.app);
+                                                    enabled: !Shell.locked;
+                                                    tooltip: Shell.locked-tip;
+                                                    clicked => {
+                                                        TextState.rule-removed(i);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if TextState.rules.length == 0: EmptyState {
+                            icon: Icons.app-generic;
+                            text: @tr("No app has a rule of its own");
+                            Button {
+                                text: @tr("Scan for apps");
+                                icon: Icons.scan;
+                                enabled: !Shell.locked;
+                                clicked => {
+                                    root.open-apps();
+                                }
+                            }
+                        }
+                        if TextState.rules.length > 0 && TextState.rule-matches == 0: EmptyState {
+                            icon: Icons.app-generic;
+                            text: @tr("No rule matches");
+                        }
+                    }
+                    // Under the field, over the list: the installed apps that match, then the typed exe.
+                    if root.suggest-open && TextState.profile-rule < 0: CardFrame {
+                        x: Theme.card-padding-h;
+                        y: Theme.card-padding-v + Theme.control-height + Theme.space-1;
+                        width: search.width;
+                        height: TextState.suggestions.length * Theme.control-height + 2 * Theme.space-1;
+                        background: Theme.bg-control;
+                        border-color: Theme.stroke-control;
+                        accessible-role: list;
+                        accessible-label: @tr("Matching apps");
+                        for s[i] in TextState.suggestions: Rectangle {
+                            x: Theme.space-1;
+                            y: Theme.space-1 + i * Theme.control-height;
+                            width: parent.width - 2 * Theme.space-1;
+                            height: Theme.control-height;
+                            border-radius: Theme.radius-control;
+                            background: i == root.active || touch.has-hover ? Theme.bg-subtle-hover : transparent;
+                            accessible-role: list-item;
+                            // The action is what a screen reader names; the exe is in the description.
+                            accessible-label: s.hint != "" ? @tr("Add rule") : s.title;
+                            accessible-description: s.hint == "dup" ? @tr("{} already has a rule", s.caption) : s.caption;
+                            accessible-action-default => {
+                                root.pick-suggestion(i);
+                            }
+                            HorizontalLayout {
+                                padding-left: Theme.space-2;
+                                padding-right: Theme.space-2;
+                                spacing: Theme.space-2;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Image {
+                                        source: s.hint == "add" ? Icons.add : s.hint == "dup" ? Icons.warning : s.picture.width > 0 ? s.picture : Icons.app-generic;
+                                        width: Theme.icon-size-small;
+                                        height: Theme.icon-size-small;
+                                        image-fit: contain;
+                                        colorize: s.hint == "dup" ? Theme.error-text : s.hint == "add" ? Theme.accent-text : s.picture.width > 0 ? transparent : Theme.text-secondary;
+                                        accessible-role: none;
+                                    }
+                                }
+                                CapText {
+                                    horizontal-stretch: 0;
+                                    text: s.hint == "add" ? @tr("Add {}", s.caption) : s.title;
+                                    overflow: elide;
+                                    decorative: true;
+                                }
+                                Caption {
+                                    text: s.hint == "dup" ? @tr("already has a rule") : s.hint == "add" ? "" : s.caption;
+                                    color: s.hint == "dup" ? Theme.error-text : Theme.text-secondary;
+                                    horizontal-stretch: 1;
+                                    horizontal-alignment: right;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    accessible-role: none;
+                                }
+                            }
+                            touch := TouchArea {
+                                mouse-cursor: MouseCursor.pointer;
+                                clicked => {
+                                    root.pick-suggestion(i);
+                                }
+                            }
+                        }
+                    }
+                    // One rule's profile in the place of the list: the card keeps its size, so nothing
+                    // moves. Every field is "Default" (follow the other tabs) or this app's own value.
+                    if TextState.profile-rule >= 0: VerticalLayout {
+                        x: Theme.card-padding-h;
+                        y: Theme.card-padding-v;
+                        width: parent.width - 2 * Theme.card-padding-h;
+                        height: parent.height - 2 * Theme.card-padding-v;
+                        spacing: Theme.space-3;
+                        HorizontalLayout {
+                            height: Theme.control-height;
+                            spacing: Theme.icon-gap;
+                            VerticalLayout {
+                                alignment: center;
+                                Image {
+                                    source: TextState.profile-icon.width > 0 ? TextState.profile-icon : Icons.app-generic;
+                                    width: Theme.icon-size;
+                                    height: Theme.icon-size;
+                                    image-fit: contain;
+                                    colorize: TextState.profile-icon.width > 0 ? transparent : Theme.text-secondary;
+                                    accessible-role: none;
+                                }
+                            }
+                            CapText {
+                                text: TextState.profile-name != "" ? TextState.profile-name : TextState.profile-app;
+                                font-weight: Theme.weight-strong;
+                                overflow: elide;
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                IconButton {
+                                    icon: Icons.close;
+                                    label: @tr("Close the profile");
+                                    tooltip: @tr("Back to the apps");
+                                    clicked => {
+                                        TextState.profile-rule = -1;
+                                    }
+                                }
+                            }
+                        }
+                        Divider { }
+                        profile-box := ScrollBox {
+                            vertical-stretch: 1;
+                            reserve-gutter: true;
+                            content-height: 10 * Theme.control-height + 9 * Theme.space-3;
+                            VerticalLayout {
+                                alignment: start;
+                                spacing: Theme.space-3;
+                                width: profile-box.content-width;
+                                Row {
+                                    title: @tr("Language");
+                                    // Only in the profile pane: search opens the tab, the row has no flash of its own.
+                                    search-key: "";
+                                    info: @tr("This app's language. A language with its own model (Model > Languages) runs that model; Auto runs the model of the first row there.");
+                                    Combo {
+                                        model: TextState.language-names;
+                                        current-index: TextState.profile-values[0];
+                                        accessible-label: @tr("Language");
+                                        selected => {
+                                            TextState.profile-picked(0, self.current-index);
+                                        }
+                                    }
+                                }
+                                Row {
+                                    title: @tr("Model");
+                                    search-key: "";
+                                    info: @tr("This app's model. Changing between two apps with different models loads a model each time (1 to 4 seconds, while you speak).");
+                                    Combo {
+                                        model: TextState.model-names;
+                                        current-index: TextState.profile-values[1];
+                                        accessible-label: @tr("Model");
+                                        selected => {
+                                            TextState.profile-picked(1, self.current-index);
+                                        }
+                                    }
+                                }
+                                Row {
+                                    title: @tr("Write to a file");
+                                    search-key: "";
+                                    info: @tr("Needs the folder on Paste > Write to file.");
+                                    warning: TextState.file-folder == "" && TextState.profile-values[2] >= 2 ? @tr("No folder chosen: nothing is written") : "";
+                                    Combo {
+                                        model: [TextState.profile-defaults[2], @tr("Off"), @tr("Paste and write"), @tr("Write only")];
+                                        current-index: TextState.profile-values[2];
+                                        accessible-label: @tr("Write to a file");
+                                        selected => {
+                                            TextState.profile-picked(2, self.current-index);
+                                        }
+                                    }
+                                }
+                                Row {
+                                    title: @tr("Typing speed");
+                                    search-key: "";
+                                    info: @tr("How fast this app gets typed text. It matters only when the app types its text instead of pasting it.");
+                                    Combo {
+                                        model: [TextState.profile-defaults[9], @tr("Fast"), @tr("Safe")];
+                                        current-index: TextState.profile-values[9];
+                                        accessible-label: @tr("Typing speed");
+                                        selected => {
+                                            TextState.profile-picked(9, self.current-index);
+                                        }
+                                    }
+                                }
+                                Row {
+                                    title: @tr("Dictionary");
+                                    search-key: "";
+                                    info: @tr("Off sends Whisper no dictionary words for this app.");
+                                    Combo {
+                                        model: [TextState.profile-defaults[3], @tr("On"), @tr("Off")];
+                                        current-index: TextState.profile-values[3];
+                                        accessible-label: @tr("Dictionary");
+                                        selected => {
+                                            TextState.profile-picked(3, self.current-index);
+                                        }
+                                    }
+                                }
+                                Row {
+                                    title: @tr("Replacements");
+                                    search-key: "";
+                                    info: @tr("Off skips the replacements of Text > Replacements for this app.");
+                                    Combo {
+                                        model: [TextState.profile-defaults[4], @tr("On"), @tr("Off")];
+                                        current-index: TextState.profile-values[4];
+                                        accessible-label: @tr("Replacements");
+                                        selected => {
+                                            TextState.profile-picked(4, self.current-index);
+                                        }
+                                    }
+                                }
+                                Row {
+                                    title: @tr("Voice commands");
+                                    search-key: "";
+                                    info: @tr("All voice commands on or off for this app, whatever Text > Voice commands says.");
+                                    Combo {
+                                        model: [TextState.profile-defaults[5], @tr("On"), @tr("Off")];
+                                        current-index: TextState.profile-values[5];
+                                        accessible-label: @tr("Voice commands");
+                                        selected => {
+                                            TextState.profile-picked(5, self.current-index);
+                                        }
+                                    }
+                                }
+                                Row {
+                                    title: @tr("Remove filler words");
+                                    search-key: "";
+                                    info: @tr("On or off for this app, whatever Text > Words says.");
+                                    Combo {
+                                        model: [TextState.profile-defaults[6], @tr("On"), @tr("Off")];
+                                        current-index: TextState.profile-values[6];
+                                        accessible-label: @tr("Remove filler words");
+                                        selected => {
+                                            TextState.profile-picked(6, self.current-index);
+                                        }
+                                    }
+                                }
+                                Row {
+                                    title: @tr("Punctuation from pauses");
+                                    search-key: "";
+                                    info: @tr("On or off for this app, whatever Text > Formatting says.");
+                                    Combo {
+                                        model: [TextState.profile-defaults[7], @tr("On"), @tr("Off")];
+                                        current-index: TextState.profile-values[7];
+                                        accessible-label: @tr("Punctuation from pauses");
+                                        selected => {
+                                            TextState.profile-picked(7, self.current-index);
+                                        }
+                                    }
+                                }
+                                Row {
+                                    title: @tr("Join lines");
+                                    search-key: "";
+                                    info: @tr("On joins the lines with spaces in this app, Off keeps them, whatever the \"Join lines in command prompts\" switch above the rules says.");
+                                    Combo {
+                                        model: [TextState.profile-defaults[8], @tr("On"), @tr("Off")];
+                                        current-index: TextState.profile-values[8];
+                                        accessible-label: @tr("Join lines");
+                                        selected => {
+                                            TextState.profile-picked(8, self.current-index);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Not laid out: the popup takes its own place, centred on the page and in the window.
+                Rectangle {
+                    width: 0;
+                    height: 0;
+                    apps := AppsPopup {
+                        width: min(960px, root.window-width - 4 * Theme.space-4);
+                        height: min(640px, Shell.window-height - 4 * Theme.space-4);
+                        x: (root.window-width - self.width) / 2 - parent.absolute-position.x;
+                        y: (Shell.window-height - self.height) / 2 - parent.absolute-position.y;
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,312 @@
+// Visual pickers: icon tiles and the screen diagram. Large items, so selected = soft fill
+// (accent tint and the check badge; the ink stays text-primary, DS-20.5); borders never change colour.
+import { Theme, Shell } from "../tokens.slint";
+import { Icons } from "../icons.slint";
+import { FocusRing, KeyFocus, Caption, CardFrame, Tip } from "base.slint";
+
+// 20 px accent circle with a white check; grey on a read-only picker.
+export component CheckBadge inherits Rectangle {
+    in property <bool> muted;
+    width: Theme.check-badge-size;
+    height: Theme.check-badge-size;
+    border-radius: Theme.radius-round;
+    background: root.muted ? Theme.text-secondary : Theme.accent;
+    Image {
+        source: Icons.checkmark-12;
+        width: Theme.check-glyph-size;
+        height: Theme.check-glyph-size;
+        colorize: root.muted ? Theme.bg-card : Theme.on-accent;
+        accessible-role: none;
+    }
+}
+
+export struct TileItem {
+    // Regular icon; `icon-selected` (the filled one) is drawn while the tile is picked.
+    icon: image,
+    icon-selected: image,
+    title: string,
+    caption: string,
+}
+
+// One tile; `TilePicker` lays them out and handles keys. Exported for the gallery's state grid.
+export component Tile inherits Rectangle {
+    in property <TileItem> item;
+    in property <bool> selected;
+    in property <bool> hover;
+    in property <bool> pressed;
+    in property <bool> read-only;
+    in property <bool> focused;
+    in property <length> tile-height: Theme.tile-height;
+    // Glyph and title ink: read-only greys the ink, not the layer, so text stays crisp (DS-8.3 [22]).
+    out property <color> ink: root.read-only ? Theme.text-disabled : Theme.text-primary;
+    animate ink { duration: Theme.motion-quick; easing: ease-out; }
+    out property <color> caption-ink: root.read-only ? Theme.text-disabled : Theme.text-secondary;
+    min-width: Theme.tile-min-width;
+    min-height: max(root.tile-height, inner.min-height);
+    horizontal-stretch: 1;
+    border-radius: Theme.radius-card;
+    // 1 px hairline: the tile's stroke.
+    border-width: 1px;
+    border-color: Theme.stroke-card;
+    // A press selects: the fill goes hover -> tint, never through the darker pressed fill (a blink
+    // in dark; DS-5.5). `pressed` stays for the callers; the selected tile keeps its fill too.
+    background: root.selected ? Theme.accent-tint : root.hover && !root.read-only ? Theme.bg-control-hover : Theme.bg-card;
+    animate background { duration: Theme.motion-quick; easing: ease-out; }
+    inner := VerticalLayout {
+        padding: Theme.space-3;
+        spacing: Theme.space-1;
+        alignment: center;
+        HorizontalLayout {
+            alignment: center;
+            // Both glyphs live for the tile's life and cross-fade on a pick: a swap read as a blink (DS-5.5).
+            Rectangle {
+                width: Theme.icon-size-large;
+                height: Theme.icon-size-large;
+                Image {
+                    source: root.item.icon;
+                    width: parent.width;
+                    height: parent.height;
+                    colorize: root.ink;
+                    opacity: root.selected && root.item.icon-selected.width > 0 ? 0 : 1;
+                    animate opacity { duration: Theme.motion-quick; easing: ease-out; }
+                    accessible-role: none;
+                }
+                if root.item.icon-selected.width > 0: Image {
+                    source: root.item.icon-selected;
+                    width: parent.width;
+                    height: parent.height;
+                    colorize: root.ink;
+                    opacity: root.selected ? 1 : 0;
+                    animate opacity { duration: Theme.motion-quick; easing: ease-out; }
+                    accessible-role: none;
+                }
+            }
+        }
+        Text {
+            text: root.item.title;
+            font-size: Theme.body-size;
+            font-weight: Theme.weight-strong;
+            color: root.ink;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+            accessible-role: none;
+        }
+        if root.item.caption != "": Caption {
+            text: root.item.caption;
+            color: root.caption-ink;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+            accessible-role: none;
+        }
+    }
+    // Always there and faded, not created by `if`: a badge popping in read as a blink.
+    CheckBadge {
+        x: parent.width - self.width - Theme.space-2;
+        y: Theme.space-2;
+        muted: root.read-only;
+        opacity: root.selected ? 1 : 0;
+        animate opacity { duration: Theme.motion-quick; easing: ease-out; }
+    }
+    FocusRing {
+        shown: root.focused;
+        radius: Theme.radius-card;
+    }
+}
+
+// A grid of equal tiles, `columns` to a row. One-way: `picked` fires, the owner updates
+// `selected`. Left/Right move in reading order, Up/Down by a row; each stops at the edge. Give
+// it an `accessible-label` (the group title).
+export component TilePicker {
+    in property <[TileItem]> tiles;
+    in property <int> selected;
+    in property <int> columns: root.tiles.length;
+    in property <bool> locked: Shell.locked;
+    in property <length> tile-height: Theme.tile-height;
+    in property <int> force-hover: -1;
+    in property <int> force-pressed: -1;
+    in property <bool> force-focus;
+    callback picked(int);
+    property <int> cols: max(1, min(root.columns, root.tiles.length));
+    property <bool> key-focus;
+    // Whether the keyboard focus ring is drawn (tests: a click draws none).
+    out property <bool> ring: root.key-focus && fs.has-focus;
+
+    function pick(i: int) {
+        if (!root.locked && i >= 0 && i < root.tiles.length && i != root.selected) {
+            root.picked(i);
+        }
+    }
+
+    accessible-role: radio-group;
+    fs := FocusScope {
+        enabled: !root.locked;
+        focus-on-click: false;
+        focus-gained(reason) => {
+            root.key-focus = KeyFocus.after(reason, root.key-focus);
+        }
+        key-pressed(event) => {
+            if (event.text == Key.LeftArrow) {
+                root.pick(root.selected - 1);
+                return accept;
+            }
+            if (event.text == Key.RightArrow) {
+                root.pick(root.selected + 1);
+                return accept;
+            }
+            if (event.text == Key.UpArrow && root.cols < root.tiles.length) {
+                root.pick(root.selected - root.cols);
+                return accept;
+            }
+            if (event.text == Key.DownArrow && root.cols < root.tiles.length) {
+                root.pick(root.selected + root.cols);
+                return accept;
+            }
+            reject
+        }
+    }
+    VerticalLayout {
+        spacing: Theme.tile-gap;
+        for row in ceil(root.tiles.length / root.cols): HorizontalLayout {
+            spacing: Theme.tile-gap;
+            // Every row has `cols` cells, so a short last row keeps the column width.
+            for col in root.cols: VerticalLayout {
+                horizontal-stretch: 1;
+                // Equal columns: share the whole width, not what is left after each caption.
+                preferred-width: 0;
+                min-width: Theme.tile-min-width;
+                if row * root.cols + col < root.tiles.length: Tile {
+                    tile-height: root.tile-height;
+                    property <int> i: row * root.cols + col;
+                    item: root.tiles[self.i];
+                    selected: self.i == root.selected;
+                    hover: touch.has-hover || root.force-hover == self.i;
+                    pressed: touch.pressed || root.force-pressed == self.i;
+                    read-only: root.locked;
+                    focused: self.i == root.selected && (root.force-focus || (root.key-focus && fs.has-focus));
+                    accessible-role: radio-button;
+                    accessible-label: self.item.title;
+                    accessible-checkable: true;
+                    accessible-checked: self.selected;
+                    accessible-enabled: !root.locked;
+                    accessible-action-default => {
+                        root.pick(self.i);
+                    }
+                    touch := TouchArea {
+                        enabled: !root.locked;
+                        mouse-cursor: pointer;
+                        clicked => {
+                            fs.focus();
+                            // After `focus()`: its reason is not a pointer click, and this was one.
+                            root.key-focus = false;
+                            root.pick(parent.i);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The six spots as a 3 x 2 grid of small screens in the control column (DS-28.4: 112 x 32, 12 apart,
+// `tile-gap` between rows; narrower in the 240 column), each with a dash where the pill sits;
+// picked = tint plus an accent dash, the name is the tooltip. One-way like `TilePicker`; a click on
+// the picked tile fires `picked` too (it re-shows the preview). Arrows move on the screen, not along
+// the row: Left/Right along the top or bottom edge, Up/Down between the edges, each stopping there.
+export component PositionTiles {
+    in property <[string]> names;
+    in property <int> selected;
+    callback picked(int);
+    property <bool> key-focus;
+
+    function pick(i: int) {
+        if (!Shell.locked && i >= 0 && i < 6) {
+            root.picked(i);
+        }
+    }
+
+    accessible-role: radio-group;
+    fs := FocusScope {
+        enabled: !Shell.locked;
+        focus-on-click: false;
+        focus-gained(reason) => {
+            root.key-focus = KeyFocus.after(reason, root.key-focus);
+        }
+        key-pressed(event) => {
+            if (event.text == Key.LeftArrow && mod(root.selected, 3) > 0) {
+                root.pick(root.selected - 1);
+                return accept;
+            }
+            if (event.text == Key.RightArrow && mod(root.selected, 3) < 2) {
+                root.pick(root.selected + 1);
+                return accept;
+            }
+            if (event.text == Key.UpArrow && root.selected >= 3) {
+                root.pick(root.selected - 3);
+                return accept;
+            }
+            if (event.text == Key.DownArrow && root.selected < 3) {
+                root.pick(root.selected + 3);
+                return accept;
+            }
+            reject
+        }
+    }
+    VerticalLayout {
+        spacing: Theme.tile-gap;
+        for row in 2: HorizontalLayout {
+            spacing: Theme.position-tile-gap;
+            for col in 3: CardFrame {
+                property <int> i: row * 3 + col;
+                property <bool> on: self.i == root.selected;
+                property <bool> hover: !Shell.locked && touch.has-hover;
+                horizontal-stretch: 1;
+                preferred-width: Theme.position-tile-width;
+                height: Theme.position-tile-height;
+                border-radius: Theme.radius-control;
+                // The selected tile is the tint plus the accent mark below, never an outline (DS-20.6).
+                border-color: Theme.stroke-control;
+                background: self.on ? Theme.accent-tint : self.hover ? Theme.bg-control-hover : Theme.bg-control;
+                animate background { duration: Theme.motion-quick; easing: ease-out; }
+                opacity: Shell.locked ? 0.4 : 1;
+                accessible-role: radio-button;
+                accessible-label: self.i < root.names.length ? root.names[self.i] : "";
+                accessible-checkable: true;
+                accessible-checked: self.on;
+                accessible-enabled: !Shell.locked;
+                accessible-action-default => {
+                    root.pick(self.i);
+                }
+                // The pill's place on a 112 x 32 screen: a 28 % wide, 4 px high dash 4 px from its edge.
+                Rectangle {
+                    width: parent.width * 0.28;
+                    height: Theme.space-1;
+                    x: mod(parent.i, 3) == 0 ? Theme.space-2 : mod(parent.i, 3) == 1 ? (parent.width - self.width) / 2 : parent.width - self.width - Theme.space-2;
+                    y: parent.i < 3 ? Theme.space-2 : parent.height - self.height - Theme.space-2;
+                    border-radius: Theme.radius-round;
+                    background: parent.on ? Theme.accent : parent.hover ? Theme.text-primary : Theme.text-secondary;
+                }
+                FocusRing {
+                    shown: parent.on && root.key-focus && fs.has-focus;
+                    radius: Theme.radius-control;
+                }
+                // Enabled even when locked, like `Button`'s: the tooltip says why the tile is off.
+                touch := TouchArea {
+                    mouse-cursor: Shell.locked ? MouseCursor.default : MouseCursor.pointer;
+                    clicked => {
+                        if (!Shell.locked) {
+                            fs.focus();
+                            // After `focus()`: its reason is not a pointer click, and this was one.
+                            root.key-focus = false;
+                            root.pick(parent.i);
+                        }
+                    }
+                }
+                Tip {
+                    text: Shell.locked ? Shell.locked-tip : parent.accessible-label;
+                    hovered: touch.has-hover;
+                    pressed: touch.pressed;
+                }
+            }
+        }
+    }
+}

@@ -34,9 +34,20 @@ cpal = "0.18"
 rtrb = "0.4"
 rubato = "5"
 hound = "3.5"
+lewton = "0.10.2"
+# File transcription decoders (MPL-2.0, per-crate exception in deny.toml): mp3, aac, mp4, flac only;
+# wav and ogg stay on hound and lewton.
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "isomp4", "flac"] }
+# lewton's own Ogg reader, used to check the Vorbis headers before lewton reads them.
+ogg = "0.8"
 earshot = "1.2"
 nnnoiseless = "0.5"
+unicode-normalization = "0.1.26"
 windows-sys = "0.61"
+# WinRT clipboard history (Win+V) beside windows-sys; features are set where it is used.
+windows = { version = "0.62", default-features = false }
+# `#[implement]` of `windows` expands to `::windows_core` paths (oxi-platform capture/watch.rs).
+windows-core = { version = "0.62", default-features = false }
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd", "png-format"] }
 ab_glyph = "0.2"
 rfd = { version = "0.17", default-features = false }
@@ -44,12 +55,12 @@ rfd = { version = "0.17", default-features = false }
 slint = { version = "=1.18.1", default-features = false }
 slint-build = "=1.18.1"
 i-slint-backend-testing = "=1.18.1"
-notify = "8.2"
 notify-debouncer-full = "0.7"
 sha2 = "0.11"
 ureq = { version = "3.5", default-features = false }
 proptest = "1.12"
 insta = "1.49"
+embed-resource = "3.0"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -94,14 +105,18 @@ oxi-whisper.workspace = true
 oxi-platform.workspace = true
 oxi-settings.workspace = true
 anyhow.workspace = true
-serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
+ab_glyph.workspace = true
 notify-debouncer-full.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 ureq = { workspace = true, features = ["rustls"] }
+
+# Icon and manifest into the Windows executable (build.rs).
+[build-dependencies]
+embed-resource.workspace = true
 
 [lints]
 workspace = true
@@ -117,6 +132,11 @@ opt-level = 3
 # cmake maps a non-zero opt-level to an optimised build of whisper.cpp.
 [profile.dev.package."*"]
 opt-level = 2
+debug = false
+
+# Full debuginfo made the shared target dir grow past 100 GB; line tables keep backtraces.
+[profile.dev]
+debug = "line-tables-only"
 
 # Release speed without the fat-LTO link: benches and the Vulkan/CUDA measurement.
 [profile.profiling]
@@ -125,7 +145,3 @@ lto = "thin"
 codegen-units = 16
 strip = false
 debug = "line-tables-only"
-
-# Added ahead of the task that uses them (wave 2 daemon); remove the entry when it does.
-[package.metadata.cargo-machete]
-ignored = ["serde_json", "tracing", "tracing-subscriber", "tracing-appender", "notify-debouncer-full"]

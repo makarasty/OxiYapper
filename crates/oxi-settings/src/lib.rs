@@ -1,28 +1,1099 @@
 //! Slint settings window and first-run wizard (ARCHITECTURE section 4).
 
-use slint::ComponentHandle;
+pub mod constants;
+mod ctx;
+mod debounce;
+pub mod ipc;
+mod pages;
+mod search;
+#[cfg(test)]
+mod testing;
+
+use std::io;
+
+use oxi_core::config::{ConfigError, Theme};
+use oxi_core::ipc::{Push, SettingsPage, SettingsTab, Target};
+#[cfg(windows)]
+use oxi_core::overlay::Rect;
+use oxi_core::paths::Layout;
+use oxi_core::strings::CONFIG_READ_ONLY_NEXT;
+use slint::{ComponentHandle, Weak};
+#[cfg(windows)]
+use slint::{LogicalSize, PhysicalPosition};
+
+pub use ctx::Ctx;
+pub use ipc::Ipc;
+use ipc::{Action, Event, Level, Link, Options};
 
 // Slint's generated code trips the workspace `unused_qualifications` lint; it is not ours to fix.
 #[allow(unused_qualifications)]
 mod generated {
     slint::include_modules!();
 }
-use generated::AppWindow;
+pub use generated::{
+    AppWindow, AudioKey, AudioState, ChipLevel, HomeState, ModelState, Page, PathText, SetupState,
+    Shell, SystemState, TestRow, TestState, TextState, Theme as Tokens, ThemeChoice, Toast,
+};
+pub use pages::test::{Finish, Mic, bind_with as bind_test_page};
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Ui(#[from] slint::PlatformError),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+}
 
 /// Show the settings window and block until it is closed.
-pub fn run() -> Result<(), slint::PlatformError> {
-    AppWindow::new()?.run()
+pub fn run() -> Result<(), Error> {
+    let layout = oxi_platform::dirs::layout()?;
+    oxi_platform::dirs::ensure(&layout)?;
+    let skia = use_skia();
+    match show(layout) {
+        // Skia is built into this process, but its surface can fail at the first show (no usable
+        // display driver); the platform cannot be re-selected after that, so run a fresh process.
+        Err(Error::Ui(e)) if skia => {
+            eprintln!("skia renderer failed ({e}); retrying with the software renderer");
+            rerun_with_software(e)
+        }
+        result => result,
+    }
+}
+
+fn show(layout: Layout) -> Result<(), Error> {
+    // The window comes first: it sets up the Slint platform, and the worker's events need that
+    // to reach the UI thread.
+    let window = open_inner(layout, |window| {
+        let mut options = Options::daemon()?;
+        options.spawn = watch_spawn(options.spawn, window.as_weak());
+        Ok(Some(Ipc::connect(options)?))
+    })?;
+    // The first start of a new config opens on the setup wizard; tests and shots open it by hand.
+    pages::setup::open_if_new(&window);
+    #[cfg(windows)]
+    {
+        let size = if let Ok((area, scale)) = oxi_platform::os::display::work_area() {
+            let (size, position) = placement(area, scale);
+            window.window().set_position(position);
+            size
+        } else {
+            LogicalSize::new(constants::DEFAULT.0, constants::DEFAULT.1)
+        };
+        window.window().set_size(size);
+    }
+    // A window opened by a second launch must not show behind the app the user is in; the
+    // daemon allowed this process to take the foreground. The callback runs once the event loop
+    // has created and shown the window.
+    #[cfg(windows)]
+    let _ = slint::invoke_from_event_loop({
+        let weak = window.as_weak();
+        move || {
+            // The backend wrote the system accent when it created the window.
+            if let Some(window) = weak.upgrade() {
+                own_accent(&window);
+                caption_theme(&window, window.get_theme());
+            }
+            oxi_platform::os::foreground::raise_current_thread_window();
+        }
+    });
+    window.run()?;
+    Ok(())
+}
+
+/// Env var that forces the software renderer; also how a failed Skia run restarts itself.
+#[cfg(windows)]
+const RENDERER_ENV: &str = "OXI_RENDERER";
+
+/// Slint's renderer name for the env var's value: Skia's CPU surface unless it says `software`.
+#[cfg(windows)]
+fn renderer_name(env: Option<&str>) -> &'static str {
+    if env == Some("software") {
+        "software"
+    } else {
+        "skia-software"
+    }
+}
+
+/// Picks Skia's CPU raster surface and says whether it did. Its text is the same as on Skia's GPU
+/// surface (real-window captures), with gamma and hinting the software renderer lacks, and it needs
+/// no GPU, so it also runs over RDP; measured with the window open, 69 MB private bytes against
+/// 272 MB on D3D. `OXI_RENDERER=software`, or a Skia that cannot be selected, picks the software
+/// renderer: never Slint's default, which would be Skia on D3D.
+pub fn use_skia() -> bool {
+    // Skia is built on Windows only; elsewhere Slint's only renderer is the software one.
+    #[cfg(windows)]
+    {
+        let name = renderer_name(std::env::var(RENDERER_ENV).ok().as_deref());
+        let select = |name: &str| {
+            slint::BackendSelector::new()
+                .renderer_name(name.into())
+                .with_winit_window_attributes_hook(icons_at_creation)
+                .select()
+        };
+        if select(name).is_ok() {
+            return name == "skia-software";
+        }
+        let _ = select("software");
+    }
+    false
+}
+
+/// Runs this program again with the software renderer and waits for it; `e` is what to report if
+/// that cannot start or fails too.
+fn rerun_with_software(e: slint::PlatformError) -> Result<(), Error> {
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(std::env::args_os().skip(1))
+            .env(RENDERER_ENV, "software")
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+    Err(Error::Ui(e))
+}
+
+/// `spawn` that also shows why it failed (the error kind only) in the window.
+fn watch_spawn(
+    spawn: Box<dyn Fn() -> io::Result<()> + Send>,
+    window: Weak<AppWindow>,
+) -> Box<dyn Fn() -> io::Result<()> + Send> {
+    Box::new(move || {
+        let result = spawn();
+        if let Err(e) = &result {
+            let note = spawn_note(e);
+            // Err means the event loop is gone: the window is closing.
+            let _ = window.upgrade_in_event_loop(move |window| window.set_spawn_error(note.into()));
+        }
+        result
+    })
+}
+
+fn spawn_note(e: &io::Error) -> String {
+    oxi_core::strings::spawn_failed(e.kind())
+}
+
+/// Logical size and physical top-left of a new window centred in `area` (physical pixels, at
+/// `scale`).
+#[cfg(windows)]
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)] // screen pixels
+fn placement(area: Rect, scale: f32) -> (LogicalSize, PhysicalPosition) {
+    let (w, h) = (area.w as f32 / scale, area.h as f32 / scale);
+    let size = LogicalSize::new(
+        constants::DEFAULT.0.min(w * 0.85).max(constants::MIN.0),
+        constants::DEFAULT.1.min(h * 0.88).max(constants::MIN.1),
+    );
+    let position = PhysicalPosition::new(
+        area.x + ((w - size.width) * scale / 2.0).round() as i32,
+        area.y + ((h - size.height) * scale / 2.0).round() as i32,
+    );
+    (size, position)
+}
+
+/// The colours the accent takes in one theme, each `0xRRGGBB` (DESIGN-SYSTEM section 20). The
+/// derivation from a seed is pure colour maths elsewhere (oxi-core); this is what the window shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccentColors {
+    pub accent: u32,
+    pub hover: u32,
+    pub pressed: u32,
+    pub on_accent: u32,
+    pub text: u32,
+    pub tint: u32,
+    /// Heat scale levels 1 to 4 of the Home heatmap.
+    pub heat: [u32; 4],
+}
+
+impl AccentColors {
+    /// The brand Red (seed #D93A3F) in the dark theme: the default of a fresh or invalid config,
+    /// and the values `Theme.accent-dark` holds before Rust sets anything.
+    pub const RED_DARK: Self = Self {
+        accent: 0x00D9_3A3F,
+        hover: 0x00C3_3439,
+        pressed: 0x00AE_2E32,
+        on_accent: 0x00FF_FFFF,
+        text: 0x00E4_7175,
+        tint: 0x003D_2324,
+        heat: [0x004E_2627, 0x0073_2B2D, 0x00A1_3235, 0x00D9_3A3F],
+    };
+    /// The brand Red in the light theme.
+    pub const RED_LIGHT: Self = Self {
+        accent: 0x00D9_3A3F,
+        hover: 0x00C3_3439,
+        pressed: 0x00AE_2E32,
+        on_accent: 0x00FF_FFFF,
+        text: 0x00BF_3337,
+        tint: 0x00F8_E4E2,
+        heat: [0x00F3_CBCA, 0x00EC_A4A5, 0x00E4_7477, 0x00D9_3A3F],
+    };
+
+    fn to_set(self) -> generated::AccentSet {
+        let c = |v: u32| {
+            let [_, r, g, b] = v.to_be_bytes();
+            slint::Color::from_rgb_u8(r, g, b)
+        };
+        generated::AccentSet {
+            accent: c(self.accent),
+            hover: c(self.hover),
+            pressed: c(self.pressed),
+            on_accent: c(self.on_accent),
+            text: c(self.text),
+            tint: c(self.tint),
+            heat_1: c(self.heat[0]),
+            heat_2: c(self.heat[1]),
+            heat_3: c(self.heat[2]),
+            heat_4: c(self.heat[3]),
+        }
+    }
+}
+
+/// Sets the accent of both themes; the open window recolours at once, no restart (DS-20.3). The
+/// theme in use picks its own set, so a change of theme needs nothing more. The std widgets that
+/// still tint from Slint's system accent follow too.
+pub fn set_accent(window: &AppWindow, dark: AccentColors, light: AccentColors) {
+    let tokens = window.global::<Tokens>();
+    tokens.set_accent_dark(dark.to_set());
+    tokens.set_accent_light(light.to_set());
+    own_accent(window);
+    set_window_icon(window, light.accent);
+}
+
+/// The title-bar icon with its record dot in `accent` (`0xRRGGBB`), at the size the window's
+/// display scale picks from the PNGs (`Icons.window-logo`). The tile is paper, so the light
+/// theme's accent is the one that holds on it. The OS gets it twice: the small one for the title
+/// bar and the big one for the taskbar and Alt+Tab, each at its own size for the scale.
+fn set_window_icon(window: &AppWindow, accent: u32) {
+    let Some(icons) = render_os_icons(window.get_icon_scale(), accent) else {
+        return;
+    };
+    let [(pixels, side), _] = &icons;
+    let buffer =
+        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(pixels, *side, *side);
+    window.set_window_icon(slint::Image::from_rgba8_premultiplied(buffer));
+    OS_ICONS.set(Some(icons));
+    push_window_icon(window);
+}
+
+/// The small and the big icon with the record dot in `accent` (`0xRRGGBB`) for display scale `scale`.
+fn render_os_icons(scale: f32, accent: u32) -> Option<OsIcons> {
+    let [_, r, g, b] = accent.to_be_bytes();
+    let dot = oxi_core::overlay::Rgba(r, g, b, 0xFF);
+    let [small, big] = [icon_size(scale), big_icon_size(scale)];
+    let pixels = |side| {
+        Some((
+            oxi_platform::draw::logo_with(side, dot)?.data().to_vec(),
+            side,
+        ))
+    };
+    Some([pixels(small)?, pixels(big)?])
+}
+
+/// `(pixels, side)` of the small and the big window icon, for the OS window.
+type OsIcons = [(Vec<u8>, u32); 2];
+
+thread_local! {
+    /// The icons the OS window is made with and gets again when they change (the UI thread's).
+    static OS_ICONS: std::cell::RefCell<Option<OsIcons>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The icons as winit wants them (`[small, big]`), none before the first build.
+#[cfg(windows)]
+fn os_icons() -> Option<[slint::winit_030::winit::window::Icon; 2]> {
+    use slint::winit_030::winit::window::Icon;
+    OS_ICONS.with_borrow(|icons| {
+        let [(s, ss), (b, bs)] = icons.as_ref()?;
+        Some([
+            Icon::from_rgba(s.clone(), *ss, *ss).ok()?,
+            Icon::from_rgba(b.clone(), *bs, *bs).ok()?,
+        ])
+    })
+}
+
+/// Gives the title bar and the taskbar their icons through winit itself: Slint hands an image to
+/// the OS only when its cache key changes, and a pixel buffer has none (`None` against the
+/// backend's `None`), so the window kept the OS default. A no-op before the OS window exists (the
+/// window is also made with them, [`icons_at_creation`]) and under the testing backend.
+// shortcut: winit's window behind the pinned `slint =1.18.1` (`unstable-winit-030`); re-check it on
+// every Slint bump.
+fn push_window_icon(window: &AppWindow) {
+    #[cfg(windows)]
+    {
+        use slint::winit_030::WinitWindowAccessor as _;
+        use slint::winit_030::winit::platform::windows::WindowExtWindows as _;
+        let Some([small, big]) = os_icons() else {
+            return;
+        };
+        window.window().with_winit_window(|win| {
+            win.set_window_icon(Some(small));
+            win.set_taskbar_icon(Some(big));
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = window;
+}
+
+/// The OS window is made with the icons, so the first frame already has them (the push after the
+/// loop starts can come later than the first look at the window).
+#[cfg(windows)]
+fn icons_at_creation(
+    attributes: slint::winit_030::winit::window::WindowAttributes,
+) -> slint::winit_030::winit::window::WindowAttributes {
+    use slint::winit_030::winit::platform::windows::WindowAttributesExtWindows as _;
+    // The hook runs as the window is made, before any page has built the icons: the default red at
+    // the opening scale; the first `set_accent` push replaces them with the user's.
+    if OS_ICONS.with_borrow(Option::is_none) {
+        OS_ICONS.set(render_os_icons(
+            pages::set_scale(None),
+            AccentColors::RED_LIGHT.accent,
+        ));
+    }
+    match os_icons() {
+        Some([small, big]) => attributes
+            .with_window_icon(Some(small))
+            .with_taskbar_icon(Some(big)),
+        None => attributes,
+    }
+}
+
+/// The title-bar icon's side in pixels at display scale `scale`.
+fn icon_size(scale: f32) -> u32 {
+    if scale > 1.5 {
+        32
+    } else if scale > 1.25 {
+        24
+    } else if scale > 1.0 {
+        20
+    } else {
+        16
+    }
+}
+
+/// The taskbar icon's side: the OS's big icon (32 px at 100 %) scaled for the display.
+fn big_icon_size(scale: f32) -> u32 {
+    let side = [32_u16, 40, 48, 64]
+        .into_iter()
+        .find(|side| f32::from(*side) >= 32.0 * scale);
+    u32::from(side.unwrap_or(64))
+}
+
+/// Back to the brand Red.
+pub fn reset_accent(window: &AppWindow) {
+    set_accent(window, AccentColors::RED_DARK, AccentColors::RED_LIGHT);
+}
+
+/// Puts our accent token (the user's accent, DS-20) where Slint keeps the system accent, which the
+/// std widgets still in use tint from; never the Windows accent (redesign spec 7.3).
+// shortcut: private Slint API, safe only while `slint` is pinned `=1.18.1`; re-check it on every
+// Slint bump. The backend writes the system accent back when it creates the window and on a theme
+// change: `run` calls this once the window is up and the file poll repeats it (a no-op write when
+// nothing changed), so a new Windows accent can show for up to a second.
+pub fn own_accent(window: &AppWindow) {
+    slint::private_unstable_api::re_exports::WindowInner::from_pub(window.window())
+        .context()
+        .set_accent_color(window.global::<Tokens>().get_accent());
+}
+
+/// The title bar follows an explicit Light or Dark pick: Slint sets only its own palette, and on
+/// Windows the OS keeps drawing the caption in the system theme. A no-op before the window exists
+/// and under the testing backend.
+// shortcut: winit's window behind the pinned `slint =1.18.1` (`unstable-winit-030`); re-check it on
+// every Slint bump. A DWM call behind `oxi-platform` would not depend on it.
+pub fn caption_theme(window: &AppWindow, choice: ThemeChoice) {
+    use slint::winit_030::WinitWindowAccessor as _;
+    use slint::winit_030::winit::window::Theme as Caption;
+    let theme = match choice {
+        ThemeChoice::System => None,
+        ThemeChoice::Dark => Some(Caption::Dark),
+        ThemeChoice::Light => Some(Caption::Light),
+    };
+    window.window().with_winit_window(|w| w.set_theme(theme));
+}
+
+/// Makes every frame repaint and present the whole window. Skia's CPU surface otherwise presents
+/// only what changed and treats a paint message as nothing to do, so pixels the OS dropped never
+/// come back: the window is created see-through (winit's blur-behind), the desktop shows where
+/// they were and only hovered rows are drawn again (`os_lost_pixels_are_repainted`).
+// shortcut: Slint turns partial rendering off for a window with a rendering notifier, and offers no
+// direct switch; re-check it on every Slint bump. The software renderer has no notifier (`Err`) and
+// keeps partial rendering; it runs only when Skia cannot start.
+fn draw_whole_frames(window: &AppWindow) {
+    let _ = window.window().set_rendering_notifier(|_, _| {});
+}
+
+/// Follows the OS "Animation effects" setting (UI rule 22): off zeroes `motion-quick` and
+/// `motion-open`.
+fn follow_os_motion(window: &AppWindow) {
+    set_reduced_motion(window, oxi_platform::reduced_motion());
+}
+
+fn set_reduced_motion(window: &AppWindow, reduced: bool) {
+    window.global::<Shell>().set_reduced_motion(reduced);
+}
+
+/// Every `PathField` shows a long path elided in the middle (DS-13.1), not cut at its end.
+fn elide_paths(window: &AppWindow) {
+    window.global::<PathText>().on_elide(|path, budget| {
+        oxi_core::paths::elide_path(&path, usize::try_from(budget).unwrap_or(0)).into()
+    });
+}
+
+/// The settings window on `layout`'s config with no daemon link (it stays offline and shows no
+/// daemon banner); the caller shows it.
+pub fn open(layout: Layout) -> Result<AppWindow, Error> {
+    open_inner(layout, |_| Ok(None))
+}
+
+/// [`open`] with the link to the daemon: its state and notices show in the daemon banner.
+pub fn open_with(layout: Layout, ipc: Ipc) -> Result<AppWindow, Error> {
+    open_inner(layout, |_| Ok(Some(ipc)))
+}
+
+/// `link` gets the new window (so the platform is up) and returns the daemon link to follow, if any.
+fn open_inner(
+    layout: Layout,
+    link: impl FnOnce(&AppWindow) -> Result<Option<Ipc>, Error>,
+) -> Result<AppWindow, Error> {
+    let window = AppWindow::new()?;
+    // Before any page: the accent builds the title-bar icon at this scale.
+    pages::set_scale(Some(&window));
+    own_accent(&window);
+    // The OS window is made once the loop runs, after every bind: give it the icon then.
+    let weak = window.as_weak();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            push_window_icon(&window);
+        }
+    });
+    draw_whole_frames(&window);
+    watch_os_events(&window);
+    follow_os_motion(&window);
+    elide_paths(&window);
+    let (mut ctx, problem) = Ctx::load(layout)?;
+    let followed = link(&window)?;
+    if let Some(ipc) = &followed {
+        ctx.ipc = ipc.clone();
+    }
+    show_problem(&window, problem.as_ref());
+
+    let weak = window.as_weak();
+    let c = ctx.clone();
+    window.on_theme_changed(move |choice| {
+        if let Some(window) = weak.upgrade() {
+            caption_theme(&window, choice);
+        }
+        // The token follows the new scheme once the window has applied it.
+        let w = weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(window) = w.upgrade() {
+                own_accent(&window);
+            }
+        });
+        c.config.borrow_mut().config.ui.theme = theme(choice);
+        report(&weak, c.save());
+    });
+
+    let weak = window.as_weak();
+    let path = ctx.layout.config_file();
+    window.on_open_file(move || {
+        report(&weak, oxi_platform::open::open(&path).map_err(Error::from));
+    });
+
+    let weak = window.as_weak();
+    let c = ctx.clone();
+    let linked = followed.is_some();
+    window.on_reset_config(move || {
+        let result = c.reset();
+        if let (Ok(()), Some(window)) = (&result, weak.upgrade()) {
+            window.set_banner_text("".into());
+            // The file is valid now: drop the daemon's stale `ConfigError` notice, as `reload` does.
+            if linked {
+                on_daemon_event(&window, &c.ipc, &Event::Link(c.ipc.link()));
+            }
+            bind(&window, &c);
+        }
+        report(&weak, result);
+    });
+
+    let banner = followed.is_some().then(|| {
+        let (weak, ipc) = (window.as_weak(), ctx.ipc.clone());
+        let c = ctx.clone();
+        let events = ctx.ipc.subscribe(move |event| {
+            if let Some(window) = weak.upgrade() {
+                on_daemon_event(&window, &ipc, event);
+                // The daemon saw a file change, or the machine woke: look again. No timer.
+                if matches!(event, Event::Push(Push::FileChanged { .. } | Push::Woke)) {
+                    look_again(&window, &c, true);
+                }
+            }
+        });
+        // The worker may have reported before the subscription: show the state as it is now.
+        on_daemon_event(&window, &ctx.ipc, &Event::Link(ctx.ipc.link()));
+        events
+    });
+    on_files_check(&window, &ctx, linked);
+    let ipc = ctx.ipc.clone();
+    window.on_start_daemon({
+        let weak = window.as_weak();
+        move || {
+            // Held by this callback, which lives as long as the window.
+            let _ = &banner;
+            if let Some(window) = weak.upgrade() {
+                window.set_spawn_error("".into());
+            }
+            ipc.start_daemon();
+        }
+    });
+    let ipc = ctx.ipc.clone();
+    window.on_restart_daemon({
+        let weak = window.as_weak();
+        move || {
+            if let Some(window) = weak.upgrade() {
+                window.set_spawn_error("".into());
+            }
+            ipc.restart_daemon();
+        }
+    });
+    on_status_clicked(&window, &ctx);
+    search::bind(&window);
+    pages::test::bind(&window, &ctx);
+    bind(&window, &ctx);
+    Ok(window)
+}
+
+/// A click on an actionable status chip.
+fn on_status_clicked(window: &AppWindow, ctx: &Ctx) {
+    window.on_status_clicked({
+        let (weak, ipc) = (window.as_weak(), ctx.ipc.clone());
+        move || {
+            if let Some(window) = weak.upgrade() {
+                status_clicked(&window, &ipc.chip());
+            }
+        }
+    });
+}
+
+/// The window got the focus (or a test says so): look again, and tell the pages that follow a file
+/// of their own (Home's stats).
+fn on_files_check(window: &AppWindow, ctx: &Ctx, linked: bool) {
+    let (weak, c) = (window.as_weak(), ctx.clone());
+    window.on_files_check(move || {
+        if let Some(window) = weak.upgrade() {
+            // Linked, the banner's subscriber looks again on `Woke`: once is enough.
+            if !linked {
+                look_again(&window, &c, linked);
+            }
+            c.ipc.deliver(&Event::Push(Push::Woke));
+        }
+    });
+}
+
+/// What the one-second timer did, now only when something says it may have changed (the
+/// daemon's `FileChanged` or `Woke`, the window getting the focus, a new OS theme): the accent
+/// and motion the backend may have overwritten, the config and text files, and the pixels the OS
+/// may have dropped (`draw_whole_frames`).
+fn look_again(window: &AppWindow, ctx: &Ctx, linked: bool) {
+    #[cfg(test)]
+    tests::LOOKS.with(|n| n.set(n.get() + 1));
+    own_accent(window);
+    follow_os_motion(window);
+    reload(window, ctx, linked);
+    pages::poll(window, ctx);
+    window.window().request_redraw();
+}
+
+/// Puts back a frame the OS lost with no paint message, and looks at the files, on the events
+/// that can follow a lost frame or a change made while the window was not looked at. Nothing
+/// runs while the window sits still. A no-op under the testing backend.
+// shortcut: winit's window behind the pinned `slint =1.18.1` (`unstable-winit-030`), as
+// `caption_theme`; re-check on every Slint bump. A frame lost while the window is neither focused
+// nor under the cursor stays wrong until the user comes back to it.
+fn watch_os_events(window: &AppWindow) {
+    use slint::winit_030::winit::event::WindowEvent as Win;
+    use slint::winit_030::{EventResult, WinitWindowAccessor as _};
+    let weak = window.as_weak();
+    window.window().on_winit_window_event(move |w, event| {
+        match event {
+            Win::Focused(true) | Win::ThemeChanged(_) => {
+                // After this event: the callback must not re-enter the window mid-event.
+                let weak = weak.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(window) = weak.upgrade() {
+                        window.invoke_files_check();
+                    }
+                });
+                w.request_redraw();
+            }
+            Win::Occluded(false)
+            | Win::Resized(_)
+            | Win::ScaleFactorChanged { .. }
+            | Win::CursorEntered { .. } => w.request_redraw(),
+            _ => {}
+        }
+        EventResult::Propagate
+    });
+}
+
+/// The config banner for `problem`; `None` clears it.
+fn show_problem(window: &AppWindow, problem: Option<&ConfigError>) {
+    let text = match problem {
+        Some(ConfigError::ReadOnly) => {
+            format!("{}. {CONFIG_READ_ONLY_NEXT}", ConfigError::ReadOnly)
+        }
+        Some(other) => other.to_string(),
+        None => String::new(),
+    };
+    window.set_banner_text(text.into());
+    // Both get "Open file"; only a broken file gets "Reset to defaults", the newer one stays safe.
+    window.set_banner_fixable(!matches!(problem, Some(ConfigError::ReadOnly)));
+}
+
+/// Applies an edit of the file from outside: the banner, the lock and every page follow it. A
+/// valid file also drops what the last failure left: the save error and the daemon's
+/// `ConfigError` notice (the daemon sends nothing when a reload succeeds).
+fn reload(window: &AppWindow, ctx: &Ctx, linked: bool) {
+    let Some(problem) = ctx.reload_if_changed() else {
+        return;
+    };
+    show_problem(window, problem.as_ref());
+    if problem.is_none() {
+        window.set_action_error("".into());
+        if linked {
+            on_daemon_event(window, &ctx.ipc, &Event::Link(ctx.ipc.link()));
+        }
+    }
+    bind(window, ctx);
+}
+
+/// The status chip follows every event; the daemon banner follows the link, and a push that is
+/// not a notice leaves it alone.
+fn on_daemon_event(window: &AppWindow, ipc: &Ipc, event: &Event) {
+    show_chip(window, &ipc.chip());
+    if matches!(event, Event::Push(Push::Raise)) {
+        window.window().set_minimized(false);
+        let _ = window.show();
+        // `show` leaves a window that is already visible behind other apps; the daemon has
+        // allowed this process to take the foreground.
+        #[cfg(windows)]
+        oxi_platform::os::foreground::raise_current_thread_window();
+    }
+    let notice = ipc::notice(event);
+    if notice.is_none() && !matches!(event, Event::Link(_)) {
+        return;
+    }
+    let action = notice.as_ref().and_then(|n| n.action);
+    window.set_daemon_config_error(matches!(event, Event::Push(Push::ConfigError { .. })));
+    window.set_daemon_text(notice.map(|n| n.text).unwrap_or_default().into());
+    window.set_daemon_start(action == Some(Action::Start));
+    window.set_daemon_restart(action == Some(Action::Restart));
+    // Connecting and Offline keep it: the failure is reported just before them.
+    if matches!(event, Event::Link(link) if !matches!(link, Link::Connecting | Link::Offline)) {
+        window.set_spawn_error("".into());
+    }
+}
+
+fn show_chip(window: &AppWindow, chip: &ipc::Chip) {
+    window.set_chip_text(chip.text.into());
+    window.set_chip_tooltip(chip.tooltip.as_str().into());
+    window.set_chip_level(match chip.level {
+        Level::Ok => ChipLevel::Ok,
+        Level::Attention => ChipLevel::Attention,
+        Level::Down => ChipLevel::Down,
+    });
+}
+
+/// A click on the chip: open the setting that fixes it, or start the daemon as the banner's
+/// button does. The normal state takes no click.
+fn status_clicked(window: &AppWindow, chip: &ipc::Chip) {
+    match (chip.level, chip.target) {
+        (Level::Attention, Some(target)) => open_target(window, target, chip.model_tab),
+        (Level::Down, _) if window.get_daemon_start() => window.invoke_start_daemon(),
+        (Level::Down, _) if window.get_daemon_restart() => window.invoke_restart_daemon(),
+        _ => {}
+    }
+}
+
+/// Opens the page and sub-tab that fix the chip's status; no tab means the page's first one, not
+/// the sub-tab the user left it on.
+fn open_target(window: &AppWindow, target: Target, model_tab: i32) {
+    // The Audio page's tabs, in `SettingsTab` order.
+    let view = target.tab.map_or(0, |tab| match tab {
+        SettingsTab::Microphone => 0,
+        SettingsTab::Recording => 1,
+        SettingsTab::StartSound => 2,
+        SettingsTab::StopSound => 3,
+    });
+    match target.page {
+        SettingsPage::Model => {
+            window.set_page(Page::Model);
+            window.global::<ModelState>().set_tab(model_tab);
+        }
+        SettingsPage::Audio => {
+            window.set_page(Page::Audio);
+            window.global::<AudioState>().set_view(view);
+        }
+    }
+}
+
+/// Push the config into the shell and every page.
+fn bind(window: &AppWindow, ctx: &Ctx) {
+    let file = ctx.config.borrow();
+    window.set_theme(choice(file.config.ui.theme));
+    caption_theme(window, choice(file.config.ui.theme));
+    window.global::<Shell>().set_locked(file.read_only);
+    drop(file);
+    pages::bind(window, ctx);
+    // Bound once in `open_inner`: its recording and run outlive a reload.
+    window.global::<TestState>().invoke_shown();
+}
+
+/// Outcome of a save or file action: a failure shows under the config banner, which stays with
+/// its buttons; a success clears the failure shown before.
+pub(crate) fn report(window: &Weak<AppWindow>, result: Result<(), Error>) {
+    if let Some(window) = window.upgrade() {
+        let text = result.err().map(|e| e.to_string()).unwrap_or_default();
+        window.set_action_error(text.into());
+    }
+}
+
+const fn choice(theme: Theme) -> ThemeChoice {
+    match theme {
+        Theme::System => ThemeChoice::System,
+        Theme::Dark => ThemeChoice::Dark,
+        Theme::Light => ThemeChoice::Light,
+    }
+}
+
+const fn theme(choice: ThemeChoice) -> Theme {
+    match choice {
+        ThemeChoice::System => Theme::System,
+        ThemeChoice::Dark => Theme::Dark,
+        ThemeChoice::Light => Theme::Light,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::AppWindow;
+    use super::{AppWindow, ThemeChoice, choice, spawn_note, theme};
+    use oxi_core::config::Theme;
     use slint::ComponentHandle;
+    use std::io::{Error, ErrorKind};
+    #[cfg(windows)]
+    use {super::placement, oxi_core::overlay::Rect};
 
     #[test]
     fn window_builds_under_the_testing_backend() {
         i_slint_backend_testing::init_no_event_loop();
         let window = AppWindow::new().expect("window builds");
         assert!(window.show().is_ok());
+    }
+
+    fn blue() -> super::AccentColors {
+        super::AccentColors {
+            accent: 0x0000_8AF5,
+            hover: 0x0000_7CDD,
+            pressed: 0x0000_6EC4,
+            on_accent: 0x0000_0000,
+            text: 0x0000_6FC8,
+            tint: 0x0020_3A55,
+            heat: [0x0020_3A55, 0x0010_5E99, 0x0000_7ACF, 0x0000_8AF5],
+        }
+    }
+
+    /// DS-20.3: the Rust defaults are the values the tokens start with, and a new accent recolours
+    /// the open window (the theme in use) with no restart.
+    #[test]
+    fn accent_defaults_match_the_tokens_and_a_change_recolours() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = AppWindow::new().expect("window builds");
+        window.show().unwrap();
+        let tokens = window.global::<super::Tokens>();
+        let rgb = |c: slint::Color| u32::from_be_bytes([0, c.red(), c.green(), c.blue()]);
+        let (d, l) = (tokens.get_accent_dark(), tokens.get_accent_light());
+        assert_eq!(rgb(d.accent), super::AccentColors::RED_DARK.accent);
+        assert_eq!(rgb(d.text), super::AccentColors::RED_DARK.text);
+        assert_eq!(rgb(d.heat_2), super::AccentColors::RED_DARK.heat[1]);
+        assert_eq!(rgb(l.tint), super::AccentColors::RED_LIGHT.tint);
+        assert_eq!(rgb(l.text), super::AccentColors::RED_LIGHT.text);
+        assert_eq!(rgb(tokens.get_accent()), 0x00D9_3A3F);
+
+        super::set_accent(&window, blue(), blue());
+        assert_eq!(rgb(tokens.get_accent()), blue().accent);
+        assert_eq!(rgb(tokens.get_accent_hover()), blue().hover);
+        assert_eq!(rgb(tokens.get_on_accent()), 0);
+        assert_eq!(rgb(tokens.get_heat_4()), blue().heat[3]);
+        assert_eq!(rgb(tokens.get_focus_ring()), blue().accent);
+
+        super::reset_accent(&window);
+        assert_eq!(rgb(tokens.get_accent()), 0x00D9_3A3F);
+    }
+
+    /// DS-3: the control column is one of two widths, cut the same way in every row.
+    #[test]
+    fn control_column_has_two_steps_and_one_side_slot() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = AppWindow::new().expect("window builds");
+        window.show().unwrap();
+        let (shell, tokens) = (
+            window.global::<super::Shell>(),
+            window.global::<super::Tokens>(),
+        );
+        for (page, column, main) in [
+            (1028.0, 360.0, 264.0),
+            (720.0, 360.0, 264.0),
+            (640.0, 240.0, 144.0),
+        ] {
+            shell.set_page_width(page);
+            assert!(
+                (tokens.get_control_column() - column).abs() < 0.01,
+                "column at {page}"
+            );
+            assert!(
+                (tokens.get_control_main() - main).abs() < 0.01,
+                "main at {page}"
+            );
+        }
+        assert!((tokens.get_control_side() - 88.0).abs() < 0.01);
+        assert!((tokens.get_number_field_width() - tokens.get_control_side()).abs() < 0.01);
+        assert!((tokens.get_meter_height() - tokens.get_control_height()).abs() < 0.01);
+    }
+
+    #[test]
+    fn window_takes_reduced_motion_from_the_os() {
+        let (window, _ipc, _sent, _) = crate::testing::linked("lib", "motion", super::Page::Home);
+        let (shell, tokens) = (
+            window.global::<super::Shell>(),
+            window.global::<super::Tokens>(),
+        );
+        // The testing backend has no OS setting: `open` read the platform's value.
+        assert_eq!(shell.get_reduced_motion(), oxi_platform::reduced_motion());
+        super::set_reduced_motion(&window, false);
+        assert_eq!(tokens.get_motion_quick(), 100);
+        super::set_reduced_motion(&window, true);
+        assert!(shell.get_reduced_motion());
+        assert_eq!(tokens.get_motion_quick(), 0);
+        assert_eq!(tokens.get_motion_open(), 0);
+    }
+
+    #[test]
+    fn spawn_note_gives_the_kind_and_nothing_else() {
+        let e = Error::new(ErrorKind::NotFound, r"C:\Users\someone\oxi.exe");
+        assert_eq!(
+            spawn_note(&e),
+            "Could not start OxiYapper: entity not found."
+        );
+    }
+
+    thread_local! {
+        /// How many times `look_again` ran on this thread (the test).
+        pub(super) static LOOKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Review c04 #9: a focus change reads the files once, not twice.
+    #[test]
+    fn a_files_check_looks_again_once() {
+        let (window, _ipc, _sent, _) = crate::testing::linked("lib", "looks", super::Page::Home);
+        LOOKS.with(|n| n.set(0));
+        window.invoke_files_check();
+        assert_eq!(LOOKS.with(std::cell::Cell::get), 1);
+    }
+
+    /// Review c04 #8: the title-bar icon is built at the window's display scale (it was built at
+    /// scale 1, so 16 px on a 150 % display). A forced 2.0 makes it show on any box.
+    #[test]
+    fn the_window_icon_is_built_at_the_window_scale() {
+        crate::pages::force_scale(Some(2.0));
+        let (window, _ipc, _sent, _) = crate::testing::linked("lib", "icon", super::Page::Home);
+        crate::pages::force_scale(None);
+        assert!((window.get_icon_scale() - 2.0).abs() < f32::EPSILON);
+        assert_eq!(window.get_window_icon().size().width, 32);
+        // Stored for the OS window: the small icon and the big one (64 px at 200 %).
+        let icons = super::OS_ICONS.with_borrow(Clone::clone).expect("built");
+        for ((rgba, side), want) in icons.iter().zip([32, 64]) {
+            assert_eq!((*side, rgba.len()), (want, (want * want * 4) as usize));
+        }
+        assert_eq!(super::big_icon_size(1.5), 48);
+        assert_eq!(super::big_icon_size(1.0), 32);
+        assert_eq!(super::icon_size(1.5), 24);
+        assert_eq!(super::icon_size(1.0), 16);
+    }
+
+    /// The title-bar icon takes the accent at run time: the record dot of the light accent.
+    #[test]
+    fn the_window_icon_follows_the_accent() {
+        let (window, _ipc, _sent, _) =
+            crate::testing::linked("lib", "icon-accent", super::Page::Home);
+        let dot = |window: &AppWindow| {
+            let image = window.get_window_icon();
+            let buffer = image.to_rgba8().expect("pixels");
+            let n = buffer.width() as usize;
+            let pixels = buffer.as_slice();
+            // The most saturated pixel is the dot.
+            let c = pixels
+                .iter()
+                .max_by_key(|p| {
+                    p.r.abs_diff(p.g)
+                        .max(p.g.abs_diff(p.b))
+                        .max(p.r.abs_diff(p.b))
+                })
+                .copied()
+                .unwrap();
+            assert!(n >= 16);
+            (c.r, c.g, c.b)
+        };
+        let red = dot(&window);
+        let iris = super::AccentColors {
+            accent: 0x005B_5BD6,
+            ..super::AccentColors::RED_LIGHT
+        };
+        super::set_accent(&window, iris, iris);
+        let blue = dot(&window);
+        assert_ne!(red, blue);
+        assert!(blue.2 > blue.0, "blue-ish after Iris: {blue:?}");
+    }
+
+    #[test]
+    fn resets_leave_one_subscriber_per_page() {
+        let (window, ipc, _sent, _) = crate::testing::linked("lib", "resets", super::Page::Hotkey);
+        // The banner, Home, Hotkey, Audio, Model, History, Test and System (the updater's line;
+        // Overlay stopped subscribing in b04).
+        assert_eq!(ipc.subscribers(), 8);
+        for _ in 0..3 {
+            window.invoke_reset_config();
+        }
+        assert_eq!(ipc.subscribers(), 8);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn placement_fits_the_work_area_and_centres() {
+        let rect = |x, y, w, h| Rect { x, y, w, h };
+        // (work area, scale, logical size, physical top-left)
+        let cases = [
+            // 1920x1080 at 100 %, taskbar 48: the full default size.
+            (rect(0, 0, 1920, 1032), 1.0, (1280.0, 800.0), (320, 116)),
+            // 1366x768 laptop: 85 % of 1366 is 1161, 88 % of 720 is 633.6.
+            (rect(0, 0, 1366, 720), 1.0, (1161.1, 633.6), (102, 43)),
+            // 2560x1440 at 150 %: 1706x928 logical, the default size again.
+            (rect(0, 0, 2560, 1392), 1.5, (1280.0, 800.0), (320, 96)),
+            // A tiny screen still gets the minimum; a monitor left of the primary keeps its origin.
+            (rect(-800, 0, 800, 600), 1.0, (720.0, 528.0), (-760, 36)),
+        ];
+        for (area, scale, (w, h), (x, y)) in cases {
+            let (size, pos) = placement(area, scale);
+            assert!(
+                (size.width - w).abs() < 0.01 && (size.height - h).abs() < 0.01,
+                "{area:?}: {size:?}"
+            );
+            assert_eq!((pos.x, pos.y), (x, y), "{area:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_env_var_picks_the_software_renderer() {
+        use super::renderer_name;
+        assert_eq!(renderer_name(Some("software")), "software");
+        assert_eq!(renderer_name(None), "skia-software");
+        assert_eq!(renderer_name(Some("skia")), "skia-software");
+    }
+
+    /// Each status t12 reports shows in the chip with its level, and a click opens the page and
+    /// tab that fix it (item 33).
+    #[test]
+    fn chip_shows_each_status_and_opens_its_fix() {
+        use super::{AudioState, ChipLevel, Event, ModelState, Page, Push};
+        use crate::ipc::{Cmd, Link};
+        use oxi_core::ipc::Attention;
+        use oxi_core::strings;
+        let (window, ipc, sent, _) = crate::testing::linked("lib", "chip", Page::Home);
+        let chip = |w: &AppWindow| (w.get_chip_text().to_string(), w.get_chip_level());
+        let attention = |items: Vec<Attention>| Event::Push(Push::Attention { items });
+        ipc.deliver(&Event::Link(Link::Online));
+        assert_eq!(
+            chip(&window),
+            (strings::HEALTH_RUNNING.into(), ChipLevel::Ok)
+        );
+        window.invoke_status_clicked();
+        assert_eq!(
+            window.get_page(),
+            Page::Home,
+            "the normal state takes no click"
+        );
+        let sound = |stop| Attention::SoundFailed {
+            line: "x".into(),
+            stop,
+        };
+        for (item, page, view) in [
+            (Attention::NoModel, Page::Model, None),
+            (Attention::ModelDamaged, Page::Model, None),
+            (
+                Attention::CpuFallback { reason: "x".into() },
+                Page::Model,
+                Some(2),
+            ),
+            (Attention::OutOfMemory { cpu: true }, Page::Model, None),
+            (Attention::OutOfMemory { cpu: false }, Page::Model, Some(2)),
+            (Attention::NoMicrophone, Page::Audio, Some(0)),
+            (sound(false), Page::Audio, Some(2)),
+            (sound(true), Page::Audio, Some(3)),
+        ] {
+            // Both pages left on another sub-tab: the click opens the one that fixes it.
+            window.set_page(Page::Home);
+            window.global::<AudioState>().set_view(1);
+            window.global::<ModelState>().set_tab(1);
+            ipc.deliver(&attention(vec![item.clone()]));
+            assert_eq!(
+                chip(&window),
+                (strings::attention_chip(&item).into(), ChipLevel::Attention),
+                "{item:?}"
+            );
+            assert_eq!(
+                window.get_chip_tooltip().as_str(),
+                strings::attention_text(&item),
+                "{item:?}: the reason and the fix on hover"
+            );
+            window.invoke_status_clicked();
+            assert_eq!(window.get_page(), page, "{item:?}");
+            match (page, view) {
+                (Page::Audio, Some(view)) => {
+                    assert_eq!(window.global::<AudioState>().get_view(), view, "{item:?}");
+                }
+                // ia-map 3.8: a GPU problem opens Speed (Run the model on), the rest Models.
+                (_, view) => assert_eq!(
+                    window.global::<ModelState>().get_tab(),
+                    view.unwrap_or(0),
+                    "{item:?}: the Model tab that fixes it"
+                ),
+            }
+        }
+        ipc.deliver(&attention(vec![]));
+        assert_eq!(chip(&window).1, ChipLevel::Ok, "all well again");
+        ipc.deliver(&Event::Link(Link::Offline));
+        assert_eq!(
+            chip(&window),
+            (strings::HEALTH_NOT_RUNNING.into(), ChipLevel::Down)
+        );
+        while sent.try_recv().is_ok() {}
+        window.invoke_status_clicked();
+        assert!(
+            sent.try_iter().any(|c| matches!(c, Cmd::Start)),
+            "a click starts the daemon"
+        );
+        ipc.deliver(&Event::Link(Link::Stuck));
+        assert_eq!(
+            chip(&window),
+            (strings::HEALTH_NOT_ANSWERING.into(), ChipLevel::Down)
+        );
+    }
+
+    #[test]
+    fn theme_maps_both_ways() {
+        for t in [Theme::System, Theme::Dark, Theme::Light] {
+            assert_eq!(theme(choice(t)), t);
+        }
+        assert_eq!(choice(Theme::Dark), ThemeChoice::Dark);
     }
 }

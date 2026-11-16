@@ -3,11 +3,18 @@
 //! or [`process`] (bench), so the steps cannot run in the wrong order.
 
 mod denoise;
+mod device;
+mod levels;
 mod pipeline;
 mod resample;
+mod speech;
 mod trim;
 
-pub use pipeline::{Pipeline, process};
+pub use device::{EndpointNote, InputDevice, InputPick, endpoint_lost, pick_input};
+pub use levels::{Biquad, LevelStats, Levels, RUMBLE_HZ};
+pub use pipeline::{EdgeStats, Finished, Pipeline, Trim, process};
+pub use speech::{DETECTOR_LATENCY, SpeechDetector};
+pub use trim::voiced_runs;
 
 use crate::types::Millis;
 
@@ -40,7 +47,7 @@ pub const fn samples_for(ms: Millis, rate: u32) -> usize {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AudioError {
-    /// Less than [`MIN_VOICED`] of speech: no whisper call.
+    /// Less than [`MIN_VOICED`] of voice and the level never heard speech: no whisper call.
     #[error("nothing heard")]
     NothingHeard,
     /// All samples are zero: hardware mute or a privacy switch.
@@ -55,6 +62,17 @@ pub enum AudioError {
 pub struct Level {
     pub peak: f32,
     pub rms: f32,
+}
+
+impl Level {
+    /// The level of the same samples after a linear `gain`: both measures scale with it.
+    #[must_use]
+    pub fn scaled(self, gain: f32) -> Self {
+        Self {
+            peak: self.peak * gain,
+            rms: self.rms * gain,
+        }
+    }
 }
 
 /// Average the interleaved channels into one.
@@ -98,6 +116,50 @@ fn normalise(samples: &mut [f32]) {
     }
 }
 
-fn db_to_linear(db: f32) -> f32 {
+/// A whole clip from `from` Hz to `to` Hz (the mic test plays 16 kHz audio on the output rate).
+///
+/// # Errors
+/// [`AudioError::Resample`] for a rate of zero or a buffer rubato rejects.
+pub fn resample(samples: &[f32], from: u32, to: u32) -> Result<Vec<f32>, AudioError> {
+    let mut r = resample::StreamResampler::new(from, to)?;
+    let mut out = r.push(samples)?;
+    out.extend(r.finish()?);
+    Ok(out)
+}
+
+/// Decibels to a linear amplitude factor.
+#[must_use]
+pub fn db_to_linear(db: f32) -> f32 {
     10.0_f32.powf(db / 20.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resample_keeps_duration_and_level() {
+        let tone: Vec<f32> = (0..16_000)
+            .map(|i| 0.5 * (std::f32::consts::TAU * 440.0 * i as f32 / 16_000.0).sin())
+            .collect();
+        let out = resample(&tone, 16_000, 48_000).unwrap();
+        assert_eq!(out.len(), 48_000);
+        let (a, b) = (level(&tone), level(&out[480..out.len() - 480]));
+        assert!((a.rms - b.rms).abs() < 0.02, "{a:?} {b:?}");
+    }
+
+    /// The settings meter opens its stream at 0 dB and scales the level by the gain instead.
+    #[test]
+    fn scaled_level_equals_the_level_after_gain() {
+        let mono = [0.1, -0.2, 0.05];
+        let raw = level(&mono);
+        for gain_db in [-12.0_f32, 0.0, 6.0, 20.0] {
+            let gain = db_to_linear(gain_db);
+            let gained: Vec<f32> = mono.iter().map(|s| s * gain).collect();
+            let (after, scaled) = (level(&gained), raw.scaled(gain));
+            assert!((after.peak - scaled.peak).abs() < 1e-6, "{gain_db}");
+            assert!((after.rms - scaled.rms).abs() < 1e-6, "{gain_db}");
+        }
+        assert!((db_to_linear(6.0) - 1.9953).abs() < 1e-4);
+    }
 }

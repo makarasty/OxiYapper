@@ -3,12 +3,25 @@
 mod audio;
 mod cmd;
 mod coordinator;
+mod history;
 mod io;
 mod ipc;
 mod paste;
 mod run;
+mod sound;
+mod stats;
 mod ui;
+mod update;
 mod watch;
 mod whisper;
 
-pub use run::run;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+pub use run::{Launch, run};
+pub use update::{AFTER_UPDATE_ARG, OPEN_SETTINGS_ARG, WATCH_ARG, wait_for_parent, watch_update};
+
+/// A mutex guard even when another thread panicked holding it: the daemon's shared state stays
+/// usable, and the panic itself is logged by the hook.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}

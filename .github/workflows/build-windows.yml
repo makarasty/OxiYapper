@@ -1,0 +1,133 @@
+name: build-windows
+
+# The release assets, built once for release.yml (tags) and prerelease.yml (main after CI).
+# Asset names are a contract with the update checker: docs/RELEASING.md "Assets and tags".
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version in the asset names, without the leading v (0.2.0, 0.2.0-rc.1, 0.2.0-pre.42)
+        required: true
+        type: string
+      ref:
+        description: Commit to build; empty means the commit that triggered the caller
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # whisper.cpp (whisper-rs-sys forwards GGML_*): no -march=native, the exe runs on any x64 CPU
+  # with AVX2 (ggml's default instruction set when native is off).
+  GGML_NATIVE: "OFF"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 40 # ci.yml build (vulkan) is 10 min cold
+    env:
+      # A long target path breaks the nested vulkan-shaders-gen build (MAX_PATH).
+      CARGO_TARGET_DIR: C:/t
+      NAME: OxiYapper-${{ inputs.version }}-windows-x64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Install Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@7fe84289ddbf750f7eff9f8e4588e600e1dd06c8 # v1.8.1
+        with:
+          vulkan_version: 1.4.328.1
+          install_runtime: true
+          cache: true
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: v1-rust-ggml-portable
+          key: vulkan
+      - run: cargo build --locked --release --features vulkan
+        env:
+          # The version the exe reports and the updater compares (oxi_core::VERSION): the tag, so a
+          # pre-release knows its -pre.N (docs/RELEASING.md "Assets and tags").
+          OXI_VERSION: ${{ inputs.version }}
+      - name: Run binary
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        # The tag version must be built in: the updater compares it with the releases.
+        run: |
+          out=$("$CARGO_TARGET_DIR/release/OxiYapper" --version)
+          echo "$out"
+          [ "$out" = "OxiYapper $VERSION" ] || { echo "::error::--version says '$out', expected 'OxiYapper $VERSION'"; exit 1; }
+      # GPU drivers install vulkan-1.dll; without one the exe must still start and run on CPU
+      # (build.rs delay-loads it, src/vulkan_loader.rs handles its absence).
+      - name: vulkan-1.dll is delay-loaded
+        shell: bash
+        run: |
+          dumpbin=$("/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest -products '*' \
+            -find 'VC/Tools/MSVC/**/bin/Hostx64/x64/dumpbin.exe' | head -n 1)
+          deps=$(MSYS2_ARG_CONV_EXCL='*' "$dumpbin" -nologo -dependents "$(cygpath -w "$CARGO_TARGET_DIR/release/OxiYapper.exe")")
+          echo "$deps"
+          static=$(sed -n '/has the following dependencies/,/delay load dependencies/p' <<<"$deps")
+          delayed=$(sed -n '/delay load dependencies/,$p' <<<"$deps")
+          if grep -qi 'vulkan-1\.dll' <<<"$static"; then
+            echo "::error::vulkan-1.dll is a static import: the exe will not start without a Vulkan driver"; exit 1
+          fi
+          grep -qi 'vulkan-1\.dll' <<<"$delayed" || { echo "::error::vulkan-1.dll is not in the delay-load imports"; exit 1; }
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          mkdir -p "dist/$NAME"
+          exe="$CARGO_TARGET_DIR/release/OxiYapper.exe"
+          cp "$exe" "dist/$NAME.exe"
+          cp "$exe" LICENSE-MIT LICENSE-APACHE "dist/$NAME/"
+          # The portable marker (docs/ARCHITECTURE.md section 7): data stays in data\ beside the exe.
+          : > "dist/$NAME/portable"
+          # App-local MSVC runtime (allowed by Microsoft's redistribution terms): the zip starts on a
+          # clean Windows. Exactly the *140* DLLs the exe imports statically, from the VS redist folder.
+          vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+          dumpbin=$("$vswhere" -latest -products '*' -find 'VC/Tools/MSVC/**/bin/Hostx64/x64/dumpbin.exe' | head -n 1)
+          deps=$(MSYS2_ARG_CONV_EXCL='*' "$dumpbin" -nologo -dependents "$(cygpath -w "$exe")")
+          needed=$(sed '/delay load dependencies/,$d' <<<"$deps" | grep -ioE '[a-z0-9_]*140[a-z0-9_]*\.dll' | sort -u || true)
+          [ -n "$needed" ] || { echo "::error::no VC runtime imports found, dumpbin output changed?"; exit 1; }
+          # Plain x64 folder only (not onecore, not debug_nonredist); the newest toolset if several.
+          redist=$(cygpath -u "$("$vswhere" -latest -products '*' -find 'VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT' | sort -V | tail -n 1)")
+          [ -d "$redist" ] || { echo "::error::VC redist x64 CRT folder not found"; exit 1; }
+          for dll in $needed; do
+            lower=${dll,,}
+            [ -f "$redist/$lower" ] || { echo "::error::$lower is imported by the exe but missing from $redist"; exit 1; }
+            cp "$redist/$lower" "dist/$NAME/"
+            echo "bundled $lower"
+          done
+          printf '%s\r\n' \
+            "OxiYapper $VERSION, portable" \
+            "" \
+            "Start OxiYapper.exe. Settings, models and history stay in the data folder next to it" \
+            "(the empty file 'portable' turns that on), so the whole folder can be moved or deleted." \
+            "" \
+            "Keep the .dll files (the Microsoft C++ runtime) next to OxiYapper.exe: without them it" \
+            "does not start on a Windows that has no runtime installed." \
+            "" \
+            "Guide: https://github.com/makarasty/OxiYapper#readme (install, first run, updates, privacy)" \
+            "Licence: MIT or Apache-2.0 (LICENSE-MIT, LICENSE-APACHE)." > "dist/$NAME/README.txt"
+          (cd dist && 7z a -tzip "$NAME.zip" "$NAME" > /dev/null)
+          rm -rf "dist/$NAME"
+          ls -l dist
+      # The zip must run from a fresh folder (the runner has the runtime installed, so this checks the
+      # zip is complete and the exe starts from it, not that a clean machine has no runtime).
+      - name: Run binary from the unzipped zip
+        shell: bash
+        run: |
+          fresh=$(mktemp -d)
+          7z x -y "-o$fresh" "dist/$NAME.zip" > /dev/null
+          ls "$fresh/$NAME"
+          "$fresh/$NAME/OxiYapper.exe" --version
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-x64
+          path: dist/*
+          if-no-files-found: error

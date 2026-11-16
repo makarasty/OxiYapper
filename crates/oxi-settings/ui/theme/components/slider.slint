@@ -1,0 +1,338 @@
+// Slider and its paired number field (PowerToys pattern: both bound to one value). Our own,
+// because std `Slider` and `SpinBox` paint the system accent.
+import { Theme, Shell } from "../tokens.slint";
+import { FocusRing, KeyFocus } from "base.slint";
+
+// Rail 4 px, accent fill from the minimum (or from 0 when `bipolar`), 20 px thumb with a 12 px
+// accent dot that keeps its size in every state (no scale, DS-5.4): hover and pressed change colour. Left/Right step, PgUp/PgDn ten steps, Home/End the ends; a double click on the thumb
+// restores `default-value` (from Rust, `Config::default()`).
+export component Slider {
+    in-out property <float> value;
+    in property <float> minimum: 0;
+    in property <float> maximum: 1;
+    in property <float> step: 1;
+    in property <float> default-value: root.minimum;
+    in property <bool> bipolar;
+    in property <bool> enabled: true;
+    in property <bool> locked: Shell.locked;
+    in property <bool> force-hover;
+    in property <bool> force-pressed;
+    in property <bool> force-focus;
+    callback changed(float);
+
+    property <bool> live: root.enabled && !root.locked;
+    property <bool> hover: root.live && (touch.has-hover || root.force-hover);
+    property <bool> down: root.live && (touch.pressed || root.force-pressed);
+    property <bool> key-focus;
+    // Whether the keyboard focus ring is drawn (tests: a click draws none).
+    out property <bool> ring: root.key-focus && fs.has-focus;
+    property <length> travel: root.width - Theme.slider-thumb;
+    property <float> span: max(root.maximum - root.minimum, 0.000001);
+    property <length> thumb-x: (clamp(root.value, root.minimum, root.maximum) - root.minimum) / root.span * root.travel;
+    property <length> origin-x: root.bipolar ? (clamp(0, root.minimum, root.maximum) - root.minimum) / root.span * root.travel : 0;
+    // The fill runs between the thumb's centre and the origin's; without `bipolar` from the rail's
+    // left end, which is the slot's left x (DS-3.6).
+    property <length> fill-from: root.bipolar ? Theme.slider-thumb / 2 + root.origin-x : 0;
+
+    public function set(v: float) {
+        if (!root.live) {
+            return;
+        }
+        let snapped = clamp(root.minimum + round((v - root.minimum) / root.step) * root.step, root.minimum, root.maximum);
+        if (snapped != root.value) {
+            root.value = snapped;
+            root.changed(snapped);
+        }
+    }
+    function set-x(x: length) {
+        root.set(root.minimum + clamp((x - Theme.slider-thumb / 2) / root.travel, 0, 1) * root.span);
+    }
+
+    min-width: Theme.slider-min-width;
+    height: Theme.control-height;
+    horizontal-stretch: 1;
+    accessible-role: slider;
+    accessible-value: root.value;
+    accessible-value-minimum: root.minimum;
+    accessible-value-maximum: root.maximum;
+    accessible-value-step: root.step;
+    accessible-enabled: root.live;
+    accessible-action-increment => {
+        root.set(root.value + root.step);
+    }
+    accessible-action-decrement => {
+        root.set(root.value - root.step);
+    }
+
+    // The rail spans the whole slot: its ends are the slot's ends; only the thumb's centre travels
+    // from 10 px inside each end (DS-3.6).
+    Rectangle {
+        x: 0;
+        width: root.width;
+        height: Theme.rail-height;
+        border-radius: Theme.radius-round;
+        background: Theme.bg-inset;
+    }
+    Rectangle {
+        x: min(root.fill-from, Theme.slider-thumb / 2 + root.thumb-x);
+        width: abs(Theme.slider-thumb / 2 + root.thumb-x - root.fill-from);
+        height: Theme.rail-height;
+        border-radius: Theme.radius-round;
+        background: root.live ? Theme.accent : Theme.text-disabled;
+    }
+    thumb := Rectangle {
+        x: root.thumb-x;
+        width: Theme.slider-thumb;
+        height: Theme.slider-thumb;
+        border-radius: Theme.radius-round;
+        background: root.hover ? Theme.bg-control-hover : Theme.bg-control;
+        // 1 px hairline: the thumb's stroke.
+        border-width: 1px;
+        border-color: Theme.stroke-control;
+        animate background { duration: Theme.motion-quick; easing: ease-out; }
+        Rectangle {
+            width: Theme.slider-dot;
+            height: self.width;
+            border-radius: Theme.radius-round;
+            background: root.live ? (root.down ? Theme.accent-pressed : root.hover ? Theme.accent-hover : Theme.accent) : Theme.text-disabled;
+            animate background { duration: Theme.motion-quick; easing: ease-out; }
+        }
+        FocusRing {
+            shown: root.force-focus || (root.key-focus && fs.has-focus);
+            radius: Theme.radius-round;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.live;
+        mouse-cursor: pointer;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                fs.focus();
+                // After `focus()`: its reason is not a pointer click, and this was one.
+                root.key-focus = false;
+                root.set-x(self.mouse-x);
+            }
+        }
+        moved => {
+            if (self.pressed) {
+                root.set-x(self.mouse-x);
+            }
+        }
+        double-clicked => {
+            if (self.mouse-x >= root.thumb-x && self.mouse-x <= root.thumb-x + Theme.slider-thumb) {
+                root.set(root.default-value);
+            }
+        }
+    }
+    fs := FocusScope {
+        enabled: root.live;
+        focus-on-click: false;
+        focus-gained(reason) => {
+            root.key-focus = KeyFocus.after(reason, root.key-focus);
+        }
+        key-pressed(event) => {
+            if (event.text == Key.RightArrow || event.text == Key.UpArrow) {
+                root.set(root.value + root.step);
+            } else if (event.text == Key.LeftArrow || event.text == Key.DownArrow) {
+                root.set(root.value - root.step);
+            } else if (event.text == Key.PageUp) {
+                root.set(root.value + 10 * root.step);
+            } else if (event.text == Key.PageDown) {
+                root.set(root.value - 10 * root.step);
+            } else if (event.text == Key.Home) {
+                root.set(root.minimum);
+            } else if (event.text == Key.End) {
+                root.set(root.maximum);
+            } else {
+                return reject;
+            }
+            accept
+        }
+    }
+}
+
+// A typed value: right-aligned digits with the unit as a suffix inside the field, 80 px, in the
+// input shape of DS-8 (editing: 1 px accent border; invalid: error border). Up/Down
+// step (Shift: ten steps), the wheel steps while focused. Enter or leaving the field commits:
+// parse, round to the step, clamp, then `changed` (the slider's callback). Text that is not a
+// number (empty, nan, inf included) gets a red stroke and reverts. Only text the user changed is
+// committed, so a config value off the step survives a pass through the field. `signed` shows "+3".
+// `zero-text` ("never") stands in the field for a 0 and its unit, until the field is focused.
+// Our own frame around a `TextInput`: the suffix needs room inside the frame.
+export component NumberField {
+    in-out property <float> value;
+    in property <float> minimum: 0;
+    in property <float> maximum: 100;
+    in property <float> step: 1;
+    in property <int> decimals: 0;
+    in property <string> unit;
+    in property <bool> signed;
+    in property <string> zero-text;
+    in property <bool> enabled: true;
+    in property <bool> locked: Shell.locked;
+    in property <bool> force-hover;
+    in property <bool> force-focus;
+    // Shows the field as if the user had typed this text (gallery: the invalid state).
+    in property <string> force-text;
+    callback changed(float);
+    // The text has the keyboard focus.
+    out property <bool> has-focus: input.has-focus;
+
+    property <bool> live: root.enabled && !root.locked;
+    property <string> shown: (root.signed && root.value > 0 ? "+" : "") + root.value.to-fixed(root.decimals);
+    property <bool> invalid: !root.parses(input.text);
+    // The text differs from `shown` because the user typed.
+    property <bool> dirty;
+    property <bool> focused: root.force-focus || input.has-focus;
+    property <bool> zero-shown: root.zero-text != "" && root.value == 0 && !root.focused;
+
+    // `is-float` takes "nan" and "inf"; both fail the comparison.
+    pure function parses(text: string) -> bool {
+        return text.is-float() && abs(text.to-float()) < 1000000;
+    }
+    public function set(v: float) {
+        // A stored value outside the range (a hand-edited config) is a bound itself: a step or a
+        // typed value never moves it the wrong way, so it is lowered only by the user's choice.
+        let c = clamp(root.minimum + round((v - root.minimum) / root.step) * root.step, min(root.minimum, root.value), max(root.maximum, root.value));
+        if (c != root.value) {
+            root.value = c;
+            root.changed(c);
+        }
+    }
+    function commit() {
+        if (root.live && root.dirty && root.parses(input.text)) {
+            root.set(input.text.to-float());
+        }
+        root.dirty = false;
+        input.text = root.shown;
+    }
+
+    init => {
+        input.text = root.force-text != "" ? root.force-text : root.shown;
+    }
+    changed shown => {
+        root.dirty = false;
+        input.text = self.shown;
+    }
+
+    width: Theme.number-field-width;
+    accessible-role: spinbox;
+    accessible-value: root.shown;
+    accessible-enabled: root.live;
+    accessible-value-minimum: root.minimum;
+    accessible-value-maximum: root.maximum;
+    accessible-value-step: root.step;
+    accessible-action-increment => {
+        if (root.live) {
+            root.set(root.value + root.step);
+        }
+    }
+    accessible-action-decrement => {
+        if (root.live) {
+            root.set(root.value - root.step);
+        }
+    }
+    accessible-action-set-value(v) => {
+        if (root.live && root.parses(v)) {
+            root.set(v.to-float());
+        }
+    }
+
+    VerticalLayout {
+        alignment: center;
+        spacing: Theme.title-gap;
+        frame := Rectangle {
+            height: Theme.control-height;
+            border-radius: Theme.radius-control;
+            // Disabled and locked keep the rest fill; only the ink greys (DS-8.3).
+            background: root.live && !root.focused && (touch.has-hover || root.force-hover) ? Theme.bg-control-hover : Theme.bg-control;
+            // 1 px hairline: the field's stroke, accent while editing (DS-8.2).
+            border-width: 1px;
+            border-color: root.invalid ? Theme.error-text : root.focused && root.live ? Theme.accent : Theme.stroke-control;
+            animate background, border-color { duration: Theme.motion-quick; easing: ease-out; }
+            touch := TouchArea {
+                enabled: root.live;
+                mouse-cursor: text;
+                clicked => {
+                    input.focus();
+                }
+                scroll-event(event) => {
+                    if (!input.has-focus || event.delta-y == 0) {
+                        return reject;
+                    }
+                    root.set(root.value + (event.delta-y > 0 ? root.step : -root.step));
+                    accept
+                }
+            }
+            FocusScope {
+                enabled: false;
+                capture-key-pressed(event) => {
+                    if (event.text == Key.UpArrow || event.text == Key.DownArrow) {
+                        if (root.dirty && root.parses(input.text)) {
+                            root.set(input.text.to-float());
+                        }
+                        root.dirty = false;
+                        root.set(root.value + (event.text == Key.UpArrow ? 1 : -1) * (event.modifiers.shift ? 10 : 1) * root.step);
+                        input.text = root.shown;
+                        return accept;
+                    }
+                    reject
+                }
+                HorizontalLayout {
+                    padding-left: Theme.space-3;
+                    padding-right: Theme.space-3;
+                    spacing: Theme.space-1;
+                    input := TextInput {
+                        enabled: root.live;
+                        input-type: decimal;
+                        single-line: true;
+                        horizontal-alignment: right;
+                        vertical-alignment: center;
+                        font-size: Theme.body-size;
+                        // The 0 stays in the input, so a click on "never" edits it as usual.
+                        color: root.zero-shown ? transparent : root.live ? Theme.text-primary : Theme.text-disabled;
+                        selection-background-color: Theme.accent;
+                        selection-foreground-color: Theme.on-accent;
+                        accessible-role: none;
+                        edited => {
+                            root.dirty = true;
+                        }
+                        accepted => {
+                            root.commit();
+                        }
+                        changed has-focus => {
+                            if (!self.has-focus) {
+                                root.commit();
+                            }
+                        }
+                    }
+                    if root.unit != "" && !root.zero-shown: Text {
+                        text: root.unit;
+                        font-size: Theme.caption-size;
+                        color: root.live ? Theme.text-secondary : Theme.text-disabled;
+                        vertical-alignment: center;
+                        accessible-role: none;
+                    }
+                }
+            }
+            // The darker bottom edge at rest (1 px hairline), as every input.
+            Rectangle {
+                visible: !root.focused && !root.invalid;
+                x: Theme.radius-control;
+                y: parent.height - 1px;
+                width: parent.width - 2 * Theme.radius-control;
+                height: 1px;
+                background: Theme.stroke-control-bottom;
+            }
+            if root.zero-shown: Text {
+                x: Theme.space-3;
+                width: parent.width - 2 * Theme.space-3;
+                text: root.zero-text;
+                font-size: Theme.body-size;
+                color: root.live ? Theme.text-primary : Theme.text-disabled;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+        }
+    }
+}

@@ -1,8 +1,16 @@
 use std::collections::HashSet;
 
+use std::time::{Duration, SystemTime};
+
+use oxi_core::constants::HOUR;
 use oxi_core::models::{
-    MODELS, Stamp, find, find_by_file_name, sha256_file, stamp_file_name, stamp_trusted,
+    MODELS, ModelStatus, PART_KEEP, Stamp, find, find_by_file_name, part_expired, sha256_file,
+    stamp_file_name, stamp_trusted, status, write_stamp,
 };
+
+#[path = "common/scratch.rs"]
+mod scratch;
+use scratch::{fake_model, scratch_dir};
 
 fn is_hex(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
@@ -68,7 +76,7 @@ fn file_names_resolve_to_their_entry_and_others_are_custom() {
 
 #[test]
 fn sha256_file_is_lower_hex_of_the_bytes() {
-    let path = std::env::temp_dir().join(format!("oxi-sha-{}", std::process::id()));
+    let path = scratch_dir(&format!("oxi-sha-{}", std::process::id())).join("abc.bin");
     std::fs::write(&path, b"abc").unwrap();
     let got = sha256_file(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
@@ -159,5 +167,68 @@ fn stamp_policy() {
     ];
     for (name, stamp, actual, want) in cases {
         assert_eq!(stamp_trusted(stamp, actual, entry), want, "{name}");
+    }
+}
+
+fn scratch(name: &str) -> std::path::PathBuf {
+    scratch_dir(&format!("oxi-status-{}-{name}", std::process::id()))
+}
+
+/// A file of the registry size that takes no disk (sparse; the content is never read).
+fn sized_file(dir: &std::path::Path, name: &str, len: u64) -> std::path::PathBuf {
+    let path = dir.join(name);
+    fake_model(&path, len);
+    path
+}
+
+#[test]
+fn status_follows_size_and_stamp() {
+    let entry = find("tiny").unwrap();
+    let dir = scratch("table");
+    let stamp = dir.join(stamp_file_name(entry.file_name));
+
+    assert_eq!(status(entry, &dir), ModelStatus::Missing);
+
+    let file = sized_file(&dir, entry.file_name, 5);
+    assert_eq!(status(entry, &dir), ModelStatus::Bad, "wrong size");
+
+    sized_file(&dir, entry.file_name, entry.size);
+    assert_eq!(status(entry, &dir), ModelStatus::NeedsHash, "no stamp");
+
+    write_stamp(&file).unwrap();
+    assert_eq!(status(entry, &dir), ModelStatus::Ready);
+
+    std::fs::write(&stamp, "garbage").unwrap();
+    assert_eq!(status(entry, &dir), ModelStatus::NeedsHash, "bad stamp");
+
+    let now = Stamp::of(&file).unwrap();
+    let old = Stamp {
+        mtime_ms: now.mtime_ms - 1,
+        ..now
+    };
+    std::fs::write(&stamp, old.to_line()).unwrap();
+    assert_eq!(status(entry, &dir), ModelStatus::NeedsHash, "file changed");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn write_stamp_needs_an_existing_file() {
+    let dir = scratch("nostamp");
+    assert!(write_stamp(&dir.join("absent.bin")).is_err());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn part_age_rule() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_hours(100 * 24);
+    let table = [
+        ("6d23h", now - PART_KEEP.checked_sub(HOUR).unwrap(), false),
+        ("7d", now - PART_KEEP, true),
+        ("8d", now - PART_KEEP - Duration::from_hours(24), true),
+        ("future", now + HOUR, false),
+    ];
+    for (case, modified, want) in table {
+        assert_eq!(part_expired(modified, now), want, "{case}");
     }
 }

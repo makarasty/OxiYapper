@@ -4,12 +4,11 @@
 
 use std::path::PathBuf;
 
+use oxi_core::constants::VOCAB_FILE;
 use oxi_core::device::DeviceChoice;
 use oxi_core::dictionary::{BUDGET, token_count};
 use oxi_whisper::Engine;
 use whisper_rs::{WhisperContext, WhisperContextParameters};
-
-const VOCAB_FILE: &[u8] = include_bytes!("../../oxi-core/data/vocab/multilingual.vocab");
 
 fn tiny_model() -> Option<PathBuf> {
     let model = std::env::var_os("OXI_TINY_MODEL").map(PathBuf::from);

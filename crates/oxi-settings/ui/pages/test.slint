@@ -1,0 +1,782 @@
+// Test page (SPEC Settings UI, Test tab; owner 2026-11-13, hold 29-32): a three-step wizard on
+// one view (the goal as cards, the models to compare, Run), run through the daemon with the
+// percent, the time left and the time per recording; the results with the error percent of each
+// set, each recording's transcript under the set picked in the table, Apply best and the offers to
+// download the recommended model or delete the ones that lost. The recordings come from History by
+// themselves; the Recordings view picks them by hand (new ones or from history), each with its own
+// editable text of what was said.
+import { Theme, Shell, Icons, Card, CardFrame, Caption, Row, Divider, Combo, TextArea, Button, ButtonKind, IconButton, InfoTip, SubTabs, ScrollBox, EmptyState, ProgressBar, Badge, BadgeKind, Toast, Group, TilePicker, Segmented, CheckBadge } from "../theme/index.slint";
+
+// One line of the results table, ready to show.
+export struct TestRow {
+    model: string,
+    normalize: string,
+    denoise: string,
+    trim: string,
+    // "12.5 %" over every recording, or how the run of this set went.
+    errors: string,
+    time: string,
+    best: bool,
+}
+
+// One picked recording.
+export struct TestTake {
+    // "New recording", or when a history recording was made.
+    source: string,
+    // "0:12"; "Recording 0:03" while it records.
+    duration: string,
+    // The waveform, 0 to 1 per bar; empty while there is no audio to draw.
+    peaks: [float],
+    // What was said: the text every transcript of this recording is scored against.
+    reference: string,
+    recording: bool,
+    // Why Play is off; empty while it is on.
+    play-off: string,
+}
+
+// One recording's run under the set picked in the results table.
+export struct TestHeard {
+    source: string,
+    // "12.5 %", or how the run went ("Waiting", "Not downloaded").
+    errors: string,
+    // The transcript; empty until it is heard.
+    text: string,
+}
+
+// One model of the wizard's list.
+export struct TestModel {
+    name: string,
+    // "1.6 GB".
+    size: string,
+    on: bool,
+    downloaded: bool,
+    recommended: bool,
+}
+
+// Filled and read by `pages::test`.
+export global TestState {
+    // Step 1: 0 the best model, 1 the best settings, 2 a quiet microphone.
+    in property <int> goal;
+    // Step 2: the quick pick, 0 Downloaded, 1 Recommended, 2 All; -1 a pick by hand.
+    in property <int> preset;
+    in property <[TestModel]> models;
+    // Step 2 of the settings goals, which compare no models: "Tunes the model in use: Whisper small".
+    in property <string> tunes;
+    // Step 3: what Run takes ("3 recordings from History · 12 runs") and its "i".
+    in property <string> plan;
+    in property <string> plan-tip;
+    in property <[TestTake]> takes;
+    // The take being recorded is the last one.
+    in property <bool> recording;
+    // Why Record is off; empty while it is on.
+    in property <string> record-off;
+    // The "i" next to Record: where the text of a new recording comes from.
+    in property <string> record-tip;
+    // `[history] enabled`: off shows Turn on instead of the picker.
+    in property <bool> history-on;
+    // "Pick a recording to add", then the history recordings not picked yet, newest first;
+    // empty when there are none.
+    in property <[string]> history;
+    in-out property <int> history-pick;
+    // Why the history picker is off; empty while it is on.
+    in property <string> add-off;
+    // The take that plays, -1 for none.
+    in property <int> playing: -1;
+    in property <bool> running;
+    // The run's progress, 0 to 1, and its label ("42 %").
+    in property <float> progress;
+    in property <string> progress-text;
+    // The average time of one recording so far ("2.1 s per recording"); empty before the first.
+    in property <string> pace;
+    // Why Run is off; empty while it is on.
+    in property <string> run-off;
+    // 0 Test (the wizard), 1 Recordings, 2 Results.
+    in-out property <int> view;
+    in property <[TestRow]> rows;
+    // The row whose recordings show under the table.
+    in property <int> selected;
+    in property <[TestHeard]> heard;
+    in property <string> best-text;
+    // Why Apply best is off; empty while it is on.
+    in property <string> apply-off;
+    // After a run: Download of the recommended model that is not on disk ("Download Whisper
+    // large-v3 Russian"; empty: no offer), and Delete of the models that lost ("Delete 2 others"),
+    // its question ("Delete Whisper small, Whisper base? Frees 0.6 GB.") and why it is off.
+    in property <string> get-text;
+    in property <string> drop-text;
+    in property <string> drop-ask;
+    in property <string> drop-off;
+    // Delete was clicked: the row asks before it deletes, in place (as a model card does).
+    in-out property <bool> dropping;
+    callback shown();
+    callback goal-picked(int);
+    callback preset-picked(int);
+    callback model-ticked(int);
+    // The PC's memory and graphics cards were measured (a worker wakes the event loop with it).
+    callback measured();
+    callback cancel();
+    callback get();
+    callback drop();
+    callback record();
+    callback add-history();
+    callback turn-on-history();
+    callback play(int);
+    callback remove(int);
+    callback reference-edited(int, string);
+    callback run();
+    callback select(int);
+    callback apply();
+}
+
+// One line of the table: the columns come from the stretches alone, so they line up in every
+// line. A result line picks the set whose recordings show below.
+component Line inherits Rectangle {
+    in property <TestRow> data;
+    in property <bool> head;
+    in property <bool> on;
+    callback picked();
+    property <color> ink: root.head ? Theme.text-secondary : Theme.text-primary;
+    property <length> size: root.head ? Theme.caption-size : Theme.body-size;
+    height: Theme.control-height;
+    border-radius: Theme.radius-control;
+    background: root.on ? Theme.bg-subtle-selected : touch.has-hover ? Theme.bg-subtle-hover : transparent;
+    animate background { duration: Theme.motion-quick; easing: ease-out; }
+    touch := TouchArea {
+        enabled: !root.head;
+        mouse-cursor: self.enabled ? pointer : default;
+        clicked => {
+            root.picked();
+        }
+    }
+    HorizontalLayout {
+        padding-left: Theme.space-2;
+        padding-right: Theme.space-2;
+        spacing: Theme.space-2;
+        Text {
+            text: root.data.model;
+            color: root.ink;
+            font-size: root.size;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 32;
+            preferred-width: 0;
+            min-width: 0;
+        }
+        Text {
+            text: root.data.normalize;
+            color: root.ink;
+            font-size: root.size;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 12;
+            preferred-width: 0;
+            min-width: 0;
+        }
+        Text {
+            text: root.data.denoise;
+            color: root.ink;
+            font-size: root.size;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 12;
+            preferred-width: 0;
+            min-width: 0;
+        }
+        Text {
+            text: root.data.trim;
+            color: root.ink;
+            font-size: root.size;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 12;
+            preferred-width: 0;
+            min-width: 0;
+        }
+        HorizontalLayout {
+            horizontal-stretch: 20;
+            preferred-width: 0;
+            min-width: 0;
+            alignment: start;
+            spacing: Theme.pair-gap;
+            Text {
+                text: root.data.errors;
+                color: root.ink;
+                font-size: root.size;
+                vertical-alignment: center;
+                overflow: elide;
+                min-width: 0;
+                horizontal-stretch: 0;
+            }
+            if root.data.best: VerticalLayout {
+                alignment: center;
+                Badge {
+                    text: @tr("Best");
+                    kind: BadgeKind.accent;
+                }
+            }
+        }
+        Text {
+            text: root.data.time;
+            color: root.ink;
+            font-size: root.size;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 12;
+            preferred-width: 0;
+            min-width: 0;
+        }
+    }
+}
+
+// The bars of a recording, centred on its middle line.
+component Wave inherits Rectangle {
+    in property <[float]> peaks;
+    property <length> slot: root.width / max(1, root.peaks.length);
+    accessible-role: none;
+    for p[i] in root.peaks: Rectangle {
+        x: i * root.slot + root.slot * 0.2;
+        width: root.slot * 0.6;
+        height: max(Theme.space-1 / 2, p * root.height);
+        y: (root.height - self.height) / 2;
+        border-radius: Theme.radius-small;
+        background: Theme.text-secondary;
+    }
+}
+
+// One picked recording (DS-23): the bar holds Play first and Delete last, the wave and the length
+// between them, then the text of what was said.
+component TakeCard inherits CardFrame {
+    in property <TestTake> take;
+    in property <int> index;
+    in property <bool> playing;
+    in property <bool> busy;
+    changed take => {
+        // A removed card above hands this one the next take: its text follows (a typed text has
+        // dropped the binding).
+        area.text = root.take.reference;
+    }
+    VerticalLayout {
+        padding-left: Theme.card-padding-h;
+        padding-right: Theme.card-padding-h;
+        padding-top: Theme.card-padding-v;
+        padding-bottom: Theme.card-padding-v;
+        spacing: Theme.space-2;
+        HorizontalLayout {
+            spacing: Theme.control-gap;
+            Button {
+                icon: root.playing ? Icons.stop : Icons.play;
+                text: root.playing ? @tr("Stop") : @tr("Play");
+                enabled: root.take.play-off == "";
+                tooltip: root.take.play-off;
+                clicked => {
+                    TestState.play(root.index);
+                }
+            }
+            Wave {
+                peaks: root.take.peaks;
+                horizontal-stretch: 1;
+                min-width: 0;
+                height: Theme.control-height;
+            }
+            Caption {
+                text: root.take.source;
+                overflow: elide;
+                horizontal-stretch: 0;
+                max-width: 160px;
+                min-width: 0;
+                vertical-alignment: center;
+            }
+            // A fixed slot: the running length changes every tick and moves nothing (DS-25.7).
+            Text {
+                text: root.take.duration;
+                font-size: Theme.body-size;
+                color: root.take.recording ? Theme.accent-text : Theme.text-primary;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                horizontal-stretch: 0;
+                preferred-width: Theme.control-side + Theme.control-gap;
+                min-width: self.preferred-width;
+                overflow: elide;
+            }
+            IconButton {
+                icon: Icons.delete;
+                label: @tr("Remove");
+                destructive: true;
+                enabled: !root.busy && !root.take.recording;
+                clicked => {
+                    TestState.remove(root.index);
+                }
+            }
+        }
+        area := TextArea {
+            vertical-stretch: 1;
+            locked: false;
+            enabled: !root.busy;
+            text: root.take.reference;
+            placeholder-text: @tr("What was said");
+            accessible-label: @tr("What was said");
+            edited(text) => {
+                TestState.reference-edited(root.index, text);
+            }
+        }
+    }
+}
+
+// One recording's transcript under the picked set, with Copy.
+component HeardCard inherits CardFrame {
+    in property <TestHeard> heard;
+    HorizontalLayout {
+        padding-left: Theme.card-padding-h;
+        padding-right: Theme.card-padding-h;
+        padding-top: Theme.card-padding-v;
+        padding-bottom: Theme.card-padding-v;
+        spacing: Theme.icon-gap;
+        VerticalLayout {
+            preferred-width: Theme.control-column-min;
+            horizontal-stretch: 0;
+            spacing: Theme.title-gap;
+            alignment: start;
+            Text {
+                text: root.heard.source;
+                font-size: Theme.body-size;
+                color: Theme.text-primary;
+                overflow: elide;
+                min-width: 0;
+            }
+            Caption {
+                text: root.heard.errors;
+                overflow: elide;
+                min-width: 0;
+            }
+            Rectangle {
+                height: Theme.space-2;
+            }
+            HorizontalLayout {
+                alignment: start;
+                Button {
+                    icon: Icons.copy;
+                    text: @tr("Copy");
+                    enabled: root.heard.text != "";
+                    tooltip: root.heard.text == "" ? @tr("Nothing heard yet") : "";
+                    clicked => {
+                        copier.text = root.heard.text;
+                        copier.select-all();
+                        copier.copy();
+                        copier.clear-selection();
+                        Toast.show(@tr("Copied."));
+                    }
+                }
+            }
+        }
+        TextArea {
+            horizontal-stretch: 1;
+            locked: false;
+            read-only: true;
+            text: root.heard.text;
+            accessible-label: @tr("Transcript");
+        }
+    }
+    // The clipboard is reached through a text input's own Copy.
+    copier := TextInput {
+        visible: false;
+        height: 0;
+        // `width: 0` alone still lets the copied text's length widen the layout (d12).
+        min-width: 0;
+        preferred-width: 0;
+        max-width: 0;
+        accessible-role: none;
+    }
+}
+
+// One model of the wizard's list: a click ticks it. The badges say what the name cannot: it is
+// recommended for this PC, or it is not on disk (a run skips it and says so).
+component ModelLine inherits Rectangle {
+    in property <TestModel> data;
+    in property <bool> enabled;
+    callback ticked();
+    height: Theme.control-height;
+    border-radius: Theme.radius-control;
+    background: touch.has-hover && root.enabled ? Theme.bg-subtle-hover : transparent;
+    animate background { duration: Theme.motion-quick; easing: ease-out; }
+    accessible-role: checkbox;
+    accessible-checkable: true;
+    accessible-checked: root.data.on;
+    accessible-label: root.data.name;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        root.ticked();
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: self.enabled ? pointer : default;
+        clicked => {
+            root.ticked();
+        }
+    }
+    HorizontalLayout {
+        padding-left: Theme.space-2;
+        padding-right: Theme.space-2;
+        spacing: Theme.icon-gap;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: Theme.check-badge-size;
+                height: Theme.check-badge-size;
+                border-radius: Theme.radius-round;
+                border-width: 1px;
+                border-color: Theme.stroke-control;
+                // Always there and faded: a badge popping in read as a blink (tiles.slint).
+                CheckBadge {
+                    muted: !root.enabled;
+                    opacity: root.data.on ? 1 : 0;
+                    animate opacity { duration: Theme.motion-quick; easing: ease-out; }
+                }
+            }
+        }
+        Text {
+            text: root.data.name;
+            font-size: Theme.body-size;
+            color: root.enabled ? Theme.text-primary : Theme.text-disabled;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+            min-width: 0;
+        }
+        if root.data.recommended: VerticalLayout {
+            alignment: center;
+            Badge {
+                text: @tr("Recommended");
+                kind: BadgeKind.accent;
+            }
+        }
+        if !root.data.downloaded: VerticalLayout {
+            alignment: center;
+            Badge {
+                text: @tr("Not downloaded");
+                kind: BadgeKind.neutral;
+            }
+        }
+        // A fixed slot, so the badges of every line end at one place.
+        Caption {
+            text: root.data.size;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+            width: Theme.control-side + Theme.control-gap;
+        }
+    }
+}
+
+export component TestPage inherits VerticalLayout {
+    // A take and a transcript card: the text box and the card's padding.
+    property <length> card-h: Theme.control-height + Theme.space-2 + Theme.editor-min-height + 2 * Theme.card-padding-v;
+    vertical-stretch: 1;
+    spacing: Theme.header-bottom;
+    init => {
+        TestState.shown();
+    }
+    HorizontalLayout {
+        vertical-stretch: 0;
+        SubTabs {
+            items: [@tr("Test"), @tr("Recordings"), @tr("Results")];
+            counts: [-1, TestState.takes.length, -1];
+            selected: TestState.view;
+            picked(i) => {
+                TestState.view = i;
+            }
+        }
+        // Holds the focus when Run swaps the views under it, so Ctrl+Tab still reaches the window
+        // and the next Tab goes on into the results. Outside the `if`s below: it must outlive them.
+        results-focus := FocusScope {
+            width: 0;
+            focus-on-click: false;
+            focus-on-tab-navigation: false;
+        }
+    }
+    // Step 1: what to find.
+    if TestState.view == 0: Group {
+        title: @tr("1. Goal");
+        vertical-stretch: 0;
+        max-height: self.preferred-height;
+        TilePicker {
+            accessible-label: @tr("Goal");
+            columns: 3;
+            tile-height: Theme.tile-height-short;
+            locked: TestState.running;
+            tiles: [
+                { icon: Icons.brain-circuit, icon-selected: Icons.brain-circuit-filled, title: @tr("Best model"), caption: @tr("Which model hears you best") },
+                { icon: Icons.settings, icon-selected: Icons.settings-filled, title: @tr("Best settings"), caption: @tr("Which sound settings help") },
+                { icon: Icons.mic, icon-selected: Icons.mic-filled, title: @tr("Quiet microphone"), caption: @tr("The same recordings, quieter") },
+            ];
+            selected: TestState.goal;
+            picked(i) => {
+                TestState.goal-picked(i);
+            }
+        }
+    }
+    // Step 2: the models to compare; the list scrolls inside the card.
+    if TestState.view == 0 && TestState.goal == 0: CardFrame {
+        vertical-stretch: 1;
+        min-height: 2 * Theme.control-height + Theme.row-min-height + 2 * Theme.card-padding-v + 2 * Theme.space-2;
+        // No taller than the whole list: Run follows it, the page's room is left below.
+        max-height: max(self.min-height, TestState.models.length * Theme.control-height + Theme.row-min-height + 2 * Theme.card-padding-v + 2 * Theme.space-2 + 1px);
+        VerticalLayout {
+            padding-left: Theme.card-padding-h;
+            padding-right: Theme.card-padding-h;
+            padding-top: Theme.card-padding-v;
+            padding-bottom: Theme.card-padding-v;
+            spacing: Theme.space-2;
+            Row {
+                title: @tr("2. Models");
+                fill-controls: true;
+                Segmented {
+                    items: [@tr("Downloaded"), @tr("Recommended"), @tr("All")];
+                    selected: TestState.preset;
+                    enabled: !TestState.running;
+                    accessible-label: @tr("Models");
+                    picked(i) => {
+                        TestState.preset-picked(i);
+                    }
+                }
+            }
+            Divider { }
+            list := ScrollBox {
+                vertical-stretch: 1;
+                min-height: Theme.control-height;
+                content-height: TestState.models.length * Theme.control-height;
+                for m[i] in TestState.models: ModelLine {
+                    x: 0;
+                    y: i * Theme.control-height;
+                    width: list.content-width;
+                    data: m;
+                    enabled: !TestState.running;
+                    ticked => {
+                        TestState.model-ticked(i);
+                    }
+                }
+            }
+        }
+    }
+    // Step 2 of the settings goals: nothing to pick, they tune the model in use.
+    if TestState.view == 0 && TestState.goal != 0: Card {
+        vertical-stretch: 0;
+        max-height: self.preferred-height;
+        Row {
+            title: @tr("2. Model");
+            description: TestState.tunes;
+        }
+    }
+    // Step 3: one button.
+    if TestState.view == 0: Card {
+        vertical-stretch: 0;
+        max-height: self.preferred-height;
+        Row {
+            title: @tr("3. Run");
+            description: TestState.plan;
+            info: TestState.plan-tip;
+            Button {
+                text: @tr("Run");
+                kind: ButtonKind.primary;
+                enabled: TestState.run-off == "";
+                tooltip: TestState.run-off;
+                clicked => {
+                    TestState.run();
+                    // A refused Run stays on this view, and on this button.
+                    if (TestState.view == 2) {
+                        results-focus.focus();
+                    }
+                }
+            }
+        }
+    }
+    // The room the model list does not need stays below Run: the list takes its fill first.
+    if TestState.view == 0: Rectangle {
+        vertical-stretch: 0;
+        preferred-height: 0;
+    }
+    // By hand: new recordings and recordings from history, each with its text.
+    if TestState.view == 1: Card {
+        // The list below takes the height left.
+        vertical-stretch: 0;
+        Row {
+            title: @tr("New recording");
+            info: TestState.record-tip;
+            Button {
+                // No glyph: Record and Stop keep one width, so the "i" beside them stays put.
+                text: TestState.recording ? @tr("Stop") : @tr("Record");
+                kind: TestState.recording ? ButtonKind.danger : ButtonKind.secondary;
+                enabled: TestState.record-off == "";
+                tooltip: TestState.record-off;
+                clicked => {
+                    TestState.record();
+                }
+            }
+        }
+        Divider { }
+        // Return or a click on a line adds it (no Add button); arrows, Esc and a click outside
+        // only walk or close the list.
+        if TestState.history-on: Row {
+            title: @tr("From history");
+            fill-controls: true;
+            enabled: TestState.add-off == "";
+            off-tip: TestState.add-off;
+            Combo {
+                locked: false;
+                enabled: TestState.add-off == "";
+                model: TestState.history.length > 0 ? TestState.history : [TestState.add-off];
+                current-index <=> TestState.history-pick;
+                accessible-label: @tr("From history");
+                committed => {
+                    if (TestState.history-pick > 0) {
+                        TestState.add-history();
+                    }
+                }
+                // Esc or a click outside: the arrows only previewed a name, back to the prompt.
+                dismissed => {
+                    TestState.history-pick = 0;
+                }
+            }
+        }
+        if !TestState.history-on: Row {
+            title: @tr("From history");
+            description: @tr("History is off");
+            Button {
+                text: @tr("Turn on");
+                enabled: !Shell.locked;
+                tooltip: Shell.locked ? Shell.locked-tip : "";
+                clicked => {
+                    TestState.turn-on-history();
+                }
+            }
+        }
+    }
+    if TestState.view == 1 && TestState.takes.length == 0: EmptyState {
+        vertical-stretch: 1;
+        icon: Icons.mic;
+        text: @tr("No recordings picked");
+    }
+    if TestState.view == 1 && TestState.takes.length > 0: takes := ScrollBox {
+        vertical-stretch: 1;
+        // Short windows show part of a card and scroll it; the page itself never scrolls.
+        min-height: Theme.control-height;
+        content-height: TestState.takes.length * (root.card-h + Theme.card-gap) - Theme.card-gap;
+        for take[i] in TestState.takes: TakeCard {
+            x: 0;
+            y: i * (root.card-h + Theme.card-gap);
+            width: takes.content-width;
+            height: root.card-h;
+            take: take;
+            index: i;
+            playing: TestState.playing == i;
+            busy: TestState.running;
+        }
+    }
+    if TestState.view == 2 && TestState.rows.length == 0: EmptyState {
+        vertical-stretch: 1;
+        icon: Icons.timer;
+        text: @tr("Nothing run yet");
+    }
+    // The table and the transcripts scroll as one: a short window still reaches both.
+    if TestState.view == 2 && TestState.rows.length > 0: results := ScrollBox {
+        vertical-stretch: 1;
+        min-height: Theme.control-height;
+        content-height: table.height + (TestState.heard.length == 0 ? 0 : Theme.header-bottom + TestState.heard.length * (root.card-h + Theme.card-gap) - Theme.card-gap);
+        table := Card {
+            x: 0;
+            y: 0;
+            width: results.content-width;
+            height: self.preferred-height;
+            Row {
+                title: TestState.running ? @tr("Running") : @tr("Best set");
+                description: TestState.running ? TestState.pace : TestState.best-text;
+                fill-controls: TestState.running;
+                if TestState.running: ProgressBar {
+                    value: TestState.progress;
+                    label: TestState.progress-text;
+                }
+                if TestState.running: Button {
+                    text: @tr("Cancel");
+                    clicked => {
+                        TestState.cancel();
+                    }
+                }
+                if !TestState.running: Button {
+                    text: @tr("Apply best");
+                    kind: ButtonKind.primary;
+                    enabled: !Shell.locked && TestState.apply-off == "";
+                    tooltip: Shell.locked ? Shell.locked-tip : TestState.apply-off;
+                    clicked => {
+                        TestState.apply();
+                    }
+                }
+            }
+            // The offers of a finished run; Delete asks first, in this row.
+            if !TestState.running && (TestState.get-text != "" || TestState.drop-text != ""): Divider { }
+            if !TestState.running && !TestState.dropping && (TestState.get-text != "" || TestState.drop-text != ""): Row {
+                title: @tr("Models");
+                if TestState.get-text != "": Button {
+                    icon: Icons.download;
+                    text: TestState.get-text;
+                    kind: ButtonKind.soft;
+                    clicked => {
+                        TestState.get();
+                    }
+                }
+                if TestState.drop-text != "": Button {
+                    icon: Icons.delete;
+                    text: TestState.drop-text;
+                    kind: ButtonKind.soft;
+                    enabled: TestState.drop-off == "";
+                    tooltip: TestState.drop-off;
+                    clicked => {
+                        TestState.dropping = true;
+                    }
+                }
+            }
+            if !TestState.running && TestState.dropping: Row {
+                title: TestState.drop-ask;
+                Button {
+                    text: @tr("Delete");
+                    icon: Icons.delete;
+                    kind: ButtonKind.danger;
+                    clicked => {
+                        TestState.dropping = false;
+                        TestState.drop();
+                    }
+                }
+                Button {
+                    text: @tr("Keep");
+                    kind: ButtonKind.primary;
+                    clicked => {
+                        TestState.dropping = false;
+                    }
+                }
+            }
+            Divider { }
+            Line {
+                head: true;
+                data: {
+                    model: @tr("Model"),
+                    normalize: @tr("Normalise"),
+                    denoise: @tr("Denoise"),
+                    trim: @tr("Trim"),
+                    errors: @tr("Errors"),
+                    time: @tr("Time"),
+                };
+            }
+            for row[i] in TestState.rows: Line {
+                data: row;
+                on: i == TestState.selected;
+                picked => {
+                    TestState.select(i);
+                }
+            }
+        }
+        for one[i] in TestState.heard: HeardCard {
+            x: 0;
+            y: table.height + Theme.header-bottom + i * (root.card-h + Theme.card-gap);
+            width: results.content-width;
+            height: root.card-h;
+            heard: one;
+        }
+    }
+}

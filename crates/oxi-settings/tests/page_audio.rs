@@ -1,0 +1,849 @@
+//! Audio page under the testing backend, on a temporary config directory. No test here opens a
+//! microphone: the meter opens one on its 30 Hz timer, which only `OXI_MIC_TEST=1` runs.
+
+mod common;
+
+use std::fs;
+use std::time::Duration;
+
+use common::{assert_nothing_moved, config, has, layout, open, open_linked, spots, with_role};
+use i_slint_backend_testing::{AccessibleRole, ElementHandle, ElementQuery};
+use oxi_core::config::{Config, EdgePreset, Noise};
+use oxi_core::device::DeviceChoice;
+use oxi_core::ipc::{Push, Request};
+use oxi_core::machine::Phase;
+use oxi_core::paths::Layout;
+use oxi_settings::ipc::{Cmd, Event};
+use oxi_settings::{AppWindow, AudioState, Ipc, Page};
+use slint::platform::{Key, PointerEventButton, WindowEvent};
+use slint::{ComponentHandle, Model};
+
+fn saved(layout: &Layout) -> Config {
+    config(layout).config
+}
+
+/// Opens a sub-tab of the page.
+fn tab(window: &AppWindow, label: &str) {
+    with_role(window, label, AccessibleRole::Tab).invoke_accessible_default_action();
+}
+
+/// Opens the Sounds tab on the sound `role`: 0 start, 1 stop, 2 text ready, 3 cancel, 4 error.
+fn sounds(window: &AppWindow, role: i32) {
+    tab(window, "Sounds");
+    window.global::<AudioState>().set_view(2 + role);
+}
+
+fn checked(window: &AppWindow, label: &str) -> Option<bool> {
+    with_role(window, label, AccessibleRole::RadioButton).accessible_checked()
+}
+
+/// What the daemon says about the sounds in its `Status`.
+fn status(ipc: &Ipc, warnings: &[&str]) {
+    ipc.deliver(&Event::Push(Push::Status {
+        phase: Phase::Idle,
+        model: String::new(),
+        device: DeviceChoice::default(),
+        backend: String::new(),
+        loaded: false,
+        warnings: warnings.iter().map(|w| (*w).to_owned()).collect(),
+    }));
+}
+
+#[test]
+fn every_control_writes_its_key() {
+    let l = layout("controls", Some("version = 2\n# mine\n"));
+    let window = open(&l, Page::Audio);
+    // Tall enough for the whole page: the search skips what is scrolled away.
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(1120.0, 1600.0));
+    let defaults = Config::default();
+
+    // The NumberField beside each slider: typing writes the same key as dragging.
+    let slider = |label: &str, value: &str| {
+        with_role(&window, label, AccessibleRole::Spinbox).set_accessible_value(value);
+    };
+    slider("Microphone boost", "-6");
+    assert!((saved(&l).audio.gain_db - -6.0).abs() < f64::EPSILON);
+    slider("Level bar sensitivity", "12");
+    assert!((saved(&l).audio.meter_sensitivity_db - 12.0).abs() < f32::EPSILON);
+    tab(&window, "Recording");
+    slider("Keep recording after release", "300");
+    assert_eq!(saved(&l).audio.tail_ms, 300);
+    slider("Longest recording", "15");
+    assert_eq!(saved(&l).audio.max_seconds, 900);
+
+    for (label, get) in [
+        (
+            "Even out loudness",
+            (|c: &Config| c.audio.normalize) as fn(&Config) -> bool,
+        ),
+        ("Cut silence at the ends", |c: &Config| c.audio.trim),
+        ("Cut low rumble", |c: &Config| c.audio.cut_rumble),
+    ] {
+        with_role(&window, label, AccessibleRole::Switch).invoke_accessible_default_action();
+        assert_eq!(get(&saved(&l)), !get(&defaults), "{label}");
+    }
+    // The two named choices of hold item 41: one row each over the keys they set.
+    pick(&window, "Reduce background noise", 1);
+    assert_eq!(saved(&l).audio.noise(), Noise::Light);
+    pick(&window, "Reduce background noise", 4);
+    assert_eq!(saved(&l).audio.noise(), Noise::Auto);
+    pick(&window, "Don't cut my words", 1);
+    let audio = saved(&l).audio;
+    assert_eq!((audio.edges(), audio.tail_ms), (EdgePreset::Careful, 300));
+    let combo = with_role(&window, "Don't cut my words", AccessibleRole::Combobox);
+    slider("Keep recording after release", "250");
+    assert_eq!(
+        combo.accessible_value().as_deref(),
+        Some("Custom"),
+        "a hand-set tail"
+    );
+
+    tab(&window, "Microphone");
+    with_role(
+        &window,
+        "Remember for this microphone",
+        AccessibleRole::Switch,
+    )
+    .invoke_accessible_default_action();
+    let audio = saved(&l).audio;
+    assert!(audio.per_device);
+    // With "System default" the set is the default device's (its name; "" when none is known).
+    assert_eq!(audio.device_sets.len(), 1, "{:?}", audio.device_sets.keys());
+    assert_eq!(
+        audio.device_sets.values().next().unwrap().gain_db,
+        -6.0,
+        "saved for the mic in use now"
+    );
+
+    let text = fs::read_to_string(l.config_file()).unwrap();
+    assert!(text.contains("# mine"), "comment lost: {text}");
+}
+
+/// UI rule 35: the Gain and Meter sensitivity hints are the rows' "i" tips.
+#[test]
+fn gain_and_sensitivity_have_info_tips() {
+    let l = layout("hints", None);
+    let window = open(&l, Page::Audio);
+    assert!(has(
+        &window,
+        "Makes your voice louder or quieter in the recording Whisper hears. Record 3 s checks the level."
+    ));
+    assert!(has(
+        &window,
+        "Only changes how far the Level bar moves; the recording stays as it is."
+    ));
+}
+
+#[test]
+fn denoise_shows_the_whisper_note() {
+    let l = layout("denoise", None);
+    let window = open(&l, Page::Audio);
+    tab(&window, "Recording");
+    let note = "Reducing background noise can make Whisper worse.";
+    assert!(!has(&window, note));
+    pick(&window, "Reduce background noise", 1);
+    assert!(has(&window, note), "every level but Off can make it worse");
+}
+
+/// An old `denoise = true` is Strong.
+#[test]
+fn old_denoise_on_shows_as_strong() {
+    let old = layout(
+        "denoise-old",
+        Some("version = 2\n[audio]\ndenoise = true\n"),
+    );
+    let window = open(&old, Page::Audio);
+    tab(&window, "Recording");
+    let combo = with_role(&window, "Reduce background noise", AccessibleRole::Combobox);
+    assert_eq!(combo.accessible_value().as_deref(), Some("Strong"));
+}
+
+/// Opens the combo `label` and commits its row `row` (keys: up to the first, then down).
+fn pick(window: &AppWindow, label: &str, row: usize) {
+    with_role(window, label, AccessibleRole::Combobox).mock_single_click(PointerEventButton::Left);
+    for _ in 0..8 {
+        window.window().dispatch_event(WindowEvent::KeyPressed {
+            text: Key::UpArrow.into(),
+        });
+    }
+    for _ in 0..row {
+        window.window().dispatch_event(WindowEvent::KeyPressed {
+            text: Key::DownArrow.into(),
+        });
+    }
+    window.window().dispatch_event(WindowEvent::KeyPressed {
+        text: Key::Return.into(),
+    });
+}
+
+#[test]
+fn config_values_show_on_the_page() {
+    let l = layout(
+        "values",
+        Some("version = 2\n[audio]\ngain_db = 4.0\ntail_ms = 250\n[model]\nlanguage = \"en\"\n"),
+    );
+    let window = open(&l, Page::Audio);
+    let gain = with_role(&window, "Microphone boost", AccessibleRole::Slider);
+    assert_eq!(gain.accessible_value().as_deref(), Some("4"));
+    let field = |label: &str| with_role(&window, label, AccessibleRole::Spinbox).accessible_value();
+    assert_eq!(field("Microphone boost").as_deref(), Some("+4"));
+    tab(&window, "Recording");
+    assert_eq!(
+        field("Keep recording after release").as_deref(),
+        Some("250")
+    );
+    assert_eq!(field("Longest recording").as_deref(), Some("60"));
+}
+
+/// UI rule 28: a device name too long for the Combo stands in full in a tooltip; a short one has
+/// none.
+#[test]
+fn long_device_name_stands_in_full_on_hover() {
+    let long = "Microphone Array (Synth Smart Sound Technology for Digital Microphones)";
+    let l = layout(
+        "device-long",
+        Some(&format!("version = 2\n[audio]\ndevice = \"{long}\"\n")),
+    );
+    let window = open(&l, Page::Audio);
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(720.0, 520.0));
+    let full = format!("Not connected: {long}");
+    let picker = with_role(&window, "Device", AccessibleRole::Combobox);
+    assert_eq!(picker.accessible_value().as_deref(), Some(full.as_str()));
+    let (at, size) = (picker.absolute_position(), picker.size());
+    window.window().dispatch_event(WindowEvent::PointerMoved {
+        position: slint::LogicalPosition::new(at.x + size.width / 2.0, at.y + size.height / 2.0),
+    });
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(700));
+    let tips = ElementHandle::find_by_accessible_label(&window, &full)
+        .filter(|e| e.accessible_role() != Some(AccessibleRole::Combobox))
+        .count();
+    assert!(tips > 0, "no full-name tooltip");
+}
+
+/// A configured microphone that is not plugged in stays picked; choosing the first row writes
+/// the system default (an empty name).
+#[test]
+fn missing_device_stays_picked_until_default_is_chosen() {
+    let l = layout(
+        "device",
+        Some("version = 2\n[audio]\ndevice = \"Test Mic 9\"\n"),
+    );
+    let window = open(&l, Page::Audio);
+    let picker = with_role(&window, "Device", AccessibleRole::Combobox);
+    assert_eq!(
+        picker.accessible_value().as_deref(),
+        Some("Not connected: Test Mic 9")
+    );
+
+    picker.mock_single_click(PointerEventButton::Left);
+    let rows = 1 + oxi_platform::capture::list_input_devices().map_or(0, |d| d.len());
+    for _ in 0..rows {
+        window.window().dispatch_event(WindowEvent::KeyPressed {
+            text: Key::UpArrow.into(),
+        });
+    }
+    assert_eq!(saved(&l).audio.device, "");
+    assert_eq!(picker.accessible_value().as_deref(), Some("System default"));
+}
+
+#[test]
+fn locked_config_disables_the_controls() {
+    let original = "version = 99\n[audio]\ngain_db = 3.0\n";
+    let l = layout("locked", Some(original));
+    let window = open(&l, Page::Audio);
+    // Tall enough for the whole page under the read-only banner: the search skips what is scrolled away.
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(1120.0, 1400.0));
+    let off = |label: &str, role| {
+        let e = with_role(&window, label, role);
+        assert_eq!(e.accessible_enabled(), Some(false), "{label}");
+    };
+    off("Microphone boost", AccessibleRole::Slider);
+    off("Device", AccessibleRole::Combobox);
+    // Hovering a locked control says why (UI rule 31): the Device combo and the Gain slider.
+    let tip = window.global::<oxi_settings::Shell>().get_locked_tip();
+    for (label, role) in [
+        ("Device", AccessibleRole::Combobox),
+        ("Microphone boost", AccessibleRole::Slider),
+    ] {
+        let e = with_role(&window, label, role);
+        let (at, size) = (e.absolute_position(), e.size());
+        window.window().dispatch_event(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(
+                at.x + size.width / 2.0,
+                at.y + size.height / 2.0,
+            ),
+        });
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(700));
+        assert!(has(&window, &tip), "no tooltip on the locked {label}");
+        window.window().dispatch_event(WindowEvent::PointerExited);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+        assert!(!has(&window, &tip), "the {label} tooltip stayed");
+    }
+    tab(&window, "Recording");
+    off("Cut silence at the ends", AccessibleRole::Switch);
+    // The sub-tabs still work; only the settings are locked.
+    tab(&window, "Sounds");
+    let stop = with_role(&window, "Stop", AccessibleRole::RadioButton);
+    assert_eq!(stop.accessible_enabled(), Some(true), "the sound cards");
+    // A real click on the Stop card: the view follows, nothing is saved.
+    stop.mock_single_click(PointerEventButton::Left);
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(350));
+    assert_eq!(
+        window.global::<AudioState>().get_view(),
+        3,
+        "the card did not move off Start"
+    );
+    off("Hit 4", AccessibleRole::RadioButton);
+    assert_eq!(fs::read_to_string(l.config_file()).unwrap(), original);
+}
+
+/// Real microphone: the meter opens it on the Audio page and closes it when the page is left.
+/// `live` outlives the page, so coming back before the next frame shows whether it closed.
+#[test]
+fn mic_meter_closes_when_the_page_is_left() {
+    if std::env::var_os("OXI_MIC_TEST").is_none_or(|v| v != "1") {
+        return;
+    }
+    let l = layout("mic", None);
+    let window = open(&l, Page::Audio);
+    let live = || {
+        ElementHandle::find_by_accessible_label(&window, "Level")
+            .any(|e| e.accessible_role() == Some(AccessibleRole::ProgressIndicator))
+    };
+    assert!(!live());
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(100));
+    assert!(live(), "the meter did not open the microphone");
+    window.set_page(Page::About);
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(100));
+    window.set_page(Page::Audio);
+    assert!(
+        !live(),
+        "the microphone stayed open after the page was left"
+    );
+}
+
+/// At the minimum width the control columns of all rows start at one x: before, the column
+/// followed the wrapping of the text on its left, so equal sliders sat 3 to 11 px apart; and a
+/// slider row asked for a wider column (280 px) than the device row (240 px), 30 px apart.
+#[test]
+fn control_columns_start_at_one_x_at_the_minimum_width() {
+    let l = layout("columns", None);
+    let window = open(&l, Page::Audio);
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(720.0, 1600.0));
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(50));
+    let x = |label: &str, role| with_role(&window, label, role).absolute_position().x;
+    let gain = x("Microphone boost", AccessibleRole::Slider);
+    let same = |label: &str, role| {
+        let at = x(label, role);
+        assert!((at - gain).abs() < 0.5, "{label}: {at}, Gain {gain}");
+    };
+    same("Device", AccessibleRole::Combobox);
+    same("Level bar sensitivity", AccessibleRole::Slider);
+    tab(&window, "Recording");
+    same("Keep recording after release", AccessibleRole::Slider);
+    same("Longest recording", AccessibleRole::Slider);
+    sounds(&window, 1);
+    same("Volume", AccessibleRole::Slider);
+}
+
+/// The level track starts under the Device select and the Test button beside it ends where the
+/// select ends (DS-3.3): one column, one pair of edges. shortcut: no size above 1280 px, where
+/// the Row's column outgrows the Combo's 360 px cap (finding on layout.slint `Row`); add
+/// 1920x1080 once that is fixed.
+#[test]
+fn level_row_has_the_edges_of_the_device_select() {
+    let l = layout("level-edges", None);
+    let window = open(&l, Page::Audio);
+    for (width, height) in [(720.0, 520.0), (1000.0, 700.0), (1280.0, 860.0)] {
+        window
+            .window()
+            .set_size(slint::LogicalSize::new(width, height));
+        // Runs the shell's page-width handler; the 30 Hz meter timer stays asleep.
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+        let edges = |e: &ElementHandle| {
+            let x = e.absolute_position().x;
+            (x, x + e.size().width)
+        };
+        let select = edges(&with_role(&window, "Device", AccessibleRole::Combobox));
+        let track = edges(
+            &ElementQuery::from_root(&window)
+                .match_accessible_role(AccessibleRole::ProgressIndicator)
+                .find_first()
+                .expect("no level meter"),
+        );
+        let test = edges(&with_role(&window, "Record 3 s", AccessibleRole::Button));
+        let gain = edges(&with_role(
+            &window,
+            "Microphone boost",
+            AccessibleRole::Spinbox,
+        ));
+        assert!(
+            (select.0 - track.0).abs() < 0.5,
+            "{width}: select {select:?}, track {track:?}"
+        );
+        for (name, right) in [("Record 3 s", test.1), ("Gain field", gain.1)] {
+            assert!(
+                (select.1 - right).abs() < 0.5,
+                "{width}: select {select:?}, {name} ends at {right}"
+            );
+        }
+        assert!(
+            track.1 < test.0,
+            "{width}: track {track:?} under Test {test:?}"
+        );
+    }
+}
+
+/// The Sounds grid takes the room the window leaves, not two rows (it was 216 px tall at 1000x700,
+/// 200 px short of the window's foot).
+#[test]
+fn the_sounds_grid_fills_the_window_height() {
+    let window = open(&layout("grid-room", None), Page::Audio);
+    sounds(&window, 0);
+    let foot = |width: f32, height: f32| {
+        window
+            .window()
+            .set_size(slint::LogicalSize::new(width, height));
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+        let grid = ElementHandle::find_by_accessible_label(&window, "Sounds")
+            .find(|e| e.accessible_role() != Some(AccessibleRole::Tab))
+            .expect("no Sounds grid");
+        (grid.absolute_position().y, grid.size().height)
+    };
+    let (top, height) = foot(1000.0, 700.0);
+    assert!(
+        top + height > 700.0 - 40.0,
+        "the grid ends at {} in a 700 px window",
+        top + height
+    );
+}
+
+/// Preview plays the picked tile, so it has its own row, not the own-file row's (Choose file).
+#[test]
+#[cfg_attr(
+    not(windows),
+    ignore = "Choose file shows only where a file dialog exists (can-browse)"
+)]
+fn preview_is_not_in_the_own_file_row() {
+    let window = open(&layout("preview-row", None), Page::Audio);
+    sounds(&window, 0);
+    let y = |label: &str| {
+        let e = with_role(&window, label, AccessibleRole::Button);
+        e.absolute_position().y + e.size().height / 2.0
+    };
+    let (choose, preview) = (y("Choose file"), y("Preview"));
+    assert!(
+        preview > choose + 20.0,
+        "Choose file at {choose}, Preview at {preview}"
+    );
+}
+
+/// DS-23.5: Remove folder keeps its slot with no folder (off), so Add folder does not move.
+#[test]
+#[cfg_attr(
+    not(windows),
+    ignore = "Add folder shows only where a file dialog exists (can-browse)"
+)]
+fn remove_folder_keeps_its_slot_with_no_folder() {
+    let window = open(&layout("remove-slot", None), Page::Audio);
+    sounds(&window, 0);
+    let remove = with_role(
+        &window,
+        "Remove folder (its files stay)",
+        AccessibleRole::Button,
+    );
+    assert_eq!(remove.accessible_enabled(), Some(false));
+    let choose = with_role(&window, "Choose file", AccessibleRole::Button);
+    assert!(
+        remove.absolute_position().x >= choose.absolute_position().x + choose.size().width,
+        "Delete is the right-most"
+    );
+}
+
+/// DS-11.4 d: with no folder and a writable config, the off Remove folder says "no folder", not "read-only".
+#[test]
+#[cfg_attr(
+    not(windows),
+    ignore = "Add folder shows only where a file dialog exists (can-browse)"
+)]
+fn remove_folder_off_without_folder_does_not_claim_read_only() {
+    let window = open(&layout("remove-reason", None), Page::Audio);
+    sounds(&window, 0);
+    let remove = with_role(
+        &window,
+        "Remove folder (its files stay)",
+        AccessibleRole::Button,
+    );
+    let locked_tip = window.global::<oxi_settings::Shell>().get_locked_tip();
+    let tip = remove.accessible_description().unwrap_or_default();
+    assert_eq!(remove.accessible_enabled(), Some(false));
+    assert!(!tip.is_empty(), "a disabled button needs a reason");
+    assert_ne!(tip.as_str(), locked_tip.as_str(), "wrong reason: {tip}");
+}
+
+/// Picking a built-in tile writes that sound's own key, plays it, and each sound shows its own.
+#[test]
+fn picking_a_built_in_saves_it_and_plays_it() {
+    let l = layout("builtin", None);
+    let (ipc, sent) = Ipc::fake();
+    let window = open_linked(&l, Page::Audio, ipc);
+    sounds(&window, 0);
+    assert_eq!(checked(&window, "Hit 3"), Some(true), "the default");
+    with_role(&window, "Hit 4", AccessibleRole::RadioButton).invoke_accessible_default_action();
+    assert_eq!(saved(&l).sounds.start, "apa-hit-4");
+    assert_eq!(saved(&l).sounds.stop, "apa-hit-2", "the other sound stays");
+    assert_eq!(checked(&window, "Hit 4"), Some(true));
+    let previews: Vec<Cmd> = sent.try_iter().collect();
+    assert!(
+        previews.contains(&Cmd::Send(Request::PreviewSound {
+            choice: "apa-hit-4".into(),
+            volume_percent: 50,
+        })),
+        "{previews:?}"
+    );
+    sounds(&window, 1);
+    assert_eq!(checked(&window, "Hit 2"), Some(true));
+    with_role(&window, "Hit 5", AccessibleRole::RadioButton).invoke_accessible_default_action();
+    assert_eq!(saved(&l).sounds.stop, "apa-hit-5");
+    assert_eq!(saved(&l).sounds.start, "apa-hit-4");
+    // The event cards follow a view set from outside (the status chip opens the stop sound).
+    assert_eq!(checked(&window, "Stop"), Some(true));
+    sounds(&window, 4);
+    assert_eq!(checked(&window, "Error"), Some(true));
+    assert_eq!(checked(&window, "Stop"), Some(false));
+}
+
+/// The cards read as words, the file name stays as the id in the tooltip, and "Default" marks the
+/// sound's own default whichever card is picked.
+#[test]
+fn cards_have_friendly_names_and_default_marks_the_default_card() {
+    let l = layout(
+        "friendly",
+        Some(
+            "version = 2
+[sounds]
+start = \"apa-hit-4\"
+",
+        ),
+    );
+    let window = open(&l, Page::Audio);
+    sounds(&window, 0);
+    let card = with_role(&window, "Hit 4", AccessibleRole::RadioButton);
+    assert_eq!(card.accessible_description().as_deref(), Some("apa-hit-4"));
+    assert!(!has(&window, "Apa hit 4"), "the id is not the name");
+    let tiles = window.global::<AudioState>().get_role_tiles();
+    let start = tiles.row_data(0).unwrap();
+    let marked: Vec<_> = start
+        .iter()
+        .filter(|t| t.caption == "Default")
+        .map(|t| t.title.to_string())
+        .collect();
+    // Hit 4 is picked, yet the mark is on the default card (apa-hit-3).
+    assert_eq!(marked, ["Hit 3"]);
+}
+
+/// Every sound has an Off tile; on text ready it is the old switch.
+#[test]
+fn every_sound_can_be_switched_off() {
+    let l = layout("sound-off", None);
+    let (ipc, sent) = Ipc::fake();
+    let window = open_linked(&l, Page::Audio, ipc);
+    assert!(
+        !has(&window, "Play when the text is ready"),
+        "the switch is the Off tile now"
+    );
+    sounds(&window, 0);
+    with_role(&window, "Off", AccessibleRole::RadioButton).invoke_accessible_default_action();
+    assert_eq!(saved(&l).sounds.start, "off");
+    assert_eq!(checked(&window, "Off"), Some(true));
+    assert!(
+        !sent
+            .try_iter()
+            .any(|c| matches!(c, Cmd::Send(Request::PreviewSound { .. }))),
+        "an Off pick plays nothing"
+    );
+    sounds(&window, 2);
+    with_role(&window, "Off", AccessibleRole::RadioButton).invoke_accessible_default_action();
+    assert!(!saved(&l).sounds.done_enabled);
+    assert_eq!(saved(&l).sounds.done, "rx-25");
+}
+
+/// An own file from the config stands on its tile with its name; the whole path is the tooltip.
+#[test]
+fn own_file_shows_on_its_tile() {
+    // A path of this OS: a backslash is no separator on Linux, so a Windows path would not split.
+    let path = if cfg!(windows) {
+        r"C:\Sounds\my start.wav"
+    } else {
+        "/Sounds/my start.wav"
+    };
+    let l = layout(
+        "own",
+        Some(&format!("version = 2\n[sounds]\nstart = '{path}'\n")),
+    );
+    let window = open(&l, Page::Audio);
+    sounds(&window, 0);
+    assert_eq!(checked(&window, "Own file"), Some(true));
+    let own = window
+        .global::<AudioState>()
+        .get_role_tiles()
+        .row_data(0)
+        .unwrap();
+    assert_eq!(own.row_data(1).unwrap().caption, "my start.wav");
+    let tile = with_role(&window, "Own file", AccessibleRole::RadioButton);
+    assert_eq!(tile.accessible_description().as_deref(), Some(path));
+    sounds(&window, 1);
+    assert_eq!(
+        checked(&window, "Own file"),
+        Some(false),
+        "the other sound has none"
+    );
+}
+
+/// The volume is a percent on the page and a fraction in the file.
+#[test]
+fn volume_slider_writes_the_fraction() {
+    let l = layout("volume", None);
+    let window = open(&l, Page::Audio);
+    sounds(&window, 0);
+    with_role(&window, "Volume", AccessibleRole::Spinbox).set_accessible_value("55");
+    assert!((saved(&l).sounds.volume - 0.55).abs() < 1e-9);
+    with_role(&window, "Volume", AccessibleRole::Spinbox).set_accessible_value("400");
+    assert!((saved(&l).sounds.volume - 1.0).abs() < 1e-9, "clamped");
+}
+
+/// A sound the daemon cannot use is the "!" of the Own file row, moves nothing, and leaves when
+/// the daemon stops saying so.
+#[test]
+fn a_bad_own_file_is_the_warning_of_the_row() {
+    let l = layout(
+        "bad-file",
+        Some("version = 2\n[sounds]\nstart = 'C:\\Sounds\\bad.wav'\n"),
+    );
+    let (ipc, _sent) = Ipc::fake();
+    let window = open_linked(&l, Page::Audio, ipc.clone());
+    sounds(&window, 0);
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(1280.0, 860.0));
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    let before = spots(&window);
+    let text = "Start sound: not a WAV file, using rise";
+    assert!(!has(&window, text));
+    status(&ipc, &["sounds.start: not a WAV file, using rise"]);
+    assert!(has(&window, text), "the \"!\" holds the reason");
+    assert_nothing_moved(&before, &spots(&window));
+    status(&ipc, &[]);
+    assert!(!has(&window, text));
+    // A preview that failed says so when no setting has a line of its own.
+    status(&ipc, &["sounds.preview: cannot read the file (not found)"]);
+    assert!(has(&window, "Preview: cannot read the file (not found)"));
+}
+
+/// UI rule 26: under banners the page scrolls, and the sound gallery then shows every tile, so
+/// the wheel never has a scroll inside a scroll to pick; with no banner the page does not scroll.
+#[test]
+#[cfg_attr(
+    not(windows),
+    ignore = "the fit is measured in Segoe UI Variable Text, which only Windows has"
+)]
+fn sound_tabs_never_scroll_inside_a_scroll() {
+    let l = layout("sound-fit", None);
+    let window = open(&l, Page::Audio);
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(720.0, 520.0));
+    let settle = || i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(500));
+    let wheel = |at: slint::LogicalPosition| {
+        window
+            .window()
+            .dispatch_event(WindowEvent::PointerScrolled {
+                position: at,
+                delta_x: 0.0,
+                delta_y: -100_000.0,
+            });
+        settle();
+    };
+    for (daemon, error) in [
+        ("", ""),
+        (oxi_core::strings::DAEMON_OFFLINE, ""),
+        (oxi_core::strings::DAEMON_OFFLINE, "Synthetic action error."),
+    ] {
+        // The start sound, and the text ready one with its switch row.
+        for sound in [0, 2] {
+            window.set_daemon_text(daemon.into());
+            window.set_daemon_start(!daemon.is_empty());
+            window.set_action_error(error.into());
+            // A page change puts the page back at the top.
+            window.set_page(Page::Home);
+            settle();
+            window.set_page(Page::Audio);
+            settle();
+            sounds(&window, sound);
+            settle();
+            let at = |label: &str, role| {
+                let e = with_role(&window, label, role).absolute_position();
+                slint::LogicalPosition::new(e.x + 4.0, e.y + 4.0)
+            };
+            // The first tile drawn: the grid makes only the rows in view.
+            let first = ElementQuery::from_root(&window)
+                .match_accessible_role(AccessibleRole::RadioButton)
+                .find_first()
+                .expect("no tile")
+                .absolute_position();
+            let tile = slint::LogicalPosition::new(first.x + 4.0, first.y + 4.0);
+            let bar = at("Sounds", AccessibleRole::Tab);
+            assert!(tile.y < 520.0, "the first tile is below the window");
+            // The wheel over a tile: the gallery takes it if it scrolls, else the page does.
+            wheel(tile);
+            let by_tile = window.get_scroll_y() != 0.0;
+            // Over the sub-tabs only the page can take it.
+            wheel(bar);
+            let by_bar = window.get_scroll_y() != 0.0;
+            let what = format!("sound {sound}, daemon {daemon:?}, error {error:?}");
+            assert!(
+                !by_bar || by_tile,
+                "the page and the gallery both scroll: {what}"
+            );
+            if daemon.is_empty() && error.is_empty() {
+                assert!(!by_bar, "the page scrolls with no banner: {what}");
+            }
+        }
+    }
+}
+
+/// Hold items 19 and 20: the events are five cards in one row, and Off and Own file are a row of
+/// their own above the rest of the gallery.
+#[test]
+fn events_are_cards_and_off_and_own_file_are_the_first_row() {
+    let l = layout("first-row", None);
+    let window = open(&l, Page::Audio);
+    window
+        .window()
+        .set_size(slint::LogicalSize::new(1280.0, 860.0));
+    sounds(&window, 0);
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+    let y = |label: &str| {
+        with_role(&window, label, AccessibleRole::RadioButton)
+            .absolute_position()
+            .y
+    };
+    for event in ["Stop", "Text ready", "Cancel", "Error"] {
+        assert_eq!(y(event), y("Start"), "{event} is on the row of the cards");
+    }
+    assert_eq!(y("Off"), y("Own file"), "one row");
+    assert!(y("Off") > y("Start"), "below the event cards");
+    assert!(y("Hit 2") > y("Off"), "the gallery is below the first row");
+    assert_eq!(checked(&window, "Start"), Some(true));
+}
+
+/// Hold item 41: quiet recordings in the history make a boost suggestion on its row; Apply
+/// writes it and the suggestion goes. Nothing is written before Apply.
+#[test]
+fn a_suggestion_from_the_history_applies_only_on_apply() {
+    use oxi_core::audio::Levels;
+    use oxi_core::history::{Meta, Status};
+    use oxi_settings::AudioKey;
+    let l = layout("suggest", Some("version = 2\n"));
+    let day = l.history_dir().join("2026-11-13");
+    fs::create_dir_all(&day).unwrap();
+    for i in 0..12 {
+        let stem = format!("1000{i:02}-000");
+        let meta = Meta {
+            levels: Some(Levels {
+                peak_db: -36,
+                speech_db: -46,
+                floor_db: -70,
+                rumble_db: -40,
+                start_gap_ms: Some(300),
+                end_gap_ms: Some(300),
+                gain_db: Some(0),
+            }),
+            ..Meta::basic(
+                &format!("2026-11-13/{stem}"),
+                1000,
+                Status::Done,
+                "turbo",
+                "ru",
+            )
+        };
+        fs::write(day.join(format!("{stem}.json")), meta.to_json().unwrap()).unwrap();
+    }
+    let window = open(&l, Page::Audio);
+    let state = window.global::<AudioState>();
+    // The read runs on its own thread; the page's meter tick takes the answer.
+    for _ in 0..200 {
+        if !state.get_gain_tip().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(50));
+    }
+    assert_eq!(
+        state.get_gain_tip().as_str(),
+        "12 of your last 12 recordings were quiet. Raise the boost to +20 dB?"
+    );
+    assert_eq!(saved(&l).audio.gain_db, 0.0, "nothing changes unasked");
+    state.invoke_suggestion(AudioKey::Gain, true);
+    assert_eq!(saved(&l).audio.gain_db, 20.0);
+    assert_eq!(
+        state.get_gain_tip().as_str(),
+        "",
+        "applied: nothing left to suggest"
+    );
+    assert_eq!(
+        state.get_noise_tip().as_str(),
+        "",
+        "a quiet room: no noise change"
+    );
+
+    // The old numbers were heard at 0 dB: they say nothing about +20. New clipping ones at +20
+    // are seen only on "Check again".
+    for i in 0..12 {
+        let stem = format!("2000{i:02}-000");
+        let meta = Meta {
+            levels: Some(Levels {
+                peak_db: 0,
+                speech_db: -10,
+                floor_db: -70,
+                rumble_db: -40,
+                start_gap_ms: Some(300),
+                end_gap_ms: Some(300),
+                gain_db: Some(20),
+            }),
+            ..Meta::basic(
+                &format!("2026-11-13/{stem}"),
+                1000,
+                Status::Done,
+                "turbo",
+                "ru",
+            )
+        };
+        fs::write(day.join(format!("{stem}.json")), meta.to_json().unwrap()).unwrap();
+    }
+    assert_eq!(
+        state.get_gain_tip().as_str(),
+        "",
+        "not seen before it is asked"
+    );
+    state.invoke_recheck();
+    for _ in 0..200 {
+        if !state.get_gain_tip().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(50));
+    }
+    assert_eq!(
+        state.get_gain_tip().as_str(),
+        "12 of your last 12 recordings were too loud. Lower the boost to +14 dB?"
+    );
+}

@@ -1,0 +1,135 @@
+// Switch and radio dot: small selectable items, so selected = strong accent fill.
+import { Theme, Shell } from "../tokens.slint";
+import { FocusRing, KeyFocus } from "base.slint";
+
+// 40x20 track (one knob size, no scale) with the Fluent "On"/"Off" caption on its left. `locked` (read-only config) and
+// `enabled` both grey it out.
+export component Switch {
+    in-out property <bool> checked;
+    in property <bool> enabled: true;
+    in property <bool> locked: Shell.locked;
+    in property <bool> force-hover;
+    in property <bool> force-pressed;
+    in property <bool> force-focus;
+    callback toggled(bool);
+
+    property <bool> live: root.enabled && !root.locked;
+    property <bool> hover: root.live && (touch.has-hover || root.force-hover);
+    property <bool> down: root.live && (touch.pressed || root.force-pressed);
+    property <bool> key-focus;
+    out property <bool> key-focused: root.key-focus && fs.has-focus;
+    property <color> ink: !root.live ? Theme.text-disabled : root.checked ? Theme.accent : Theme.text-secondary;
+
+    // For a control that replaces the focused one: `ring` says if the keyboard did it (UI rule 17).
+    public function take-focus(ring: bool) {
+        fs.focus();
+        root.key-focus = ring;
+    }
+
+    public function toggle() {
+        if (root.live) {
+            root.checked = !root.checked;
+            root.toggled(root.checked);
+        }
+    }
+
+    accessible-role: switch;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-enabled: root.live;
+    accessible-action-default => {
+        root.toggle();
+    }
+    height: Theme.control-height;
+
+    HorizontalLayout {
+        spacing: Theme.space-3;
+        Text {
+            text: root.checked ? @tr("On") : @tr("Off");
+            font-size: Theme.body-size;
+            color: root.live ? Theme.text-secondary : Theme.text-disabled;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            min-width: Theme.switch-caption-width;
+            accessible-role: none;
+        }
+        // The track sits (32 - 20) / 2 = 6 px from the box's top and bottom (DS-10.1).
+        Rectangle {
+            width: Theme.switch-track-width;
+            track := Rectangle {
+                y: Theme.whole((root.height - self.height) / 2);
+                width: Theme.switch-track-width;
+                height: Theme.switch-track-height;
+                border-radius: Theme.radius-round;
+                background: root.checked ? (root.down ? Theme.accent-pressed : root.hover ? Theme.accent-hover : root.ink) : root.down ? Theme.bg-subtle-selected : root.hover ? Theme.bg-subtle-hover : transparent;
+                // 1 px hairline: the off track's outline.
+                border-width: root.checked ? 0 : 1px;
+                border-color: root.ink;
+                animate background, border-color { duration: Theme.motion-quick; easing: ease-out; }
+                // One size in every state: only its place and colour change (DS-5.4).
+                knob := Rectangle {
+                    width: Theme.switch-knob;
+                    height: Theme.switch-knob;
+                    border-radius: Theme.radius-round;
+                    x: root.checked ? parent.width - self.width - Theme.switch-knob-inset : Theme.switch-knob-inset;
+                    y: (parent.height - self.height) / 2;
+                    background: root.checked ? (root.live ? Theme.on-accent : Theme.bg-card) : root.ink;
+                    animate x, background { duration: Theme.motion-quick; easing: ease-out; }
+                }
+                FocusRing {
+                    shown: root.force-focus || root.key-focused;
+                    radius: Theme.radius-round;
+                }
+            }
+        }
+    }
+    // Exposed for the gallery's geometry readout: the track's top inside the box.
+    out property <length> track-y: track.y;
+    touch := TouchArea {
+        enabled: root.live;
+        mouse-cursor: pointer;
+        clicked => {
+            root.toggle();
+        }
+    }
+    fs := FocusScope {
+        enabled: root.live;
+        focus-on-click: false;
+        focus-gained(reason) => {
+            root.key-focus = KeyFocus.after(reason, root.key-focus);
+        }
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                root.toggle();
+                return accept;
+            }
+            reject
+        }
+    }
+}
+
+// The radio dot of a choice card (Model page): 16 px; selected = accent fill with an on-accent
+// centre. Visual only: the card around it carries the role and the click.
+export component Radio {
+    in property <bool> checked;
+    in property <bool> enabled: true;
+    in property <bool> hover;
+    width: Theme.radio-size;
+    height: Theme.radio-size;
+    accessible-role: none;
+    Rectangle {
+        border-radius: Theme.radius-round;
+        background: root.checked ? (root.enabled ? Theme.accent : Theme.text-disabled) : root.hover && root.enabled ? Theme.bg-subtle-hover : transparent;
+        // 1 px hairline: the empty radio's outline.
+        border-width: root.checked ? 0 : 1px;
+        border-color: root.enabled ? Theme.text-secondary : Theme.text-disabled;
+        animate background { duration: Theme.motion-quick; easing: ease-out; }
+        Rectangle {
+            visible: root.checked;
+            width: Theme.radio-dot;
+            height: self.width;
+            border-radius: Theme.radius-round;
+            background: Theme.on-accent;
+        }
+    }
+}

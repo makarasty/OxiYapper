@@ -1,5 +1,6 @@
 //! Shared primitives used by several crates; defined once, here.
 
+use crate::languages::{self, LanguageInfo};
 use serde::{Deserialize, Serialize};
 use std::ops::{Add, Sub};
 use std::str::FromStr;
@@ -30,52 +31,56 @@ impl Sub for Millis {
     }
 }
 
-/// Dictation language. [`Language::as_str`] is its one spelling: config, CLI and whisper.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(into = "&'static str", try_from = "String")]
-pub enum Language {
-    Ru,
-    En,
-    Auto,
-}
+/// Dictation language: `auto` or one code of the whisper table. One pointer, so it is `Copy`;
+/// the field is private, so only `auto` and table codes exist. [`Language::as_str`] is its one
+/// spelling: config, CLI and whisper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Language(&'static str);
 
 impl Language {
-    const ALL: [Self; 3] = [Self::Ru, Self::En, Self::Auto];
+    pub const AUTO: Self = Self("auto");
+    pub const RU: Self = Self("ru");
+    pub const EN: Self = Self("en");
 
     /// The config and CLI value, also whisper.cpp's language code.
     pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Ru => "ru",
-            Self::En => "en",
-            Self::Auto => "auto",
-        }
+        self.0
+    }
+
+    /// The table row; `None` for auto.
+    pub fn info(self) -> Option<&'static LanguageInfo> {
+        languages::find(self.0)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("expected ru, en or auto, got {0:?}")]
+#[error("unknown language code {0:?}: expected auto or a whisper code such as ru, en, zh")]
 pub struct UnknownLanguage(pub String);
 
 impl FromStr for Language {
     type Err = UnknownLanguage;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::ALL
-            .into_iter()
-            .find(|l| l.as_str() == s)
+        if s == Self::AUTO.0 {
+            return Ok(Self::AUTO);
+        }
+        languages::find(s)
+            .map(|i| Self(i.code))
             .ok_or_else(|| UnknownLanguage(s.to_owned()))
     }
 }
 
-impl TryFrom<String> for Language {
-    type Error = UnknownLanguage;
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        s.parse()
+// By hand: a derive would borrow the `&'static str` field from the input and demand `'de: 'static`.
+impl Serialize for Language {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.0)
     }
 }
 
-impl From<Language> for &'static str {
-    fn from(l: Language) -> Self {
-        l.as_str()
+impl<'de> Deserialize<'de> for Language {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        String::deserialize(d)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -101,9 +106,11 @@ mod tests {
     #[test]
     fn language_serde_lowercase() {
         for (lang, name) in [
-            (Language::Ru, "ru"),
-            (Language::En, "en"),
-            (Language::Auto, "auto"),
+            (Language::RU, "ru"),
+            (Language::EN, "en"),
+            (Language::AUTO, "auto"),
+            (Language("zh"), "zh"),
+            (Language("haw"), "haw"),
         ] {
             let json = serde_json::to_string(&lang).unwrap();
             assert_eq!(json, format!("\"{name}\""));
@@ -113,11 +120,17 @@ mod tests {
     }
 
     #[test]
-    fn language_parses_its_own_spelling_only() {
-        for lang in Language::ALL {
-            assert_eq!(lang.as_str().parse(), Ok(lang));
+    fn language_parses_auto_and_every_table_code_only() {
+        assert_eq!("auto".parse(), Ok(Language::AUTO));
+        assert_eq!(Language::AUTO.info(), None);
+        assert_eq!("ru".parse(), Ok(Language::RU));
+        assert_eq!("en".parse(), Ok(Language::EN));
+        for i in languages::LANGUAGES {
+            let lang: Language = i.code.parse().unwrap();
+            assert_eq!(lang.as_str(), i.code);
+            assert_eq!(lang.info(), Some(&i));
         }
-        for bad in ["", "de", "RU", " ru"] {
+        for bad in ["", "xx", "RU", " ru", "zho", "Auto"] {
             assert_eq!(bad.parse::<Language>(), Err(UnknownLanguage(bad.into())));
         }
     }

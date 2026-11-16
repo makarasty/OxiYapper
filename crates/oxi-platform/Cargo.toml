@@ -13,12 +13,33 @@ oxi-core.workspace = true
 cpal.workspace = true
 rtrb.workspace = true
 hound.workspace = true
+lewton.workspace = true
+ogg.workspace = true
+symphonia.workspace = true
 thiserror.workspace = true
 tiny-skia.workspace = true
 ab_glyph.workspace = true
 interprocess.workspace = true
 directories.workspace = true
 tracing.workspace = true
+
+# Win+V history: Clipboard.GetHistoryItemsAsync, DeleteItemFromHistory (Win10 1809+).
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+    "ApplicationModel_DataTransfer", # Clipboard, ClipboardHistoryItem, StandardDataFormats
+    "Foundation",                    # IAsyncOperation, DateTime
+    "Foundation_Collections",        # IVectorView
+    "Win32_System_Com",              # CoInitializeEx: the clipboard calls need a COM apartment; IBindCtx, CoTaskMemFree
+    "Win32_Media_Audio",             # IMMNotificationClient: a recording's endpoint unplugged or removed (capture/watch.rs)
+    "Win32_Foundation",              # HANDLE, the known-folder call's token
+    "Win32_Graphics_Dxgi",           # CreateDXGIFactory1, IDXGIAdapter1::GetDesc1: graphics memory for the model recommendation (sysinfo.rs)
+    "Win32_UI_Shell",                # SHGetKnownFolderItem, IShellItem, IEnumShellItems: the Store apps of shell:AppsFolder
+]
+
+# The crate `#[windows::core::implement]` expands to; same version as `windows`, already in the tree via cpal.
+[target.'cfg(windows)'.dependencies.windows-core]
+workspace = true
 
 # Each feature is the module of the listed API in windows-sys 0.61.2 (src/Windows/Win32/...).
 [target.'cfg(windows)'.dependencies.windows-sys]
@@ -28,14 +49,18 @@ features = [
     "Win32_Security",                  # GetTokenInformation, GetSidSubAuthority, SECURITY_ATTRIBUTES
     "Win32_Security_Authorization",    # ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW
     "Win32_Graphics_Gdi",              # CreateDIBSection, MonitorFromWindow, GetMonitorInfoW
-    "Win32_Storage_FileSystem",        # FILE_FLAGS_AND_ATTRIBUTES for CreateNamedPipeW
+    "Win32_Storage_FileSystem",        # FILE_FLAGS_AND_ATTRIBUTES for CreateNamedPipeW, GetDiskFreeSpaceExW
     "Win32_System_DataExchange",       # OpenClipboard, EnumClipboardFormats, GetClipboardData, SetClipboardData, EmptyClipboard, GetClipboardSequenceNumber, RegisterClipboardFormatW
+    "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot, Process32FirstW, Process32NextW: the process tree of a classic console
     "Win32_System_IO",                 # ConnectNamedPipe, OVERLAPPED (ReadFile/WriteFile sit in Win32_Storage_FileSystem)
+    "Win32_System_JobObjects",         # CreateJobObjectW, SetInformationJobObject, AssignProcessToJobObject: decoding children die with the daemon
     "Win32_System_LibraryLoader",      # GetModuleHandleW
     "Win32_System_Memory",             # GlobalAlloc, GlobalLock, GlobalSize
     "Win32_System_Ole",                # CF_UNICODETEXT
     "Win32_System_Pipes",              # CreateNamedPipeW
+    "Win32_System_Registry",           # RegGetValueW (light or dark taskbar)
     "Win32_System_RemoteDesktop",      # WTSRegisterSessionNotification
+    "Win32_System_SystemInformation",  # GetLocalTime, GlobalMemoryStatusEx
     "Win32_System_Threading",          # OpenProcess, QueryFullProcessImageNameW, OpenProcessToken
     "Win32_UI_HiDpi",                  # GetDpiForMonitor, SetProcessDpiAwarenessContext
     "Win32_UI_Input_KeyboardAndMouse", # SendInput, GetAsyncKeyState
@@ -45,7 +70,3 @@ features = [
 
 [lints]
 workspace = true
-
-# Added ahead of the task that uses them (wave 2 platform modules); remove the entry when it does.
-[package.metadata.cargo-machete]
-ignored = ["tiny-skia", "ab_glyph", "interprocess", "directories", "tracing", "windows-sys"]

@@ -1,0 +1,121 @@
+name: prerelease
+
+# Every commit on main that passes ci gets a pre-release `v<Cargo.toml version>-pre.<run>`, and
+# every other pre-release and its tag are deleted; a stable release is never touched here
+# (release.yml replaces it). Contract: docs/RELEASING.md.
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Queued, not cancelled: a publish half-way through its deletes must finish.
+concurrency:
+  group: prerelease
+  cancel-in-progress: false
+
+jobs:
+  version:
+    # `branches` matches a fork's PR branch named main too: only pushes to this repository.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      cargo_version: ${{ steps.version.outputs.cargo_version }}
+      version: ${{ steps.version.outputs.version }}
+      skip: ${{ steps.version.outputs.skip }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      # A pre-release of a version that has a stable release sorts below it (semver), so the
+      # updater would never offer it: skipped until Cargo.toml is bumped. So is a commit tagged as
+      # a stable release (its release.yml run publishes it).
+      - id: version
+        shell: bash
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          cargo_version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "oxi-yapper") | .version')
+          echo "cargo_version=$cargo_version" >> "$GITHUB_OUTPUT"
+          echo "version=$cargo_version-pre.$GITHUB_RUN_NUMBER" >> "$GITHUB_OUTPUT"
+          reason=$(git ls-remote --tags "https://github.com/$GITHUB_REPOSITORY" \
+            | bash scripts/release.sh pre-skip "$cargo_version" "$SHA")
+          if [ -n "$reason" ]; then
+            echo "::notice::no pre-release: $reason"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: version
+    if: needs.version.outputs.skip != 'true'
+    uses: ./.github/workflows/build-windows.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      ref: ${{ github.event.workflow_run.head_sha }}
+
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # id-token and attestations: build provenance, as release.yml (docs/ARCHITECTURE.md section 12).
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: v${{ needs.version.outputs.version }}
+      SHA: ${{ github.event.workflow_run.head_sha }}
+      CARGO_VERSION: ${{ needs.version.outputs.cargo_version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      # Again just before the create: a stable tag pushed during the build wins.
+      - name: Still no stable release of this version or commit
+        id: gate
+        shell: bash
+        run: |
+          reason=$(git ls-remote --tags "https://github.com/$GH_REPO" \
+            | bash scripts/release.sh pre-skip "$CARGO_VERSION" "$SHA")
+          if [ -n "$reason" ]; then
+            echo "::notice::no pre-release: $reason"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-x64
+          path: dist
+      - name: Checksums
+        if: steps.gate.outputs.skip != 'true'
+        working-directory: dist
+        run: sha256sum OxiYapper-* > SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        if: steps.gate.outputs.skip != 'true'
+        with:
+          subject-path: dist/*
+      # A tag made with GITHUB_TOKEN starts no workflow, so release.yml does not run for it.
+      - name: Create the pre-release
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          gh release create "$TAG" dist/* --target "$SHA" --prerelease --title "OxiYapper $TAG" \
+            --notes "Automatic pre-release of $SHA, built after ci passed on main."
+      # After the create, so there is never a moment with no pre-release.
+      - name: Delete the other pre-releases and their tags
+        if: steps.gate.outputs.skip != 'true'
+        shell: bash
+        run: |
+          gh release list --limit 1000 --json tagName,isPrerelease --jq '.[] | "\(.tagName) \(.isPrerelease)"' \
+            | bash scripts/release.sh prune "$TAG" \
+            | while read -r tag; do gh release delete "$tag" --cleanup-tag --yes; done

@@ -1,0 +1,217 @@
+// The horizontal sub-tabs under a page title (owner's variant A, 2026-11-08) and the pane that
+// holds one sub-tab's content. The mockup leaves 12 px above the bar and 24 px below it; the page
+// sets that with its own spacing.
+import { Theme } from "../tokens.slint";
+import { FocusRing, KeyFocus } from "base.slint";
+
+// Text tabs on one divider (DS-14): no fill, the first label at x 0 and every label's centre at y 20,
+// 24 px apart; the open one is semibold with a 2 px accent underline flush with the bar's bottom. Left/Right
+// and Home/End switch at once, Tab leaves the bar. One-way like the pickers: `picked` fires, the
+// owner updates `selected`. Navigation only, so a locked config does not lock it.
+export component SubTabs {
+    in property <[string]> items;
+    in property <int> selected;
+    // A badge after the label, parallel to `items`; negative or missing: none. 0 shows (muted), so
+    // the first item added or the last removed does not widen or narrow the tab.
+    in property <[int]> counts;
+    // Gallery: the tab drawn hovered and pressed (-1: none).
+    in property <int> force-hover: -1;
+    in property <int> force-pressed: -1;
+    in property <bool> force-focus;
+    // Test surface: the focus ring is drawn on the open tab.
+    out property <bool> ring: root.force-focus || (root.key-focus && fs.has-focus);
+    callback picked(int);
+
+    property <bool> key-focus;
+
+    function pick(i: int) {
+        if (i >= 0 && i < root.items.length && i != root.selected) {
+            root.picked(i);
+        }
+    }
+
+    // As tall as the header row of a page without tabs, so both line up with the first rail item.
+    height: Theme.header-row-height;
+    // Pages read `tabs.preferred-height` to size what is under the bar: it is the bar's height.
+    preferred-height: Theme.header-row-height;
+    vertical-stretch: 0;
+    // The tab line spans the whole content width, card edge to card edge (DS-14.2 [24]).
+    horizontal-stretch: 1;
+    accessible-role: tab-list;
+
+    // Before the tabs: the underline lies on top of it (1 px hairline).
+    Rectangle {
+        y: root.height - self.height;
+        height: 1px;
+        background: Theme.divider;
+    }
+    HorizontalLayout {
+        // Each tab's hit area is its label plus `space-3` each side (DS-14), so labels are `tab-gap`
+        // apart; shifted left by the first tab's lead, its text is at x 0.
+        x: -Theme.space-3;
+        spacing: 0;
+        alignment: start;
+        for item[i] in root.items: item-box := Rectangle {
+            property <bool> on: i == root.selected;
+            property <bool> hover: touch.has-hover || root.force-hover == i;
+            property <bool> down: touch.pressed || root.force-pressed == i;
+            // The 12 px hit area left of the label; the first tab's overhangs the bar (below).
+            property <length> lead: Theme.space-3;
+            // Short of room the labels stay whole; the side padding is part of the box.
+            min-width: content.preferred-width;
+            preferred-width: content.preferred-width;
+            accessible-role: tab;
+            accessible-label: item;
+            // The count, so a screen reader hears it too.
+            accessible-description: i < root.counts.length && root.counts[i] >= 0 ? "\{root.counts[i]}" : "";
+            accessible-item-selectable: true;
+            accessible-item-selected: self.on;
+            accessible-action-default => {
+                root.pick(i);
+            }
+            content := HorizontalLayout {
+                padding-left: item-box.lead;
+                // Label centre at y 20 of the 40 px bar (DS-14).
+                padding-right: Theme.space-3;
+                spacing: Theme.tab-count-gap;
+                alignment: start;
+                // Always as wide as the semibold label, so opening a tab moves nothing.
+                Rectangle {
+                    width: strong.preferred-width;
+                    strong := Text {
+                        height: 100%;
+                        vertical-alignment: center;
+                        text: item;
+                        font-size: Theme.body-size;
+                        font-weight: Theme.weight-strong;
+                        color: Theme.text-primary;
+                        opacity: item-box.on ? 1 : 0;
+                        animate opacity { duration: Theme.motion-quick; easing: ease-out; }
+                        accessible-role: none;
+                    }
+                    Text {
+                        width: 100%;
+                        height: 100%;
+                        vertical-alignment: center;
+                        text: item;
+                        font-size: Theme.body-size;
+                        color: item-box.hover ? Theme.text-primary : Theme.text-secondary;
+                        horizontal-alignment: center;
+                        opacity: item-box.on ? 0 : 1;
+                        animate opacity, color { duration: Theme.motion-quick; easing: ease-out; }
+                        accessible-role: none;
+                    }
+                }
+                // The count as a pill badge (owner item 31): at least two digits wide and shown
+                // at 0 too, so 0 -> 1 -> 12 moves nothing and the underline always covers it.
+                if i < root.counts.length && root.counts[i] >= 0: Rectangle {
+                    width: max(2, count.text.character-count) * zero.preferred-width + 2 * Theme.space-2;
+                    // Muted at 0: nothing to count yet, the width stays.
+                    opacity: root.counts[i] == 0 ? 0.6 : 1;
+                    badge := Rectangle {
+                        y: (parent.height - self.height) / 2;
+                        height: Theme.badge-height;
+                        border-radius: Theme.radius-round;
+                        background: Theme.bg-inset;
+                        count := Text {
+                            text: root.counts[i];
+                            font-size: Theme.caption-size;
+                            color: item-box.on || item-box.hover ? Theme.text-primary : Theme.text-secondary;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            accessible-role: none;
+                        }
+                    }
+                }
+            }
+            // The underline fades with the selection, no slide or scale (DS-5.5); it covers the
+            // 1 px tab line.
+            underline := Rectangle {
+                opacity: parent.on ? 1 : 0;
+                animate opacity { duration: Theme.motion-quick; easing: ease-out; }
+                // The label and its badge (DS-14), flush with the bottom.
+                x: item-box.lead;
+                y: parent.height - Theme.tab-underline;
+                width: content.preferred-width - item-box.lead - Theme.space-3;
+                height: Theme.tab-underline;
+                border-radius: Theme.radius-small;
+                background: Theme.accent;
+            }
+            FocusRing {
+                shown: parent.on && root.ring;
+            }
+            touch := TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    fs.focus();
+                    // After `focus()`: its reason is not a pointer click, and this was one.
+                    root.key-focus = false;
+                    root.pick(i);
+                }
+            }
+        }
+    }
+    zero := Text {
+        visible: false;
+        text: "0";
+        font-size: Theme.caption-size;
+        accessible-role: none;
+    }
+    fs := FocusScope {
+        focus-on-click: false;
+        focus-gained(reason) => {
+            root.key-focus = KeyFocus.after(reason, root.key-focus);
+        }
+        key-pressed(event) => {
+            if (event.text == Key.LeftArrow) {
+                root.pick(root.selected - 1);
+                return accept;
+            }
+            if (event.text == Key.RightArrow) {
+                root.pick(root.selected + 1);
+                return accept;
+            }
+            if (event.text == Key.Home) {
+                root.pick(0);
+                return accept;
+            }
+            if (event.text == Key.End) {
+                root.pick(root.items.length - 1);
+                return accept;
+            }
+            reject
+        }
+    }
+}
+
+// One sub-tab's content. A page stacks its panes in one plain `Rectangle` under the bar. A pane
+// stays built while hidden, so its scroll position, cursor and unsaved text survive (an `if` would
+// drop them), it leaves the Tab order, and it asks for no room, so the tallest hidden tab cannot
+// bring back the page scroll. Children stretch; nest a `VerticalLayout { alignment: start; }` for
+// cards that keep their height.
+// shortcut: focus inside a pane stays there if the owner switches `shown` from code (a click or the
+// bar's keys move it to the bar first), give the pane a focus target when a page does that.
+export component SubTabPane {
+    in property <bool> shown;
+    visible: self.shown;
+    width: 100%;
+    height: 100%;
+    accessible-role: tab-panel;
+    // The pane's size request: the content's while shown, none while hidden.
+    Rectangle {
+        min-width: root.shown ? body.min-width : 0;
+        min-height: root.shown ? body.min-height : 0;
+        preferred-width: root.shown ? body.preferred-width : 0;
+        preferred-height: root.shown ? body.preferred-height : 0;
+        max-width: root.shown ? body.max-width : 100000px;
+        max-height: root.shown ? body.max-height : 100000px;
+    }
+    // Placed by hand: a child the compiler sizes would add its own minimum back to the pane.
+    body := VerticalLayout {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        @children
+    }
+}

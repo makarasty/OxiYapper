@@ -1,8 +1,64 @@
 use super::denoise::Denoiser;
+use super::levels::{Biquad, LevelStats, Levels, RUMBLE_HZ};
 use super::resample::StreamResampler;
-use super::trim::Gate;
+use super::speech::SpeechDetector;
+use super::trim::{Gate, SPEECH_FRAMES, to_samples};
 use super::{AudioError, DENOISE_RATE, Level, SAMPLE_RATE, db_to_linear, level, normalise};
-use crate::config::Audio;
+use crate::config::{Audio, Noise};
+use crate::types::Millis;
+use std::collections::VecDeque;
+
+/// What the speech gate did to a finished recording.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Trim {
+    /// The gate found the voiced span; the silence around it (past the padding) is cut.
+    Cut,
+    /// The gate found too little voice but the level heard speech: the whole audio is kept.
+    Skipped,
+    /// `audio.trim` is off: no gate ran.
+    #[default]
+    Off,
+}
+
+/// Where the voice sits in a recording, for the log (never the audio itself). All zero or `None`
+/// with the trim off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EdgeStats {
+    /// The whole recording at 16 kHz, before the cut.
+    pub audio_ms: u64,
+    /// Time the gate scored as voice.
+    pub voiced_ms: u64,
+    /// From the first sample to the first voice: under 60 ms the user spoke before the mic was ready.
+    pub first_voiced_ms: Option<u64>,
+    /// From the last voice to the last sample: under 60 ms the tail cut the speech.
+    pub last_voiced_to_end_ms: Option<u64>,
+    /// Peak, speech, room and rumble of the recording (after the boost, before the rest), and
+    /// the two gaps above: the numbers a history entry keeps.
+    pub levels: Levels,
+}
+
+/// A finished recording: the clip for whisper and what the gate saw.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Finished {
+    pub samples: Vec<f32>,
+    pub trim: Trim,
+    pub stats: EdgeStats,
+}
+
+/// What has told a [`Pipeline`] the user speaks so far; a later, stronger sign replaces a weaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Heard {
+    Nothing,
+    /// The gate scored [`SPEECH_FRAMES`] of voice in a row.
+    Voice,
+    /// The level detector fired (over -40 dBFS for 80 ms).
+    Loud,
+}
+
+/// Milliseconds of `n` samples at 16 kHz.
+fn ms(n: usize) -> u64 {
+    n as u64 * 1000 / u64::from(SAMPLE_RATE)
+}
 
 /// The whole DSP chain for one dictation, steps 3-7 of ARCHITECTURE section 9.
 ///
@@ -12,13 +68,24 @@ use crate::config::Audio;
 /// key-up only flushes the last chunk, cuts and normalises.
 pub struct Pipeline {
     gain: f32,
-    /// Device rate to 48 kHz, then `RNNoise`, when denoise is on.
-    denoise: Option<(StreamResampler, Denoiser)>,
+    /// The boost as set, whole dB, kept with the loudness numbers.
+    gain_db: i16,
+    /// "Cut low rumble": a high-pass at the device rate, when on.
+    rumble: Option<Biquad>,
+    /// The loudness numbers, read from the boosted input.
+    stats: LevelStats,
+    /// Device rate to 48 kHz, then `RNNoise` and its blend, when denoise is on.
+    denoise: Option<(StreamResampler, Blend)>,
     to_16k: StreamResampler,
     gate: Option<Gate>,
     normalize: bool,
     /// Any non-zero input sample so far.
     heard: bool,
+    in_rate: u32,
+    /// Input samples so far: the clock of the level detector.
+    in_samples: u64,
+    level: SpeechDetector,
+    speech: Heard,
     out: Vec<f32>,
 }
 
@@ -28,59 +95,147 @@ impl Pipeline {
     /// # Errors
     /// [`AudioError::Resample`] for a rate of zero.
     pub fn new(in_rate: u32, opts: &Audio) -> Result<Self, AudioError> {
-        let denoise = if opts.denoise {
+        let noise = opts.noise();
+        let denoise = if noise == Noise::Off {
+            None
+        } else {
             Some((
                 StreamResampler::new(in_rate, DENOISE_RATE)?,
-                Denoiser::new(),
+                Blend::new(noise),
             ))
-        } else {
-            None
         };
-        let from = if opts.denoise { DENOISE_RATE } else { in_rate };
+        let from = if denoise.is_some() {
+            DENOISE_RATE
+        } else {
+            in_rate
+        };
         #[allow(
             clippy::cast_possible_truncation,
             reason = "a gain of a few dB fits f32 with room to spare"
         )]
         let gain = db_to_linear(opts.gain_db as f32);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "clamped to a range i16 holds"
+        )]
+        let gain_db = opts.gain_db.round().clamp(-120.0, 120.0) as i16;
         Ok(Self {
             gain,
+            gain_db,
+            rumble: opts
+                .cut_rumble
+                .then(|| Biquad::high_pass(in_rate, RUMBLE_HZ)),
+            stats: LevelStats::new(in_rate),
             denoise,
             to_16k: StreamResampler::new(from, SAMPLE_RATE)?,
-            gate: opts.trim.then(Gate::new),
+            gate: opts.trim.then(|| Gate::new(opts.vad_sensitivity)),
             normalize: opts.normalize,
             heard: false,
+            in_rate,
+            in_samples: 0,
+            level: SpeechDetector::new(),
+            speech: Heard::Nothing,
             out: Vec::new(),
         })
     }
 
-    /// Add mono samples; returns their level after gain, for the meter.
+    /// Add mono samples; returns their level after gain, for the meter. Push in windows of
+    /// [`super::CHUNK`] (as capture does): the level detector judges each push as one window.
     ///
     /// # Errors
     /// [`AudioError::Resample`] if rubato rejects a buffer.
     pub fn push(&mut self, mono: &[f32]) -> Result<Level, AudioError> {
-        let gained: Vec<f32> = mono.iter().map(|s| s * self.gain).collect();
+        let mut gained: Vec<f32> = mono.iter().map(|s| s * self.gain).collect();
         self.heard |= gained.iter().any(|&s| s != 0.0);
+        self.stats.feed(&gained);
+        let level = level(&gained);
+        if let Some(hp) = &mut self.rumble {
+            for s in &mut gained {
+                *s = hp.step(*s);
+            }
+        }
         let at_16k = match &mut self.denoise {
-            Some((to_48k, rnn)) => self.to_16k.push(&rnn.push(&to_48k.push(&gained)?))?,
+            Some((to_48k, blend)) => self.to_16k.push(&blend.push(&to_48k.push(&gained)?))?,
             None => self.to_16k.push(&gained)?,
         };
         self.append(&at_16k);
-        Ok(level(&gained))
+        self.in_samples += mono.len() as u64;
+        let now = Millis(self.in_samples * 1000 / u64::from(self.in_rate));
+        if self.level.feed(level, now) {
+            self.speech = Heard::Loud;
+        }
+        Ok(level)
+    }
+
+    /// True once the user is heard speaking: the level was over -40 dBFS for 80 ms, or the gate
+    /// scored 80 ms of voice in a row (a quiet voice under the level). Never goes back to false.
+    #[must_use]
+    pub fn speech_started(&self) -> bool {
+        self.speech != Heard::Nothing
+    }
+
+    /// True when the gate scored at least one frame as voice, however short: a hint of speech.
+    /// Ask before [`Pipeline::finish_with_stats`] (which consumes the pipeline); the unflushed
+    /// tail is under one gate frame.
+    #[must_use]
+    pub fn voice_seen(&self) -> bool {
+        self.gate.as_ref().is_some_and(Gate::any_voice)
     }
 
     /// Key-up: the 16 kHz clip for whisper.
     ///
     /// # Errors
+    /// As [`Pipeline::finish_with_stats`].
+    pub fn finish(self) -> Result<Vec<f32>, AudioError> {
+        self.finish_with_stats().map(|f| f.samples)
+    }
+
+    /// Key-up: the 16 kHz clip for whisper, with what the gate did and saw. When the gate finds
+    /// too little voice but the level heard speech, the whole audio is kept ([`Trim::Skipped`]):
+    /// a recording the user was heard in is never thrown away by the trim.
+    ///
+    /// # Errors
     /// [`AudioError::MicSilence`] for all-zero input, checked first; then
-    /// [`AudioError::NothingHeard`] from the speech gate; [`AudioError::Resample`] from the flush.
-    pub fn finish(mut self) -> Result<Vec<f32>, AudioError> {
+    /// [`AudioError::NothingHeard`] when the gate found too little voice and the level never
+    /// fired; [`AudioError::Resample`] from the flush.
+    pub fn finish_with_stats(mut self) -> Result<Finished, AudioError> {
         self.flush()?;
         if !self.heard {
             return Err(AudioError::MicSilence);
         }
-        let keep = match &self.gate {
-            Some(gate) => gate.span(self.out.len())?,
-            None => 0..self.out.len(),
+        let len = self.out.len();
+        let (keep, trim, mut stats) = match &self.gate {
+            Some(gate) => {
+                let (keep, trim) = match gate.span(len) {
+                    Ok(keep) => (keep, Trim::Cut),
+                    Err(_) if self.speech >= Heard::Voice => (0..len, Trim::Skipped),
+                    Err(e) => return Err(e),
+                };
+                let runs: Vec<_> = gate.runs().iter().map(to_samples).collect();
+                let stats = EdgeStats {
+                    audio_ms: ms(len),
+                    voiced_ms: runs.iter().map(|r| ms(r.len())).sum(),
+                    first_voiced_ms: runs.first().map(|r| ms(r.start)),
+                    last_voiced_to_end_ms: runs.last().map(|r| ms(len.saturating_sub(r.end))),
+                    levels: Levels::default(),
+                };
+                (keep, trim, stats)
+            }
+            None => (
+                0..len,
+                Trim::Off,
+                EdgeStats {
+                    audio_ms: ms(len),
+                    ..EdgeStats::default()
+                },
+            ),
+        };
+        let gap = |v: Option<u64>| v.map(|ms| u32::try_from(ms).unwrap_or(u32::MAX));
+        stats.levels = Levels {
+            start_gap_ms: gap(stats.first_voiced_ms),
+            end_gap_ms: gap(stats.last_voiced_to_end_ms),
+            gain_db: Some(self.gain_db),
+            ..self.stats.levels()
         };
         let mut clip = self.out;
         clip.truncate(keep.end);
@@ -88,15 +243,18 @@ impl Pipeline {
         if self.normalize {
             normalise(&mut clip);
         }
-        Ok(clip)
+        Ok(Finished {
+            samples: clip,
+            trim,
+            stats,
+        })
     }
 
     /// Push what is still inside the resamplers and the denoiser through.
     fn flush(&mut self) -> Result<(), AudioError> {
         let mut tail = match &mut self.denoise {
-            Some((to_48k, rnn)) => {
-                let mut at_48k = rnn.push(&to_48k.finish()?);
-                at_48k.extend(rnn.finish());
+            Some((to_48k, blend)) => {
+                let at_48k = blend.finish(&to_48k.finish()?);
                 self.to_16k.push(&at_48k)?
             }
             None => Vec::new(),
@@ -110,11 +268,87 @@ impl Pipeline {
         self.out.extend_from_slice(at_16k);
         if let Some(gate) = &mut self.gate {
             gate.feed(&self.out);
+            if gate.run >= SPEECH_FRAMES {
+                self.speech = self.speech.max(Heard::Voice);
+            }
         }
     }
 }
 
-/// A whole recording in one call (bench): `mono` at `in_rate` through a [`Pipeline`].
+/// Samples `RNNoise` holds back: its output at index `i` is the input at `i - DENOISE_LAG`
+/// (measured: `blend_lines_up_with_the_denoiser`). The original is delayed as much before the
+/// mix, or the blend would add a comb filter.
+const DENOISE_LAG: usize = 480;
+/// Auto listens this long (at 48 kHz) to the room before it picks a strength: the pause before
+/// speech.
+const AUTO_PROBE: usize = DENOISE_RATE as usize * 3 / 10;
+
+/// `RNNoise` and its share of the mix ([`Noise::mix`]): Strong is the cleaned signal alone,
+/// Light and Medium blend it with the original, Auto picks one of them from the first 300 ms.
+struct Blend {
+    rnn: Denoiser,
+    /// The original at 48 kHz, delayed by [`DENOISE_LAG`].
+    dry: VecDeque<f32>,
+    /// `None` while Auto still listens.
+    mix: Option<f32>,
+    /// Auto, until it decides: (cleaned, original) pairs not mixed yet, and the room's levels.
+    held: Vec<(f32, f32)>,
+    probe: LevelStats,
+    probed: usize,
+}
+
+impl Blend {
+    fn new(noise: Noise) -> Self {
+        Self {
+            rnn: Denoiser::new(),
+            dry: VecDeque::from(vec![0.0; DENOISE_LAG]),
+            mix: noise.mix(),
+            held: Vec::new(),
+            probe: LevelStats::new(DENOISE_RATE),
+            probed: 0,
+        }
+    }
+
+    /// 48 kHz in; the mix of the frames done so far out (nothing while Auto still listens).
+    fn push(&mut self, at_48k: &[f32]) -> Vec<f32> {
+        self.dry.extend(at_48k);
+        if self.mix.is_none() {
+            self.probe.feed(at_48k);
+            self.probed += at_48k.len();
+        }
+        let wet = self.rnn.push(at_48k);
+        self.mix_out(&wet, self.probed >= AUTO_PROBE)
+    }
+
+    /// The rest of the input and the last partial frame; Auto decides now if it has not yet.
+    fn finish(&mut self, at_48k: &[f32]) -> Vec<f32> {
+        let mut out = self.push(at_48k);
+        let wet = self.rnn.finish();
+        out.extend(self.mix_out(&wet, true));
+        out
+    }
+
+    fn mix_out(&mut self, wet: &[f32], decide: bool) -> Vec<f32> {
+        let dry = &mut self.dry;
+        self.held
+            .extend(wet.iter().map(|&w| (w, dry.pop_front().unwrap_or(0.0))));
+        if self.mix.is_none() && decide {
+            self.mix = Noise::for_floor(self.probe.levels().floor_db).mix();
+        }
+        let Some(m) = self.mix else {
+            return Vec::new();
+        };
+        // `w * 1 + d * 0` is `w` exactly: Strong stays the old full denoise, bit for bit.
+        self.held
+            .drain(..)
+            .map(|(w, d)| w * m + d * (1.0 - m))
+            .collect()
+    }
+}
+
+/// A whole recording in one call (bench, the recognition test): `mono` at `in_rate` through a
+/// [`Pipeline`] in one push, so the level detector never fires and the gate alone decides
+/// "nothing heard", as before (bench numbers stay comparable).
 ///
 /// # Errors
 /// As [`Pipeline::new`] and [`Pipeline::finish`].
@@ -150,5 +384,328 @@ mod tests {
         p.flush().unwrap();
         let in_finish = p.gate.as_ref().unwrap().frames - before;
         assert!(in_finish <= 4, "{in_finish} frames scored at key-up");
+    }
+
+    /// 2 s of a voice-like 48 kHz signal: harmonics of 150 Hz in 4 Hz syllables.
+    fn voice48() -> Vec<f32> {
+        let rate = 48_000.0;
+        (0..96_000)
+            .map(|i| {
+                let t = i as f32 / rate;
+                let env = (TAU * 4.0 * t).sin().max(0.0);
+                let tone: f32 = (1..30)
+                    .map(|h| (TAU * 150.0 * h as f32 * t).sin() / h as f32)
+                    .sum();
+                0.2 * env * tone
+            })
+            .collect()
+    }
+
+    #[test]
+    fn blend_lines_up_with_the_denoiser() {
+        let input = voice48();
+        let out = Denoiser::new().push(&input);
+        let score = |lag: usize| -> f32 {
+            (lag..out.len())
+                .map(|i| out[i] * input[i - lag])
+                .sum::<f32>()
+        };
+        let best = (0..1500).max_by(|&a, &b| score(a).total_cmp(&score(b)));
+        // The peak of a band-limited signal sits within a sample or two (479 measured): 2
+        // samples at 48 kHz put the blend's first comb notch at 12 kHz, past what whisper gets.
+        let best = best.unwrap();
+        assert!(best.abs_diff(DENOISE_LAG) <= 2, "lag {best}");
+    }
+
+    #[test]
+    fn strong_is_the_denoiser_alone_and_light_keeps_more_of_the_original() {
+        let input = voice48();
+        let plain = Denoiser::new().push(&input);
+        assert_eq!(Blend::new(Noise::Strong).push(&input), plain);
+        let light = Blend::new(Noise::Light).push(&input);
+        assert_eq!(light.len(), plain.len());
+        // Lined up with the original, the light blend is much closer to it than the cleaned one.
+        let off = |x: &[f32]| -> f32 {
+            (DENOISE_LAG..x.len())
+                .map(|i| (x[i] - input[i - DENOISE_LAG]).powi(2))
+                .sum()
+        };
+        assert!(
+            off(&light) < off(&plain) * 0.5,
+            "{} vs {}",
+            off(&light),
+            off(&plain)
+        );
+    }
+
+    #[test]
+    fn auto_listens_to_the_room_then_picks_a_strength() {
+        let noise = |amp: f32| -> Vec<f32> {
+            // A fixed pseudo-random hiss: no dependency, same every run.
+            let mut x = 1u32;
+            (0..24_000)
+                .map(|_| {
+                    x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    amp * ((x >> 8) as f32 / (1 << 23) as f32 - 1.0)
+                })
+                .collect()
+        };
+        let mut quiet = Blend::new(Noise::Auto);
+        assert!(
+            quiet.push(&noise(0.0001)[..4800]).is_empty(),
+            "holds while it listens"
+        );
+        quiet.push(&noise(0.0001)[4800..]);
+        assert_eq!(quiet.mix, Some(0.0), "a quiet room gets no cleaning");
+        let mut loud = Blend::new(Noise::Auto);
+        let out = loud.push(&noise(0.05));
+        assert_eq!(loud.mix, Noise::Medium.mix(), "a noisy room gets a blend");
+        assert!(!out.is_empty(), "what was held comes out at once");
+        let mut short = Blend::new(Noise::Auto);
+        let tail = short.finish(&noise(0.05)[..2000]);
+        assert!(
+            short.mix.is_some() && !tail.is_empty(),
+            "a short clip decides at the end"
+        );
+    }
+
+    #[test]
+    fn rumble_cut_and_levels_come_out_of_the_pipeline() {
+        let rate = 16_000;
+        let clip: Vec<f32> = (0..rate)
+            .map(|i| {
+                let t = i as f32 / rate as f32;
+                0.25 * (TAU * 40.0 * t).sin() + 0.25 * (TAU * 300.0 * t).sin()
+            })
+            .collect();
+        let run = |cut_rumble| {
+            let opts = Audio {
+                cut_rumble,
+                trim: false,
+                normalize: false,
+                ..Audio::default()
+            };
+            let mut p = Pipeline::new(rate, &opts).unwrap();
+            p.push(&clip).unwrap();
+            p.finish_with_stats().unwrap()
+        };
+        let (plain, cut) = (run(false), run(true));
+        let energy = |s: &[f32]| s.iter().map(|x| x * x).sum::<f32>();
+        assert!(energy(&cut.samples) < energy(&plain.samples) * 0.7);
+        // Levels are read before the cut: the same numbers either way.
+        assert_eq!(plain.stats.levels, cut.stats.levels);
+        let l = plain.stats.levels;
+        assert!((-7..=-5).contains(&l.peak_db), "{l:?}");
+        assert!(l.rumble_db > -6, "half the energy is at 40 Hz: {l:?}");
+        assert_eq!((l.start_gap_ms, l.end_gap_ms), (None, None), "trim off");
+    }
+}
+
+/// Synthetic signals at 16 kHz (ARCHITECTURE section 4.4 of the run plan): 300 Hz tones, which
+/// earshot scores as voice, white noise, silence.
+#[cfg(test)]
+mod signals {
+    use super::*;
+    use crate::audio::speech::{DETECTOR_LATENCY, GATE_REPORT_MAX, REPORT_OVERHEAD};
+    use crate::audio::{CHUNK_SAMPLES, voiced_runs};
+    use crate::config::VadSensitivity;
+    use std::f32::consts::TAU;
+
+    const MS: usize = SAMPLE_RATE as usize / 1000;
+
+    fn opts() -> Audio {
+        Audio {
+            denoise: false,
+            ..Audio::default()
+        }
+    }
+
+    /// Peak of a sine with an RMS of `dbfs`.
+    fn sine_amp(dbfs: f32) -> f32 {
+        db_to_linear(dbfs) * 2.0_f32.sqrt()
+    }
+
+    fn tone(ms: usize, dbfs: f32) -> Vec<f32> {
+        let amp = sine_amp(dbfs);
+        (0..ms * MS)
+            .map(|i| amp * (TAU * 300.0 * i as f32 / SAMPLE_RATE as f32).sin())
+            .collect()
+    }
+
+    /// Deterministic uniform white noise with an RMS of `dbfs`.
+    fn noise(ms: usize, dbfs: f32) -> Vec<f32> {
+        let amp = db_to_linear(dbfs) * 3.0_f32.sqrt();
+        let mut state = 12345_u32;
+        (0..ms * MS)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                amp * ((state >> 8) as f32 / (1 << 23) as f32 - 1.0)
+            })
+            .collect()
+    }
+
+    fn silence(ms: usize) -> Vec<f32> {
+        noise(ms, -70.0)
+    }
+
+    /// Pushed in 20 ms windows as capture does; also the input time (ms) when speech was first
+    /// reported.
+    fn record(parts: &[Vec<f32>], opts: &Audio) -> (Pipeline, Option<usize>) {
+        let s = parts.concat();
+        let mut p = Pipeline::new(SAMPLE_RATE, opts).unwrap();
+        let mut heard_at = None;
+        for (i, window) in s.chunks(CHUNK_SAMPLES).enumerate() {
+            p.push(window).unwrap();
+            if heard_at.is_none() && p.speech_started() {
+                heard_at = Some((i + 1) * 20);
+            }
+        }
+        (p, heard_at)
+    }
+
+    #[test]
+    fn audio_quiet_short_phrase_is_heard_and_kept() {
+        // 300 ms at -45 dBFS: under the level detector, the gate alone hears it.
+        let (p, heard_at) = record(&[silence(1000), tone(300, -45.0), silence(1000)], &opts());
+        let at = heard_at.expect("speech heard");
+        let after = at - 1000;
+        assert!(
+            after as u64 <= GATE_REPORT_MAX.0,
+            "heard {after} ms after the start"
+        );
+        // The machine waits DETECTOR_LATENCY for a cancel: the report plus its transport fits.
+        assert!(after as u64 + REPORT_OVERHEAD.0 <= DETECTOR_LATENCY.0);
+        let f = p.finish_with_stats().unwrap();
+        assert_eq!(f.trim, Trim::Cut);
+        assert!(f.samples.len() >= 300 * MS, "{}", f.samples.len());
+    }
+
+    #[test]
+    fn audio_quiet_short_word_the_machine_heard_is_kept_whole() {
+        // 200 ms at -45 dBFS: the gate reports speech (SpeechHeard is sent) but its voiced
+        // total is under the 250 ms minimum. A recording announced as speech is never dropped.
+        let (p, heard_at) = record(&[silence(1000), tone(200, -45.0), silence(1000)], &opts());
+        assert!(heard_at.is_some(), "the gate hears it");
+        let f = p.finish_with_stats().unwrap();
+        assert_eq!(f.trim, Trim::Skipped);
+        assert!(f.samples.len().abs_diff(2200 * MS) <= CHUNK_SAMPLES);
+    }
+
+    #[test]
+    fn audio_loud_non_voice_is_kept_whole() {
+        let (p, heard_at) = record(&[silence(500), noise(500, -30.0), silence(500)], &opts());
+        assert!(heard_at.is_some(), "the level hears it");
+        let f = p.finish_with_stats().unwrap();
+        assert_eq!(f.trim, Trim::Skipped);
+        assert!(
+            f.samples.len().abs_diff(1500 * MS) <= CHUNK_SAMPLES,
+            "{}",
+            f.samples.len()
+        );
+    }
+
+    #[test]
+    fn audio_voice_seen_tells_a_hint_from_nothing() {
+        let hint = |parts: &[Vec<f32>]| record(parts, &opts()).0;
+        // Noise floor: no frame scores as voice.
+        let p = hint(&[silence(2000)]);
+        assert!(!p.voice_seen());
+        assert!(matches!(
+            p.finish_with_stats(),
+            Err(AudioError::NothingHeard)
+        ));
+        // Borderline: 30 ms of quiet tone, short of a 5-frame run, does not count but scored voice.
+        let p = hint(&[silence(500), tone(30, -45.0), silence(500)]);
+        assert!(p.voice_seen());
+        assert!(matches!(
+            p.finish_with_stats(),
+            Err(AudioError::NothingHeard)
+        ));
+        // The quiet one-word case: heard, so kept whole.
+        let p = hint(&[silence(1000), tone(200, -45.0), silence(1000)]);
+        assert!(p.voice_seen());
+        assert!(p.finish_with_stats().is_ok());
+    }
+
+    #[test]
+    fn audio_silence_is_nothing_heard() {
+        let (p, heard_at) = record(&[silence(2000)], &opts());
+        assert_eq!(heard_at, None);
+        assert!(matches!(
+            p.finish_with_stats(),
+            Err(AudioError::NothingHeard)
+        ));
+    }
+
+    #[test]
+    fn audio_long_pause_keeps_one_span() {
+        let parts = [
+            silence(500),
+            tone(400, -20.0),
+            silence(3000),
+            tone(400, -20.0),
+            silence(500),
+        ];
+        let (p, _) = record(&parts, &opts());
+        let f = p.finish_with_stats().unwrap();
+        assert_eq!(f.trim, Trim::Cut);
+        assert!(
+            f.samples.len() >= 3800 * MS,
+            "pause cut: {}",
+            f.samples.len()
+        );
+        assert!(f.stats.voiced_ms.abs_diff(800) <= 150, "{:?}", f.stats);
+        assert!(f.stats.audio_ms.abs_diff(4800) <= 20, "{:?}", f.stats);
+
+        let runs = voiced_runs(&parts.concat(), VadSensitivity::Normal);
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        for r in &runs {
+            assert!((r.len() / MS).abs_diff(400) <= 100, "{runs:?}");
+        }
+        assert_eq!(voiced_runs(&silence(2000), VadSensitivity::Normal), []);
+    }
+
+    #[test]
+    fn audio_phrase_ending_at_release_keeps_its_end() {
+        let (p, _) = record(&[silence(500), tone(600, -20.0)], &opts());
+        let f = p.finish_with_stats().unwrap();
+        assert_eq!(f.trim, Trim::Cut);
+        let to_end = f.stats.last_voiced_to_end_ms.unwrap();
+        assert!(to_end < 60, "{:?}", f.stats);
+        // The first 300 ms before the padding go, the end stays.
+        assert!(f.samples.len() >= 800 * MS - 3 * 256, "{}", f.samples.len());
+        assert!(
+            f.stats.first_voiced_ms.unwrap().abs_diff(500) <= 60,
+            "{:?}",
+            f.stats
+        );
+    }
+
+    #[test]
+    fn audio_level_does_not_change_a_cut() {
+        // A loud phrase the gate accepts: the windows (level fires) and one push (it cannot)
+        // give the same clip, so the level path only adds `Skipped`.
+        let parts = [silence(700), tone(800, -15.0), silence(700)];
+        let (p, heard_at) = record(&parts, &opts());
+        assert!(heard_at.is_some());
+        let windows = p.finish_with_stats().unwrap();
+        assert_eq!(windows.trim, Trim::Cut);
+        assert_eq!(
+            windows.samples,
+            process(&parts.concat(), SAMPLE_RATE, &opts()).unwrap()
+        );
+    }
+
+    #[test]
+    fn audio_trim_off_keeps_everything() {
+        let o = Audio {
+            trim: false,
+            ..opts()
+        };
+        let (p, _) = record(&[silence(300)], &o);
+        let f = p.finish_with_stats().unwrap();
+        assert_eq!(f.trim, Trim::Off);
+        assert_eq!(f.stats.voiced_ms, 0);
+        assert_eq!(f.samples.len(), 300 * MS);
     }
 }

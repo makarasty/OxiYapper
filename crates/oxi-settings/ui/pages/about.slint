@@ -1,0 +1,406 @@
+// About page: the hero with the project links, what the app is built with and the author. The Slint
+// tile opens the std "Made with Slint" badge (SPEC Settings UI, R2.3). The browser opens every link;
+// the app makes no request.
+import { AboutSlint } from "std-widgets.slint";
+import { Theme, Shell, Icons, Caption, CapText, Group, Card, CardFrame, Button, FocusRing, KeyFocus } from "../theme/index.slint";
+
+// `brand`: one of the `Theme.brand-*` inks (DS-19.3).
+// An empty `url`: the tile opens the Slint badge instead of a link.
+struct Tech {
+    name: string,
+    note: string,
+    mark: image,
+    brand: color,
+    url: string,
+}
+
+// A project the app is built with: a whole-card link. `short` drops the note where it would be cut.
+// ClickCard's look and keys on a bare frame: the card body's fixed 16/12 padding cannot put the
+// short tile's mark `space-2` from every edge, so the tile pads itself (no negative padding).
+component TechCard inherits CardFrame {
+    in property <string> name;
+    in property <string> note;
+    in property <image> mark;
+    in property <color> brand;
+    in property <bool> short;
+    // The tile opens a link in the browser, not something inside the app.
+    in property <bool> external: true;
+    callback clicked;
+    out property <bool> hover: touch.has-hover;
+    property <bool> key-focus;
+    background: touch.pressed ? Theme.bg-card-pressed : root.hover ? Theme.bg-control-hover : Theme.bg-card;
+    animate background { duration: Theme.motion-quick; easing: ease-out; }
+    accessible-role: button;
+    accessible-label: root.name;
+    accessible-description: root.note;
+    accessible-action-default => {
+        root.clicked();
+    }
+    border-color: root.hover ? Theme.stroke-control : Theme.stroke-card;
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+    fs := FocusScope {
+        focus-on-click: false;
+        focus-gained(reason) => {
+            root.key-focus = KeyFocus.after(reason, root.key-focus);
+        }
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+    HorizontalLayout {
+        // The page sets the height so the mark box sits as far from the top and bottom as from
+        // the left: `card-padding-h` round the tall tile's box, `space-2` round the short one's.
+        padding-left: root.short ? Theme.space-2 : Theme.card-padding-h;
+        padding-right: self.padding-left;
+        spacing: Theme.space-3;
+        VerticalLayout {
+            alignment: center;
+            mark-box := Rectangle {
+                width: root.short ? Theme.icon-size : Theme.control-height;
+                height: self.width;
+                border-radius: Theme.radius-control;
+                // The short tile's square is no bigger than the mark: no tint to crowd it.
+                background: root.short ? transparent : root.brand.transparentize(0.9);
+                // Placed by hand: equal insets on all four sides by construction (DS-15.4).
+                mark := Image {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    source: root.mark;
+                    width: Theme.icon-size;
+                    height: Theme.icon-size;
+                    colorize: root.brand;
+                    accessible-role: none;
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: Theme.title-gap;
+            horizontal-stretch: 1;
+            CapText {
+                text: root.name;
+                height: Theme.body-line;
+                overflow: elide;
+                decorative: true;
+            }
+            if !root.short: CapText {
+                text: root.note;
+                height: Theme.caption-line;
+                font-size: Theme.caption-size;
+                ink: Theme.text-secondary;
+                overflow: elide;
+                decorative: true;
+            }
+        }
+        // `open-external` only on a tile that opens another app (DS-24.1); the Slint tile opens the
+        // in-app badge, which has no glyph in the DS-24 table, so its slot stays empty at full width.
+        VerticalLayout {
+            alignment: center;
+            width: Theme.icon-size-small;
+            if root.external: external-mark := Image {
+                source: Icons.open-external;
+                width: Theme.icon-size-small;
+                height: Theme.icon-size-small;
+                colorize: root.hover ? Theme.accent-text : Theme.text-secondary;
+                accessible-role: none;
+            }
+        }
+    }
+    FocusRing {
+        shown: root.key-focus && fs.has-focus;
+        radius: Theme.radius-card;
+    }
+}
+
+// The app mark (`oxi-platform` draw::logo, 256 grid): paper tile, ink ring, record dot. The dot is
+// drawn in the accent, so it follows the user's pick (DS-20.8); the rest is the brand's fixed paper
+// and ink, the same in both themes, as in the exe icon.
+component AppMark inherits Rectangle {
+    // One grid unit: the side over 256.
+    property <length> u: self.width / 256;
+    height: self.width;
+    border-radius: 0.22 * self.width;
+    border-width: self.width / 64;
+    border-color: #E4DED2;
+    background: #FAF7F1;
+    accessible-role: none;
+    Rectangle {
+        x: 36 * root.u;
+        y: 60 * root.u;
+        width: 160 * root.u;
+        height: self.width;
+        border-radius: self.width / 2;
+        border-width: 40 * root.u;
+        border-color: #1C1B19;
+    }
+    Rectangle {
+        x: 172 * root.u;
+        y: 36 * root.u;
+        width: 48 * root.u;
+        height: self.width;
+        border-radius: self.width / 2;
+        background: Theme.accent;
+    }
+}
+
+component AuthorCard inherits Card {
+    callback open(string);
+    // Under the second tile column the line shows "Made in Ukraine" alone.
+    in property <bool> compact;
+    in property <length> logo-size;
+    HorizontalLayout {
+        spacing: Theme.icon-gap;
+        Rectangle {
+            width: root.logo-size;
+            height: root.logo-size;
+            border-radius: Theme.radius-round;
+            clip: true;
+            Image {
+                source: Icons.avatar;
+                width: 100%;
+                height: 100%;
+                image-fit: cover;
+                accessible-role: none;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: Theme.title-gap;
+            horizontal-stretch: 1;
+            preferred-width: 0;
+            CapText {
+                text: "makarasty";
+                font-weight: Theme.weight-strong;
+            }
+            HorizontalLayout {
+                alignment: start;
+                spacing: Theme.space-1;
+                CapText {
+                    text: "Made in Ukraine";
+                    font-size: Theme.caption-size;
+                    ink: Theme.text-secondary;
+                }
+                if !root.compact: CapText {
+                    text: "·";
+                    font-size: Theme.caption-size;
+                    ink: Theme.text-secondary;
+                    decorative: true;
+                }
+                if !root.compact: CapText {
+                    text: @tr("Issues and ideas welcome");
+                    font-size: Theme.caption-size;
+                    ink: Theme.text-secondary;
+                    overflow: elide;
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Button {
+                text: "github.com/makarasty";
+                icon: Icons.github-mark;
+                clicked => {
+                    root.open("https://github.com/makarasty");
+                }
+            }
+        }
+    }
+}
+
+export component AboutPage inherits VerticalLayout {
+    in property <string> app-name;
+    in property <string> version;
+    in property <string> licence;
+    in property <string> repository;
+    // The column's height under the page title (banners already taken off).
+    in property <length> free-height;
+    function open(url: string) {
+        Platform.open-url(url);
+    }
+    // The popup reports its own `is-open` only to the component that holds it.
+    property <bool> badge-open: slint-badge.is-open;
+    changed badge-open => {
+        Shell.modal(root.badge-open);
+    }
+    property <[Tech]> techs: [
+        { name: "Rust", note: @tr("The whole app"), mark: Icons.rust-mark, brand: Theme.brand-rust, url: "https://github.com/rust-lang/rust" },
+        { name: "Slint", note: @tr("This settings window"), mark: Icons.slint-mark, brand: Theme.brand-slint, url: "" },
+        { name: "whisper.cpp", note: @tr("Speech recognition"), mark: Icons.person-voice, brand: Theme.brand-whisper-cpp, url: "https://github.com/ggml-org/whisper.cpp" },
+        { name: "whisper-rs", note: @tr("Rust bindings"), mark: Icons.plug-connected, brand: Theme.brand-whisper-rs, url: "https://codeberg.org/tazz4843/whisper-rs" },
+        { name: "nnnoiseless", note: @tr("Noise suppression"), mark: Icons.sound-wave-circle, brand: Theme.brand-nnnoiseless, url: "https://github.com/jneem/nnnoiseless" },
+        { name: "cpal", note: @tr("Microphone capture"), mark: Icons.mic, brand: Theme.brand-cpal, url: "https://github.com/RustAudio/cpal" },
+        { name: "Phosphor Icons", note: @tr("Every icon in the app"), mark: Icons.icons, brand: Theme.brand-phosphor, url: "https://github.com/phosphor-icons/core" },
+        { name: "Claude Code", note: @tr("Pair programming"), mark: Icons.claude-mark, brand: Theme.brand-claude, url: "https://github.com/anthropics/claude-code" },
+        { name: "tiny-skia", note: @tr("Draws the overlay pill"), mark: Icons.paint-brush, brand: Theme.brand-tiny-skia, url: "https://github.com/RazrFalcon/tiny-skia" },
+        { name: "symphonia", note: @tr("Reads audio files"), mark: Icons.audio-file, brand: Theme.brand-symphonia, url: "https://github.com/pdeljanov/Symphonia" },
+        { name: "rubato", note: @tr("Resamples audio"), mark: Icons.sine-wave, brand: Theme.brand-rubato, url: "https://github.com/HEnquist/rubato" },
+        { name: "earshot", note: @tr("Detects speech"), mark: Icons.ear, brand: Theme.brand-earshot, url: "https://github.com/pykeio/earshot" },
+        { name: "windows-rs", note: @tr("Talks to Windows"), mark: Icons.windows-api, brand: Theme.brand-windows-rs, url: "https://github.com/microsoft/windows-rs" },
+        { name: "rfd", note: @tr("File dialogs"), mark: Icons.file-dialog, brand: Theme.brand-rfd, url: "https://github.com/PolyMeilex/rfd" },
+        { name: "ureq", note: @tr("Model downloads"), mark: Icons.cloud-down, brand: Theme.brand-ureq, url: "https://github.com/algesten/ureq" },
+    ];
+    property <int> columns: 3;
+    property <int> rows: ceil(root.techs.length / root.columns);
+    property <length> tile-width: (root.width - (root.columns - 1) * Theme.tile-gap) / root.columns;
+    // A column's left edge in whole pixels, so every 1 px tile stroke stays crisp (UI rule 20) and
+    // the gaps stay one tile gap.
+    pure function column-x(c: int) -> length {
+        return Theme.whole(c * (root.width + Theme.tile-gap) / root.columns);
+    }
+    // A tile's text column once its padding, mark and arrow are off; the longest note needs half a
+    // control column.
+    property <bool> notes-fit: root.tile-width - 2 * Theme.card-padding-h - Theme.control-height - 2 * Theme.space-3 - Theme.icon-size-small >= Theme.control-column-min / 2;
+    // The mark box sets a tile's height: as far from the tile's top and bottom as the card padding
+    // puts it from the left edge (item 11, DS-15.4). The name and note lines fit inside.
+    property <length> tall-tile: 2 * Theme.card-padding-h + Theme.control-height;
+    property <length> card-height: 2 * Theme.card-padding-v + Theme.about-logo-size;
+    property <length> group-head: Theme.icon-size + Theme.header-gap;
+    // Under the full height the logo shrinks to a control height; `card-height` stays the full size so `tight` does not depend on itself.
+    property <length> logo-size: root.tight ? Theme.control-height : Theme.about-logo-size;
+    // The short tile is the mark between 8 px on all sides (DS-15.4); the cards shrink their logo when tight, so five rows fit 720 x 520 under a banner.
+    property <length> short-tile: 2 * Theme.space-2 + Theme.icon-size;
+    // The page as drawn: two cards, the tile grid, two group titles and the gaps.
+    property <length> drawn-height: 2 * root.card-height + root.rows * (root.notes-fit ? root.tall-tile : root.short-tile) + (root.rows - 1) * Theme.tile-gap + 2 * root.group-head + 2 * Theme.group-gap;
+    // Too low for that (UI rule 25): the logos shrink and the tiles go short.
+    property <bool> tight: root.free-height < root.drawn-height;
+    property <bool> short: root.tight || !root.notes-fit;
+    property <length> tile-height: root.short ? root.short-tile : root.tall-tile;
+    // Tight and still too low (a banner over 720 x 520): the group titles go and the blocks sit
+    // `space-4` apart, the page padding.
+    property <length> tight-height: 2 * (2 * Theme.card-padding-v + Theme.control-height) + root.rows * root.short-tile + (root.rows - 1) * Theme.tile-gap + 2 * root.group-head + 2 * Theme.group-gap;
+    property <bool> titled: !root.tight || root.free-height >= root.tight-height;
+    alignment: start;
+    spacing: root.titled ? Theme.group-gap : Theme.space-4;
+    Card {
+        HorizontalLayout {
+            spacing: Theme.icon-gap;
+            AppMark {
+                width: root.logo-size;
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: Theme.title-gap;
+                horizontal-stretch: 1;
+                Text {
+                    text: root.app-name;
+                    font-size: Theme.subtitle-size;
+                    font-weight: Theme.weight-strong;
+                    color: Theme.text-primary;
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    spacing: Theme.space-1;
+                    Caption {
+                        text: @tr("Version");
+                    }
+                    Caption {
+                        text: root.version;
+                    }
+                    // Under this width the two licence buttons say it alone (UI rule 29).
+                    if root.notes-fit: Caption {
+                        text: "·";
+                        accessible-role: none;
+                    }
+                    if root.notes-fit: Caption {
+                        text: root.licence;
+                    }
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                HorizontalLayout {
+                    spacing: Theme.control-gap;
+                    Button {
+                        text: @tr("Project page");
+                        icon: Icons.github-mark;
+                        clicked => {
+                            root.open(root.repository);
+                        }
+                    }
+                    Button {
+                        text: @tr("MIT licence");
+                        clicked => {
+                            root.open(root.repository + "/blob/main/LICENSE-MIT");
+                        }
+                    }
+                    Button {
+                        text: @tr("Apache-2.0 licence");
+                        clicked => {
+                            root.open(root.repository + "/blob/main/LICENSE-APACHE");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Group {
+        title: !root.titled ? "" : @tr("Built with");
+        Rectangle {
+            height: root.rows * root.tile-height + (root.rows - 1) * Theme.tile-gap;
+            for tech[i] in root.techs: TechCard {
+                x: root.column-x(mod(i, root.columns));
+                y: floor(i / root.columns) * (root.tile-height + Theme.tile-gap);
+                width: root.column-x(mod(i, root.columns) + 1) - Theme.tile-gap - self.x;
+                height: root.tile-height;
+                name: tech.name;
+                note: tech.note;
+                mark: tech.mark;
+                brand: tech.brand;
+                short: root.short;
+                external: tech.url != "";
+                clicked => {
+                    if (tech.url == "") {
+                        slint-badge.show();
+                    } else {
+                        root.open(tech.url);
+                    }
+                }
+            }
+            // R2.3: the royalty-free licence's "Made with Slint" badge, under the Slint tile.
+            slint-badge := PopupWindow {
+                x: root.column-x(1);
+                y: root.tile-height + Theme.space-1;
+                close-policy: close-on-click-outside;
+                CardFrame {
+                    VerticalLayout {
+                        padding-left: Theme.card-padding-h;
+                        padding-right: Theme.card-padding-h;
+                        padding-top: Theme.card-padding-v;
+                        padding-bottom: Theme.card-padding-v;
+                        spacing: Theme.space-2;
+                        AboutSlint {
+                            width: Theme.about-slint-width;
+                            height: Theme.about-slint-height;
+                        }
+                        Button {
+                            text: @tr("Project page");
+                            icon: Icons.github-mark;
+                            clicked => {
+                                slint-badge.close();
+                                root.open("https://github.com/slint-ui/slint");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Group {
+        title: !root.titled ? "" : @tr("Author");
+        AuthorCard {
+            logo-size: root.logo-size;
+            open(url) => {
+                root.open(url);
+            }
+        }
+    }
+}

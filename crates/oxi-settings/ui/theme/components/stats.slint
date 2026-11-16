@@ -1,0 +1,283 @@
+// Home dashboard pieces: stat cards and the speaking-activity heatmap.
+import { Theme } from "../tokens.slint";
+import { Caption, Tip } from "base.slint";
+import { ClickCard, CapText } from "layout.slint";
+
+// One number on a card: icon + label, the big value ("299.9K"), a caption ("All time"). A click
+// opens its trend; while open the card is filled.
+export component StatCard inherits ClickCard {
+    in property <image> icon;
+    in property <string> label;
+    in property <string> value;
+    in property <string> caption;
+    in property <bool> selected;
+    // Lines the label may need. The owner sets it for the whole row, so the four values sit on one
+    // baseline even when one label wraps (a wrapped label is under 2 x 20 px).
+    in property <int> label-lines: 1;
+    min-width: Theme.stat-card-min;
+    horizontal-stretch: 1;
+    // A state, not a `background:` binding: that would replace ClickCard's hover and pressed fills.
+    states [
+        open when root.selected: {
+            background: Theme.accent-tint;
+        }
+    ]
+    accessible-label: root.label + ": " + root.value + (root.caption == "" ? "" : ", " + root.caption);
+    accessible-checkable: true;
+    accessible-checked: root.selected;
+    VerticalLayout {
+        // On top of the card body's 12 px: 16 px on every side.
+        padding-top: Theme.space-1;
+        padding-bottom: Theme.space-1;
+        spacing: Theme.space-1;
+        // The row makes the cards one height: the spare goes below, not between the texts.
+        alignment: start;
+        HorizontalLayout {
+            spacing: Theme.pair-gap;
+            min-height: root.label-lines * Theme.body-line;
+            if root.icon.width > 0: VerticalLayout {
+                alignment: center;
+                Image {
+                    source: root.icon;
+                    width: Theme.icon-size;
+                    height: Theme.icon-size;
+                    colorize: Theme.text-secondary;
+                    accessible-role: none;
+                }
+            }
+            CapText {
+                text: root.label;
+                ink: Theme.text-secondary;
+                wrap: word-wrap;
+                decorative: true;
+            }
+        }
+        Text {
+            text: root.value;
+            font-size: Theme.title-size;
+            font-weight: Theme.weight-strong;
+            color: Theme.text-primary;
+            accessible-role: none;
+        }
+        Caption {
+            text: root.caption;
+            wrap: word-wrap;
+            accessible-role: none;
+        }
+    }
+}
+
+// A metric by day: one bar per day, oldest first, today at the right edge, the highest day's
+// number above and the first and last day below. A short history keeps narrow bars at the right
+// (the width of a heatmap cell at most); a full year fills the width with touching bars. Takes the
+// size its owner gives it.
+export component TrendChart {
+    // Each day in thousandths of the peak.
+    in property <[int]> bars;
+    in property <string> peak;
+    in property <string> first-day;
+    in property <string> last-day;
+    in property <string> summary;
+    in property <length> max-pitch: Theme.trend-max-pitch;
+    property <length> pitch: min(root.max-pitch, root.width / max(1, root.bars.length));
+    property <length> span: root.bars.length * root.pitch;
+    // Whole pixels: a bar under 4 px fills its pitch, wider ones leave 14 % between.
+    property <length> bar: root.pitch < Theme.rail-height ? ceil(root.pitch / 1px) * 1px : floor(root.pitch * 0.86 / 1px) * 1px;
+    property <length> plot-top: Theme.caption-line + Theme.space-1;
+    property <length> baseline: root.height - Theme.caption-line - Theme.space-1;
+
+    accessible-role: image;
+    accessible-label: root.summary;
+
+    if root.bars.length > 0: Caption {
+        x: max(0px, root.width - max(root.span, self.preferred-width));
+        y: 0;
+        height: Theme.caption-line;
+        text: root.peak;
+        accessible-role: none;
+    }
+    for value[i] in root.bars: Rectangle {
+        x: floor((root.width - root.span + i * root.pitch) / 1px) * 1px;
+        y: root.baseline - self.height;
+        width: root.bar;
+        height: value <= 0 ? 0 : max(Theme.radius-small, (root.baseline - root.plot-top) * value / 1000);
+        border-radius: Theme.radius-small;
+        background: Theme.accent;
+    }
+    // 1 px hairline: the baseline.
+    Rectangle {
+        y: root.baseline;
+        height: 1px;
+        background: Theme.divider;
+    }
+    if root.bars.length > 0: Caption {
+        x: max(0px, root.width - root.span);
+        y: root.baseline + Theme.space-1;
+        height: Theme.caption-line;
+        // A short history has room for one date only.
+        visible: root.span >= 2 * self.preferred-width + Theme.space-4;
+        text: root.first-day;
+        accessible-role: none;
+    }
+    if root.bars.length > 0: Caption {
+        x: root.width - self.preferred-width;
+        y: root.baseline + Theme.space-1;
+        height: Theme.caption-line;
+        text: root.last-day;
+        accessible-role: none;
+    }
+}
+
+export struct MonthLabel {
+    // Week column the month starts in.
+    week: int,
+    text: string,
+}
+
+// GitHub-style activity grid: weeks as columns, seven day rows, month labels on top,
+// five levels from empty to full accent, a Less..More legend, today's cell outlined.
+// `levels` is one 0..4 per day, week by week (index = week * 7 + row, rows as in `day-labels`);
+// the last week may be partial. `today` is the index of today's cell (-1: none). A day with a
+// level above 0 is live (DS-28.6): a 1 px outline and the tip `day-tips[i]` on hover, `day-clicked(i)`
+// on a click (the page decides what a day opens); empty days are inert.
+export component ActivityHeatmap {
+    in property <[int]> levels;
+    in property <[MonthLabel]> months;
+    in property <int> today: -1;
+    // Parallel to `levels`: the tooltip of each day ("12 Nov · 34 dictations · 1,240 words").
+    in property <[string]> day-tips;
+    callback day-clicked(int);
+    // The live day under the pointer (-1: none); read by tests.
+    out property <int> hot: touch.has-hover && root.gx >= 0px && root.gy >= 0px && mod(root.gx / 1px, root.pitch / 1px) < root.cell / 1px && mod(root.gy / 1px, root.pitch / 1px) < root.cell / 1px && root.day-row < 7 && root.cand < root.levels.length && root.levels[root.cand] > 0 ? root.cand : -1;
+    // The pointer in grid coordinates, and the day index of the cell or gap it is over.
+    property <length> gx: touch.mouse-x - root.label-w;
+    property <length> gy: touch.mouse-y - root.top;
+    property <int> day-row: floor(root.gy / root.pitch);
+    property <int> cand: floor(root.gx / root.pitch) * 7 + root.day-row;
+    // Spoken summary of the grid (the cells are drawn, not readable).
+    in property <string> summary;
+    in property <[string]> day-labels: [@tr("Mon"), @tr("Tue"), @tr("Wed"), @tr("Thu"), @tr("Fri"), @tr("Sat"), @tr("Sun")];
+    in property <string> less-text: @tr("Less");
+    in property <string> more-text: @tr("More");
+    in property <length> cell: Theme.heat-cell-default;
+    in property <length> gap: Theme.heat-gap;
+    // The Less..More legend swatches; the grid cells can be larger.
+    in property <length> legend-cell: Theme.heat-cell-default;
+    property <length> pitch: root.cell + root.gap;
+    property <int> weeks: ceil(root.levels.length / 7);
+    // Width of the day labels, and what the owner needs to fit the grid to a width.
+    in property <length> label-w: Theme.heat-label-width;
+    // Off in Home's tight layout: the scale is the first thing a low window drops.
+    in property <bool> legend-shown: true;
+    property <length> top: Theme.heat-top;
+
+    public pure function level-color(level: int) -> color {
+        return level <= 0 ? Theme.bg-inset : level == 1 ? Theme.heat-1 : level == 2 ? Theme.heat-2 : level == 3 ? Theme.heat-3 : Theme.heat-4;
+    }
+
+    accessible-role: image;
+    accessible-label: root.summary;
+    min-width: root.label-w + root.weeks * root.pitch;
+    min-height: grid.height + (root.legend-shown ? legend.height + Theme.space-3 : 0px);
+
+    grid := Rectangle {
+        x: 0;
+        y: 0;
+        width: root.label-w + root.weeks * root.pitch;
+        height: root.top + 7 * root.pitch;
+        for m in root.months: Caption {
+            x: root.label-w + m.week * root.pitch;
+            y: 0;
+            text: m.text;
+            accessible-role: none;
+        }
+        for d[i] in root.day-labels: Caption {
+            x: 0;
+            y: root.top + i * root.pitch + (root.cell - Theme.caption-line) / 2;
+            height: Theme.caption-line;
+            text: d;
+            accessible-role: none;
+        }
+        for level[i] in root.levels: Rectangle {
+            x: root.label-w + floor(i / 7) * root.pitch;
+            y: root.top + mod(i, 7) * root.pitch;
+            width: root.cell;
+            height: root.cell;
+            border-radius: Theme.radius-small;
+            background: root.level-color(level);
+            // Today: a 1.5 px outline, its outer edge `radius-small` outside the cell.
+            if i == root.today: Rectangle {
+                x: -Theme.radius-small;
+                y: -Theme.radius-small;
+                width: parent.width + 2 * Theme.radius-small;
+                height: parent.height + 2 * Theme.radius-small;
+                border-radius: 2 * Theme.radius-small;
+                border-width: 1.5px;
+                border-color: Theme.text-primary;
+            }
+        }
+        // The hover outline, one element for the whole grid: 1 px, inside the cell.
+        Rectangle {
+            visible: root.hot >= 0;
+            x: root.label-w + floor(root.hot / 7) * root.pitch;
+            y: root.top + mod(root.hot, 7) * root.pitch;
+            width: root.cell;
+            height: root.cell;
+            border-radius: Theme.radius-small;
+            border-width: 1px;
+            border-color: Theme.stroke-keycap;
+        }
+        touch := TouchArea {
+            mouse-cursor: root.hot >= 0 ? MouseCursor.pointer : MouseCursor.default;
+            clicked => {
+                if (root.hot >= 0) {
+                    root.day-clicked(root.hot);
+                }
+            }
+        }
+        // One tip for the grid, over the hovered cell: it follows the cell, not a Tip per cell.
+        Tip {
+            x: root.label-w + floor(max(root.hot, 0) / 7) * root.pitch;
+            y: root.top + mod(max(root.hot, 0), 7) * root.pitch;
+            width: root.cell;
+            height: root.cell;
+            text: root.hot >= 0 && root.hot < root.day-tips.length ? root.day-tips[root.hot] : "";
+            hovered: root.hot >= 0;
+            pressed: touch.pressed;
+        }
+    }
+    legend := HorizontalLayout {
+        visible: root.legend-shown;
+        x: grid.width - self.preferred-width;
+        y: grid.height + Theme.space-3;
+        width: self.preferred-width;
+        // One legend line (DS-28.6): as high as its caption or swatch, not as the grid's cell.
+        height: max(root.legend-cell, Theme.caption-line);
+        spacing: root.gap;
+        Caption {
+            text: root.less-text;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+        Rectangle {
+            width: Theme.space-1;
+        }
+        for level in 5: VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: root.legend-cell;
+                height: root.legend-cell;
+                border-radius: Theme.radius-small;
+                background: root.level-color(level);
+            }
+        }
+        Rectangle {
+            width: Theme.space-1;
+        }
+        Caption {
+            text: root.more-text;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+    }
+}

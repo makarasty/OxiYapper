@@ -1,0 +1,484 @@
+// Audio page (SPEC Recording, Audio before whisper, Sounds): microphone, live meter, the DSP
+// switches, tail, recording cap and the sounds of the five events.
+import { Theme, Shell, Icons, Card, Row, Divider, ToggleRow, SliderRow, Combo, SubTabs, Button, IconButton, Meter, CardGrid, GalleryTile } from "../theme/index.slint";
+import { Warnings } from "../theme/components/feedback.slint";
+
+// Which control changed; `value` of `AudioState.edited` carries its new value.
+export enum AudioKey { device, gain, sensitivity, normalize, trim, noise, tail, max-minutes, volume, channel, vad, edges, rumble, per-device }
+
+// Filled and read by `pages::audio`.
+export global AudioState {
+    // 0 Microphone, 1 Recording, 2 to 6 the Sounds tab on the sound of start, stop, text ready,
+    // cancel and error (the order of `pages::audio::ROLES`).
+    in-out property <int> view;
+    // "System default" first, then the input devices.
+    in property <[string]> devices;
+    in-out property <int> device;
+    in-out property <float> gain-db;
+    in-out property <float> sensitivity-db;
+    // Which side of a stereo mic is used: 0 both mixed, 1 left, 2 right.
+    in-out property <int> channel;
+    // How easily speech is heard: 0 low, 1 normal, 2 high.
+    in-out property <int> vad;
+    in-out property <bool> normalize;
+    in-out property <bool> trim;
+    // Noise suppression: 0 off, 1 light, 2 medium, 3 strong, 4 auto (`Noise::ALL`).
+    in-out property <int> noise;
+    // "Don't cut my words": 0 normal, 1 careful, 2 tight, 3 custom (`EdgePreset::ALL`).
+    in-out property <int> edges;
+    in-out property <bool> cut-rumble;
+    in-out property <bool> per-device;
+    // Suggestions from the person's recordings (hold item 41): why, per row; empty: none.
+    in property <string> noise-tip;
+    in property <string> gain-tip;
+    in property <string> edges-tip;
+    in property <string> rumble-tip;
+    in-out property <float> tail-ms;
+    in-out property <float> max-minutes;
+    // The defaults of `Config::default()`: a double click on a slider's thumb returns to them.
+    in property <float> default-gain-db;
+    in property <float> default-sensitivity-db;
+    in property <float> default-tail-ms;
+    in property <float> default-max-minutes;
+    // Live meter: bar heights 0..1, oldest first.
+    in property <[float]> bars;
+    in property <bool> clipping;
+    // Per bar, parallel to `bars`: which ones clipped (red).
+    in property <[bool]> clipped;
+    // True while the page holds the microphone open.
+    in property <bool> live;
+    // Why there is no meter ("No microphone"), shown while `live` is off.
+    in property <string> note;
+    // The configured mic is missing and the meter runs on the system default; empty otherwise.
+    in property <string> fallback;
+    // Listing the devices failed (the error kind); empty otherwise.
+    in property <string> list-error;
+    // The open mic gives only exact zeros (muted or switched off); empty otherwise.
+    in property <string> silence;
+    // The Test button: true while it records and plays back (its steps are toasts).
+    in property <bool> testing;
+    // What the last Record 3 s heard ("Quiet", "Good level", "Too loud"), drawn in the meter;
+    // empty until a test has run.
+    in property <string> mic-result;
+    // Per sound (start, stop, text ready, cancel, error): its tiles, Off, `Builtin::ALL` in order
+    // then the own file, and the tile picked (-1: none).
+    in property <[[GalleryTile]]> role-tiles;
+    in property <[int]> role-tile;
+    // The glyphs of the tiles, read by `pages::audio` when it builds them.
+    out property <image> sound-icon: Icons.sound-wave-circle;
+    out property <image> file-icon: Icons.folder-open;
+    in-out property <float> volume;
+    in property <float> default-volume;
+    // The glyph of the Off tile, the first tile of every sound.
+    out property <image> off-icon: Icons.dismiss-16;
+    // Why a sound cannot be used or played, from the daemon's warnings; empty otherwise.
+    in property <string> sound-warning;
+    // Why the daemon cannot play a preview now; empty when it can.
+    in property <string> preview-off;
+    in property <bool> can-browse;
+    // The sound folder's name; empty while none is set.
+    in property <string> folder-name;
+    callback shown();
+    callback edited(AudioKey, float);
+    callback test();
+    // A suggestion's Apply (true) or Not now (false), for the row of `AudioKey` noise, gain,
+    // edges or rumble.
+    callback suggestion(AudioKey, bool);
+    // A suggestion's "Check again": read the history's numbers anew.
+    callback recheck();
+    callback sound-picked(int);
+    callback choose-file();
+    callback choose-folder();
+    callback remove-folder();
+    callback preview();
+}
+
+// The microphone pick; also the setup wizard's microphone step.
+export component MicDeviceRow inherits Row {
+    title: @tr("Device");
+    warning: Warnings.both(AudioState.list-error, AudioState.fallback);
+    fill-controls: true;
+    full-text: AudioState.devices[AudioState.device];
+    Combo {
+        model: AudioState.devices;
+        current-index <=> AudioState.device;
+        accessible-label: @tr("Device");
+        selected => {
+            AudioState.edited(AudioKey.device, self.current-index);
+        }
+    }
+}
+
+// The live meter and Record 3 s; also the setup wizard's microphone step.
+// The Test button takes its width from the column: the meter shrinks, the right edge stays
+// the column's (DS-3.3).
+export component MicLevelRow inherits Row {
+    title: @tr("Level");
+    info: @tr("How loud your microphone is right now. Speak to see it move.");
+    // The "!" carries the words of the clip line (DS-21.3).
+    warning: Warnings.both(AudioState.silence, AudioState.clipping ? @tr("Too loud: lower the microphone boost.") : "");
+    fill-controls: true;
+    Meter {
+        bars: AudioState.bars;
+        live: AudioState.live;
+        clipped: AudioState.clipped;
+        overloaded: AudioState.clipping;
+        empty-text: AudioState.note;
+        idle-text: @tr("Listening");
+        result: AudioState.mic-result;
+        accessible-label: !AudioState.live ? AudioState.note : AudioState.clipping ? @tr("Level, clipping") : @tr("Level");
+    }
+    Button {
+        text: @tr("Record 3 s");
+        enabled: !AudioState.testing;
+        tooltip: @tr("A test is running");
+        clicked => {
+            AudioState.test();
+        }
+    }
+}
+
+export component AudioPage inherits VerticalLayout {
+    // The shell's room under the header row: the sound gallery takes what the sub-tabs and the
+    // card above it leave, so the Sounds tab fits without the page scrolling (UI rule 25).
+    in property <length> free-height;
+    // The sound shown on the Sounds tab: 0 start, 1 stop, 2 text ready, 3 cancel, 4 error.
+    property <int> role: clamp(AudioState.view - 2, 0, 4);
+    alignment: start;
+    spacing: Theme.space-4;
+    init => {
+        AudioState.shown();
+    }
+    tabs := SubTabs {
+        items: [@tr("Microphone"), @tr("Recording"), @tr("Sounds")];
+        selected: min(AudioState.view, 2);
+        picked(i) => {
+            AudioState.view = i;
+        }
+    }
+    if AudioState.view == 0: Card {
+        MicDeviceRow { }
+        Divider { }
+        ToggleRow {
+            flat: true;
+            title: @tr("Remember for this microphone");
+            info: @tr("Keeps the boost, noise and rumble settings, stereo side and speech sensitivity for each microphone, and brings them back when you pick it.");
+            checked <=> AudioState.per-device;
+            toggled(on) => {
+                AudioState.edited(AudioKey.per-device, on ? 1 : 0);
+            }
+        }
+        Divider { }
+        MicLevelRow { }
+        Divider { }
+        SliderRow {
+            title: @tr("Microphone boost");
+            info: @tr("Makes your voice louder or quieter in the recording Whisper hears. Record 3 s checks the level.");
+            can-suggest: true;
+            suggestion: AudioState.gain-tip;
+            suggestion-accepted => {
+                AudioState.suggestion(AudioKey.gain, true);
+            }
+            suggestion-dismissed => {
+                AudioState.suggestion(AudioKey.gain, false);
+            }
+            suggestion-refresh => {
+                AudioState.recheck();
+            }
+            minimum: -20;
+            maximum: 20;
+            bipolar: true;
+            signed: true;
+            unit: "dB";
+            default-value: AudioState.default-gain-db;
+            value <=> AudioState.gain-db;
+            changed(v) => {
+                AudioState.edited(AudioKey.gain, v);
+            }
+        }
+        Divider { }
+        SliderRow {
+            title: @tr("Level bar sensitivity");
+            info: @tr("Only changes how far the Level bar moves; the recording stays as it is.");
+            minimum: -20;
+            maximum: 20;
+            bipolar: true;
+            signed: true;
+            unit: "dB";
+            default-value: AudioState.default-sensitivity-db;
+            value <=> AudioState.sensitivity-db;
+            changed(v) => {
+                AudioState.edited(AudioKey.sensitivity, v);
+            }
+        }
+        Divider { }
+        Row {
+            title: @tr("Stereo side");
+            info: @tr("Which side of a stereo microphone is used. Both averages them; pick one when the other is noisy or silent.");
+            fill-controls: true;
+            Combo {
+                model: [@tr("Both"), @tr("Left"), @tr("Right")];
+                current-index <=> AudioState.channel;
+                accessible-label: @tr("Stereo side");
+                selected => {
+                    AudioState.edited(AudioKey.channel, self.current-index);
+                }
+            }
+        }
+    }
+    if AudioState.view == 1: Card {
+        Row {
+            title: @tr("Don't cut my words");
+            info: @tr("Careful keeps quieter starts and ends and listens longer after you let go; Tight cuts closer. Custom: the two rows below set by hand.");
+            fill-controls: true;
+            can-suggest: true;
+            suggestion: AudioState.edges-tip;
+            suggestion-accepted => {
+                AudioState.suggestion(AudioKey.edges, true);
+            }
+            suggestion-dismissed => {
+                AudioState.suggestion(AudioKey.edges, false);
+            }
+            suggestion-refresh => {
+                AudioState.recheck();
+            }
+            Combo {
+                model: [@tr("Normal"), @tr("Careful"), @tr("Tight"), @tr("Custom")];
+                current-index <=> AudioState.edges;
+                accessible-label: @tr("Don't cut my words");
+                selected => {
+                    AudioState.edited(AudioKey.edges, self.current-index);
+                }
+            }
+        }
+        Divider { }
+        Row {
+            title: @tr("Speech sensitivity");
+            info: @tr("How easily quiet speech is counted as speech. Raise it when short phrases are lost.");
+            fill-controls: true;
+            Combo {
+                model: [@tr("Low"), @tr("Normal"), @tr("High")];
+                current-index <=> AudioState.vad;
+                accessible-label: @tr("Speech sensitivity");
+                selected => {
+                    AudioState.edited(AudioKey.vad, self.current-index);
+                }
+            }
+        }
+        Divider { }
+        SliderRow {
+            title: @tr("Keep recording after release");
+            info: @tr("Keeps listening this long after you let go, so the last word is not cut.");
+            minimum: 0;
+            maximum: 1000;
+            step: 50;
+            unit: "ms";
+            default-value: AudioState.default-tail-ms;
+            value <=> AudioState.tail-ms;
+            changed(v) => {
+                AudioState.edited(AudioKey.tail, v);
+            }
+        }
+        Divider { }
+        ToggleRow {
+            flat: true;
+            title: @tr("Cut silence at the ends");
+            info: @tr("Removes the quiet before and after you speak: fewer made-up words, a faster result.");
+            checked <=> AudioState.trim;
+            toggled(on) => {
+                AudioState.edited(AudioKey.trim, on ? 1 : 0);
+            }
+        }
+        Divider { }
+        ToggleRow {
+            flat: true;
+            title: @tr("Even out loudness");
+            info: @tr("Makes quiet and loud recordings equally loud before Whisper hears them.");
+            checked <=> AudioState.normalize;
+            toggled(on) => {
+                AudioState.edited(AudioKey.normalize, on ? 1 : 0);
+            }
+        }
+        Divider { }
+        Row {
+            title: @tr("Reduce background noise");
+            info: @tr("Removes steady noise like a fan or hum. Light and Medium keep part of the original sound; Auto cleans only when the room is noisy.");
+            warning: AudioState.noise != 0 ? @tr("Reducing background noise can make Whisper worse.") : "";
+            fill-controls: true;
+            can-suggest: true;
+            suggestion: AudioState.noise-tip;
+            suggestion-accepted => {
+                AudioState.suggestion(AudioKey.noise, true);
+            }
+            suggestion-dismissed => {
+                AudioState.suggestion(AudioKey.noise, false);
+            }
+            suggestion-refresh => {
+                AudioState.recheck();
+            }
+            Combo {
+                model: [@tr("Off"), @tr("Light"), @tr("Medium"), @tr("Strong"), @tr("Auto: only when noisy")];
+                current-index <=> AudioState.noise;
+                accessible-label: @tr("Reduce background noise");
+                selected => {
+                    AudioState.edited(AudioKey.noise, self.current-index);
+                }
+            }
+        }
+        Divider { }
+        ToggleRow {
+            flat: true;
+            title: @tr("Cut low rumble");
+            info: @tr("Removes deep hum and thumps below the voice: fans, desk knocks, air conditioning. Speech stays as it is.");
+            can-suggest: true;
+            suggestion: AudioState.rumble-tip;
+            suggestion-accepted => {
+                AudioState.suggestion(AudioKey.rumble, true);
+            }
+            suggestion-dismissed => {
+                AudioState.suggestion(AudioKey.rumble, false);
+            }
+            suggestion-refresh => {
+                AudioState.recheck();
+            }
+            checked <=> AudioState.cut-rumble;
+            toggled(on) => {
+                AudioState.edited(AudioKey.rumble, on ? 1 : 0);
+            }
+        }
+        Divider { }
+        SliderRow {
+            title: @tr("Longest recording");
+            info: @tr("A recording stops at this length; the overlay warns 30 s before.");
+            minimum: 1;
+            maximum: 120;
+            unit: "min";
+            default-value: AudioState.default-max-minutes;
+            value <=> AudioState.max-minutes;
+            changed(v) => {
+                AudioState.edited(AudioKey.max-minutes, v);
+            }
+        }
+    }
+    if AudioState.view >= 2: VerticalLayout {
+        // Tighter than the page's 16: the cards, the first row and the gallery fit 720x520 with it.
+        spacing: Theme.space-3;
+        // One card per event, like the model cards; picking one only changes the view, so the sounds
+        // stay readable on a locked config.
+        events := CardGrid {
+            accessible-label: @tr("Sound for");
+            locked: false;
+            min-cell: 100px;
+            tile-height: Theme.tile-height-short;
+            // `full-height` counts the gap after the last row; the page spaces the grids itself.
+            height: self.full-height - Theme.tile-gap;
+            tiles: [
+                { icon: Icons.play, title: @tr("Start") },
+                { icon: Icons.stop, title: @tr("Stop") },
+                { icon: Icons.text-t, title: @tr("Text ready") },
+                { icon: Icons.dismiss-16, title: @tr("Cancel") },
+                { icon: Icons.warning, title: @tr("Error") },
+            ];
+            selected: root.role;
+            picked(i) => {
+                AudioState.view = 2 + i;
+            }
+        }
+        sound-card := Card {
+            Row {
+                title: @tr("Own sounds");
+                // The folder's name is in the tip: a line under the title made this row taller than its neighbours.
+                info: AudioState.folder-name == "" ? @tr("Choose one WAV or OGG file, or a folder: every file directly in it (up to 200) becomes a tile below.") : @tr("Folder: ") + AudioState.folder-name;
+                // The folder button first, so the file button stays the right-most (DS-3.3).
+                if AudioState.can-browse: Button {
+                    text: @tr("Add folder");
+                    enabled: !Shell.locked;
+                    tooltip: Shell.locked-tip;
+                    clicked => {
+                        AudioState.choose-folder();
+                    }
+                }
+                if AudioState.can-browse: Button {
+                    text: @tr("Choose file");
+                    enabled: !Shell.locked;
+                    tooltip: Shell.locked-tip;
+                    clicked => {
+                        AudioState.choose-file();
+                    }
+                }
+                // Delete is the right-most action (DS-23.2). It forgets the folder; its files stay.
+                // Always there, off with no folder, so Add folder and Choose file do not jump (DS-23.5).
+                IconButton {
+                    icon: Icons.delete;
+                    label: @tr("Remove folder (its files stay)");
+                    destructive: true;
+                    enabled: AudioState.folder-name != "" && !Shell.locked;
+                    tooltip: Shell.locked ? Shell.locked-tip : @tr("No folder added");
+                    clicked => {
+                        AudioState.remove-folder();
+                    }
+                }
+            }
+            Divider { }
+            // Preview plays the tile picked below, so it is not in the own-file row.
+            Row {
+                title: @tr("Picked sound");
+                warning: AudioState.sound-warning;
+                Button {
+                    text: @tr("Preview");
+                    icon: Icons.play;
+                    // Tile 0 is Off: nothing to hear.
+                    enabled: AudioState.preview-off == "" && AudioState.role-tile[root.role] != 0;
+                    tooltip: AudioState.role-tile[root.role] == 0 ? @tr("This sound is off") : AudioState.preview-off;
+                    clicked => {
+                        AudioState.preview();
+                    }
+                }
+            }
+            Divider { }
+            SliderRow {
+                title: @tr("Volume");
+                minimum: 0;
+                maximum: 100;
+                unit: "%";
+                default-value: AudioState.default-volume;
+                value <=> AudioState.volume;
+                changed(v) => {
+                    AudioState.edited(AudioKey.volume, v);
+                }
+            }
+        }
+        // Off and Own file are the first row, easy to find; the rest of the gallery is below (the
+        // same list, two windows onto it).
+        VerticalLayout {
+            spacing: Theme.tile-gap;
+            top := CardGrid {
+                accessible-label: @tr("Off and own file");
+                count: 2;
+                pack: true;
+                reserve-gutter: gallery.overflows;
+                height: self.full-height - Theme.tile-gap;
+                tiles: AudioState.role-tiles[root.role];
+                selected: AudioState.role-tile[root.role];
+                picked(i) => {
+                    AudioState.sound-picked(i);
+                }
+            }
+            // All the room the window leaves, so the page itself does not scroll at 720x520: the
+            // tiles scroll inside the grid, a row may show cut. Under banners not even half a row
+            // fits and the page scrolls: then the grid shows every row, so only one thing scrolls
+            // (UI rule 26).
+            gallery := CardGrid {
+                accessible-label: @tr("Sounds");
+                first: 2;
+                property <length> room: root.free-height - tabs.preferred-height - events.height - sound-card.preferred-height - top.height - Theme.space-4 - 2 * Theme.space-3 - Theme.tile-gap;
+                height: self.room < self.min-height / 2 ? self.full-height : min(self.room, self.full-height);
+                tiles: AudioState.role-tiles[root.role];
+                selected: AudioState.role-tile[root.role];
+                picked(i) => {
+                    AudioState.sound-picked(i);
+                }
+            }
+        }
+    }
+}

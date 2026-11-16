@@ -18,6 +18,9 @@ sha2.workspace = true
 rubato.workspace = true
 earshot.workspace = true
 nnnoiseless = { workspace = true, default-features = false }
+unicode-normalization.workspace = true
+lewton.workspace = true
+ogg.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

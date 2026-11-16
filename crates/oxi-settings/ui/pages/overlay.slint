@@ -1,0 +1,58 @@
+// Overlay page (SPEC Feedback): the pill on or off, its spot on screen (a click on a tile also shows
+// the pill there, DS-27.1) and hiding it over fullscreen apps. One card of three rows, like System.
+import { Shell, Card, Row, Divider, ToggleRow, PositionTiles } from "../theme/index.slint";
+
+// Filled and read by `pages::overlay`.
+export global OverlayState {
+    in-out property <bool> enabled;
+    // Picker order: top left, top centre, top right, then the bottom row the same way.
+    in property <int> position;
+    in-out property <bool> hide-over-fullscreen;
+    callback enabled-toggled(bool);
+    // Also fired for the already picked tile: the daemon shows the pill at that spot.
+    callback position-picked(int);
+    callback hide-over-fullscreen-toggled(bool);
+}
+
+export component OverlayPage inherits VerticalLayout {
+    property <[string]> names: [@tr("Top left"), @tr("Top centre"), @tr("Top right"), @tr("Bottom left"), @tr("Bottom centre"), @tr("Bottom right")];
+    alignment: start;
+    Card {
+        ToggleRow {
+            flat: true;
+            title: @tr("Show the overlay");
+            checked <=> OverlayState.enabled;
+            toggled(on) => {
+                OverlayState.enabled-toggled(on);
+            }
+        }
+        Divider { }
+        ToggleRow {
+            flat: true;
+            title: @tr("Hide over fullscreen apps");
+            checked <=> OverlayState.hide-over-fullscreen;
+            toggled(on) => {
+                OverlayState.hide-over-fullscreen-toggled(on);
+            }
+        }
+        Divider { }
+        // The picked spot's name is the description, left of the tiles, so it moves nothing.
+        Row {
+            title: @tr("Position");
+            info: @tr("Click a position to see the overlay there.");
+            enabled: !Shell.locked;
+            description: OverlayState.position >= 0 && OverlayState.position < root.names.length ? root.names[OverlayState.position] : "";
+            VerticalLayout {
+                alignment: center;
+                PositionTiles {
+                    accessible-label: @tr("Position");
+                    names: root.names;
+                    selected: OverlayState.position;
+                    picked(i) => {
+                        OverlayState.position-picked(i);
+                    }
+                }
+            }
+        }
+    }
+}
